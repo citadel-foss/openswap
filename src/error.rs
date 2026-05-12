@@ -2,6 +2,8 @@
 
 use std::error::Error;
 
+use crate::bip324_stream::Bip324Error;
+
 /// Represents all possible network-related errors.
 #[derive(Debug)]
 pub enum NetError {
@@ -29,6 +31,9 @@ pub enum NetError {
 
     /// Error indicating an invalid CLI application network.
     InvalidAppNetwork,
+
+    /// Error related to Bip324
+    Bip324Error(Bip324Error),
 }
 
 impl std::fmt::Display for NetError {
@@ -52,6 +57,18 @@ impl From<std::io::Error> for NetError {
 impl From<serde_cbor::Error> for NetError {
     fn from(value: serde_cbor::Error) -> Self {
         Self::Cbor(value)
+    }
+}
+
+impl From<bip324::io::ProtocolError> for NetError {
+    fn from(value: bip324::io::ProtocolError) -> Self {
+        Self::Bip324Error(value.into())
+    }
+}
+
+impl From<Bip324Error> for NetError {
+    fn from(value: Bip324Error) -> Self {
+        Self::Bip324Error(value)
     }
 }
 

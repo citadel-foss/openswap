@@ -3,6 +3,7 @@
 pub extern crate bitcoin;
 pub extern crate bitcoind;
 
+pub mod bip324_stream;
 pub mod error;
 pub mod fee_estimation;
 pub mod maker;

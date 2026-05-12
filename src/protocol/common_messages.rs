@@ -49,6 +49,8 @@ pub struct TakerHello;
 pub struct MakerHello {
     /// Protocol versions this maker supports.
     pub supported_protocols: Vec<ProtocolVersion>,
+    /// ECDSA signature over session_id using the maker's identity key, proving ownership and binding to maker address.
+    pub session_id_sig: bitcoin::secp256k1::ecdsa::Signature,
 }
 
 /// Request for offer from Taker to Maker.

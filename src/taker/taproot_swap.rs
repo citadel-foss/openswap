@@ -14,7 +14,7 @@ use crate::{
         contract2::{create_hashlock_script, create_timelock_script},
         taproot_messages::{SerializableScalar, TaprootContractData},
     },
-    utill::{read_message, send_message, MIN_FEE_RATE},
+    utill::MIN_FEE_RATE,
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         Blockchain, Wallet,
@@ -220,8 +220,7 @@ impl Taker {
         self.persist_swap(SwapPhase::FundsBroadcast)?;
         // funding_broadcast opens maker 0's connection before the
         // confirmation wait and keeps the whole route warm with keepalives,
-        // returning the live maker 0 stream for the contract exchange.
-        let maker0_stream = self.funding_broadcast()?;
+        self.funding_broadcast()?;
 
         // Phase 2: Exchange contract data with makers.
         log::info!("Exchanging contract data with makers...");
@@ -230,20 +229,9 @@ impl Taker {
         let hashlock_nonces = self.swap_state()?.hashlock_nonces.clone();
         let mut received_contracts: Vec<TaprootContractData> = Vec::new();
 
-        let mut maker0_stream = Some(maker0_stream);
-
         for i in 0..num_makers {
-            let maker_address = self.swap_state()?.makers[i].address.to_string();
-            let mut stream = if i == 0 {
-                // Reuse the warm, already-handshaked connection from funding_broadcast.
-                maker0_stream
-                    .take()
-                    .ok_or_else(|| TakerError::General("Missing warm maker 0 stream".to_string()))?
-            } else {
-                let mut stream = self.net_connect(&maker_address)?;
-                self.net_handshake(&mut stream)?;
-                stream
-            };
+            // tries to reuse the authenticated channel from earlier
+            let mut stream = self.take_connection(i)?;
             self.swap_state_mut()?.makers[i]
                 .taproot_exchange_mut()?
                 .connected = true;
@@ -360,16 +348,14 @@ impl Taker {
                 ));
             }
 
-            send_message(
-                &mut stream,
-                &TakerToMakerMessage::TaprootContractData(Box::new(contract_data)),
-            )?;
+            stream.send_message(&TakerToMakerMessage::TaprootContractData(Box::new(
+                contract_data,
+            )))?;
             self.swap_state_mut()?.makers[i]
                 .taproot_exchange_mut()?
                 .contract_data_sent = true;
 
-            let msg_bytes = read_message(&mut stream)?;
-            let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+            let msg: MakerToTakerMessage = stream.read_message()?;
 
             match msg {
                 MakerToTakerMessage::TaprootContractData(maker_contract) => {
@@ -537,6 +523,7 @@ impl Taker {
                     )));
                 }
             }
+            self.return_connection(i, stream)?;
         }
 
         // SP6-T: All makers responded, incoming/watchonly swapcoins created.
@@ -664,9 +651,8 @@ impl Taker {
     /// Broadcast contract transactions (Taproot) and wait for them to confirm.
     ///
     /// Opens maker 0's connection *before* the confirmation wait and keeps the
-    /// route alive with `WaitingFundingConfirmation` keepalives, returning the
-    /// live maker 0 stream so the contract exchange can reuse it.
-    fn funding_broadcast(&mut self) -> Result<std::net::TcpStream, TakerError> {
+    /// route alive with `WaitingFundingConfirmation` keepalives.
+    fn funding_broadcast(&mut self) -> Result<(), TakerError> {
         log::info!("Broadcasting contract transactions...");
 
         let wallet = self.write_wallet()?;
@@ -713,15 +699,15 @@ impl Taker {
         // Open and handshake maker 0 up front so its operational connection can
         // stay warm and be reused after the taker's funding confirms.
         let swap_id = self.swap_state()?.id.clone();
-        let maker0_address = self.swap_state()?.makers[0].address.to_string();
-        let mut stream = self.net_connect(&maker0_address)?;
-        self.net_handshake(&mut stream)?;
+        let stream = self.take_connection(0)?;
 
         self.wait_for_funding_confirmation(
             &contract_txids,
             required_confirms,
             crate::utill::TX_BROADCAST_TIMEOUT,
         )?;
+
+        self.return_connection(0, stream)?;
 
         #[cfg(debug_assertions)]
         log::debug!(
@@ -731,7 +717,7 @@ impl Taker {
             required_confirms
         );
         log::info!("Contract transactions broadcast and confirmed");
-        Ok(stream)
+        Ok(())
     }
 
     /// Wait for contract (funding) txs to reach `required_confirms`.
