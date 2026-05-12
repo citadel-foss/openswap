@@ -21,11 +21,12 @@ use std::{
 #[cfg(feature = "integration-test")]
 use std::net::TcpStream;
 
-use bitcoin::OutPoint;
+use bitcoin::{Network, OutPoint};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     atomic_file::{read_json, write_json_atomically},
+    bip324_stream::Bip324Stream,
     lock_debug,
     protocol::{
         common_messages::{
@@ -36,7 +37,6 @@ use crate::{
         contract::calculate_swap_fee,
         error::ProtocolError,
     },
-    utill::{read_message, send_message},
     wallet::{
         verify_fidelity_checks, AnyBlockchain, Blockchain, FidelityBond, FidelityError, WalletError,
     },
@@ -638,6 +638,8 @@ pub struct OfferSyncService {
     offerbook: OfferBookHandle,
     registry: FileRegistry,
     socks_port: u16,
+    /// Network, for the BIP324 magic.
+    network: Network,
     /// Shared so per-maker offer-fetch workers can each hold a handle.
     blockchain: Arc<AnyBlockchain>,
     /// Set to `true` by Nostr discovery after the first EOSE is received.
@@ -803,6 +805,7 @@ impl OfferSyncService {
         offerbook: OfferBookHandle,
         registry: FileRegistry,
         socks_port: u16,
+        network: Network,
         blockchain: Arc<AnyBlockchain>,
         initial_sync_complete: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
@@ -811,6 +814,7 @@ impl OfferSyncService {
             offerbook,
             registry,
             socks_port,
+            network,
             blockchain,
             initial_sync_complete,
             shutdown,
@@ -961,9 +965,11 @@ impl OfferSyncService {
     /// worker pool and the manual `poll_one` path. Returns the recorded maker, or
     /// `None` if no entry exists for `addr` after the update (e.g. a concurrent
     /// `remove` raced the poll).
+    #[allow(clippy::too_many_arguments)]
     fn fetch_and_record_one(
         addr: MakerAddress,
         socks_port: u16,
+        network: Network,
         blockchain: &AnyBlockchain,
         offerbook: &Arc<RwLock<OfferBook>>,
         offerbook_path: &Path,
@@ -986,7 +992,7 @@ impl OfferSyncService {
         };
         let downloaded = addr
             .clone()
-            .download_offer_with_retries(socks_port, shutdown);
+            .download_offer_with_retries(socks_port, network, shutdown);
         // Verify before taking the guard. The backend calls in here can block on a
         // slow server, which would serialize every worker in the pool behind it.
         let outcome = downloaded.map(|mut oa| {
@@ -1077,6 +1083,7 @@ impl OfferSyncService {
         Self::fetch_and_record_one(
             address,
             self.socks_port,
+            self.network,
             &self.blockchain,
             &self.offerbook.inner,
             &self.offerbook.path,
@@ -1100,6 +1107,7 @@ impl OfferSyncService {
         let offerbook = self.offerbook.inner.clone();
         let offerbook_path = self.offerbook.path.clone();
         let socks_port = self.socks_port;
+        let network = self.network;
         let blockchain = self.blockchain.clone();
         let shutdown = self.shutdown.clone();
 
@@ -1147,6 +1155,7 @@ impl OfferSyncService {
                         let _ = Self::fetch_and_record_one(
                             addr,
                             socks_port,
+                            network,
                             &backend,
                             &offerbook,
                             &offerbook_path,
@@ -1882,13 +1891,14 @@ impl MakerAddress {
     fn download_offer_with_retries(
         self,
         socks_port: u16,
+        network: Network,
         shutdown: &AtomicBool,
     ) -> Option<OfferAndAddress> {
         for attempt in 1..=FIRST_CONNECT_ATTEMPTS {
             if shutdown.load(Ordering::Relaxed) {
                 return None;
             }
-            match self.clone().download_offer_auto(socks_port) {
+            match self.clone().download_offer_auto(socks_port, network) {
                 Ok(offer) => return Some(offer),
                 Err(e) if attempt < FIRST_CONNECT_ATTEMPTS => {
                     log::debug!(
@@ -1917,8 +1927,12 @@ impl MakerAddress {
         None
     }
 
-    fn download_offer_auto(self, socks_port: u16) -> Result<OfferAndAddress, TakerError> {
-        let (offer, protocol, features) = self.fetch_offer(socks_port)?;
+    fn download_offer_auto(
+        self,
+        socks_port: u16,
+        network: Network,
+    ) -> Result<OfferAndAddress, TakerError> {
+        let (offer, protocol, features) = self.fetch_offer(socks_port, network)?;
         Ok(OfferAndAddress {
             offer,
             address: self,
@@ -1932,6 +1946,7 @@ impl MakerAddress {
     fn fetch_offer(
         &self,
         socks_port: u16,
+        network: Network,
     ) -> Result<(Offer, MakerProtocol, Vec<String>), TakerError> {
         if !is_valid_maker_address(&self.0) {
             return Err(TakerError::General("invalid maker address".into()));
@@ -1939,13 +1954,13 @@ impl MakerAddress {
         log::debug!("Downloading offer from maker: {}", self);
 
         #[cfg(feature = "integration-test")]
-        let mut socket = {
+        let socket = {
             let _ = socks_port;
             // Integration test: self.0 is "ip:port"
             TcpStream::connect(self.to_string())?
         };
         #[cfg(not(feature = "integration-test"))]
-        let mut socket = {
+        let socket = {
             use crate::protocol::common_messages::OPENSWAP_PORT;
 
             // Production: self.0 is a .onion hostname, connect via the Tor proxy
@@ -1961,14 +1976,15 @@ impl MakerAddress {
         socket.set_read_timeout(Some(Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC)))?;
         socket.set_write_timeout(Some(Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC)))?;
 
+        let mut socket = Bip324Stream::new(socket, network, bip324::Role::Initiator, None)?;
         let features = handshake_with_maker(&mut socket, &[])?;
 
         // Send GetOffer
         let get_offer = RouterTakerToMakerMessage::GetOffer(RouterGetOffer);
-        send_message(&mut socket, &get_offer)?;
+        socket.send_message(&get_offer)?;
 
         // Read Offer
-        let offer_bytes = read_message(&mut socket)?;
+        let offer_bytes = socket.read_frame(None)?;
         let offer_msg: RouterMakerToTakerMessage = serde_cbor::from_slice(&offer_bytes)?;
 
         let router_offer = match offer_msg {
@@ -1981,6 +1997,8 @@ impl MakerAddress {
                 .into());
             }
         };
+        // Whoever answered must hold the key the offer advertises.
+        socket.authenticate(&router_offer.tweakable_point)?;
 
         // Convert router offer to legacy Offer format for storage
         let offer = Offer {
@@ -2697,6 +2715,7 @@ pub(crate) mod tests {
             handle.clone(),
             registry.clone(),
             0,
+            Network::Regtest,
             Arc::new(AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap())),
             initial_sync_complete.clone(),
             Arc::new(AtomicBool::new(false)),
@@ -3655,6 +3674,7 @@ pub(crate) mod tests {
             offerbook.clone(),
             FileRegistry::new(),
             0,
+            Network::Regtest,
             Arc::new(AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap())),
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),

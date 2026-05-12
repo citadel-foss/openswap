@@ -23,6 +23,7 @@ use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 use zeroize::Zeroizing;
 
 use crate::{
+    bip324_stream::Bip324Stream,
     blocklist::{AddOutcome, AddressBlocklist, BlocklistEntry},
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
@@ -35,8 +36,8 @@ use crate::{
         features::{choose_pins, supported, unmet_for_flow, KNOWN},
     },
     utill::{
-        funding_fee_policy_sats, generate_maker_keys, get_taker_dir, read_message, send_message,
-        set_config_key, sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
+        funding_fee_policy_sats, generate_maker_keys, get_taker_dir, set_config_key,
+        sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
         blockchain::BackendConnector,
@@ -585,6 +586,8 @@ pub struct Taker {
     pub(crate) require_features: Vec<String>,
     /// Wallet for managing funds.
     pub(crate) wallet: Arc<RwLock<Wallet>>,
+    /// The wallet's network, which also sets the BIP324 network magic.
+    pub(crate) network: bitcoin::Network,
     /// Opens backend connections without taking the wallet lock.
     pub(crate) backend: BackendConnector,
     /// Stops the role and every backend connection it owns.
@@ -740,9 +743,10 @@ impl Taker {
         // long-lived server config.
         let wallet =
             Wallet::load_or_init_with_lock(&wallet_path, blockchain, password.take(), wallet_lock)?;
+        let network = wallet.store.network;
         // Validate the blocklist on startup when screening is enabled.
         if config.check_blocklist.unwrap_or(false) {
-            AddressBlocklist::load(&data_dir, wallet.store.network)?;
+            AddressBlocklist::load(&data_dir, network)?;
         }
 
         // Init Watch Service
@@ -768,6 +772,7 @@ impl Taker {
             &offerbook,
             registry,
             config.socks_port,
+            network,
             Arc::new(connector.connect()?),
             initial_sync_complete,
             shutdown.clone(),
@@ -777,6 +782,7 @@ impl Taker {
             config,
             require_features,
             wallet: Arc::new(RwLock::new(wallet)),
+            network,
             backend: connector,
             shutdown,
             offerbook,
@@ -1016,6 +1022,7 @@ impl Taker {
         offerbook: &OfferBookHandle,
         registry: FileRegistry,
         socks_port: u16,
+        network: bitcoin::Network,
         chain: Arc<AnyBlockchain>,
         initial_sync_complete: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
@@ -1024,6 +1031,7 @@ impl Taker {
             offerbook.clone(),
             registry,
             socks_port,
+            network,
             chain,
             initial_sync_complete,
             shutdown,
@@ -2031,9 +2039,8 @@ impl Taker {
 
         // Fetch the maker's offer before proposing swap details.
         // This gives us the fee schedule for amount verification later.
-        send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
-        let offer_bytes = read_message(&mut stream)?;
-        let offer_msg: MakerToTakerMessage = serde_cbor::from_slice(&offer_bytes)?;
+        stream.send_message(&TakerToMakerMessage::GetOffer(GetOffer))?;
+        let offer_msg: MakerToTakerMessage = stream.read_message()?;
         match offer_msg {
             MakerToTakerMessage::Offer(offer) => {
                 log::info!(
@@ -2043,6 +2050,21 @@ impl Taker {
                     offer.amount_relative_fee_pct,
                     offer.time_relative_fee_pct
                 );
+                // The maker we picked from the offerbook must still own the
+                // same tweakable key, and must prove it for this channel.
+                if let Some(expected) = self.swap_state()?.makers[maker_idx]
+                    .offer
+                    .as_ref()
+                    .map(|offer| offer.tweakable_point)
+                {
+                    if offer.tweakable_point != expected {
+                        return Err(TakerError::General(format!(
+                            "Maker {} changed offer tweakable point: expected {}, got {}",
+                            maker_idx, expected, offer.tweakable_point,
+                        )));
+                    }
+                }
+                stream.authenticate(&offer.tweakable_point)?;
                 Self::validate_offer(&offer, maker_idx, amount)?;
                 // A repricing since the payment quote would silently move the
                 // receiver's amount; abort while nothing is funded. Bitwise
@@ -2115,17 +2137,24 @@ impl Taker {
         #[cfg(feature = "integration-test")]
         let mut swap_details = self.forge_swap_details(swap_details);
 
-        send_message(
-            &mut stream,
-            &TakerToMakerMessage::SwapDetails(swap_details.clone()),
-        )?;
+        stream.send_message(&TakerToMakerMessage::SwapDetails(swap_details.clone()))?;
 
-        let msg_bytes = read_message(&mut stream)?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+        let msg: MakerToTakerMessage = stream.read_message()?;
 
         match msg {
             MakerToTakerMessage::AckSwapDetails(ack) => {
                 if let Some(tweakable_point) = ack.tweakable_point {
+                    // The ack must name the key this channel was authenticated with.
+                    let offer_point = self.swap_state()?.makers[maker_idx]
+                        .offer
+                        .as_ref()
+                        .map(|offer| offer.tweakable_point);
+                    if offer_point != Some(tweakable_point) {
+                        return Err(TakerError::General(format!(
+                            "Maker {} acked with tweakable point {}, offer has {:?}",
+                            maker_idx, tweakable_point, offer_point,
+                        )));
+                    }
                     // An accept must carry the frozen plan shape the next hop
                     // derives from; an empty or over-ceiling shape is a rejection.
                     if ack.funding_splits.is_empty() || ack.funding_splits.len() > tx_count as usize
@@ -2257,7 +2286,7 @@ impl Taker {
         self.wait_for_funding_step(swap_id, entered)?;
         log::warn!("Test behavior: racing a duplicate funding-step message to {maker_address}");
         let mut stream = self.net_connect(maker_address)?;
-        send_message(&mut stream, msg)?;
+        stream.send_message(msg)?;
         Ok(())
     }
 
@@ -2271,13 +2300,10 @@ impl Taker {
         // A replay can target a swap that already aborted and cleared the live
         // state, so the maker must list what the replayed details use.
         let (mut stream, _) = self.net_connect_with(maker_address, &details.features)?;
-        send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
-        read_message(&mut stream)?;
-        send_message(
-            &mut stream,
-            &TakerToMakerMessage::SwapDetails(details.clone()),
-        )?;
-        Ok(serde_cbor::from_slice(&read_message(&mut stream)?)?)
+        stream.send_message(&TakerToMakerMessage::GetOffer(GetOffer))?;
+        stream.read_frame(None)?;
+        stream.send_message(&TakerToMakerMessage::SwapDetails(details.clone()))?;
+        Ok(serde_cbor::from_slice(&stream.read_frame(None)?)?)
     }
 
     /// Rebuild the SwapDetails this swap negotiated with `maker_idx`, so they can
@@ -2383,10 +2409,9 @@ impl Taker {
             if i > 0 {
                 std::thread::sleep(gap);
             }
-            send_message(
-                &mut stream,
-                &TakerToMakerMessage::WaitingFundingConfirmation(swap_id.to_string()),
-            )?;
+            stream.send_message(&TakerToMakerMessage::WaitingFundingConfirmation(
+                swap_id.to_string(),
+            ))?;
         }
         Ok(())
     }
@@ -2808,32 +2833,43 @@ impl Taker {
     }
 
     /// Connect to a maker on the live swap and exchange Hellos. The maker must
-    /// still list this hop's pins.
-    pub(crate) fn net_connect(&self, address: &str) -> Result<TcpStream, TakerError> {
+    /// still list this hop's pins, and once its offer is known, must prove it
+    /// holds the offer's tweakable key for this BIP324 session.
+    pub(crate) fn net_connect(&self, address: &str) -> Result<Bip324Stream, TakerError> {
         let swap = self.swap_state()?;
-        let needed = match swap
+        let maker = swap
             .makers
             .iter()
-            .find(|m| m.address.to_string() == address)
-        {
+            .find(|m| m.address.to_string() == address);
+        let needed = match maker {
             Some(maker) => maker.needed(),
             None => vec![swap.params.protocol.feature_name().to_string()],
         };
-        Ok(self.net_connect_with(address, &needed)?.0)
+        let identity = maker
+            .and_then(|m| m.offer.as_ref())
+            .map(|offer| offer.tweakable_point);
+        let (stream, _) = self.net_connect_with(address, &needed)?;
+        if let Some(tweakable_point) = identity {
+            stream.authenticate(&tweakable_point)?;
+        }
+        Ok(stream)
     }
 
     /// Connect to a maker directly or through Tor and exchange Hellos. The
     /// maker must list every name in `needed`; returns the names it listed.
+    /// The channel is not yet bound to the maker's identity: callers that know
+    /// its tweakable point check it with [`Bip324Stream::authenticate`].
     pub(crate) fn net_connect_with(
         &self,
         address: &str,
         needed: &[String],
-    ) -> Result<(TcpStream, Vec<String>), TakerError> {
+    ) -> Result<(Bip324Stream, Vec<String>), TakerError> {
         let mut stream = connect_to_maker(
             address,
             self.config.connection_type,
             self.config.socks_port,
             Duration::from_secs(MAKER_RESPONSE_TIMEOUT_SECS),
+            self.network,
         )?;
         let features = handshake_with_maker(&mut stream, needed)?;
         Ok((stream, features))
@@ -2844,17 +2880,21 @@ impl Taker {
 /// `needed`. Returns the names it listed that this build recognizes; the rest
 /// mean nothing here. Free of `Taker` so background threads can reconnect.
 pub(crate) fn handshake_with_maker(
-    stream: &mut TcpStream,
+    stream: &mut Bip324Stream,
     needed: &[String],
 ) -> Result<Vec<String>, TakerError> {
     let hello = Hello {
         features: supported().into_iter().map(String::from).collect(),
+        session_id_sig: None,
     };
-    send_message(stream, &TakerToMakerMessage::Hello(hello))?;
+    stream.send_message(&TakerToMakerMessage::Hello(hello))?;
 
-    let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(stream)?)?;
+    let msg: MakerToTakerMessage = serde_cbor::from_slice(&stream.read_frame(None)?)?;
     let features = match msg {
-        MakerToTakerMessage::Hello(hello) => hello.features,
+        MakerToTakerMessage::Hello(hello) => {
+            stream.set_maker_session_sig(hello.session_id_sig);
+            hello.features
+        }
         MakerToTakerMessage::Unsupported(refusal) => {
             return Err(TakerError::General(format!(
                 "Maker refused our Hello: {}",
@@ -2882,8 +2922,8 @@ pub(crate) fn handshake_with_maker(
     Ok(features)
 }
 
-/// Connect to a maker directly or through Tor. Free of `Taker` so background
-/// threads can reconnect on their own.
+/// Connect to a maker directly or through Tor and run the BIP324 handshake.
+/// Free of `Taker` so background threads can reconnect on their own.
 // The integration-test build connects directly and reads neither knob.
 #[cfg_attr(feature = "integration-test", allow(unused_variables))]
 pub(crate) fn connect_to_maker(
@@ -2891,7 +2931,8 @@ pub(crate) fn connect_to_maker(
     connection_type: ConnectionType,
     socks_port: u16,
     read_timeout: Duration,
-) -> Result<TcpStream, TakerError> {
+    network: bitcoin::Network,
+) -> Result<Bip324Stream, TakerError> {
     {
         log::debug!("Connecting to maker at {}", address);
         let timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
@@ -2921,7 +2962,12 @@ pub(crate) fn connect_to_maker(
             .and_then(|_| socket.set_write_timeout(Some(timeout)))
             .map_err(|e| TakerError::General(format!("Failed to set socket timeout: {}", e)))?;
 
-        Ok(socket)
+        Ok(Bip324Stream::new(
+            socket,
+            network,
+            bip324::Role::Initiator,
+            None,
+        )?)
     }
 }
 
@@ -2943,6 +2989,7 @@ impl Taker {
         let dial = super::background_services::PeerDial {
             connection_type: self.config.connection_type,
             socks_port: self.config.socks_port,
+            network: self.network,
         };
         match super::background_services::RouteHeartbeat::start(swap_id, peers, dial) {
             Ok(heartbeat) => Some(heartbeat),
@@ -3007,9 +3054,9 @@ impl Taker {
 
                         let msg =
                             Self::msg_build_handover(protocol, swap_id.clone(), &current_privkeys);
-                        send_message(&mut stream, &msg)?;
+                        stream.send_message(&msg)?;
 
-                        let msg_bytes = read_message(&mut stream)?;
+                        let msg_bytes = stream.read_frame(None)?;
                         let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
 
                         match msg {
@@ -4029,23 +4076,37 @@ mod tests {
 
     fn compat_hello_reply(reply: Value, needed: &[String]) -> Result<Vec<String>, TakerError> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let peer = thread::spawn(move || {
-            let (mut server, _) = listener.accept().unwrap();
+            let (server, _) = listener.accept().unwrap();
             server
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let message: TakerToMakerMessage =
-                serde_cbor::from_slice(&read_message(&mut server).unwrap()).unwrap();
+            let mut server = Bip324Stream::new(
+                server,
+                bitcoin::Network::Regtest,
+                bip324::Role::Responder,
+                None,
+            )
+            .unwrap();
+            let message: TakerToMakerMessage = server.read_message().unwrap();
             let TakerToMakerMessage::Hello(hello) = message else {
                 panic!("first message must be Hello");
             };
             assert_eq!(hello.features, supported());
-            send_message(&mut server, &reply).unwrap();
+            assert_eq!(hello.session_id_sig, None);
+            server.send_message(&reply).unwrap();
         });
+        let mut client = Bip324Stream::new(
+            client,
+            bitcoin::Network::Regtest,
+            bip324::Role::Initiator,
+            None,
+        )
+        .unwrap();
         let result = handshake_with_maker(&mut client, needed);
         peer.join().unwrap();
         result
@@ -4055,7 +4116,11 @@ mod tests {
     fn compat_hello_accepts_many_future_names_and_fields() {
         let mut names: Vec<_> = (0..100).map(|i| format!("future-{i}-v1")).collect();
         names.extend(KNOWN.iter().map(|f| f.name.to_string()));
-        let mut reply = to_value(MakerToTakerMessage::Hello(Hello { features: names })).unwrap();
+        let mut reply = to_value(MakerToTakerMessage::Hello(Hello {
+            features: names,
+            ..Default::default()
+        }))
+        .unwrap();
         let Value::Map(outer) = &mut reply else {
             panic!()
         };
@@ -4076,6 +4141,7 @@ mod tests {
     fn compat_hello_keeps_recognized_names_bounded_by_registry() {
         let reply = to_value(MakerToTakerMessage::Hello(Hello {
             features: vec!["taproot".into(); 100],
+            ..Default::default()
         }))
         .unwrap();
         assert_eq!(
@@ -4086,7 +4152,11 @@ mod tests {
             .flat_map(|_| KNOWN.iter().rev().map(|f| f.name.to_string()))
             .chain(["future-v1".into()])
             .collect();
-        let reply = to_value(MakerToTakerMessage::Hello(Hello { features: repeated })).unwrap();
+        let reply = to_value(MakerToTakerMessage::Hello(Hello {
+            features: repeated,
+            ..Default::default()
+        }))
+        .unwrap();
         assert_eq!(
             compat_hello_reply(reply, &[]).unwrap(),
             KNOWN.iter().map(|f| f.name).collect::<Vec<_>>()
@@ -4123,6 +4193,7 @@ mod tests {
         ] {
             let reply = to_value(MakerToTakerMessage::Hello(Hello {
                 features: features.into_iter().map(String::from).collect(),
+                ..Default::default()
             }))
             .unwrap();
             let needed = needed.into_iter().map(String::from).collect::<Vec<_>>();

@@ -1501,6 +1501,7 @@ mod tests {
 
         let message = MakerToTakerMessage::Hello(Hello {
             features: vec!["legacy".to_string(), "taproot".to_string()],
+            ..Default::default()
         });
 
         thread::spawn(move || {

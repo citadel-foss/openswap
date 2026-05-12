@@ -16,7 +16,6 @@ use crate::{
         },
         taproot_messages::{SerializableScalar, TaprootContractData},
     },
-    utill::{read_message, send_message},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         Blockchain, Wallet,
@@ -374,10 +373,9 @@ impl Taker {
 
             #[cfg(feature = "integration-test")]
             let entered = crate::maker::handlers::funding_steps_entered(&contract_data.id);
-            send_message(
-                &mut stream,
-                &TakerToMakerMessage::TaprootContractData(Box::new(contract_data.clone())),
-            )?;
+            stream.send_message(&TakerToMakerMessage::TaprootContractData(Box::new(
+                contract_data.clone(),
+            )))?;
 
             #[cfg(feature = "integration-test")]
             if self.races_funding_step(&maker_address)? {
@@ -393,7 +391,7 @@ impl Taker {
                 }
             }
 
-            let msg_bytes = read_message(&mut stream).map_err(TakerError::from);
+            let msg_bytes = stream.read_frame(None).map_err(TakerError::from);
             #[cfg(feature = "integration-test")]
             let msg_bytes = match msg_bytes {
                 Err(_)
@@ -620,11 +618,11 @@ impl Taker {
         contract_data: &TaprootContractData,
     ) -> Result<Vec<u8>, TakerError> {
         let mut stream = self.net_connect(maker_address)?;
-        send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
-        read_message(&mut stream)?;
+        stream.send_message(&TakerToMakerMessage::GetOffer(GetOffer))?;
+        stream.read_frame(None)?;
         let details = self.current_swap_details(maker_idx)?;
-        send_message(&mut stream, &TakerToMakerMessage::SwapDetails(details))?;
-        let ack: MakerToTakerMessage = serde_cbor::from_slice(&read_message(&mut stream)?)?;
+        stream.send_message(&TakerToMakerMessage::SwapDetails(details))?;
+        let ack: MakerToTakerMessage = serde_cbor::from_slice(&stream.read_frame(None)?)?;
         match ack {
             MakerToTakerMessage::AckSwapDetails(ref ack) if ack.tweakable_point.is_some() => {}
             other => {
@@ -634,11 +632,10 @@ impl Taker {
                 )));
             }
         }
-        send_message(
-            &mut stream,
-            &TakerToMakerMessage::TaprootContractData(Box::new(contract_data.clone())),
-        )?;
-        Ok(read_message(&mut stream)?)
+        stream.send_message(&TakerToMakerMessage::TaprootContractData(Box::new(
+            contract_data.clone(),
+        )))?;
+        Ok(stream.read_frame(None)?)
     }
 
     /// Build contract data from our outgoing swapcoins (first hop).

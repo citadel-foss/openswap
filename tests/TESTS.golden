@@ -1,5 +1,10 @@
 openswap atomic_file::tests::compat_wallet_lock_is_exclusive_until_its_process_exits
 openswap atomic_file::tests::compat_wallet_lock_survives_atomic_wallet_replacement
+openswap bip324_stream::tests::clean_close_is_connection_closed
+openswap bip324_stream::tests::idle_timeout_leaves_stream_usable
+openswap bip324_stream::tests::oversized_packet_is_refused_before_allocating
+openswap bip324_stream::tests::roundtrip_and_session_binding
+openswap bip324_stream::tests::stalled_handshake_hits_deadline
 openswap blocklist::tests::add_rejects_all_entries_when_any_address_is_invalid
 openswap blocklist::tests::add_update_remove_round_trip
 openswap blocklist::tests::compat_blocklist_header_and_entries_use_one_snapshot
