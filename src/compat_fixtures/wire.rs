@@ -178,6 +178,7 @@ pub(super) fn generate(release: &Path) {
             "ln-swap-in".into(),
             "ln-swap-out".into(),
         ],
+        ..Default::default()
     };
     let details = SwapDetails {
         id: swap_id.clone(),
