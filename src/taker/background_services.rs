@@ -5,7 +5,6 @@
 
 use std::{
     collections::HashSet,
-    net::TcpStream,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
         mpsc, Arc, Mutex, RwLock,
@@ -17,6 +16,7 @@ use std::{
 use bitcoin::{OutPoint, ScriptBuf, Txid};
 
 use crate::{
+    bip324_stream::Bip324Stream,
     lock_debug,
     protocol::common_messages::TakerToMakerMessage,
     taker::{
@@ -522,6 +522,8 @@ pub(crate) struct PeerDial {
     pub(crate) connection_type: ConnectionType,
     /// Tor SOCKS port, ignored for clearnet.
     pub(crate) socks_port: u16,
+    /// Network, for the BIP324 magic.
+    pub(crate) network: bitcoin::Network,
 }
 
 /// One maker in the route, with its keepalive stream and reconnect state.
@@ -530,7 +532,7 @@ struct HeartbeatPeer {
     /// Names the maker's Hello must list for this swap.
     needed: Vec<String>,
     /// `None` while disconnected and waiting to retry.
-    stream: Option<TcpStream>,
+    stream: Option<Bip324Stream>,
     /// Ticks still to wait before the next connect attempt.
     retry_in: u32,
     /// Ticks to wait after the next failure; doubles up to the ceiling.
@@ -561,6 +563,7 @@ impl HeartbeatPeer {
                 dial.connection_type,
                 dial.socks_port,
                 dial_timeout,
+                dial.network,
             )
             .and_then(|mut stream| handshake_with_maker(&mut stream, &self.needed).map(|_| stream))
             {
@@ -583,7 +586,7 @@ impl HeartbeatPeer {
         }
 
         if let Some(stream) = self.stream.as_mut() {
-            if let Err(e) = crate::utill::send_message(stream, keepalive) {
+            if let Err(e) = stream.send_message(keepalive) {
                 // The maker may be perfectly alive with only this socket dead,
                 // and the protocol reads run on a different connection, so they
                 // would never notice. Drop it and reconnect on the next tick.
@@ -684,7 +687,7 @@ mod tests {
         transaction::Version,
         Amount, PublicKey, Transaction, TxOut,
     };
-    use std::net::{Shutdown, TcpListener};
+    use std::net::{Shutdown, TcpListener, TcpStream};
 
     fn outgoing_for(id: &str, locktime: u32) -> OutgoingSwapCoin {
         let key = SecretKey::from_slice(&[1; 32]).unwrap();
@@ -928,6 +931,7 @@ mod tests {
         PeerDial {
             connection_type: ConnectionType::Clearnet,
             socks_port: 0,
+            network: bitcoin::Network::Regtest,
         }
     }
 
@@ -1008,9 +1012,28 @@ mod tests {
     fn dead_keepalive_socket_is_dropped_and_retried_immediately() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
-        let stream = TcpStream::connect(&address).unwrap();
+        let maker = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            Bip324Stream::new(
+                socket,
+                bitcoin::Network::Regtest,
+                bip324::Role::Responder,
+                None,
+            )
+            .unwrap()
+        });
+        let socket = TcpStream::connect(&address).unwrap();
+        let write_half = socket.try_clone().unwrap();
+        let stream = Bip324Stream::new(
+            socket,
+            bitcoin::Network::Regtest,
+            bip324::Role::Initiator,
+            None,
+        )
+        .unwrap();
+        let _maker = maker.join().unwrap();
         // Shutting down our own write half makes the next send fail for sure.
-        stream.shutdown(Shutdown::Write).unwrap();
+        write_half.shutdown(Shutdown::Write).unwrap();
 
         let mut peer = HeartbeatPeer {
             address,

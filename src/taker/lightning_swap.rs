@@ -18,7 +18,6 @@
 //! (swap-out), the timelock branch otherwise (swap-in refund).
 
 use std::{
-    net::TcpStream,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -30,6 +29,7 @@ use bitcoin::{
 };
 
 use crate::{
+    bip324_stream::Bip324Stream,
     lightning::{
         invoice::verify_invoice, swap::SwapHtlc, InvoiceParams, LightningBackend, LnEvent, Preimage,
     },
@@ -41,7 +41,7 @@ use crate::{
             LnSwapInRequest, LnSwapOutClaimed, LnSwapOutPaid, LnSwapOutRequest,
         },
     },
-    utill::{generate_keypair, read_message, send_message, MIN_RELAY_FEE_RATE},
+    utill::{generate_keypair, MIN_RELAY_FEE_RATE},
     wallet::{AddressType, LnPendingSwap},
 };
 
@@ -246,7 +246,7 @@ fn general(msg: impl Into<String>) -> TakerError {
 
 /// A maker connection with the hello/offer handshake completed.
 struct LnMakerConn {
-    socket: TcpStream,
+    socket: Bip324Stream,
     address: String,
     ln_offer: LightningOffer,
     /// Exact feature names this swap uses, sent in its request.
@@ -255,11 +255,9 @@ struct LnMakerConn {
 
 impl LnMakerConn {
     fn send(&mut self, msg: LightningTakerMessage) -> Result<(), TakerError> {
-        send_message(
-            &mut self.socket,
-            &TakerToMakerMessage::Lightning(Box::new(msg)),
-        )
-        .map_err(|e| general(format!("send to maker failed: {e:?}")))
+        self.socket
+            .send_message(&TakerToMakerMessage::Lightning(Box::new(msg)))
+            .map_err(|e| general(format!("send to maker failed: {e:?}")))
     }
 
     /// Listens briefly for an early rejection. A maker that refuses replies
@@ -269,12 +267,7 @@ impl LnMakerConn {
     /// The caller must not read this connection again afterwards: a read
     /// that times out mid-frame would leave the stream unaligned.
     fn check_no_early_reject(&mut self, window: Duration) -> Result<(), TakerError> {
-        let previous = self.socket.read_timeout().ok().flatten();
-        if self.socket.set_read_timeout(Some(window)).is_err() {
-            return Ok(());
-        }
-        let early = read_message(&mut self.socket);
-        let _ = self.socket.set_read_timeout(previous);
+        let early = self.socket.read_frame(Some(Instant::now() + window));
         match early {
             Ok(bytes) => match serde_cbor::from_slice::<MakerToTakerMessage>(&bytes) {
                 Ok(MakerToTakerMessage::Lightning(ln)) => match *ln {
@@ -300,7 +293,9 @@ impl LnMakerConn {
     /// Reads the next Lightning-family reply, surfacing `Reject` and
     /// `Unsupported` as errors.
     fn read_ln(&mut self) -> Result<LightningMakerMessage, TakerError> {
-        let bytes = read_message(&mut self.socket)
+        let bytes = self
+            .socket
+            .read_frame(None)
             .map_err(|e| general(format!("read from maker failed: {e:?}")))?;
         let msg: MakerToTakerMessage = serde_cbor::from_slice(&bytes)
             .map_err(|e| general(format!("bad maker message: {e:?}")))?;
@@ -375,16 +370,22 @@ impl Taker {
             general(format!("maker cannot meet required features {missing:?}"))
         })?;
 
-        send_message(&mut socket, &TakerToMakerMessage::GetOffer(GetOffer))
+        socket
+            .send_message(&TakerToMakerMessage::GetOffer(GetOffer))
             .map_err(|e| general(format!("get offer failed: {e:?}")))?;
-        let bytes =
-            read_message(&mut socket).map_err(|e| general(format!("offer reply: {e:?}")))?;
+        let bytes = socket
+            .read_frame(None)
+            .map_err(|e| general(format!("offer reply: {e:?}")))?;
         let msg: MakerToTakerMessage =
             serde_cbor::from_slice(&bytes).map_err(|e| general(format!("bad offer: {e:?}")))?;
         let offer: Offer = match msg {
             MakerToTakerMessage::Offer(offer) => *offer,
             other => return Err(general(format!("expected Offer, got {other:?}"))),
         };
+        // Whoever answered must hold the key the offer advertises.
+        socket
+            .authenticate(&offer.tweakable_point)
+            .map_err(|e| general(format!("maker failed channel authentication: {e:?}")))?;
         let ln_offer = offer
             .lightning
             .ok_or_else(|| general("maker does not offer Lightning swaps"))?;
