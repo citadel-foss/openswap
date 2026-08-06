@@ -7,6 +7,8 @@ pub(crate) mod atomic_file;
 pub mod blocklist;
 pub mod error;
 pub mod fee_estimation;
+#[cfg(feature = "lightning")]
+pub mod lightning;
 pub mod maker;
 pub mod protocol;
 pub mod security;
