@@ -6,6 +6,8 @@ pub extern crate bitcoind;
 pub(crate) mod atomic_file;
 pub mod blocklist;
 pub mod error;
+#[cfg(feature = "lightning")]
+pub mod lightning;
 pub mod maker;
 pub mod protocol;
 pub mod security;
