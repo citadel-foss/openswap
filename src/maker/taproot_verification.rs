@@ -31,6 +31,19 @@ pub(crate) fn verify_taproot_contract_data(
         ));
     }
 
+    // Bound the incoming count: each contract consumes a distinct confirmed UTXO, so an
+    // unbounded count could force the maker to fan out beyond the split ceiling.
+    if data.contract_txs.len() > crate::wallet::MAX_SPLITS {
+        return Err(MakerError::General(
+            format!(
+                "Taproot incoming contract count ({}) exceeds maximum splits ({})",
+                data.contract_txs.len(),
+                crate::wallet::MAX_SPLITS
+            )
+            .leak(),
+        ));
+    }
+
     // contract_txs and amounts must have matching lengths
     if data.contract_txs.len() != data.amounts.len() {
         return Err(MakerError::General(

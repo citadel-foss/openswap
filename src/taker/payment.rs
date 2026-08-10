@@ -158,9 +158,12 @@ impl Taker {
             ))
         })?;
 
-        // The receiver amount is split across `tx_count` settlement outputs;
-        // each must clear the dust floor.
-        let tx_count = params.tx_count as u64;
+        // Settlement outputs are the final hop's count (last entry); each must clear dust.
+        let tx_counts = params.resolved_tx_counts();
+        let tx_count = *tx_counts
+            .last()
+            .expect("resolved_tx_counts always yields maker_count + 1 entries")
+            as u64;
         if tx_count == 0 {
             return Err(TakerError::General(
                 "A payment swap needs at least one transaction split".into(),
@@ -183,15 +186,26 @@ impl Taker {
     /// rewrite `params.send_amount` from the receiver's exact amount to the
     /// solved gross route amount. `address` is the validated receiver.
     pub(crate) fn payment_prepare_route(&mut self, address: Address) -> Result<(), TakerError> {
-        let (receiver_amount, tx_count, protocol, maker_count) = {
+        let (receiver_amount, tx_counts, protocol, maker_count) = {
             let swap = self.swap_state()?;
             (
                 swap.params.send_amount,
-                swap.params.tx_count as u64,
+                swap.params.resolved_tx_counts(),
                 swap.params.protocol,
                 swap.makers.len(),
             )
         };
+
+        // `solve_route_gross_sats` prices one uniform per-hop mining fee, so an uneven
+        // route has no exact solution — refuse rather than silently misprice a hop.
+        if tx_counts.iter().any(|&c| c != tx_counts[0]) {
+            return Err(TakerError::General(format!(
+                "A payment swap needs a uniform per-hop split count, got {tx_counts:?}; \
+                 use a single count for every hop"
+            )));
+        }
+        // Uniform per above, so any entry is the settlement (final-hop) count.
+        let tx_count = tx_counts[0] as u64;
 
         // Discovery fills these from the offerbook synced moments earlier; a
         // preferred-maker route has none, so poll those makers directly (which

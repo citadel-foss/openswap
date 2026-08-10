@@ -64,6 +64,12 @@ pub enum MakerBehavior {
     UnderfundTaprootContract,
     /// Deduct one extra satoshi beyond the advertised fee.
     FeeSkimming,
+    /// Build one more outgoing Taproot contract than requested (over-split test).
+    OverSplitTaprootContract,
+    /// Build one fewer outgoing Taproot contract than requested (under-split test).
+    UnderSplitTaprootContract,
+    /// Advertise `max_tx_splits: None` to emulate a pre-feature maker (downgrade test).
+    AdvertiseNoSplitSupport,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).
@@ -128,6 +134,13 @@ pub struct ConnectionState {
     pub timelock: u32,
     /// Relative locktime offset for deterministic fee calculation.
     pub refund_locktime_offset: u16,
+    /// Number of outgoing contracts to build for this hop (Taproot per-hop splitting).
+    ///
+    /// `None` means the taker did not request a specific outgoing count, so the maker
+    /// mirrors its incoming contract count (legacy behavior). Carried from
+    /// [`SwapDetails::outgoing_tx_count`] so `process_taproot_contract` can decouple its
+    /// outgoing count from the incoming one.
+    pub outgoing_tx_count: Option<u32>,
     /// Incoming swap coins (we receive).
     pub incoming_swapcoins: Vec<IncomingSwapCoin>,
     /// Outgoing swap coins (we send).
@@ -177,6 +190,7 @@ impl Default for ConnectionState {
             tx_count: 0,
             timelock: 0,
             refund_locktime_offset: 0,
+            outgoing_tx_count: None,
             incoming_swapcoins: Vec::new(),
             outgoing_swapcoins: Vec::new(),
             pending_funding_txes: Vec::new(),
@@ -557,6 +571,16 @@ fn handle_get_offer<M: Maker>(
         tweakable_point,
         fidelity,
         tweak_chain_code,
+        // `Some` tells the taker this maker reads `outgoing_tx_count`, up to the ceiling.
+        #[cfg(not(feature = "integration-test"))]
+        max_tx_splits: Some(crate::wallet::MAX_SPLITS as u32),
+        // One test behavior suppresses this to emulate a pre-feature maker.
+        #[cfg(feature = "integration-test")]
+        max_tx_splits: if maker.behavior() == MakerBehavior::AdvertiseNoSplitSupport {
+            None
+        } else {
+            Some(crate::wallet::MAX_SPLITS as u32)
+        },
     };
 
     log::info!(
@@ -605,6 +629,7 @@ fn handle_swap_details<M: Maker>(
     state.tx_count = details.tx_count;
     state.timelock = details.timelock;
     state.refund_locktime_offset = refund_locktime_offset;
+    state.outgoing_tx_count = details.outgoing_tx_count;
     state.protocol = details.protocol_version;
     state.swap_start_time = Instant::now();
     let swap_fee = maker.calculate_swap_fee(details.amount, state.refund_locktime_offset as u32);
@@ -691,6 +716,7 @@ fn restore_state_if_needed<M: Maker>(
             state.service_fee_sats = stored.service_fee_sats;
             state.swap_start_time = stored.swap_start_time;
             state.refund_locktime_offset = stored.refund_locktime_offset;
+            state.outgoing_tx_count = stored.outgoing_tx_count;
         }
     }
     Ok(())

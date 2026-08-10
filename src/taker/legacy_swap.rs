@@ -139,7 +139,8 @@ impl Taker {
         let swap = self.swap_state()?;
         let swap_id = swap.id.clone();
         let maker_count = swap.makers.len();
-        let tx_count = swap.params.tx_count;
+        // Legacy uses a uniform split count; every entry is equal, so read index 0.
+        let tx_count = swap.params.resolved_tx_counts()[0];
 
         // Ping every maker for the life of the march: while we negotiate one
         // hop, the others must not read our silence as a dropped swap.

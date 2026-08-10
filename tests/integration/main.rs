@@ -35,6 +35,7 @@ mod taproot_maker_abort3;
 mod taproot_maker_malice;
 mod taproot_multi_maker;
 mod taproot_multi_taker;
+mod taproot_per_hop_splits;
 mod taproot_swap;
 mod taproot_taker_abort1;
 mod taproot_taker_abort2;

@@ -185,7 +185,8 @@ impl Taker {
         refund_locktime: u16,
         expected_amount: Option<Amount>,
     ) -> Result<(), TakerError> {
-        let expected_count = self.swap_state()?.params.tx_count as usize;
+        // Uniform Legacy count: index 0 applies to every hop.
+        let expected_count = self.swap_state()?.params.resolved_tx_counts()[0] as usize;
         if senders_info.len() != expected_count {
             return Err(TakerError::General(format!(
                 "Wrong number of maker sender contracts: expected {}, got {}",
