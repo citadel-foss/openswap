@@ -17,6 +17,7 @@ use std::{
 use bitcoin::{bip32::ChainCode, Amount, Network, OutPoint, PublicKey, Transaction};
 
 use crate::{
+    blocklist::AddressBlocklist,
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
     protocol::common_messages::{FidelityProof, ProtocolVersion, SwapDetails},
@@ -129,6 +130,8 @@ pub struct MakerServerConfig {
     pub min_swap_amount: u64,
     /// Required confirmations for funding transactions.
     pub required_confirms: u32,
+    /// Whether funding inputs should be checked against the address blocklist.
+    pub check_blocklist: bool,
     /// Supported protocol versions.
     pub supported_protocols: Vec<ProtocolVersion>,
     /// Fidelity bond amount in satoshis.
@@ -168,6 +171,7 @@ impl Default for MakerServerConfig {
             time_relative_fee_pct: 0.0001,
             min_swap_amount: 10_000,
             required_confirms: 1,
+            check_blocklist: false,
             supported_protocols: vec![ProtocolVersion::Legacy, ProtocolVersion::Taproot],
             fidelity_amount: 10_000,   // 0.0001 BTC
             fidelity_timelock: 15_000, // ~6 months (MAX_FIDELITY_TIMELOCK)
@@ -276,6 +280,10 @@ impl MakerServerConfig {
                 config_map.get("required_confirms"),
                 default_config.required_confirms,
             ),
+            check_blocklist: parse_field(
+                config_map.get("check_blocklist"),
+                default_config.check_blocklist,
+            ),
             fidelity_amount: parse_field(
                 config_map.get("fidelity_amount"),
                 default_config.fidelity_amount,
@@ -338,6 +346,8 @@ amount_relative_fee_pct = {}
 time_relative_fee_pct = {}
 # Required confirmations for funding transactions
 required_confirms = {}
+# Check funding inputs against the address blocklist
+check_blocklist = {}
 ",
             self.network_port,
             self.rpc_port,
@@ -355,6 +365,7 @@ required_confirms = {}
             self.amount_relative_fee_pct,
             self.time_relative_fee_pct,
             self.required_confirms,
+            self.check_blocklist,
         );
 
         std::fs::create_dir_all(path.parent().ok_or_else(|| {
@@ -596,7 +607,10 @@ impl MakerServer {
             );
             config.network = wallet_network;
         }
-
+        // Validate the blocklist on startup when screening is enabled.
+        if config.check_blocklist {
+            AddressBlocklist::load(&data_dir, config.network)?;
+        }
         // Initialize watch service. A failure here aborts init instead of
         // entering recovery-only: that mode polls the same backend that
         // just failed to build, so there is nothing to degrade to.
@@ -1350,6 +1364,17 @@ impl MakerTrait for MakerServer {
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
 
         wallet.send_tx(tx).map_err(MakerError::Wallet)
+    }
+
+    fn screen_funding_tx(&self, tx: &Transaction) -> Result<(), MakerError> {
+        if !self.config.check_blocklist {
+            return Ok(());
+        }
+
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        crate::blocklist::screen_funding_tx(&self.data_dir, self.config.network, &wallet, tx)
+            .map_err(MakerError::Blocklist)
     }
 
     fn is_transaction_known(&self, txid: &bitcoin::Txid) -> bool {

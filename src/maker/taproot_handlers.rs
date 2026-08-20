@@ -179,6 +179,7 @@ fn process_taproot_contract<M: Maker>(
         // Blocks passed while we waited. We have broadcast nothing yet, so aborting
         // here costs only the reserved UTXOs.
         check_sweep_margin(maker, state.timelock)?;
+        maker.screen_funding_tx(&incoming_contract_tx)?;
 
         let incoming_funding_amount = data.amounts[j];
 

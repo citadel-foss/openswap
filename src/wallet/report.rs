@@ -14,12 +14,14 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::OpenOptions,
     path::{Path, PathBuf},
     time::Instant,
 };
 
-use crate::utill::now_unix_secs;
+use crate::{
+    atomic_file::{read_json, write_json_atomically, FileLock},
+    utill::now_unix_secs,
+};
 
 use super::{
     deniability::{proof_from_swapcoins, DeniabilityProof},
@@ -741,51 +743,6 @@ fn wallet_report_path(data_dir: &Path, role: SwapRole, wallet_file_name: Option<
         .join(wallet_report_file_name(data_dir, role, wallet_file_name))
 }
 
-struct LockGuard {
-    path: PathBuf,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn acquire_lock(lock_path: &Path) -> std::io::Result<LockGuard> {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    let mut deadline = std::time::Instant::now() + TIMEOUT;
-    loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)
-        {
-            Ok(_) => {
-                return Ok(LockGuard {
-                    path: lock_path.to_owned(),
-                })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if std::time::Instant::now() > deadline {
-                    let is_stale = std::fs::metadata(lock_path)
-                        .and_then(|m| m.modified())
-                        .map(|mtime| mtime.elapsed().unwrap_or_default() > TIMEOUT)
-                        .unwrap_or(true);
-
-                    if is_stale {
-                        std::fs::remove_file(lock_path)?;
-                    } else {
-                        // Owner is still active — extend and keep waiting.
-                        deadline = std::time::Instant::now() + TIMEOUT;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 fn write_to_path<F>(file_path: &Path, mutate: F) -> std::io::Result<()>
 where
     F: FnOnce(&mut SwapReportFile),
@@ -797,26 +754,13 @@ where
 
     let lock_path = file_path.with_extension("json.lock");
 
-    let _lock = acquire_lock(&lock_path)?;
+    let _lock = FileLock::acquire(&lock_path)?;
 
-    let mut report_file: SwapReportFile = if file_path.exists() {
-        let content = std::fs::read_to_string(file_path)?;
-        serde_json::from_str(&content).map_err(std::io::Error::other)?
-    } else {
-        SwapReportFile::default()
-    };
+    let mut report_file: SwapReportFile = read_json(file_path)?;
 
     mutate(&mut report_file);
 
-    let json = serde_json::to_string_pretty(&report_file).map_err(std::io::Error::other)?;
-    let tmp_path = file_path.with_extension("partial");
-    {
-        use std::io::Write;
-        let mut tmp = std::fs::File::create(&tmp_path)?;
-        tmp.write_all(json.as_bytes())?;
-        tmp.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, file_path)?;
+    write_json_atomically(file_path, &report_file)?;
 
     log::info!("Saved swap report to: {}", file_path.display());
     Ok(())

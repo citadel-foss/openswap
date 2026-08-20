@@ -3207,6 +3207,43 @@ impl Wallet {
             abort_check,
         )
     }
+
+    /// Resolve the previous-output scripts for every input in a transaction.
+    ///
+    /// Parent transactions are cached for the duration of this call so inputs
+    /// spending multiple outputs from one parent require only one backend
+    /// lookup.
+    pub fn resolve_input_scripts(
+        &self,
+        tx: &Transaction,
+    ) -> Result<Vec<(OutPoint, ScriptBuf)>, WalletError> {
+        let mut parent_transactions = HashMap::new();
+        let mut resolved = Vec::with_capacity(tx.input.len());
+
+        for input in &tx.input {
+            let outpoint = input.previous_output;
+            let parent = if let Some(parent) = parent_transactions.get(&outpoint.txid) {
+                parent
+            } else {
+                let parent = self.blockchain.get_raw_transaction(&outpoint.txid, None)?;
+                parent_transactions.insert(outpoint.txid, parent);
+                parent_transactions
+                    .get(&outpoint.txid)
+                    .expect("inserted parent transaction")
+            };
+
+            let output = parent.output.get(outpoint.vout as usize).ok_or_else(|| {
+                WalletError::General(format!(
+                    "Input {outpoint} references missing output {}",
+                    outpoint.vout
+                ))
+            })?;
+
+            resolved.push((outpoint, output.script_pubkey.clone()));
+        }
+
+        Ok(resolved)
+    }
 }
 
 /// Wait for the given txs to reach `required_confirms`, returning the highest block

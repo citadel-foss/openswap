@@ -16,6 +16,7 @@ use super::messages::{AuthenticatedRpcRequest, RpcMsgReq};
 #[cfg(not(feature = "integration-test"))]
 use crate::utill::TorError;
 use crate::{
+    blocklist::AddressBlocklist,
     lock_debug,
     maker::{
         api::{MakerServerConfig, ShutdownSignal},
@@ -210,6 +211,22 @@ fn handle_request<M: MakerRpc>(
             match lock_debug!(maker.wallet().read())?.verify_deniability(&swap_id) {
                 Ok(valid) => RpcMsgResp::VerifyDeniabilityResp(valid),
                 Err(e) => RpcMsgResp::ServerError(e.to_string()),
+            }
+        }
+        RpcMsgReq::BlocklistAdd { entries } => {
+            match AddressBlocklist::load(maker.data_dir(), maker.config().network)
+                .and_then(|mut blocklist| blocklist.add(entries))
+            {
+                Ok(outcome) => RpcMsgResp::BlocklistAddResp(outcome),
+                Err(error) => RpcMsgResp::ServerError(error.to_string()),
+            }
+        }
+        RpcMsgReq::BlocklistRemove { addresses } => {
+            match AddressBlocklist::load(maker.data_dir(), maker.config().network)
+                .and_then(|mut blocklist| blocklist.remove(addresses))
+            {
+                Ok(removed) => RpcMsgResp::BlocklistRemoveResp(removed),
+                Err(error) => RpcMsgResp::ServerError(error.to_string()),
             }
         }
     };

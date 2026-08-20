@@ -681,6 +681,36 @@ impl TestFramework {
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
+        Self::init_with_blocklist_setting::<B>(
+            makers_config_map,
+            taker_behavior,
+            maker_behaviors,
+            false,
+        )
+    }
+
+    /// Initialize the test framework with runtime blocklist screening enabled.
+    #[allow(clippy::type_complexity)]
+    pub fn init_with_blocklist<B: TestBackend>(
+        makers_config_map: Vec<(u16, Option<u16>)>,
+        taker_behavior: Vec<TakerBehavior>,
+        maker_behaviors: Vec<MakerBehavior>,
+    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
+        Self::init_with_blocklist_setting::<B>(
+            makers_config_map,
+            taker_behavior,
+            maker_behaviors,
+            true,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn init_with_blocklist_setting<B: TestBackend>(
+        makers_config_map: Vec<(u16, Option<u16>)>,
+        taker_behavior: Vec<TakerBehavior>,
+        maker_behaviors: Vec<MakerBehavior>,
+        check_blocklist: bool,
+    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
         // Setup directory — use a unique suffix so tests can run in parallel
         let unique_id = format!("openswap-{}", rand::random::<u64>());
         let temp_dir = env::temp_dir().join(unique_id);
@@ -733,6 +763,7 @@ impl TestFramework {
                     // Wallet files are always encrypted; tests use a fixed
                     // passphrase (PBKDF2 rounds are 1 under `integration-test`).
                     config.password = Some("integration-test".to_string());
+                    config.check_blocklist = Some(check_blocklist);
                     let mut taker = Taker::init(config).unwrap();
                     taker.behavior = behavior;
                     taker
@@ -763,6 +794,7 @@ impl TestFramework {
                         time_relative_fee_pct: 0.0001,
                         min_swap_amount: 10_000,
                         required_confirms: 1,
+                        check_blocklist,
                         supported_protocols: vec![
                             ProtocolVersion::Legacy,
                             ProtocolVersion::Taproot,

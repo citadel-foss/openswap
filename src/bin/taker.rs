@@ -140,6 +140,19 @@ enum Commands {
         #[clap(long, short = 'm')]
         address: String,
     },
+    /// Add or update an address in the funding-source blocklist.
+    BlocklistAdd {
+        /// Bitcoin address to block.
+        address: String,
+        /// Optional note explaining why the address is blocked.
+        #[clap(long, short = 'l')]
+        label: Option<String>,
+    },
+    /// Remove an address from the funding-source blocklist.
+    BlocklistRemove {
+        /// Bitcoin address to remove.
+        address: String,
+    },
     /// Initiate the openswap process
     OpenSwap {
         /// Sets the Maker count to swap with. Swapping with less than 2 makers is not allowed to maintain client privacy.
@@ -375,6 +388,7 @@ fn main() -> Result<(), TakerError> {
     let config = TakerInitConfig {
         data_dir: Some(data_dir),
         socks_port: file_config.socks_port,
+        check_blocklist: Some(file_config.check_blocklist),
         control_port: Some(file_config.control_port),
         tor_auth_password: args.tor_auth.clone().or_else(|| {
             (!file_config.tor_auth_password.is_empty()).then_some(file_config.tor_auth_password)
@@ -539,6 +553,14 @@ fn main() -> Result<(), TakerError> {
             } else {
                 println!("No maker with address {address} in offerbook");
             }
+        }
+        Commands::BlocklistAdd { address, label } => {
+            let outcome = taker.add_blocklist_entry(address.clone(), label.clone())?;
+            println!("Added: {}, updated: {}", outcome.added, outcome.updated);
+        }
+        Commands::BlocklistRemove { address } => {
+            let removed = taker.remove_blocklist_entry(address.clone())?;
+            println!("Removed: {removed}");
         }
         Commands::OpenSwap {
             makers,

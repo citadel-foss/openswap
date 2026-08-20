@@ -29,6 +29,7 @@ use bitcoin::{
 use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 
 use crate::{
+    blocklist::{AddOutcome, AddressBlocklist, BlocklistEntry},
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
     protocol::{
@@ -163,6 +164,8 @@ pub struct TakerInitConfig {
     pub tor_auth_password: Option<String>,
     /// SOCKS port for Tor.
     pub socks_port: u16,
+    /// Whether funding inputs should be checked against the address blocklist (optional).
+    pub check_blocklist: Option<bool>,
     /// Wallet password (optional).
     pub password: Option<String>,
     /// Connection type (Tor or Clearnet).
@@ -180,6 +183,7 @@ impl Default for TakerInitConfig {
             control_port: None,
             tor_auth_password: None,
             socks_port: 9050,
+            check_blocklist: None,
             password: None,
             connection_type: ConnectionType::Tor,
             nostr_relays: NOSTR_RELAYS.iter().map(|s| s.to_string()).collect(),
@@ -590,6 +594,10 @@ impl Taker {
         // key material, so the cleartext passphrase must not linger in the
         // long-lived server config.
         let wallet = Wallet::load_or_init(&wallet_path, blockchain, config.password.take())?;
+        // Validate the blocklist on startup when screening is enabled.
+        if config.check_blocklist.unwrap_or(false) {
+            AddressBlocklist::load(&data_dir, wallet.store.network)?;
+        }
 
         // Init Watch Service
         let (watch_service, registry, initial_sync_complete) =
@@ -787,6 +795,10 @@ impl Taker {
 
         if let Some(ref tor_auth_password) = config.tor_auth_password {
             taker_config.tor_auth_password = tor_auth_password.clone();
+        }
+
+        if let Some(check_blocklist) = config.check_blocklist {
+            taker_config.check_blocklist = check_blocklist;
         }
 
         #[cfg(not(feature = "integration-test"))]
@@ -2945,6 +2957,44 @@ impl Taker {
         let parsed = MakerAddress::try_from(address)
             .map_err(|e| TakerError::General(format!("Invalid maker address: {e}")))?;
         self.offerbook.remove(&parsed)
+    }
+
+    /// Add a funding-source address to the shared blocklist, or update its label.
+    pub fn add_blocklist_entry(
+        &self,
+        address: String,
+        label: Option<String>,
+    ) -> Result<AddOutcome, TakerError> {
+        let data_dir = self
+            .config
+            .data_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(get_taker_dir)?;
+        let network = self.read_wallet()?.store.network;
+        let mut blocklist =
+            AddressBlocklist::load(&data_dir, network).map_err(TakerError::Blocklist)?;
+
+        blocklist
+            .add(vec![BlocklistEntry::new(address, label)])
+            .map_err(TakerError::Blocklist)
+    }
+
+    /// Remove a funding-source address from the shared blocklist.
+    pub fn remove_blocklist_entry(&self, address: String) -> Result<usize, TakerError> {
+        let data_dir = self
+            .config
+            .data_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(get_taker_dir)?;
+        let network = self.read_wallet()?.store.network;
+        let mut blocklist =
+            AddressBlocklist::load(&data_dir, network).map_err(TakerError::Blocklist)?;
+
+        blocklist
+            .remove(vec![address])
+            .map_err(TakerError::Blocklist)
     }
 
     /// Restore a wallet from a backup file (static — no taker instance needed).
