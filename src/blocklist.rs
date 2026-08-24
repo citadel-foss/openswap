@@ -18,6 +18,11 @@ use std::{
 
 const BLOCKLIST_FILE: &str = "blocklist.json";
 
+/// Maximum number of funding inputs screened per transaction.
+/// Each input's previous output is fetched from the node, so an unbounded
+/// count on a counterparty-supplied transaction can take arbitrarily long.
+const MAX_FUNDING_INPUTS: usize = 25;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// A Bitcoin address to reject as a funding source.
 pub struct BlocklistEntry {
@@ -137,8 +142,24 @@ pub fn screen_funding_tx(
     let blocklist = AddressBlocklist::load(data_dir, network)?;
 
     if blocklist.is_empty() {
-        log::info!("No blocklist entries usable on {network}, skipping funding screen");
+        if blocklist.path().exists() {
+            log::warn!(
+                "Blocklist {} holds no entries usable on {network}, skipping funding screen",
+                blocklist.path().display()
+            );
+        } else {
+            log::debug!("No blocklist file, skipping funding screen");
+        }
         return Ok(());
+    }
+
+    if tx.input.len() > MAX_FUNDING_INPUTS {
+        return Err(BlocklistError::InputResolution(WalletError::General(
+            format!(
+                "funding transaction has {} inputs, limit is {MAX_FUNDING_INPUTS}",
+                tx.input.len()
+            ),
+        )));
     }
 
     for (outpoint, script) in wallet.resolve_input_scripts(tx)? {

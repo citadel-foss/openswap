@@ -644,6 +644,9 @@ pub struct TestFramework {
     /// Kept so [`TestFramework::taker_init_config`] can rebuild the same backend
     /// config the takers were started with.
     zmq_addr: String,
+    /// Kept for the same reason as `zmq_addr`: a taker rebuilt by
+    /// [`TestFramework::taker_init_config`] must screen as the original did.
+    check_blocklist: bool,
     shutdown: AtomicBool,
     block_gen_paused: AtomicBool,
     nostr_relay: Mutex<Option<Child>>,
@@ -825,6 +828,7 @@ impl TestFramework {
             temp_dir: temp_dir.clone(),
             nostr_relay_url: nostr_relay_url.clone(),
             zmq_addr,
+            check_blocklist,
             shutdown: AtomicBool::new(false),
             block_gen_paused: AtomicBool::new(false),
             nostr_relay: Mutex::new(Some(nostr_relay)),
@@ -889,6 +893,7 @@ impl TestFramework {
         // Must match the passphrase set in `TestFramework::init`, or the
         // re-init cannot decrypt the wallet.
         config.password = Some("integration-test".to_string());
+        config.check_blocklist = Some(self.check_blocklist);
         config
     }
 

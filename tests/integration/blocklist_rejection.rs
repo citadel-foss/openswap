@@ -34,7 +34,16 @@ fn taker_rejects_taproot_funding_from_blocked_address() {
 }
 
 #[test]
-fn populated_blocklist_is_ignored_when_disabled() {
+fn legacy_populated_blocklist_is_ignored_when_disabled() {
+    run_disabled_blocklist(ProtocolVersion::Legacy);
+}
+
+#[test]
+fn taproot_populated_blocklist_is_ignored_when_disabled() {
+    run_disabled_blocklist(ProtocolVersion::Taproot);
+}
+
+fn run_disabled_blocklist(protocol: ProtocolVersion) {
     let makers_config_map = vec![(6102, None)];
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal];
@@ -125,7 +134,7 @@ fn populated_blocklist_is_ignored_when_disabled() {
         )
         .unwrap();
 
-    let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
+    let params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
         .with_tx_count(1)
         .with_required_confirms(1);
     let summary = taker
@@ -368,6 +377,42 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
         }
         Err(other) => panic!("expected blocked-address error, got {:?}", other),
         Ok(_) => panic!("the taker accepted funding from the maker's blocked source address"),
+    }
+
+    // The maker broadcast its funding before the taker rejected it, so those
+    // coins stay locked in a contract until the timelock matures and the maker
+    // sweeps them back. Rejecting must not strand maker funds.
+    thread::sleep(timelock_recovery_wait::<BitcoindBackend>());
+
+    for (i, maker) in makers.iter().enumerate() {
+        maker
+            .wallet
+            .write()
+            .unwrap()
+            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+            .unwrap();
+        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
+        println!(
+            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+            i,
+            maker_balances.regular,
+            maker_balances.swap,
+            maker_balances.contract,
+            maker_balances.spendable,
+        );
+        assert_eq!(
+            maker_balances.contract.to_sat(),
+            0,
+            "Maker {} contract balance mismatch",
+            i
+        );
+        assert_eq!(
+            maker_balances.swap.to_sat(),
+            0,
+            "Maker {} swap balance mismatch",
+            i
+        );
+        assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
     }
 
     drop(takers);

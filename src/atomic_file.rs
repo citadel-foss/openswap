@@ -2,63 +2,47 @@
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions, TryLockError},
     io,
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
+    path::Path,
 };
 
-const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
+/// An exclusive lock on a file, held while this value is alive.
+///
+/// The lock belongs to the operating system, so it is released when this value
+/// is dropped and also if the process dies while holding it.
 pub(crate) struct FileLock {
-    path: PathBuf,
+    /// Holding the handle is the lock; closing it releases.
+    _file: File,
 }
 
 impl FileLock {
+    /// Block until the lock at `lock_path` is held.
+    ///
+    /// The sentinel file is created if absent and never removed: deleting it
+    /// would let another process lock a fresh inode under the same path while
+    /// this one still holds the old one.
     pub(crate) fn acquire(lock_path: &Path) -> io::Result<Self> {
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut deadline = Instant::now() + LOCK_TIMEOUT;
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
 
-        loop {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(lock_path)
-            {
-                Ok(_) => {
-                    return Ok(Self {
-                        path: lock_path.to_owned(),
-                    })
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if Instant::now() > deadline {
-                        let is_stale = std::fs::metadata(lock_path)
-                            .and_then(|metadata| metadata.modified())
-                            .map(|modified| modified.elapsed().unwrap_or_default() > LOCK_TIMEOUT)
-                            .unwrap_or(true);
-
-                        if is_stale {
-                            std::fs::remove_file(lock_path)?;
-                        } else {
-                            deadline = Instant::now() + LOCK_TIMEOUT;
-                        }
-                    }
-
-                    std::thread::sleep(LOCK_POLL_INTERVAL);
-                }
-                Err(error) => return Err(error),
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                log::info!("Waiting for lock on {}", lock_path.display());
+                file.lock()?;
             }
+            Err(TryLockError::Error(error)) => return Err(error),
         }
-    }
-}
 
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        Ok(Self { _file: file })
     }
 }
 

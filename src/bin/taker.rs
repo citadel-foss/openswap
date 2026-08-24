@@ -414,10 +414,16 @@ fn main() -> Result<(), TakerError> {
         })?;
     }
 
-    // Sync wallet after initialization
-    lock_debug!(taker.get_wallet().write())
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)?;
+    // Sync wallet after initialization. Blocklist edits only touch the local
+    // JSON file, so they skip the chain sync.
+    if !matches!(
+        args.command,
+        Commands::BlocklistAdd { .. } | Commands::BlocklistRemove { .. }
+    ) {
+        lock_debug!(taker.get_wallet().write())
+            .unwrap()
+            .sync_and_save(&openswap::utill::NO_SHUTDOWN)?;
+    }
 
     match &args.command {
         Commands::ListUtxo => {
