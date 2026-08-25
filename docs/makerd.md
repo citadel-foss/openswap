@@ -128,7 +128,7 @@ This will display information about the `makerd` binary and its options.
 ```bash
 OpenSwap Maker Server
 
-The server requires a Bitcoin Core RPC connection running in Testnet4. It requires some starting balance, around 50,000 sats for Fidelity + Swap Liquidity (suggested 50,000 sats). So topup with at least 0.001 BTC to start all the node processses. Suggested [faucet here]<https://mempool.space/testnet4/faucet>
+The server requires a Bitcoin Core RPC connection running on the custom signet. It requires some starting balance, around 50,000 sats for Fidelity + Swap Liquidity (suggested 50,000 sats). So topup with at least 0.001 BTC to start all the node processes. Suggested faucet (tor browser required): <http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/>
 
 All server processes will start after the fidelity bond transaction is confirmed. This may take some time. Approx: 10 mins. Once the bond is confirmed, the server starts listening for incoming swap requests. As it performs swaps for clients, it keeps earning fees.
 
@@ -203,7 +203,7 @@ This will give you detailed information about the options and arguments availabl
   - Pass your custom values using the `-r` and `-a` options, like this:
 
 ```bash
-  $ ./makerd -r 127.0.0.1:38332 -a myuser:mypass
+  $ ./makerd -r 127.0.0.1:38332 -a myuser:mypass -p my-wallet-passphrase
 ```
 
 ## For this tutorial, we'll assume a custom configuration with port 38332. Output examples will reflect this setup.
@@ -213,10 +213,10 @@ This will give you detailed information about the options and arguments availabl
 To start `makerd`, run the following command:
 
 ```bash
-$ ./makerd -a user:password -r 127.0.0.1:38332
+$ ./makerd -a user:password -r 127.0.0.1:38332 -p my-wallet-passphrase
 ```
 
-This will launch `makerd` and connect it to the Bitcoin RPC core running on its RPC port, using the default data directory for `maker` located at `$HOME/.openswap/maker`.
+This will launch `makerd` and connect it to the Bitcoin RPC core running on its RPC port, using the default data directory for `maker` located at `$HOME/.openswap/maker`. The `-p` passphrase is required every time: it opens (or creates) the encrypted wallet file.
 
 **What happens next:**
 

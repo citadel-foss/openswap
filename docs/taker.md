@@ -44,7 +44,7 @@ This will display a detailed guide about the app and its capabilities.
 ```bash
 A simple command line app to operate as openswap client.
 
-The app works as a regular Bitcoin wallet with the added capability to perform openswaps. It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an Electrum-protocol server (via `--electrum`). Both paths support the full swap flow and the `restore` subcommand. It currently only runs on Testnet4. Suggested faucet for getting Signet coins (tor browser required): <http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/>
+The app works as a regular Bitcoin wallet with the added capability to perform openswaps. It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an Electrum-protocol server (via `--electrum`). Both paths support the full swap flow and the `restore` subcommand. It currently only runs on the custom signet. Suggested faucet for getting signet coins (tor browser required): <http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/>
 
 For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 
@@ -138,8 +138,10 @@ Options:
   - Pass your custom values using the `-r` and `-a` options, like this:
 
 ```bash
-  $ ./taker -r 127.0.0.1:38332 -a myuser:mypass <SUBCOMMAND>
+  $ ./taker -r 127.0.0.1:38332 -a myuser:mypass -p my-wallet-passphrase <SUBCOMMAND>
 ```
+
+> **Note:** Every `taker` command opens the encrypted wallet, so `-p` is required on each invocation. The tutorial's bare `taker <SUBCOMMAND>` examples assume it is supplied.
 
 ## For this tutorial, we'll assume a custom configuration with port 38332. Output examples will reflect this setup.
 

@@ -33,7 +33,7 @@ use crate::{
         error::ProtocolError,
     },
     utill::{read_message, send_message},
-    wallet::{verify_fidelity_checks, AnyBlockchain, Blockchain, WalletError},
+    wallet::{verify_fidelity_checks, AnyBlockchain, Blockchain, FidelityBond, WalletError},
     watch_tower::registry_storage::FileRegistry,
 };
 
@@ -1251,7 +1251,13 @@ impl MakerAddress {
             min_size: router_offer.min_size,
             tweakable_point: router_offer.tweakable_point,
             fidelity: FidelityProof {
-                bond: router_offer.fidelity.bond,
+                // A peer's proof never needs the raw bond transaction:
+                // verification fetches it from the backend. Drop it so a
+                // peer cannot stuff payload into memory and the offerbook.
+                bond: FidelityBond {
+                    tx: None,
+                    ..router_offer.fidelity.bond
+                },
                 cert_hash: router_offer.fidelity.cert_hash,
                 cert_sig: router_offer.fidelity.cert_sig,
             },

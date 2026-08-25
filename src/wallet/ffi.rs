@@ -4,7 +4,7 @@
 //! for exposing swap functionality and reporting to other languages.
 
 use crate::{
-    security::{load_sensitive_struct, KeyMaterial, SecurityError, SerdeJson},
+    security::{load_sensitive_struct, KeyMaterial, SerdeJson},
     utill::{get_taker_dir, parse_checked_address, MIN_FEE_RATE},
     wallet::{infer_address_type, AddressType, Destination, Wallet, WalletBackup, WalletError},
 };
@@ -21,8 +21,8 @@ pub use super::report::{
 /// Restores a wallet from a JSON backup file for GUI/FFI applications.
 ///
 /// This is a non-interactive restore method designed for programmatic use via FFI bindings.
-/// Unlike `restore_wallet`, this function accepts a path to a JSON backup file and handles both
-/// encrypted and legacy plaintext backups using [`load_sensitive_struct`].
+/// Unlike `restore_wallet`, this function accepts a path to a JSON backup file.
+/// Only encrypted backups are accepted; decryption uses [`load_sensitive_struct`].
 ///
 /// # Behavior
 ///
@@ -35,10 +35,10 @@ pub use super::report::{
 ///
 /// - `data_dir`: Target directory, defaults to `~/.openswap/taker`
 /// - `wallet_file_name`: Restored wallet filename, defaults to name from backup if empty
-/// - `backup_file_path`: Path to the JSON file containing the wallet backup (encrypted,
-///   or a legacy plaintext backup, which is migrated)
-/// - `password`: Required. Decrypts an encrypted backup; for a legacy plaintext
-///   backup it becomes the passphrase of the restored (always encrypted) wallet.
+/// - `backup_file_path`: Path to the JSON file containing the wallet backup.
+///   Only encrypted backups are accepted.
+/// - `password`: Required. Decrypts the encrypted backup and becomes the
+///   passphrase of the restored (always encrypted) wallet.
 pub fn restore_wallet_gui_app(
     data_dir: Option<PathBuf>,
     wallet_file_name: Option<String>,
@@ -61,21 +61,6 @@ pub fn restore_wallet_gui_app(
         Ok((backup, Some(material))) => (backup, material),
         Ok((_, None)) => {
             unreachable!("a supplied passphrase either decrypts or errors")
-        }
-        // A passphrase was supplied for a legacy plaintext backup: read it
-        // as plaintext and encrypt the restored wallet with that passphrase.
-        Err(SecurityError::Format(msg)) if msg.contains("expected encrypted file") => {
-            match load_sensitive_struct::<WalletBackup, SerdeJson>(&backup_file_path, None) {
-                Ok((backup, _)) => {
-                    let material = KeyMaterial::new_from_password(Some(password))
-                        .expect("a non-empty passphrase always yields key material");
-                    (backup, material)
-                }
-                Err(err) => {
-                    log::error!("Wallet backup load failed: {err}");
-                    return;
-                }
-            }
         }
         Err(err) => {
             log::error!("Wallet backup load failed: {err}");

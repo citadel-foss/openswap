@@ -500,10 +500,8 @@ impl Wallet {
     /// Load wallet data from file and connect to a blockchain backend.
     /// In case of core rpc, core wallet name, and wallet_id field in the file should match.
     ///
-    /// Wallet files are always encrypted. A legacy unencrypted file is
-    /// migrated on load: it is resealed under the supplied passphrase and
-    /// rewritten encrypted. Loading a legacy file without a passphrase, or
-    /// creating/loading without one where encryption is impossible, fails.
+    /// Wallet files are always encrypted; an unencrypted file is rejected.
+    /// Opening one requires the passphrase it was written with.
     pub(crate) fn load(
         path: &Path,
         blockchain: AnyBlockchain,
@@ -511,49 +509,26 @@ impl Wallet {
     ) -> Result<Self, WalletError> {
         let password = password.filter(|p| !p.is_empty());
 
-        let migration_material = |store: WalletStore,
-                                  password: Option<String>|
-         -> Result<(WalletStore, KeyMaterial), WalletError> {
-            let password = password.ok_or_else(|| {
-                WalletError::General(format!(
-                    "wallet file {path:?} is unencrypted (legacy format); \
-                     provide the wallet passphrase to migrate it to encrypted storage"
-                ))
-            })?;
-            let material = KeyMaterial::new_from_password(Some(password))
-                .expect("a non-empty passphrase always yields key material");
-            Ok((store, material))
-        };
-
-        let (store, store_enc_material, migrated) =
-            match WalletStore::read_from_disk(path, password.clone()) {
-                Ok((store, Some(material))) => (store, material, false),
-                // Legacy plaintext file, no passphrase supplied.
-                Ok((store, None)) => {
-                    let (store, material) = migration_material(store, password.clone())?;
-                    (store, material, true)
-                }
-                // Encrypted file, no passphrase supplied. Report how to supply
-                // one instead of failing decryption with an empty passphrase.
-                Err(WalletError::Security(SecurityError::PasswordRequired)) => {
-                    return Err(WalletError::General(format!(
-                        "wallet file {path:?} is encrypted; \
+        let (store, store_enc_material) = match WalletStore::read_from_disk(path, password.clone())
+        {
+            Ok((store, Some(material))) => (store, material),
+            // Cleartext wallet files are not supported at all.
+            Ok((_, None)) => {
+                return Err(WalletError::General(format!(
+                    "wallet file {path:?} is unencrypted; \
+                         cleartext wallet files are not supported"
+                )))
+            }
+            // Encrypted file, no passphrase supplied. Report how to supply
+            // one instead of failing decryption with an empty passphrase.
+            Err(WalletError::Security(SecurityError::PasswordRequired)) => {
+                return Err(WalletError::General(format!(
+                    "wallet file {path:?} is encrypted; \
                          provide the wallet passphrase via -p/--password"
-                    )))
-                }
-                // Passphrase supplied for a legacy plaintext file: read it as
-                // plaintext, then migrate.
-                Err(WalletError::Security(SecurityError::Format(msg)))
-                    if password.is_some() && msg.contains("expected encrypted file") =>
-                {
-                    let (store, None) = WalletStore::read_from_disk(path, None)? else {
-                        unreachable!("a plaintext wallet file yields no encryption material")
-                    };
-                    let (store, material) = migration_material(store, password.clone())?;
-                    (store, material, true)
-                }
-                Err(e) => return Err(e),
-            };
+                )))
+            }
+            Err(e) => return Err(e),
+        };
         // Wipe the cleartext passphrase; only the derived key material is kept.
         if let Some(mut p) = password {
             p.zeroize();
@@ -596,12 +571,6 @@ impl Wallet {
             restore_scan: false,
         };
         wallet.seal_master_key()?;
-        if migrated {
-            // Persist the migration immediately: resealed master key and an
-            // encrypted file. Never leave the legacy plaintext file around.
-            wallet.save_to_disk()?;
-            log::info!("Migrated legacy plaintext wallet {path:?} to encrypted storage");
-        }
         Ok(wallet)
     }
 
@@ -3291,7 +3260,7 @@ pub(crate) fn wait_for_tx_confirmation(
                 "Tx(s) did not confirm within {}s",
                 TX_CONFIRMATION_TIMEOUT.as_secs()
             );
-            return Err(WalletError::General(
+            return Err(WalletError::TxConfirmationTimeout(
                 "Tx did not confirm before the confirmation deadline".to_string(),
             ));
         }
@@ -3343,7 +3312,7 @@ pub(crate) fn wait_for_tx_confirmation(
                             .elapsed()
                             > arrival_timeout
                     {
-                        return Err(WalletError::General(
+                        return Err(WalletError::TxConfirmationTimeout(
                             "Tx vanished from our mempool and did not reappear".to_string(),
                         ));
                     }
@@ -3358,7 +3327,7 @@ pub(crate) fn wait_for_tx_confirmation(
                 unseen.len(),
                 arrival_timeout.as_secs()
             );
-            return Err(WalletError::General(
+            return Err(WalletError::TxConfirmationTimeout(
                 "Tx did not reach our mempool before the broadcast timeout".to_string(),
             ));
         }

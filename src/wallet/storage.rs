@@ -286,7 +286,8 @@ impl WalletStore {
 
     /// Reads from a path (errors if path doesn't exist).
     /// If `password` is provided, attempts to decrypt the file using the
-    /// provided key. Returns the deserialized `WalletStore` and the nonce.
+    /// provided key. Returns the deserialized `WalletStore` and the derived
+    /// encryption material (`None` for a plaintext file).
     /// An encrypted file read without a password yields
     /// [`crate::security::SecurityError::PasswordRequired`].
     pub(crate) fn read_from_disk(

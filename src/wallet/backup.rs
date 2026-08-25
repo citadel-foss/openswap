@@ -202,6 +202,7 @@ impl Wallet {
     ///
     /// # Behavior
     ///
+    /// - **Only encrypted backups are accepted**; a cleartext backup is an error.
     /// - **Prompts for decryption passphrase** if the backup file is encrypted.
     /// - Loads and decrypts the backup content.
     /// - **Prompts for a new encryption passphrase** for the restored wallet.
@@ -212,65 +213,50 @@ impl Wallet {
         backup_file_path: &PathBuf,
         backend: &BackendConfig,
         restored_path: &Path,
-    ) {
+    ) -> Result<(), WalletError> {
         log::info!(
             "Initiating wallet restore, from backup: {backup_file_path:?} to wallet {:?}",
             restored_path.file_name()
         );
 
-        let (backup, _) =
-            match load_sensitive_struct::<WalletBackup, SerdeJson>(backup_file_path, None) {
-                Ok(backup) => backup,
-                Err(SecurityError::PasswordRequired) => {
-                    let password =
-                        match prompt_password("Enter encryption passphrase: ".to_string()) {
-                            Ok(password) => password,
-                            Err(err) => {
-                                log::error!("Failed to read passphrase: {err}");
-                                return;
-                            }
-                        };
-                    match load_sensitive_struct::<WalletBackup, SerdeJson>(
-                        backup_file_path,
-                        Some(password),
-                    ) {
-                        Ok(backup) => backup,
-                        Err(err) => {
-                            log::error!("Wallet backup load failed: {err}");
-                            return;
-                        }
-                    }
-                }
-                Err(err) => {
-                    log::error!("Wallet backup load failed: {err}");
-                    return;
-                }
-            };
-        let restore_enc_material = match KeyMaterial::new_interactive(Some(
-            "Enter restored wallet encryption passphrase: ".to_string(),
-        )) {
-            Ok(Some(material)) => material,
-            Ok(None) => {
-                log::error!(
-                    "Wallet restore failed: a passphrase is required; \
-                     cleartext wallet files are not supported"
-                );
-                return;
+        let backup = match load_sensitive_struct::<WalletBackup, SerdeJson>(backup_file_path, None)
+        {
+            // Cleartext (legacy) backups are not supported.
+            Ok((_, None)) => {
+                return Err(WalletError::General(format!(
+                    "wallet backup {backup_file_path:?} is unencrypted; \
+                     cleartext backups are not supported"
+                )))
+            }
+            Ok((backup, Some(_))) => backup,
+            Err(SecurityError::PasswordRequired) => {
+                let password = prompt_password("Enter encryption passphrase: ".to_string())
+                    .map_err(|e| WalletError::General(format!("failed to read passphrase: {e}")))?;
+                load_sensitive_struct::<WalletBackup, SerdeJson>(backup_file_path, Some(password))
+                    .map_err(|e| WalletError::General(format!("wallet backup load failed: {e}")))?
+                    .0
             }
             Err(err) => {
-                log::error!("Encryption passphrase prompt failed: {err}");
-                return;
+                return Err(WalletError::General(format!(
+                    "wallet backup load failed: {err}"
+                )))
             }
         };
+        let restore_enc_material = KeyMaterial::new_interactive(Some(
+            "Enter restored wallet encryption passphrase: ".to_string(),
+        ))
+        .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?
+        .ok_or_else(|| {
+            WalletError::General(
+                "wallet restore failed: a passphrase is required; \
+                 cleartext wallet files are not supported"
+                    .to_string(),
+            )
+        })?;
 
-        // Attempt to restore the wallet.
-        // Since this is an interactive, one-shot restore, the program will exit after this,
-        // so these messages are the last feedback the user will see.
-        if let Err(e) = Wallet::restore(&backup, restored_path, backend, restore_enc_material) {
-            log::error!("Wallet restore failed: {e:?}");
-        } else {
-            println!("Wallet restore succeeded!");
-        }
+        Wallet::restore(&backup, restored_path, backend, restore_enc_material)?;
+        println!("Wallet restore succeeded!");
+        Ok(())
     }
     /// Interactively creates a wallet backup.
     ///
@@ -283,7 +269,7 @@ impl Wallet {
     ///
     /// - Names the backup file as `{wallet_name}-backup.json`.
     /// - Writes the backup to the current working directory.
-    pub fn backup_interactive(wallet: &Self) {
+    pub fn backup_interactive(wallet: &Self) -> Result<(), WalletError> {
         log::info!("Initiating wallet backup!");
         let backup_name = format!("{}-backup", wallet.get_name());
         log::info!(
@@ -292,37 +278,22 @@ impl Wallet {
             backup_name
         );
 
-        let working_directory: PathBuf = match env::current_dir() {
-            Ok(dir) => dir,
-            Err(err) => {
-                log::error!("Failed to get current directory: {err}");
-                return;
-            }
-        };
+        let working_directory: PathBuf = env::current_dir()
+            .map_err(|e| WalletError::General(format!("failed to get current directory: {e}")))?;
 
-        let backup_enc_material = match KeyMaterial::new_interactive(None) {
-            Ok(Some(material)) => material,
-            Ok(None) => {
-                log::error!(
-                    "Wallet backup failed: a passphrase is required; \
+        let backup_enc_material = KeyMaterial::new_interactive(None)
+            .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?
+            .ok_or_else(|| {
+                WalletError::General(
+                    "wallet backup failed: a passphrase is required; \
                      cleartext backups are not supported"
-                );
-                return;
-            }
-            Err(err) => {
-                log::error!("Encryption passphrase prompt failed: {err}");
-                return;
-            }
-        };
+                        .to_string(),
+                )
+            })?;
 
         let backup_path = working_directory.join(backup_name);
-        // Attempt to back up the wallet.
-        // Since this is a one-shot operation, the program will exit after this,
-        // so these messages are the last feedback the user will see.
-        if let Err(e) = wallet.backup(&backup_path, backup_enc_material) {
-            log::error!("Wallet backup failed: {e:?}");
-        } else {
-            log::info!("Wallet backup succeeded: {backup_path:?}");
-        }
+        wallet.backup(&backup_path, backup_enc_material)?;
+        log::info!("Wallet backup succeeded: {backup_path:?}");
+        Ok(())
     }
 }

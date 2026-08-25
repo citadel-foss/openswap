@@ -72,6 +72,12 @@ pub enum WalletError {
     /// Use this variant for errors that do not fall under any specific category.
     General(String),
 
+    /// A transaction failed to confirm within its deadline (never reached the
+    /// mempool, vanished from it, or outlasted the confirmation timeout).
+    /// Distinct from backend failures so callers can decide whether giving up
+    /// on the wait is recoverable for them.
+    TxConfirmationTimeout(String),
+
     /// Waiting was interrupted by an external signal (shutdown/abort).
     Interrupted(&'static str),
 
@@ -255,6 +261,7 @@ impl std::fmt::Display for WalletError {
             WalletError::BIP32(e) => write!(f, "BIP32 error: {}", e),
             WalletError::BIP39(e) => write!(f, "BIP39 error: {}", e),
             WalletError::General(msg) => write!(f, "{}", msg),
+            WalletError::TxConfirmationTimeout(msg) => write!(f, "{}", msg),
             WalletError::Interrupted(reason) => write!(f, "Interrupted: {}", reason),
             WalletError::Protocol(e) => write!(f, "Protocol error: {}", e),
             WalletError::Fidelity(e) => write!(f, "Fidelity error: {}", e),

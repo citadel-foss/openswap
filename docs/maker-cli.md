@@ -207,7 +207,7 @@ $ ./maker-cli list-utxo-fidelity
 ]
 ```
 
-This lists fidelity bond UTXOs. Since only one live fidelity bond is allowed at a time, this shows a single UTXO of `10,000 sats`. Note that the `txid` and `vout` match the `outpoint` from the `show-fidelity` command, confirming this is the same fidelity bond UTXO.
+This lists fidelity bond UTXOs. Since only one live fidelity bond is allowed at a time, this shows a single UTXO of `10,000 sats`. Use `show-fidelity` for the bond's outpoint (txid:vout); this listing shows address, amount, and type only.
 
 ---
 

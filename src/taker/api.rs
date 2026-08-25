@@ -2949,19 +2949,19 @@ impl Taker {
         wallet_file_name: Option<String>,
         backend: BackendConfig,
         backup_file: &String,
-    ) {
+    ) -> Result<(), TakerError> {
         let backup_file_path = PathBuf::from(backup_file);
         let restored_wallet_filename = wallet_file_name.unwrap_or_default();
 
-        let restored_wallet_path = match data_dir.map(Ok).unwrap_or_else(get_taker_dir) {
-            Ok(dir) => dir.join("wallets").join(restored_wallet_filename),
-            Err(e) => {
-                log::error!("Wallet restore failed: {e}");
-                return;
-            }
-        };
+        let restored_wallet_path = data_dir
+            .map(Ok)
+            .unwrap_or_else(get_taker_dir)
+            .map_err(|e| TakerError::General(format!("wallet restore failed: {e}")))?
+            .join("wallets")
+            .join(restored_wallet_filename);
 
-        Wallet::restore_interactive(&backup_file_path, &backend, &restored_wallet_path);
+        Wallet::restore_interactive(&backup_file_path, &backend, &restored_wallet_path)?;
+        Ok(())
     }
 }
 

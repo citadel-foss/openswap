@@ -724,15 +724,30 @@ impl MakerServer {
                 .blockchain
                 .new_connection()
                 .map_err(MakerError::Wallet)?;
-            let conf_height = crate::wallet::wait_for_tx_confirmation(
+            let conf_height = match crate::wallet::wait_for_tx_confirmation(
                 &chain,
                 &[txid],
                 1,
                 crate::utill::TX_BROADCAST_TIMEOUT,
                 Some(&self.shutdown),
                 None,
-            )
-            .map_err(MakerError::Wallet)?;
+            ) {
+                Ok(height) => height,
+                // The bond tx may never confirm (e.g. evicted again at a low
+                // feerate). Losing it must not take the maker down: log it,
+                // skip it, and let the next restart retry.
+                Err(WalletError::TxConfirmationTimeout(msg)) => {
+                    log::error!(
+                        "[{}] Pending fidelity bond {} did not confirm ({}); \
+                         skipping it and continuing startup.",
+                        self.config.network_port,
+                        txid,
+                        msg
+                    );
+                    continue;
+                }
+                Err(e) => return Err(MakerError::Wallet(e)),
+            };
 
             lock_debug!(self.wallet.write())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -2014,12 +2029,33 @@ impl MakerRpc for MakerServer {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShutdownSignal, ThreadPool};
+    use super::{MakerServerConfig, ShutdownSignal, ThreadPool};
+    use crate::utill::MIN_RELAY_FEE_RATE;
     use std::{
         sync::{atomic::Ordering, mpsc, Arc, TryLockError},
         thread,
         time::{Duration, Instant},
     };
+
+    /// Non-finite or below-minimum fidelity feerates clamp to the relay
+    /// minimum; a valid value is kept. A plain `<` comparison would let
+    /// `nan` through into the bond fee math.
+    #[test]
+    fn maker_config_clamps_invalid_fidelity_feerate() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let resolve = |feerate: &str| {
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, format!("fidelity_feerate = {feerate}\n")).unwrap();
+            MakerServerConfig::new(Some(&path))
+                .unwrap()
+                .fidelity_feerate
+        };
+
+        assert_eq!(resolve("nan"), MIN_RELAY_FEE_RATE);
+        assert_eq!(resolve("inf"), MIN_RELAY_FEE_RATE);
+        assert_eq!(resolve("0.5"), MIN_RELAY_FEE_RATE);
+        assert_eq!(resolve("3.0"), 3.0);
+    }
 
     /// Keeps wallet inspection usable without clearing the terminal server latch.
     #[test]

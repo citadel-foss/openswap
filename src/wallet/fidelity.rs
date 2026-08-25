@@ -606,7 +606,7 @@ impl Wallet {
 
     /// Update the confirmation height of a fidelity bond after it confirms.
     /// Also drops the stored raw transaction, which is only kept as a
-    /// rebroadcast fallback until confirmation.
+    /// rebroadcast fallback until confirmation, and saves the wallet file.
     pub fn update_fidelity_bond_conf_details(
         &mut self,
         index: u32,
@@ -620,6 +620,10 @@ impl Wallet {
 
         bond.conf_height = Some(conf_height);
         bond.tx = None;
+
+        // Persist immediately: without this a stop before the next save
+        // replays the rebroadcast-and-wait cycle on the next start.
+        self.save_to_disk()?;
 
         Ok(())
     }

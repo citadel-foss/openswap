@@ -99,23 +99,20 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   (`-p`/`--PASSWORD`) both to create a new wallet and to open an existing
   one. Running without one fails with a clear error, and a restart always
   requires an operator to supply it again.
-- **Legacy migration is one-way**: a pre-encryption wallet file is resealed
-  and rewritten encrypted on first load with a passphrase. Older openswap
-  binaries cannot read the migrated file. Back up before upgrading if you
-  may need to downgrade.
-- **Legacy plaintext backups** restore the same way: supply a passphrase and
-  the restored wallet is encrypted with it.
+- **No cleartext formats**: unencrypted wallet files and unencrypted backups
+  are rejected, not migrated. The project is pre-launch, so no legacy
+  plaintext compatibility path exists.
 - **The BIP39 mnemonic** is shown once at wallet creation and is the ultimate
   backup — record it offline. It is kept in memory until the CLI displays it
   (`take_new_mnemonic`) and is not zeroized.
 - **Test builds** (`cfg(test)` / the `integration-test` feature) reduce
   PBKDF2 to 1 iteration for speed. Never use such a build with real funds.
 - **FFI**: `backup_wallet_gui_app` and `restore_wallet_gui_app` both require
-  a password; `is_wallet_encrypted` still detects legacy plaintext files.
+  a password; `is_wallet_encrypted` reports whether a file is encrypted.
 
 ## File formats
 
-Current wallet file (CBOR):
+Wallet file (CBOR, the only supported form):
 
 ```
 EncryptedData {                       // outer: whole-store encryption
@@ -131,7 +128,3 @@ EncryptedData {                       // outer: whole-store encryption
 }
 ```
 
-Legacy wallet file (pre-encryption): plaintext CBOR `WalletStore` with a
-plain `Xpriv` in `master_key`. Deserialization accepts both forms of the
-field (untagged); `Wallet::load` reseals and rewrites legacy files on first
-load.

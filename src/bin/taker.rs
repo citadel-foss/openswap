@@ -20,8 +20,8 @@ use std::{path::PathBuf, str::FromStr};
 /// The app works as a regular Bitcoin wallet with the added capability to perform openswaps.
 /// It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an
 /// Electrum-protocol server (via `--electrum`). Both paths support the full swap flow
-/// and the `restore` subcommand. It currently only runs on Testnet4.
-/// Suggested faucet for getting Signet coins (tor browser required): <http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/>
+/// and the `restore` subcommand. It currently only runs on the custom signet.
+/// Suggested faucet for getting signet coins (tor browser required): <http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/>
 ///
 /// For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 ///
@@ -367,7 +367,7 @@ fn main() -> Result<(), TakerError> {
             Some(wallet_name), // Use the actual translated wallet name here.
             backend,
             backup_file,
-        );
+        )?;
         return Ok(());
     }
 
@@ -655,7 +655,7 @@ fn main() -> Result<(), TakerError> {
         }
         Commands::Backup => {
             let wallet = lock_debug!(taker.get_wallet().read()).unwrap();
-            Wallet::backup_interactive(&wallet);
+            Wallet::backup_interactive(&wallet)?;
         }
         Commands::Restore { .. } => {
             // Handled above before taker init

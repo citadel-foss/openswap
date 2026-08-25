@@ -10,7 +10,6 @@ use bitcoind::{
     BitcoinD,
 };
 use electrsd::ElectrsD;
-use log::info;
 
 use openswap::wallet::{
     AddressType, AnyBlockchain, BackendConfig, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
@@ -106,70 +105,6 @@ fn assert_wallet_file_encrypted(path: &Path, password: &str) {
 }
 
 #[test]
-fn legacy_plain_backup_restores_into_encrypted_wallet() {
-    info!("Running Test: legacy plaintext backup restores into an encrypted wallet");
-
-    let (
-        original_wallet,
-        rpc_config,
-        wallet_backup_file,
-        mut bitcoind,
-        restored_wallet_file,
-        root_dir,
-    ) = setup("legacy_plain_backup_restore".to_string());
-
-    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
-
-    let mut wallet = Wallet::init(
-        &original_wallet,
-        AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap()),
-        km,
-    )
-    .unwrap();
-
-    let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
-
-    // Simulate a legacy plaintext backup file; backups are always encrypted now.
-    let backup_json = serde_json::to_string_pretty(&WalletBackup::from(&wallet)).unwrap();
-    fs::write(&wallet_backup_file, backup_json).unwrap();
-
-    let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
-
-    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
-
-    let (backup, material) =
-        load_sensitive_struct::<WalletBackup, SerdeJson>(&wallet_backup_file, None).unwrap();
-    assert!(material.is_none(), "legacy backup must be plaintext");
-
-    // Restore under a *different* passphrase: the restored wallet is encrypted
-    // with it, and wallet equality compares the underlying master keys.
-    let restore_km =
-        KeyMaterial::new_from_password(Some("restored-wallet-password".to_string())).unwrap();
-    let restored_wallet = Wallet::restore(
-        &backup,
-        &restored_wallet_file,
-        &BackendConfig::CoreRpc(rpc_config.clone()),
-        restore_km,
-    )
-    .unwrap();
-
-    assert!(
-        wallet == restored_wallet, // only compares .store!
-        "restored wallet does not match the original"
-    );
-
-    // The restore must have written an *encrypted* wallet file, keyed by the
-    // restore passphrase.
-    assert_wallet_file_encrypted(&restored_wallet_file, "restored-wallet-password");
-
-    cleanup(&mut bitcoind, &root_dir);
-
-    info!("🎉 Legacy plaintext backup migration test ran successfully!");
-}
-
-#[test]
 fn encwallet_encbackup_encrestore() {
     let (
         original_wallet,
@@ -217,6 +152,10 @@ fn encwallet_encbackup_encrestore() {
         wallet == restored_wallet, // only compares .store!
         "restored wallet does not match the original"
     );
+
+    // The restore must have written an *encrypted* wallet file, keyed by the
+    // restore passphrase.
+    assert_wallet_file_encrypted(&restored_wallet_file, "integration-test");
 
     cleanup(&mut bitcoind, &root_dir);
 }
@@ -268,66 +207,6 @@ fn setup_electrum(test_name: &str) -> ElectrumSetup {
 }
 
 #[test]
-fn legacy_plain_backup_restores_into_encrypted_wallet_electrum() {
-    info!(
-        "Running Test: Electrum-backed legacy plaintext backup restores into an encrypted wallet"
-    );
-
-    let mut s = setup_electrum("legacy_plain_backup_restore_electrum");
-
-    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
-
-    let mut wallet = Wallet::init(
-        &s.original_wallet,
-        AnyBlockchain::Electrum(Electrum::new(&s.electrum_cfg).unwrap()),
-        km,
-    )
-    .unwrap();
-
-    let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut s.bitcoind, &addr, 0.05, 1).unwrap();
-    wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
-
-    // Simulate a legacy plaintext backup file; backups are always encrypted now.
-    let backup_json = serde_json::to_string_pretty(&WalletBackup::from(&wallet)).unwrap();
-    fs::write(&s.backup_file, backup_json).unwrap();
-
-    let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut s.bitcoind, &addr, 0.05, 1).unwrap();
-    wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
-
-    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
-
-    let (backup, material) =
-        load_sensitive_struct::<WalletBackup, SerdeJson>(&s.backup_file, None).unwrap();
-    assert!(material.is_none(), "legacy backup must be plaintext");
-
-    // Restore under a *different* passphrase: the restored wallet is encrypted
-    // with it, and wallet equality compares the underlying master keys.
-    let restore_km =
-        KeyMaterial::new_from_password(Some("restored-wallet-password".to_string())).unwrap();
-    let restored_wallet = Wallet::restore(
-        &backup,
-        &s.restored_wallet,
-        &BackendConfig::Electrum(s.electrum_cfg.clone()),
-        restore_km,
-    )
-    .unwrap();
-
-    assert_eq!(wallet, restored_wallet);
-
-    // The restore must have written an *encrypted* wallet file, keyed by the
-    // restore passphrase.
-    assert_wallet_file_encrypted(&s.restored_wallet, "restored-wallet-password");
-
-    // Kill electrs before cleanup wipes root_dir, which holds its datadir.
-    drop(s.electrsd);
-    cleanup(&mut s.bitcoind, &s.root_dir);
-
-    info!("🎉 Electrum legacy plaintext backup migration test ran successfully!");
-}
-
-#[test]
 fn encwallet_encbackup_encrestore_electrum() {
     let mut s = setup_electrum("encwallet_encbackup_encrestore_electrum");
 
@@ -367,6 +246,10 @@ fn encwallet_encbackup_encrestore_electrum() {
     .unwrap();
 
     assert_eq!(wallet, restored_wallet);
+
+    // The restore must have written an *encrypted* wallet file, keyed by the
+    // restore passphrase.
+    assert_wallet_file_encrypted(&s.restored_wallet, "integration-test");
 
     // Kill electrs before cleanup wipes root_dir, which holds its datadir.
     drop(s.electrsd);
