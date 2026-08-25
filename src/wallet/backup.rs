@@ -96,9 +96,22 @@ impl Wallet {
     ) -> Result<Wallet, WalletError> {
         // A directory (or a nameless path) means "restore under the backup's
         // original filename". Resolve it before the exists-guard, which would
-        // otherwise reject the wallets directory itself.
+        // otherwise reject the wallets directory itself. The backup-supplied
+        // name is untrusted input: accept exactly one normal component, or
+        // `../x` escapes the directory and an absolute path replaces it.
         let wallet_path = if wallet_path.file_name().is_none() || wallet_path.is_dir() {
-            wallet_path.join(&wallet_backup.file_name)
+            let mut components = Path::new(&wallet_backup.file_name).components();
+            match (components.next(), components.next()) {
+                (Some(std::path::Component::Normal(_)), None) => {
+                    wallet_path.join(&wallet_backup.file_name)
+                }
+                _ => {
+                    return Err(WalletError::General(format!(
+                        "backup file name {:?} is not a plain file name",
+                        wallet_backup.file_name
+                    )))
+                }
+            }
         } else {
             wallet_path.to_path_buf()
         };
@@ -305,5 +318,48 @@ impl Wallet {
         wallet.backup(&backup_path, backup_enc_material)?;
         log::info!("Wallet backup succeeded: {backup_path:?}");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::CoreRpcConfig;
+    use bip39::rand::{thread_rng, Rng};
+    use bitcoind::tempfile::tempdir;
+
+    fn dummy_backup(file_name: &str) -> WalletBackup {
+        let seed: [u8; 16] = thread_rng().gen();
+        WalletBackup {
+            network: Network::Regtest,
+            master_key: Xpriv::new_master(Network::Regtest, &seed).unwrap(),
+            wallet_birthday: None,
+            file_name: file_name.to_string(),
+        }
+    }
+
+    /// A backup whose `file_name` traverses or is absolute must be rejected
+    /// before the restore touches the backend.
+    #[test]
+    fn restore_rejects_traversal_in_backup_file_name() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("wallets");
+        std::fs::create_dir_all(&target).unwrap();
+        let backend = BackendConfig::CoreRpc(CoreRpcConfig::default());
+        for bad in ["../escape", "/tmp/absolute", "nested/name"] {
+            let err = Wallet::restore(
+                &dummy_backup(bad),
+                &target,
+                &backend,
+                KeyMaterial::new_ephemeral(),
+            )
+            .expect_err("a traversal name must be rejected");
+            assert!(
+                err.to_string().contains("not a plain file name"),
+                "{}: {}",
+                bad,
+                err
+            );
+        }
     }
 }

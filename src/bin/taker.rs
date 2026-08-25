@@ -21,7 +21,7 @@ use std::{path::PathBuf, str::FromStr};
 /// It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an
 /// Electrum-protocol server (via `--electrum`). Both paths support the full swap flow
 /// and the `restore` subcommand. It currently only runs on the custom signet.
-/// Suggested faucet for getting signet coins (tor browser required): <http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/>
+/// Suggested faucet for getting signet coins: <https://faucet.citadelfoss.xyz/>
 ///
 /// For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 ///

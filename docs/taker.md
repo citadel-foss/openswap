@@ -44,7 +44,7 @@ This will display a detailed guide about the app and its capabilities.
 ```bash
 A simple command line app to operate as openswap client.
 
-The app works as a regular Bitcoin wallet with the added capability to perform openswaps. It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an Electrum-protocol server (via `--electrum`). Both paths support the full swap flow and the `restore` subcommand. It currently only runs on the custom signet. Suggested faucet for getting signet coins (tor browser required): <http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/>
+The app works as a regular Bitcoin wallet with the added capability to perform openswaps. It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an Electrum-protocol server (via `--electrum`). Both paths support the full swap flow and the `restore` subcommand. It currently only runs on the custom signet. Suggested faucet for getting signet coins: <https://faucet.citadelfoss.xyz/>
 
 For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 
@@ -165,7 +165,7 @@ bcrt1qyywgd4we5y7u05lnrgs8runc3j7sspwqhekrdd
 
 This returns a new Bitcoin receiving address from the taker's wallet.
 
-Now we can use the signet faucet to send some coins to this address. Use [this faucet](http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/)(open in Tor browser) to get some signet coins.
+Now we can use the signet faucet to send some coins to this address. Use [this faucet](https://faucet.citadelfoss.xyz/) to get some signet coins.
 
 ### Check Wallet Balances
 

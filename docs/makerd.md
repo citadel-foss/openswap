@@ -128,7 +128,7 @@ This will display information about the `makerd` binary and its options.
 ```bash
 OpenSwap Maker Server
 
-The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet. It requires some starting balance, around 50,000 sats for Fidelity + Swap Liquidity (suggested 50,000 sats). So topup with at least 0.001 BTC to start all the node processes. Suggested faucet (tor browser required): <http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/>
+The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet. It requires some starting balance — around 50,000 sats for Fidelity + Swap Liquidity. A 0.001 BTC top-up covers this with margin. Suggested faucet: <https://faucet.citadelfoss.xyz/>
 
 All server processes will start after the fidelity bond transaction is confirmed. This may take some time. Approx: 10 mins. Once the bond is confirmed, the server starts listening for incoming swap requests. As it performs swaps for clients, it keeps earning fees.
 
@@ -284,7 +284,7 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   INFO openswap::maker::api - Next sync in 10 secs
   ```
 
-  To fund the wallet, you can use [this faucet](http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/)(open in Tor browser).
+  To fund the wallet, you can use [this faucet](https://faucet.citadelfoss.xyz/).
   We suggest taking `0.01 BTC` testcoins as the extra amount will be used in doing wallet related operations in [maker-cli demo](./maker-cli.md)
 
 - **Regular Wallet Sync**: The server will regularly sync the wallet every 10 seconds, increasing the interval in the pattern 10,20,30..., to detect any incoming funds.
