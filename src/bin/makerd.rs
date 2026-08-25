@@ -71,9 +71,7 @@ struct Cli {
     pub(crate) wallet_name: Option<String>,
     /// Password for the encryption of the wallet. Required when creating a
     /// new wallet (wallet files are always encrypted) and to open an
-    /// encrypted one. Prefer the OPENSWAP_WALLET_PASSWORD environment
-    /// variable: a `-p` value is visible in the process list and shell
-    /// history.
+    /// encrypted one.
     #[clap(name = "PASSWORD", long, short = 'p')]
     pub password: Option<String>,
 }
@@ -98,11 +96,7 @@ fn main() -> Result<(), MakerError> {
     // operator's wallet and fidelity bond.
     let wallet_name = args.wallet_name.unwrap_or_else(|| "maker".to_string());
     config.wallet_name = wallet_name.clone();
-    // CLI flag wins; otherwise fall back to the environment variable, which
-    // unlike `-p` does not expose the passphrase in the process list.
-    config.password = args
-        .password
-        .or_else(|| std::env::var("OPENSWAP_WALLET_PASSWORD").ok());
+    config.password = args.password;
     if let Some(tor_auth) = args.tor_auth {
         config.tor_auth_password = tor_auth;
     }

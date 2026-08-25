@@ -48,9 +48,9 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
 - `KeyMaterial` (the derived key) is zeroized on drop and its `Debug` output
   is redacted. `MasterKey`'s `Debug` is likewise redacted — before this
   change, `{:?}` on a wallet printed the master xpriv to logs.
-- Prefer the `OPENSWAP_WALLET_PASSWORD` environment variable over
-  `-p`/`--PASSWORD`: a command-line value is visible in `ps` and shell
-  history.
+- The passphrase is supplied via `-p`/`--PASSWORD` on every start. There is
+  no environment-variable fallback and nothing is persisted: a restart
+  always requires an operator to present the passphrase.
 
 ## Threat model
 
@@ -58,10 +58,15 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
 
 - **Theft of the wallet file or backups** (disk, cloud sync, stolen server):
   everything is AES-256-GCM ciphertext with a strong KDF.
-- **Passive memory disclosure**: core dumps, swap/page files, hibernation
-  images, cold-boot reads, crash reporters, accidental `Debug` logging. The
-  plaintext master key's in-memory exposure shrinks from the whole process
-  lifetime to milliseconds per signature.
+- **Reduced plaintext exposure in leaked memory**: the plaintext master
+  key's in-memory lifetime shrinks from the whole process lifetime to
+  milliseconds per signature, so incidental disclosures — swap/page files,
+  hibernation images, cold-boot reads, accidental `Debug` logging — are far
+  less likely to contain it. Note that a **core dump of the live process is
+  still fatal**: it contains both the long-lived `KeyMaterial` and the
+  sealed master-key blob, and the `KeyMaterial` unseals it (see the
+  live-attacker limitation below). Sealing narrows the plaintext window; it
+  does not protect against dumps that capture the `KeyMaterial`.
 - **Accidental plaintext persistence**: the type system refuses to serialize
   a plaintext master key, and there is no code path that writes an
   unencrypted wallet file.
@@ -91,8 +96,9 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
 ## Operational notes
 
 - **Mandatory passphrase**: `makerd`/`taker` require a wallet passphrase
-  (flag or `OPENSWAP_WALLET_PASSWORD`) both to create a new wallet and to
-  open an existing one. Running without one fails with a clear error.
+  (`-p`/`--PASSWORD`) both to create a new wallet and to open an existing
+  one. Running without one fails with a clear error, and a restart always
+  requires an operator to supply it again.
 - **Legacy migration is one-way**: a pre-encryption wallet file is resealed
   and rewritten encrypted on first load with a passphrase. Older openswap
   binaries cannot read the migrated file. Back up before upgrading if you

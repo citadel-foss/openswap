@@ -117,7 +117,10 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
         "victim maker should have unfinished incoming swapcoins before reboot"
     );
 
-    let victim_config = victim.config.clone();
+    // The first init consumed the passphrase (`config.password.take()`), so
+    // re-supply it to simulate the operator re-entering it on restart.
+    let mut victim_config = victim.config.clone();
+    victim_config.password = Some("integration-test".to_string());
     info!(
         "Restarting Maker2 before idle recovery: incoming={}, outgoing={}",
         before_incoming, before_outgoing

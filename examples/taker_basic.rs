@@ -15,9 +15,11 @@
 //! ## Usage
 //!
 //! ```bash
-//! # When prompted for encryption passphrase, press Enter for no encryption
 //! cargo run --example taker_basic
 //! ```
+//!
+//! Wallet files are always encrypted, so the config sets a demo passphrase.
+//! In production, supply your own via `-p`/`--password` on every start.
 
 use bitcoin::Amount;
 use bitcoind::{
@@ -32,7 +34,6 @@ use openswap::{
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== OpenSwap Taker Basic Example ===");
-    println!("NOTE: When prompted for encryption passphrase, press Enter for no encryption");
 
     // Clean up any existing wallet files to ensure fresh start
     let wallet_path = std::env::home_dir()
@@ -96,8 +97,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Taker with builder-style config
     println!("About to initialize taker...");
 
+    // Wallet files are always encrypted; a passphrase is required.
     let config = TakerInitConfig {
         wallet_name: "taker-example".to_string(),
+        password: Some("example-password".to_string()),
         ..TakerInitConfig::default()
     }
     .with_backend(BackendConfig::CoreRpc(rpc_config));
@@ -111,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     };
     //     let config = TakerInitConfig {
     //         wallet_name: "taker-example".to_string(),
+    //         password: Some("example-password".to_string()),
     //         ..TakerInitConfig::default()
     //     }
     //     .with_backend(BackendConfig::Electrum(electrum_config));

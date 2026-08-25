@@ -895,7 +895,10 @@ impl TestFramework {
         // electrs's datadir sits inside `temp_dir` and it polls bitcoind, so it
         // has to go first or teardown races a live child against a dead node.
         drop(self.electrsd.lock().unwrap().take());
-        let _ = self.bitcoind.client.stop().unwrap();
+        // Tolerate an already-stopped node: a test may restart bitcoind
+        // mid-run (e.g. to reset the mempool) and stop the framework's
+        // original node itself.
+        let _ = self.bitcoind.client.stop();
         std::thread::sleep(std::time::Duration::from_secs(3));
         if self.temp_dir.exists() {
             let _ = fs::remove_dir_all(&self.temp_dir);

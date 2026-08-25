@@ -17,7 +17,7 @@ use openswap::wallet::{
     Wallet, WalletBackup,
 };
 
-use openswap::security::{load_sensitive_struct, KeyMaterial, SerdeJson};
+use openswap::security::{load_sensitive_struct, KeyMaterial, SecurityError, SerdeCbor, SerdeJson};
 
 use super::test_framework::{
     generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
@@ -81,6 +81,30 @@ fn send_and_mine(
     Ok(())
 }
 
+/// Asserts the wallet file on disk is genuinely encrypted with the given
+/// passphrase: it must be an encrypted container, reject a wrong password,
+/// and open with the correct one. (The missing-password `PasswordRequired`
+/// path is covered by wallet storage unit tests, which have the concrete
+/// `WalletStore` type available.)
+fn assert_wallet_file_encrypted(path: &Path, password: &str) {
+    assert!(
+        Wallet::is_wallet_encrypted(path).unwrap(),
+        "restored wallet file must be encrypted"
+    );
+
+    let err = load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(
+        path,
+        Some("definitely-wrong-password".to_string()),
+    )
+    .expect_err("encrypted wallet file must reject a wrong password");
+    assert!(matches!(err, SecurityError::Decryption));
+
+    let (_, material) =
+        load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(path, Some(password.to_string()))
+            .expect("the restore password must open the restored wallet file");
+    assert!(material.is_some());
+}
+
 #[test]
 fn legacy_plain_backup_restores_into_encrypted_wallet() {
     info!("Running Test: legacy plaintext backup restores into an encrypted wallet");
@@ -135,6 +159,10 @@ fn legacy_plain_backup_restores_into_encrypted_wallet() {
         wallet == restored_wallet, // only compares .store!
         "restored wallet does not match the original"
     );
+
+    // The restore must have written an *encrypted* wallet file, keyed by the
+    // restore passphrase.
+    assert_wallet_file_encrypted(&restored_wallet_file, "restored-wallet-password");
 
     cleanup(&mut bitcoind, &root_dir);
 
@@ -287,6 +315,10 @@ fn legacy_plain_backup_restores_into_encrypted_wallet_electrum() {
     .unwrap();
 
     assert_eq!(wallet, restored_wallet);
+
+    // The restore must have written an *encrypted* wallet file, keyed by the
+    // restore passphrase.
+    assert_wallet_file_encrypted(&s.restored_wallet, "restored-wallet-password");
 
     // Kill electrs before cleanup wipes root_dir, which holds its datadir.
     drop(s.electrsd);

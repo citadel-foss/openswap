@@ -94,7 +94,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap();
     let mut wallet = Wallet::init(&wallet_path, backend, enc_material).unwrap();
 
-    // Swap the two lines above for these to drive the same wallet through an electrs server instead of bitcoind RPC.
+    // Replace the `backend` and `Wallet::init` lines above with these to drive
+    // the same wallet through an electrs server instead of bitcoind RPC.
     //     use openswap::wallet::{Electrum, ElectrumConfig};
     //     let electrum_config = ElectrumConfig {
     //         url: "tcp://127.0.0.1:60401".to_string(),

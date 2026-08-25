@@ -42,95 +42,93 @@ This will display a detailed guide about the app and its capabilities.
 #### **Output:**
 
 ```bash
-openswap 0.1.2
-Developers at Citadel FOSS
-A simple command line app to operate as a OpenSwap client.
+A simple command line app to operate as openswap client.
 
-The app works as a regular Bitcoin wallet with the added capability to perform openswaps. The app
-requires a running Bitcoin Core node with RPC access. It currently only runs on Testnet4. Suggested
-faucet for getting Signet coins (tor browser required): http://a4ovtjlwiclzy37bjaurcbb6wpl6dtckmlqwrywq7uoajeaz6kth4uyd.onion/
+The app works as a regular Bitcoin wallet with the added capability to perform openswaps. It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an Electrum-protocol server (via `--electrum`). Both paths support the full swap flow and the `restore` subcommand. It currently only runs on Testnet4. Suggested faucet for getting Signet coins (tor browser required): <http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/>
 
-For more detailed usage information, please refer:
-https://github.com/citadel-foss/openswap/blob/master/docs/taker.md
+For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 
-This is early beta, and there are known and unknown bugs. Please report issues at:
-https://github.com/citadel-foss/openswap/issues
+This is early beta, and there are known and unknown bugs. Please report issues at: <https://github.com/citadel-foss/openswap/issues>
 
-USAGE:
-    taker [OPTIONS] <SUBCOMMAND>
+Usage: taker [OPTIONS] <COMMAND>
 
-OPTIONS:
-    -a, --USER:PASSWORD <USER:PASSWORD>
-            Bitcoin Core RPC authentication string. Ex: username:password
-            
-            [default: user:password]
+Commands:
+  list-utxo           Lists all utxos we know about along with their spend info. This is useful for debugging
+  list-utxo-regular   Lists all single signature wallet Utxos. These are all non-swap regular wallet utxos
+  list-utxo-swap      Lists all utxos received in incoming swaps
+  list-utxo-contract  Lists all utxos that we need to claim via timelock. If you see entries in this list, do a `taker recover` to claim them
+  get-balances        Get total wallet balances of different categories. regular: All single signature regular wallet coins (seed balance). swap: All 2of2 multisig coins received in swaps. contract: All live contract transaction balance locked in timelocks. If you see value in this field, you have unfinished or malfinished swaps. You can claim them back with the recover command. spendable: Spendable amount in wallet (regular + swap balance)
+  get-new-address     Returns a new address
+  send-to-address     Send to an external wallet address
+  fetch-offers        Update the offerbook with current market offers and display them
+  list-offers         List makers from the locally cached offerbook without triggering a network sync
+  poll-maker          Fetch an offer from a single maker address, verify the fidelity proof, and store the result in the offerbook. Adds the maker if absent
+  remove-maker        Remove a maker from the local offerbook by address
+  open-swap           Initiate the openswap process
+  recover             Recover from all failed swaps
+  backup              Backup the selected wallet.
+  restore             Restore a wallet from a backup file
+  verify-deniability  Verify the deniability proof for a specific swap
+  help                Print this message or the help of the given subcommand(s)
 
-    -d, --data-directory <DATA_DIRECTORY>
-            Optional data directory. Default value: "~/.openswap/taker"
+Options:
+  -d, --data-directory <DATA_DIRECTORY>
+          Optional data directory. Default value: "~/.openswap/taker"
 
-    -h, --help
-            Print help information
+  -r, --ADDRESS:PORT <ADDRESS:PORT>
+          Bitcoin Core RPC address:port value. Conflicts with `--electrum`
+          
+          [default: 127.0.0.1:38332]
 
-    -r, --ADDRESS:PORT <ADDRESS:PORT>
-            Bitcoin Core RPC address:port value
-            
-            [default: 127.0.0.1:38332]
+  -z, --ZMQ <ZMQ>
+          Bitcoin Core ZMQ address:port value. Defaults to the RPC host on port 28332
 
-    -t, --tor-auth <TOR_AUTH>
-            [default: ]
+  -a, --USER:PASSWORD <USER:PASSWORD>
+          Bitcoin Core RPC authentication string. Ex: username:password. Conflicts with `--electrum`
+          
+          [default: user:password]
 
-    -v, --verbosity <VERBOSITY>
-            Sets the verbosity level of debug.log file
-            
-            [default: info]
-            [possible values: off, error, warn, info, debug, trace]
+  -t, --tor-auth <TOR_AUTH>
+          
 
-    -V, --version
-            Print version information
+      --electrum <ELECTRUM_URL>
+          Electrum server URL (e.g. `tcp://localhost:50001`). When set, the wallet is initialised against an Electrum backend instead of Bitcoin Core. Mutually exclusive with the Bitcoin Core flags (--rpc/--zmq/--auth). Electrum servers do not serve full blocks, so chain-based fidelity-bond discovery is unavailable — maker discovery relies on nostr relays only
 
-    -w, --WALLET <WALLET>
-            Sets the taker wallet's name. If the wallet file already exists, it will load that
-            wallet. Default: taker-wallet
+      --electrum-tor
+          Route the Electrum backend through the Tor SOCKS proxy on `socks_port`. Works with an onion or a clearnet server; an onion URL needs it. Peer-to-peer Tor is unaffected either way
 
-SUBCOMMANDS:
-    openswap
-            Initiate the openswap process
-    fetch-offers
-            Update the offerbook with current market offers and display them
-    list-offers
-            List makers from the locally cached offerbook without requesting a fresh offer sync
-    get-balances
-            Get total wallet balances of different categories. regular: All single signature regular
-            wallet coins (seed balance). swap: All 2of2 multisig coins received in swaps. contract:
-            All live contract transaction balance locked in timelocks. If you see value in this
-            field, you have unfinished or malfinished swaps. You can claim them back with the
-            recover command. spendable: Spendable amount in wallet (regular + swap balance)
-    get-new-address
-            Returns a new address
-    help
-            Print this message or the help of the given subcommand(s)
-    list-utxo
-            Lists all utxos we know about along with their spend info. This is useful for debugging
-    list-utxo-contract
-            Lists all utxos that we need to claim via timelock. If you see entries in this list, do
-            a `taker recover` to claim them
-    list-utxo-regular
-            Lists all single signature wallet Utxos. These are all non-swap regular wallet utxos
-    list-utxo-swap
-            Lists all utxos received in incoming swaps
-    recover
-            Recover from all failed swaps
-    send-to-address
-            Send to an external wallet address
+  -w, --WALLET <WALLET>
+          Sets the taker wallet's name. If the wallet file already exists, it will load that wallet. Default: taker-wallet
+
+  -p, --PASSWORD <PASSWORD>
+          Password for the encryption of the wallet. Required when creating a new wallet (wallet files are always encrypted) and to open an encrypted one
+
+  -v, --verbosity <VERBOSITY>
+          Sets the verbosity level of debug.log file
+          
+          [default: info]
+          [possible values: off, error, warn, info, debug, trace]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ### Key Points About Command Arguments
 
-- The `-p` or `--PASSWORD` option sets the wallet encryption passphrase. It is **required** when creating a new wallet and to open an encrypted one — wallet files are always encrypted (see [wallet security](./wallet-security.md)). Prefer the `OPENSWAP_WALLET_PASSWORD` environment variable: a command-line value is visible in the process list and shell history.
+- The `-p` or `--PASSWORD` option sets the wallet encryption passphrase. It is **required** when creating a new wallet and to open an encrypted one — wallet files are always encrypted (see [wallet security](./wallet-security.md)). The passphrase must be supplied on every (re)start; it is never persisted.
 
 - The `-r` or `--ADDRESS:PORT` option specifies the Bitcoin Core RPC address and port. By default, this is set to `127.0.0.1:38332`.
 
+- The `-z` or `--ZMQ` option specifies the Bitcoin Core ZMQ address. If omitted, it defaults to the RPC host on port `28332`.
+
 - The `-a` or `--USER:PASSWORD` option specifies the Bitcoin Core RPC authentication. By default, this is set to **`user:password`**.
+
+- The `--electrum <ELECTRUM_URL>` option switches the wallet to an Electrum backend instead of Bitcoin Core (e.g. `tcp://localhost:50001`). It is mutually exclusive with `--rpc`, `--zmq`, and `--auth`. Add `--electrum-tor` to route the Electrum connection through the Tor SOCKS proxy (required for onion servers). Peer-to-peer Tor is unaffected either way.
+
+- The `-v` or `--verbosity` option sets the log level of the `debug.log` file (default: `info`).
 
 - #### If you're using the **default configuration**:
 
@@ -217,7 +215,7 @@ $ taker list-utxo
 }
 ```
 
-This lists all UTXOs we know about along with their spend info. Since the wallet is empty, no UTXOs are displayed.
+This lists all UTXOs the wallet knows about, along with their spend info — useful for debugging.
 
 ### List Regular UTXOs
 
@@ -259,7 +257,7 @@ $ taker list-utxo-swap
 }
 ```
 
-This lists all UTXOs received in incoming swaps. Since we haven't performed any openswaps yet, this list is empty.
+This lists all UTXOs received in incoming swaps. In this example the wallet holds one swept swap coin; on a fresh wallet that has never swapped, this list is empty.
 
 ### List Contract UTXOs
 
@@ -284,118 +282,168 @@ Now we are ready to initiate a openswap. We are first going to sync the offer bo
 $ taker fetch-offers
 ```
 
-**Output:**
+This blocks until the offerbook sync cycle completes (including Nostr-based maker discovery), then prints each discovered maker with its state, offer terms, and fidelity bond details, followed by a summary line:
 
-```json
-{
-  "base_fee": 500,
-  "amount_relative_fee_pct": 0.0025,
-  "time_relative_fee_pct": 0.0001,
-  "required_confirms": 1,
-  "minimum_locktime": 20,
-  "max_size": 49949540,
-  "min_size": 10000,
-  "bond_outpoint": "21e3902cc0a2b94602fa94a7d3664f1a4d861df84af5049a334d5ddf402ed7f5:0",
-  "bond_value": 904,
-  "bond_expiry": 28864,
-  "tor_address": "ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202"
-}
+```bash
+Waiting for offerbook synchronization to complete…
+Offerbook synchronized in 12.34s
+
+Discovered 2 makers
+
+
+    Maker
+    ─────
+    Address        : rywnaguli5qwad2ayqyu3673acyyl5dw7bsjifhge4zohftfi76ybbid.onion:6102
+    Protocol       : Legacy
+    State          : Good
+
+    Offer
+    ─────
+    Base Fee       : 500
+    Amount Fee %   : 0.0025
+    Time Fee %     : 0.0001
+
+    Limits
+    ──────
+    Min Size       : 10000
+    Max Size       : 49949540
+    Required Conf. : 1
+    Min Locktime   : 20
+
+    Fidelity Bond
+    ─────────────
+    Outpoint       : 21e3902cc0a2b94602fa94a7d3664f1a4d861df84af5049a334d5ddf402ed7f5:0
+    Value          : 904
+    Expiry         : 28864
+
+...
+
+Offerbook summary → good: 2, bad: 0, unresponsive: 0 (total: 2)
 ```
 
-This will fetch the list of available makers and display their offers.
+### List Cached Offers
+
+To list the makers already stored in the local offerbook without triggering a network sync:
+
+```bash
+$ taker list-offers
+```
+
+This prints the same per-maker display as `fetch-offers`, but reads only the locally cached offerbook.
+
+### Poll or Remove a Single Maker
+
+You can fetch and verify the offer of one specific maker (adding it to the offerbook if absent):
+
+```bash
+$ taker poll-maker --address <maker-onion-address:port>
+```
+
+And remove a maker from the local offerbook by address:
+
+```bash
+$ taker remove-maker --address <maker-onion-address:port>
+```
 
 ### Initiate a OpenSwap
 
 Now we can initiate a openswap with the makers:
 
 ```bash
-$ taker openswap
+$ taker open-swap
 ```
 
-This will initiate a openswap with the default parameters. The process typically takes several minutes to complete. You can monitor the swap progress by watching the debug log in a new terminal:
+This initiates a openswap with the default parameters (2 makers, 20,000 sats, legacy protocol). To see all available options, run:
+
+```bash
+$ taker open-swap --help
+```
+
+**Output:**
+
+```bash
+Initiate the openswap process
+
+Usage: taker open-swap [OPTIONS]
+
+Options:
+  -m, --makers <MAKERS>
+          Sets the Maker count to swap with. Swapping with less than 2 makers is not allowed to maintain client privacy. Adding more makers in the swap will incur more swap fees [default: 2]
+  -a, --amount <AMOUNT>
+          Sets the swap amount in sats [default: 20000]
+      --tx-count <TX_COUNT>
+          [default: 1]
+      --protocol <PROTOCOL>
+          Protocol version to use: "legacy" or "taproot" [default: legacy]
+      --maker-address <MAKER_ADDRESSES>
+          Manually specify maker addresses (host:port). Can be repeated. When set, these makers are used directly instead of auto-discovery
+      --auto-select
+          Automatically select UTXOs instead of interactive picker
+      --payment-address <PAYMENT_ADDRESS>
+          PaySwap: settle the swap to this third-party address. The swap amount then means the exact amount the receiver gets
+  -y, --yes
+          Skip the confirmation prompt and proceed immediately
+  -h, --help
+          Print help
+```
+
+By default, the command opens an interactive UTXO picker so you can choose which coins fund the swap; pass `--auto-select` to let the wallet pick them automatically.
+
+The swap runs in two phases. First it prepares the swap — discovering makers, negotiating with each hop, and computing the fees — then prints a summary and asks for confirmation:
+
+```bash
+========== Swap Summary ==========
+Swap ID:   c874d9f7ac7e6230
+Protocol:  Legacy
+Sending:   20000 sats
+
+  Hop 0: ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202 (Legacy)
+         Fees: base=500 sats, amt=0.0025%, time=0.000100%
+         Locktime: 48 blocks, Estimated fee: 550 sats
+  Hop 1: rywnaguli5qwad2ayqyu3673acyyl5dw7bsjifhge4zohftfi76ybbid.onion:6102 (Legacy)
+         Fees: base=500 sats, amt=0.0025%, time=0.000100%
+         Locktime: 24 blocks, Estimated fee: 530 sats
+
+Total estimated fee: 1080 sats
+Estimated receive:   18920 sats
+==================================
+
+Proceed with this swap? [y/N]
+```
+
+Confirm with `y` (or pass `-y`/`--yes` upfront) to execute the swap. With `--payment-address <addr>` (PaySwap), the summary instead shows the receiver, the exact amount the receiver gets, and the total openswap cost.
+
+The process typically takes several minutes to complete. You can monitor the swap progress by watching the debug log in a new terminal:
 
 ```bash
 tail -f ~/.openswap/taker/debug.log
 ```
 
 ```bash
-
-2025-09-03T18:58:34.830814322+05:30 INFO openswap::utill - ✅ Logger initialized successfully
-2025-09-03T18:58:34.831885420+05:30 INFO openswap::wallet::api - Wallet file at "/home/keraliss/.openswap/taker/wallets/taker-wallet" successfully loaded.
-2025-09-03T18:58:34.831932106+05:30 INFO openswap::taker::config - Successfully loaded config file from : /home/keraliss/.openswap/taker/config.toml
-2025-09-03T18:58:34.832064049+05:30 INFO openswap::utill - Tor is fully started and operational!
-2025-09-03T18:58:34.832636855+05:30 INFO openswap::taker::api - Succesfully loaded offerbook at : "/home/keraliss/.openswap/taker/offerbook.json"
-2025-09-03T18:58:34.832650756+05:30 INFO openswap::wallet::rpc - Initializing wallet sync and save
-2025-09-03T18:58:35.157963973+05:30 INFO openswap::wallet::rpc - Completed wallet sync and save
-2025-09-03T18:58:35.157987063+05:30 INFO openswap::taker::api - Using regular UTXOs for openswap
-2025-09-03T18:58:35.157991757+05:30 INFO openswap::taker::api - Syncing Offerbook
-2025-09-03T18:58:35.158000831+05:30 INFO openswap::taker::api - Fetching addresses from DNS: lp75qh3del4qot6fmkqq4taqm33pidvk63lncvhlwsllbwrl2f4g4qqd.onion:8080
-2025-09-03T18:58:44.794069324+05:30 INFO openswap::taker::routines - Downloading offer from ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
-2025-09-03T18:58:44.794123815+05:30 INFO openswap::taker::routines - Downloading offer from rywnaguli5qwad2ayqyu3673acyyl5dw7bsjifhge4zohftfi76ybbid.onion:6102
-2025-09-03T18:58:53.391435256+05:30 INFO openswap::taker::routines - Downloaded offer from : rywnaguli5qwad2ayqyu3673acyyl5dw7bsjifhge4zohftfi76ybbid.onion:6102 
-2025-09-03T18:58:53.641409491+05:30 INFO openswap::taker::routines - Downloaded offer from : ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202 
-2025-09-03T18:58:53.641555305+05:30 INFO openswap::taker::api - Found offer from rywnaguli5qwad2ayqyu3673acyyl5dw7bsjifhge4zohftfi76ybbid.onion:6102. Verifying Fidelity Proof
-2025-09-03T18:58:53.644582350+05:30 INFO openswap::taker::api - Fidelity Bond verification success. Adding offer to our OfferBook
-2025-09-03T18:58:53.644600038+05:30 INFO openswap::taker::api - Found offer from ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202. Verifying Fidelity Proof
-2025-09-03T18:58:53.645776479+05:30 INFO openswap::taker::api - Fidelity Bond verification success. Adding offer to our OfferBook
-2025-09-03T18:58:53.646061049+05:30 INFO openswap::taker::api - Found 5 suitable makers for this swap round
-2025-09-03T18:58:53.646074741+05:30 INFO openswap::taker::api - Initiating openswap with id : c874d9f7ac7e6230
-2025-09-03T18:58:53.646081183+05:30 INFO openswap::taker::api - Initializing First Hop.
-2025-09-03T18:58:53.646089505+05:30 INFO openswap::taker::api - Choosing next maker: 127.0.0.1:6102
-2025-09-03T18:58:53.700488732+05:30 INFO openswap::wallet::api - Address grouping: Selected 2 regular UTXOs (total: 253000 sats, target+fee: 20324 sats)
-2025-09-03T18:58:53.702775316+05:30 INFO openswap::wallet::spend - Adding change output with 232560 sats (fee: 440 sats)
-2025-09-03T18:58:53.706404936+05:30 INFO openswap::wallet::spend - Created Funding tx, txid: 3233bcef16eb6c2179fda31d9229c6989111a75f297c9c49859320069cd460e6 | Size: 220 vB | Fee: 440 sats | Feerate: 2.00 sat/vB
-2025-09-03T18:58:53.706461956+05:30 INFO openswap::wallet::funding - Created Funding tx, txid: 3233bcef16eb6c2179fda31d9229c6989111a75f297c9c49859320069cd460e6 | Size: 220 vB | Fee: 440 sats | Feerate: 2.00 sat/vB
-2025-09-03T18:58:53.706768325+05:30 INFO wallet - created funding txes random amounts
-2025-09-03T18:58:53.708215981+05:30 ERROR openswap::taker::api - Failed to obtain sender's contract signatures from first_maker 127.0.0.1:6102: IO(Custom { kind: Other, error: "general SOCKS server failure" })
-2025-09-03T18:58:53.708262825+05:30 INFO openswap::taker::api - Choosing next maker: 127.0.0.1:6102
-2025-09-03T18:58:53.756678424+05:30 INFO openswap::wallet::api - Address grouping: Selected 2 regular UTXOs (total: 253000 sats, target+fee: 20324 sats)
-2025-09-03T18:58:53.758990905+05:30 INFO openswap::wallet::spend - Adding change output with 232560 sats (fee: 440 sats)
-2025-09-03T18:58:53.762458743+05:30 INFO openswap::wallet::spend - Created Funding tx, txid: db7afbbd4a7e7b0e1aa1b27b5f1deef509140413459b272c894a2ee8473eae44 | Size: 220 vB | Fee: 440 sats | Feerate: 2.00 sat/vB
-2025-09-03T18:58:53.762508683+05:30 INFO openswap::wallet::funding - Created Funding tx, txid: db7afbbd4a7e7b0e1aa1b27b5f1deef509140413459b272c894a2ee8473eae44 | Size: 220 vB | Fee: 440 sats | Feerate: 2.00 sat/vB
-2025-09-03T18:58:53.762721044+05:30 INFO wallet - created funding txes random amounts
-2025-09-03T18:58:53.763710980+05:30 ERROR openswap::taker::api - Failed to obtain sender's contract signatures from first_maker 127.0.0.1:6102: IO(Custom { kind: Other, error: "general SOCKS server failure" })
-2025-09-03T18:58:53.763757893+05:30 INFO openswap::taker::api - Choosing next maker: 127.0.0.1:6102
-2025-09-03T18:58:53.813457799+05:30 INFO openswap::wallet::api - Address grouping: Selected 2 regular UTXOs (total: 253000 sats, target+fee: 20324 sats)
-2025-09-03T18:58:53.815543924+05:30 INFO openswap::wallet::spend - Adding change output with 232560 sats (fee: 440 sats)
-2025-09-03T18:58:53.819894556+05:30 INFO openswap::wallet::spend - Created Funding tx, txid: a680b1d032a5fa5febd4f2c38743c9aa657783c2d1c713b5748ba6c57c6474d0 | Size: 220 vB | Fee: 440 sats | Feerate: 2.00 sat/vB
-2025-09-03T18:58:53.820038208+05:30 INFO openswap::wallet::funding - Created Funding tx, txid: a680b1d032a5fa5febd4f2c38743c9aa657783c2d1c713b5748ba6c57c6474d0 | Size: 220 vB | Fee: 440 sats | Feerate: 2.00 sat/vB
-2025-09-03T18:58:53.820375931+05:30 INFO wallet - created funding txes random amounts
-2025-09-03T18:58:53.821413777+05:30 ERROR openswap::taker::api - Failed to obtain sender's contract signatures from first_maker 127.0.0.1:6102: IO(Custom { kind: Other, error: "general SOCKS server failure" })
-2025-09-03T18:58:53.821551711+05:30 INFO openswap::taker::api - Choosing next maker: ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
-2025-09-03T18:58:53.872796787+05:30 INFO openswap::wallet::api - Address grouping: Selected 2 regular UTXOs (total: 253000 sats, target+fee: 20324 sats)
-2025-09-03T18:58:53.874726933+05:30 INFO openswap::wallet::spend - Adding change output with 232560 sats (fee: 440 sats)
-2025-09-03T18:58:53.877062518+05:30 INFO openswap::wallet::spend - Created Funding tx, txid: 5eacac48877057bdda3e34d1a7e5f93d4d594cde599be166e465b5464501c76c | Size: 220 vB | Fee: 440 sats | Feerate: 2.00 sat/vB
-2025-09-03T18:58:53.877090094+05:30 INFO openswap::wallet::funding - Created Funding tx, txid: 5eacac48877057bdda3e34d1a7e5f93d4d594cde599be166e465b5464501c76c | Size: 220 vB | Fee: 440 sats | Feerate: 2.00 sat/vB
-2025-09-03T18:58:53.877509748+05:30 INFO wallet - created funding txes random amounts
-2025-09-03T18:58:54.568365133+05:30 INFO openswap::taker::api - ===> ReqContractSigsForSender | ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
-2025-09-03T18:58:58.263137675+05:30 INFO openswap::taker::api - <=== RespContractSigsForSender | ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
-2025-09-03T18:58:58.263583864+05:30 INFO openswap::taker::api - Total Funding Txs Fees: 0.00000440 BTC
-2025-09-03T18:58:58.263606558+05:30 INFO openswap::taker::api - Transaction size: 220 vB (0.220 kvB)
-2025-09-03T18:58:58.291022378+05:30 INFO openswap::taker::api - Broadcasted Funding tx. txid: 5eacac48877057bdda3e34d1a7e5f93d4d594cde599be166e465b5464501c76c
-2025-09-03T18:58:58.291105164+05:30 INFO openswap::taker::api - Waiting for funding transaction confirmation. Txids : [5eacac48877057bdda3e34d1a7e5f93d4d594cde599be166e465b5464501c76c]
-2025-09-03T18:58:58.292556173+05:30 INFO openswap::taker::api - Funding tx Seen in Mempool. Waiting for confirmation for 0 secs
-2025-09-03T18:58:59.062221277+05:30 INFO openswap::taker::api - ===> WaitingFundingConfirmation | ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
-2025-09-03T18:59:29.063641719+05:30 INFO openswap::taker::api - Funding tx Seen in Mempool. Waiting for confirmation for 30 secs
-2025-09-03T18:59:29.683684462+05:30 INFO openswap::taker::api - ===> WaitingFundingConfirmation | ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
+INFO openswap::wallet::api - Wallet file at "/home/user/.openswap/taker/wallets/taker-wallet" successfully loaded.
+INFO openswap::taker::config - Successfully loaded config file from : /home/user/.openswap/taker/config.toml
+INFO openswap::utill - Tor is fully started and operational!
+INFO openswap::taker::api - Syncing Offerbook
+INFO openswap::taker::api - Found 5 suitable makers for this swap round
+INFO openswap::taker::api - Initiating openswap with id : c874d9f7ac7e6230
+INFO openswap::taker::api - Initializing First Hop.
+INFO openswap::taker::api - Choosing next maker: ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
+INFO openswap::wallet::spend - Created Funding tx, txid: 5eacac48... | Size: 220 vB | Fee: 440 sats | Feerate: 2.00 sat/vB
+INFO openswap::taker::api - ===> ReqContractSigsForSender | ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
+INFO openswap::taker::api - <=== RespContractSigsForSender | ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
+INFO openswap::taker::api - Broadcasted Funding tx. txid: 5eacac48...
+INFO openswap::taker::api - Waiting for funding transaction confirmation. Txids : [5eacac48...]
 
 .
 .
 .
-.
-.
 
-2025-09-03T19:55:19.045810783+05:30 INFO openswap::wallet::api - Transaction seen in mempool,waiting for confirmation, txid: aed232df3ce3523434fcd2a8aad7fad02fa858d4be29cf0e1c18dde4a3cefb9d
-2025-09-03T19:55:19.045831823+05:30 INFO openswap::wallet::api - Next sync in 130 secs
-2025-09-03T19:57:29.047058307+05:30 INFO openswap::wallet::api - Transaction confirmed at blockheight: 16032, txid : aed232df3ce3523434fcd2a8aad7fad02fa858d4be29cf0e1c18dde4a3cefb9d
-2025-09-03T19:57:29.047080134+05:30 INFO openswap::wallet::api - Sweep Transaction aed232df3ce3523434fcd2a8aad7fad02fa858d4be29cf0e1c18dde4a3cefb9d confirmed at blockheight: 16032
-2025-09-03T19:57:29.047090987+05:30 INFO openswap::wallet::api - Successfully swept incoming swap coin, txid: aed232df3ce3523434fcd2a8aad7fad02fa858d4be29cf0e1c18dde4a3cefb9d
-2025-09-03T19:57:29.047106047+05:30 INFO openswap::wallet::api - Successfully removed incoming swaps coins
-2025-09-03T19:57:29.047290187+05:30 INFO openswap::taker::api - Successfully swept 1 incoming swap coins: [aed232df3ce3523434fcd2a8aad7fad02fa858d4be29cf0e1c18dde4a3cefb9d]
-2025-09-03T19:57:29.047300886+05:30 INFO openswap::taker::api - Successfully Completed OpenSwap.
-2025-09-03T19:57:29.047307582+05:30 INFO openswap::taker::api - Shutting down taker.
-2025-09-03T19:57:29.047631218+05:30 INFO openswap::taker::api - offerbook data saved to disk.
-2025-09-03T19:57:29.047740527+05:30 INFO openswap::taker::api - Wallet data saved to disk.
+INFO openswap::wallet::api - Successfully swept incoming swap coin, txid: aed232df...
+INFO openswap::taker::api - Successfully swept 1 incoming swap coins: [aed232df...]
+INFO openswap::taker::api - Successfully Completed OpenSwap.
+INFO openswap::taker::api - Shutting down taker.
+INFO openswap::taker::api - offerbook data saved to disk.
+INFO openswap::taker::api - Wallet data saved to disk.
 ```
 
 ### Recovering Failed Swaps
@@ -414,7 +462,7 @@ $ taker list-utxo-contract
 If you see any UTXOs in the output, you can recover them using the `recover` command:
 
 ```bash
-$ taker  recover
+$ taker recover
 ```
 
 **Output:**
@@ -427,6 +475,38 @@ $ taker  recover
 
 This will attempt to recover all funds from failed swaps. In this case, since there are no unfinished transactions (both incoming and outgoing txids arrays are empty), the recovery process completes immediately with no funds to recover.
 
+### Backing Up the Wallet
+
+To back up the selected wallet (use `-w` to pick a non-default wallet), run:
+
+```bash
+$ taker backup
+```
+
+The backup is created in the current working directory as `<wallet_name>-backup.json`. Backups contain the master key and are always encrypted — you will be prompted interactively for a passphrase.
+
+### Restoring a Wallet
+
+To restore a wallet from a backup file:
+
+```bash
+$ taker restore --backup-file <backup-file>
+```
+
+If no `-w` wallet name is provided, the wallet is restored with its original name stored in the backup; otherwise it is restored under the given name.
+
+### Verifying a Deniability Proof
+
+After a completed swap, you can verify the deniability proof for a specific swap ID:
+
+```bash
+$ taker verify-deniability --swap-id <swap_id>
+
+Proof valid: swap participated in a completed openswap
+```
+
+If the proof is missing or doesn't check out, the command prints `Proof invalid or not found for this swap ID`.
+
 ## Data, Config and Wallets
 
 The taker stores all its data in a data directory. By default, the data directory is located at `$HOME/.openswap/taker`. You can change the data directory by passing the `--data-directory` option to the `taker` command.
@@ -436,6 +516,7 @@ The data directory contains the following files:
 1. `config.toml` - The configuration file for the taker.
 2. `debug.log` - The log file for the taker.
 3. `wallets` directory - Contains the wallet files for the taker.
+4. `offerbook.json` - The locally cached offerbook of known makers, updated by `fetch-offers` and `poll-maker`.
 
 **Default Taker Configuration (`~/.openswap/taker/config.toml`):**
 
@@ -443,13 +524,11 @@ The data directory contains the following files:
 control_port = 9051
 socks_port = 9050
 tor_auth_password = ""
-connection_type = "TOR"
 ```
  
 - `control_port`: The Tor Control Port. Check the [tor doc](tor.md) for more details.
 - `socks_port`: The Tor Socks Port. Check the [tor doc](tor.md) for more details.
 - `tor_auth_password`: Optional password for Tor control authentication; empty by default.
-- `connection_type`: The connection type to use for the directory server. Possible values are `CLEARNET` and `TOR`.
 
 ### Wallets
 

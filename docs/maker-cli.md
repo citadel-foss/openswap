@@ -30,73 +30,54 @@ This will display a detailed guide about the app and its capabilities.
 #### **Output:**
 
 ```bash
-openswap 0.1.0
-Developers at Citadel FOSS
 A simple command line app to operate the makerd server.
 
-The app works as an RPC client for makerd, useful to access the server, retrieve information, and
-manage server operations.
+The app works as an RPC client for makerd, useful to access the server, retrieve information, and manage server operations.
 
-For more detailed usage information, please refer:
-https://github.com/citadel-foss/openswap/blob/master/docs/maker-cli.md
+For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/maker-cli.md>
 
-This is early beta, and there are known and unknown bugs. Please report issues at:
-https://github.com/citadel-foss/openswap/issues
+This is early beta, and there are known and unknown bugs. Please report issues at: <https://github.com/citadel-foss/openswap/issues>
 
-USAGE:
-    maker-cli [OPTIONS] <SUBCOMMAND>
+Usage: maker-cli [OPTIONS] <COMMAND>
 
-OPTIONS:
-    -h, --help
-            Print help information
+Commands:
+  send-ping           Sends a ping to makerd. Will return a pong
+  list-utxo           Lists all utxos in the wallet. Including fidelity bonds
+  list-utxo-swap      Lists utxos received from incoming swaps
+  list-utxo-contract  Lists HTLC contract utxos
+  list-utxo-fidelity  Lists fidelity bond utxos
+  get-balances        Get total wallet balances of different categories. regular: All single signature regular wallet coins (seed balance). swap: All 2of2 multisig coins received in swaps. contract: All live contract transaction balance locked in timelocks. If you see value in this field, you have unfinished or malfinished swaps. You can claim them back with the recover command. fidelity: All coins locked in fidelity bonds. spendable: Spendable amount in wallet (regular + swap balance)
+  get-new-address     Gets a new bitcoin receiving address
+  send-to-address     Send Bitcoin to an external address and return the txid
+  show-tor-address    Show the server tor address
+  show-data-dir       Show the data directory path
+  stop                Shutdown the makerd server
+  show-fidelity       Show all the fidelity bonds, current and previous, with an (index, {bond_proof, is_spent}) tuple
+  sync-wallet         Sync the Maker wallet with the current blockchain state
+  verify-deniability  Verify the deniability proof for a specific swap
+  help                Print this message or the help of the given subcommand(s)
 
-    -p, --rpc-port <RPC_PORT>
-            Sets the rpc-port of Makerd
+Options:
+  -p, --rpc-port <RPC_PORT>
+          Sets the rpc-port of Makerd
+          
+          [default: 127.0.0.1:6103]
 
-            [default: 127.0.0.1:6103]
+  -d, --data-directory <DATA_DIRECTORY>
+          Maker data directory used to read the RPC authentication cookie
 
-    -V, --version
-            Print version information
+  -h, --help
+          Print help (see a summary with '-h')
 
-SUBCOMMANDS:
-    get-balances
-            Get total wallet balances of different categories. regular: All single signature regular
-            wallet coins (seed balance). swap: All 2of2 multisig coins received in swaps. contract:
-            All live contract transaction balance locked in timelocks. If you see value in this
-            field, you have unfinished or malfinished swaps. You can claim them back with the
-            recover command. fidelity: All coins locked in fidelity bonds. spendable: Spendable
-            amount in wallet (regular + swap balance)
-    get-new-address
-            Gets a new bitcoin receiving address
-    help
-            Print this message or the help of the given subcommand(s)
-    list-utxo
-            Lists all utxos in the wallet. Including fidelity bonds
-    list-utxo-contract
-            Lists HTLC contract utxos
-    list-utxo-fidelity
-            Lists fidelity bond utxos
-    list-utxo-swap
-            Lists utxos received from incoming swaps
-    send-ping
-            Sends a ping to makerd. Will return a pong
-    send-to-address
-            Send Bitcoin to an external address and return the txid
-    show-data-dir
-            Show the data directory path
-    show-fidelity
-            Show all the fidelity bonds, current and previous, with an (index, {bond_proof,is_spent}) tuple
-    show-tor-address
-            Show the server tor address
-    stop
-            Shutdown the makerd server
-    sync-wallet
-            Sync the maker wallet with the current blockchain state
+  -V, --version
+          Print version
 ```
 
-### Key Points About the `rpc-port` Argument
+### Key Points About the Arguments
 
-- The `rpc-port` option specifies the RPC port that `makerd` listens on. By default, this is set to **`6103`**.
+- The `rpc-port` option specifies the RPC port that `makerd` listens on. By default, this is set to **`127.0.0.1:6103`**.
+
+- The `-d` or `--data-directory` option points `maker-cli` at the maker's data directory. It defaults to `~/.openswap/maker` and is used to read the **`rpc_cookie`** file that `makerd` writes on startup — every RPC request is authenticated with this token. If you started `makerd` with a custom `--data-directory`, pass the same directory to `maker-cli`.
 
 - #### If you're using the **default configuration**:
 
@@ -110,8 +91,6 @@ SUBCOMMANDS:
 ```
 
 ## For this tutorial, we'll assume the default configuration is being used. Output examples will reflect this setup.
-
-Here's a simplified and easier-to-read version of your content:
 
 ---
 
@@ -186,24 +165,24 @@ $ ./maker-cli show-fidelity
 ```json
 [
   {
-    "amount": 50000,
-    "bond_value": 0,
     "index": 0,
     "outpoint": "6c06a925066b0cf8adb400e53001b20587729407bce7dcb95dcacd038950b0e4:0",
-    "status": "Live"
+    "amount": 10000,
+    "status": "Live",
+    "bond_value": 904
   }
 ]
 ```
 
 This shows our maker's fidelity bond in a clean JSON format:
 
-- **amount**: The amount locked in the fidelity bond (50,000 sats in this example)
-- **bond_value**: The calculated bond value (0 indicates a newly created bond)
 - **index**: The bond index (0 for the first/current bond)
 - **outpoint**: The transaction output point (txid:vout) where the bond is locked
-- **status**: Current status of the bond ("Live" means active and unexpired)
+- **amount**: The amount locked in the fidelity bond (10,000 sats by default)
+- **status**: Current status of the bond ("Live" means active and unspent, "Redeemed" means it has been spent after expiry)
+- **bond_value**: The calculated bond value (only shown for live bonds)
 
-> **Note:** Currently, a maker can have only one active (unexpired) fidelity bond at a time. Once a bond expires and is redeemed, a new fidelity bond can be created.
+> **Note:** Currently, a maker can have only one active (unexpired) fidelity bond at a time. `makerd` automatically creates a new bond once the previous one expires and is redeemed.
 
 ---
 
@@ -221,14 +200,14 @@ $ ./maker-cli list-utxo-fidelity
 [
   {
     "addr": "tb1qttutr6nuum6e5neyddukxrzvnx87eksteu9vzx6xfmrfc30cppqspa6ut2",
-    "amount": 50000,
+    "amount": 10000,
     "confirmations": 1,
     "utxo_type": "fidelity-bond"
   }
 ]
 ```
 
-This lists fidelity bond UTXOs. Since only one live fidelity bond is allowed at a time, this shows a single UTXO of `50,000 sats`. Note that the `txid` and `vout` match the `outpoint` from the `show-fidelity` command, confirming this is the same fidelity bond UTXO.
+This lists fidelity bond UTXOs. Since only one live fidelity bond is allowed at a time, this shows a single UTXO of `10,000 sats`. Note that the `txid` and `vout` match the `outpoint` from the `show-fidelity` command, confirming this is the same fidelity bond UTXO.
 
 ---
 
@@ -245,9 +224,9 @@ $ ./maker-cli get-balances
 ```json
 {
   "contract": 0,
-  "fidelity": 50000,
-  "regular": 1000000,
-  "spendable": 1000000,
+  "fidelity": 10000,
+  "regular": 989000,
+  "spendable": 989000,
   "swap": 0
 }
 ```
@@ -296,10 +275,10 @@ Both categories show zero balances as confirmed by our `get-balances` output:
 $ ./maker-cli get-balances
 {
   "contract": 0,
-  "fidelity": 50000,
-  "regular": 1000000,
-  "spendable": 1000000,
-  "swap": 0,
+  "fidelity": 10000,
+  "regular": 989000,
+  "spendable": 989000,
+  "swap": 0
 }
 ```
 
@@ -315,27 +294,15 @@ $ ./maker-cli list-utxo
 [
   {
     "addr": "tb1qttutr6nuum6e5neyddukxrzvnx87eksteu9vzx6xfmrfc30cppqspa6ut2",
-    "amount": 50000,
+    "amount": 10000,
     "confirmations": 1,
     "utxo_type": "fidelity-bond"
   },
   {
     "addr": "tb1qu332pjytwdu0z73f5xzftkk06hpgdyvjvef9kn",
-    "amount": 80741,
+    "amount": 989000,
     "confirmations": 1,
     "utxo_type": "regular"
-  },
-  {
-    "addr": "tb1qzelepmza0c0gkkvm3aaerr95qjq8eysmkcw76z",
-    "amount": 9540,
-    "confirmations": 1,
-    "utxo_type": "regular"
-  },
-  {
-    "addr": "tb1qrjefrm0puwnl2exjpl73devd7czjqd8rl37wze",
-    "amount": 19124,
-    "confirmations": 1,
-    "utxo_type": "swept-incoming-swap"
   }
 ]
 ```
@@ -347,13 +314,13 @@ This lists all UTXOs in the wallet, including fidelity bonds. We created a fundi
 
 ### Breakdown:
 
-- Initially, we funded the wallet with `0.01 BTC`.
-- `50,000 sats` were used for the fidelity bond.
-- `1,000 sats` were used as the mining fee for the fidelity transaction.
+- Initially, we funded the wallet with `0.01 BTC` (1,000,000 sats).
+- `10,000 sats` were locked in the fidelity bond.
+- `1,000 sats` were paid as the mining fee for the fidelity transaction (at the default `fidelity_feerate` of 2 sats/vB).
 
 The remaining balance after these transactions is:
 
-**949,000 sats** = **1,000,000 sats** (total funding) - **50,000 sats** (for the fidelity bond) - **1,000 sats** (mining fees).
+**989,000 sats** = **1,000,000 sats** (total funding) - **10,000 sats** (for the fidelity bond) - **1,000 sats** (mining fees).
 
 We can verify this balance by running the `get-balances` command, which shows the total wallet balances of different categories:
 
@@ -361,9 +328,9 @@ We can verify this balance by running the `get-balances` command, which shows th
 $ ./maker-cli get-balances
 {
   "contract": 0,
-    "fidelity": 50000,
-    "regular": 949000,
-    "spendable": 949000
+  "fidelity": 10000,
+  "regular": 989000,
+  "spendable": 989000,
   "swap": 0
 }
 ```
@@ -399,27 +366,26 @@ The `send-to-address` command allows us to send Bitcoin to an external address. 
 ```bash
 $ ./maker-cli send-to-address --help
 
-Send Bitcoin to an external address and returns the txid
+Send Bitcoin to an external address and return the txid
 
-USAGE:
-    maker-cli send-to-address --address <ADDRESS> --amount <AMOUNT> --fee <FEE>
+Usage: maker-cli send-to-address [OPTIONS] --address <ADDRESS> --amount <AMOUNT>
 
-OPTIONS:
-    -a, --amount <AMOUNT>      Amount to send in sats
-    -f, --fee <FEE>            Total fee to be paid in sats
-    -h, --help                 Print help information
-    -t, --address <ADDRESS>    Recipient's address
+Options:
+  -t, --address <ADDRESS>  Recipient's address
+  -a, --amount <AMOUNT>    Amount to send in sats
+  -f, --feerate <FEERATE>  Feerate in sats/vByte. Defaults to 2 sats/vByte
+  -h, --help               Print help
 ```
 
 > **Note:**  
-> The command currently requires the `fee` parameter to specify the total mining fee for the transaction instead of using `fee_rate`. This is because the functionality to calculate the fee using a `fee_rate` for transactions that have not been created yet has not been implemented. This process will be improved in the next release.
+> The transaction fee is specified as a fee rate in sats/vByte via the `--feerate` option. If omitted, it defaults to 2 sats/vByte.
 
-Let's now send `10,000 sats` to the derived address, with a mining fee of `1,000 sats`:
+Let's now send `10,000 sats` to the derived address, with a fee rate of 2 sats/vByte:
 
 ```bash
-$ ./maker-cli send-to-address --amount 10000 --address <derived address> --fee 1000
+$ ./maker-cli send-to-address --amount 10000 --address <derived address> --feerate 2
 
-<tx hex>
+<txid>
 ```
 
 This command will create a transaction, send `10,000 sats` from the maker's wallet to the derived address, broadcast the transaction to the network, and return the transaction ID in hex format.
@@ -436,8 +402,8 @@ success
 This syncs the maker wallet with the current blockchain state. On `makerd`, we will see:
 
 ```bash
-INFO openswap::maker::rpc::server - Starting wallet sync.
-INFO openswap::maker::rpc::server - Wallet sync success.
+INFO openswap::maker::rpc::server - Initializing wallet sync
+INFO openswap::maker::rpc::server - Completed wallet sync
 ```
 
 ### Checking Wallet Balances and UTXOs:
@@ -454,7 +420,7 @@ $ ./maker-cli list-utxo-fidelity
 [
   {
     "addr": "tb1qttutr6nuum6e5neyddukxrzvnx87eksteu9vzx6xfmrfc30cppqspa6ut2",
-    "amount": 50000,
+    "amount": 10000,
     "confirmations": 1,
     "utxo_type": "fidelity-bond"
   }
@@ -463,15 +429,15 @@ $ ./maker-cli list-utxo-fidelity
 $ ./maker-cli get-balances
 
 {
-    "regular": 949000,
+    "regular": 978500,
     "swap": 0,
     "contract": 0,
-    "fidelity": 50000,
-    "spendable": 949000
+    "fidelity": 10000,
+    "spendable": 978500
 }
 ```
 
-> **NOTE**: Fidelity UTXOs are not used for spending purposes. We can only spend these UTXOs by using the `redeem_fidelity` command after the fidelity bond expires. This is why the UTXO list and balance remain unchanged.
+> **NOTE**: Fidelity UTXOs are not used for spending purposes. These UTXOs can only be spent after the fidelity bond expires, which `makerd` handles automatically during bond renewal. This is why the UTXO list and balance remain unchanged.
 
 ---
 
@@ -483,11 +449,11 @@ $ ./maker-cli list-utxo-swap
 
 $ ./maker-cli get-balances
 {
-    "regular": 949000,
+    "regular": 978500,
     "swap": 0,
     "contract": 0,
-    "fidelity": 50000,
-    "spendable": 949000
+    "fidelity": 10000,
+    "spendable": 978500
 }
 ```
 
@@ -501,11 +467,11 @@ $ ./maker-cli list-utxo-contract
 
 $ ./maker-cli get-balances
 {
-    "regular": 949000,
+    "regular": 978500,
     "swap": 0,
     "contract": 0,
-    "fidelity": 50000,
-    "spendable": 949000
+    "fidelity": 10000,
+    "spendable": 978500
 }
 ```
 
@@ -519,39 +485,43 @@ $ ./maker-cli list-utxo
 [
   {
     "addr": "tb1qttutr6nuum6e5neyddukxrzvnx87eksteu9vzx6xfmrfc30cppqspa6ut2",
-    "amount": 50000,
+    "amount": 10000,
     "confirmations": 1,
     "utxo_type": "fidelity-bond"
   },
   {
     "addr": "tb1qu332pjytwdu0z73f5xzftkk06hpgdyvjvef9kn",
-    "amount": 80741,
+    "amount": 978500,
     "confirmations": 1,
     "utxo_type": "regular"
-  },
-  {
-    "addr": "tb1qzelepmza0c0gkkvm3aaerr95qjq8eysmkcw76z",
-    "amount": 9540,
-    "confirmations": 1,
-    "utxo_type": "regular"
-  },
-  {
-    "addr": "tb1qrjefrm0puwnl2exjpl73devd7czjqd8rl37wze",
-    "amount": 19124,
-    "confirmations": 1,
-    "utxo_type": "swept-incoming-swap"
   }
 ]
 
 $ ./maker-cli get-balances
 {
-    "regular": 938000,
+    "regular": 978500,
     "swap": 0,
     "contract": 0,
-    "fidelity": 50000,
-    "spendable": 938000
+    "fidelity": 10000,
+    "spendable": 978500
 }
 ```
+
+After sending `10,000 sats` with a ~`500 sats` mining fee, the spendable balance dropped from `989,000` to `978,500` sats, and the change was consolidated back into the regular wallet UTXO.
+
+---
+
+### VerifyDeniability
+
+After a completed swap, you can verify the deniability proof for a specific swap ID:
+
+```bash
+$ ./maker-cli verify-deniability --swap-id <swap_id>
+
+Proof valid: swap participated in a completed openswap
+```
+
+If the proof is missing or doesn't check out, the command prints `Proof invalid or not found for this swap ID`.
 
 ---
 
@@ -568,18 +538,13 @@ Shutdown Initiated
 This shuts down the makerd server. Once you run this command, the maker server initiates a shutdown, and we'll see the following logs indicating the shutdown process:
 
 ```bash
- INFO openswap::maker::server - [6102] Maker is shutting down.
- INFO openswap::maker::api - Joining 4 threads
- INFO openswap::maker::api - [6102] Thread RPC Thread joined
- INFO openswap::maker::api - [6102] Thread Contract Watcher Thread joined
- INFO openswap::maker::api - [6102] Thread Idle Client Checker Thread joined
- INFO openswap::maker::api - [6102] Thread Bitcoin Core Connection Checker Thread joined
- INFO openswap::maker::api - Successfully joined 4 threads
- INFO openswap::maker::server - Shutdown wallet sync initiated.
- INFO openswap::maker::server - Shutdown wallet syncing completed.
- INFO openswap::maker::server - Wallet file saved to disk.
- INFO openswap::maker::server - Maker Server is shut down successfully
+ INFO openswap::maker::server - [6102] Server shutting down...
+ INFO openswap::maker::server - shutdown_phase_start pid=... component=maker:6102 phase=wallet_save
+ INFO openswap::maker::server - shutdown_phase_done pid=... component=maker:6102 phase=wallet_save outcome=ok
+ INFO openswap::maker::server - [6102] Server shutdown complete
 ```
+
+On shutdown, `makerd` also removes the `rpc_cookie` file from the data directory.
 
 ---
 

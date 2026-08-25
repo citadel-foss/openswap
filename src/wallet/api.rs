@@ -157,9 +157,19 @@ impl PartialEq for Wallet {
         self.store.network == other.store.network &&
         // Compare master keys by plaintext (each unsealed with its own
         // passphrase), not by sealed bytes, so wallets sealed under
-        // different passphrases/nonces still compare equal.
-        self.store.master_key.plaintext_with(&self.store_enc_material) ==
-        other.store.master_key.plaintext_with(&other.store_enc_material) &&
+        // different passphrases/nonces still compare equal. Both sides must
+        // unseal: `plaintext_with` maps a decryption failure to `None`, and
+        // `None == None` would report a false match.
+        matches!(
+            (
+                self.store.master_key.plaintext_with(&self.store_enc_material),
+                other
+                    .store
+                    .master_key
+                    .plaintext_with(&other.store_enc_material),
+            ),
+            (Some(a), Some(b)) if a == b
+        ) &&
         self.store.external_index == other.store.external_index &&
         self.store.internal_index == other.store.internal_index &&
         self.store.offer_maxsize == other.store.offer_maxsize &&
@@ -516,19 +526,27 @@ impl Wallet {
         };
 
         let (store, store_enc_material, migrated) =
-            match WalletStore::read_from_disk(path, password.clone().unwrap_or_default()) {
+            match WalletStore::read_from_disk(path, password.clone()) {
                 Ok((store, Some(material))) => (store, material, false),
                 // Legacy plaintext file, no passphrase supplied.
                 Ok((store, None)) => {
                     let (store, material) = migration_material(store, password.clone())?;
                     (store, material, true)
                 }
+                // Encrypted file, no passphrase supplied. Report how to supply
+                // one instead of failing decryption with an empty passphrase.
+                Err(WalletError::Security(SecurityError::PasswordRequired)) => {
+                    return Err(WalletError::General(format!(
+                        "wallet file {path:?} is encrypted; \
+                         provide the wallet passphrase via -p/--password"
+                    )))
+                }
                 // Passphrase supplied for a legacy plaintext file: read it as
                 // plaintext, then migrate.
                 Err(WalletError::Security(SecurityError::Format(msg)))
                     if password.is_some() && msg.contains("expected encrypted file") =>
                 {
-                    let (store, None) = WalletStore::read_from_disk(path, String::new())? else {
+                    let (store, None) = WalletStore::read_from_disk(path, None)? else {
                         unreachable!("a plaintext wallet file yields no encryption material")
                     };
                     let (store, material) = migration_material(store, password.clone())?;
@@ -2187,14 +2205,11 @@ impl Wallet {
                         // Prevouts only need the script_pubkey: derive it
                         // from the account xpub so no secret material is
                         // involved in this pass at all.
-                        let account_xpub = self
-                            .with_account_key(*address_type, |account| {
-                                Ok(Xpub::from_priv(&secp, account))
-                            })
-                            .unwrap();
+                        let account_xpub = self.with_account_key(*address_type, |account| {
+                            Ok(Xpub::from_priv(&secp, account))
+                        })?;
                         let child_pubkey = account_xpub
-                            .derive_pub(&secp, &DerivationPath::from_str(path).unwrap())
-                            .unwrap()
+                            .derive_pub(&secp, &DerivationPath::from_str(path)?)?
                             .public_key;
 
                         let script_pubkey = match address_type {
@@ -2203,7 +2218,7 @@ impl Wallet {
                                     compressed: true,
                                     inner: child_pubkey,
                                 };
-                                ScriptBuf::new_p2wpkh(&pubkey.wpubkey_hash().unwrap())
+                                ScriptBuf::new_p2wpkh(&pubkey.wpubkey_hash()?)
                             }
                             AddressType::P2TR => {
                                 let x_only_pubkey = XOnlyPublicKey::from(child_pubkey);
@@ -3982,7 +3997,7 @@ mod prevout_contract_tests {
             .contains_key(&new_prevout));
 
         let (reloaded_store, _) =
-            WalletStore::read_from_disk(&wallet_path, "test-password".to_string()).unwrap();
+            WalletStore::read_from_disk(&wallet_path, Some("test-password".to_string())).unwrap();
         assert_eq!(
             reloaded_store.prevout_to_contract_map.get(&prevout),
             Some(&approved_contract)

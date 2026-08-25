@@ -241,7 +241,8 @@ impl KeyMaterial {
     /// The key is never persisted, so anything sealed with it is
     /// unrecoverable once the process exits. Only used by tests — wallets
     /// always seal with passphrase-derived material.
-    pub fn new_ephemeral() -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_ephemeral() -> Self {
         KeyMaterial {
             key: random::<EncryptionKey>(),
             nonce: Aes256Gcm::generate_nonce(&mut OsRng).into(),

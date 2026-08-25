@@ -18,7 +18,7 @@ use openswap::{
     maker::{start_server, MakerServer},
     taker::TakerBehavior,
     utill::MIN_FEE_RATE,
-    wallet::{AddressType, Blockchain, CoreRPC, CoreRpcConfig, Destination},
+    wallet::{AddressType, Blockchain, CoreRPC, CoreRpcConfig, Destination, ElectrumConfig},
 };
 
 use super::test_framework::*;
@@ -748,7 +748,11 @@ fn test_unconfirmed_fidelity_bond_not_duplicated() {
     // Resume mining so the restarted maker can wait out the confirmation.
     test_framework.set_block_gen_paused(false);
 
-    let restarted = Arc::new(MakerServer::init(maker.config.clone()).unwrap());
+    // The first init consumed the passphrase (`config.password.take()`), so
+    // re-supply it to simulate the operator re-entering it on restart.
+    let mut restart_config = maker.config.clone();
+    restart_config.password = Some("integration-test".to_string());
+    let restarted = Arc::new(MakerServer::init(restart_config).unwrap());
     let restarted_clone = restarted.clone();
     let restarted_thread = thread::spawn(move || {
         let _ = start_server(restarted_clone);
@@ -808,4 +812,538 @@ fn test_unconfirmed_fidelity_bond_not_duplicated() {
     block_generation_handle.join().unwrap();
 
     log::info!("Unconfirmed fidelity bond restart test completed successfully");
+}
+
+/// Eviction path: if the unconfirmed bond tx falls out of the mempool while
+/// the maker is offline, the restart must rebroadcast the stored raw
+/// transaction — keeping the original txid and creating no second bond.
+///
+/// Regtest has no "evict from mempool" RPC, so the eviction is simulated by
+/// restarting bitcoind with `-persistmempool=0` on the same datadir: the
+/// chain (and every confirmed coin) survives, the mempool does not.
+///
+/// Anchored to `test_unconfirmed_fidelity_bond_not_duplicated`, which covers
+/// the mempool-present early return; this test covers the rebroadcast branch
+/// of `ensure_fidelity_bond_broadcast`.
+#[test]
+fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
+    // ---- Setup ----
+    let makers_config_map = vec![(8104, None)];
+
+    let (test_framework, _takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, vec![], vec![]);
+
+    log::info!("Running Test: Evicted Fidelity Bond Rebroadcast On Restart");
+
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers.first().unwrap();
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+
+    fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
+
+    // ----- Run 1: maker broadcasts a bond, then stops before it confirms -----
+
+    // Pause the background miner so the bond tx cannot confirm while run 1 is up.
+    test_framework.set_block_gen_paused(true);
+
+    let maker_clone = maker.clone();
+    let maker_thread = thread::spawn(move || {
+        let _ = start_server(maker_clone);
+    });
+
+    wait_for_log(
+        &log_path,
+        "Fidelity bond broadcast, waiting for confirmation",
+        Duration::from_secs(120),
+    );
+
+    let broadcast_line = std::fs::read_to_string(&log_path)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains("Fidelity bond broadcast, waiting for confirmation"))
+        .expect("run 1 must log the bond broadcast line")
+        .to_string();
+    let bond_txid: Txid = broadcast_line
+        .rsplit(": ")
+        .next()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "could not parse bond txid from log line: {}",
+                broadcast_line
+            )
+        });
+    assert!(
+        bitcoind.client.get_mempool_entry(&bond_txid).is_ok(),
+        "bond tx {} must be in the mempool before the eviction",
+        bond_txid
+    );
+
+    // Stop the maker while the bond is still unconfirmed.
+    maker.shutdown.store(true, Relaxed);
+    let _ = maker_thread.join();
+
+    // ----- Evict the bond: restart bitcoind without mempool persistence -----
+
+    let (wallet_name, zmq_addr) = match &maker.config.backend {
+        openswap::wallet::BackendConfig::CoreRpc(cfg) => {
+            (cfg.wallet_name.clone(), cfg.zmq_addr.clone())
+        }
+        _ => panic!("expected a CoreRpc backend"),
+    };
+
+    // Clean stop writes mempool.dat; the replacement node must not load it.
+    let _ = test_framework.bitcoind.client.stop();
+
+    let mut conf = bitcoind::Conf::default();
+    conf.args.push("-txindex=1");
+    conf.args.push("-deprecatedrpc=warnings");
+    // This is the eviction: the mempool is not reloaded from mempool.dat.
+    conf.args.push("-persistmempool=0");
+    // ... and the node wallet must not resurrect the evicted tx: Core
+    // rebroadcasts the wallet's unconfirmed transactions on startup, which
+    // would put the bond right back in the mempool.
+    conf.args.push("-walletbroadcast=0");
+    let raw_tx = format!("-zmqpubrawtx={zmq_addr}");
+    conf.args.push(&raw_tx);
+    let block_hash = format!("-zmqpubrawblock={zmq_addr}");
+    conf.args.push(&block_hash);
+    conf.p2p = bitcoind::P2P::Yes;
+    conf.staticdir = Some(test_framework.temp_dir.join(".bitcoin"));
+
+    // The old node releases the datadir lock and the ZMQ ports
+    // asynchronously; retry until the replacement can take them over.
+    let new_bitcoind = {
+        let exe_path = bitcoind::exe_path().unwrap();
+        let mut attempt = 0;
+        loop {
+            match bitcoind::BitcoinD::with_conf(exe_path.clone(), &conf) {
+                Ok(node) => break node,
+                Err(e) if attempt < 30 => {
+                    attempt += 1;
+                    log::warn!("replacement bitcoind not ready yet ({}); retrying", e);
+                    thread::sleep(Duration::from_secs(2));
+                }
+                Err(e) => panic!("replacement bitcoind failed to start: {}", e),
+            }
+        }
+    };
+
+    assert!(
+        new_bitcoind.client.get_mempool_entry(&bond_txid).is_err(),
+        "bond tx {} must be evicted after the mempool reset",
+        bond_txid
+    );
+
+    // ----- Run 2: the restart must rebroadcast the stored bond tx -----
+
+    // The first init consumed the passphrase (`config.password.take()`), so
+    // re-supply it, and point the backend at the replacement node.
+    let mut restart_config = maker.config.clone();
+    restart_config.password = Some("integration-test".to_string());
+    restart_config.backend = openswap::wallet::BackendConfig::CoreRpc(CoreRpcConfig {
+        url: new_bitcoind.rpc_url().split_at(7).1.to_string(),
+        auth: Auth::CookieFile(new_bitcoind.params.cookie_file.clone()),
+        wallet_name,
+        zmq_addr,
+    });
+
+    let restarted = Arc::new(MakerServer::init(restart_config).unwrap());
+    let restarted_clone = restarted.clone();
+    let restarted_thread = thread::spawn(move || {
+        let _ = start_server(restarted_clone);
+    });
+
+    // The restart must detect the eviction and rebroadcast the stored raw
+    // transaction, which reproduces the original txid.
+    wait_for_log(
+        &log_path,
+        "evicted from mempool?); rebroadcasting",
+        Duration::from_secs(120),
+    );
+    assert!(
+        new_bitcoind.client.get_mempool_entry(&bond_txid).is_ok(),
+        "rebroadcast must put the original bond tx {} back in the mempool",
+        bond_txid
+    );
+
+    // Confirm the rebroadcast tx so finalization completes (the background
+    // miner stays paused: it talks to the dead node).
+    generate_blocks(&new_bitcoind, 1);
+    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+
+    // State assertions: exactly one bond, with the original outpoint, and its
+    // confirmation recorded.
+    {
+        let wallet_read = restarted.wallet.read().unwrap();
+        let bonds = wallet_read.get_fidelity_bonds();
+        assert_eq!(bonds.len(), 1, "restart must not create a second bond");
+        assert_eq!(
+            bonds[0].outpoint().txid,
+            bond_txid,
+            "rebroadcast must keep the original bond txid"
+        );
+        assert_eq!(
+            wallet_read.get_highest_fidelity_index().unwrap(),
+            Some(0),
+            "rebroadcast bond must be valuated, i.e. its confirmation was recorded"
+        );
+    }
+
+    restarted.shutdown.store(true, Relaxed);
+    let _ = restarted_thread.join();
+
+    // ----- Assertions on the log of both runs -----
+    let log = std::fs::read_to_string(&log_path).unwrap();
+
+    assert!(
+        log.contains("not visible to the backend (evicted from mempool?); rebroadcasting"),
+        "restart must take the rebroadcast branch for the evicted bond"
+    );
+    assert!(
+        log.contains("confirmed at height"),
+        "restart must record the rebroadcast bond's confirmation"
+    );
+    assert_eq!(
+        log.matches("No active Fidelity Bonds found. Creating one.")
+            .count(),
+        1,
+        "restart must not take the create-new-bond branch (would doubly lock funds)"
+    );
+    assert!(
+        !log.contains("Successfully created fidelity bond"),
+        "restart must not create a second fidelity bond"
+    );
+
+    // Teardown: stop the replacement node first; the framework's original
+    // node is already down (TestFramework::stop tolerates that).
+    let _ = new_bitcoind.client.stop();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+
+    log::info!("Evicted fidelity bond rebroadcast test completed successfully");
+}
+
+/// Electrum variant of `test_unconfirmed_fidelity_bond_not_duplicated`:
+/// a maker that shuts down with an unconfirmed bond must adopt it on restart
+/// instead of creating a second one, this time over the Electrum backend.
+#[test]
+fn test_unconfirmed_fidelity_bond_not_duplicated_electrum() {
+    // ---- Setup ----
+    let makers_config_map = vec![(8105, None)];
+
+    let (test_framework, _takers, makers, block_generation_handle) =
+        TestFramework::init::<ElectrumBackend>(makers_config_map, vec![], vec![]);
+
+    log::info!("Running Test: Unconfirmed Fidelity Bond Survives Maker Restart (Electrum)");
+
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers.first().unwrap();
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+
+    fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
+
+    // ----- Run 1: maker broadcasts a bond, then stops before it confirms -----
+
+    test_framework.set_block_gen_paused(true);
+
+    let maker_clone = maker.clone();
+    let maker_thread = thread::spawn(move || {
+        let _ = start_server(maker_clone);
+    });
+
+    wait_for_log(
+        &log_path,
+        "Fidelity bond broadcast, waiting for confirmation",
+        Duration::from_secs(120),
+    );
+
+    let broadcast_line = std::fs::read_to_string(&log_path)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains("Fidelity bond broadcast, waiting for confirmation"))
+        .expect("run 1 must log the bond broadcast line")
+        .to_string();
+    let bond_txid: Txid = broadcast_line
+        .rsplit(": ")
+        .next()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "could not parse bond txid from log line: {}",
+                broadcast_line
+            )
+        });
+    assert!(
+        bitcoind.client.get_mempool_entry(&bond_txid).is_ok(),
+        "bond tx {} must still be unconfirmed for this test to mean anything",
+        bond_txid
+    );
+
+    maker.shutdown.store(true, Relaxed);
+    let _ = maker_thread.join();
+
+    // ----- Run 2: the restart must adopt the pending bond, not create a new one -----
+
+    // Resume mining so the restarted maker can wait out the confirmation.
+    test_framework.set_block_gen_paused(false);
+
+    // The first init consumed the passphrase (`config.password.take()`), so
+    // re-supply it to simulate the operator re-entering it on restart. The
+    // Electrum backend is untouched: electrs keeps running throughout.
+    let mut restart_config = maker.config.clone();
+    restart_config.password = Some("integration-test".to_string());
+    let restarted = Arc::new(MakerServer::init(restart_config).unwrap());
+    let restarted_clone = restarted.clone();
+    let restarted_thread = thread::spawn(move || {
+        let _ = start_server(restarted_clone);
+    });
+
+    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+
+    {
+        let wallet_read = restarted.wallet.read().unwrap();
+        let bonds = wallet_read.get_fidelity_bonds();
+        assert_eq!(bonds.len(), 1, "restart must not create a second bond");
+        assert_eq!(
+            bonds[0].outpoint().txid,
+            bond_txid,
+            "restart must adopt the bond broadcast in run 1"
+        );
+        assert_eq!(
+            wallet_read.get_highest_fidelity_index().unwrap(),
+            Some(0),
+            "adopted bond must be valuated, i.e. its confirmation was recorded"
+        );
+    }
+
+    restarted.shutdown.store(true, Relaxed);
+    let _ = restarted_thread.join();
+
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("waiting for confirmation instead of creating a new one"),
+        "restart must detect the pending bond and wait for it"
+    );
+    assert!(
+        log.contains("confirmed at height"),
+        "restart must record the pending bond's confirmation"
+    );
+    assert_eq!(
+        log.matches("No active Fidelity Bonds found. Creating one.")
+            .count(),
+        1,
+        "restart must not take the create-new-bond branch (would doubly lock funds)"
+    );
+    assert!(
+        !log.contains("Successfully created fidelity bond"),
+        "restart must not create a second fidelity bond"
+    );
+
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+
+    log::info!("Unconfirmed fidelity bond restart test (Electrum) completed successfully");
+}
+
+/// Electrum variant of `test_evicted_fidelity_bond_rebroadcast_on_restart`:
+/// the unconfirmed bond is evicted while the maker is offline (bitcoind
+/// restarted with `-persistmempool=0`), and the restart must rebroadcast the
+/// stored raw transaction over Electrum, keeping the original txid.
+///
+/// electrs follows bitcoind's mempool, so it must be restarted against the
+/// replacement node as well; its mempool view is in-memory, so a fresh
+/// electrs reflects the empty mempool immediately.
+#[test]
+fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum() {
+    // ---- Setup ----
+    let makers_config_map = vec![(8106, None)];
+
+    let (test_framework, _takers, makers, block_generation_handle) =
+        TestFramework::init::<ElectrumBackend>(makers_config_map, vec![], vec![]);
+
+    log::info!("Running Test: Evicted Fidelity Bond Rebroadcast On Restart (Electrum)");
+
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers.first().unwrap();
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+
+    fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
+
+    // ----- Run 1: maker broadcasts a bond, then stops before it confirms -----
+
+    test_framework.set_block_gen_paused(true);
+
+    let maker_clone = maker.clone();
+    let maker_thread = thread::spawn(move || {
+        let _ = start_server(maker_clone);
+    });
+
+    wait_for_log(
+        &log_path,
+        "Fidelity bond broadcast, waiting for confirmation",
+        Duration::from_secs(120),
+    );
+
+    let broadcast_line = std::fs::read_to_string(&log_path)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains("Fidelity bond broadcast, waiting for confirmation"))
+        .expect("run 1 must log the bond broadcast line")
+        .to_string();
+    let bond_txid: Txid = broadcast_line
+        .rsplit(": ")
+        .next()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "could not parse bond txid from log line: {}",
+                broadcast_line
+            )
+        });
+    assert!(
+        bitcoind.client.get_mempool_entry(&bond_txid).is_ok(),
+        "bond tx {} must be in the mempool before the eviction",
+        bond_txid
+    );
+
+    maker.shutdown.store(true, Relaxed);
+    let _ = maker_thread.join();
+
+    // ----- Evict the bond: restart bitcoind without mempool persistence -----
+
+    let electrum_cfg = match &maker.config.backend {
+        openswap::wallet::BackendConfig::Electrum(cfg) => cfg.clone(),
+        _ => panic!("expected an Electrum backend"),
+    };
+
+    // electrs polls bitcoind, so it goes down before the node does.
+    drop(test_framework.electrsd.lock().unwrap().take());
+    // Clean stop writes mempool.dat; the replacement node must not load it.
+    let _ = test_framework.bitcoind.client.stop();
+
+    let mut conf = bitcoind::Conf::default();
+    conf.args.push("-txindex=1");
+    conf.args.push("-deprecatedrpc=warnings");
+    // This is the eviction: the mempool is not reloaded from mempool.dat.
+    // (No `-walletbroadcast=0` needed here: with the Electrum backend no
+    // node-side wallet tracks the bond tx. No ZMQ args either: electrs
+    // talks to the node over RPC/p2p only.)
+    conf.args.push("-persistmempool=0");
+    conf.p2p = bitcoind::P2P::Yes;
+    conf.staticdir = Some(test_framework.temp_dir.join(".bitcoin"));
+
+    // The old node releases the datadir lock asynchronously; retry until the
+    // replacement can take it over.
+    let new_bitcoind = {
+        let exe_path = bitcoind::exe_path().unwrap();
+        let mut attempt = 0;
+        loop {
+            match bitcoind::BitcoinD::with_conf(exe_path.clone(), &conf) {
+                Ok(node) => break node,
+                Err(e) if attempt < 30 => {
+                    attempt += 1;
+                    log::warn!("replacement bitcoind not ready yet ({}); retrying", e);
+                    thread::sleep(Duration::from_secs(2));
+                }
+                Err(e) => panic!("replacement bitcoind failed to start: {}", e),
+            }
+        }
+    };
+
+    assert!(
+        new_bitcoind.client.get_mempool_entry(&bond_txid).is_err(),
+        "bond tx {} must be evicted after the mempool reset",
+        bond_txid
+    );
+
+    // Fresh electrs against the replacement node (same db dir: the indexed
+    // chain survives, the mempool view is rebuilt empty).
+    thread::sleep(Duration::from_secs(2));
+    let new_electrsd = init_electrsd(&new_bitcoind, &test_framework.temp_dir);
+    let new_electrum_cfg = ElectrumConfig {
+        url: format!("tcp://{}", new_electrsd.electrum_url),
+        ..electrum_cfg
+    };
+    wait_for_electrs_tip(&new_bitcoind, &new_electrsd, &new_electrum_cfg);
+
+    // ----- Run 2: the restart must rebroadcast the stored bond tx -----
+
+    // The first init consumed the passphrase (`config.password.take()`), so
+    // re-supply it, and point the backend at the replacement electrs.
+    let mut restart_config = maker.config.clone();
+    restart_config.password = Some("integration-test".to_string());
+    restart_config.backend = openswap::wallet::BackendConfig::Electrum(new_electrum_cfg.clone());
+
+    let restarted = Arc::new(MakerServer::init(restart_config).unwrap());
+    let restarted_clone = restarted.clone();
+    let restarted_thread = thread::spawn(move || {
+        let _ = start_server(restarted_clone);
+    });
+
+    wait_for_log(
+        &log_path,
+        "evicted from mempool?); rebroadcasting",
+        Duration::from_secs(120),
+    );
+    assert!(
+        new_bitcoind.client.get_mempool_entry(&bond_txid).is_ok(),
+        "rebroadcast must put the original bond tx {} back in the mempool",
+        bond_txid
+    );
+
+    // Confirm the rebroadcast tx so finalization completes, and nudge electrs
+    // to index the block (the background miner stays paused: it talks to the
+    // dead node).
+    generate_blocks(&new_bitcoind, 1);
+    let _ = new_electrsd.trigger();
+    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+
+    {
+        let wallet_read = restarted.wallet.read().unwrap();
+        let bonds = wallet_read.get_fidelity_bonds();
+        assert_eq!(bonds.len(), 1, "restart must not create a second bond");
+        assert_eq!(
+            bonds[0].outpoint().txid,
+            bond_txid,
+            "rebroadcast must keep the original bond txid"
+        );
+        assert_eq!(
+            wallet_read.get_highest_fidelity_index().unwrap(),
+            Some(0),
+            "rebroadcast bond must be valuated, i.e. its confirmation was recorded"
+        );
+    }
+
+    restarted.shutdown.store(true, Relaxed);
+    let _ = restarted_thread.join();
+
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("not visible to the backend (evicted from mempool?); rebroadcasting"),
+        "restart must take the rebroadcast branch for the evicted bond"
+    );
+    assert!(
+        log.contains("confirmed at height"),
+        "restart must record the rebroadcast bond's confirmation"
+    );
+    assert_eq!(
+        log.matches("No active Fidelity Bonds found. Creating one.")
+            .count(),
+        1,
+        "restart must not take the create-new-bond branch (would doubly lock funds)"
+    );
+    assert!(
+        !log.contains("Successfully created fidelity bond"),
+        "restart must not create a second fidelity bond"
+    );
+
+    // Teardown: electrs first (its datadir sits inside temp_dir), then the
+    // replacement node; the framework's original node is already down.
+    drop(new_electrsd);
+    let _ = new_bitcoind.client.stop();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+
+    log::info!("Evicted fidelity bond rebroadcast test (Electrum) completed successfully");
 }

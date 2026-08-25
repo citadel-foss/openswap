@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::BufWriter,
+    io::{BufWriter, Write},
     path::Path,
 };
 
@@ -270,28 +270,37 @@ impl WalletStore {
 
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-        serde_cbor::to_writer(BufWriter::new(&mut tmp), &encrypted)?;
+        let mut writer = BufWriter::new(&mut tmp);
+        serde_cbor::to_writer(&mut writer, &encrypted)?;
+        // `Drop for BufWriter` discards flush errors, so flush explicitly:
+        // a swallowed error would rename a truncated wallet over the good one.
+        writer.flush()?;
+        drop(writer);
         tmp.as_file().sync_all()?;
         tmp.persist(path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // Without this the rename itself may not survive a crash.
+        File::open(parent)?.sync_all()?;
         Ok(())
     }
 
     /// Reads from a path (errors if path doesn't exist).
-    /// If `store_enc_material` is provided, attempts to decrypt the file using the
+    /// If `password` is provided, attempts to decrypt the file using the
     /// provided key. Returns the deserialized `WalletStore` and the nonce.
+    /// An encrypted file read without a password yields
+    /// [`crate::security::SecurityError::PasswordRequired`].
     pub(crate) fn read_from_disk(
         backup_file_path: &Path,
-        password: String,
+        password: Option<String>,
     ) -> Result<(Self, Option<KeyMaterial>), WalletError> {
-        load_sensitive_struct::<Self, SerdeCbor>(backup_file_path, Some(password))
-            .map_err(Into::into)
+        load_sensitive_struct::<Self, SerdeCbor>(backup_file_path, password).map_err(Into::into)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::SecurityError;
     use bip39::rand::{thread_rng, Rng};
     use bitcoind::tempfile::tempdir;
 
@@ -321,7 +330,8 @@ mod tests {
             .write_to_disk(&file_path, &encryption_material)
             .unwrap();
 
-        let (read_wallet, material) = WalletStore::read_from_disk(&file_path, password).unwrap();
+        let (read_wallet, material) =
+            WalletStore::read_from_disk(&file_path, Some(password)).unwrap();
         assert!(material.is_some());
         assert_eq!(original_wallet_store, read_wallet);
     }
@@ -388,7 +398,7 @@ mod tests {
             .write_to_disk(&file_path, &encryption_material)
             .unwrap();
 
-        let (read_store, _) = WalletStore::read_from_disk(&file_path, password).unwrap();
+        let (read_store, _) = WalletStore::read_from_disk(&file_path, Some(password)).unwrap();
         assert_eq!(store, read_store);
         let unsealed = read_store
             .master_key
@@ -416,13 +426,42 @@ mod tests {
         )
         .unwrap();
 
-        let error = WalletStore::read_from_disk(&file_path, "wrong password".to_string())
+        let error = WalletStore::read_from_disk(&file_path, Some("wrong password".to_string()))
             .expect_err("a wrong password must fail authentication");
         assert!(error.to_string().contains("decryption failed"));
 
         let (read_wallet, read_encryption_material) =
-            WalletStore::read_from_disk(&file_path, password).unwrap();
+            WalletStore::read_from_disk(&file_path, Some(password)).unwrap();
         assert_eq!(original_wallet_store, read_wallet);
         assert!(read_encryption_material.is_some());
+    }
+
+    #[test]
+    fn encrypted_wallet_without_password_says_password_required() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_wallet.cbor");
+        let seed: [u8; 16] = thread_rng().gen();
+        let master_key = Xpriv::new_master(Network::Bitcoin, &seed).unwrap();
+        let encryption_material =
+            KeyMaterial::new_from_password(Some("wallet password".to_string())).unwrap();
+
+        WalletStore::init(
+            "test_wallet".to_string(),
+            &file_path,
+            Network::Bitcoin,
+            master_key,
+            None,
+            &encryption_material,
+        )
+        .unwrap();
+
+        // No passphrase at all must surface PasswordRequired, not a
+        // misleading decryption failure from an empty passphrase.
+        let error = WalletStore::read_from_disk(&file_path, None)
+            .expect_err("an encrypted file without a password must be rejected");
+        assert!(matches!(
+            error,
+            WalletError::Security(SecurityError::PasswordRequired)
+        ));
     }
 }

@@ -379,10 +379,25 @@ impl Blockchain for CoreRPC {
     }
 
     fn is_tx_unknown(&self, txid: &Txid) -> Result<bool, WalletError> {
-        match self.rpc.get_raw_transaction(txid, None) {
-            Ok(_) => Ok(false),
+        let info = match self.rpc.get_raw_transaction_info(txid, None) {
+            Ok(info) => info,
             // -5 (RPC_INVALID_ADDRESS_OR_KEY): Core's "no such mempool or
             // blockchain transaction" answer.
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -5 => {
+                return Ok(true)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if info.blockhash.is_some() {
+            // Confirmed in a block.
+            return Ok(false);
+        }
+        // Unconfirmed. `getrawtransaction` also returns wallet-record
+        // transactions that were evicted from the mempool; those must count
+        // as unknown so callers rebroadcast them. A live mempool entry is the
+        // only proof of "known" here.
+        match self.rpc.get_mempool_entry(txid) {
+            Ok(_) => Ok(false),
             Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -5 => Ok(true),
             Err(e) => Err(e.into()),
         }

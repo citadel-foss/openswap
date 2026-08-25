@@ -18,38 +18,54 @@ Maker stores all its data in a directory located by default at `$HOME/.openswap/
 ### **1. Default Maker Configuration (`~/.openswap/maker/config.toml`):**
 
 ```toml
+# Maker Configuration File
+
+# Network port for client connections
 network_port = 6102
+# RPC port for maker-cli operations
 rpc_port = 6103
+# Socks port for Tor proxy
 socks_port = 9050
+# Control port for Tor interface
 control_port = 9051
+# Authentication password for Tor interface
 tor_auth_password = ""
+# Minimum amount in satoshis that can be swapped
 min_swap_amount = 10000
-fidelity_amount = 50000
-fidelity_timelock = 13104
+# Fidelity Bond amount in satoshis
+fidelity_amount = 10000
+# Fidelity Bond timelock in blocks (must be between 12960 and 25920)
+fidelity_timelock = 15000
+# Fee rate in sats/vB for the fidelity bond transaction (must be at least 1.0)
 fidelity_feerate = 2.0
-connection_type = TOR
+# A fixed base fee charged by the Maker for providing its services (in satoshis)
 base_fee = 500
+# A percentage fee based on the swap amount
 amount_relative_fee_pct = 0.0025
+# A percentage fee based on the swap duration
 time_relative_fee_pct = 0.0001
+# Required confirmations for funding transactions
+required_confirms = 1
 ```
 - `network_port`: TCP port where the Maker listens for incoming OpenSwap protocol messages.
 - `rpc_port`: The port through which `makerd` listens for RPC commands from `maker-cli`.
 - `socks_port`: The Tor Socks Port.  Check the [tor doc](tor.md) for more details.
 - `control_port`: The Tor Control Port. Check the [tor doc](tor.md) for more details.
 - `tor_auth_password`: Optional password for Tor control authentication; empty by default.
-- `min_swap_amount`: Minimum swap amount (in satoshis).
-- `fidelity_amount`: Amount (in satoshis) locked as a fidelity bond to deter Sybil attacks.
-- `fidelity_timelock`: Lock duration in block heights for the fidelity bond.
+- `min_swap_amount`: Minimum swap amount (in satoshis). Values below the protocol minimum of 10,000 sats are rejected at startup.
+- `fidelity_amount`: Amount (in satoshis) locked as a fidelity bond to deter Sybil attacks. Defaults to 10,000 sats.
+- `fidelity_timelock`: Lock duration in block heights for the fidelity bond. Defaults to 15,000 blocks; must be within the accepted range of 12,960–25,920 blocks.
 - `fidelity_feerate`: Fee rate (in sats/vB) for the fidelity bond transaction. Defaults to 2.0; lower values are allowed, but anything below the relay minimum of 1.0 sats/vB is clamped to 1.0.
-- `connection_type`: Specifies the network mode; set to "TOR" in production for privacy, or "CLEARNET" during testing.
 - `base_fee`: A fixed fee charged by the Maker for providing its services (in satoshis).
 - `amount_relative_fee_pct`: A percentage fee based on the swap amount.
 - `time_relative_fee_pct`: A percentage fee based on the swap duration.
+- `required_confirms`: Number of confirmations required for funding transactions (default: 1).
 
-
+> **Note:**  
+> On the first run, if the default `network_port` or `rpc_port` is already in use, `makerd` automatically discovers a free port and persists it to `config.toml`.
 
 > **Important:**  
-> At the moment, OpenSwap operates only on the **TOR** network. The `connection_type` is hardcoded to `TOR`, and the app will only work with this network until multi-network support is added.
+> At the moment, OpenSwap operates only on the **TOR** network for peer-to-peer connections. There is no clearnet option; the app will only work over Tor until multi-network support is added.
 
 ### 2. **wallets Directory**
 
@@ -60,6 +76,10 @@ The default wallet directory is `$HOME/.openswap/maker/wallets`.
 ### 3. **debug.log**
 
 The log file for `makerd`, where debug information is stored for troubleshooting and monitoring.
+
+### 4. **rpc_cookie**
+
+A randomly generated authentication token written by `makerd` on startup and removed on shutdown. `maker-cli` reads this file from the maker data directory to authenticate its RPC requests, so it must be run on the same machine (and with read access to the data directory) as `makerd`.
 
 ---
 
@@ -106,56 +126,57 @@ This will display information about the `makerd` binary and its options.
 **Output:**
 
 ```bash
-openswap 0.1.2
-Developers at Citadel FOSS
 OpenSwap Maker Server
 
-The server requires a Bitcoin Core RPC connection running in Testnet4. It requires a starting
-balance, around 50,000 sats for Fidelity + Swap Liquidity (suggested 50,000 sats). So top up with at
-least 0.001 BTC to start all the node processes. Suggested [faucet
-here] http://xjw3jlepdy35ydwpjuptdbu3y74gyeagcjbuyq7xals2njjxrze6kxid.onion/
+The server requires a Bitcoin Core RPC connection running in Testnet4. It requires some starting balance, around 50,000 sats for Fidelity + Swap Liquidity (suggested 50,000 sats). So topup with at least 0.001 BTC to start all the node processses. Suggested [faucet here]<https://mempool.space/testnet4/faucet>
 
-All server processes will start after the fidelity bond transaction is confirmed. This may take some
-time. Approx: 10 mins. Once the bond is confirmed, the server starts listening for incoming swap
-requests. As it performs swaps for clients, it keeps earning fees.
+All server processes will start after the fidelity bond transaction is confirmed. This may take some time. Approx: 10 mins. Once the bond is confirmed, the server starts listening for incoming swap requests. As it performs swaps for clients, it keeps earning fees.
 
 The server is operated with the maker-cli app, for all basic wallet related operations.
 
-For more detailed usage information, please refer to the [Maker
-Doc] https://github.com/citadel-foss/openswap/blob/master/docs/makerd.md
+For more detailed usage information, please refer the [Maker Doc]<https://github.com/citadel-foss/openswap/blob/master/docs/makerd.md>
 
-This is early beta, and there are known and unknown bugs. Please report issues in the [Project Issue
-Board] https://github.com/citadel-foss/openswap/issues
+This is early beta, and there are known and unknown bugs. Please report issues in the [Project Issue Board]<https://github.com/citadel-foss/openswap/issues>
 
-USAGE:
-    makerd [OPTIONS]
+Usage: makerd [OPTIONS]
 
-OPTIONS:
-    -a, --USER:PASSWORD <USER:PASSWORD>
-            Bitcoin Core RPC authentication string (username, password)
-            
-            [default: user:password]
+Options:
+  -d, --data-directory <DATA_DIRECTORY>
+          Optional DNS data directory. Default value: "~/.openswap/maker"
 
-    -d, --data-directory <DATA_DIRECTORY>
-            Optional data directory. Default value: "~/.openswap/maker"
+  -r, --ADDRESS:PORT <ADDRESS:PORT>
+          Bitcoin Core RPC network address. Conflicts with `--electrum`
+          
+          [default: 127.0.0.1:38332]
 
-    -h, --help
-            Print help information
+  -z, --ZMQ <ZMQ>
+          Bitcoin Core ZMQ address:port value. Defaults to the RPC host on port 28332
 
-    -r, --ADDRESS:PORT <ADDRESS:PORT>
-            Bitcoin Core RPC network address
-            
-            [default: 127.0.0.1:38332]
+  -a, --USER:PASSWORD <USER:PASSWORD>
+          Bitcoin Core RPC authentication string (username, password). Conflicts with `--electrum`
+          
+          [default: user:password]
 
-    -t, --tor-auth <TOR_AUTH>
-            [default: ]
+      --electrum <ELECTRUM_URL>
+          Electrum server URL (e.g. `tcp://localhost:50001`). When set, the wallet is initialised against an Electrum backend instead of Bitcoin Core. Mutually exclusive with the Bitcoin Core flags (--rpc/--zmq/--auth)
 
-    -V, --version
-            Print version information
+      --electrum-tor
+          Route the Electrum backend through the Tor SOCKS proxy on `socks_port`. Works with an onion or a clearnet server; an onion URL needs it. Peer-to-peer Tor is unaffected either way
 
-    -w, --WALLET <WALLET>
-            Optional wallet name. If the wallet exists, load the wallet, else create a new wallet
-            with the given name. Default: maker-wallet
+  -t, --tor-auth <TOR_AUTH>
+          
+
+  -w, --WALLET <WALLET>
+          Optional wallet name. If the wallet exists, load the wallet, else create a new wallet with the given name. Default: maker
+
+  -p, --PASSWORD <PASSWORD>
+          Password for the encryption of the wallet. Required when creating a new wallet (wallet files are always encrypted) and to open an encrypted one
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 This will give you detailed information about the options and arguments available for `Makerd`.
@@ -164,7 +185,15 @@ This will give you detailed information about the options and arguments availabl
 
 - The `-r` or `--ADDRESS:PORT` option specifies the Bitcoin Core RPC address and port. By default, this is set to **`127.0.0.1:38332`**.
 
+- The `-z` or `--ZMQ` option specifies the Bitcoin Core ZMQ address. If omitted, it defaults to the RPC host on port **`28332`**.
+
 - The `-a` or `--USER:PASSWORD` option specifies the Bitcoin Core RPC authentication. By default, this is set to **`user:password`**.
+
+- The `--electrum <ELECTRUM_URL>` option switches the wallet to an Electrum backend instead of Bitcoin Core (e.g. `tcp://localhost:50001`). It is mutually exclusive with `--rpc`, `--zmq`, and `--auth`. Add `--electrum-tor` to route the Electrum connection through the Tor SOCKS proxy (required for onion servers). Peer-to-peer Tor is unaffected either way.
+
+- The `-w` or `--WALLET` option selects the wallet file. The default wallet name is **`maker`**.
+
+- The `-p` or `--PASSWORD` option sets the wallet encryption passphrase. It is **required** when creating a new wallet and to open an encrypted one — wallet files are always encrypted (see [wallet security](./wallet-security.md)). The passphrase must be supplied on every (re)start; it is never persisted.
 
 - #### If you're using the **default configuration**:
 
@@ -194,27 +223,31 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
 - **Wallet Loading**: If an existing wallet file is found at `$HOME/.openswap/maker/wallets`, `makerd` will load it:
 
   ```bash
-  INFO openswap::wallet::api - Wallet file at "/path/to/maker-wallet" successfully loaded.
+  INFO openswap::wallet::api - Wallet file at "/path/to/maker" successfully loaded.
   ```
 
-- **New Wallet Creation**: If no wallet file is found, `makerd` will create a new wallet named `maker-wallet`. Wallet files are always encrypted, so a wallet passphrase must be supplied when creating (and later opening) the wallet. Prefer the `OPENSWAP_WALLET_PASSWORD` environment variable over `-p`/`--PASSWORD` — a command-line value is visible in the process list and shell history:
+- **New Wallet Creation**: If no wallet file is found, `makerd` will create a new wallet named `maker`. Wallet files are always encrypted, so a wallet passphrase must be supplied via `-p`/`--PASSWORD` when creating (and later opening) the wallet — restarts always require an operator to provide it:
 
   ```bash
-  $ OPENSWAP_WALLET_PASSWORD=my-wallet-passphrase ./makerd -a user:password -r 127.0.0.1:38332
+  $ ./makerd -a user:password -r 127.0.0.1:38332 -p my-wallet-passphrase
   ```
 
+  On creation, the wallet's mnemonic seed phrase is displayed once on the terminal — back it up securely before continuing:
+
   ```bash
-  INFO openswap::wallet::api - Backup the Wallet Mnemonics.
-  ["harvest", "trust", "catalog", "degree", "oxygen", "business", "crawl", "enemy", "hamster", "music", "this", "idle"]
-  
-  INFO openswap::maker::api - New Wallet created at: "$HOME/.openswap/maker/wallets/maker-wallet".
+  ========== New Wallet Seed Phrase ==========
+  harvest trust catalog degree oxygen business crawl enemy hamster music this idle
+
+  Write these words down and store them offline. They will not be shown again.
+
+  INFO openswap::maker::api - New Wallet created at : "$HOME/.openswap/maker/wallets/maker".
   ```
 
 - **Configuration File**: If no `config` file exists, `makerd` will create a default `config.toml` file at `$HOME/.openswap/maker/config.toml`:
 
    ```bash
-   WARN openswap::maker::config - Maker config file not found, creating default config file at path: /tmp/openswap/maker/config.toml
-   INFO openswap::maker::config - Successfully loaded config file from: $HOME/.openswap/maker/config.toml
+   WARN openswap::maker::api - Maker config file not found, creating default at: $HOME/.openswap/maker/config.toml
+   INFO openswap::maker::api - Loaded config file from: $HOME/.openswap/maker/config.toml
    ```
 
 - **Wallet Sync**: The wallet will sync to catch up with the latest updates:
@@ -224,68 +257,68 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   INFO openswap::wallet::rpc - Completed wallet sync and save
   ```
 
-- **TOR Initialization**: `makerd` will start the TOR process and listen for connections on a TOR address:
-
-  ```bash
-  INFO openswap::maker::server - [6102] Server is listening at 3xvc6tvf455afnogiwhzpztp7r5w43kq4r2yb5oootu7rog6k6rnq4id.onion:6102
-  ```
+- **TOR Initialization**: `makerd` will start the TOR process and listen for connections on a TOR address.
 
 - **Fidelity Bond Check**: `makerd` checks for existing fidelity bonds. 
 
   **If an existing fidelity bond is found**:
   ```bash
-  INFO openswap::wallet::fidelity - Fidelity Bond found | Index: 0 | Bond Value : 0.00043653 BTC
-  INFO openswap::maker::server - Highest bond at outpoint fc11a129...c:0 | Amount 5000000 sats | Remaining Timelock for expiry : 536 Blocks
+  INFO openswap::maker::api - Highest bond at outpoint fc11a129...c:0 | index 0 | Amount 10000 sats | Remaining Timelock: 536 Blocks | Bond Value: 1523 sats
   ```
 
-  **If no fidelity bonds are found**, it will create one using the fidelity amount and timelock from the configuration file. By default, the fidelity amount is `50,000 sats` and the timelock is `13104 blocks`:
+  **If no fidelity bonds are found**, it will create one using the fidelity amount and timelock from the configuration file. By default, the fidelity amount is `10,000 sats` and the timelock is `15,000 blocks`:
 
   ```bash
-  INFO openswap::maker::server - No active Fidelity Bonds found. Creating one.
-  INFO openswap::maker::server - Fidelity value chosen = 0.0005 BTC
-  INFO openswap::maker::server - Fidelity Tx fee = 1000 sats
+  INFO openswap::maker::api - No active Fidelity Bonds found. Creating one.
+  INFO openswap::maker::api - Fidelity value chosen = 10000 sats
+  INFO openswap::maker::api - Fidelity timelock 15000 blocks
   ```
 
-  > **Note**: Currently, the transaction fee for the fidelity bond is hardcoded at `1000 sats`. This approach of directly considering `fee` not `fee rate` will be improved in v0.1.1 milestones.
+  > **Note**: The fidelity bond transaction fee is calculated from the `fidelity_feerate` config value (default 2.0 sats/vB, clamped to the 1.0 sats/vB relay minimum), not a fixed amount.
 
-- **Funding Requirements**: If creating a new fidelity bond and the maker wallet is empty, you'll need to fund it with at least `0.00051000 BTC` to cover the fidelity amount and transaction fee. To fund the wallet, you can use [this faucet](http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/)(open in Tor browser).
+- **Funding Requirements**: If creating a new fidelity bond and the maker wallet is empty, you'll need to fund it — `makerd` will tell you exactly how much is missing and where to send it:
+
+  ```bash
+  WARN openswap::maker::api - Insufficient funds to create fidelity bond.
+  INFO openswap::maker::api - Send at least 0.00010500 BTC to "tb1p..."
+  INFO openswap::maker::api - Next sync in 10 secs
+  ```
+
+  To fund the wallet, you can use [this faucet](http://s2ncekhezyo2tkwtftti3aiukfpqmxidatjrdqmwie6xnf2dfggyscad.onion/)(open in Tor browser).
   We suggest taking `0.01 BTC` testcoins as the extra amount will be used in doing wallet related operations in [maker-cli demo](./maker-cli.md)
 
-- **Regular Wallet Sync**: The server will regularly sync the wallet every 10 seconds, increasing the interval in the pattern 10,20,30,40..., to detect any incoming funds.
+- **Regular Wallet Sync**: The server will regularly sync the wallet every 10 seconds, increasing the interval in the pattern 10,20,30..., to detect any incoming funds.
 
 - **Fidelity Transaction Creation**: Once the server detects sufficient funding (for new setups), it will automatically create and broadcast a fidelity transaction using the funding UTXOs:
 
   ```bash
-  INFO openswap::wallet::fidelity - Fidelity Transaction 4593a892809621b64418d6bf9590c6536a1fa27f7a136d176ad302fb8ec3ce23 seen in mempool, waiting for confirmation.
+  INFO openswap::maker::api - [6102] Fidelity bond broadcast, waiting for confirmation: 4593a892809621b64418d6bf9590c6536a1fa27f7a136d176ad302fb8ec3ce23
   ```
   
 - **Fidelity Transaction Confirmation**: Once the transaction is confirmed:
   
   ```bash
-  INFO openswap::wallet::fidelity - Fidelity Transaction 4593a892809621b64418d6bf9590c6536a1fa27f7a136d176ad302fb8ec3ce23 confirmed at blockheight: 229349
-  INFO openswap::maker::server - [6102] Successfully created fidelity bond
+  INFO openswap::maker::api - [6102] Successfully created fidelity bond
   ```
 
 
-- **Thread Spawning**: Several threads will be spawned to handle specific tasks:
+- **Thread Spawning**: Several threads will be spawned to handle specific tasks — a Nostr background task (to announce the fidelity bond), the RPC server, an idle-state checker, and a fidelity renewal loop:
 
   ```bash
-  INFO openswap::maker::server - [6102] Spawning contract-watcher thread
-  INFO openswap::maker::server - [6102] Spawning Client connection status checker thread
-  INFO openswap::maker::server - [6102] Spawning RPC server thread
+  INFO openswap::maker::server - [6102] Spawning nostr background task
   INFO openswap::maker::rpc::server - [6102] RPC socket binding successful at 127.0.0.1:6103
   ```
 
 - **Server Ready**: Finally, the `makerd` server is fully set up and ready to connect with other takers for coin swaps:
 
 ```bash
-INFO openswap::maker::server - [6102] Server Setup completed!! Use maker-cli to operate the server and the internal wallet.
+INFO openswap::maker::server - [6102] Server setup complete! Listening on port 6102
 ```
 
 The server will display information about swap liquidity and continue listening for requests:
 
 ```bash
-INFO openswap::maker::server - Swap Liquidity: 5001672 sats | Min: 10000 sats | Listening for requests.
+INFO openswap::maker::api - Swap Liquidity: 5001672 sats | Min: 10000 sats | Listening for requests.
 INFO openswap::maker::server - [6102] Bitcoin Network: regtest
 INFO openswap::maker::server - [6102] Spendable Wallet Balance: 0.05001672 BTC
 ```

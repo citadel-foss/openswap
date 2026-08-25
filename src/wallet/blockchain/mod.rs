@@ -182,9 +182,13 @@ pub trait Blockchain: Send + Sync + 'static {
     ) -> Result<GetRawTransactionResult, WalletError>;
     /// Whether the backend positively reports the transaction as unknown.
     ///
-    /// `Ok(true)` only on an explicit "no such transaction" answer (Core's
-    /// `-5`, Electrum's unknown-txid protocol error). Any transport or server
-    /// failure is propagated, so a failed query is never read as absence.
+    /// "Unknown" means neither mempool-visible nor confirmed, so a caller can
+    /// safely rebroadcast. `Ok(true)` on an explicit "no such transaction"
+    /// answer (Core's `-5`, Electrum's unknown-txid protocol error) or — Core
+    /// only — when the node returns a mere wallet record of a transaction
+    /// that is neither in the mempool nor in a block (i.e. it was evicted).
+    /// Any transport or server failure is propagated, so a failed query is
+    /// never read as absence.
     fn is_tx_unknown(&self, txid: &Txid) -> Result<bool, WalletError>;
     /// Unspent output at `txid:vout`, following Core's `gettxout`.
     ///

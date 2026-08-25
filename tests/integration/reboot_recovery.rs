@@ -134,7 +134,10 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
         "victim maker should have unfinished incoming swapcoins before reboot"
     );
 
-    let victim_config = victim.config.clone();
+    // The first init consumed the passphrase (`config.password.take()`), so
+    // re-supply it to simulate the operator re-entering it on restart.
+    let mut victim_config = victim.config.clone();
+    victim_config.password = Some("integration-test".to_string());
     info!(
         "Restarting Maker2 before idle recovery: incoming={}, outgoing={}",
         before_incoming, before_outgoing
@@ -360,7 +363,10 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
             > 0,
         "taker should still hold an incoming contract before the restart"
     );
-    let taker_config = taker.config().clone();
+    // The first init consumed the passphrases (`config.password.take()`), so
+    // re-supply them to simulate the operator re-entering them on restart.
+    let mut taker_config = taker.config().clone();
+    taker_config.password = Some("integration-test".to_string());
     let is_electrum = taker.get_wallet().read().unwrap().is_electrum();
 
     let mut maker_configs = Vec::new();
@@ -376,7 +382,9 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
             "maker {} should still hold an incoming contract before the restart",
             i
         );
-        maker_configs.push(maker.config.clone());
+        let mut config = maker.config.clone();
+        config.password = Some("integration-test".to_string());
+        maker_configs.push(config);
     }
 
     // Freeze the chain here. Left running, the miner races past every refund

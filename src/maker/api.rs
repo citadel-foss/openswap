@@ -675,19 +675,19 @@ impl MakerServer {
     /// the maker create a second bond and doubly lock funds. Finalizing it
     /// here prevents that.
     fn finalize_pending_fidelity_bonds(&self) -> Result<(), MakerError> {
-        loop {
-            let pending = lock_debug!(self.wallet.read())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .store
-                .fidelity_bond
-                .iter()
-                .find(|b| !b.is_spent && b.conf_height.is_none())
-                .map(|b| (b.bond_index, b.outpoint.txid));
+        // Snapshot the pending bonds once: an unrecoverable bond stays
+        // pending in the wallet, so re-finding inside the loop would spin
+        // on it forever.
+        let pending: Vec<(u32, bitcoin::Txid)> = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .store
+            .fidelity_bond
+            .iter()
+            .filter(|b| !b.is_spent && b.conf_height.is_none())
+            .map(|b| (b.bond_index, b.outpoint.txid))
+            .collect();
 
-            let Some((index, txid)) = pending else {
-                return Ok(());
-            };
-
+        for (index, txid) in pending {
             log::info!(
                 "[{}] Found unconfirmed fidelity bond {}, waiting for confirmation instead of creating a new one",
                 self.config.network_port,
@@ -697,10 +697,25 @@ impl MakerServer {
             // An evicted bond tx would never confirm; rebroadcast the stored
             // raw transaction before waiting. Returns the original txid
             // unchanged if the broadcast is still live.
-            let txid = lock_debug!(self.wallet.read())
+            let txid = match lock_debug!(self.wallet.read())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?
                 .ensure_fidelity_bond_broadcast(index)
-                .map_err(MakerError::Wallet)?;
+            {
+                Ok(txid) => txid,
+                // The bond was evicted and there is no stored transaction to
+                // rebroadcast: it can never confirm. Losing the bond must not
+                // take the maker down — log it and start up anyway.
+                Err(WalletError::Fidelity(FidelityError::BondTransactionMissing { .. })) => {
+                    log::error!(
+                        "[{}] Pending fidelity bond {} was evicted and has no stored transaction; \
+                         it is unrecoverable. Skipping it and continuing startup.",
+                        self.config.network_port,
+                        txid
+                    );
+                    continue;
+                }
+                Err(e) => return Err(MakerError::Wallet(e)),
+            };
 
             // Wait on a fresh backend connection so the wallet lock is not
             // held for the duration of the wait.
@@ -731,6 +746,8 @@ impl MakerServer {
                 conf_height
             );
         }
+
+        Ok(())
     }
 
     /// Setup fidelity bond for this maker.
