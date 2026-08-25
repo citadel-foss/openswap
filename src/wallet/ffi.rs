@@ -67,10 +67,12 @@ pub fn restore_wallet_gui_app(
             return;
         }
     };
-    let restored_wallet_filename = wallet_file_name.unwrap_or("".to_string());
-
     let restored_wallet_path = match data_dir.clone().map(Ok).unwrap_or_else(get_taker_dir) {
-        Ok(dir) => dir.join("wallets").join(restored_wallet_filename),
+        // A nameless path resolves to the backup's filename inside `Wallet::restore`.
+        Ok(dir) => match wallet_file_name {
+            Some(name) => dir.join("wallets").join(name),
+            None => dir.join("wallets"),
+        },
         Err(e) => {
             log::error!("Wallet restore failed: {e}");
             return;

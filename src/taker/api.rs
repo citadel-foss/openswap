@@ -2944,6 +2944,7 @@ impl Taker {
     }
 
     /// Restore a wallet from a backup file (static — no taker instance needed).
+    /// A `None` wallet name restores under the backup's original filename.
     pub fn restore_wallet(
         data_dir: Option<PathBuf>,
         wallet_file_name: Option<String>,
@@ -2951,14 +2952,17 @@ impl Taker {
         backup_file: &String,
     ) -> Result<(), TakerError> {
         let backup_file_path = PathBuf::from(backup_file);
-        let restored_wallet_filename = wallet_file_name.unwrap_or_default();
 
-        let restored_wallet_path = data_dir
+        let wallets_dir = data_dir
             .map(Ok)
             .unwrap_or_else(get_taker_dir)
             .map_err(|e| TakerError::General(format!("wallet restore failed: {e}")))?
-            .join("wallets")
-            .join(restored_wallet_filename);
+            .join("wallets");
+        // A nameless path resolves to the backup's filename inside `Wallet::restore`.
+        let restored_wallet_path = match wallet_file_name {
+            Some(name) => wallets_dir.join(name),
+            None => wallets_dir,
+        };
 
         Wallet::restore_interactive(&backup_file_path, &backend, &restored_wallet_path)?;
         Ok(())

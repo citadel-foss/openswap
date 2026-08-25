@@ -2042,10 +2042,22 @@ mod tests {
     /// `nan` through into the bond fee math.
     #[test]
     fn maker_config_clamps_invalid_fidelity_feerate() {
+        // The accepted timelock range depends on the integration-test
+        // feature, so write one that is valid for this build instead of
+        // inheriting the 15,000-block default (invalid under the feature).
+        let timelock = if cfg!(feature = "integration-test") {
+            950
+        } else {
+            15_000
+        };
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let resolve = |feerate: &str| {
             let path = dir.path().join("config.toml");
-            std::fs::write(&path, format!("fidelity_feerate = {feerate}\n")).unwrap();
+            std::fs::write(
+                &path,
+                format!("fidelity_timelock = {timelock}\nfidelity_feerate = {feerate}\n"),
+            )
+            .unwrap();
             MakerServerConfig::new(Some(&path))
                 .unwrap()
                 .fidelity_feerate

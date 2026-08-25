@@ -157,6 +157,19 @@ fn encwallet_encbackup_encrestore() {
     // restore passphrase.
     assert_wallet_file_encrypted(&restored_wallet_file, "integration-test");
 
+    // A nameless restore path resolves to the backup's original filename
+    // instead of colliding with the wallets directory itself.
+    let nameless_dir = root_dir.join("nameless-restore");
+    std::fs::create_dir_all(&nameless_dir).unwrap();
+    Wallet::restore(
+        &backup,
+        &nameless_dir,
+        &BackendConfig::CoreRpc(rpc_config.clone()),
+        km.clone(),
+    )
+    .unwrap();
+    assert_wallet_file_encrypted(&nameless_dir.join("original-wallet"), "integration-test");
+
     cleanup(&mut bitcoind, &root_dir);
 }
 

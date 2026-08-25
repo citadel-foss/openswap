@@ -94,6 +94,16 @@ impl Wallet {
         backend_config: &BackendConfig,
         restored_enc_material: KeyMaterial,
     ) -> Result<Wallet, WalletError> {
+        // A directory (or a nameless path) means "restore under the backup's
+        // original filename". Resolve it before the exists-guard, which would
+        // otherwise reject the wallets directory itself.
+        let wallet_path = if wallet_path.file_name().is_none() || wallet_path.is_dir() {
+            wallet_path.join(&wallet_backup.file_name)
+        } else {
+            wallet_path.to_path_buf()
+        };
+        let wallet_path = wallet_path.as_path();
+
         if wallet_path.exists() {
             return Err(WalletError::General(format!(
                 "a wallet already exists at {wallet_path:?}; refusing to overwrite it"
