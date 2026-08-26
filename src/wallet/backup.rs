@@ -85,8 +85,9 @@ impl Wallet {
     ///
     /// # Behavior
     ///
-    /// If `wallet_path` does not contain a file name, `wallet_backup.file_name` will be used.
-    /// The method initializes the wallet store, connects to the blockchain backend,
+    /// If `wallet_path` is a directory or has no file name, the wallet is
+    /// restored inside it under `wallet_backup.file_name`. The method
+    /// initializes the wallet store, connects to the blockchain backend,
     /// syncs wallet data, and saves the state to disk.
     pub fn restore(
         wallet_backup: &WalletBackup,
@@ -94,11 +95,9 @@ impl Wallet {
         backend_config: &BackendConfig,
         restored_enc_material: KeyMaterial,
     ) -> Result<Wallet, WalletError> {
-        // A directory (or a nameless path) means "restore under the backup's
-        // original filename". Resolve it before the exists-guard, which would
-        // otherwise reject the wallets directory itself. The backup-supplied
-        // name is untrusted input: accept exactly one normal component, or
-        // `../x` escapes the directory and an absolute path replaces it.
+        // Directories and nameless paths restore under the backup's filename.
+        // That name is untrusted input: accept exactly one normal component,
+        // or `../x` escapes the directory and an absolute path replaces it.
         let wallet_path = if wallet_path.file_name().is_none() || wallet_path.is_dir() {
             let mut components = Path::new(&wallet_backup.file_name).components();
             match (components.next(), components.next()) {

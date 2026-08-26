@@ -13,9 +13,10 @@ The taker CLI is an application that allows you to perform openswaps as a taker.
 > **Warning:**  
 > Taker wallet files contain private keys required to spend your funds. Ensure these wallet files are backed up securely, and take appropriate measures to protect your private keys.
 
-### Start Bitcoin Core (Pre-requisite)
+### Start the Blockchain Backend (Pre-requisite)
 
-`Taker` requires a **Bitcoin Core** RPC connection running on a **custom signet** for its operation(check [demo doc](./demo.md)).
+`Taker` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on a **custom signet** (check [demo doc](./demo.md)). The examples below use Bitcoin Core.
+
 > **Important:**  
 > All apps are designed to run on our **custom signet** for testing purposes. The marketplace is only live in custom signet. Running the taker in other networks will not work as there's no marketplace in that network.
 
@@ -144,6 +145,8 @@ Options:
 > **Note:** Every `taker` command opens the encrypted wallet, so `-p` is required on each invocation. The tutorial's bare `taker <SUBCOMMAND>` examples assume it is supplied.
 
 ## For this tutorial, we'll assume a custom configuration with port 38332. Output examples will reflect this setup.
+
+> **Note:** The sample outputs were captured on **regtest**, so they show `bcrt1...` addresses and `Bitcoin Network: regtest` log lines. On the custom signet, addresses are `tb1...` and the network name differs — the commands are the same.
 
 ---
 

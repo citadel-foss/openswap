@@ -98,9 +98,9 @@ This section focuses on `Makerd`, walking you through the process of starting an
 
 ## How to Set Up Makerd
 
-### 1. Start Bitcoin Core (Pre-requisite)
+### 1. Start the Blockchain Backend (Pre-requisite)
 
-`Makerd` requires a **Bitcoin Core** RPC connection running on **signet** for its operation (check [demo doc](./demo.md)). To get started, you need to start `bitcoind`:
+`Makerd` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on the **custom signet** (check [demo doc](./demo.md)). The examples below use Bitcoin Core. To get started, start `bitcoind`:
 
 > **Important:**  
 > All apps are designed to run on our **custom signet** for testing purposes. The marketplace is only live in custom signet. Running the maker in other networks will not work as there's no marketplace in that network.
@@ -207,6 +207,8 @@ This will give you detailed information about the options and arguments availabl
 ```
 
 ## For this tutorial, we'll assume a custom configuration with port 38332. Output examples will reflect this setup.
+
+> **Note:** The sample outputs were captured on **regtest**, so they show `tb1`/`bcrt1` addresses and `Bitcoin Network: regtest` log lines. On the custom signet the addresses and network name differ — the commands are the same.
 
 ### Start `makerd`:
 
