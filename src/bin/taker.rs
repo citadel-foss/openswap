@@ -648,10 +648,21 @@ fn main() -> Result<(), TakerError> {
                 }
             }
 
-            taker.start_swap(&summary.swap_id)?;
+            // Not `?`: returning here drops the Taker, killing the recovery loop
+            // `start_swap` just spawned. Wait for it first.
+            if let Err(e) = taker.start_swap(&summary.swap_id) {
+                log::error!("Swap failed: {e:?}");
+                if !taker.wait_for_recovery() {
+                    log::warn!("Recovery did not finish; run `taker recover`");
+                }
+                return Err(e);
+            }
         }
         Commands::Recover => {
             taker.recover_active_swap()?;
+            if !taker.wait_for_recovery() {
+                log::warn!("Recovery did not finish; re-run `taker recover`");
+            }
         }
         Commands::Backup => {
             let wallet = lock_debug!(taker.get_wallet().read()).unwrap();

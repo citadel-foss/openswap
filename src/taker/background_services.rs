@@ -163,7 +163,12 @@ impl RecoveryLoop {
                         None => false,
                     };
 
-                    if all_resolved {
+                    if !all_resolved {
+                        log::info!(
+                            "Recovery loop: contracts still unresolved, retrying in {}s",
+                            RECOVERY_LOOP_INTERVAL.as_secs()
+                        );
+                    } else {
                         log::info!("Recovery loop: all contracts resolved");
                         // Clean up wallet entries and update tracker
                         let swap_ids: Vec<String> = lock_debug!(swap_tracker.lock())
@@ -377,6 +382,23 @@ impl RecoveryLoop {
     /// Check whether recovery is complete.
     pub(crate) fn is_complete(&self) -> bool {
         self.complete.load(Relaxed)
+    }
+
+    /// Block until the loop finishes on its own, reporting whether it resolved
+    /// every contract.
+    ///
+    /// The shutdown flag is left alone so the
+    /// thread runs to its natural end, which it reaches once every contract is
+    /// resolved. Consumes `self` because the join handle is not reusable.
+    pub(crate) fn join(mut self) -> bool {
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                // Otherwise a panicked thread is indistinguishable from one that
+                // finished the job.
+                log::error!("Recovery loop thread panicked; contracts may be unresolved");
+            }
+        }
+        self.is_complete()
     }
 }
 

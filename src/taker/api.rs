@@ -851,6 +851,31 @@ impl Taker {
         }
     }
 
+    /// Block until every unresolved swap contract has been recovered.
+    ///
+    /// Returns whether recovery finished. `false` means contracts are still
+    /// unresolved with nothing retrying them, or that completion could not be
+    /// confirmed.
+    ///
+    /// A refund is unspendable until its timelock matures, so this can block for
+    /// as long as that takes — up to ~1.5 days on mainnet for Legacy. Interrupting
+    /// is safe: each step is persisted as it happens and a re-run resumes.
+    pub fn wait_for_recovery(&mut self) -> bool {
+        if let Some(recovery) = self.recovery_loop.take() {
+            return recovery.join();
+        }
+
+        match self.read_wallet() {
+            Ok(wallet) => {
+                wallet.get_outgoing_swapcoins_count() + wallet.get_incoming_swapcoins_count() == 0
+            }
+            Err(e) => {
+                log::error!("Could not read wallet to check recovery progress: {:?}", e);
+                false
+            }
+        }
+    }
+
     /// Prepare a openswap: discover makers, negotiate, and return a summary.
     ///
     /// No funds are committed. The caller reviews the summary and then calls
