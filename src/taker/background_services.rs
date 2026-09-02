@@ -87,6 +87,7 @@ impl RecoveryLoop {
                         &chain,
                         2.0,
                         &shutdown_clone,
+                        None,
                     ) {
                         Ok(ref swept) if !swept.is_empty() => {
                             log::info!(

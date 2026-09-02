@@ -15,7 +15,7 @@ use super::blockchain::{BackendConfig, Blockchain};
 use std::path::{Path, PathBuf};
 
 pub use super::report::{
-    MakerFeeInfo, MakerReport, RecoveryReport, SwapRole, SwapStatus, TakerReport,
+    MakerFeeInfo, MakerReport, RecoveryReport, ReportUtxo, SwapRole, SwapStatus, TakerReport,
 };
 
 /// Restores a wallet from a JSON backup file for GUI/FFI applications.

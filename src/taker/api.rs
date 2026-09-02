@@ -45,7 +45,8 @@ use crate::{
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig,
-        MakerFeeInfo as ReportMakerFeeInfo, RecoveryOutcome, SwapStatus, TakerReport, Wallet,
+        MakerFeeInfo as ReportMakerFeeInfo, RecoveryOutcome, ReportUtxo, SwapStatus, TakerReport,
+        Wallet,
     },
     watch_tower::{
         registry_storage::FileRegistry,
@@ -674,6 +675,7 @@ impl Taker {
                 chain,
                 2.0,
                 &crate::utill::NO_SHUTDOWN,
+                None,
             ) {
                 Ok(ref swept) if !swept.is_empty() => {
                     log::info!(
@@ -1268,7 +1270,13 @@ impl Taker {
 
         // Success path: sweep + report (shared by both protocols)
         let swap_id_owned = swap_id.to_string();
-        let expected_incoming_swapcoins = self.swap_state()?.incoming_swapcoins.len();
+        let incoming_contract_txids: HashSet<_> = self
+            .swap_state()?
+            .incoming_swapcoins
+            .iter()
+            .map(|swapcoin| swapcoin.contract_tx.compute_txid())
+            .collect();
+        let expected_incoming_swapcoins = incoming_contract_txids.len();
         // Hoist connection creation so the read guard drops before sweep
         // takes the write lock on the same wallet.
         let chain = self.read_wallet()?.blockchain.new_connection()?;
@@ -1277,6 +1285,7 @@ impl Taker {
             &chain,
             2.0,
             &crate::utill::NO_SHUTDOWN,
+            Some(&incoming_contract_txids),
         )?;
         log::info!("Swept {} incoming swapcoins", swept.resolved.len());
         self.write_wallet()?
@@ -2544,10 +2553,22 @@ impl Taker {
 
         let network = wallet.store.network;
         let wallet_file_name = wallet.get_name().to_string();
+        let incoming_contract_txids: HashSet<_> = swap
+            .incoming_swapcoins
+            .iter()
+            .map(|swapcoin| swapcoin.contract_tx.compute_txid())
+            .collect();
+        let resolved_sweep_txids: HashSet<_> = swept
+            .into_iter()
+            .flat_map(|outcome| outcome.resolved.iter())
+            .filter(|(contract_txid, _)| incoming_contract_txids.contains(contract_txid))
+            .map(|(_, sweep_txid)| *sweep_txid)
+            .collect();
 
         let output_swap_utxos: Vec<(u64, String)> = wallet
             .list_swept_incoming_swap_utxos()
             .iter()
+            .filter(|(utxo, _)| resolved_sweep_txids.contains(&utxo.txid))
             .map(|(utxo, _)| {
                 let address = utxo
                     .address
@@ -2710,29 +2731,47 @@ impl Taker {
             (total_fee as f64 / fee_denominator as f64) * 100.0
         };
 
-        // Contract txids
-        let outgoing_contract_txid = if !swap.outgoing_swapcoins.is_empty() {
-            Some(
-                swap.outgoing_swapcoins
-                    .iter()
-                    .map(|sc| sc.contract_tx.compute_txid().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
-        } else {
-            None
-        };
+        let funding_inputs: HashSet<OutPoint> = swap
+            .outgoing_swapcoins
+            .iter()
+            .filter_map(|swapcoin| match swapcoin.protocol {
+                ProtocolVersion::Legacy => swapcoin.funding_tx.as_ref(),
+                ProtocolVersion::Taproot => Some(&swapcoin.contract_tx),
+            })
+            .flat_map(|funding_tx| funding_tx.input.iter().map(|input| input.previous_output))
+            .collect();
+        let outgoing_utxos = initial_utxos
+            .iter()
+            .filter(|utxo| {
+                funding_inputs.contains(&OutPoint {
+                    txid: utxo.txid,
+                    vout: utxo.vout,
+                })
+            })
+            .filter_map(|utxo| {
+                let address = utxo
+                    .address
+                    .as_ref()?
+                    .clone()
+                    .require_network(network)
+                    .ok()?;
+                Some(ReportUtxo {
+                    address: address.to_string(),
+                    value: utxo.amount.to_sat(),
+                })
+            })
+            .collect();
 
-        let incoming_contract_txid = if !swap.incoming_swapcoins.is_empty() {
-            Some(
-                swap.incoming_swapcoins
-                    .iter()
-                    .map(|sc| sc.contract_tx.compute_txid().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
+        let incoming_utxos = if payment.is_some() {
+            Vec::new()
         } else {
-            None
+            output_swap_utxos
+                .iter()
+                .map(|(value, address)| ReportUtxo {
+                    address: address.clone(),
+                    value: *value,
+                })
+                .collect()
         };
 
         let swap_end_ts = std::time::SystemTime::now()
@@ -2744,7 +2783,11 @@ impl Taker {
             swap_id: swap.id.clone(),
             swap_duration_seconds: swap_duration.as_secs_f64(),
             outgoing_amount: swap.params.send_amount.to_sat(),
-            incoming_amount: total_output_swap_amount,
+            incoming_amount: if payment.is_some() {
+                0
+            } else {
+                total_output_swap_amount
+            },
             fee_paid: total_fee,
             makers_count: maker_count,
             maker_addresses,
@@ -2760,8 +2803,8 @@ impl Taker {
             output_swap_utxos,
             network: network.to_string(),
             error_message,
-            incoming_contract_txid,
-            outgoing_contract_txid,
+            outgoing_utxos,
+            incoming_utxos,
             end_timestamp: swap_end_ts,
             start_timestamp: swap_end_ts.saturating_sub(swap_duration.as_secs()),
             deniability_proof: None,

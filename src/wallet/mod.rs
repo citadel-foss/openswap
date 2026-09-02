@@ -30,7 +30,8 @@ pub(crate) use fidelity::{
     verify_fidelity_checks, FidelityError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK,
 };
 pub use report::{
-    MakerFeeInfo, MakerReport, PaymentResult, RecoveryReport, SwapRole, SwapStatus, TakerReport,
+    MakerFeeInfo, MakerReport, PaymentResult, RecoveryReport, ReportUtxo, SwapRole, SwapStatus,
+    TakerReport,
 };
 pub use spend::Destination;
 pub use storage::AddressType;

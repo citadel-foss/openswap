@@ -125,6 +125,25 @@ pub struct PaymentResult {
     pub confirmed: bool,
 }
 
+/// User-facing UTXO information recorded in a swap report.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportUtxo {
+    /// Address locking the reported output.
+    pub address: String,
+    /// Output value in satoshis.
+    pub value: u64,
+}
+
+impl ReportUtxo {
+    pub(crate) fn from_txout(output: &bitcoin::TxOut, network: bitcoin::Network) -> Option<Self> {
+        let address = bitcoin::Address::from_script(&output.script_pubkey, network).ok()?;
+        Some(Self {
+            address: address.to_string(),
+            value: output.value.to_sat(),
+        })
+    }
+}
+
 /// Taker-perspective record for one swap (success or failed).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TakerReport {
@@ -145,7 +164,8 @@ pub struct TakerReport {
 
     /// Amount the taker sent (satoshis).
     pub outgoing_amount: u64,
-    /// Amount the taker received back after the swap (satoshis).
+    /// Amount the taker received back after the swap (satoshis). Omitted for PaySwap.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub incoming_amount: u64,
     /// Total fee paid (outgoing − wallet outputs − settled PaySwap
     /// receiver payment, satoshis).
@@ -157,10 +177,12 @@ pub struct TakerReport {
     /// Total fees paid to all makers (satoshis).
     pub total_maker_fees: u64,
 
-    /// Transaction ID of the taker's outgoing contract.
-    pub outgoing_contract_txid: Option<String>,
-    /// Transaction ID of the taker's incoming contract.
-    pub incoming_contract_txid: Option<String>,
+    /// Wallet UTXOs spent to fund the taker's outgoing contract transactions.
+    pub outgoing_utxos: Vec<ReportUtxo>,
+    /// Final wallet UTXOs created by sweeping the taker's incoming swapcoins.
+    /// Omitted for PaySwap because its settlement outputs belong to the receiver.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incoming_utxos: Vec<ReportUtxo>,
     /// Funding transaction IDs organised by hop.
     pub funding_txids: Vec<Vec<String>>,
 
@@ -175,16 +197,18 @@ pub struct TakerReport {
     pub input_utxos: Vec<u64>,
     /// Change output amounts returned to the regular wallet (satoshis).
     pub output_change_amounts: Vec<u64>,
-    /// Swap output amounts received from the swap (satoshis).
+    /// Swap output amounts received by the taker (satoshis).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_swap_amounts: Vec<u64>,
     /// Change UTXOs with amounts and addresses.
     pub output_change_utxos: Vec<(u64, String)>,
-    /// Swap UTXOs with amounts and addresses.
+    /// Swap UTXOs received by the taker, with amounts and addresses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_swap_utxos: Vec<(u64, String)>,
     /// Deniability proof for this swap, if successfully generated.
     pub deniability_proof: Option<DeniabilityProof>,
     /// PaySwap outcome; present only when the swap paid a third-party receiver.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payment: Option<PaymentResult>,
 }
 
@@ -302,15 +326,11 @@ impl TakerReport {
         }
 
         println!("\n\x1b[1;36m--------------------------------------------------------------------------------");
-        println!("                            Transaction IDs");
+        println!("                              Swap UTXOs");
         println!("--------------------------------------------------------------------------------\x1b[0m");
 
-        if let Some(ref txid) = self.outgoing_contract_txid {
-            println!("\x1b[1;37mOutgoing Contract :\x1b[0m {}", txid);
-        }
-        if let Some(ref txid) = self.incoming_contract_txid {
-            println!("\x1b[1;37mIncoming Contract :\x1b[0m {}", txid);
-        }
+        print_report_utxos("Outgoing UTXO", &self.outgoing_utxos);
+        print_report_utxos("Incoming UTXO", &self.incoming_utxos);
         if !self.funding_txids.is_empty() {
             println!("\x1b[1;37mFunding Txs       :\x1b[0m");
             for (hop_idx, hop_txids) in self.funding_txids.iter().enumerate() {
@@ -375,6 +395,22 @@ impl TakerReport {
     }
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn print_report_utxos(label: &str, utxos: &[ReportUtxo]) {
+    for (index, utxo) in utxos.iter().enumerate() {
+        println!(
+            "  {:<19} {}. {} ({} sats)",
+            label,
+            index + 1,
+            utxo.address,
+            utxo.value
+        );
+    }
+}
+
 /// Maker-perspective record for one swap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MakerReport {
@@ -398,10 +434,10 @@ pub struct MakerReport {
     /// Maker service fee earned, excluding maker-side mining-fee reimbursement.
     pub fee_earned: u64,
 
-    /// Transaction ID of the incoming contract.
-    pub incoming_contract_txid: String,
-    /// Transaction ID of the outgoing contract.
-    pub outgoing_contract_txid: String,
+    /// Final UTXOs created by sweeping the maker's incoming swapcoins.
+    pub incoming_utxos: Vec<ReportUtxo>,
+    /// Wallet UTXOs spent to fund the maker's outgoing contract transactions.
+    pub outgoing_utxos: Vec<ReportUtxo>,
     /// Timelock value in blocks for the outgoing contract.
     pub timelock: u32,
     /// Deniability proof for this swap, if successfully generated.
@@ -416,8 +452,8 @@ impl MakerReport {
         incoming_amount: u64,
         outgoing_amount: u64,
         fee_earned: u64,
-        incoming_contract_txid: String,
-        outgoing_contract_txid: String,
+        incoming_utxos: Vec<ReportUtxo>,
+        outgoing_utxos: Vec<ReportUtxo>,
         timelock: u32,
         network: String,
         incoming: Option<&IncomingSwapCoin>,
@@ -435,8 +471,8 @@ impl MakerReport {
             incoming_amount,
             outgoing_amount,
             fee_earned,
-            incoming_contract_txid,
-            outgoing_contract_txid,
+            incoming_utxos,
+            outgoing_utxos,
             timelock,
             deniability_proof: proof_from_swapcoins(incoming, outgoing, SwapRole::Maker),
         }
@@ -501,17 +537,11 @@ impl MakerReport {
         println!("\x1b[1;37mNetwork           :\x1b[0m {}", self.network);
 
         println!("\n\x1b[1;36m--------------------------------------------------------------------------------");
-        println!("                            Transaction IDs");
+        println!("                              Swap UTXOs");
         println!("--------------------------------------------------------------------------------\x1b[0m");
 
-        println!(
-            "\x1b[1;37mIncoming Contract :\x1b[0m {}",
-            self.incoming_contract_txid
-        );
-        println!(
-            "\x1b[1;37mOutgoing Contract :\x1b[0m {}",
-            self.outgoing_contract_txid
-        );
+        print_report_utxos("Incoming UTXO", &self.incoming_utxos);
+        print_report_utxos("Outgoing UTXO", &self.outgoing_utxos);
 
         println!("\n\x1b[1;36m================================================================================");
         println!("                                END REPORT");
@@ -855,8 +885,8 @@ mod tests {
             mining_fee: 100,
             fee_percentage: 10.0,
             total_maker_fees: 900,
-            outgoing_contract_txid: None,
-            incoming_contract_txid: None,
+            outgoing_utxos: vec![],
+            incoming_utxos: vec![],
             funding_txids: vec![],
             makers_count: 0,
             maker_addresses: vec![],
@@ -869,6 +899,54 @@ mod tests {
             deniability_proof: None,
             payment: None,
         }
+    }
+
+    #[test]
+    fn report_schema_uses_swap_boundary_utxos_without_contract_fields() {
+        let mut report = sample_taker_report();
+        report.outgoing_utxos.push(ReportUtxo {
+            address: "bcrt1qoutgoing".to_string(),
+            value: 10_000,
+        });
+        report.incoming_utxos.push(ReportUtxo {
+            address: "bcrt1qincoming".to_string(),
+            value: 9_500,
+        });
+
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert!(serialized.get("outgoing_contract_txid").is_none());
+        assert!(serialized.get("incoming_contract_txid").is_none());
+        assert!(serialized.get("outgoing_contract_utxos").is_none());
+        assert!(serialized.get("incoming_contract_utxos").is_none());
+        assert_eq!(serialized["outgoing_utxos"][0]["address"], "bcrt1qoutgoing");
+        assert_eq!(serialized["incoming_utxos"][0]["value"], 9_500);
+    }
+
+    #[test]
+    fn payswap_omits_taker_incoming_fields_and_round_trips() {
+        let mut report = sample_taker_report();
+        report.incoming_amount = 0;
+        report.payment = Some(PaymentResult {
+            receiver_address: "bcrt1qreceiver".to_string(),
+            requested_amount: 9_000,
+            delivered_amount: 9_000,
+            settlement_txids: vec!["settlement-txid".to_string()],
+            confirmed: true,
+        });
+
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert!(serialized.get("incoming_amount").is_none());
+        assert!(serialized.get("incoming_utxos").is_none());
+        assert!(serialized.get("output_swap_amounts").is_none());
+        assert!(serialized.get("output_swap_utxos").is_none());
+        assert!(serialized.get("outgoing_utxos").is_some());
+        assert!(serialized.get("payment").is_some());
+
+        let decoded: TakerReport = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.incoming_amount, 0);
+        assert!(decoded.incoming_utxos.is_empty());
+        assert!(decoded.output_swap_amounts.is_empty());
+        assert!(decoded.output_swap_utxos.is_empty());
     }
 
     #[test]

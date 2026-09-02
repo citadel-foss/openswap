@@ -162,6 +162,14 @@ fn test_taproot_payswap() {
     assert!(payment_result.confirmed, "payment must report confirmed");
     assert_eq!(payment_result.requested_amount, payment_amount.to_sat());
     assert_eq!(payment_result.delivered_amount, payment_amount.to_sat());
+    assert_eq!(report.incoming_amount, 0);
+    assert!(report.incoming_utxos.is_empty());
+    assert!(report.output_swap_amounts.is_empty());
+    assert!(report.output_swap_utxos.is_empty());
+    assert!(
+        !report.outgoing_utxos.is_empty(),
+        "PaySwap must still report the taker funding inputs"
+    );
     assert!(
         report.fee_paid < payment_amount.to_sat(),
         "receiver payment principal must not be reported as a fee"
@@ -341,6 +349,14 @@ fn test_legacy_payswap() {
         .expect("payment swap report must carry a payment result");
     assert!(payment_result.confirmed);
     assert_eq!(payment_result.delivered_amount, payment_amount.to_sat());
+    assert_eq!(report.incoming_amount, 0);
+    assert!(report.incoming_utxos.is_empty());
+    assert!(report.output_swap_amounts.is_empty());
+    assert!(report.output_swap_utxos.is_empty());
+    assert!(
+        !report.outgoing_utxos.is_empty(),
+        "PaySwap must still report the taker funding inputs"
+    );
     assert_eq!(
         payment_result.settlement_txids.len(),
         1,

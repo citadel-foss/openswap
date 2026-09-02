@@ -1,6 +1,6 @@
 //! Message handlers for the Maker.
 
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use bitcoin::{bip32::ChainCode, Amount, PublicKey, Transaction};
 
@@ -15,7 +15,10 @@ use crate::{
         taproot_messages::TaprootTakerMessage,
     },
     taker::api::REFUND_LOCKTIME_STEP,
-    wallet::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+    wallet::{
+        swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+        MakerReport, RecoveryOutcome, ReportUtxo,
+    },
 };
 
 /// Test-only behavior overrides for the maker.
@@ -306,8 +309,14 @@ pub trait Maker: Send + Sync {
     /// Sync wallet with Bitcoin Core and save state to disk.
     fn sync_and_save_wallet(&self) -> Result<(), MakerError>;
 
+    /// Fetch a transaction needed to resolve user-facing report UTXOs.
+    fn get_raw_transaction(&self, txid: &bitcoin::Txid) -> Result<Transaction, MakerError>;
+
     /// Sweep incoming swapcoins after successful swap.
-    fn sweep_incoming_swapcoins(&self) -> Result<(), MakerError>;
+    fn sweep_incoming_swapcoins(
+        &self,
+        incoming_swapcoins: &[IncomingSwapCoin],
+    ) -> Result<RecoveryOutcome, MakerError>;
 
     /// Store connection state for persistence across connections.
     /// `admission` is set only when storing from a fresh SwapDetails message.
@@ -388,6 +397,105 @@ pub trait Maker: Send + Sync {
     /// Get the test behavior override.
     #[cfg(feature = "integration-test")]
     fn behavior(&self) -> MakerBehavior;
+}
+
+pub(super) fn emit_maker_success_report<M: Maker>(
+    maker: &Arc<M>,
+    state: &ConnectionState,
+    swap_id: &str,
+    swept: &RecoveryOutcome,
+) {
+    let network = maker.network();
+    let mut seen_inputs = HashSet::new();
+    let mut outgoing_utxos = Vec::new();
+
+    for swapcoin in &state.outgoing_swapcoins {
+        let funding_tx = match swapcoin.protocol {
+            ProtocolVersion::Legacy => swapcoin.funding_tx.as_ref(),
+            ProtocolVersion::Taproot => Some(&swapcoin.contract_tx),
+        };
+        let Some(funding_tx) = funding_tx else {
+            log::warn!("Missing Legacy funding transaction for swap report");
+            continue;
+        };
+        for input in &funding_tx.input {
+            let outpoint = input.previous_output;
+            if !seen_inputs.insert(outpoint) {
+                continue;
+            }
+            let output = maker
+                .get_raw_transaction(&outpoint.txid)
+                .ok()
+                .and_then(|transaction| transaction.output.get(outpoint.vout as usize).cloned());
+            match output.and_then(|output| ReportUtxo::from_txout(&output, network)) {
+                Some(utxo) => outgoing_utxos.push(utxo),
+                None => log::warn!(
+                    "Failed to resolve outgoing funding input {} for swap report",
+                    outpoint
+                ),
+            }
+        }
+    }
+
+    let incoming_contract_txids: HashSet<_> = state
+        .incoming_swapcoins
+        .iter()
+        .map(|swapcoin| swapcoin.contract_tx.compute_txid())
+        .collect();
+    let incoming_utxos = swept
+        .resolved
+        .iter()
+        .filter(|(contract_txid, _)| incoming_contract_txids.contains(contract_txid))
+        .filter_map(
+            |(_, sweep_txid)| match maker.get_raw_transaction(sweep_txid) {
+                Ok(transaction) => Some(transaction),
+                Err(error) => {
+                    log::warn!(
+                        "Failed to load sweep transaction {} for swap report: {:?}",
+                        sweep_txid,
+                        error
+                    );
+                    None
+                }
+            },
+        )
+        .flat_map(|transaction| transaction.output)
+        .filter_map(|output| ReportUtxo::from_txout(&output, network))
+        .collect();
+
+    let incoming_total = state
+        .incoming_swapcoins
+        .iter()
+        .map(|swapcoin| swapcoin.funding_amount.to_sat())
+        .sum();
+    let outgoing_total = state
+        .outgoing_swapcoins
+        .iter()
+        .map(|swapcoin| swapcoin.funding_amount.to_sat())
+        .sum();
+    let timelock = state
+        .outgoing_swapcoins
+        .first()
+        .and_then(|swapcoin| swapcoin.get_timelock())
+        .unwrap_or(0);
+
+    let report = MakerReport::success(
+        swap_id.to_string(),
+        state.swap_start_time,
+        incoming_total,
+        outgoing_total,
+        state.service_fee_sats,
+        incoming_utxos,
+        outgoing_utxos,
+        timelock,
+        network.to_string(),
+        state.incoming_swapcoins.first(),
+        state.outgoing_swapcoins.first(),
+    );
+    report.print();
+    if let Err(error) = report.save_for_wallet(maker.data_dir(), Some(maker.wallet_name())) {
+        log::warn!("Failed to save maker success report: {error:?}");
+    }
 }
 
 /// Fail closed after admission; persistence limits the check-to-broadcast race.

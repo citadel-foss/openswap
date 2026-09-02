@@ -25,7 +25,7 @@ use crate::{
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FidelityError,
-        Wallet, WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK,
+        RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::service::WatchService,
 };
@@ -1404,7 +1404,27 @@ impl MakerTrait for MakerServer {
             .map_err(MakerError::Wallet)
     }
 
-    fn sweep_incoming_swapcoins(&self) -> Result<(), MakerError> {
+    fn get_raw_transaction(&self, txid: &bitcoin::Txid) -> Result<Transaction, MakerError> {
+        let chain = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .new_connection()
+            .map_err(MakerError::Wallet)?;
+        let transaction = chain
+            .get_raw_transaction(txid, None)
+            .map_err(MakerError::Wallet)?;
+        if transaction.compute_txid() != *txid {
+            return Err(MakerError::General(
+                "backend returned an unexpected transaction",
+            ));
+        }
+        Ok(transaction)
+    }
+
+    fn sweep_incoming_swapcoins(
+        &self,
+        incoming_swapcoins: &[IncomingSwapCoin],
+    ) -> Result<RecoveryOutcome, MakerError> {
         log::info!(
             "[{}] Sweeping coins after successful swap",
             self.config.network_port
@@ -1417,9 +1437,18 @@ impl MakerTrait for MakerServer {
             .blockchain
             .new_connection()
             .map_err(MakerError::Wallet)?;
-        let sweep_outcome =
-            Wallet::sweep_incoming_swapcoins(&self.wallet, &chain, MIN_FEE_RATE, &self.shutdown)
-                .map_err(MakerError::Wallet)?;
+        let contract_txids = incoming_swapcoins
+            .iter()
+            .map(|swapcoin| swapcoin.contract_tx.compute_txid())
+            .collect();
+        let sweep_outcome = Wallet::sweep_incoming_swapcoins(
+            &self.wallet,
+            &chain,
+            MIN_FEE_RATE,
+            &self.shutdown,
+            Some(&contract_txids),
+        )
+        .map_err(MakerError::Wallet)?;
 
         if !sweep_outcome.is_empty() {
             log::info!(
@@ -1439,7 +1468,7 @@ impl MakerTrait for MakerServer {
             .sync_and_save(&self.shutdown)
             .map_err(MakerError::Wallet)?;
 
-        Ok(())
+        Ok(sweep_outcome)
     }
 
     fn store_connection_state(
@@ -1912,14 +1941,16 @@ impl MakerTrait for MakerServer {
                 &contract_redeemscript,
             )?;
 
-            outgoing_swapcoins.push(OutgoingSwapCoin::new_legacy(
+            let mut outgoing_swapcoin = OutgoingSwapCoin::new_legacy(
                 my_multisig_privkey,
                 other_multisig_pubkey,
                 my_senders_contract_tx,
                 contract_redeemscript,
                 timelock_privkey,
                 funding_amount,
-            ));
+            );
+            outgoing_swapcoin.funding_tx = Some(my_funding_tx.clone());
+            outgoing_swapcoins.push(outgoing_swapcoin);
         }
 
         let mining_fees = Amount::from_sat(create_funding_txes_result.total_miner_fee);

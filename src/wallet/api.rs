@@ -988,6 +988,7 @@ impl Wallet {
     ///
     /// The caller supplies the backend connection: the confirmation waits run
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
+    /// This recovery pass is wallet-wide; every eligible outgoing swapcoin is considered.
     pub fn recover_timelocked_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
@@ -2872,11 +2873,14 @@ impl Wallet {
     ///
     /// The caller supplies the backend connection: the confirmation waits run
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
+    /// `contract_txids` scopes normal settlement to one swap; `None` is reserved
+    /// for startup and background recovery across the whole wallet.
     pub fn sweep_incoming_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
         feerate: f64,
         shutdown: &std::sync::atomic::AtomicBool,
+        contract_txids: Option<&HashSet<Txid>>,
     ) -> Result<RecoveryOutcome, WalletError> {
         let mut outcome = RecoveryOutcome::default();
 
@@ -2890,7 +2894,10 @@ impl Wallet {
                 .incoming_swapcoins
                 .iter()
                 .filter(|(_, swapcoin)| {
-                    swapcoin.other_privkey.is_some() || swapcoin.hash_preimage.is_some()
+                    (swapcoin.other_privkey.is_some() || swapcoin.hash_preimage.is_some())
+                        && contract_txids.is_none_or(|txids| {
+                            txids.contains(&swapcoin.contract_tx.compute_txid())
+                        })
                 })
                 .map(|(swap_id, swapcoin)| (swap_id.clone(), swapcoin.clone()))
                 .collect();

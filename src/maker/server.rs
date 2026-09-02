@@ -24,7 +24,7 @@ use crate::{
 use super::{
     api::MakerServer,
     error::MakerError,
-    handlers::{handle_message, ConnectionState, Maker},
+    handlers::{emit_maker_success_report, handle_message, ConnectionState, Maker},
 };
 
 /// Idle connection timeout (production).
@@ -453,13 +453,17 @@ fn handle_connection(maker: Arc<MakerServer>, stream: Arc<TcpStream>) -> Result<
                 "[{}] Swap completed, sweeping incoming swapcoins",
                 maker.config.network_port
             );
-            if let Err(e) = maker.sweep_incoming_swapcoins() {
-                log::error!(
-                    "[{}] Failed to sweep incoming swapcoins: {:?}",
-                    maker.config.network_port,
-                    e
-                );
-            }
+            let sweep_outcome = match maker.sweep_incoming_swapcoins(&state.incoming_swapcoins) {
+                Ok(outcome) => Some(outcome),
+                Err(e) => {
+                    log::error!(
+                        "[{}] Failed to sweep incoming swapcoins: {:?}",
+                        maker.config.network_port,
+                        e
+                    );
+                    None
+                }
+            };
 
             // Sync wallet after sweep to update UTXO cache.
             if let Err(e) = maker.sync_and_save_wallet() {
@@ -470,29 +474,62 @@ fn handle_connection(maker: Arc<MakerServer>, stream: Arc<TcpStream>) -> Result<
                 );
             }
 
-            // Unwatch all contract outputs now that the swap is complete.
-            for incoming in &state.incoming_swapcoins {
-                let txid = incoming.contract_tx.compute_txid();
-                for (vout, txout) in incoming.contract_tx.output.iter().enumerate() {
-                    maker.unwatch_outpoint(
-                        bitcoin::OutPoint {
-                            txid,
-                            vout: vout as u32,
-                        },
-                        txout.script_pubkey.clone(),
+            let settlement_complete = if let (Some(swap_id), Some(sweep_outcome)) =
+                (state.swap_id.as_ref(), sweep_outcome.as_ref())
+            {
+                let fully_swept = !state.incoming_swapcoins.is_empty()
+                    && state.incoming_swapcoins.iter().all(|swapcoin| {
+                        let contract_txid = swapcoin.contract_tx.compute_txid();
+                        sweep_outcome
+                            .resolved
+                            .iter()
+                            .any(|(resolved_txid, _)| *resolved_txid == contract_txid)
+                    });
+                if fully_swept {
+                    emit_maker_success_report(&maker, &state, swap_id, sweep_outcome);
+                } else {
+                    log::error!(
+                        "[{}] Not writing success report for {}: only {}/{} incoming swapcoins were swept",
+                        maker.config.network_port,
+                        swap_id,
+                        sweep_outcome.resolved.len(),
+                        state.incoming_swapcoins.len()
                     );
                 }
-            }
-            for outgoing in &state.outgoing_swapcoins {
-                let txid = outgoing.contract_tx.compute_txid();
-                for (vout, txout) in outgoing.contract_tx.output.iter().enumerate() {
-                    maker.unwatch_outpoint(
-                        bitcoin::OutPoint {
-                            txid,
-                            vout: vout as u32,
-                        },
-                        txout.script_pubkey.clone(),
-                    );
+                fully_swept
+            } else {
+                false
+            };
+
+            if !settlement_complete {
+                if let Some(ref swap_id) = state.swap_id {
+                    maker.store_connection_state(swap_id, &state, false)?;
+                }
+            } else {
+                // The swap is settled; its contract watches are no longer needed.
+                for incoming in &state.incoming_swapcoins {
+                    let txid = incoming.contract_tx.compute_txid();
+                    for (vout, txout) in incoming.contract_tx.output.iter().enumerate() {
+                        maker.unwatch_outpoint(
+                            bitcoin::OutPoint {
+                                txid,
+                                vout: vout as u32,
+                            },
+                            txout.script_pubkey.clone(),
+                        );
+                    }
+                }
+                for outgoing in &state.outgoing_swapcoins {
+                    let txid = outgoing.contract_tx.compute_txid();
+                    for (vout, txout) in outgoing.contract_tx.output.iter().enumerate() {
+                        maker.unwatch_outpoint(
+                            bitcoin::OutPoint {
+                                txid,
+                                vout: vout as u32,
+                            },
+                            txout.script_pubkey.clone(),
+                        );
+                    }
                 }
             }
 
@@ -1001,11 +1038,17 @@ fn recover_from_swap(
 
             let chain = chain.as_ref().expect("connection created for this branch");
 
+            let contract_txids = incoming_swapcoins
+                .iter()
+                .map(|swapcoin| swapcoin.contract_tx.compute_txid())
+                .collect();
+
             let swept = Wallet::sweep_incoming_swapcoins(
                 &maker.wallet,
                 chain,
                 crate::utill::MIN_FEE_RATE,
                 &maker.shutdown,
+                Some(&contract_txids),
             )
             .map_err(MakerError::Wallet)?;
 

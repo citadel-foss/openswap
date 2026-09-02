@@ -19,7 +19,7 @@ use crate::{
         legacy_messages::{FundingTxInfo, LegacyTakerMessage},
     },
     utill::{estimate_funding_tx_fee_sats, redeemscript_to_scriptpubkey},
-    wallet::{swapcoin::IncomingSwapCoin, MakerReport, WalletError},
+    wallet::{swapcoin::IncomingSwapCoin, WalletError},
 };
 
 /// Handle a Legacy protocol message.
@@ -882,9 +882,6 @@ fn process_legacy_handover<M: Maker>(
         state.outgoing_swapcoins.len()
     );
 
-    // Generate and save maker success report
-    emit_maker_success_report(maker, state, &handover.id);
-
     #[cfg(feature = "integration-test")]
     {
         use super::handlers::MakerBehavior;
@@ -892,7 +889,7 @@ fn process_legacy_handover<M: Maker>(
             // Sweep here rather than letting the error skip the server loop's
             // sweep block, or the preimage only reaches the chain 30s later via
             // idle recovery and the behavior's name is a lie.
-            if let Err(e) = maker.sweep_incoming_swapcoins() {
+            if let Err(e) = maker.sweep_incoming_swapcoins(&state.incoming_swapcoins) {
                 log::error!("[{}] Test sweep failed: {e:?}", maker.network_port());
             }
             log::warn!(
@@ -935,52 +932,4 @@ fn find_funding_output_index(funding_tx_info: &FundingTxInfo) -> Result<u32, Mak
         .ok_or(MakerError::General(
             "Funding output doesn't match with multisig redeem script",
         ))
-}
-
-/// Emit a maker success report after private key handover.
-fn emit_maker_success_report<M: Maker>(maker: &Arc<M>, state: &ConnectionState, swap_id: &str) {
-    let incoming_total: u64 = state
-        .incoming_swapcoins
-        .iter()
-        .map(|s| s.funding_amount.to_sat())
-        .sum();
-    let outgoing_total: u64 = state
-        .outgoing_swapcoins
-        .iter()
-        .map(|s| s.funding_amount.to_sat())
-        .sum();
-    let incoming_txid = state
-        .incoming_swapcoins
-        .first()
-        .map(|s| s.contract_tx.compute_txid().to_string())
-        .unwrap_or_else(|| "N/A".to_string());
-    let outgoing_txid = state
-        .outgoing_swapcoins
-        .first()
-        .map(|s| s.contract_tx.compute_txid().to_string())
-        .unwrap_or_else(|| "N/A".to_string());
-    let timelock = state
-        .outgoing_swapcoins
-        .first()
-        .and_then(|s| s.get_timelock())
-        .unwrap_or(0);
-    let network = maker.network().to_string();
-
-    let report = MakerReport::success(
-        swap_id.to_string(),
-        state.swap_start_time,
-        incoming_total,
-        outgoing_total,
-        state.service_fee_sats,
-        incoming_txid,
-        outgoing_txid,
-        timelock,
-        network,
-        state.incoming_swapcoins.first(),
-        state.outgoing_swapcoins.first(),
-    );
-    report.print();
-    if let Err(e) = report.save_for_wallet(maker.data_dir(), Some(maker.wallet_name())) {
-        log::warn!("Failed to save maker success report: {:?}", e);
-    }
 }
