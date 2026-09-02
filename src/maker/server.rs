@@ -1,14 +1,14 @@
 //! OpenSwap Maker Server.
 
 use std::{
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     net::{Ipv4Addr, TcpListener, TcpStream},
     sync::{
         atomic::Ordering::{self, Relaxed},
-        Arc,
+        Arc, Mutex,
     },
     thread::{self, sleep},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(not(feature = "integration-test"))]
@@ -24,8 +24,144 @@ use crate::{
 use super::{
     api::MakerServer,
     error::MakerError,
-    handlers::{handle_message, ConnectionState, Maker},
+    handlers::{handle_message, ConnectionState, Maker, MAX_CONCURRENT_SWAPS},
 };
+
+/// A live swap normally owns a route-heartbeat connection and one protocol
+/// connection. The third slot allows a replacement connection to arrive before
+/// the dead one has noticed the disconnect.
+const MAX_INBOUND_CONNECTIONS: usize = MAX_CONCURRENT_SWAPS * 3;
+/// Unidentified peers may consume only one third of the handler budget. The
+/// other two thirds cover the steady heartbeat and protocol connections.
+const MAX_PENDING_CONNECTIONS: usize = MAX_CONCURRENT_SWAPS;
+/// A burst lets all 30 swaps reconnect together; sustained churn stays bounded.
+const CONNECTIONS_PER_SECOND: f64 = 4.0;
+const CONNECTION_BURST: f64 = MAX_CONCURRENT_SWAPS as f64;
+/// Tor has already established the TCP stream, so protocol identification
+/// should finish well inside this deadline.
+const PENDING_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
+/// Maximum time to finish a frame after its first byte arrives.
+const MESSAGE_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(feature = "integration-test"))]
+const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(feature = "integration-test")]
+const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+struct LimiterState {
+    active: usize,
+    pending: usize,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl LimiterState {
+    fn new() -> Self {
+        Self {
+            active: 0,
+            pending: 0,
+            tokens: CONNECTION_BURST,
+            last_refill: Instant::now(),
+        }
+    }
+}
+
+struct ConnectionLimiter {
+    state: Mutex<LimiterState>,
+}
+
+impl ConnectionLimiter {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(LimiterState::new()),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        state.tokens = (state.tokens
+            + now.duration_since(state.last_refill).as_secs_f64() * CONNECTIONS_PER_SECOND)
+            .min(CONNECTION_BURST);
+        state.last_refill = now;
+        if state.tokens < 1.0 {
+            return None;
+        }
+        state.tokens -= 1.0;
+
+        // Consume the rate token even at capacity. Under a continuous flood,
+        // this prevents a full burst from accumulating while pending sockets
+        // wait for their deadline.
+        if state.active >= MAX_INBOUND_CONNECTIONS || state.pending >= MAX_PENDING_CONNECTIONS {
+            return None;
+        }
+        state.active += 1;
+        state.pending += 1;
+
+        Some(ConnectionPermit {
+            limiter: Arc::clone(self),
+            pending: true,
+        })
+    }
+}
+
+/// Releases both counters on every exit path, including handler panics.
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+    pending: bool,
+}
+
+impl ConnectionPermit {
+    fn mark_established(&mut self) {
+        if std::mem::replace(&mut self.pending, false) {
+            let mut state = self
+                .limiter
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.pending -= 1;
+        }
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.pending {
+            state.pending -= 1;
+        }
+        state.active -= 1;
+    }
+}
+
+enum HeartbeatAction {
+    Accept,
+    Reject,
+    Throttle,
+}
+
+fn admit_heartbeat(
+    known_swap: bool,
+    last_keepalive: &mut Option<Instant>,
+    permit: &mut ConnectionPermit,
+) -> HeartbeatAction {
+    if !known_swap {
+        HeartbeatAction::Reject
+    } else if last_keepalive.is_some_and(|last| last.elapsed() < MIN_KEEPALIVE_INTERVAL) {
+        HeartbeatAction::Throttle
+    } else {
+        *last_keepalive = Some(Instant::now());
+        permit.mark_established();
+        HeartbeatAction::Accept
+    }
+}
 
 /// Idle connection timeout (production).
 #[cfg(not(feature = "integration-test"))]
@@ -226,6 +362,7 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         maker.thread_pool.add_thread(fidelity_handle)?;
     }
 
+    let connection_limiter = ConnectionLimiter::new();
     while !maker.is_shutdown() {
         let Some(listener) = listener.as_ref() else {
             sleep(Duration::from_millis(100));
@@ -233,7 +370,14 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         };
         match listener.accept() {
             Ok((stream, addr)) => {
-                log::info!(
+                let Some(permit) = connection_limiter.try_acquire() else {
+                    // Refuse silently: logging attacker-controlled connection
+                    // volume would turn the limiter into a disk-amplification path.
+                    drop(stream);
+                    continue;
+                };
+
+                log::debug!(
                     "[{}] New connection from {}",
                     maker.config.network_port,
                     addr
@@ -248,8 +392,8 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                 let conn_handle = thread::Builder::new()
                     .name(format!("connection-{}", addr))
                     .spawn(move || {
-                        if let Err(e) = handle_connection(maker_clone, stream) {
-                            log::error!("Connection error: {:?}", e);
+                        if let Err(e) = handle_connection(maker_clone, stream, permit) {
+                            log::debug!("Connection closed: {:?}", e);
                         }
                     })
                     .map_err(MakerError::IO)?;
@@ -358,13 +502,22 @@ fn spawn_nostr_broadcast_thread(maker: &Arc<MakerServer>) -> Result<(), MakerErr
 }
 
 /// Handle a single connection.
-fn handle_connection(maker: Arc<MakerServer>, stream: Arc<TcpStream>) -> Result<(), MakerError> {
+fn handle_connection(
+    maker: Arc<MakerServer>,
+    stream: Arc<TcpStream>,
+    mut permit: ConnectionPermit,
+) -> Result<(), MakerError> {
     stream.set_nonblocking(false).map_err(MakerError::IO)?;
     stream
         .set_read_timeout(Some(CONNECTION_READ_TIMEOUT))
         .map_err(MakerError::IO)?;
+    stream
+        .set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT))
+        .map_err(MakerError::IO)?;
 
     let mut state = ConnectionState::default();
+    let mut pending_deadline = Instant::now() + PENDING_CONNECTION_TIMEOUT;
+    let mut last_keepalive = None;
 
     log::debug!(
         "[{}] Starting connection handler",
@@ -386,7 +539,7 @@ fn handle_connection(maker: Arc<MakerServer>, stream: Arc<TcpStream>) -> Result<
             break;
         }
 
-        let message = match read_message(&stream) {
+        let message = match read_message(&stream, permit.pending.then_some(pending_deadline)) {
             Ok(msg) => msg,
             Err(e) => {
                 // A read timeout is only a wakeup: keepalives arrive on separate
@@ -404,12 +557,23 @@ fn handle_connection(maker: Arc<MakerServer>, stream: Arc<TcpStream>) -> Result<
             }
         };
 
+        // Heartbeat connections carry a known swap id but intentionally keep a
+        // lightweight local state. Recognize them without changing the protocol.
+        if let TakerToMakerMessage::WaitingFundingConfirmation(id) = &message {
+            let known_swap = maker.get_connection_state(id)?.is_some();
+            match admit_heartbeat(known_swap, &mut last_keepalive, &mut permit) {
+                HeartbeatAction::Reject | HeartbeatAction::Throttle => break,
+                HeartbeatAction::Accept => {}
+            }
+        }
+
         log::debug!(
             "[{}] Received message: {:?}",
             maker.config.network_port,
             message
         );
 
+        let handling_started = Instant::now();
         let response = match handle_message(&maker, &mut state, message) {
             Ok(resp) => resp,
             Err(e) => {
@@ -418,6 +582,14 @@ fn handle_connection(maker: Arc<MakerServer>, stream: Arc<TcpStream>) -> Result<
                 break;
             }
         };
+        // Maker-side processing does not spend the peer's admission budget.
+        if permit.pending {
+            pending_deadline += handling_started.elapsed();
+        }
+
+        if state.swap_id.is_some() {
+            permit.mark_established();
+        }
 
         // Handling can block for minutes on contract confirmation waits.
         // Count the work itself as activity, or the loop-top idle check kills
@@ -510,7 +682,7 @@ fn handle_connection(maker: Arc<MakerServer>, stream: Arc<TcpStream>) -> Result<
 
 /// True when the error is the socket read timeout firing, not a real IO failure.
 fn is_read_timeout(e: &MakerError) -> bool {
-    matches!(e, MakerError::IO(io) if io.kind() == ErrorKind::WouldBlock)
+    matches!(e, MakerError::IO(io) if matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
 }
 
 /// A swap is quiet when neither this connection nor any keepalive connection
@@ -1150,15 +1322,18 @@ fn recover_from_swap(
     Ok(())
 }
 
-/// Read a message from a stream.
-fn read_message(stream: &TcpStream) -> Result<TakerToMakerMessage, MakerError> {
+/// Read a message, enforcing one absolute deadline until the connection proves
+/// that it belongs to an admitted swap.
+fn read_message(
+    stream: &TcpStream,
+    pending_deadline: Option<Instant>,
+) -> Result<TakerToMakerMessage, MakerError> {
     let mut len_buf = [0u8; 4];
-    use std::io::Read;
-
-    let mut stream_ref = stream;
-    stream_ref
-        .read_exact(&mut len_buf)
-        .map_err(MakerError::IO)?;
+    read_exact_until(stream, &mut len_buf[..1], pending_deadline)?;
+    let assembly_deadline = Instant::now() + MESSAGE_ASSEMBLY_TIMEOUT;
+    let deadline =
+        Some(pending_deadline.map_or(assembly_deadline, |pending| pending.min(assembly_deadline)));
+    read_exact_until(stream, &mut len_buf[1..], deadline)?;
 
     let len = u32::from_be_bytes(len_buf) as usize;
 
@@ -1167,12 +1342,53 @@ fn read_message(stream: &TcpStream) -> Result<TakerToMakerMessage, MakerError> {
     }
 
     let mut buf = vec![0u8; len];
-    stream_ref.read_exact(&mut buf).map_err(MakerError::IO)?;
+    read_exact_until(stream, &mut buf, deadline)?;
 
     let message: TakerToMakerMessage = serde_cbor::from_slice(&buf)
         .map_err(|_| MakerError::General("Failed to deserialize message"))?;
 
     Ok(message)
+}
+
+fn read_exact_until(
+    stream: &TcpStream,
+    mut buf: &mut [u8],
+    deadline: Option<Instant>,
+) -> Result<(), MakerError> {
+    while !buf.is_empty() {
+        let timeout = deadline
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or(MakerError::General("Message read deadline expired"))
+            })
+            .transpose()?
+            .unwrap_or(CONNECTION_READ_TIMEOUT)
+            .max(Duration::from_millis(1));
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(MakerError::IO)?;
+
+        let mut stream_ref = stream;
+        match stream_ref.read(buf) {
+            Ok(0) => {
+                return Err(MakerError::IO(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "peer closed during protocol message",
+                )));
+            }
+            Ok(read) => buf = &mut buf[read..],
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e)
+                if deadline.is_some()
+                    && matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                return Err(MakerError::General("Message read deadline expired"));
+            }
+            Err(e) => return Err(MakerError::IO(e)),
+        }
+    }
+    Ok(())
 }
 
 /// Send a message to a stream.
@@ -1215,4 +1431,107 @@ pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
     Err(MakerError::General(
         "No available ports found in valid range",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn pending_connections_are_bounded() {
+        let limiter = ConnectionLimiter::new();
+        let permits: Vec<_> = (0..MAX_PENDING_CONNECTIONS)
+            .map(|_| limiter.try_acquire().expect("pending slot below limit"))
+            .collect();
+
+        limiter.state.lock().unwrap().tokens = CONNECTION_BURST;
+        assert!(limiter.try_acquire().is_none());
+        assert_eq!(
+            limiter.state.lock().unwrap().pending,
+            MAX_PENDING_CONNECTIONS
+        );
+        assert_eq!(limiter.state.lock().unwrap().tokens, CONNECTION_BURST - 1.0);
+        drop(permits);
+        let state = limiter.state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert_eq!(state.pending, 0);
+    }
+
+    #[test]
+    fn established_connections_are_bounded() {
+        let limiter = ConnectionLimiter::new();
+        let mut permits = Vec::new();
+        for _ in 0..MAX_INBOUND_CONNECTIONS {
+            limiter.state.lock().unwrap().tokens = 1.0;
+            let mut permit = limiter.try_acquire().expect("active slot below limit");
+            permit.mark_established();
+            permits.push(permit);
+        }
+
+        limiter.state.lock().unwrap().tokens = 1.0;
+        assert!(limiter.try_acquire().is_none());
+        {
+            let state = limiter.state.lock().unwrap();
+            assert_eq!(state.active, MAX_INBOUND_CONNECTIONS);
+            assert_eq!(state.pending, 0);
+        }
+        drop(permits);
+        assert_eq!(limiter.state.lock().unwrap().active, 0);
+    }
+
+    #[test]
+    fn token_bucket_limits_connection_burst() {
+        let limiter = ConnectionLimiter::new();
+        let mut permits = Vec::new();
+        for _ in 0..MAX_PENDING_CONNECTIONS {
+            let mut permit = limiter.try_acquire().expect("token within burst");
+            permit.mark_established();
+            permits.push(permit);
+        }
+        let mut state = limiter.state.lock().unwrap();
+        state.tokens = 0.0;
+        state.last_refill = Instant::now();
+        drop(state);
+        assert!(limiter.try_acquire().is_none());
+    }
+
+    #[test]
+    fn heartbeat_admission_rejects_throttles_and_promotes() {
+        let limiter = ConnectionLimiter::new();
+        let mut permit = limiter.try_acquire().unwrap();
+        let mut last_keepalive = None;
+
+        assert!(matches!(
+            admit_heartbeat(false, &mut last_keepalive, &mut permit),
+            HeartbeatAction::Reject
+        ));
+        assert!(permit.pending);
+
+        assert!(matches!(
+            admit_heartbeat(true, &mut last_keepalive, &mut permit),
+            HeartbeatAction::Accept
+        ));
+        assert!(!permit.pending);
+        assert!(matches!(
+            admit_heartbeat(true, &mut last_keepalive, &mut permit),
+            HeartbeatAction::Throttle
+        ));
+    }
+
+    #[test]
+    fn pending_deadline_stops_slow_reads() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let reader = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            read_message(&stream, Some(Instant::now() + Duration::from_millis(50)))
+        });
+
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(&[0]).unwrap();
+        thread::sleep(Duration::from_millis(150));
+
+        assert!(reader.join().unwrap().is_err());
+    }
 }
