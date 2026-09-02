@@ -315,13 +315,17 @@ pub(crate) fn check_hashvalues_are_equal(
         .map(|funding_info| read_hashvalue_from_contract(&funding_info.contract_redeemscript))
         .collect::<Result<Vec<_>, ProtocolError>>()?;
 
-    if !hashvalues.iter().all(|value| value == &hashvalues[0]) {
+    let first = hashvalues
+        .first()
+        .ok_or(ProtocolError::General("No confirmed funding txes provided"))?;
+
+    if !hashvalues.iter().all(|value| value == first) {
         return Err(ProtocolError::General(
             "Contract redeemscript doesn't have equal hashvalues",
         ));
     }
 
-    Ok(hashvalues[0])
+    Ok(*first)
 }
 
 /// Read the locktime from a contract redeem script.
@@ -1314,6 +1318,21 @@ mod test {
             error_message_invalid_length,
             "Contract redeemscript doesn't have equal hashvalues"
         );
+
+        // case with empty confirmed funding txes (must not panic)
+        let empty_proof = ProofOfFunding {
+            confirmed_funding_txes: vec![],
+            next_openswap_info: vec![],
+            refund_locktime: u16::default(),
+            contract_feerate: f64::default(),
+            id: "empty".to_string(),
+        };
+        match check_hashvalues_are_equal(&empty_proof).unwrap_err() {
+            ProtocolError::General(msg) => {
+                assert_eq!(msg, "No confirmed funding txes provided");
+            }
+            err => panic!("Unexpected error: {:?}", err),
+        }
     }
 
     #[test]
