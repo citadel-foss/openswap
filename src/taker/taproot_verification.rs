@@ -10,9 +10,12 @@ use bitcoin::{
     PublicKey,
 };
 
-use crate::protocol::{
-    contract::sum_claimed_amounts, contract2::extract_hash_from_hashlock,
-    musig_interface::get_aggregated_pubkey_compat, taproot_messages::TaprootContractData,
+use crate::{
+    protocol::{
+        contract::sum_claimed_amounts, contract2::extract_hash_from_hashlock,
+        musig_interface::get_aggregated_pubkey_compat, taproot_messages::TaprootContractData,
+    },
+    utill::get_taker_dir,
 };
 
 use super::{api::Taker, error::TakerError};
@@ -147,10 +150,28 @@ impl Taker {
         }
 
         let secp = Secp256k1::verification_only();
+        // The taker receives only the final maker's outgoing contracts.
+        let is_final_maker = maker_idx + 1 == self.swap_state()?.makers.len();
+        let blocklist_data_dir = if self.config.check_blocklist.unwrap_or(false) && is_final_maker {
+            Some(
+                self.config
+                    .data_dir
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(get_taker_dir)?,
+            )
+        } else {
+            None
+        };
 
         // Each contract has its own timelock script, internal key and tap tweak,
         // so verify the timelock template, locktime value and P2TR output per contract.
         for (i, tx) in contract.contract_txs.iter().enumerate() {
+            if let Some(data_dir) = &blocklist_data_dir {
+                let wallet = self.read_wallet()?;
+                crate::blocklist::screen_funding_tx(data_dir, wallet.store.network, &wallet, tx)?;
+            }
+
             let timelock_script = &contract.timelock_scripts[i];
             verify_internal_key(
                 contract.internal_keys[i],

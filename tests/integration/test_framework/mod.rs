@@ -644,6 +644,9 @@ pub struct TestFramework {
     /// Kept so [`TestFramework::taker_init_config`] can rebuild the same backend
     /// config the takers were started with.
     zmq_addr: String,
+    /// Kept for the same reason as `zmq_addr`: a taker rebuilt by
+    /// [`TestFramework::taker_init_config`] must screen as the original did.
+    check_blocklist: bool,
     shutdown: AtomicBool,
     block_gen_paused: AtomicBool,
     nostr_relay: Mutex<Option<Child>>,
@@ -680,6 +683,36 @@ impl TestFramework {
         makers_config_map: Vec<(u16, Option<u16>)>,
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
+    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
+        Self::init_with_blocklist_setting::<B>(
+            makers_config_map,
+            taker_behavior,
+            maker_behaviors,
+            false,
+        )
+    }
+
+    /// Initialize the test framework with runtime blocklist screening enabled.
+    #[allow(clippy::type_complexity)]
+    pub fn init_with_blocklist<B: TestBackend>(
+        makers_config_map: Vec<(u16, Option<u16>)>,
+        taker_behavior: Vec<TakerBehavior>,
+        maker_behaviors: Vec<MakerBehavior>,
+    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
+        Self::init_with_blocklist_setting::<B>(
+            makers_config_map,
+            taker_behavior,
+            maker_behaviors,
+            true,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn init_with_blocklist_setting<B: TestBackend>(
+        makers_config_map: Vec<(u16, Option<u16>)>,
+        taker_behavior: Vec<TakerBehavior>,
+        maker_behaviors: Vec<MakerBehavior>,
+        check_blocklist: bool,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
         // Setup directory — use a unique suffix so tests can run in parallel
         let unique_id = format!("openswap-{}", rand::random::<u64>());
@@ -733,6 +766,7 @@ impl TestFramework {
                     // Wallet files are always encrypted; tests use a fixed
                     // passphrase (PBKDF2 rounds are 1 under `integration-test`).
                     config.password = Some("integration-test".to_string());
+                    config.check_blocklist = Some(check_blocklist);
                     let mut taker = Taker::init(config).unwrap();
                     taker.behavior = behavior;
                     taker
@@ -763,6 +797,7 @@ impl TestFramework {
                         time_relative_fee_pct: 0.0001,
                         min_swap_amount: 10_000,
                         required_confirms: 1,
+                        check_blocklist,
                         supported_protocols: vec![
                             ProtocolVersion::Legacy,
                             ProtocolVersion::Taproot,
@@ -793,6 +828,7 @@ impl TestFramework {
             temp_dir: temp_dir.clone(),
             nostr_relay_url: nostr_relay_url.clone(),
             zmq_addr,
+            check_blocklist,
             shutdown: AtomicBool::new(false),
             block_gen_paused: AtomicBool::new(false),
             nostr_relay: Mutex::new(Some(nostr_relay)),
@@ -857,6 +893,7 @@ impl TestFramework {
         // Must match the passphrase set in `TestFramework::init`, or the
         // re-init cannot decrypt the wallet.
         config.password = Some("integration-test".to_string());
+        config.check_blocklist = Some(self.check_blocklist);
         config
     }
 

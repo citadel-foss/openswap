@@ -281,6 +281,9 @@ pub trait Maker: Send + Sync {
     /// Broadcast a transaction.
     fn broadcast_transaction(&self, tx: &Transaction) -> Result<bitcoin::Txid, MakerError>;
 
+    /// Check every funding input's previous-output script against the blocklist.
+    fn screen_funding_tx(&self, tx: &Transaction) -> Result<(), MakerError>;
+
     /// Whether the backend already knows this transaction (mempool or chain);
     /// used to tolerate duplicate-broadcast errors. `false` also covers
     /// "backend down". Core must run with `-txindex=1`.

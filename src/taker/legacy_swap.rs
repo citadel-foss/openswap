@@ -1197,6 +1197,7 @@ impl Taker {
                 let expected_amount = self.expected_amount_for_hop(maker_idx);
                 self.verify_maker_sender_contracts(
                     &req.senders_contract_txs_info,
+                    maker_idx,
                     next_multisig_pubkeys,
                     next_hashlock_pubkeys,
                     refund_locktime,

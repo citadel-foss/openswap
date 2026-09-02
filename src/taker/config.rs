@@ -17,6 +17,8 @@ pub struct TakerConfig {
     pub socks_port: u16,
     /// Authentication password for Tor interface
     pub tor_auth_password: String,
+    /// Whether funding inputs should be checked against the address blocklist.
+    pub check_blocklist: bool,
 }
 
 impl Default for TakerConfig {
@@ -25,6 +27,7 @@ impl Default for TakerConfig {
             control_port: 9051,
             socks_port: 9050,
             tor_auth_password: "".to_string(),
+            check_blocklist: false,
         }
     }
 }
@@ -69,6 +72,10 @@ impl TakerConfig {
                 config_map.get("tor_auth_password"),
                 default_config.tor_auth_password,
             ),
+            check_blocklist: parse_field(
+                config_map.get("check_blocklist"),
+                default_config.check_blocklist,
+            ),
         })
     }
 
@@ -82,8 +89,10 @@ control_port = {}
 # Socks port for Tor proxy
 socks_port = {}
 # Authentication password for Tor control interface
-tor_auth_password = {}",
-            self.control_port, self.socks_port, self.tor_auth_password,
+tor_auth_password = {}
+# Check funding inputs against the address blocklist
+check_blocklist = {}",
+            self.control_port, self.socks_port, self.tor_auth_password, self.check_blocklist,
         );
 
         let parent = path.parent().ok_or_else(|| {
@@ -174,6 +183,7 @@ mod tests {
         let contents = r#"
             [taker_config]
             socks_port = 9050
+            check_blocklist = true
         "#;
         let config_path = create_temp_config(contents, "different_data_taker_config.toml");
         let config = TakerConfig::new(Some(&config_path)).unwrap();
@@ -185,6 +195,7 @@ mod tests {
         assert_eq!(
             TakerConfig {
                 socks_port: 9050,         // Configurable via TOML.
+                check_blocklist: true,    // Explicitly enabled at runtime.
                 ..TakerConfig::default()  // Use default for other values.
             },
             config
