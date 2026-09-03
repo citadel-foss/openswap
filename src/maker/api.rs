@@ -51,8 +51,8 @@ pub const MIN_SWAP_AMOUNT: u64 = 10_000;
 struct SwapState {
     /// Swap amount.
     swap_amount: Amount,
-    /// Number of contract transactions agreed at negotiation.
-    tx_count: u32,
+    /// [maximum forwarding transaction count, maximum inputs per forwarding transaction].
+    tx_count: [u32; 2],
     /// Timelock value (Legacy: relative CSV, Taproot: absolute CLTV height).
     timelock: u32,
     /// Protocol version for this swap.
@@ -91,7 +91,7 @@ impl Default for SwapState {
     fn default() -> Self {
         SwapState {
             swap_amount: Amount::ZERO,
-            tx_count: 0,
+            tx_count: [0, 0],
             timelock: 0,
             protocol: ProtocolVersion::Legacy,
             phase: SwapPhase::AwaitingHello,
@@ -1172,6 +1172,15 @@ impl MakerTrait for MakerServer {
 
         let config = self.get_config();
 
+        if details.max_tx_count() == 0 {
+            return Err(MakerError::General("Transaction count must be non-zero"));
+        }
+        if details.max_utxos_per_tx() == 0 {
+            return Err(MakerError::General(
+                "UTXO count per transaction must be non-zero",
+            ));
+        }
+
         // Check amount is within bounds
         let amount_sat = details.amount.to_sat();
         if amount_sat < config.min_swap_amount {
@@ -1274,6 +1283,7 @@ impl MakerTrait for MakerServer {
         amount: Amount,
         address: bitcoin::Address,
         excluded_outpoints: Option<Vec<OutPoint>>,
+        max_inputs_per_tx: usize,
     ) -> Result<(Transaction, u32), MakerError> {
         let mut wallet = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -1285,6 +1295,7 @@ impl MakerTrait for MakerServer {
                 crate::utill::MIN_FEE_RATE,
                 None,
                 excluded_outpoints,
+                Some(max_inputs_per_tx),
             )
             .map_err(MakerError::Wallet)?;
 
@@ -1854,6 +1865,7 @@ impl MakerTrait for MakerServer {
         locktime: u16,
         contract_feerate: f64,
         excluded_outpoints: Option<Vec<OutPoint>>,
+        max_inputs_per_tx: usize,
     ) -> Result<(Vec<Transaction>, Vec<OutgoingSwapCoin>, Amount), MakerError> {
         log::info!(
             "[{}] Initializing openswap: amount={} sats, {} pubkeys",
@@ -1880,6 +1892,7 @@ impl MakerTrait for MakerServer {
                 contract_feerate,
                 None,
                 excluded_outpoints,
+                Some(max_inputs_per_tx),
             )
             .map_err(MakerError::Wallet)?;
 

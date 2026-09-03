@@ -78,7 +78,7 @@ fn fidelity_limit_violation() {
 
     // Swap params - small amount for faster testing
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 1)
-        .with_tx_count(2)
+        .with_tx_count([2, 3])
         .with_required_confirms(1);
 
     // Prepare the swap - it will fail

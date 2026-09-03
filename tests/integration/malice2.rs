@@ -120,7 +120,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
 
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(1)
+        .with_tx_count([1, 3])
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);

@@ -98,7 +98,7 @@ fn run_multi_confirm_swap(protocol: ProtocolVersion, makers_config_map: Vec<(u16
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(REQUIRED_CONFIRMS);
 
     generate_blocks(bitcoind, 1);

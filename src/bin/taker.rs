@@ -576,7 +576,7 @@ fn main() -> Result<(), TakerError> {
 
             let mut swap_params =
                 SwapParams::new(protocol_version, Amount::from_sat(*amount), *makers);
-            swap_params.tx_count = *tx_count;
+            swap_params.tx_count[0] = *tx_count;
             swap_params.manually_selected_outpoints = manually_selected_outpoints;
             if !maker_addresses.is_empty() {
                 swap_params.preferred_makers = Some(maker_addresses.clone());

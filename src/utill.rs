@@ -52,7 +52,11 @@ pub(crate) fn global_secp() -> &'static Secp256k1<All> {
 use crate::{
     error::NetError,
     lock_debug,
-    protocol::{contract::derive_maker_pubkey_and_nonce, error::ProtocolError},
+    protocol::{
+        common_messages::ProtocolVersion,
+        contract::{derive_maker_pubkey_and_nonce, CONTRACT_TX_VSIZE},
+        error::ProtocolError,
+    },
     wallet::{SecretMnemonic, UTXOSpendInfo, WalletError},
 };
 
@@ -139,13 +143,37 @@ pub fn calculate_fee_sats(vbytes: u64) -> u64 {
         .to_sat()
 }
 
-/// Estimated on-chain miner cost (sats) a maker bears per swap contract: a funding tx
-/// (overhead 11 + P2WPKH input 68 + P2WSPK change 31 + (P2TR/P2WSPK) payment output 43 = 153 vB)
-/// plus a sweep tx (overhead 11 + input 68 + self-payment output 43 = 122 vB).
-///
-/// Used both by the maker (for routed amount) and by taker's `expected_amount_for_hop`
+/// Estimated reimbursable maker funding cost (sats) for one forwarding transaction.
+/// Excludes later sweep/recovery spends, which stay maker-paid.
 pub fn estimate_funding_tx_fee_sats() -> u64 {
-    calculate_fee_sats((11 + 68 + 31 + 43) + (11 + 68 + 43))
+    estimate_funding_tx_fee_for_inputs_sats(1)
+}
+
+/// Estimated reimbursable maker funding cost (sats) for one forwarding transaction
+/// capped at `input_count` wallet inputs.
+pub fn estimate_funding_tx_fee_for_inputs_sats(input_count: u32) -> u64 {
+    let inputs = u64::from(input_count.max(1));
+    calculate_fee_sats(11 + (68 * inputs) + 31 + 43)
+}
+
+/// Estimated maker-reimbursable fee from the actual forwarding transactions
+/// returned by the maker. This still uses the protocol's vsize model, but it
+/// prices the real input count instead of letting the maker keep unused ceiling.
+pub fn estimate_maker_reimbursable_fee_for_input_counts_sats<I>(
+    protocol: ProtocolVersion,
+    input_counts: I,
+) -> u64
+where
+    I: IntoIterator<Item = usize>,
+{
+    let legacy_contract_fee = match protocol {
+        ProtocolVersion::Legacy => calculate_fee_sats(CONTRACT_TX_VSIZE),
+        ProtocolVersion::Taproot => 0,
+    };
+    input_counts
+        .into_iter()
+        .map(|count| estimate_funding_tx_fee_for_inputs_sats(count as u32) + legacy_contract_fee)
+        .sum()
 }
 
 /// Sets up the logger for the taker component.

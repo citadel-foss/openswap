@@ -109,7 +109,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
 
     // Swap params for openswap (Taproot)
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
-        .with_tx_count(1)
+        .with_tx_count([1, 3])
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);

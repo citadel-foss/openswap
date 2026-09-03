@@ -24,7 +24,7 @@ use crate::{
         taproot_messages::{SerializableScalar, TaprootContractData, TaprootTakerMessage},
     },
     taker::api::REFUND_LOCKTIME_STEP,
-    utill::estimate_funding_tx_fee_sats,
+    utill::{estimate_funding_tx_fee_for_inputs_sats, estimate_funding_tx_fee_sats},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         MakerReport, WalletError,
@@ -127,12 +127,12 @@ fn process_taproot_contract<M: Maker>(
 
     // Contract count was agreed in SwapDetails and drives how many outgoing
     // contracts we fund, so the taker must not change it here.
-    if data.contract_txs.len() != state.tx_count as usize {
+    if data.contract_txs.len() != state.tx_count[0] as usize {
         log::error!(
             "[{}] Taproot contract count {} does not match negotiated {}",
             maker.network_port(),
             data.contract_txs.len(),
-            state.tx_count
+            state.tx_count[0]
         );
         return Err(MakerError::General(
             "Taproot contract count does not match the negotiated tx count",
@@ -277,7 +277,7 @@ fn process_taproot_contract<M: Maker>(
 
     for &expected_outgoing_amount in &outgoing_amounts {
         #[cfg(feature = "integration-test")]
-        let outgoing_amount = if maker.behavior() == MakerBehavior::FeeSkimming {
+        let mut outgoing_amount = if maker.behavior() == MakerBehavior::FeeSkimming {
             expected_outgoing_amount
                 .checked_sub(Amount::from_sat(1))
                 .ok_or(MakerError::General("Test fee skim exceeds outgoing amount"))?
@@ -285,7 +285,7 @@ fn process_taproot_contract<M: Maker>(
             expected_outgoing_amount
         };
         #[cfg(not(feature = "integration-test"))]
-        let outgoing_amount = expected_outgoing_amount;
+        let mut outgoing_amount = expected_outgoing_amount;
         let outgoing_nonce =
             bitcoin::secp256k1::SecretKey::new(&mut bitcoin::secp256k1::rand::thread_rng());
         let outgoing_privkey = tweakable_privkey
@@ -338,24 +338,54 @@ fn process_taproot_contract<M: Maker>(
         let mut excluded_utxos = base_excluded.clone();
         excluded_utxos.extend(spent_inputs.iter().cloned());
 
-        // QA: Integration-only malicious maker path for taker validation tests.
-        #[cfg(feature = "integration-test")]
-        let funding_amount = {
-            use super::handlers::MakerBehavior;
-            if maker.behavior() == MakerBehavior::UnderfundTaprootContract {
+        let mut fee_iterations = 0;
+        let (contract_tx, output_pos) = loop {
+            fee_iterations += 1;
+            #[cfg(feature = "integration-test")]
+            let funding_amount = if maker.behavior() == MakerBehavior::UnderfundTaprootContract {
                 Amount::from_sat(10_000)
             } else {
                 outgoing_amount
-            }
-        };
-        #[cfg(not(feature = "integration-test"))]
-        let funding_amount = outgoing_amount;
+            };
+            #[cfg(not(feature = "integration-test"))]
+            let funding_amount = outgoing_amount;
 
-        let (contract_tx, output_pos) = maker.create_funding_transaction(
-            funding_amount,
-            taproot_address.clone(),
-            Some(excluded_utxos),
-        )?;
+            let result = maker.create_funding_transaction(
+                funding_amount,
+                taproot_address.clone(),
+                Some(excluded_utxos.clone()),
+                state.tx_count[1] as usize,
+            )?;
+
+            #[cfg(feature = "integration-test")]
+            if maker.behavior() == MakerBehavior::UnderfundTaprootContract {
+                break result;
+            }
+
+            let actual_fee = estimate_funding_tx_fee_for_inputs_sats(result.0.input.len() as u32);
+            let extra_fee = actual_fee.saturating_sub(estimate_funding_tx_fee_sats());
+            let expected_with_actual_fee = expected_outgoing_amount
+                .checked_sub(Amount::from_sat(extra_fee))
+                .ok_or(MakerError::General("Funding fee exceeds outgoing amount"))?;
+            #[cfg(feature = "integration-test")]
+            let expected_with_actual_fee = if maker.behavior() == MakerBehavior::FeeSkimming {
+                expected_with_actual_fee
+                    .checked_sub(Amount::from_sat(1))
+                    .ok_or(MakerError::General("Test fee skim exceeds outgoing amount"))?
+            } else {
+                expected_with_actual_fee
+            };
+
+            if outgoing_amount == expected_with_actual_fee {
+                break result;
+            }
+            if fee_iterations >= 3 {
+                return Err(MakerError::General(
+                    "Maker funding fee did not converge within input limit",
+                ));
+            }
+            outgoing_amount = expected_with_actual_fee;
+        };
         spent_inputs.extend(contract_tx.input.iter().map(|i| i.previous_output));
         let contract_outpoint = OutPoint {
             txid: contract_tx.compute_txid(),
@@ -534,6 +564,41 @@ fn process_taproot_contract<M: Maker>(
         n,
         data.id
     );
+
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == MakerBehavior::OverproduceContractData {
+        if let (
+            Some(pubkey),
+            Some(internal_key),
+            Some(tap_tweak),
+            Some(timelock_script),
+            Some(contract_tx),
+            Some(amount),
+        ) = (
+            response_pubkeys.first().copied(),
+            response_internal_keys.first().copied(),
+            response_tap_tweaks.first().cloned(),
+            response_timelock_scripts.first().cloned(),
+            response_contract_txs.first().cloned(),
+            response_amounts.first().copied(),
+        ) {
+            response_pubkeys.push(pubkey);
+            response_internal_keys.push(internal_key);
+            response_tap_tweaks.push(tap_tweak);
+            response_timelock_scripts.push(timelock_script);
+            response_contract_txs.push(contract_tx);
+            response_amounts.push(amount);
+        }
+    }
+
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == MakerBehavior::OverconsumeFundingInputs {
+        if let Some(tx) = response_contract_txs.first_mut() {
+            while tx.input.len() <= state.tx_count[1] as usize {
+                tx.input.push(bitcoin::TxIn::default());
+            }
+        }
+    }
 
     let response = TaprootContractData::new(
         data.id.clone(),

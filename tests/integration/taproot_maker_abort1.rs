@@ -89,7 +89,7 @@ fn test_taproot_maker_abort1() {
 
     // Swap params: Taproot, requires 2 makers but only 1 is available
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);

@@ -39,8 +39,8 @@ use crate::{
         contract::calculate_pubkey_from_nonce,
     },
     utill::{
-        estimate_funding_tx_fee_sats, generate_maker_keys, get_taker_dir, read_message,
-        send_message,
+        estimate_maker_reimbursable_fee_for_input_counts_sats, generate_maker_keys, get_taker_dir,
+        read_message, send_message,
     },
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
@@ -216,10 +216,8 @@ pub struct SwapParams {
     pub send_amount: Amount,
     /// Number of makers (hops) to use.
     pub maker_count: usize,
-    /// Number of funding transactions per hop. Each funding transaction creates
-    /// one contract transaction, so this also determines the number of contracts
-    /// per hop. Used by both Legacy and Taproot protocols; defaults to 1.
-    pub tx_count: u32,
+    /// [maximum forwarding transaction count, maximum inputs per forwarding transaction].
+    pub tx_count: [u32; 2],
     /// Required confirmations for funding transactions.
     pub required_confirms: u32,
     /// User-selected UTXOs (optional).
@@ -240,7 +238,7 @@ impl SwapParams {
             protocol,
             send_amount,
             maker_count,
-            tx_count: 1,
+            tx_count: [3, 3],
             required_confirms: 1,
             manually_selected_outpoints: None,
             preferred_makers: None,
@@ -249,9 +247,17 @@ impl SwapParams {
     }
 
     /// Set the number of funding transactions per hop.
-    pub fn with_tx_count(mut self, tx_count: u32) -> Self {
+    pub fn with_tx_count(mut self, tx_count: [u32; 2]) -> Self {
         self.tx_count = tx_count;
         self
+    }
+
+    pub(crate) fn max_tx_count(&self) -> u32 {
+        self.tx_count[0]
+    }
+
+    pub(crate) fn max_utxos_per_tx(&self) -> u32 {
+        self.tx_count[1]
     }
 
     /// Set the required confirmations.
@@ -402,48 +408,41 @@ impl MakerConnection {
 }
 
 impl Taker {
-    /// Compute the exact expected output amount for a specific maker hop.
-    ///
-    /// Accounts for cumulative fees from all previous hops so that each maker's
-    /// output is compared against the correct input amount (not the original
-    /// `send_amount`). Taproot hops are priced on the negotiated locktime offset,
-    /// matching the maker's fee.
+    /// Compute the ceiling-priced output for one maker from the amount it actually received.
     ///
     /// Returns `None` if any maker along the route (up to and including `maker_idx`)
     /// has no stored offer.
     ///
     /// Fee formula: `total_fee = base_fee + (amount * amt_pct)/100 + (amount * locktime * time_pct)/100`
     /// TODO: Use fee estimation here
-    pub(crate) fn expected_amount_for_hop(&self, maker_idx: usize) -> Option<Amount> {
+    pub(crate) fn expected_amount_for_hop(
+        &self,
+        maker_idx: usize,
+        incoming_amount: Amount,
+    ) -> Option<Amount> {
         let swap = self.swap_state().ok()?;
-        let send_amount = swap.params.send_amount;
         let maker_count = swap.makers.len();
-
-        // TODO : Have the makers derive the fee & a smart messaging layer to send the estimated target to the taker sequentially.
-        let per_hop_mining_fee = estimate_funding_tx_fee_sats() * swap.params.tx_count as u64;
-
-        // Replay each hop's deduction exactly as the maker computes it. Any
-        // slack here is room for a cheating maker to underpay the next hop;
-        // the PaySwap solver shares this formula and relies on its exactness.
-        let mut amount_sats = send_amount.to_sat();
-        for i in 0..=maker_idx {
-            let maker = &swap.makers[i];
-            let offer = maker.offer.as_ref()?;
-            let locktime = match maker.protocol {
-                ProtocolVersion::Legacy => maker.negotiated_timelock,
-                ProtocolVersion::Taproot => {
-                    (REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - i - 1) as u16)
-                        as u32
-                }
-            };
-            amount_sats = hop_net_sats(
-                &HopFeeTerms::from_offer(offer, locktime),
-                per_hop_mining_fee,
-                amount_sats,
-            );
-        }
-
-        Some(Amount::from_sat(amount_sats))
+        let maker = &swap.makers[maker_idx];
+        let offer = maker.offer.as_ref()?;
+        let locktime = match maker.protocol {
+            ProtocolVersion::Legacy => maker.negotiated_timelock,
+            ProtocolVersion::Taproot => {
+                (REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - maker_idx - 1) as u16)
+                    as u32
+            }
+        };
+        let ceiling_fee = estimate_maker_reimbursable_fee_for_input_counts_sats(
+            maker.protocol,
+            std::iter::repeat_n(
+                swap.params.max_utxos_per_tx() as usize,
+                swap.params.max_tx_count() as usize,
+            ),
+        );
+        Some(Amount::from_sat(hop_net_sats(
+            &HopFeeTerms::from_offer(offer, locktime),
+            ceiling_fee,
+            incoming_amount.to_sat(),
+        )))
     }
 }
 
@@ -1558,7 +1557,7 @@ impl Taker {
 
         #[cfg(debug_assertions)]
         log::debug!(
-            "[SWAP_ROUTE] Source: taker::api::negotiate_swap_details | SwapID: {} | NegotiatedMakers: {} | Protocol: {:?} | ReferenceHeight: {} | TxCount: {}",
+            "[SWAP_ROUTE] Source: taker::api::negotiate_swap_details | SwapID: {} | NegotiatedMakers: {} | Protocol: {:?} | ReferenceHeight: {} | TxUtxoCount: {:?}",
             swap_id,
             maker_count,
             protocol,
@@ -1574,7 +1573,7 @@ impl Taker {
         maker_idx: usize,
         swap_id: &str,
         send_amount: Amount,
-        tx_count: u32,
+        tx_count: [u32; 2],
         maker_count: usize,
         reference_height: u32,
     ) -> Result<(), TakerError> {
@@ -1932,7 +1931,7 @@ impl Taker {
         let preimage = swap.preimage;
         let send_amount = swap.params.send_amount;
         let swap_id = swap.id.clone();
-        let swap_tx_count = swap.params.tx_count as usize;
+        let swap_tx_count = swap.params.max_tx_count() as usize;
         let manually_selected_outpoints = swap.params.manually_selected_outpoints.clone();
         let reference_height = swap.reference_height;
 
@@ -1940,7 +1939,7 @@ impl Taker {
             generate_maker_keys(
                 &tweakable_point,
                 if protocol == ProtocolVersion::Legacy {
-                    swap.params.tx_count
+                    swap.params.max_tx_count()
                 } else {
                     1
                 },

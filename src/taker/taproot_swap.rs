@@ -155,6 +155,7 @@ impl Taker {
             MIN_FEE_RATE,
             manually_selected_outpoints,
             None,
+            None,
         )?;
 
         for (
@@ -348,6 +349,15 @@ impl Taker {
                     None
                 },
             );
+            let incoming_amount =
+                contract_data
+                    .amounts
+                    .iter()
+                    .try_fold(Amount::ZERO, |total, amount| {
+                        total.checked_add(*amount).ok_or_else(|| {
+                            TakerError::General("Taproot incoming amount overflow".to_string())
+                        })
+                    })?;
 
             #[cfg(feature = "integration-test")]
             if self.behavior == super::api::TakerBehavior::CloseAtSendersContract {
@@ -392,7 +402,7 @@ impl Taker {
 
                     // Verify contract data before creating swapcoins
                     let expected_locktime = self.swap_state()?.makers[i].negotiated_timelock;
-                    let expected_amount = self.expected_amount_for_hop(i);
+                    let expected_amount = self.expected_amount_for_hop(i, incoming_amount);
                     self.verify_maker_taproot_contract(
                         &maker_contract,
                         i,

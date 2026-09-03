@@ -18,7 +18,10 @@ use crate::{
         },
         legacy_messages::{FundingTxInfo, LegacyTakerMessage},
     },
-    utill::{estimate_funding_tx_fee_sats, redeemscript_to_scriptpubkey},
+    utill::{
+        estimate_funding_tx_fee_sats, estimate_maker_reimbursable_fee_for_input_counts_sats,
+        redeemscript_to_scriptpubkey,
+    },
     wallet::{swapcoin::IncomingSwapCoin, MakerReport, WalletError},
 };
 
@@ -178,12 +181,12 @@ fn process_proof_of_funding<M: Maker>(
 
     // Contract count was agreed in SwapDetails and drives how many outgoing
     // contracts we fund, so the taker must not change it here.
-    if pof.confirmed_funding_txes.len() != state.tx_count as usize {
+    if pof.confirmed_funding_txes.len() != state.tx_count[0] as usize {
         log::error!(
             "[{}] ProofOfFunding tx count {} does not match negotiated {}",
             maker.network_port(),
             pof.confirmed_funding_txes.len(),
-            state.tx_count
+            state.tx_count[0]
         );
         return Err(MakerError::General(
             "ProofOfFunding tx count does not match the negotiated tx count",
@@ -317,21 +320,12 @@ fn process_proof_of_funding<M: Maker>(
     // amount; overwrite with the fee on the actual incoming amount so
     // success reports match what was really earned.
     state.service_fee_sats = swap_fee.to_sat();
-    let mining_fee =
+    let mut mining_fee =
         Amount::from_sat(estimate_funding_tx_fee_sats() * pof.next_openswap_info.len() as u64);
-    let outgoing_amount = incoming_amount
+    let mut outgoing_amount = incoming_amount
         .checked_sub(swap_fee)
         .and_then(|amt| amt.checked_sub(mining_fee))
         .ok_or(MakerError::General("Swap fee exceeds incoming amount"))?;
-    #[cfg(feature = "integration-test")]
-    let outgoing_amount = if maker.behavior() == super::handlers::MakerBehavior::FeeSkimming {
-        outgoing_amount
-            .checked_sub(Amount::from_sat(1))
-            .ok_or(MakerError::General("Test fee skim exceeds outgoing amount"))?
-    } else {
-        outgoing_amount
-    };
-
     log::info!(
         "[{}] Incoming: {}, Fee: {}, MiningFee: {}, Outgoing: {}",
         maker.network_port(),
@@ -379,15 +373,49 @@ fn process_proof_of_funding<M: Maker>(
         );
     }
 
-    let (funding_txes, mut outgoing_swapcoins, _mining_fees) = maker.initialize_openswap(
-        outgoing_amount,
-        &next_multisig_pubkeys,
-        &next_hashlock_pubkeys,
-        hashvalue,
-        pof.refund_locktime,
-        pof.contract_feerate,
-        Some(excluded_utxos),
-    )?;
+    let mut fee_iterations = 0;
+    let (funding_txes, mut outgoing_swapcoins, _mining_fees) = loop {
+        fee_iterations += 1;
+        #[cfg(feature = "integration-test")]
+        let funding_amount = if maker.behavior() == super::handlers::MakerBehavior::FeeSkimming {
+            outgoing_amount
+                .checked_sub(Amount::from_sat(1))
+                .ok_or(MakerError::General("Test fee skim exceeds outgoing amount"))?
+        } else {
+            outgoing_amount
+        };
+        #[cfg(not(feature = "integration-test"))]
+        let funding_amount = outgoing_amount;
+
+        let result = maker.initialize_openswap(
+            funding_amount,
+            &next_multisig_pubkeys,
+            &next_hashlock_pubkeys,
+            hashvalue,
+            pof.refund_locktime,
+            pof.contract_feerate,
+            Some(excluded_utxos.clone()),
+            state.tx_count[1] as usize,
+        )?;
+        let actual_mining_fee =
+            Amount::from_sat(estimate_maker_reimbursable_fee_for_input_counts_sats(
+                state.protocol,
+                result.0.iter().map(|tx| tx.input.len()),
+            ));
+        if actual_mining_fee == mining_fee {
+            break result;
+        }
+        if fee_iterations >= 3 {
+            return Err(MakerError::General(
+                "Maker funding fee did not converge within input limit",
+            ));
+        }
+        mining_fee = actual_mining_fee;
+        outgoing_amount = incoming_amount
+            .checked_sub(swap_fee)
+            .and_then(|amt| amt.checked_sub(mining_fee))
+            .ok_or(MakerError::General("Swap fee exceeds incoming amount"))?;
+    };
     for outgoing in &mut outgoing_swapcoins {
         outgoing.swap_id = Some(pof.id.clone());
     }
@@ -477,6 +505,22 @@ fn process_proof_of_funding<M: Maker>(
         maker.network_port(),
         outgoing_swapcoins.len()
     );
+
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == super::handlers::MakerBehavior::OverproduceContractData {
+        if let Some(extra) = senders_contract_txs_info.first().cloned() {
+            senders_contract_txs_info.push(extra);
+        }
+    }
+
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == super::handlers::MakerBehavior::OverconsumeFundingInputs {
+        if let Some(info) = senders_contract_txs_info.first_mut() {
+            while info.funding_tx.input.len() <= state.tx_count[1] as usize {
+                info.funding_tx.input.push(bitcoin::TxIn::default());
+            }
+        }
+    }
 
     let response = crate::protocol::legacy_messages::ReqContractSigsAsRecvrAndSender {
         receivers_contract_txs,

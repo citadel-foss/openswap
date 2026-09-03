@@ -133,7 +133,7 @@ pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &E
     info!("Initiating openswap protocol");
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);
@@ -391,7 +391,7 @@ fn electrum_sweeps_after_breach() {
     }
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         // Zero confirms: the taker hits the closed connection at once instead
         // of sitting in a confirmation wait while the contract mines.
         .with_required_confirms(0);
@@ -519,7 +519,7 @@ fn electrum_discards_only_on_confirmed_spend() {
     }
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(0);
 
     generate_blocks(bitcoind, 1);

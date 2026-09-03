@@ -13,7 +13,7 @@ use bitcoin::{Address, Amount, ScriptBuf};
 
 use crate::{
     protocol::common_messages::Offer,
-    utill::estimate_funding_tx_fee_sats,
+    utill::estimate_maker_reimbursable_fee_for_input_counts_sats,
     wallet::{payment_settlement_budget_sats, swapcoin::PaymentTarget},
 };
 
@@ -160,7 +160,7 @@ impl Taker {
 
         // The receiver amount is split across `tx_count` settlement outputs;
         // each must clear the dust floor.
-        let tx_count = params.tx_count as u64;
+        let tx_count = params.max_tx_count() as u64;
         if tx_count == 0 {
             return Err(TakerError::General(
                 "A payment swap needs at least one transaction split".into(),
@@ -187,7 +187,7 @@ impl Taker {
             let swap = self.swap_state()?;
             (
                 swap.params.send_amount,
-                swap.params.tx_count as u64,
+                swap.params.max_tx_count() as u64,
                 swap.params.protocol,
                 swap.makers.len(),
             )
@@ -222,7 +222,13 @@ impl Taker {
 
         let settlement_budget = payment_settlement_budget_sats(protocol) * tx_count;
         let final_net = receiver_amount.to_sat() + settlement_budget;
-        let per_hop_mining_fee = estimate_funding_tx_fee_sats() * tx_count;
+        let per_hop_mining_fee = estimate_maker_reimbursable_fee_for_input_counts_sats(
+            protocol,
+            std::iter::repeat_n(
+                self.swap_state()?.params.max_utxos_per_tx() as usize,
+                tx_count as usize,
+            ),
+        );
         let gross = solve_route_gross_sats(&hops, per_hop_mining_fee, final_net)?;
 
         // Maker selection was sized on the receiver amount, since the gross is
@@ -269,8 +275,9 @@ impl Taker {
     /// Pin the receiver on every final incoming swapcoin, right after
     /// creation and before wallet persistence. No-op for regular swaps.
     ///
-    /// Each coin surrenders an equal share of the settlement budget; the hop
-    /// total was verified exact, so the outputs sum to the receiver amount.
+    /// The receiver amount is split exactly across the final coins. Each coin
+    /// must still retain its share of the settlement budget for the claim fee;
+    /// any conservative maker-fee ceiling left in the route is not forwarded.
     pub(crate) fn payment_stamp_targets(&mut self) -> Result<(), TakerError> {
         let Some(payment) = self.swap_state()?.payment.clone() else {
             return Ok(());
@@ -291,21 +298,54 @@ impl Taker {
             )));
         }
         let per_coin_budget = budget / coin_count;
+        let mut output_values = swap
+            .incoming_swapcoins
+            .iter()
+            .map(|swapcoin| {
+                swapcoin
+                    .funding_amount
+                    .to_sat()
+                    .checked_sub(per_coin_budget)
+                    .filter(|value| *value >= MIN_PAYMENT_OUTPUT_SATS)
+                    .ok_or_else(|| {
+                        TakerError::General(format!(
+                            "Incoming swapcoin funding {} cannot retain the {per_coin_budget} sat \
+                             settlement budget above dust",
+                            swapcoin.funding_amount
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let requested = payment.amount.to_sat();
+        let available = output_values.iter().sum::<u64>();
+        let mut surplus = available.checked_sub(requested).ok_or_else(|| {
+            TakerError::General(format!(
+                "Settlement outputs can fund only {available} sats, below requested {requested}"
+            ))
+        })?;
+        while surplus > 0 {
+            let (_, output) = output_values
+                .iter_mut()
+                .enumerate()
+                .max_by_key(|(_, value)| **value)
+                .ok_or_else(|| TakerError::General("No settlement outputs".to_string()))?;
+            let reducible = output.saturating_sub(MIN_PAYMENT_OUTPUT_SATS);
+            if reducible == 0 {
+                return Err(TakerError::General(format!(
+                    "Cannot remove {surplus} sats of fee-ceiling surplus from settlement outputs"
+                )));
+            }
+            let reduction = reducible.min(surplus);
+            *output -= reduction;
+            surplus -= reduction;
+        }
 
         let mut total = 0;
-        for swapcoin in &mut swap.incoming_swapcoins {
-            let output_sats = swapcoin
-                .funding_amount
-                .to_sat()
-                .checked_sub(per_coin_budget)
-                .filter(|v| *v >= MIN_PAYMENT_OUTPUT_SATS)
-                .ok_or_else(|| {
-                    TakerError::General(format!(
-                        "Incoming swapcoin funding {} cannot carry a settlement output above dust \
-                         after the {per_coin_budget} sat fee budget",
-                        swapcoin.funding_amount
-                    ))
-                })?;
+        for (swapcoin, output_sats) in swap
+            .incoming_swapcoins
+            .iter_mut()
+            .zip(output_values)
+        {
             swapcoin.payment_target = Some(PaymentTarget {
                 script_pubkey: script_pubkey.clone(),
                 amount: Amount::from_sat(output_sats),

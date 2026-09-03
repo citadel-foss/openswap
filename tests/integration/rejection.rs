@@ -113,7 +113,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     let err = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Taproot, below_min, 2)
-                .with_tx_count(1)
+                .with_tx_count([1, 3])
                 .with_required_confirms(1),
         )
         .expect_err("an amount under the maker's min_size must not be routable");
@@ -128,7 +128,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     let err = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Taproot, above_max, 2)
-                .with_tx_count(1)
+                .with_tx_count([1, 3])
                 .with_required_confirms(1),
         )
         .expect_err("an amount over the maker's max_size must not be routable");
@@ -143,7 +143,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     let err = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Taproot, below_min, 2)
-                .with_tx_count(1)
+                .with_tx_count([1, 3])
                 .with_required_confirms(1)
                 .with_preferred_makers(preferred.clone()),
         )
@@ -163,7 +163,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     let err = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Taproot, above_max, 2)
-                .with_tx_count(1)
+                .with_tx_count([1, 3])
                 .with_required_confirms(1)
                 .with_preferred_makers(preferred.clone()),
         )
@@ -184,7 +184,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     let err = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
-                .with_tx_count(1)
+                .with_tx_count([1, 3])
                 .with_required_confirms(1),
         )
         .expect_err("CloseEarly must abort prepare_swap");
@@ -198,7 +198,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     let err = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
-                .with_tx_count(1)
+                .with_tx_count([1, 3])
                 .with_required_confirms(1)
                 .with_preferred_makers(preferred.clone()),
         )
@@ -210,7 +210,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     let err = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
-                .with_tx_count(1)
+                .with_tx_count([1, 3])
                 .with_required_confirms(1)
                 .with_preferred_makers(preferred.clone()),
         )
@@ -224,7 +224,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     let err = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
-                .with_tx_count(1)
+                .with_tx_count([1, 3])
                 .with_required_confirms(1)
                 .with_preferred_makers(preferred),
         )
@@ -409,7 +409,7 @@ fn test_low_swap_liquidity() {
 
     // Swap params
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 1)
-        .with_tx_count(2)
+        .with_tx_count([2, 3])
         .with_required_confirms(1);
 
     // Attempt the swap - it will fail because maker has no liquidity
@@ -437,7 +437,7 @@ fn test_low_swap_liquidity() {
 
     // Attempt the swap again, it should succeed
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 1)
-        .with_tx_count(2)
+        .with_tx_count([2, 3])
         .with_required_confirms(1);
 
     let summary = taker
@@ -528,7 +528,7 @@ fn makers_reject_duplicate_funding_outpoints() {
     // The Taproot behavior repeats one contract transaction together with all
     // aligned per-contract vectors, so length and script checks still pass.
     let taproot_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
     let taproot_summary = takers[0]
         .prepare_swap(taproot_params)
@@ -612,7 +612,7 @@ fn run_legacy_proof_guard(port: u16, rpc: u16, behavior: TakerBehavior, expected
     generate_blocks(bitcoind, 1);
 
     let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
     let summary = taker
         .prepare_swap(params)
@@ -667,6 +667,154 @@ fn maker_rejects_duplicated_funding_outpoint() {
     );
 }
 
+fn run_zero_tx_count_bound_rejection(port: u16, rpc: u16, tx_count: [u32; 2], expected: &str) {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            vec![(port, Some(rpc))],
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker(
+        taker,
+        bitcoind,
+        3,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker = maker.clone();
+            thread::spawn(move || start_server(maker).unwrap())
+        })
+        .collect::<Vec<_>>();
+    wait_for_makers_setup(&makers, 120);
+    generate_blocks(bitcoind, 1);
+
+    let err = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
+                .with_tx_count(tx_count)
+                .with_required_confirms(1),
+        )
+        .expect_err("maker must reject zero tx_count bound");
+    let error = format!("{err:?}");
+
+    makers
+        .iter()
+        .for_each(|maker| maker.shutdown.store(true, Relaxed));
+    maker_threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());
+    drop(takers);
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    test_framework.assert_log(expected, &log_path);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+
+    assert!(
+        error.contains("failed and no spare makers available"),
+        "unexpected error: {}",
+        error
+    );
+}
+
+#[test]
+fn maker_rejects_zero_forwarding_tx_count() {
+    run_zero_tx_count_bound_rejection(8814, 21313, [0, 3], "Transaction count must be non-zero");
+}
+
+#[test]
+fn maker_rejects_zero_forwarding_utxo_count() {
+    run_zero_tx_count_bound_rejection(
+        8816,
+        21314,
+        [3, 0],
+        "UTXO count per transaction must be non-zero",
+    );
+}
+
+#[test]
+fn maker_rejects_forwarding_tx_above_utxo_count_limit() {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            vec![(8818, Some(21315))],
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker(
+        taker,
+        bitcoind,
+        3,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        1,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        9,
+        Amount::from_sat(80_000),
+        AddressType::P2TR,
+    );
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker = maker.clone();
+            thread::spawn(move || start_server(maker).unwrap())
+        })
+        .collect::<Vec<_>>();
+    wait_for_makers_setup(&makers, 120);
+    generate_blocks(bitcoind, 1);
+
+    let summary = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
+                .with_tx_count([3, 1])
+                .with_required_confirms(1),
+        )
+        .expect("prepare swap should succeed before maker forwarding selection");
+    let err = taker
+        .start_swap(&summary.swap_id)
+        .expect_err("maker must reject forwarding tx above UTXO limit");
+    let error = format!("{err:?}");
+
+    makers
+        .iter()
+        .for_each(|maker| maker.shutdown.store(true, Relaxed));
+    maker_threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());
+    drop(takers);
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    test_framework.assert_log("above negotiated maximum", &log_path);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+
+    assert!(
+        error.contains("failed to fill whole buffer"),
+        "unexpected error: {}",
+        error
+    );
+}
+
 /// A confirmed funding txid proves nothing about its outputs. Here the taker claims
 /// its own funding output through the contract path first, then still names that
 /// outpoint in ProofOfFunding. The maker must refuse before funding the next hop.
@@ -714,7 +862,7 @@ fn run_rejects_spent_funding_outpoint<B: TestBackend>(behavior: TakerBehavior) {
     generate_blocks(bitcoind, 1);
 
     let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
     let summary = takers[0]
         .prepare_swap(params)
@@ -831,7 +979,7 @@ fn maker_errors_when_seen_funding_tx_is_evicted() {
     // Zero required confirms sends the contract data while the funding tx is
     // still in the mempool, which is what puts the maker into its wait.
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
-        .with_tx_count(1)
+        .with_tx_count([1, 3])
         .with_required_confirms(0);
     let summary = taker
         .prepare_swap(swap_params)
@@ -929,7 +1077,7 @@ fn maker_rejects_proof_of_funding_with_missing_contract_cache() {
         .spendable;
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
     generate_blocks(bitcoind, 1);
 
@@ -1036,7 +1184,7 @@ fn test_taproot_maker_rejects_contract_amount_mismatch() {
     }
 
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
     generate_blocks(bitcoind, 1);
 
@@ -1115,7 +1263,7 @@ fn test_legacy_taker_rejects_malformed_maker_funding_output() {
     }
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
     generate_blocks(bitcoind, 1);
 
@@ -1158,12 +1306,37 @@ fn test_legacy_taker_rejects_malformed_maker_funding_output() {
 
 #[test]
 fn test_legacy_taker_rejects_fee_skimming_maker() {
-    let makers_config_map = vec![(6103, Some(19053))];
+    test_legacy_maker_contract_rejection(MakerBehavior::FeeSkimming, "does not match expected");
+}
+
+#[test]
+fn test_legacy_taker_rejects_overproduced_maker_contracts() {
+    test_legacy_maker_contract_rejection(
+        MakerBehavior::OverproduceContractData,
+        "Wrong number of maker sender contracts",
+    );
+}
+
+#[test]
+fn test_legacy_taker_rejects_maker_funding_inputs_above_limit() {
+    test_legacy_maker_contract_rejection(
+        MakerBehavior::OverconsumeFundingInputs,
+        "above negotiated maximum",
+    );
+}
+
+fn test_legacy_maker_contract_rejection(behavior: MakerBehavior, expected_error: &str) {
+    let makers_config_map = match behavior {
+        MakerBehavior::FeeSkimming => vec![(6103, Some(19053))],
+        MakerBehavior::OverproduceContractData => vec![(6105, Some(19055))],
+        MakerBehavior::OverconsumeFundingInputs => vec![(6107, Some(19057))],
+        _ => vec![(6109, Some(19059))],
+    };
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             makers_config_map,
             vec![TakerBehavior::Normal],
-            vec![MakerBehavior::FeeSkimming],
+            vec![behavior],
         );
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -1193,18 +1366,14 @@ fn test_legacy_taker_rejects_fee_skimming_maker() {
     let summary = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
-                .with_tx_count(3)
+                .with_tx_count([3, 3])
                 .with_required_confirms(1),
         )
         .expect("prepare Legacy swap");
     let error = taker
         .start_swap(&summary.swap_id)
-        .expect_err("reject fee skim");
-    assert!(
-        format!("{error:?}").contains("does not match expected"),
-        "unexpected error: {:?}",
-        error
-    );
+        .expect_err("reject malicious maker contract data");
+    let error = format!("{error:?}");
     makers
         .iter()
         .for_each(|maker| maker.shutdown.store(true, Relaxed));
@@ -1213,6 +1382,12 @@ fn test_legacy_taker_rejects_fee_skimming_maker() {
         .for_each(|thread| thread.join().unwrap());
     test_framework.stop();
     block_generation_handle.join().unwrap();
+
+    assert!(
+        error.contains(expected_error),
+        "unexpected error: {}",
+        error
+    );
 }
 
 #[test]
@@ -1267,7 +1442,7 @@ fn test_taproot_rejects_underfunded_maker_contract() {
     // A 30k-sat swap keeps the maker's 10k-sat underfunded output valid enough
     // to broadcast while still making the amount mismatch obvious.
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(30_000), 1)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
     let summary = taker
         .prepare_swap(swap_params)
@@ -1310,8 +1485,29 @@ fn test_taproot_rejects_fee_skimming_maker() {
     test_taproot_rejection(MakerBehavior::FeeSkimming, "does not match expected");
 }
 
+#[test]
+fn test_taproot_rejects_overproduced_maker_contracts() {
+    test_taproot_rejection(
+        MakerBehavior::OverproduceContractData,
+        "wrong Taproot contract count",
+    );
+}
+
+#[test]
+fn test_taproot_rejects_maker_funding_inputs_above_limit() {
+    test_taproot_rejection(
+        MakerBehavior::OverconsumeFundingInputs,
+        "above negotiated maximum",
+    );
+}
+
 fn test_taproot_rejection(behavior: MakerBehavior, expected_error: &str) {
-    let makers_config_map = vec![(7103, Some(19062))];
+    let makers_config_map = match behavior {
+        MakerBehavior::FeeSkimming => vec![(7103, Some(19062))],
+        MakerBehavior::OverproduceContractData => vec![(7107, Some(19066))],
+        MakerBehavior::OverconsumeFundingInputs => vec![(7109, Some(19068))],
+        _ => vec![(7111, Some(19070))],
+    };
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             makers_config_map,
@@ -1346,18 +1542,14 @@ fn test_taproot_rejection(behavior: MakerBehavior, expected_error: &str) {
     let summary = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(30_000), 1)
-                .with_tx_count(3)
+                .with_tx_count([3, 3])
                 .with_required_confirms(1),
         )
         .expect("prepare Taproot swap");
     let error = taker
         .start_swap(&summary.swap_id)
         .expect_err("reject fee skim");
-    assert!(
-        format!("{error:?}").contains(expected_error),
-        "unexpected error: {:?}",
-        error
-    );
+    let error = format!("{error:?}");
     makers
         .iter()
         .for_each(|maker| maker.shutdown.store(true, Relaxed));
@@ -1366,6 +1558,12 @@ fn test_taproot_rejection(behavior: MakerBehavior, expected_error: &str) {
         .for_each(|thread| thread.join().unwrap());
     test_framework.stop();
     block_generation_handle.join().unwrap();
+
+    assert!(
+        error.contains(expected_error),
+        "unexpected error: {}",
+        error
+    );
 }
 
 #[test]
@@ -1426,7 +1624,7 @@ fn test_maker_rejects_insufficient_liquidity_from_active_reservation() {
     // Taker 0 admits a swap with the maker. prepare_swap only negotiates;
     // it does not fund, so the maker keeps an active reservation for the amount.
     let first = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(9_000_000), 1)
-        .with_tx_count(1)
+        .with_tx_count([1, 3])
         .with_required_confirms(1)
         .with_preferred_makers(vec![maker_addr.clone()]);
     takers[0]
@@ -1436,7 +1634,7 @@ fn test_maker_rejects_insufficient_liquidity_from_active_reservation() {
     // Taker 1 asks for the same amount. The advertised max_size is still large
     // enough, but the active reservation leaves the maker short of liquidity.
     let second = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(9_000_000), 1)
-        .with_tx_count(1)
+        .with_tx_count([1, 3])
         .with_required_confirms(1)
         .with_preferred_makers(vec![maker_addr]);
     let _err = takers[1]

@@ -101,7 +101,7 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
     }
 
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);
@@ -331,7 +331,7 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
     }
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);

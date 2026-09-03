@@ -64,6 +64,10 @@ pub enum MakerBehavior {
     UnderfundTaprootContract,
     /// Deduct one extra satoshi beyond the advertised fee.
     FeeSkimming,
+    /// Return one more outgoing contract than negotiated.
+    OverproduceContractData,
+    /// Return a forwarding transaction with more wallet inputs than negotiated.
+    OverconsumeFundingInputs,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).
@@ -122,8 +126,8 @@ pub struct ConnectionState {
     pub swap_id: Option<String>,
     /// Swap amount.
     pub swap_amount: Amount,
-    /// Number of contract transactions agreed at negotiation.
-    pub tx_count: u32,
+    /// [maximum forwarding transaction count, maximum inputs per forwarding transaction].
+    pub tx_count: [u32; 2],
     /// Timelock value (Legacy: relative CSV, Taproot: absolute CLTV height).
     pub timelock: u32,
     /// Relative locktime offset for deterministic fee calculation.
@@ -174,7 +178,7 @@ impl Default for ConnectionState {
             phase: SwapPhase::AwaitingHello,
             swap_id: None,
             swap_amount: Amount::ZERO,
-            tx_count: 0,
+            tx_count: [0, 0],
             timelock: 0,
             refund_locktime_offset: 0,
             incoming_swapcoins: Vec::new(),
@@ -276,6 +280,7 @@ pub trait Maker: Send + Sync {
         amount: Amount,
         address: bitcoin::Address,
         excluded_outpoints: Option<Vec<bitcoin::OutPoint>>,
+        max_inputs_per_tx: usize,
     ) -> Result<(Transaction, u32), MakerError>;
 
     /// Broadcast a transaction.
@@ -377,6 +382,7 @@ pub trait Maker: Send + Sync {
         locktime: u16,
         contract_feerate: f64,
         excluded_outpoints: Option<Vec<bitcoin::OutPoint>>,
+        max_inputs_per_tx: usize,
     ) -> Result<(Vec<Transaction>, Vec<OutgoingSwapCoin>, Amount), MakerError>;
 
     /// Find outgoing swapcoin by its multisig redeemscript.
@@ -627,7 +633,7 @@ fn handle_swap_details<M: Maker>(
             state.phase = SwapPhase::AwaitingSwapDetails;
             state.swap_id = None;
             state.swap_amount = Amount::ZERO;
-            state.tx_count = 0;
+            state.tx_count = [0, 0];
             state.timelock = 0;
             state.refund_locktime_offset = 0;
             state.service_fee_sats = 0;

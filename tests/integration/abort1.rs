@@ -90,7 +90,7 @@ fn taker_abort_1_legacy_corerpc() {
     info!("Initiating openswap protocol");
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);
@@ -338,7 +338,7 @@ fn maker_recovers_swap_past_refund_deadline() {
     // Legacy so the deadline is counted from the funding confirmation height the
     // maker records, which is the arm this test exists to prove.
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
-        .with_tx_count(1)
+        .with_tx_count([1, 3])
         .with_required_confirms(1);
     let summary = taker
         .prepare_swap(swap_params)

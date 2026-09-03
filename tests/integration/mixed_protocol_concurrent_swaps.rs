@@ -92,7 +92,7 @@ fn test_concurrent_legacy_and_taproot_swaps() {
             info!("Starting Legacy swap concurrently");
 
             let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
-                .with_tx_count(3)
+                .with_tx_count([3, 3])
                 .with_required_confirms(1);
             let result = legacy_taker
                 .prepare_swap(params)
@@ -114,7 +114,7 @@ fn test_concurrent_legacy_and_taproot_swaps() {
             info!("Starting Taproot swap concurrently");
 
             let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(700_000), 2)
-                .with_tx_count(3)
+                .with_tx_count([3, 3])
                 .with_required_confirms(1);
             let result = taproot_taker
                 .prepare_swap(params)

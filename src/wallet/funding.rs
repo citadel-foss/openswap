@@ -31,6 +31,7 @@ impl Wallet {
         fee_rate: f64,
         manually_selected_outpoints: Option<Vec<OutPoint>>,
         excluded_outpoints: Option<Vec<OutPoint>>,
+        max_inputs_per_tx: Option<usize>,
     ) -> Result<CreateFundingTxesResult, WalletError> {
         let ret = self.create_funding_txes_random_amounts(
             openswap_amount,
@@ -38,6 +39,7 @@ impl Wallet {
             fee_rate,
             manually_selected_outpoints,
             excluded_outpoints,
+            max_inputs_per_tx,
         );
 
         if ret.is_err() {
@@ -139,6 +141,7 @@ impl Wallet {
         fee_rate: f64,
         manually_selected_outpoints: Option<Vec<OutPoint>>,
         excluded_outpoints: Option<Vec<OutPoint>>,
+        max_inputs_per_tx: Option<usize>,
     ) -> Result<CreateFundingTxesResult, WalletError> {
         let output_values = Wallet::generate_amount_fractions(destinations.len(), openswap_amount)?;
 
@@ -171,6 +174,15 @@ impl Wallet {
                     manual_for_split,
                     excluded_outpoints.clone(),
                 )?;
+                if let Some(max_inputs) = max_inputs_per_tx {
+                    if selected_utxo.len() > max_inputs {
+                        return Err(WalletError::General(format!(
+                            "Funding transaction selected {} inputs, above negotiated maximum {}",
+                            selected_utxo.len(),
+                            max_inputs
+                        )));
+                    }
+                }
 
                 let outpoints: Vec<OutPoint> = selected_utxo
                     .iter()

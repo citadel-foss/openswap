@@ -90,8 +90,8 @@ pub struct SwapDetails {
     pub protocol_version: ProtocolVersion,
     /// Amount to swap in satoshis.
     pub amount: Amount,
-    /// Number of contract transactions.
-    pub tx_count: u32,
+    /// [maximum forwarding transaction count, maximum inputs per forwarding transaction].
+    pub tx_count: [u32; 2],
     /// Timelock value.
     /// - Legacy: relative block count (CSV).
     /// - Taproot: absolute block height (CLTV).
@@ -100,6 +100,18 @@ pub struct SwapDetails {
     /// offset, not the funding height, so it is fixed at negotiation and identical on both
     /// sides. Not bound to the real lock duration; assess the CSV transition as the real fix.
     pub refund_locktime_offset: u16,
+}
+
+impl SwapDetails {
+    /// Maximum maker forwarding transaction count for this hop.
+    pub fn max_tx_count(&self) -> u32 {
+        self.tx_count[0]
+    }
+
+    /// Maximum maker wallet inputs allowed in each forwarding transaction.
+    pub fn max_utxos_per_tx(&self) -> u32 {
+        self.tx_count[1]
+    }
 }
 
 /// Acknowledgment of swap details from Maker.

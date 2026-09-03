@@ -81,7 +81,7 @@ fn test_standard_openswap() {
     // Only 2 makers are running, so a 3-hop route must fail at discovery
     // before any funds are committed.
     let too_many_hops = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 3)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
     let err = taker
         .prepare_swap(too_many_hops)
@@ -96,7 +96,7 @@ fn test_standard_openswap() {
     info!("Initiating openswap protocol");
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);
@@ -148,7 +148,7 @@ fn test_standard_openswap() {
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        494587,
+        494251,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -166,7 +166,7 @@ fn test_standard_openswap() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        6337,
+        6673,
         "Taker spendable balance change mismatch"
     );
 
@@ -190,8 +190,8 @@ fn test_standard_openswap() {
             balances.spendable,
         );
 
-        let expected_regular = [14500865u64, 14503103][i];
-        let expected_swap = [499100u64, 496825][i];
+        let expected_regular = [14501033u64, 14503439][i];
+        let expected_swap = [499100u64, 496657][i];
         assert_eq!(
             balances.regular.to_sat(),
             expected_regular,
@@ -219,7 +219,7 @@ fn test_standard_openswap() {
 
         info!("Maker {} fee earned: {} sats", i, maker_fee.to_sat());
 
-        let expected_fee = [451u64, 414][i];
+        let expected_fee = [619u64, 582][i];
         assert_eq!(
             maker_fee.to_sat(),
             expected_fee,

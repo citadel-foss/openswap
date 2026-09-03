@@ -166,7 +166,7 @@ fn concurrent_takers(
         s.spawn(move || {
             info!("Taker 1 starting concurrent {:?} openswap", protocol);
             let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
-                .with_tx_count(3)
+                .with_tx_count([3, 3])
                 .with_required_confirms(1);
 
             match taker1.prepare_swap(swap_params) {
@@ -194,7 +194,7 @@ fn concurrent_takers(
         s.spawn(move || {
             info!("Taker 2 starting concurrent {:?} openswap", protocol);
             let swap_params = SwapParams::new(protocol, Amount::from_sat(900000), 2)
-                .with_tx_count(3)
+                .with_tx_count([3, 3])
                 .with_required_confirms(1);
 
             match taker2.prepare_swap(swap_params) {

@@ -87,7 +87,7 @@ fn test_taproot_multi_maker_openswap() {
 
     // Swap params for openswap (Taproot) with 4 makers
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 4)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
 
     // Mine some blocks before the swap to ensure wallet is ready

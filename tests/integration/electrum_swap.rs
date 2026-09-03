@@ -90,7 +90,7 @@ fn run_electrum_swap(protocol: ProtocolVersion, expected: &ExpectedBalances) {
     }
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
     generate_blocks(bitcoind, 1);
     // The taker's pre-swap sync must see the funding blocks, not a stale index.

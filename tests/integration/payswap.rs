@@ -94,7 +94,7 @@ fn test_taproot_payswap() {
         .unwrap();
     let wrong_network_result = taker.prepare_swap(
         SwapParams::new(ProtocolVersion::Taproot, payment_amount, 2)
-            .with_tx_count(3)
+            .with_tx_count([3, 3])
             .with_required_confirms(1)
             .with_payment_address(mainnet_address),
     );
@@ -110,7 +110,7 @@ fn test_taproot_payswap() {
 
     // ---- The actual payment swap ----
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, payment_amount, 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1)
         .with_payment_address(receiver_address.as_unchecked().clone());
 
@@ -297,6 +297,7 @@ fn test_legacy_payswap() {
     generate_blocks(bitcoind, 1);
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, payment_amount, 2)
+        .with_tx_count([1, 3])
         .with_required_confirms(1)
         .with_payment_address(receiver_address.as_unchecked().clone());
 

@@ -95,7 +95,7 @@ fn test_multi_taker_openswap() {
     log::info!("Starting swap for Taker 1 (Legacy protocol)...");
 
     let swap_params1 = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);
@@ -134,7 +134,7 @@ fn test_multi_taker_openswap() {
     log::info!("Starting swap for Taker 2 (Legacy protocol)...");
 
     let swap_params2 = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
+        .with_tx_count([3, 3])
         .with_required_confirms(1);
 
     let taker2 = &mut takers[1];

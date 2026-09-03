@@ -54,7 +54,7 @@ fn maker_rejects_new_swaps_after_watcher_exit() {
     for protocol in [ProtocolVersion::Legacy, ProtocolVersion::Taproot] {
         let result = taker.prepare_swap(
             SwapParams::new(protocol, Amount::from_sat(500_000), 1)
-                .with_tx_count(1)
+                .with_tx_count([1, 3])
                 .with_required_confirms(1),
         );
         match result {
@@ -116,7 +116,7 @@ fn taker_refuses_swap_before_funding_after_watcher_exit() {
     let summary = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
-                .with_tx_count(1)
+                .with_tx_count([1, 3])
                 .with_required_confirms(1),
         )
         .unwrap();

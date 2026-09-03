@@ -10,9 +10,13 @@ use bitcoin::{
     PublicKey,
 };
 
-use crate::protocol::{
-    contract::sum_claimed_amounts, contract2::extract_hash_from_hashlock,
-    musig_interface::get_aggregated_pubkey_compat, taproot_messages::TaprootContractData,
+use crate::{
+    protocol::{
+        common_messages::ProtocolVersion, contract::sum_claimed_amounts,
+        contract2::extract_hash_from_hashlock, musig_interface::get_aggregated_pubkey_compat,
+        taproot_messages::TaprootContractData,
+    },
+    utill::estimate_maker_reimbursable_fee_for_input_counts_sats,
 };
 
 use super::{api::Taker, error::TakerError};
@@ -52,11 +56,16 @@ impl Taker {
         expected_locktime: u32,
         expected_amount: Option<bitcoin::Amount>,
     ) -> Result<(), TakerError> {
-        // Must have at least one contract tx
-        if contract.contract_txs.is_empty() {
+        let params = &self.swap_state()?.params;
+        let max_count = params.max_tx_count() as usize;
+        let max_inputs_per_tx = params.max_utxos_per_tx() as usize;
+
+        if contract.contract_txs.is_empty() || contract.contract_txs.len() > max_count {
             return Err(TakerError::General(format!(
-                "Maker {} sent empty Taproot contract data (no contract txs)",
-                maker_idx
+                "Maker {} sent wrong Taproot contract count: expected 1..={}, got {}",
+                maker_idx,
+                max_count,
+                contract.contract_txs.len()
             )));
         }
         // QA: Maker-controlled Taproot metadata must stay 1:1 with the actual
@@ -151,6 +160,15 @@ impl Taker {
         // Each contract has its own timelock script, internal key and tap tweak,
         // so verify the timelock template, locktime value and P2TR output per contract.
         for (i, tx) in contract.contract_txs.iter().enumerate() {
+            if tx.input.len() > max_inputs_per_tx {
+                return Err(TakerError::General(format!(
+                    "Maker {} Taproot contract tx {} uses {} inputs, above negotiated maximum {}",
+                    maker_idx,
+                    i,
+                    tx.input.len(),
+                    max_inputs_per_tx
+                )));
+            }
             let timelock_script = &contract.timelock_scripts[i];
             verify_internal_key(
                 contract.internal_keys[i],
@@ -341,6 +359,22 @@ impl Taker {
         // The maker deducts a fee we can compute exactly from its advertised
         // schedule, so the total must match, not just clear a minimum.
         if let Some(expected) = expected_amount {
+            let actual_fee =
+                bitcoin::Amount::from_sat(estimate_maker_reimbursable_fee_for_input_counts_sats(
+                    ProtocolVersion::Taproot,
+                    contract.contract_txs.iter().map(|tx| tx.input.len()),
+                ));
+            let ceiling_fee =
+                bitcoin::Amount::from_sat(estimate_maker_reimbursable_fee_for_input_counts_sats(
+                    ProtocolVersion::Taproot,
+                    std::iter::repeat_n(max_inputs_per_tx, max_count),
+                ));
+            let expected = expected
+                .checked_add(ceiling_fee)
+                .and_then(|amount| amount.checked_sub(actual_fee))
+                .ok_or_else(|| {
+                    TakerError::General("Failed to price maker Taproot contracts".to_string())
+                })?;
             let total_amount =
                 sum_claimed_amounts(contract.amounts.iter().copied()).map_err(|amount| {
                     TakerError::General(format!(

@@ -22,7 +22,10 @@ use crate::{
             RespContractSigsForRecvrAndSender, SenderContractTxInfo,
         },
     },
-    utill::{generate_keypair, generate_maker_keys, read_message, send_message, MIN_FEE_RATE},
+    utill::{
+        generate_keypair, generate_maker_keys, read_message, redeemscript_to_scriptpubkey,
+        send_message, MIN_FEE_RATE,
+    },
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         Wallet,
@@ -92,6 +95,7 @@ impl Taker {
             MIN_FEE_RATE,
             manually_selected_outpoints,
             None,
+            None,
         )?;
 
         for (
@@ -139,7 +143,7 @@ impl Taker {
         let swap = self.swap_state()?;
         let swap_id = swap.id.clone();
         let maker_count = swap.makers.len();
-        let tx_count = swap.params.tx_count;
+        let tx_count = swap.params.max_tx_count();
 
         // Ping every maker for the life of the march: while we negotiate one
         // hop, the others must not read our silence as a dropped swap.
@@ -1173,6 +1177,28 @@ impl Taker {
             )
             .collect();
 
+        let incoming_amount = confirmed_funding_txes.iter().try_fold(
+            Amount::ZERO,
+            |total, info| -> Result<Amount, TakerError> {
+                let script_pubkey = redeemscript_to_scriptpubkey(&info.multisig_redeemscript)?;
+                let value = info
+                    .funding_tx
+                    .output
+                    .iter()
+                    .find(|output| output.script_pubkey == script_pubkey)
+                    .ok_or_else(|| {
+                        TakerError::General(
+                            "Funding transaction does not contain negotiated multisig output"
+                                .to_string(),
+                        )
+                    })?
+                    .value;
+                total.checked_add(value).ok_or_else(|| {
+                    TakerError::General("Incoming funding amount overflow".to_string())
+                })
+            },
+        )?;
+
         let pof = ProofOfFunding {
             id: swap_id.to_string(),
             confirmed_funding_txes,
@@ -1194,7 +1220,7 @@ impl Taker {
                     req.senders_contract_txs_info.len()
                 );
                 // Verify the maker's sender contracts (structure, hashvalue, locktime, pubkeys, amounts)
-                let expected_amount = self.expected_amount_for_hop(maker_idx);
+                let expected_amount = self.expected_amount_for_hop(maker_idx, incoming_amount);
                 self.verify_maker_sender_contracts(
                     &req.senders_contract_txs_info,
                     next_multisig_pubkeys,

@@ -10,6 +10,7 @@ use bitcoin::{
 };
 
 use crate::{
+    protocol::common_messages::ProtocolVersion,
     protocol::{
         contract::{
             check_reedemscript_is_multisig, read_contract_locktime,
@@ -19,7 +20,7 @@ use crate::{
         },
         legacy_messages::SenderContractTxInfo,
     },
-    utill::redeemscript_to_scriptpubkey,
+    utill::{estimate_maker_reimbursable_fee_for_input_counts_sats, redeemscript_to_scriptpubkey},
 };
 
 use super::{api::Taker, error::TakerError};
@@ -185,11 +186,13 @@ impl Taker {
         refund_locktime: u16,
         expected_amount: Option<Amount>,
     ) -> Result<(), TakerError> {
-        let expected_count = self.swap_state()?.params.tx_count as usize;
-        if senders_info.len() != expected_count {
+        let params = &self.swap_state()?.params;
+        let max_count = params.max_tx_count() as usize;
+        let max_inputs_per_tx = params.max_utxos_per_tx() as usize;
+        if senders_info.is_empty() || senders_info.len() > max_count {
             return Err(TakerError::General(format!(
-                "Wrong number of maker sender contracts: expected {}, got {}",
-                expected_count,
+                "Wrong number of maker sender contracts: expected 1..={}, got {}",
+                max_count,
                 senders_info.len()
             )));
         }
@@ -210,6 +213,14 @@ impl Taker {
                 return Err(TakerError::General(format!(
                     "Sender contract {} contract_tx has no inputs",
                     i
+                )));
+            }
+            if info.funding_tx.input.len() > max_inputs_per_tx {
+                return Err(TakerError::General(format!(
+                    "Sender contract {} funding tx uses {} inputs, above negotiated maximum {}",
+                    i,
+                    info.funding_tx.input.len(),
+                    max_inputs_per_tx
                 )));
             }
             let contract_input_txid = info.contract_tx.input[0].previous_output.txid;
@@ -331,6 +342,22 @@ impl Taker {
         // The maker deducts a fee we can compute exactly from its advertised
         // schedule, so the total must match, not just clear a minimum.
         if let Some(expected) = expected_amount {
+            let actual_fee =
+                Amount::from_sat(estimate_maker_reimbursable_fee_for_input_counts_sats(
+                    ProtocolVersion::Legacy,
+                    senders_info.iter().map(|i| i.funding_tx.input.len()),
+                ));
+            let ceiling_fee =
+                Amount::from_sat(estimate_maker_reimbursable_fee_for_input_counts_sats(
+                    ProtocolVersion::Legacy,
+                    std::iter::repeat_n(max_inputs_per_tx, max_count),
+                ));
+            let expected = expected
+                .checked_add(ceiling_fee)
+                .and_then(|amount| amount.checked_sub(actual_fee))
+                .ok_or_else(|| {
+                    TakerError::General("Failed to price maker sender contracts".to_string())
+                })?;
             let total_funding = sum_claimed_amounts(senders_info.iter().map(|i| i.funding_amount))
                 .map_err(|amount| {
                     TakerError::General(format!(
