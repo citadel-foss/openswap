@@ -120,3 +120,8 @@ impl From<WatcherError> for TakerError {
         Self::Watcher(value)
     }
 }
+impl From<bip324::io::ProtocolError> for TakerError {
+    fn from(value: bip324::io::ProtocolError) -> Self {
+        Self::Net(value.into())
+    }
+}

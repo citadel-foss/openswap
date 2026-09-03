@@ -5,8 +5,8 @@ use std::sync::{MutexGuard, PoisonError, RwLockReadGuard, RwLockWriteGuard};
 use bitcoin::{secp256k1, Amount};
 
 use crate::{
-    error::NetError, protocol::error::ProtocolError, utill::TorError, wallet::WalletError,
-    watch_tower::watcher_error::WatcherError,
+    bip324_stream::Bip324Error, error::NetError, protocol::error::ProtocolError, utill::TorError,
+    wallet::WalletError, watch_tower::watcher_error::WatcherError,
 };
 
 #[cfg(feature = "integration-test")]
@@ -132,5 +132,17 @@ impl From<NetError> for MakerError {
 impl From<WatcherError> for MakerError {
     fn from(value: WatcherError) -> Self {
         Self::Watcher(value)
+    }
+}
+
+impl From<bip324::io::ProtocolError> for MakerError {
+    fn from(value: bip324::io::ProtocolError) -> Self {
+        Self::Net(value.into())
+    }
+}
+
+impl From<Bip324Error> for MakerError {
+    fn from(value: Bip324Error) -> Self {
+        Self::Net(value.into())
     }
 }

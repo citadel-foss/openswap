@@ -156,6 +156,10 @@ pub fn estimate_funding_tx_fee_sats() -> u64 {
 /// of log verbosity.
 pub fn setup_taker_logger(filter: LevelFilter, is_stdout: bool, datadir: Option<PathBuf>) {
     LOGGER.get_or_init(|| {
+        let filter = std::env::var("RUST_LOG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(filter);
         // File logging is best-effort: without a data dir or a writable log
         // file we still want stdout logging, not a panic.
         let file_appender = match datadir.map(Ok).unwrap_or_else(get_taker_dir) {
@@ -217,6 +221,10 @@ pub fn setup_taker_logger(filter: LevelFilter, is_stdout: bool, datadir: Option<
 /// of log verbosity.
 pub fn setup_maker_logger(filter: LevelFilter, data_dir: Option<PathBuf>) {
     LOGGER.get_or_init(|| {
+        let filter = std::env::var("RUST_LOG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(filter);
         // File logging is best-effort: without a data dir or a writable log
         // file we still want stdout logging, not a panic.
         let file_appender = match data_dir.map(Ok).unwrap_or_else(get_maker_dir) {
@@ -1231,8 +1239,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
 
+        let secp = Secp256k1::new();
+        let (sk, _) = secp.generate_keypair(&mut thread_rng());
+        let msg = bitcoin::secp256k1::Message::from_digest([0u8; 32]);
+        let session_id_sig = secp.sign_ecdsa_low_r(&msg, &sk);
         let message = MakerToTakerMessage::MakerHello(MakerHello {
             supported_protocols: vec![ProtocolVersion::Legacy, ProtocolVersion::Taproot],
+            session_id_sig,
         });
 
         thread::spawn(move || {

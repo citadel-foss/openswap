@@ -606,7 +606,10 @@ pub(crate) struct RouteHeartbeat {
 
 impl RouteHeartbeat {
     /// Spawn the heartbeat thread over pre-connected, handshaked streams.
-    pub(crate) fn start(swap_id: &str, streams: Vec<std::net::TcpStream>) -> std::io::Result<Self> {
+    pub(crate) fn start(
+        swap_id: &str,
+        mut streams: Vec<crate::bip324_stream::Bip324Stream>,
+    ) -> std::io::Result<Self> {
         let (stop, stop_rx) = mpsc::channel();
         let keepalive =
             crate::protocol::common_messages::TakerToMakerMessage::WaitingFundingConfirmation(
@@ -614,19 +617,16 @@ impl RouteHeartbeat {
             );
         let handle = thread::Builder::new()
             .name("Route heartbeat".to_string())
-            .spawn(move || {
-                let mut streams = streams;
-                loop {
-                    for stream in streams.iter_mut() {
-                        if stop_rx.try_recv().is_ok() {
-                            return;
-                        }
-                        let _ = crate::utill::send_message(stream, &keepalive);
+            .spawn(move || loop {
+                for stream in streams.iter_mut() {
+                    if stop_rx.try_recv().is_ok() {
+                        return;
                     }
-                    match stop_rx.recv_timeout(super::api::ROUTE_HEARTBEAT_INTERVAL) {
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
+                    let _ = stream.send_message(&keepalive);
+                }
+                match stop_rx.recv_timeout(super::api::ROUTE_HEARTBEAT_INTERVAL) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             })?;
         Ok(Self {
