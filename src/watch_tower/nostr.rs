@@ -2,7 +2,7 @@
 //!
 //! Handles the discovery of Maker fidelity bonds via Nostr relays. It creates persistent
 //! subscriptions to network-specific OpenSwap events, validates incoming fidelity
-//! announcements against the Bitcoin blockchain, and stores verified bonds in the registry.
+//! announcements against the Bitcoin blockchain, and stores validated candidates in the registry.
 
 use std::{
     borrow::Cow,
@@ -408,19 +408,51 @@ fn handle_relay_message(
                     return Ok(false);
                 }
             };
+            let confirmation_height = match blockchain.tx_block_height(&txid) {
+                Ok(Some(height)) => height,
+                Ok(None) => {
+                    log::debug!("Ignoring unconfirmed fidelity transaction {txid} via {relay_url}");
+                    lock_debug!(seen_txid.lock())?.release(&txid);
+                    return Ok(false);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to fetch confirmation height for {txid} via {relay_url}: {e}"
+                    );
+                    lock_debug!(seen_txid.lock())?.release(&txid);
+                    return Ok(false);
+                }
+            };
 
-            // The txid is marked seen once fetched (regardless of validation outcome) so a relay
-            // replaying an invalid txid can't force re-validation every time;
+            match blockchain.get_tx_out(&txid, vout, Some(true)) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    log::debug!("Ignoring spent fidelity output {txid}:{vout} via {relay_url}");
+                    lock_debug!(seen_txid.lock())?.insert(txid);
+                    registry.save_nostr_cursor(relay_url, cursor)?;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to fetch fidelity output {txid}:{vout} via {relay_url}: {e}"
+                    );
+                    lock_debug!(seen_txid.lock())?.release(&txid);
+                    return Ok(false);
+                }
+            }
+
+            // Once chain state is known, remember even structurally invalid transactions so a
+            // relay replay cannot force validation work repeatedly.
             lock_debug!(seen_txid.lock())?.insert(txid);
             log::info!("Added txid to Nostr discovery cache: {txid}");
 
-            match process_fidelity(&tx) {
+            match process_fidelity(&tx, confirmation_height) {
                 Some(fidelity) => {
                     let maker_address = fidelity.onion.clone();
                     let expires_at_height = fidelity.expires_at_height;
                     if registry.insert_fidelity(txid, fidelity)? {
                         log::info!(
-                                "Stored verified fidelity | relay={} | event_id={} | txid={} | vout={} | maker_address={} | expires_at_height={}",
+                                "Stored validated fidelity candidate | relay={} | event_id={} | txid={} | vout={} | maker_address={} | expires_at_height={}",
                                 relay_url,
                                 event.id,
                                 txid,

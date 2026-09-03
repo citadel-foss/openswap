@@ -436,7 +436,7 @@ impl<R: Role> Watcher<R> {
                 return Ok(());
             }
             let block = self.blockchain.block_at_height(height)?;
-            process_block::<R>(block, &mut self.registry)?;
+            process_block::<R>(block, Some(height), &mut self.registry)?;
         }
         Ok(())
     }
@@ -515,7 +515,19 @@ impl<R: Role> Watcher<R> {
                 // discovery does not exist on Electrum — it is nostr-only there.
                 if b.hash.len() != 32 {
                     if let Ok(block) = deserialize::<Block>(&b.hash) {
-                        if let Err(e) = process_block::<R>(block, &mut self.registry) {
+                        let confirmation_height = if b.height > 0 {
+                            Some(b.height)
+                        } else {
+                            block.txdata.first().and_then(|tx| {
+                                self.blockchain
+                                    .tx_block_height(&tx.compute_txid())
+                                    .ok()
+                                    .flatten()
+                            })
+                        };
+                        if let Err(e) =
+                            process_block::<R>(block, confirmation_height, &mut self.registry)
+                        {
                             log::error!("registry update failed for connected block: {e:?}");
                         }
                     }
