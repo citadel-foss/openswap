@@ -10,6 +10,7 @@ mod fidelity;
 mod funding;
 mod report;
 mod spend;
+mod split_utxos;
 mod storage;
 pub(crate) mod swapcoin;
 
@@ -33,4 +34,6 @@ pub use report::{
     MakerFeeInfo, MakerReport, PaymentResult, RecoveryReport, SwapRole, SwapStatus, TakerReport,
 };
 pub use spend::Destination;
+pub(crate) use split_utxos::vary_amounts;
+pub use split_utxos::MAX_SPLITS;
 pub use storage::AddressType;

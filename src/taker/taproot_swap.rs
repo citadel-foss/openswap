@@ -390,6 +390,20 @@ impl Taker {
                         ));
                     }
 
+                    // Maker's contract count must equal the agreed outgoing split
+                    // (tx_counts[i + 1]); reject before signing. Since maker i's outgoing
+                    // is maker i+1's incoming, this also chain-checks consecutive hops.
+                    let expected_outgoing =
+                        self.swap_state()?.params.resolved_tx_counts()[i + 1] as usize;
+                    if maker_contract.contract_txs.len() != expected_outgoing {
+                        return Err(TakerError::General(format!(
+                            "Maker {} returned {} contract txs but the agreed outgoing split for this hop is {}",
+                            i,
+                            maker_contract.contract_txs.len(),
+                            expected_outgoing
+                        )));
+                    }
+
                     // Verify contract data before creating swapcoins
                     let expected_locktime = self.swap_state()?.makers[i].negotiated_timelock;
                     let expected_amount = self.expected_amount_for_hop(i);

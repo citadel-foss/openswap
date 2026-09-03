@@ -27,9 +27,13 @@ use crate::{
     utill::estimate_funding_tx_fee_sats,
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
-        MakerReport, WalletError,
+        vary_amounts, MakerReport, WalletError,
     },
 };
+
+/// Minimum size (sats) for an outgoing contract output; smaller splits are rejected as
+/// dust. Above P2TR dust (~330) with margin for the next hop's spend fee.
+const MIN_OUTGOING_CHUNK: u64 = 1_000;
 
 /// Handle a Taproot protocol message.
 pub fn handle_taproot_message<M: Maker>(
@@ -204,6 +208,34 @@ fn process_taproot_contract<M: Maker>(
         incoming_swapcoins.push(incoming_swapcoin);
     }
 
+    // Outgoing count is `outgoing_tx_count` if set, else mirror the incoming count.
+    // Re-check bounds here (also checked at SwapDetails time) since this is what we build.
+    let n_out = match state.outgoing_tx_count {
+        Some(c) => c as usize,
+        None => n,
+    };
+    if n_out == 0 {
+        return Err(MakerError::General("Outgoing tx count is zero"));
+    }
+    if n_out > crate::wallet::MAX_SPLITS {
+        return Err(MakerError::General(
+            "Outgoing tx count exceeds maximum splits",
+        ));
+    }
+
+    // QA: return a wrong outgoing count to exercise the taker's per-hop count assertion.
+    #[cfg(feature = "integration-test")]
+    let n_out = {
+        use super::handlers::MakerBehavior;
+        match maker.behavior() {
+            MakerBehavior::OverSplitTaprootContract if n_out < crate::wallet::MAX_SPLITS => {
+                n_out + 1
+            }
+            MakerBehavior::UnderSplitTaprootContract if n_out > 1 => n_out - 1,
+            _ => n_out,
+        }
+    };
+
     // The fee is priced on the negotiated offset, so it is fixed at negotiation
     // and matches the taker's mirror. The offset is not bound to the real lock
     // duration; assess the CSV transition (binding it in the script) later.
@@ -212,37 +244,43 @@ fn process_taproot_contract<M: Maker>(
     // amount; overwrite with the fee on the actual incoming amount so
     // success reports match what was really earned.
     state.service_fee_sats = swap_fee.to_sat();
-    let mining_fee = Amount::from_sat(estimate_funding_tx_fee_sats() * n as u64);
+    // Mining fee scales with the outgoing count, which the taker ultimately covers.
+    let mining_fee = Amount::from_sat(estimate_funding_tx_fee_sats() * n_out as u64);
     let fee = swap_fee + mining_fee;
     let outgoing_total = total_incoming
         .checked_sub(fee)
         .ok_or(MakerError::General("Fee exceeds incoming amount"))?;
-    let total_sat = total_incoming.to_sat() as u128;
-    let mut outgoing_amounts = data
-        .amounts
-        .iter()
-        .map(|amt| {
-            let share = (fee.to_sat() as u128 * amt.to_sat() as u128 / total_sat) as u64;
-            Amount::from_sat(amt.to_sat() - share)
-        })
+
+    // Split into n_out organic-looking chunks (summing to outgoing_total) so per-output
+    // sizes don't correlate across hops. n_out is already bounded to 1..=MAX_SPLITS.
+    let outgoing_amounts = vary_amounts(outgoing_total.to_sat(), n_out)
+        .into_iter()
+        .map(Amount::from_sat)
         .collect::<Vec<Amount>>();
-    // Flooring leaves the outgoing sum a few sats above total fee; deduct that remainder from the largest output so the totals stay exact and deterministic.
-    let remainder =
-        outgoing_amounts.iter().map(|amt| amt.to_sat()).sum::<u64>() - outgoing_total.to_sat();
-    if remainder > 0 {
-        let max_idx = outgoing_amounts
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, amt)| amt.to_sat())
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        outgoing_amounts[max_idx] -= Amount::from_sat(remainder);
+
+    // Reject splits that would produce dust-tier outgoing contracts.
+    if let Some(dust) = outgoing_amounts
+        .iter()
+        .find(|amt| amt.to_sat() < MIN_OUTGOING_CHUNK)
+    {
+        log::warn!(
+            "[{}] Rejecting split into {} outputs: chunk {} below dust floor {}",
+            maker.network_port(),
+            n_out,
+            dust,
+            MIN_OUTGOING_CHUNK
+        );
+        return Err(MakerError::General(
+            "Requested split would produce dust-sized outgoing contracts",
+        ));
     }
 
     log::info!(
-        "[{}] Fee calculation: incoming_total={}, swap_fee={}, mining_fee={}, outgoing_total={}",
+        "[{}] Fee calculation: incoming_total={}, incoming_txs={}, outgoing_txs={}, swap_fee={}, mining_fee={}, outgoing_total={}",
         maker.network_port(),
         total_incoming,
+        n,
+        n_out,
         swap_fee,
         mining_fee,
         outgoing_total
@@ -262,15 +300,15 @@ fn process_taproot_contract<M: Maker>(
     let next_hop_xonly = bitcoin::key::XOnlyPublicKey::from(next_hop_hashlock_pubkey.inner);
     let hashlock_script = create_hashlock_script(&hash, &next_hop_xonly);
 
-    // Build one outgoing contract (with its own keys/scripts/address) per contract.
-    let mut outgoing_swapcoins = Vec::with_capacity(n);
-    let mut response_pubkeys = Vec::with_capacity(n);
-    let mut response_internal_keys = Vec::with_capacity(n);
-    let mut response_tap_tweaks = Vec::with_capacity(n);
-    let mut response_timelock_scripts = Vec::with_capacity(n);
-    let mut response_contract_txs = Vec::with_capacity(n);
-    let mut response_amounts = Vec::with_capacity(n);
-    let mut reserved = Vec::with_capacity(n);
+    // Build one outgoing contract (with its own keys/scripts/address) per outgoing chunk.
+    let mut outgoing_swapcoins = Vec::with_capacity(n_out);
+    let mut response_pubkeys = Vec::with_capacity(n_out);
+    let mut response_internal_keys = Vec::with_capacity(n_out);
+    let mut response_tap_tweaks = Vec::with_capacity(n_out);
+    let mut response_timelock_scripts = Vec::with_capacity(n_out);
+    let mut response_contract_txs = Vec::with_capacity(n_out);
+    let mut response_amounts = Vec::with_capacity(n_out);
+    let mut reserved = Vec::with_capacity(n_out);
     let mut spent_inputs: Vec<OutPoint> = Vec::new();
 
     let base_excluded = maker.collect_excluded_utxos(&data.id)?;
@@ -410,9 +448,10 @@ fn process_taproot_contract<M: Maker>(
     state.outgoing_swapcoins = outgoing_swapcoins.clone();
     #[cfg(debug_assertions)]
     log::debug!(
-        "[CONTRACT_STATE] Role: Maker | Protocol: Taproot | SwapID: {} | Contracts: {} | IncomingTotal: {} | ReservedUtxos: {}",
+        "[CONTRACT_STATE] Role: Maker | Protocol: Taproot | SwapID: {} | IncomingContracts: {} | OutgoingContracts: {} | IncomingTotal: {} | ReservedUtxos: {}",
         data.id,
         n,
+        n_out,
         total_incoming.to_sat(),
         state.reserve_utxo.len()
     );

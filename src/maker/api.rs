@@ -85,6 +85,9 @@ struct SwapState {
     /// from it, and it cannot be derived later once the swap has moved on.
     /// `None` until that confirmation is observed.
     funding_confirmation_height: Option<u32>,
+    /// Requested outgoing contract count for this hop (Taproot per-hop splitting),
+    /// persisted across connections. `None` mirrors the incoming count (legacy).
+    outgoing_tx_count: Option<u32>,
 }
 
 impl Default for SwapState {
@@ -106,6 +109,7 @@ impl Default for SwapState {
             swap_start_time: Instant::now(),
             refund_locktime_offset: 0,
             funding_confirmation_height: None,
+            outgoing_tx_count: None,
         }
     }
 }
@@ -1202,6 +1206,19 @@ impl MakerTrait for MakerServer {
             }
         }
 
+        // Reject over-cap outgoing splits at connect time. Advisory only (doesn't check
+        // available UTXOs), so the taker still needs its mid-swap abort path.
+        if let Some(requested) = details.outgoing_tx_count {
+            if requested == 0 {
+                return Err(MakerError::General("Requested outgoing_tx_count is zero"));
+            }
+            if requested as usize > crate::wallet::MAX_SPLITS {
+                return Err(MakerError::General(
+                    "Requested outgoing_tx_count exceeds maximum splits",
+                ));
+            }
+        }
+
         // Check timelock bounds and work out how long the funds stay locked.
         let locked_blocks = if details.protocol_version == ProtocolVersion::Legacy {
             if details.timelock < MIN_CONTRACT_REACTION_TIME as u32 {
@@ -1558,6 +1575,7 @@ impl MakerTrait for MakerServer {
         swap_state.last_activity = Instant::now();
         swap_state.swap_start_time = state.swap_start_time;
         swap_state.refund_locktime_offset = state.refund_locktime_offset;
+        swap_state.outgoing_tx_count = state.outgoing_tx_count;
         log::debug!(
             "[{}] Stored connection state for {}: amount={}, timelock={}, protocol={:?}, outgoing_count={}",
             self.config.network_port,
@@ -1590,6 +1608,7 @@ impl MakerTrait for MakerServer {
             state.swap_start_time = s.swap_start_time;
             state.refund_locktime_offset = s.refund_locktime_offset;
             state.last_activity = s.last_activity;
+            state.outgoing_tx_count = s.outgoing_tx_count;
             state
         }))
     }

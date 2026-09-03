@@ -79,6 +79,11 @@ pub struct Offer {
     pub fidelity: FidelityProof,
     /// Chain code for deterministic derivation of swap addresses from the tweakable point.
     pub tweak_chain_code: ChainCode,
+    /// Max outgoing contract splits this maker will build per hop (Taproot).
+    /// `None` = maker predates the feature; the taker must not send it an
+    /// `outgoing_tx_count` differing from the incoming count.
+    #[serde(default)]
+    pub max_tx_splits: Option<u32>,
 }
 
 /// Swap details from Taker to Maker.
@@ -90,8 +95,13 @@ pub struct SwapDetails {
     pub protocol_version: ProtocolVersion,
     /// Amount to swap in satoshis.
     pub amount: Amount,
-    /// Number of contract transactions.
+    /// Contracts the taker funds *into this maker* (this hop's incoming count).
     pub tx_count: u32,
+    /// Outgoing contracts to build for this hop (Taproot per-hop splitting).
+    /// `None` (wire default) = mirror the incoming count. Old peers ignore/omit it,
+    /// so its presence activates the feature without a protocol version bump.
+    #[serde(default)]
+    pub outgoing_tx_count: Option<u32>,
     /// Timelock value.
     /// - Legacy: relative block count (CSV).
     /// - Taproot: absolute block height (CLTV).
