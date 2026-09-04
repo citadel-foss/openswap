@@ -527,7 +527,10 @@ pub(crate) fn sum_claimed_amounts(
         if amount > Amount::MAX_MONEY {
             return Err(amount);
         }
-        total += amount;
+        total = total
+            .checked_add(amount)
+            .filter(|&t| t <= Amount::MAX_MONEY)
+            .ok_or(amount)?;
     }
     Ok(total)
 }
@@ -1326,6 +1329,25 @@ mod test {
         assert_eq!(
             sum_claimed_amounts([normal, normal]),
             Ok(Amount::from_sat(1_000_000))
+        );
+
+        // Multiple amounts that are individually <= MAX_MONEY but whose sum exceeds MAX_MONEY
+        let one_sat = Amount::from_sat(1);
+        assert_eq!(
+            sum_claimed_amounts([Amount::MAX_MONEY, one_sat]),
+            Err(one_sat)
+        );
+
+        let twenty_million_btc = Amount::from_sat(20_000_000 * 100_000_000);
+        assert_eq!(
+            sum_claimed_amounts([twenty_million_btc, twenty_million_btc]),
+            Err(twenty_million_btc)
+        );
+
+        // Many amounts that would overflow u64 must error without panicking
+        assert_eq!(
+            sum_claimed_amounts(std::iter::repeat_n(Amount::MAX_MONEY, 10_000)),
+            Err(Amount::MAX_MONEY)
         );
     }
 }
