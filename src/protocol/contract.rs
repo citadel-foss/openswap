@@ -334,9 +334,14 @@ pub(crate) fn read_contract_locktime(redeemscript: &Script) -> Result<u16, Proto
         Instruction::PushBytes(locktime_bytes) => match locktime_bytes.len() {
             1 => Ok(locktime_bytes[0] as u16),
             2 | 3 => {
-                let (int_bytes, _rest) = locktime_bytes
+                let (int_bytes, rest) = locktime_bytes
                     .as_bytes()
                     .split_at(std::mem::size_of::<u16>());
+                if rest.iter().any(|&b| b != 0) {
+                    return Err(ProtocolError::General(
+                        "Can't read locktime value from contract redeemscript",
+                    ));
+                }
                 Ok(u16::from_le_bytes(int_bytes.try_into().map_err(|_| {
                     ProtocolError::General("Can't read locktime value from contract redeemscript")
                 })?))
@@ -637,6 +642,30 @@ mod test {
             hashvalue
         );
         assert_eq!(read_contract_locktime(&contract_script).unwrap(), locktime);
+
+        // A contract with 3-byte locktime exceeding u16 range (e.g. 65536) must error
+        let overflowing_contract = Builder::new()
+            .push_opcode(opcodes::all::OP_SIZE)
+            .push_opcode(opcodes::all::OP_SWAP)
+            .push_opcode(opcodes::all::OP_HASH160)
+            .push_slice(hashvalue.to_byte_array())
+            .push_opcode(opcodes::all::OP_EQUAL)
+            .push_opcode(opcodes::all::OP_IF)
+            .push_key(&pub_hashlock)
+            .push_int(32)
+            .push_int(0)
+            .push_opcode(opcodes::all::OP_ELSE)
+            .push_key(&pub_timelock)
+            .push_int(0)
+            .push_slice([0x00, 0x00, 0x01])
+            .push_opcode(opcodes::all::OP_ENDIF)
+            .push_opcode(opcodes::all::OP_CSV)
+            .push_opcode(opcodes::all::OP_DROP)
+            .push_opcode(opcodes::all::OP_ROT)
+            .push_opcode(opcodes::all::OP_EQUALVERIFY)
+            .push_opcode(opcodes::all::OP_CHECKSIG)
+            .into_script();
+        assert!(read_contract_locktime(&overflowing_contract).is_err());
     }
 
     #[test]
