@@ -37,6 +37,9 @@ use crate::{
 /// clock skew only; anything further would poison the saved cursor.
 const MAX_FUTURE_SKEW_SECS: u64 = 300;
 
+/// Maximum queued Nostr discovery events before relay readers apply backpressure.
+const DISCOVERY_EVENT_BUFFER_SIZE: usize = 1024;
+
 /// Runs the main discovery routine for maker's fidelity bonds by subscribing to network-specific Nostr events.
 /// Blocks until every relay session exits (normally at shutdown).
 pub fn run_discovery(
@@ -57,7 +60,8 @@ pub fn run_discovery(
     );
 
     let registry = Arc::new(registry);
-    let (event_tx, event_rx) = crossbeam_channel::unbounded::<(String, RelayMessage<'static>)>();
+    let (event_tx, event_rx) =
+        crossbeam_channel::bounded::<(String, RelayMessage<'static>)>(DISCOVERY_EVENT_BUFFER_SIZE);
 
     let worker_shutdown = shutdown.clone();
     let worker_registry = Arc::clone(&registry);
@@ -306,9 +310,17 @@ fn read_event_loop(
             continue;
         };
 
-        if event_tx.send((relay_url.to_string(), relay_msg)).is_err() {
-            // Receiver hung up
-            break;
+        let mut to_send = (relay_url.to_string(), relay_msg);
+        while !shutdown.load(Ordering::SeqCst) {
+            match event_tx.send_timeout(to_send, std::time::Duration::from_millis(100)) {
+                Ok(()) => break,
+                Err(crossbeam_channel::SendTimeoutError::Timeout(item)) => {
+                    to_send = item;
+                }
+                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                    return Ok(());
+                }
+            }
         }
     }
 
