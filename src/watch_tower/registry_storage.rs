@@ -9,7 +9,10 @@ use bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
 
 use crate::{
     lock_debug,
-    watch_tower::{utils::FidelityAnnouncement, watcher_error::WatcherError},
+    watch_tower::{
+        utils::{is_valid_maker_address, FidelityAnnouncement},
+        watcher_error::WatcherError,
+    },
 };
 
 /// Represents a UTXO being watched and records when it gets spent.
@@ -121,7 +124,7 @@ impl FileRegistry {
             data.fidelity = data
                 .fidelity
                 .iter()
-                .filter(|v| v.expire_height > height)
+                .filter(|v| v.expire_height > height && is_valid_maker_address(&v.onion_address))
                 .cloned()
                 .collect();
             data.fidelity.clone()
@@ -134,6 +137,10 @@ impl FileRegistry {
         txid: Txid,
         fidelity_announcement: FidelityAnnouncement,
     ) -> Result<bool, WatcherError> {
+        if !is_valid_maker_address(&fidelity_announcement.onion) {
+            log::warn!("Rejected fidelity record with invalid maker address");
+            return Ok(false);
+        }
         let fidelity = Fidelity {
             txid,
             onion_address: fidelity_announcement.onion,
@@ -213,6 +220,13 @@ mod tests {
         }
     }
 
+    fn maker_address(_label: char, _port: u16) -> String {
+        #[cfg(not(feature = "integration-test"))]
+        return "aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaea37ead.onion".to_string();
+        #[cfg(feature = "integration-test")]
+        return format!("127.0.0.1:{_port}");
+    }
+
     #[test]
     fn test_watch_upsert_and_list() {
         let mut reg = FileRegistry::new();
@@ -286,12 +300,12 @@ mod tests {
         let txid2 = dummy_txid(2);
 
         let fidelity_announcement_1 = FidelityAnnouncement {
-            onion: "abc.onion".to_string(),
+            onion: maker_address('a', 6102),
             expires_at_height: 212,
         };
 
         let fidelity_announcement_2 = FidelityAnnouncement {
-            onion: "def.onion".to_string(),
+            onion: maker_address('b', 6103),
             expires_at_height: 232,
         };
 
@@ -305,6 +319,32 @@ mod tests {
 
         let list2 = reg.list_fidelity(0).unwrap();
         assert_eq!(list2.len(), 0);
+    }
+
+    #[test]
+    fn test_fidelity_rejects_invalid_address() {
+        let reg = FileRegistry::new();
+        let inserted = reg
+            .insert_fidelity(
+                dummy_txid(1),
+                FidelityAnnouncement {
+                    onion: "<script>alert(1)</script>.onion".to_string(),
+                    expires_at_height: 500,
+                },
+            )
+            .unwrap();
+        assert!(!inserted);
+        assert!(reg.list_fidelity(0).unwrap().is_empty());
+
+        reg.with_data(|data| {
+            data.fidelity.insert(Fidelity {
+                txid: dummy_txid(2),
+                onion_address: "malformed.onion".to_string(),
+                expire_height: 500,
+            });
+        })
+        .unwrap();
+        assert!(reg.list_fidelity(0).unwrap().is_empty());
     }
 
     #[test]

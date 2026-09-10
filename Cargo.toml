@@ -33,6 +33,7 @@ aes-gcm = "0.10.3"
 zeroize = { version = "1", features = ["derive"] }
 tempfile = "3"
 sha2 = "0.10.9"
+sha3 = "0.10.8"
 rust-coinselect = "0.1.7"
 crossterm = "0.29.0"
 zmq = "0.10.0"

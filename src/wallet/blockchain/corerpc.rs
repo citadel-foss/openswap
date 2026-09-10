@@ -205,6 +205,11 @@ impl CoreRPC {
         Self::new(&self.config)
     }
 
+    /// Returns the active-chain height for a block received through ZMQ.
+    pub(crate) fn block_height(&self, block_hash: &BlockHash) -> Result<u64, WalletError> {
+        Ok(self.rpc.get_block_header_info(block_hash)?.height as u64)
+    }
+
     pub(crate) fn spending_transaction(
         &self,
         outpoint: &OutPoint,
