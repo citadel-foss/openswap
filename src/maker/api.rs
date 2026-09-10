@@ -34,8 +34,10 @@ use crate::{
     watch_tower::service::WatchService,
 };
 
-#[cfg(not(feature = "integration-test"))]
 use crate::utill::TX_CONFIRMATION_TIMEOUT;
+
+#[cfg(feature = "integration-test")]
+use std::env;
 
 #[cfg(feature = "integration-test")]
 pub use super::handlers::MakerBehavior;
@@ -57,12 +59,9 @@ pub const MIN_SWAP_AMOUNT: u64 = 10_000;
 /// admission. The honest road to first evidence is the taker confirming its own
 /// funding (bounded taker-side by `TX_CONFIRMATION_TIMEOUT`) plus one bounded
 /// maker-funding wait per preceding hop; past this age the swap is dead even if
-/// keepalives keep refreshing its idle timer.
-#[cfg(not(feature = "integration-test"))]
+/// keepalives keep refreshing its idle timer. Test builds use the same bound —
+/// a shorter one kills honest swaps whose taker waits out slow confirmations.
 const UNFUNDED_SWAP_LIFETIME: Duration = Duration::from_secs(2 * TX_CONFIRMATION_TIMEOUT.as_secs());
-/// Test scale: four idle-timeout cycles, so a pinged-but-unfunded swap still dies.
-#[cfg(feature = "integration-test")]
-const UNFUNDED_SWAP_LIFETIME: Duration = Duration::from_secs(120);
 
 /// The terms fixed by the taker's `SwapDetails` at negotiation, including the
 /// fee rate. Compared as one value on reconnect so no field can silently
@@ -1088,6 +1087,14 @@ impl MakerServer {
         // there is nothing on-chain to recover, so it is dropped without recovery.
         // Activity refreshes the idle timer, but the admission lifetime is a hard
         // bound: keepalives cannot pin a reservation forever.
+        #[cfg(feature = "integration-test")]
+        let lifetime = env::var("OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(UNFUNDED_SWAP_LIFETIME);
+        #[cfg(not(feature = "integration-test"))]
+        let lifetime = UNFUNDED_SWAP_LIFETIME;
         let released_ids: Vec<(String, bool)> = swaps
             .iter()
             .filter_map(|(id, state)| {
@@ -1099,7 +1106,7 @@ impl MakerServer {
                 if !unfunded {
                     return None;
                 }
-                let expired = state.swap_start_time.elapsed() > UNFUNDED_SWAP_LIFETIME;
+                let expired = state.swap_start_time.elapsed() > lifetime;
                 (expired || state.last_activity.elapsed() > timeout).then(|| (id.clone(), expired))
             })
             .collect();
@@ -2017,16 +2024,23 @@ impl MakerTrait for MakerServer {
             let Some(state) = swaps.get(swap_id) else {
                 return Ok(false);
             };
+            // Evidence is the taker's money moving, not our own artifacts.
+            // Taproot's claimed txs carry the funding on-chain; a legacy
+            // receiver contract is maker-built and never broadcast, so the
+            // taker's funding tx behind it is the only live evidence there.
+            let legacy = state.negotiated.protocol == ProtocolVersion::Legacy;
             state
                 .claimed_incoming_txids
                 .iter()
                 .copied()
-                .chain(
-                    state
-                        .incoming_swapcoins
-                        .iter()
-                        .map(|sc| sc.contract_tx.compute_txid()),
-                )
+                .filter(|_| !legacy)
+                .chain(state.incoming_swapcoins.iter().filter_map(|sc| {
+                    if legacy {
+                        sc.contract_tx.input.first().map(|i| i.previous_output.txid)
+                    } else {
+                        Some(sc.contract_tx.compute_txid())
+                    }
+                }))
                 .collect()
         };
         // No funding named yet: the unfunded lifetime, not this check, bounds

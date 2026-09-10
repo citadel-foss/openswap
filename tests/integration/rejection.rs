@@ -3619,6 +3619,9 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(
 fn unfunded_swap_dies_at_lifetime_despite_keepalives() {
     warn!("Running Test: unfunded swap dies at its admission lifetime despite keepalives");
 
+    // The default test lifetime matches production (two hours); shrink it so
+    // this test does not wait that out. Makers read it at drain time.
+    std::env::set_var("OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS", "120");
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             vec![(9811, Some(21441))],
@@ -3867,6 +3870,8 @@ fn keepalive_with_mempool_funding_still_refreshes() {
 fn keepalive_naming_unseen_funding_is_refused() {
     warn!("Running Test: keepalive naming unseen funding is refused");
 
+    // Same env knob as the lifetime test: shrink the two-hour default.
+    std::env::set_var("OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS", "120");
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             vec![(9813, Some(21443))],
