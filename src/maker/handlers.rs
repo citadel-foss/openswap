@@ -2,7 +2,7 @@
 
 use std::{sync::Arc, time::Instant};
 
-use bitcoin::{bip32::ChainCode, Amount, PublicKey, Transaction};
+use bitcoin::{bip32::ChainCode, Amount, OutPoint, PublicKey, Transaction, Txid};
 
 use super::error::MakerError;
 use crate::{
@@ -15,7 +15,10 @@ use crate::{
         taproot_messages::TaprootTakerMessage,
     },
     taker::api::REFUND_LOCKTIME_STEP,
-    wallet::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+    wallet::{
+        funding::SplitPlan,
+        swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+    },
 };
 
 /// Test-only behavior overrides for the maker.
@@ -64,6 +67,21 @@ pub enum MakerBehavior {
     UnderfundTaprootContract,
     /// Deduct one extra satoshi beyond the advertised fee.
     FeeSkimming,
+    /// Return one more outgoing contract than was actually funded, exceeding
+    /// the negotiated maximum split count.
+    OverproduceContractData,
+    /// Move one sat between two claimed Taproot amounts so count and total
+    /// stay exact; only the taker's per-output amount binding can catch it.
+    InflateContractAmount,
+    /// Repeat one funded Taproot contract in place of another so count and
+    /// total stay exact; only the duplicate-outpoint check can catch it.
+    DuplicateContractOutpoint,
+    /// Fail the batch's second funding broadcast so the first tx is on-chain
+    /// while the handler errors; exercises partial-batch recovery.
+    FailSecondBroadcast,
+    /// Build funding splits at the relay floor while the taker reimburses the
+    /// negotiated rate (funding-fee underpayment rejection tests).
+    UnderpayFundingFee,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).
@@ -80,11 +98,10 @@ pub(crate) fn offset_meets_reaction_time(refund_locktime_offset: u16) -> bool {
     refund_locktime_offset >= MIN_CONTRACT_REACTION_TIME
 }
 
-/// Upper bound, not equality: each hop's incoming is reduced by the earlier hops'
-/// fees. Funding above the negotiated amount books capital the taker never
-/// reserved, so only that direction is rejected.
-pub(crate) fn incoming_within_swap_amount(total_incoming: Amount, swap_amount: Amount) -> bool {
-    total_incoming <= swap_amount
+/// The declared amount is exact: the taker priced this hop on it, so less
+/// short-changes the maker and more was never reserved.
+pub(crate) fn incoming_matches_swap_amount(total_incoming: Amount, swap_amount: Amount) -> bool {
+    total_incoming == swap_amount
 }
 
 /// We can only sweep our incoming contract until `timelock + REFUND_LOCKTIME_STEP`.
@@ -122,8 +139,13 @@ pub struct ConnectionState {
     pub swap_id: Option<String>,
     /// Swap amount.
     pub swap_amount: Amount,
-    /// Number of contract transactions agreed at negotiation.
+    /// Maximum contract transactions this hop agreed to forward — a ceiling.
+    /// The exact count the taker will send is `incoming_count`.
     pub tx_count: u32,
+    /// Exactly how many contracts the taker will send this hop.
+    pub incoming_count: u32,
+    /// Maximum inputs per forwarding tx whose fee the taker covers.
+    pub max_input_budget: u32,
     /// Timelock value (Legacy: relative CSV, Taproot: absolute CLTV height).
     pub timelock: u32,
     /// Relative locktime offset for deterministic fee calculation.
@@ -134,14 +156,18 @@ pub struct ConnectionState {
     pub outgoing_swapcoins: Vec<OutgoingSwapCoin>,
     /// Pending funding transactions (not yet broadcast).
     pub pending_funding_txes: Vec<Transaction>,
-    /// Contract fee rate for multi-hop swap creation.
-    pub contract_feerate: f64,
+    /// Negotiated swap feerate; every transaction in the swap is built and
+    /// priced at this rate.
+    pub swap_feerate: f64,
     /// Maker service fee calculated from the accepted offer, excluding mining reimbursement.
     pub service_fee_sats: u64,
-    /// Whether the funding transaction was actually broadcast to the network.
-    pub funding_broadcast: bool,
-    /// Reserved UTXOs for this swap (prevents concurrent double-spending).
-    pub reserve_utxo: Vec<bitcoin::OutPoint>,
+    /// Funding txids broadcast so far, one per tx as the batch progresses. A
+    /// partial batch must not read as never broadcast, or recovery discards
+    /// recovery material for transactions already on-chain.
+    pub funding_broadcast_txids: Vec<Txid>,
+    /// The funding plan frozen at admission; executed as-is, never re-planned.
+    /// Empty until admission succeeds.
+    pub funding_plan: Vec<SplitPlan>,
     /// Last activity timestamp.
     pub last_activity: Instant,
     /// Swap start time for duration tracking in reports.
@@ -175,15 +201,17 @@ impl Default for ConnectionState {
             swap_id: None,
             swap_amount: Amount::ZERO,
             tx_count: 0,
+            incoming_count: 0,
+            max_input_budget: 0,
             timelock: 0,
             refund_locktime_offset: 0,
             incoming_swapcoins: Vec::new(),
             outgoing_swapcoins: Vec::new(),
             pending_funding_txes: Vec::new(),
-            contract_feerate: 0.0,
+            swap_feerate: 0.0,
             service_fee_sats: 0,
-            funding_broadcast: false,
-            reserve_utxo: Vec::new(),
+            funding_broadcast_txids: Vec::new(),
+            funding_plan: Vec::new(),
             last_activity: Instant::now(),
             swap_start_time: Instant::now(),
         }
@@ -270,21 +298,47 @@ pub trait Maker: Send + Sync {
     /// Calculate the swap fee.
     fn calculate_swap_fee(&self, amount: Amount, timelock: u32) -> Amount;
 
-    /// Create a funding transaction for Legacy (P2WSH) address.
-    fn create_funding_transaction(
+    /// Execute the funding plan frozen at admission, one transaction per
+    /// split. `amount` must match the plan's pre-netting total exactly; a
+    /// missing or mismatched plan is a protocol error, never a re-plan.
+    fn create_funding_transactions(
         &self,
+        swap_id: &str,
         amount: Amount,
-        address: bitcoin::Address,
-        excluded_outpoints: Option<Vec<bitcoin::OutPoint>>,
-    ) -> Result<(Transaction, u32), MakerError>;
+        addresses: &[bitcoin::Address],
+        feerate: f64,
+    ) -> Result<(Vec<Transaction>, Vec<u32>), MakerError>;
 
     /// Broadcast a transaction.
     fn broadcast_transaction(&self, tx: &Transaction) -> Result<bitcoin::Txid, MakerError>;
 
     /// Whether the backend already knows this transaction (mempool or chain);
-    /// used to tolerate duplicate-broadcast errors. `false` also covers
-    /// "backend down". Core must run with `-txindex=1`.
-    fn is_transaction_known(&self, txid: &bitcoin::Txid) -> bool;
+    /// used to tolerate duplicate-broadcast errors. A lock or backend failure
+    /// is an error, never `false`. Core must run with `-txindex=1`.
+    fn is_transaction_known(&self, txid: &Txid) -> Result<bool, MakerError>;
+
+    /// Record one successfully broadcast funding txid, so a mid-batch failure
+    /// is never read back as "never broadcast". Called per send, not at batch end.
+    fn record_funding_broadcast(&self, swap_id: &str, txid: &Txid) -> Result<(), MakerError>;
+
+    /// Whether the backend still reports this contract outpoint unspent
+    /// (mempool spends count). A lock or backend failure is an error, never
+    /// `false` — a spent contract output must not fund another hop.
+    fn contract_output_unspent(&self, outpoint: &OutPoint) -> Result<bool, MakerError>;
+
+    /// True if any other live swap or any wallet swapcoin already references
+    /// this contract txid. Replayed contract data must not fund a second swap.
+    fn contract_txid_seen(&self, txid: &Txid, except_swap_id: &str) -> Result<bool, MakerError>;
+
+    /// Atomically claim incoming contract txids for this swap under the
+    /// ongoing-swaps lock: a txid another live swap holds or claimed is a
+    /// replay. Claiming before the confirmation wait is what makes a
+    /// concurrent duplicate fail at claim time, not after both swaps funded.
+    fn claim_incoming_contract_txids(
+        &self,
+        swap_id: &str,
+        txids: &[Txid],
+    ) -> Result<(), MakerError>;
 
     /// Save incoming swapcoin to wallet.
     fn save_incoming_swapcoin(&self, swapcoin: &IncomingSwapCoin) -> Result<(), MakerError>;
@@ -330,12 +384,6 @@ pub trait Maker: Send + Sync {
     /// Get the active maker wallet file name.
     fn wallet_name(&self) -> &str;
 
-    /// Collect reserved UTXOs from all other active swaps (for concurrent double-spend prevention).
-    fn collect_excluded_utxos(
-        &self,
-        current_swap_id: &str,
-    ) -> Result<Vec<bitcoin::OutPoint>, MakerError>;
-
     /// Get the current block height from the Bitcoin node.
     fn get_current_height(&self) -> Result<u32, MakerError>;
 
@@ -343,11 +391,18 @@ pub trait Maker: Send + Sync {
     /// a Legacy deadline needs is recorded there and not on the connection.
     fn swap_past_refund_deadline(&self, swap_id: &str) -> Result<bool, MakerError>;
 
-    /// Wait until a peer's tx is confirmed to `required_confirms` depth. Both mempool
-    /// arrival and the confirmation itself are bounded, so a peer's unconfirmable tx
-    /// cannot park this thread; shutdown also breaks the wait.
+    /// True when this swap has named its incoming funding txids (claimed at
+    /// contract-data admission, or saved as incoming swapcoins) but the backend
+    /// sees none of them, mempool included. Pre-evidence and unknown swaps
+    /// return false: their refresh is bounded by the unfunded lifetime instead.
+    fn claimed_funding_unseen(&self, swap_id: &str) -> Result<bool, MakerError>;
+
+    /// Wait until a peer's tx is confirmed to `required_confirms` depth. Arrival and
+    /// confirmation are bounded and shutdown breaks the wait; each poll also refreshes
+    /// the swap's stored activity, so the idle drain cannot kill a live wait.
     fn wait_for_tx_on_chain(
         &self,
+        swap_id: &str,
         txid: &bitcoin::Txid,
         required_confirms: u32,
     ) -> Result<(), MakerError>;
@@ -366,17 +421,19 @@ pub trait Maker: Send + Sync {
         message: &crate::protocol::legacy_messages::ProofOfFunding,
     ) -> Result<crate::protocol::Hash160, MakerError>;
 
-    /// Initialize outgoing openswap.
+    /// Initialize outgoing swap by executing the funding plan frozen at
+    /// admission. `send_amount` must match the plan's pre-netting total
+    /// exactly; a missing or mismatched plan is a protocol error.
     #[allow(clippy::too_many_arguments)]
-    fn initialize_openswap(
+    fn initialize_swap(
         &self,
+        swap_id: &str,
         send_amount: Amount,
         next_multisig_pubkeys: &[PublicKey],
         next_hashlock_pubkeys: &[PublicKey],
         hashvalue: crate::protocol::Hash160,
         locktime: u16,
-        contract_feerate: f64,
-        excluded_outpoints: Option<Vec<bitcoin::OutPoint>>,
+        swap_feerate: f64,
     ) -> Result<(Vec<Transaction>, Vec<OutgoingSwapCoin>, Amount), MakerError>;
 
     /// Find outgoing swapcoin by its multisig redeemscript.
@@ -481,6 +538,17 @@ pub fn handle_message<M: Maker>(
             if maker.swap_past_refund_deadline(id)? {
                 log::warn!(
                     "[{}] Swap {} is past its refund deadline; letting it go idle for recovery",
+                    maker.network_port(),
+                    id
+                );
+                return Ok(None);
+            }
+            // Once the swap has named its funding, a keepalive counts only while
+            // the backend still sees it; otherwise a never-broadcast funding
+            // could pin the reservation at zero on-chain cost.
+            if maker.claimed_funding_unseen(id)? {
+                log::warn!(
+                    "[{}] Keepalive for swap {} names funding the backend cannot see; not refreshing",
                     maker.network_port(),
                     id
                 );
@@ -598,11 +666,29 @@ fn handle_swap_details<M: Maker>(
 
     // The fee pays for how long our funds stay locked, so use the length derived from the
     // timelock. Otherwise the taker could ask for a long lock and pay for a short one.
-    let refund_locktime_offset = maker.validate_swap_parameters(&details)?;
+    // A validation failure is a terminal refusal, so it goes back as a reject-Ack like
+    // an admission failure below: a dropped connection would stall an honest taker.
+    let refund_locktime_offset = match maker.validate_swap_parameters(&details) {
+        Ok(offset) => offset,
+        Err(e) => {
+            log::warn!(
+                "[{}] Rejecting SwapDetails for {}: parameter validation failed: {:?}",
+                Maker::network_port(maker.as_ref()),
+                details.id,
+                e
+            );
+            return Ok(Some(MakerToTakerMessage::AckSwapDetails(
+                AckSwapDetails::reject(),
+            )));
+        }
+    };
 
     state.swap_id = Some(details.id.clone());
     state.swap_amount = details.amount;
     state.tx_count = details.tx_count;
+    state.incoming_count = details.incoming_count;
+    state.max_input_budget = details.max_input_budget;
+    state.swap_feerate = details.feerate as f64;
     state.timelock = details.timelock;
     state.refund_locktime_offset = refund_locktime_offset;
     state.protocol = details.protocol_version;
@@ -613,32 +699,47 @@ fn handle_swap_details<M: Maker>(
 
     // An admission rejection must reach the taker as a message, not a dropped
     // connection, or it waits out a timeout before trying the next maker.
-    match maker.store_connection_state(&details.id, state, true) {
-        // A param mismatch means the id already belongs to a live swap; all
-        // arms are terminal rejections and get the same reset.
-        Err(
-            MakerError::TooManySwaps
-            | MakerError::SwapParamMismatch
-            | MakerError::InsufficientLiquidity { .. },
-        ) => {
-            // A rejected admission must leave no live phase: with AwaitingContractData
-            // still set, the taker could send ContractData and drive funding for a
-            // swap we refused. Nothing was stored, so restore_state_if_needed stays a no-op.
-            state.phase = SwapPhase::AwaitingSwapDetails;
-            state.swap_id = None;
-            state.swap_amount = Amount::ZERO;
-            state.tx_count = 0;
-            state.timelock = 0;
-            state.refund_locktime_offset = 0;
-            state.service_fee_sats = 0;
-            return Ok(Some(MakerToTakerMessage::AckSwapDetails(
-                AckSwapDetails::reject(),
-            )));
-        }
-        result => result?,
+    // Every admission failure is a terminal rejection and gets the same
+    // reset; nothing was stored, so restore_state_if_needed stays a no-op.
+    if let Err(e) = maker.store_connection_state(&details.id, state, true) {
+        log::warn!(
+            "[{}] Rejecting SwapDetails for {}: admission failed: {:?}",
+            Maker::network_port(maker.as_ref()),
+            details.id,
+            e
+        );
+        // A rejected admission must leave no live phase: with AwaitingContractData
+        // still set, the taker could send ContractData and drive funding for a
+        // swap we refused.
+        state.phase = SwapPhase::AwaitingSwapDetails;
+        state.swap_id = None;
+        state.swap_amount = Amount::ZERO;
+        state.tx_count = 0;
+        state.incoming_count = 0;
+        state.max_input_budget = 0;
+        state.timelock = 0;
+        state.refund_locktime_offset = 0;
+        state.service_fee_sats = 0;
+        state.swap_feerate = 0.0;
+        state.funding_plan = Vec::new();
+        return Ok(Some(MakerToTakerMessage::AckSwapDetails(
+            AckSwapDetails::reject(),
+        )));
     }
 
     let (_, tweakable_point, _) = maker.get_tweakable_keypair()?;
+
+    // The Ack reports the shape of the plan frozen at admission, so the taker
+    // derives the next hop's amount and count from what we actually reserved.
+    let stored = maker
+        .get_connection_state(&details.id)?
+        .ok_or(MakerError::General("Admission left no stored swap state"))?;
+    let funding_splits: Vec<u32> = stored
+        .funding_plan
+        .iter()
+        .map(|split| split.utxos.len() as u32)
+        .collect();
+    state.funding_plan = stored.funding_plan;
 
     log::info!(
         "[{}] Accepting swap (id: {})",
@@ -656,7 +757,7 @@ fn handle_swap_details<M: Maker>(
     }
 
     Ok(Some(MakerToTakerMessage::AckSwapDetails(
-        AckSwapDetails::accept(tweakable_point),
+        AckSwapDetails::accept(tweakable_point, funding_splits),
     )))
 }
 
@@ -680,15 +781,18 @@ fn restore_state_if_needed<M: Maker>(
             state.swap_id = Some(swap_id.to_string());
             state.swap_amount = stored.swap_amount;
             state.tx_count = stored.tx_count;
+            state.incoming_count = stored.incoming_count;
+            state.max_input_budget = stored.max_input_budget;
             state.timelock = stored.timelock;
             state.protocol = stored.protocol;
             state.phase = stored.phase;
             state.incoming_swapcoins = stored.incoming_swapcoins;
             state.outgoing_swapcoins = stored.outgoing_swapcoins;
             state.pending_funding_txes = stored.pending_funding_txes;
-            state.funding_broadcast = stored.funding_broadcast;
-            state.contract_feerate = stored.contract_feerate;
+            state.funding_broadcast_txids = stored.funding_broadcast_txids;
+            state.swap_feerate = stored.swap_feerate;
             state.service_fee_sats = stored.service_fee_sats;
+            state.funding_plan = stored.funding_plan;
             state.swap_start_time = stored.swap_start_time;
             state.refund_locktime_offset = stored.refund_locktime_offset;
         }
@@ -777,17 +881,17 @@ mod tests {
     }
 
     #[test]
-    fn incoming_above_negotiated_swap_amount_is_rejected() {
+    fn incoming_must_match_the_declared_swap_amount() {
         let negotiated = Amount::from_sat(500_000);
 
-        assert!(!incoming_within_swap_amount(
+        assert!(incoming_matches_swap_amount(negotiated, negotiated));
+        assert!(!incoming_matches_swap_amount(
             negotiated + Amount::from_sat(1),
             negotiated
         ));
-        assert!(incoming_within_swap_amount(negotiated, negotiated));
-        // Earlier hops take their fee out, so a later hop's incoming is smaller.
-        // This case is why the check is an upper bound and not equality.
-        assert!(incoming_within_swap_amount(
+        // The declared amount is exact: under-delivery pays fees on the
+        // declared value while delivering less, so it is rejected too.
+        assert!(!incoming_matches_swap_amount(
             negotiated - Amount::from_sat(4_000),
             negotiated
         ));

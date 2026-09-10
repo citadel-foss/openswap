@@ -168,6 +168,7 @@ impl Wallet {
             store_enc_material: restored_enc_material,
             new_mnemonic: None,
             locked_utxos: std::collections::HashSet::new(),
+            swap_locks: std::collections::HashMap::new(),
             // Flag to use the RESTORE_ADDRESS_GAP instead of normal gap while restoring.
             restore_scan: true,
         };

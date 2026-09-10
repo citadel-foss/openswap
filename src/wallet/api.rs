@@ -40,9 +40,9 @@ use crate::{
     lock_debug,
     protocol::contract::create_multisig_redeemscript,
     utill::{
-        compute_checksum, generate_keypair, get_hd_path_from_descriptor,
-        redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL, TX_BROADCAST_TIMEOUT,
-        TX_CONFIRMATION_TIMEOUT,
+        compute_checksum, fee_at_rate_sats, generate_keypair, get_hd_path_from_descriptor,
+        redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL, LEGACY_CONTRACT_SPEND_VSIZE,
+        TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
     },
 };
 
@@ -77,10 +77,6 @@ pub(crate) const RESTORE_ADDRESS_GAP: u32 = 100;
 /// higher indices must not keep the loop or the watch window growing forever.
 const MAX_SYNC_PASSES: u32 = 100;
 const MAX_WATCH_WINDOW: u32 = 100_000;
-/// P2WSH ECDSA: 2 sigs/sig+preimage + full redeemscript (~149)
-const LEGACY_CONTRACT_SPEND_VSIZE: u64 = 150;
-/// key-path: one 64B Schnorr sig, no script (~111)
-const TAPROOT_KEYPATH_VSIZE: u64 = 112;
 /// script-path: sig+preimage+script+control_block (~154)
 const TAPROOT_SCRIPTPATH_VSIZE: u64 = 155;
 /// ≈141 + 1 (growing block-height)
@@ -114,6 +110,10 @@ pub struct Wallet {
     pub(super) new_mnemonic: Option<SecretMnemonic>,
     /// Wallet-side set of outpoints excluded from coin selection.
     pub(crate) locked_utxos: HashSet<OutPoint>,
+    /// Outpoints promised to one in-flight swap, keyed by swap id. Unlike
+    /// `locked_utxos` (a property of the coin), these live and die with the
+    /// swap, so one swap's release must never free another's inputs.
+    pub(crate) swap_locks: HashMap<String, HashSet<OutPoint>>,
     /// Transient (never persisted): widens the gap-limit window to
     /// [`RESTORE_ADDRESS_GAP`] while the restore sync runs. Set only by
     /// [`Wallet::restore`].
@@ -291,23 +291,31 @@ pub(crate) enum SpendKind {
     Timelock,
 }
 
-/// Per-swapcoin fee budget a PaySwap taker reserves on the final hop, sized
-/// for the most expensive settlement path: legacy publishes the contract tx
-/// and spends via hashlock; taproot is the script-path spend. Cheaper paths
-/// pay the surplus as extra miner fee — a change output back to the taker
-/// would link it to the settlement.
+/// Per-swapcoin fee budget a PaySwap taker reserves on the final hop, priced
+/// at the negotiated feerate and sized for the most expensive settlement
+/// path: legacy publishes the contract tx and spends via hashlock; taproot is
+/// the script-path spend. Cheaper paths pay the surplus as extra miner fee —
+/// a change output back to the taker would link it to the settlement.
 /// On the common cooperative path the taker
 /// loses the worst-vs-cheap vsize gap per swapcoin: 43 vB for taproot
-/// (key-path, ~86 sats at the minimum feerate) and 150 vB for legacy
-/// (2-of-2 spend, ~300 sats).
-pub(crate) fn payment_settlement_budget_sats(protocol: crate::protocol::ProtocolVersion) -> u64 {
-    use crate::utill::calculate_fee_sats;
+/// (key-path, 43 sats at the relay floor) and 150 vB for legacy
+/// (2-of-2 spend, 150 sats).
+pub(crate) fn payment_settlement_budget_sats(
+    protocol: crate::protocol::ProtocolVersion,
+    feerate: f64,
+) -> Option<u64> {
     match protocol {
         crate::protocol::ProtocolVersion::Legacy => {
-            calculate_fee_sats(crate::protocol::contract::CONTRACT_TX_VSIZE)
-                + calculate_fee_sats(LEGACY_CONTRACT_SPEND_VSIZE)
+            fee_at_rate_sats(crate::protocol::contract::CONTRACT_TX_VSIZE, feerate).and_then(
+                |contract_fee| {
+                    fee_at_rate_sats(LEGACY_CONTRACT_SPEND_VSIZE, feerate)
+                        .and_then(|spend_fee| contract_fee.checked_add(spend_fee))
+                },
+            )
         }
-        crate::protocol::ProtocolVersion::Taproot => calculate_fee_sats(TAPROOT_SCRIPTPATH_VSIZE),
+        crate::protocol::ProtocolVersion::Taproot => {
+            fee_at_rate_sats(TAPROOT_SCRIPTPATH_VSIZE, feerate)
+        }
     }
 }
 
@@ -460,6 +468,7 @@ impl Wallet {
             store_enc_material,
             new_mnemonic: Some(SecretMnemonic(mnemonic)),
             locked_utxos: HashSet::new(),
+            swap_locks: HashMap::new(),
             restore_scan: false,
         })
     }
@@ -568,6 +577,7 @@ impl Wallet {
             store_enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
+            swap_locks: HashMap::new(),
             restore_scan: false,
         };
         wallet.seal_master_key()?;
@@ -988,6 +998,12 @@ impl Wallet {
     ///
     /// The caller supplies the backend connection: the confirmation waits run
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
+    ///
+    /// `feerate` must be our own estimate, read at recovery time: the peer that
+    /// abandoned the swap must not price our refund, and a rate fixed at startup
+    /// is stale by the time a timelock expires.
+    /// TODO: source it from `FeeEstimator` once that module is usable; every
+    /// caller passes `MIN_RELAY_FEE_RATE` until then.
     pub fn recover_timelocked_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
@@ -1494,15 +1510,46 @@ impl Wallet {
         self.locked_utxos.extend(outpoints.iter().copied());
     }
 
-    /// Clear the wallet-side lock set, making every coin selectable again.
-    pub(crate) fn unlock_all_utxos(&mut self) {
-        self.locked_utxos.clear();
-    }
-
     /// Outpoints currently held in the wallet-side lock set (see
     /// [`Wallet::locked_utxos`]).
-    fn list_lock_unspent(&self) -> Vec<OutPoint> {
+    pub(crate) fn list_lock_unspent(&self) -> Vec<OutPoint> {
         self.locked_utxos.iter().copied().collect()
+    }
+
+    /// Reserve `outpoints` for the swap `swap_key`; they stay out of coin
+    /// selection until [`Wallet::release_swap_locks`].
+    pub(crate) fn reserve_swap_locks(&mut self, swap_key: &str, outpoints: &[OutPoint]) {
+        self.swap_locks
+            .entry(swap_key.to_string())
+            .or_default()
+            .extend(outpoints.iter().copied());
+    }
+
+    /// `Some(inputs)` releases one funding transaction's inputs whose outcome
+    /// is proved (broadcast-accepted or known never sent); `None` drops the
+    /// whole swap's reservation once the swap has ended. Never release a
+    /// batch after an ambiguous broadcast failure — the transaction may still
+    /// have reached the mempool, and freeing its inputs invites a conflict.
+    pub(crate) fn release_swap_locks(&mut self, swap_key: &str, inputs: Option<&[OutPoint]>) {
+        let Some(inputs) = inputs else {
+            self.swap_locks.remove(swap_key);
+            return;
+        };
+        if let Some(locks) = self.swap_locks.get_mut(swap_key) {
+            for input in inputs {
+                locks.remove(input);
+            }
+            if locks.is_empty() {
+                self.swap_locks.remove(swap_key);
+            }
+        }
+    }
+
+    /// True while any in-flight swap holds `outpoint` reserved.
+    pub(crate) fn is_swap_reserved(&self, outpoint: &OutPoint) -> bool {
+        self.swap_locks
+            .values()
+            .any(|locks| locks.contains(outpoint))
     }
 
     /// Checks if a UTXO belongs to fidelity bonds, and then returns corresponding UTXOSpendInfo
@@ -2423,7 +2470,7 @@ impl Wallet {
         // TODO : Have a combined policy for change to choose it's type depending on the wallet state.
         let change_output_weight = (Amount::SIZE as u64 + 1 + 34u64) * 4;
 
-        // 1. Drop locked and explicitly excluded UTXOs from consideration.
+        // 1. Drop locked, swap-reserved, and explicitly excluded UTXOs.
         let locked_utxos = self.list_lock_unspent();
         let excluded: std::collections::HashSet<OutPoint> =
             excluded_outpoints.unwrap_or_default().into_iter().collect();
@@ -2432,7 +2479,9 @@ impl Wallet {
                 .into_iter()
                 .filter(|(utxo, _)| {
                     let outpoint = OutPoint::new(utxo.txid, utxo.vout);
-                    !locked_utxos.contains(&outpoint) && !excluded.contains(&outpoint)
+                    !locked_utxos.contains(&outpoint)
+                        && !excluded.contains(&outpoint)
+                        && !self.is_swap_reserved(&outpoint)
                 })
                 .collect::<Vec<_>>()
         };
@@ -2872,10 +2921,10 @@ impl Wallet {
     ///
     /// The caller supplies the backend connection: the confirmation waits run
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
+    /// Each coin sweeps at its stored negotiated feerate.
     pub fn sweep_incoming_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
-        feerate: f64,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<RecoveryOutcome, WalletError> {
         let mut outcome = RecoveryOutcome::default();
@@ -3107,7 +3156,7 @@ impl Wallet {
                     let spend = swapcoin.sign_spend_transaction(
                         input_value,
                         &address.script_pubkey(),
-                        feerate,
+                        swapcoin.negotiated_feerate as f64,
                     );
                     (Some(address), spend)
                 }
@@ -3875,6 +3924,7 @@ mod prevout_contract_tests {
             store_enc_material: enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
+            swap_locks: HashMap::new(),
             restore_scan: false,
         }
     }
@@ -4094,6 +4144,7 @@ mod restore_history_probe_tests {
             store_enc_material: enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
+            swap_locks: HashMap::new(),
             restore_scan: true,
         }
     }

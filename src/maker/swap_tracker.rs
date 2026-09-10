@@ -120,10 +120,10 @@ pub struct MakerSwapRecord {
     pub swap_amount_sat: u64,
     pub incoming_count: usize,
     pub outgoing_count: usize,
-    /// Whether the funding transaction was actually broadcast to the network.
-    /// If `false`, there is nothing on-chain to recover for this swap.
+    /// Funding txids broadcast so far, one per tx as the batch progresses.
+    /// Empty means nothing is on-chain and recovery material can be discarded.
     #[serde(default)]
-    pub funding_broadcast: bool,
+    pub funding_broadcast_txids: Vec<Txid>,
     pub recovery: MakerRecoveryState,
     pub created_at: u64,
     pub updated_at: u64,
@@ -133,14 +133,14 @@ impl fmt::Display for MakerSwapRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "[{}] phase={} proto={:?} amt={} in={} out={} funded={}",
+            "[{}] phase={} proto={:?} amt={} in={} out={} funded={:?}",
             self.swap_id,
             self.phase,
             self.protocol,
             self.swap_amount_sat,
             self.incoming_count,
             self.outgoing_count,
-            self.funding_broadcast,
+            short_txids(&self.funding_broadcast_txids),
         )?;
         write!(f, "\n  recovery: {}", self.recovery)?;
         Ok(())
@@ -220,14 +220,14 @@ impl MakerSwapTracker {
         if self.data.swaps.get(&record.swap_id).is_none_or(|old| {
             old.phase != record.phase
                 || old.recovery.phase != record.recovery.phase
-                || old.funding_broadcast != record.funding_broadcast
+                || old.funding_broadcast_txids != record.funding_broadcast_txids
         }) {
             log::debug!(
-                "[SWAP_TRACKER] Source: maker::swap_tracker::save_record | Role: Maker | SwapID: {} | Phase: {} | Recovery: {} | FundingBroadcast: {} | Incoming: {} | Outgoing: {}",
+                "[SWAP_TRACKER] Source: maker::swap_tracker::save_record | Role: Maker | SwapID: {} | Phase: {} | Recovery: {} | FundingBroadcastTxids: {:?} | Incoming: {} | Outgoing: {}",
                 record.swap_id,
                 record.phase,
                 record.recovery.phase,
-                record.funding_broadcast,
+                short_txids(&record.funding_broadcast_txids),
                 record.incoming_count,
                 record.outgoing_count
             );
@@ -315,7 +315,7 @@ mod tests {
             swap_amount_sat: 100_000,
             incoming_count: 2,
             outgoing_count: 2,
-            funding_broadcast: true,
+            funding_broadcast_txids: Vec::new(),
             recovery: MakerRecoveryState::default(),
             created_at: now_secs(),
             updated_at: now_secs(),

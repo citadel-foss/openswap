@@ -153,10 +153,10 @@ fn run_multi_confirm_swap(protocol: ProtocolVersion, makers_config_map: Vec<(u16
         taker_balances.spendable,
     );
 
-    let expected_taker_regular = 14499076;
+    let expected_taker_regular = 14499538;
     let expected_taker_swap = match protocol {
-        ProtocolVersion::Legacy => 494587,
-        ProtocolVersion::Taproot => 494815,
+        ProtocolVersion::Legacy => 496123,
+        ProtocolVersion::Taproot => 496465,
     };
     assert_eq!(
         taker_balances.regular.to_sat(),
@@ -181,8 +181,8 @@ fn run_multi_confirm_swap(protocol: ProtocolVersion, makers_config_map: Vec<(u16
         .unwrap();
     info!("Taker fees paid: {} sats", balance_diff.to_sat());
     let expected_diff = match protocol {
-        ProtocolVersion::Legacy => 6337,
-        ProtocolVersion::Taproot => 6109,
+        ProtocolVersion::Legacy => 4339,
+        ProtocolVersion::Taproot => 3997,
     };
     assert_eq!(
         balance_diff.to_sat(),
@@ -190,15 +190,15 @@ fn run_multi_confirm_swap(protocol: ProtocolVersion, makers_config_map: Vec<(u16
         "Taker spendable balance change mismatch"
     );
 
-    let expected_regular = [14500865u64, 14503103];
+    let expected_regular = match protocol {
+        ProtocolVersion::Legacy => [14501027u64, 14502722],
+        ProtocolVersion::Taproot => [14500913u64, 14502494],
+    };
     let expected_swap = match protocol {
-        ProtocolVersion::Legacy => [499100u64, 496825],
-        ProtocolVersion::Taproot => [499328u64, 497053],
+        ProtocolVersion::Legacy => [499550u64, 497818],
+        ProtocolVersion::Taproot => [499664u64, 498046],
     };
-    let expected_fee = match protocol {
-        ProtocolVersion::Legacy => [451u64, 414],
-        ProtocolVersion::Taproot => [679u64, 642],
-    };
+    let expected_fee = [820u64, 783];
 
     for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
         let balances = maker.wallet.read().unwrap().get_balances().unwrap();

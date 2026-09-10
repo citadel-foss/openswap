@@ -297,6 +297,7 @@ fn test_legacy_payswap() {
     generate_blocks(bitcoind, 1);
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, payment_amount, 2)
+        .with_tx_count(1)
         .with_required_confirms(1)
         .with_payment_address(receiver_address.as_unchecked().clone());
 
@@ -384,6 +385,118 @@ fn test_legacy_payswap() {
     );
 
     info!("Legacy PaySwap test completed successfully!");
+
+    makers
+        .iter()
+        .for_each(|maker| maker.shutdown.store(true, Relaxed));
+    maker_threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// A payment below the dust floor times the declared `tx_count` ceiling must
+/// be refused at quote time — before any maker negotiation or funding —
+/// instead of aborting after every hop is funded. Uses a non-default feerate,
+/// which no other PaySwap test exercises.
+#[test]
+fn test_payswap_dust_floor_rejects_before_funding() {
+    warn!("Running Test: PaySwap below the dust floor - refused at quote time");
+
+    let makers_config_map = vec![(9012, Some(19041))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![MakerBehavior::Normal];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    let taker_original_balance = fund_taker(
+        taker,
+        bitcoind,
+        1,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+
+    fund_makers(
+        &makers,
+        bitcoind,
+        2,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+
+    log::info!("Starting Maker server...");
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || {
+                start_server(maker_clone).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    wait_for_makers_setup(&makers, 120);
+
+    let receiver_address = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .require_network(bitcoin::Network::Regtest)
+        .unwrap();
+    generate_blocks(bitcoind, 1);
+
+    // One sat below the 546 * 10 ceiling: ten settlement outputs could never
+    // each clear dust. The refusal must come back from `prepare_swap` itself.
+    let payment_amount = Amount::from_sat(5459);
+    let mempool_before = bitcoind.client.get_raw_mempool().unwrap();
+    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+
+    let dust_err = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Taproot, payment_amount, 1)
+                .with_tx_count(10)
+                .with_feerate(3)
+                .with_required_confirms(1)
+                .with_preferred_makers(vec![maker_address])
+                .with_payment_address(receiver_address.as_unchecked().clone()),
+        )
+        .expect_err("a payment below the dust-floor ceiling must be refused at quote time");
+    info!("Quote-time refusal: {:?}", dust_err);
+    assert!(
+        format!("{dust_err:?}").contains("below maker 0 min_size"),
+        "unexpected refusal error: {:?}",
+        dust_err
+    );
+
+    // Nothing was negotiated, funded, or spent: the refusal precedes the
+    // route, so the maker never hears about the swap.
+    assert!(
+        !makers[0].has_ongoing_swaps().unwrap(),
+        "the maker must not be negotiated for a refused quote"
+    );
+    assert_eq!(
+        bitcoind.client.get_raw_mempool().unwrap(),
+        mempool_before,
+        "a refused quote must not broadcast any funding transaction"
+    );
+    taker
+        .get_wallet()
+        .write()
+        .unwrap()
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    assert_eq!(
+        taker_balances.spendable, taker_original_balance,
+        "a refused quote must not cost the taker anything"
+    );
+
+    info!("PaySwap dust-floor refusal test completed successfully!");
 
     makers
         .iter()

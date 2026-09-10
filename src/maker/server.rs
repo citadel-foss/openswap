@@ -16,8 +16,8 @@ use crate::maker::rpc::server::MakerRpc;
 use crate::{
     lock_debug,
     maker::nostr::broadcast_bond_on_nostr,
-    protocol::common_messages::{MakerToTakerMessage, TakerToMakerMessage},
-    utill::{HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE},
+    protocol::common_messages::{MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage},
+    utill::{HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE},
     wallet::{Blockchain, RecoveryReport, Wallet},
 };
 
@@ -196,6 +196,14 @@ const NOSTR_BROADCAST_INTERVAL: Duration = Duration::from_secs(30);
 /// Nostr bond re-broadcast interval (production): 30 minutes.
 #[cfg(not(feature = "integration-test"))]
 const NOSTR_BROADCAST_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Fee rate for maker recovery transactions, in sats/vB.
+// TODO: read the fee market at recovery time — a live server cannot be
+// reconfigured mid-swap, and a startup value is stale by then. FeeEstimator is
+// unusable as-is (fetches mempool.space/blockstream.info, takes Wallet by value).
+fn recovery_feerate() -> f64 {
+    MIN_RELAY_FEE_RATE
+}
 
 /// Start the maker server.
 pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
@@ -725,7 +733,7 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                 swap_amount_sat: idle.swap_amount_sat,
                 incoming_count: idle.incoming_swapcoins.len(),
                 outgoing_count: idle.outgoing_swapcoins.len(),
-                funding_broadcast: idle.funding_broadcast,
+                funding_broadcast_txids: idle.funding_broadcast_txids.clone(),
                 recovery: MakerRecoveryState::default(),
                 created_at: now,
                 updated_at: now,
@@ -806,7 +814,7 @@ fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result
         // Redeem any expired bonds
         if let Err(e) = lock_debug!(maker.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .redeem_expired_fidelity_bonds(AddressType::P2TR)
+            .redeem_expired_fidelity_bonds(recovery_feerate(), AddressType::P2TR)
         {
             log::warn!(
                 "[{}] Failed to redeem expired fidelity bonds: {:?}",
@@ -1051,44 +1059,69 @@ fn recover_from_swap(
     };
     let mut timelock_recovery_txids = Vec::new();
 
-    // Check if funding was ever broadcast. Only an explicit tracker record with
-    // funding_broadcast=false is safe to discard; missing tracker state can
-    // happen after a reboot and must not delete persisted recovery material.
+    // Discard only when every funding tx of the batch is positively unknown to
+    // the backend: an empty broadcast record can follow a crash before the
+    // first send was logged, and a failed query is not proof of absence.
     {
-        let funding_broadcast = lock_debug!(maker.swap_tracker.lock())
+        let never_recorded = lock_debug!(maker.swap_tracker.lock())
             .map_err(|_| MakerError::MutexPossion)?
             .get_record(&swap_id)
-            .map(|r| r.funding_broadcast);
+            .is_some_and(|r| r.funding_broadcast_txids.is_empty());
 
-        if funding_broadcast == Some(false) {
-            log::info!(
-                "[{}] Funding was never broadcast for swap {} — nothing to recover. Discarding swapcoins.",
-                maker.config.network_port,
-                swap_id
-            );
+        if never_recorded {
+            // The batch is the maker's own sends: Legacy's funding txs (each
+            // outgoing contract spends one) or Taproot's contract txs.
+            let batch_txids: Vec<_> = outgoing_swapcoins
+                .iter()
+                .map(|outgoing| match outgoing.protocol {
+                    ProtocolVersion::Legacy => outgoing.contract_tx.input[0].previous_output.txid,
+                    ProtocolVersion::Taproot => outgoing.contract_tx.compute_txid(),
+                })
+                .collect();
 
-            {
-                let mut wallet = lock_debug!(maker.wallet.write())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                for outgoing in &outgoing_swapcoins {
-                    let key = outgoing.contract_tx.compute_txid().to_string();
-                    wallet.remove_outgoing_swapcoin(&key);
+            let wallet = lock_debug!(maker.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            let mut all_unknown = true;
+            for txid in &batch_txids {
+                // An error propagates: the records stay and the next recovery
+                // pass asks again, instead of deleting live recovery material.
+                if !wallet.blockchain.is_tx_unknown(txid)? {
+                    all_unknown = false;
+                    break;
                 }
-                for incoming in &incoming_swapcoins {
-                    let key = incoming.contract_tx.compute_txid().to_string();
-                    wallet.remove_incoming_swapcoin(&key);
-                }
-                wallet.save_to_disk().map_err(MakerError::Wallet)?;
             }
+            drop(wallet);
 
-            update_tracker(&maker, &swap_id, |r| {
-                r.phase = MakerSwapPhase::Recovered;
-                r.recovery.phase = MakerRecoveryPhase::CleanedUp;
-            });
+            if all_unknown {
+                log::info!(
+                    "[{}] Funding was never broadcast for swap {} — nothing to recover. Discarding swapcoins.",
+                    maker.config.network_port,
+                    swap_id
+                );
 
-            #[cfg(feature = "integration-test")]
-            maker.shutdown.store(true, Relaxed);
-            return Ok(());
+                {
+                    let mut wallet = lock_debug!(maker.wallet.write())
+                        .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                    for outgoing in &outgoing_swapcoins {
+                        let key = outgoing.contract_tx.compute_txid().to_string();
+                        wallet.remove_outgoing_swapcoin(&key);
+                    }
+                    for incoming in &incoming_swapcoins {
+                        let key = incoming.contract_tx.compute_txid().to_string();
+                        wallet.remove_incoming_swapcoin(&key);
+                    }
+                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                }
+
+                update_tracker(&maker, &swap_id, |r| {
+                    r.phase = MakerSwapPhase::Recovered;
+                    r.recovery.phase = MakerRecoveryPhase::CleanedUp;
+                });
+
+                #[cfg(feature = "integration-test")]
+                maker.shutdown.store(true, Relaxed);
+                return Ok(());
+            }
         }
     }
 
@@ -1173,13 +1206,8 @@ fn recover_from_swap(
 
             let chain = chain.as_ref().expect("connection created for this branch");
 
-            let swept = Wallet::sweep_incoming_swapcoins(
-                &maker.wallet,
-                chain,
-                crate::utill::MIN_FEE_RATE,
-                &maker.shutdown,
-            )
-            .map_err(MakerError::Wallet)?;
+            let swept = Wallet::sweep_incoming_swapcoins(&maker.wallet, chain, &maker.shutdown)
+                .map_err(MakerError::Wallet)?;
 
             if !swept.is_empty() {
                 log::info!(
@@ -1257,7 +1285,7 @@ fn recover_from_swap(
             let recovered = Wallet::recover_timelocked_swapcoins(
                 &maker.wallet,
                 chain,
-                crate::utill::MIN_FEE_RATE,
+                recovery_feerate(),
                 &maker.shutdown,
             )
             .map_err(MakerError::Wallet)?;

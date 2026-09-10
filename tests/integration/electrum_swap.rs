@@ -27,21 +27,21 @@ struct ExpectedBalances {
 }
 
 const TAPROOT_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14_499_076,
-    taker_swap: 494_815,
-    taker_fee: 6_109,
-    maker_regular: [14_500_865, 14_503_103],
-    maker_swap: [499_328, 497_053],
-    maker_earnings: [679, 642],
+    taker_regular: 14_499_538,
+    taker_swap: 496_465,
+    taker_fee: 3_997,
+    maker_regular: [14_500_913, 14_502_494],
+    maker_swap: [499_664, 498_046],
+    maker_earnings: [820, 783],
 };
 
 const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14_499_076,
-    taker_swap: 494_587,
-    taker_fee: 6_337,
-    maker_regular: [14_500_865, 14_503_103],
-    maker_swap: [499_100, 496_825],
-    maker_earnings: [451, 414],
+    taker_regular: 14_499_538,
+    taker_swap: 496_123,
+    taker_fee: 4_339,
+    maker_regular: [14_501_027, 14_502_722],
+    maker_swap: [499_550, 497_818],
+    maker_earnings: [820, 783],
 };
 
 /// Run an Electrum-only openswap with the given protocol version and assert the
