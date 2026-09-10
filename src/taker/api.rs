@@ -19,7 +19,6 @@ use super::swap_tracker::{
 
 use bitcoin::{
     hashes::{hash160::Hash as Hash160, Hash},
-    hex::DisplayHex,
     secp256k1::{
         rand::{rngs::OsRng, RngCore},
         SecretKey,
@@ -915,7 +914,7 @@ impl Taker {
         let mut preimage = [0u8; 32];
         OsRng.fill_bytes(&mut preimage);
 
-        let swap_id = Hash160::hash(&preimage)[0..8].to_lower_hex_string();
+        let swap_id = format!("{:016x}", OsRng.next_u64());
         log::info!("Preparing openswap with id: {}", swap_id);
 
         let maker_count = params.maker_count;

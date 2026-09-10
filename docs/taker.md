@@ -416,6 +416,8 @@ Estimated receive:   18920 sats
 Proceed with this swap? [y/N]
 ```
 
+The swap ID is randomly generated and independent of the swap's cryptographic material, so it cannot be used to locate the swap's contracts on-chain. It is a local handle for referring to the swap, for example with `verify-deniability`.
+
 Confirm with `y` (or pass `-y`/`--yes` upfront) to execute the swap. With `--payment-address <addr>` (PaySwap), the summary instead shows the receiver, the exact amount the receiver gets, and the total openswap cost.
 
 The process typically takes several minutes to complete. You can monitor the swap progress by watching the debug log in a new terminal:
