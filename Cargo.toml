@@ -40,6 +40,10 @@ tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"]}
 rustls = { version = "0.23.40", default-features = false, features = ["std", "ring"] }
 nostr = "0.44.2"
 crossbeam-channel = "0.5.15"
+# Lightning (optional, behind the `lightning` feature).
+# `ldk-server-client` is unpublished; pinned to a specific upstream commit.
+ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "3e9e537144830d0b8debf62ebc1f723d75f45e31", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"], optional = true }
 
 [dev-dependencies]
 flate2 = {version = "1.0.35"}
@@ -52,6 +56,8 @@ default = []
 # The following feature set is in response to the issue described at https://github.com/rust-lang/rust/issues/45599
 # Only used for running the integration tests
 integration-test = []
+# Lightning backend over an LDK Server sidecar (gRPC).
+lightning = ["dep:ldk-server-client", "dep:tokio"]
 
 [package.metadata.cargo-machete]
 ignored = ["rustls"]
