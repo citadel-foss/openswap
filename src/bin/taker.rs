@@ -9,7 +9,7 @@ use openswap::{
         error::TakerError, format_state, MakerOfferCandidate, MakerState, SwapParams, Taker,
         TakerConfig, TakerInitConfig,
     },
-    utill::{parse_proxy_auth, print_new_wallet_seed, setup_taker_logger, UTXO},
+    utill::{parse_proxy_auth, print_new_wallet_seed, setup_taker_logger, MAX_TX_COUNT, UTXO},
     wallet::{AddressType, CoreRpcConfig, Wallet},
 };
 use serde_json::{json, to_string_pretty};
@@ -118,7 +118,8 @@ enum Commands {
         /// Amount to send in sats
         #[clap(long, short = 'a')]
         amount: u64,
-        /// Feerate in sats/vByte. Defaults to 2 sats/vByte
+        /// Feerate in sats/vByte. Defaults to 1 sat/vByte; values below the
+        /// 1 sat/vByte relay floor are rejected
         #[clap(long, short = 'f')]
         feerate: Option<f64>,
     },
@@ -149,8 +150,24 @@ enum Commands {
         /// Sets the swap amount in sats.
         #[clap(long, short = 'a', default_value = "20000")]
         amount: u64,
-        #[clap(long = "tx-count", default_value = "1")]
+        /// Maximum contracts the swap may split into; bounded because every
+        /// split costs both sides allocation and keygen work.
+        #[clap(
+            long = "tx-count",
+            default_value = "2",
+            value_parser = clap::value_parser!(u32).range(1..=MAX_TX_COUNT as i64)
+        )]
         tx_count: u32,
+        /// Maximum inputs per forwarding tx whose fee the taker covers.
+        #[clap(
+            long = "max-input-budget",
+            default_value = "2",
+            value_parser = clap::value_parser!(u32).range(1..=MAX_TX_COUNT as i64)
+        )]
+        max_input_budget: u32,
+        /// Swap feerate in sats/vB; values below the 1 sat/vB relay floor are rejected.
+        #[clap(long, default_value = "1")]
+        feerate: u64,
         /// Protocol version to use: "legacy" or "taproot"
         #[clap(long, default_value = "legacy")]
         protocol: String,
@@ -544,6 +561,8 @@ fn main() -> Result<(), TakerError> {
             makers,
             amount,
             tx_count,
+            max_input_budget,
+            feerate,
             protocol,
             maker_addresses,
             auto_select,
@@ -577,6 +596,8 @@ fn main() -> Result<(), TakerError> {
             let mut swap_params =
                 SwapParams::new(protocol_version, Amount::from_sat(*amount), *makers);
             swap_params.tx_count = *tx_count;
+            swap_params.max_input_budget = *max_input_budget;
+            swap_params.feerate = *feerate;
             swap_params.manually_selected_outpoints = manually_selected_outpoints;
             if !maker_addresses.is_empty() {
                 swap_params.preferred_makers = Some(maker_addresses.clone());
@@ -607,7 +628,10 @@ fn main() -> Result<(), TakerError> {
                 );
             }
             println!();
-            println!("Total estimated fee: {}", summary.total_estimated_fee);
+            println!(
+                "Maximum total cost (ceiling): {}",
+                summary.total_estimated_fee
+            );
             if let Some(payment) = &summary.payment {
                 println!("Estimated receive:   0 (settled to the payment receiver)");
                 println!();

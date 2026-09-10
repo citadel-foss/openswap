@@ -18,7 +18,7 @@ use bitcoin::{OutPoint, ScriptBuf, Txid};
 use crate::{
     lock_debug,
     taker::error::TakerError,
-    utill::HEART_BEAT_INTERVAL,
+    utill::{HEART_BEAT_INTERVAL, MIN_RELAY_FEE_RATE},
     wallet::{AnyBlockchain, Blockchain, RecoveryReport, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
@@ -30,6 +30,14 @@ use super::swap_tracker::{ContractOutcome, ContractResolution, RecoveryPhase, Sw
 const RECOVERY_LOOP_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(feature = "integration-test")]
 const RECOVERY_LOOP_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Fee rate for taker recovery transactions, in sats/vB.
+// TODO: read the fee market at recovery time — a live node cannot be
+// reconfigured mid-swap, and a startup value is stale by then. FeeEstimator is
+// unusable as-is (fetches mempool.space/blockstream.info, takes Wallet by value).
+fn recovery_feerate() -> f64 {
+    MIN_RELAY_FEE_RATE
+}
 
 /// Background thread that periodically retries wallet-level recovery
 /// (hashlock sweep + timelock recovery) until all contract UTXOs are resolved.
@@ -82,32 +90,28 @@ impl RecoveryLoop {
 
                     // Try hashlock sweep (incoming). It takes the lock itself and drops
                     // it across its waits, so a stuck tx cannot wedge the wallet.
-                    let incoming_result = match Wallet::sweep_incoming_swapcoins(
-                        &wallet,
-                        &chain,
-                        2.0,
-                        &shutdown_clone,
-                    ) {
-                        Ok(ref swept) if !swept.is_empty() => {
-                            log::info!(
-                                "Recovery loop: swept {} incoming swapcoins",
-                                swept.resolved.len()
-                            );
-                            Some(swept.clone())
-                        }
-                        Err(e) => {
-                            log::debug!("Recovery loop: incoming sweep: {:?}", e);
-                            None
-                        }
-                        _ => None,
-                    };
+                    let incoming_result =
+                        match Wallet::sweep_incoming_swapcoins(&wallet, &chain, &shutdown_clone) {
+                            Ok(ref swept) if !swept.is_empty() => {
+                                log::info!(
+                                    "Recovery loop: swept {} incoming swapcoins",
+                                    swept.resolved.len()
+                                );
+                                Some(swept.clone())
+                            }
+                            Err(e) => {
+                                log::debug!("Recovery loop: incoming sweep: {:?}", e);
+                                None
+                            }
+                            _ => None,
+                        };
 
                     // Try timelock recovery (outgoing). Same deal — it manages the
                     // lock itself and never holds it across a confirmation wait.
                     let outgoing_result = match Wallet::recover_timelocked_swapcoins(
                         &wallet,
                         &chain,
-                        2.0,
+                        recovery_feerate(),
                         &shutdown_clone,
                     ) {
                         Ok(ref recovered) if !recovered.is_empty() => {

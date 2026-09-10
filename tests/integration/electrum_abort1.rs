@@ -47,21 +47,21 @@ pub(crate) struct ExpectedBalances {
 }
 
 pub(crate) const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14499076,
-    taker_swap: 493687,
-    taker_spendable_diff: 7237,
-    maker_regular: [14500865, 14503103],
-    maker_swap: [498200, 495925],
-    maker_spendable: [14999065, 14999028],
+    taker_regular: 14499538,
+    taker_swap: 495673,
+    taker_spendable_diff: 4789,
+    maker_regular: [14501027, 14502722],
+    maker_swap: [499100, 497368],
+    maker_spendable: [15000127, 15000090],
 };
 
 pub(crate) const TAPROOT_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14499076,
-    taker_swap: 494557,
-    taker_spendable_diff: 6367,
-    maker_regular: [14500865, 14503103],
-    maker_swap: [499070, 496795],
-    maker_spendable: [14999935, 14999898],
+    taker_regular: 14499538,
+    taker_swap: 496336,
+    taker_spendable_diff: 4126,
+    maker_regular: [14500913, 14502494],
+    maker_swap: [499535, 497917],
+    maker_spendable: [15000448, 15000411],
 };
 
 /// Run the abort1 scenario (taker drops after funds broadcast) with the given
@@ -397,6 +397,7 @@ fn electrum_sweeps_after_breach() {
         .with_required_confirms(0);
 
     generate_blocks(bitcoind, 1);
+    let swap_start_height = chain_tip(bitcoind) + 1;
 
     let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
     let summary = taker
@@ -445,14 +446,32 @@ fn electrum_sweeps_after_breach() {
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        493_687,
+        495_673,
         "Swept swap balance mismatch"
     );
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14_499_076,
+        14_499_538,
         "Taker regular balance mismatch"
     );
+
+    // Recovery sweeps sit at depth 2 (they spend the broadcast contract txs).
+    // Each pays the relay floor at the 150 vB legacy spend model — the
+    // accepted B12 fallback until recovery fees are estimated at spend time.
+    let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[0, 0, 3]);
+    for txid in &depths[2] {
+        let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
+        assert_eq!(
+            fee, 150,
+            "recovery sweep {} must pay the 150 vB model",
+            txid
+        );
+        assert!(
+            vsize <= 150,
+            "recovery sweep {} exceeds its 150 vB model",
+            txid
+        );
+    }
 
     makers
         .iter()

@@ -190,7 +190,7 @@ fn test_taproot_multi_taker_openswap() {
 
     assert_eq!(
         taker1_balances_after.spendable.to_sat(),
-        14993891,
+        14996003,
         "Taker 1 spendable balance mismatch"
     );
     assert_eq!(
@@ -199,7 +199,7 @@ fn test_taproot_multi_taker_openswap() {
         "Taker 1 contract balance mismatch"
     );
     assert_eq!(taker1_balances_after.fidelity, Amount::ZERO);
-    assert_eq!(balance_diff1.to_sat(), 6109, "Taker 1 fee paid mismatch");
+    assert_eq!(balance_diff1.to_sat(), 3997, "Taker 1 fee paid mismatch");
 
     // ---- Verify Taker 2 ----
     let taker2_balances_after = takers[1]
@@ -218,7 +218,7 @@ fn test_taproot_multi_taker_openswap() {
 
     assert_eq!(
         taker2_balances_after.spendable.to_sat(),
-        14993891,
+        14996003,
         "Taker 2 spendable balance mismatch"
     );
     assert_eq!(
@@ -227,12 +227,12 @@ fn test_taproot_multi_taker_openswap() {
         "Taker 2 contract balance mismatch"
     );
     assert_eq!(taker2_balances_after.fidelity, Amount::ZERO);
-    assert_eq!(balance_diff2.to_sat(), 6109, "Taker 2 fee paid mismatch");
+    assert_eq!(balance_diff2.to_sat(), 3997, "Taker 2 fee paid mismatch");
 
     // ---- Verify Makers earned fees ----
-    let expected_regular = [14002216, 14006692];
-    let expected_swap = [998656, 994106];
-    let expected_fee = [1358, 1284];
+    let expected_regular = [14002069, 14005231];
+    let expected_swap = [999328, 996092];
+    let expected_fee = [1640, 1566];
     for (i, (maker, original_spendable)) in makers.iter().zip(maker_spendable_balance).enumerate() {
         let wallet = maker.wallet.read().unwrap();
         let balances = wallet.get_balances().unwrap();

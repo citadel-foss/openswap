@@ -14,7 +14,7 @@ use crate::{
         contract2::{create_hashlock_script, create_timelock_script},
         taproot_messages::{SerializableScalar, TaprootContractData},
     },
-    utill::{read_message, send_message, MIN_FEE_RATE},
+    utill::{read_message, send_message},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         Blockchain, Wallet,
@@ -26,6 +26,9 @@ use super::{
     error::{breach_or_wallet_error, TakerError},
     swap_tracker::SwapPhase,
 };
+
+#[cfg(feature = "integration-test")]
+use crate::protocol::common_messages::GetOffer;
 
 impl Taker {
     /// Build contract data from a previous maker's response (for forwarding to the next maker).
@@ -64,6 +67,7 @@ impl Taker {
         network: Network,
         manually_selected_outpoints: Option<Vec<OutPoint>>,
         reference_height: Option<u32>,
+        feerate: f64,
     ) -> Result<Vec<OutgoingSwapCoin>, TakerError> {
         let secp = Secp256k1::new();
         let mut swapcoins = Vec::new();
@@ -149,13 +153,27 @@ impl Taker {
             ));
         }
 
-        let funding_result = wallet.create_funding_txes(
+        // The taker funds its own hop and pays the fee on top: no input
+        // budget, no over-budget guard (`None`).
+        let plan = wallet.plan_funding(
             send_amount,
-            &taproot_addresses,
-            MIN_FEE_RATE,
+            taproot_addresses.len() as u32,
+            feerate,
+            u32::MAX,
+            None,
             manually_selected_outpoints,
             None,
         )?;
+        // Its own hop funds every destination or not at all: a degraded plan
+        // is a funding failure, not a smaller swap.
+        if plan.len() != taproot_addresses.len() {
+            return Err(TakerError::General(format!(
+                "wallet can fund only {} of the {} funding transactions",
+                plan.len(),
+                taproot_addresses.len()
+            )));
+        }
+        let funding_result = wallet.execute_funding_plan(&plan, &taproot_addresses, feerate)?;
 
         for (
             (contract_tx, &output_pos),
@@ -183,6 +201,7 @@ impl Taker {
                 timelock_script,
                 contract_tx.clone(),
                 contract_amount,
+                feerate as u64,
             );
             outgoing.swap_id = Some(swap_id.to_string());
             outgoing.set_taproot_params(
@@ -229,6 +248,8 @@ impl Taker {
         let num_makers = self.swap_state()?.makers.len();
         let hashlock_nonces = self.swap_state()?.hashlock_nonces.clone();
         let mut received_contracts: Vec<TaprootContractData> = Vec::new();
+        #[cfg(feature = "integration-test")]
+        let mut cached_this_swap = false;
 
         let mut maker0_stream = Some(maker0_stream);
 
@@ -349,6 +370,39 @@ impl Taker {
                 },
             );
 
+            // The first swap sends real data and caches it; a later swap sends
+            // the cached data under its fresh id — the replay the maker must reject.
+            #[cfg(feature = "integration-test")]
+            let contract_data = if matches!(
+                self.behavior,
+                super::api::TakerBehavior::ReplayTaprootContractData
+                    | super::api::TakerBehavior::ReplayTaprootContractDataInFlight
+            ) {
+                match super::api::replay_contract_cache_get(&maker_address) {
+                    Some((_, cached)) => {
+                        let mut replayed = cached;
+                        replayed.id = contract_data.id.clone();
+                        log::warn!(
+                            "Test behavior: replaying earlier contract data under swap {}",
+                            replayed.id
+                        );
+                        replayed
+                    }
+                    None => {
+                        let timelock = self.swap_state()?.makers[i].negotiated_timelock;
+                        super::api::replay_contract_cache_put(
+                            &maker_address,
+                            timelock,
+                            &contract_data,
+                        );
+                        cached_this_swap = true;
+                        contract_data
+                    }
+                }
+            } else {
+                contract_data
+            };
+
             #[cfg(feature = "integration-test")]
             if self.behavior == super::api::TakerBehavior::CloseAtSendersContract {
                 log::warn!(
@@ -362,13 +416,28 @@ impl Taker {
 
             send_message(
                 &mut stream,
-                &TakerToMakerMessage::TaprootContractData(Box::new(contract_data)),
+                &TakerToMakerMessage::TaprootContractData(Box::new(contract_data.clone())),
             )?;
             self.swap_state_mut()?.makers[i]
                 .taproot_exchange_mut()?
                 .contract_data_sent = true;
 
-            let msg_bytes = read_message(&mut stream)?;
+            let msg_bytes = read_message(&mut stream).map_err(TakerError::from);
+            #[cfg(feature = "integration-test")]
+            let msg_bytes = match msg_bytes {
+                Err(_)
+                    if self.behavior == super::api::TakerBehavior::ResumeAfterMakerDrop
+                        && i == 0 =>
+                {
+                    log::warn!(
+                        "Test behavior: maker 0 dropped mid-exchange; re-admitting swap {} and resending its contract data",
+                        contract_data.id
+                    );
+                    self.resume_contract_data_exchange(&maker_address, i, &contract_data)
+                }
+                other => other,
+            };
+            let msg_bytes = msg_bytes?;
             let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
 
             match msg {
@@ -390,9 +459,24 @@ impl Taker {
                         ));
                     }
 
+                    // Die with the maker's claim and swapcoins still live, so the
+                    // next swap's replayed contract data meets the in-flight guard.
+                    #[cfg(feature = "integration-test")]
+                    if self.behavior == super::api::TakerBehavior::ReplayTaprootContractDataInFlight
+                        && cached_this_swap
+                    {
+                        log::warn!(
+                            "Test behavior: first swap dies after maker {}'s contract response, claim left in flight",
+                            i
+                        );
+                        return Err(TakerError::General(
+                            "Test: first swap aborted with the maker's claim in flight".to_string(),
+                        ));
+                    }
+
                     // Verify contract data before creating swapcoins
                     let expected_locktime = self.swap_state()?.makers[i].negotiated_timelock;
-                    let expected_amount = self.expected_amount_for_hop(i);
+                    let expected_amount = self.forwardable_for_hop(i);
                     self.verify_maker_taproot_contract(
                         &maker_contract,
                         i,
@@ -545,6 +629,39 @@ impl Taker {
         Ok(())
     }
 
+    /// Re-admit this swap on a fresh connection and resend the same contract
+    /// data after the maker dropped mid-exchange. The maker's same-swap
+    /// exemptions are the only thing between this and a replay rejection.
+    #[cfg(feature = "integration-test")]
+    fn resume_contract_data_exchange(
+        &self,
+        maker_address: &str,
+        maker_idx: usize,
+        contract_data: &TaprootContractData,
+    ) -> Result<Vec<u8>, TakerError> {
+        let mut stream = self.net_connect(maker_address)?;
+        self.net_handshake(&mut stream)?;
+        send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
+        read_message(&mut stream)?;
+        let details = self.current_swap_details(maker_idx)?;
+        send_message(&mut stream, &TakerToMakerMessage::SwapDetails(details))?;
+        let ack: MakerToTakerMessage = serde_cbor::from_slice(&read_message(&mut stream)?)?;
+        match ack {
+            MakerToTakerMessage::AckSwapDetails(ref ack) if ack.tweakable_point.is_some() => {}
+            other => {
+                return Err(TakerError::General(format!(
+                    "resume re-admission rejected by maker {}: {:?}",
+                    maker_idx, other
+                )));
+            }
+        }
+        send_message(
+            &mut stream,
+            &TakerToMakerMessage::TaprootContractData(Box::new(contract_data.clone())),
+        )?;
+        Ok(read_message(&mut stream)?)
+    }
+
     /// Build contract data from our outgoing swapcoins (first hop).
     #[allow(clippy::type_complexity)]
     fn exchange_build_from_outgoing(
@@ -639,6 +756,7 @@ impl Taker {
                 contract.timelock_scripts[j].clone(),
                 contract_tx.clone(),
                 amount,
+                self.swap_state()?.params.swap_feerate() as u64,
             );
 
             let other_pubkey = contract.pubkeys.get(j).cloned().ok_or_else(|| {
@@ -672,6 +790,13 @@ impl Taker {
         let wallet = self.write_wallet()?;
 
         for swapcoin in &self.swap_state()?.outgoing_swapcoins {
+            // Test hook: withhold the broadcast so the maker claims a funding
+            // txid no backend can see (evidence-gated keepalive test).
+            #[cfg(feature = "integration-test")]
+            if self.behavior == super::api::TakerBehavior::WithholdFundingBroadcast {
+                log::warn!("Test behavior: withholding the contract tx broadcast");
+                continue;
+            }
             let txid = wallet.send_tx(&swapcoin.contract_tx).map_err(|e| {
                 TakerError::General(format!("Failed to broadcast contract tx: {:?}", e))
             })?;
@@ -717,6 +842,23 @@ impl Taker {
         let mut stream = self.net_connect(&maker0_address)?;
         self.net_handshake(&mut stream)?;
 
+        // Test hook: send contract data while the funding is mempool-only or
+        // withheld entirely, so keepalives meet the maker's evidence gate.
+        #[cfg(feature = "integration-test")]
+        if matches!(
+            self.behavior,
+            super::api::TakerBehavior::SkipFundingConfirmWait
+                | super::api::TakerBehavior::WithholdFundingBroadcast
+        ) {
+            log::warn!("Test behavior: skipping the funding confirmation wait");
+        } else {
+            self.wait_for_funding_confirmation(
+                &contract_txids,
+                required_confirms,
+                crate::utill::TX_BROADCAST_TIMEOUT,
+            )?;
+        }
+        #[cfg(not(feature = "integration-test"))]
         self.wait_for_funding_confirmation(
             &contract_txids,
             required_confirms,

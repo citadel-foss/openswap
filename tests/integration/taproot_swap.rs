@@ -86,6 +86,7 @@ fn test_taproot_openswap() {
 
     // Mine some blocks before the swap to ensure wallet is ready
     generate_blocks(bitcoind, 1);
+    let swap_start_height = chain_tip(bitcoind) + 1;
 
     // Prepare and execute the swap
     let summary = taker
@@ -128,10 +129,10 @@ fn test_taproot_openswap() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499076,
+        14499538,
         "Taker regular balance mismatch"
     );
-    assert_eq!(taker_balances.swap.to_sat(), 494815, "Taker swap balance");
+    assert_eq!(taker_balances.swap.to_sat(), 496465, "Taker swap balance");
     assert_eq!(
         taker_balances.contract.to_sat(),
         0,
@@ -147,14 +148,14 @@ fn test_taproot_openswap() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        6109,
+        3997,
         "Taker spendable balance change"
     );
 
     // Verify makers earned fees
-    let expected_regular = [14500865, 14503103];
-    let expected_swap = [499328, 497053];
-    let expected_fee = [679, 642];
+    let expected_regular = [14500913, 14502494];
+    let expected_swap = [499664, 498046];
+    let expected_fee = [820, 783];
     for (i, (maker, original_spendable)) in makers.iter().zip(maker_spendable_balance).enumerate() {
         let balances = maker.wallet.read().unwrap().get_balances().unwrap();
 
@@ -193,6 +194,23 @@ fn test_taproot_openswap() {
         );
 
         assert_eq!(maker_fee.to_sat(), expected_fee[i], "Maker {i} fee earned");
+    }
+
+    // Every swap tx must pay the negotiated 1 sat/vB: funding txs price their
+    // real vsize; sweeps pay the 112 vB taproot key-path model they were built
+    // at. A completed swap mines 9 funding txs (3 splits x 3 parties), 9 sweeps.
+    let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[9, 9]);
+    for txid in &depths[0] {
+        let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
+        assert_eq!(
+            fee, vsize as u64,
+            "funding tx {txid} must pay exactly 1 sat/vB"
+        );
+    }
+    for txid in &depths[1] {
+        let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
+        assert_eq!(fee, 112, "sweep tx {txid} must pay the 112 vB model");
+        assert!(vsize <= 112, "sweep tx {} exceeds its 112 vB model", txid);
     }
 
     info!("All taproot swap tests completed successfully!");

@@ -183,10 +183,10 @@ fn test_taproot_hashlock_recovery() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499076,
+        14499538,
         "Taker regular balance mismatch"
     );
-    assert_eq!(taker_balances.swap.to_sat(), 494557, "Taker swap balance");
+    assert_eq!(taker_balances.swap.to_sat(), 496336, "Taker swap balance");
     assert_eq!(
         taker_balances.contract.to_sat(),
         0,
@@ -207,14 +207,14 @@ fn test_taproot_hashlock_recovery() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        6367,
+        4126,
         "Taker spendable balance change"
     );
 
     // Verify maker balances
-    let expected_regular = [14500865, 14503103];
-    let expected_swap = [499328, 497053];
-    let expected_spendable = [15000193, 15000156];
+    let expected_regular = [14500913, 14502494];
+    let expected_swap = [499664, 498046];
+    let expected_spendable = [15000577, 15000540];
     for (i, maker) in makers.iter().enumerate() {
         maker
             .wallet

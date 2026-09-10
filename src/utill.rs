@@ -52,7 +52,10 @@ pub(crate) fn global_secp() -> &'static Secp256k1<All> {
 use crate::{
     error::NetError,
     lock_debug,
-    protocol::{contract::derive_maker_pubkey_and_nonce, error::ProtocolError},
+    protocol::{
+        common_messages::ProtocolVersion, contract::derive_maker_pubkey_and_nonce,
+        error::ProtocolError,
+    },
     wallet::{SecretMnemonic, UTXOSpendInfo, WalletError},
 };
 
@@ -84,14 +87,14 @@ pub const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(3600);
 /// `required_confirms` is absent or 0.
 pub const MIN_REQUIRED_CONFIRM: u32 = 1;
 
-/// Minimum fee rate in sats/vb for all transactions
-/// This replaces the hardcoded MINER_FEE constant
-pub const MIN_FEE_RATE: f64 = 2.0;
-
-/// Absolute fee rate floor in sats/vb — Bitcoin Core's default
-/// `minrelaytxfee`. Configurable fee rates (e.g. the fidelity bond) may go
-/// below [`MIN_FEE_RATE`] but never below this, or transactions stop relaying.
+/// Default fee rate in sats/vb for all transactions, and the absolute floor:
+/// Bitcoin Core's default `minrelaytxfee`. Lower rates stop relaying.
 pub const MIN_RELAY_FEE_RATE: f64 = 1.0;
+
+/// Maximum split count a peer may request. `tx_count` and the per-split input
+/// budget drive peer-controlled allocation and keygen work on both sides;
+/// 10 splits is already economically silly.
+pub const MAX_TX_COUNT: u32 = 10;
 
 /// Maximum size of a length-prefixed protocol or RPC message.
 /// 10 MiB limit
@@ -124,28 +127,62 @@ pub fn get_taker_dir() -> io::Result<PathBuf> {
     Ok(get_data_dir()?.join("taker"))
 }
 
-/// Creates a FeeRate from the global MIN_FEE_RATE constant
+/// Creates a FeeRate from the global MIN_RELAY_FEE_RATE constant
 /// This provides type-safe fee calculations throughout the codebase
 pub fn get_min_fee_rate() -> Option<FeeRate> {
-    FeeRate::from_sat_per_vb(MIN_FEE_RATE as u64)
+    FeeRate::from_sat_per_vb(MIN_RELAY_FEE_RATE as u64)
 }
 
-/// Calculate fee in satoshis for given virtual bytes using MIN_FEE_RATE
+/// Calculate fee in satoshis for given virtual bytes using MIN_RELAY_FEE_RATE
 pub fn calculate_fee_sats(vbytes: u64) -> u64 {
-    let fee_rate = get_min_fee_rate().expect("MIN_FEE_RATE should be valid");
+    let fee_rate = get_min_fee_rate().expect("MIN_RELAY_FEE_RATE should be valid");
     fee_rate
         .fee_vb(vbytes)
         .expect("fee calculation should not overflow")
         .to_sat()
 }
 
-/// Estimated on-chain miner cost (sats) a maker bears per swap contract: a funding tx
-/// (overhead 11 + P2WPKH input 68 + P2WSPK change 31 + (P2TR/P2WSPK) payment output 43 = 153 vB)
-/// plus a sweep tx (overhead 11 + input 68 + self-payment output 43 = 122 vB).
-///
-/// Used both by the maker (for routed amount) and by taker's `expected_amount_for_hop`
-pub fn estimate_funding_tx_fee_sats() -> u64 {
-    calculate_fee_sats((11 + 68 + 31 + 43) + (11 + 68 + 43))
+/// P2WSH ECDSA: 2 sigs/sig+preimage + full redeemscript (~149)
+pub(crate) const LEGACY_CONTRACT_SPEND_VSIZE: u64 = 150;
+/// key-path: one 64B Schnorr sig, no script (~111)
+pub(crate) const TAPROOT_KEYPATH_VSIZE: u64 = 112;
+
+/// Vsize model of one forwarding tx: overhead 11 + payment output 43 +
+/// P2TR change 43 + 68 per input. Each leg upper-bounds the wallet's real
+/// P2TR shapes, so the model fee never underprices the real one.
+pub(crate) fn funding_tx_vsize(inputs: usize) -> u64 {
+    11 + 43 + 43 + 68 * inputs as u64
+}
+
+/// Fee in sats for `vbytes` at `feerate`, using the same FeeRate convention
+/// as the wallet's tx building, so the policy price and the real build agree.
+pub(crate) fn fee_at_rate_sats(vbytes: u64, feerate: f64) -> Option<u64> {
+    FeeRate::from_sat_per_vb(feerate as u64)
+        .and_then(|rate| rate.fee_vb(vbytes))
+        .map(|fee| fee.to_sat())
+}
+
+/// Policy price of one forwarding tx at the negotiated swap feerate: the
+/// taker covers at most `max_input_budget` inputs per tx. More inputs are the
+/// maker's own cost, never a violation.
+pub fn funding_fee_policy_sats(
+    input_count: usize,
+    max_input_budget: u32,
+    feerate: f64,
+) -> Option<u64> {
+    let priced_inputs = input_count.max(1).min(max_input_budget as usize);
+    fee_at_rate_sats(funding_tx_vsize(priced_inputs), feerate)
+}
+
+/// Sweep reimbursement per incoming contract at the negotiated swap feerate:
+/// one input, one output, cooperative spend of the protocol's shape.
+/// Batching gains are the maker's; costs above the model are too.
+pub fn sweep_fee_policy_sats(protocol: ProtocolVersion, feerate: f64) -> Option<u64> {
+    let spend_vsize = match protocol {
+        ProtocolVersion::Legacy => LEGACY_CONTRACT_SPEND_VSIZE,
+        ProtocolVersion::Taproot => TAPROOT_KEYPATH_VSIZE,
+    };
+    fee_at_rate_sats(11 + 43 + spend_vsize, feerate)
 }
 
 /// Sets up the logger for the taker component.

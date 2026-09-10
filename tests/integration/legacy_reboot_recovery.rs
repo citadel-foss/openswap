@@ -200,12 +200,12 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
     // swept incoming funds rather than only its own refunded funding.
     assert_eq!(
         maker_balances.regular.to_sat(),
-        14503103,
+        14502722,
         "Restarted maker regular balance mismatch"
     );
     assert_eq!(
         maker_balances.swap.to_sat(),
-        495925,
+        497368,
         "Restarted maker swap balance mismatch"
     );
     assert_eq!(
@@ -216,7 +216,7 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
     assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
     assert_eq!(
         maker_balances.spendable.to_sat(),
-        14999028,
+        15000090,
         "Restarted maker spendable balance mismatch"
     );
 

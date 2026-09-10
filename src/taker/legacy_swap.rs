@@ -22,7 +22,7 @@ use crate::{
             RespContractSigsForRecvrAndSender, SenderContractTxInfo,
         },
     },
-    utill::{generate_keypair, generate_maker_keys, read_message, send_message, MIN_FEE_RATE},
+    utill::{generate_keypair, generate_maker_keys, read_message, send_message},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         Wallet,
@@ -50,6 +50,7 @@ impl Taker {
         swap_id: &str,
         network: Network,
         manually_selected_outpoints: Option<Vec<OutPoint>>,
+        feerate: f64,
     ) -> Result<Vec<OutgoingSwapCoin>, TakerError> {
         let secp = Secp256k1::new();
         let mut swapcoins = Vec::new();
@@ -86,13 +87,27 @@ impl Taker {
             ));
         }
 
-        let funding_result = wallet.create_funding_txes(
+        // The taker funds its own hop and pays the fee on top: no input
+        // budget, no over-budget guard (`None`).
+        let plan = wallet.plan_funding(
             send_amount,
-            &openswap_addresses,
-            MIN_FEE_RATE,
+            openswap_addresses.len() as u32,
+            feerate,
+            u32::MAX,
+            None,
             manually_selected_outpoints,
             None,
         )?;
+        // Its own hop funds every destination or not at all: a degraded plan
+        // is a funding failure, not a smaller swap.
+        if plan.len() != openswap_addresses.len() {
+            return Err(TakerError::General(format!(
+                "wallet can fund only {} of the {} funding transactions",
+                plan.len(),
+                openswap_addresses.len()
+            )));
+        }
+        let funding_result = wallet.execute_funding_plan(&plan, &openswap_addresses, feerate)?;
 
         for (
             (funding_tx, &output_pos),
@@ -113,6 +128,7 @@ impl Taker {
                 funding_outpoint,
                 funding_amount,
                 &contract_redeemscript,
+                feerate,
             )?;
 
             let mut outgoing = OutgoingSwapCoin::new_legacy(
@@ -122,6 +138,7 @@ impl Taker {
                 contract_redeemscript,
                 timelock_privkey,
                 funding_amount,
+                feerate as u64,
             );
             outgoing.swap_id = Some(swap_id.to_string());
             outgoing.funding_tx = Some(funding_tx.clone());
@@ -139,7 +156,6 @@ impl Taker {
         let swap = self.swap_state()?;
         let swap_id = swap.id.clone();
         let maker_count = swap.makers.len();
-        let tx_count = swap.params.tx_count;
 
         // Ping every maker for the life of the march: while we negotiate one
         // hop, the others must not read our silence as a dropped swap.
@@ -319,8 +335,37 @@ impl Taker {
                         wallet.add_outgoing_swapcoin(swapcoin);
                     }
                     wallet.save_to_disk()?;
+                }
 
-                    for swapcoin in &self.swap_state()?.outgoing_swapcoins {
+                // Persist the phase BEFORE the loop: with a split batch the second
+                // tx can fail with the first already in the mempool, and a partial
+                // batch must never read as never-broadcast.
+                // Point of no return. Persist nonces needed for legacy recovery.
+                taker_funding_broadcast = true;
+                self.swap_state_mut()?.makers[maker_idx]
+                    .legacy_exchange_mut()?
+                    .prev_funding_broadcast = true;
+                self.swap_state_mut()?.phase = super::api::SwapPhase::FundsBroadcast;
+                self.persist_swap(super::swap_tracker::SwapPhase::FundsBroadcast)?;
+
+                #[cfg(feature = "integration-test")]
+                let fail_second_broadcast =
+                    self.behavior == super::api::TakerBehavior::FailSecondFundingBroadcast;
+                #[cfg(not(feature = "integration-test"))]
+                let fail_second_broadcast = false;
+
+                {
+                    let wallet = self.write_wallet()?;
+                    for (index, swapcoin) in
+                        self.swap_state()?.outgoing_swapcoins.iter().enumerate()
+                    {
+                        if fail_second_broadcast && index == 1 {
+                            log::warn!("Test behavior: failing the second funding broadcast");
+                            return Err(TakerError::General(
+                                "Failed to broadcast funding tx: test-injected backend failure"
+                                    .to_string(),
+                            ));
+                        }
                         let funding_tx = swapcoin.funding_tx.as_ref().ok_or_else(|| {
                             TakerError::General("Outgoing swapcoin missing funding_tx".to_string())
                         })?;
@@ -330,14 +375,6 @@ impl Taker {
                     }
                     wallet.save_to_disk()?;
                 }
-                // Funding txs are now on-chain — mark the phase transition.
-                // Point of no return. Persist nonces needed for legacy recovery.
-                taker_funding_broadcast = true;
-                self.swap_state_mut()?.makers[maker_idx]
-                    .legacy_exchange_mut()?
-                    .prev_funding_broadcast = true;
-                self.swap_state_mut()?.phase = super::api::SwapPhase::FundsBroadcast;
-                self.persist_swap(super::swap_tracker::SwapPhase::FundsBroadcast)?;
                 let funding_txids: Vec<_> = self
                     .swap_state()?
                     .outgoing_swapcoins
@@ -400,6 +437,10 @@ impl Taker {
 
             log::info!("Sending ProofOfFunding to maker {}", maker_idx);
 
+            // One next-hop bundle per split this maker froze into its acked
+            // plan — a degraded plan falls below the `tx_count` ceiling, and
+            // the maker rejects a ProofOfFunding sized to the ceiling.
+            let next_hop_count = self.swap_state()?.makers[maker_idx].funding_splits.len() as u32;
             let (
                 next_multisig_pubkeys,
                 next_multisig_nonces,
@@ -410,7 +451,7 @@ impl Taker {
                 let tweakable_point = next_maker.tweakable_point.ok_or_else(|| {
                     TakerError::General(format!("Maker {} missing tweakable_point", maker_idx + 1))
                 })?;
-                generate_maker_keys(&tweakable_point, tx_count)?
+                generate_maker_keys(&tweakable_point, next_hop_count)?
             } else {
                 // Last hop: taker is the next peer, generate our own keys
                 let mut multisig_pubkeys = Vec::new();
@@ -418,7 +459,7 @@ impl Taker {
                 let mut nonces = Vec::new();
                 let mut hashlock_pubkeys = Vec::new();
                 let mut hashlock_privkeys = Vec::new();
-                for _ in 0..tx_count {
+                for _ in 0..next_hop_count {
                     let (multisig_pubkey, multisig_privkey) = generate_keypair();
                     let (hashlock_pubkey, hashlock_privkey) = generate_keypair();
                     multisig_pubkeys.push(multisig_pubkey);
@@ -801,6 +842,7 @@ impl Taker {
                     info.contract_redeemscript.clone(),
                     *hashlock_privkey,
                     info.funding_amount,
+                    self.swap_state()?.params.swap_feerate() as u64,
                 );
                 incoming.swap_id = Some(swap_id.clone());
                 incoming.set_preimage(self.swap_state()?.preimage);
@@ -1042,7 +1084,7 @@ impl Taker {
     #[allow(clippy::type_complexity)]
     #[allow(clippy::too_many_arguments)]
     fn exchange_send_proof_of_funding(
-        &self,
+        &mut self,
         maker_address: &str,
         swap_id: &str,
         maker_idx: usize,
@@ -1178,7 +1220,34 @@ impl Taker {
             confirmed_funding_txes,
             next_openswap_info,
             refund_locktime,
-            contract_feerate: MIN_FEE_RATE,
+        };
+
+        // The first swap sends its real proof and caches it, then dies once the
+        // maker answers; a later swap resends the cached proof under its fresh
+        // id — the cross-swap replay the maker must reject in flight.
+        #[cfg(feature = "integration-test")]
+        let mut cached_this_swap = false;
+        #[cfg(feature = "integration-test")]
+        let pof = if maker_idx == 0
+            && self.behavior == super::api::TakerBehavior::ReplayLegacyProofOfFunding
+        {
+            match super::api::replay_pof_cache_get(maker_address) {
+                Some(mut cached) => {
+                    cached.id = swap_id.to_string();
+                    log::warn!(
+                        "Test behavior: replaying the earlier proof of funding under swap {}",
+                        swap_id
+                    );
+                    cached
+                }
+                None => {
+                    super::api::replay_pof_cache_put(maker_address, &pof);
+                    cached_this_swap = true;
+                    pof
+                }
+            }
+        } else {
+            pof
         };
 
         send_message(&mut stream, &TakerToMakerMessage::ProofOfFunding(pof))?;
@@ -1193,14 +1262,26 @@ impl Taker {
                     req.receivers_contract_txs.len(),
                     req.senders_contract_txs_info.len()
                 );
+                // Die with the maker's claim and incoming swapcoins still live,
+                // so the next swap's replayed proof meets the in-flight guard.
+                #[cfg(feature = "integration-test")]
+                if cached_this_swap {
+                    log::warn!(
+                        "Test behavior: first swap dies after the maker processed its proof of funding, claim left in flight"
+                    );
+                    return Err(TakerError::General(
+                        "Test: first swap aborted with the maker's claim in flight".to_string(),
+                    ));
+                }
                 // Verify the maker's sender contracts (structure, hashvalue, locktime, pubkeys, amounts)
-                let expected_amount = self.expected_amount_for_hop(maker_idx);
+                let expected_amount = self.forwardable_for_hop(maker_idx);
                 self.verify_maker_sender_contracts(
                     &req.senders_contract_txs_info,
                     next_multisig_pubkeys,
                     next_hashlock_pubkeys,
                     refund_locktime,
                     expected_amount,
+                    maker_idx,
                 )?;
                 // Verify the maker's receiver contract txs (structure, funding reference, scriptpubkey, amounts)
                 self.verify_maker_receiver_contracts(

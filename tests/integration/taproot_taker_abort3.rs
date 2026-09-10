@@ -42,10 +42,10 @@ fn test_taproot_taker_abort3() {
         "close at maker's contract data response",
         TakerBehavior::CloseAtSendersContractFromMaker,
         vec![(7002, Some(20001)), (17002, Some(20002))],
-        [14997750, 14999514],
-        [1764, 0],
-        14998236,
-        1764,
+        [14998875, 14999757],
+        [882, 0],
+        14999118,
+        882,
     );
 }
 
@@ -60,10 +60,10 @@ fn test_taproot_taker_abort_after_full_setup() {
         "drop after full setup",
         TakerBehavior::BroadcastContractAfterFullSetup,
         vec![(8502, Some(21101)), (18502, Some(21102))],
-        [14997750, 14997750],
-        [1764, 1764],
-        14499076,
-        500924,
+        [14998875, 14998875],
+        [882, 882],
+        14499538,
+        500462,
     );
 }
 

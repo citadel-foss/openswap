@@ -90,8 +90,19 @@ pub struct SwapDetails {
     pub protocol_version: ProtocolVersion,
     /// Amount to swap in satoshis.
     pub amount: Amount,
-    /// Number of contract transactions.
+    /// Maximum contract transactions this hop plans to send — a ceiling.
+    /// The exact incoming count is `incoming_count`; one field cannot be both.
     pub tx_count: u32,
+    /// Exactly how many contracts the taker will send this hop.
+    /// Checked for equality, so it cannot double as the `tx_count` ceiling.
+    pub incoming_count: u32,
+    /// Maximum inputs per forwarding tx whose fee the taker covers.
+    /// The maker may use more inputs; that is not a violation —
+    /// the taker simply does not pay for the excess.
+    pub max_input_budget: u32,
+    /// Swap feerate in sats/vB for every transaction in this swap.
+    /// Never below the 1 sat/vB relay floor.
+    pub feerate: u64,
     /// Timelock value.
     /// - Legacy: relative block count (CSV).
     /// - Taproot: absolute block height (CLTV).
@@ -109,13 +120,18 @@ pub struct AckSwapDetails {
     /// If Some, contains the tweakable point for this swap.
     /// If None, swap is rejected.
     pub tweakable_point: Option<PublicKey>,
+    /// The maker's frozen plan shape: one entry per planned funding tx,
+    /// valued by that split's input count. Counts, not a fee total, so the
+    /// taker derives the next hop's amount itself. Empty on rejection.
+    pub funding_splits: Vec<u32>,
 }
 
 impl AckSwapDetails {
-    /// Create an acceptance response.
-    pub fn accept(tweakable_point: PublicKey) -> Self {
+    /// Create an acceptance response carrying the frozen plan shape.
+    pub fn accept(tweakable_point: PublicKey, funding_splits: Vec<u32>) -> Self {
         AckSwapDetails {
             tweakable_point: Some(tweakable_point),
+            funding_splits,
         }
     }
 
@@ -123,6 +139,7 @@ impl AckSwapDetails {
     pub fn reject() -> Self {
         AckSwapDetails {
             tweakable_point: None,
+            funding_splits: Vec::new(),
         }
     }
 }

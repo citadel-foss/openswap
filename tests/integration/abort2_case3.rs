@@ -185,7 +185,7 @@ fn maker_abort2_case3() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14997324,
+        14998662,
         "Taker regular balance mismatch"
     );
     assert_eq!(
@@ -213,7 +213,7 @@ fn maker_abort2_case3() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        2676,
+        1338,
         "Taker spendable balance change mismatch"
     );
 
@@ -233,7 +233,7 @@ fn maker_abort2_case3() {
             i, original, maker_balances.spendable,
         );
 
-        let expected_regular = [14996838u64, 14999514][i];
+        let expected_regular = [14998419u64, 14999757][i];
         assert_eq!(
             maker_balances.regular.to_sat(),
             expected_regular,

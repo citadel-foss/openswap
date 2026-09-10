@@ -7,18 +7,18 @@ use bitcoind::bitcoincore_rpc::{jsonrpc::error::Error as JsonRpcError, Error as 
 
 use super::{
     error::MakerError,
-    handlers::{incoming_within_swap_amount, ConnectionState, Maker, SwapPhase},
+    handlers::{incoming_matches_swap_amount, ConnectionState, Maker, SwapPhase},
 };
 use crate::{
     protocol::{
-        common_messages::{MakerToTakerMessage, PrivateKeyHandover, SwapPrivkey},
+        common_messages::{MakerToTakerMessage, PrivateKeyHandover, ProtocolVersion, SwapPrivkey},
         contract::{
             create_multisig_redeemscript, create_receivers_contract_tx,
             read_pubkeys_from_multisig_redeemscript,
         },
         legacy_messages::{FundingTxInfo, LegacyTakerMessage},
     },
-    utill::{estimate_funding_tx_fee_sats, redeemscript_to_scriptpubkey},
+    utill::{redeemscript_to_scriptpubkey, sweep_fee_policy_sats},
     wallet::{swapcoin::IncomingSwapCoin, MakerReport, WalletError},
 };
 
@@ -176,17 +176,30 @@ fn process_proof_of_funding<M: Maker>(
         pof.confirmed_funding_txes.len()
     );
 
-    // Contract count was agreed in SwapDetails and drives how many outgoing
-    // contracts we fund, so the taker must not change it here.
-    if pof.confirmed_funding_txes.len() != state.tx_count as usize {
+    // The declared incoming count is exact: no under-delivery, no excess.
+    if pof.confirmed_funding_txes.len() != state.incoming_count as usize {
         log::error!(
-            "[{}] ProofOfFunding tx count {} does not match negotiated {}",
+            "[{}] ProofOfFunding tx count {} != declared incoming count {}",
             maker.network_port(),
             pof.confirmed_funding_txes.len(),
-            state.tx_count
+            state.incoming_count
         );
         return Err(MakerError::General(
-            "ProofOfFunding tx count does not match the negotiated tx count",
+            "ProofOfFunding tx count differs from the declared incoming count",
+        ));
+    }
+
+    // One next-hop key bundle per frozen split: the taker derived them from
+    // the plan shape we reported in the Ack.
+    if pof.next_openswap_info.len() != state.funding_plan.len() {
+        log::error!(
+            "[{}] ProofOfFunding next-hop info count {} != frozen plan splits {}",
+            maker.network_port(),
+            pof.next_openswap_info.len(),
+            state.funding_plan.len()
+        );
+        return Err(MakerError::General(
+            "ProofOfFunding next-hop contract count differs from the frozen plan",
         ));
     }
 
@@ -204,15 +217,15 @@ fn process_proof_of_funding<M: Maker>(
             .checked_add(funding_output.value)
             .ok_or(MakerError::General("Funding output amounts overflow"))?;
     }
-    if !incoming_within_swap_amount(declared_incoming, state.swap_amount) {
+    if !incoming_matches_swap_amount(declared_incoming, state.swap_amount) {
         log::error!(
-            "[{}] ProofOfFunding incoming amount {} exceeds negotiated swap amount {}",
+            "[{}] ProofOfFunding incoming amount {} != declared swap amount {}",
             maker.network_port(),
             declared_incoming,
             state.swap_amount
         );
         return Err(MakerError::General(
-            "ProofOfFunding incoming amount exceeds the negotiated swap amount",
+            "ProofOfFunding incoming amount differs from the declared swap amount",
         ));
     }
 
@@ -231,8 +244,6 @@ fn process_proof_of_funding<M: Maker>(
         maker.network_port(),
         hashvalue
     );
-
-    state.contract_feerate = pof.contract_feerate;
 
     let (tweakable_privkey, _, _) = maker.get_tweakable_keypair()?;
     let secp = bitcoin::secp256k1::Secp256k1::new();
@@ -272,7 +283,15 @@ fn process_proof_of_funding<M: Maker>(
             },
             funding_output.value,
             &funding_info.contract_redeemscript,
+            state.swap_feerate,
         )?;
+
+        // One incoming contract must never fund two outgoing hops: the receiver
+        // contract is derived from the funding outpoint, so a txid another swap
+        // already holds is a replay (mirror of the taproot guard).
+        if maker.contract_txid_seen(&receiver_contract_tx.compute_txid(), &pof.id)? {
+            return Err(MakerError::General("Legacy contract txid already in use"));
+        }
 
         let mut incoming_swapcoin = IncomingSwapCoin::new_legacy(
             multisig_privkey,
@@ -281,6 +300,7 @@ fn process_proof_of_funding<M: Maker>(
             funding_info.contract_redeemscript.clone(),
             hashlock_privkey,
             funding_output.value,
+            state.swap_feerate as u64,
         );
         incoming_swapcoin.swap_id = Some(pof.id.clone());
 
@@ -289,6 +309,16 @@ fn process_proof_of_funding<M: Maker>(
     }
 
     state.incoming_swapcoins = incoming_swapcoins;
+
+    // Claim these contract txids under the swaps lock before funding the next
+    // hop: a concurrent swap carrying the same funding fails here, not after
+    // both spent. A same-swap retry re-claims its own txids and passes.
+    let incoming_txids: Vec<bitcoin::Txid> = state
+        .incoming_swapcoins
+        .iter()
+        .map(|sc| sc.contract_tx.compute_txid())
+        .collect();
+    maker.claim_incoming_contract_txids(&pof.id, &incoming_txids)?;
 
     // Register incoming contract outputs with watchtower so we detect
     // if the taker broadcasts the maker's incoming contract tx.
@@ -313,32 +343,31 @@ fn process_proof_of_funding<M: Maker>(
     );
 
     let swap_fee = maker.calculate_swap_fee(incoming_amount, pof.refund_locktime as u32);
-    // The fee stored at swap-details time was computed from the proposed
-    // amount; overwrite with the fee on the actual incoming amount so
-    // success reports match what was really earned.
-    state.service_fee_sats = swap_fee.to_sat();
-    let mining_fee =
-        Amount::from_sat(estimate_funding_tx_fee_sats() * pof.next_openswap_info.len() as u64);
-    let outgoing_amount = incoming_amount
+    // The sweep reimbursement prices each incoming contract's cooperative
+    // spend; the funding fee comes out in the split plan, not here.
+    // The feerate is negotiated with the peer; an overflowing product would
+    // panic this connection thread, so fail the swap instead.
+    let sweep_fee = Amount::from_sat(
+        sweep_fee_policy_sats(ProtocolVersion::Legacy, state.swap_feerate)
+            .and_then(|per_contract| {
+                per_contract.checked_mul(pof.confirmed_funding_txes.len() as u64)
+            })
+            .ok_or(MakerError::General("Sweep fee overflow"))?,
+    );
+    // Incoming amount and count are exact now, so this equals the forwardable
+    // the admission plan was frozen on; `initialize_swap` rejects any drift.
+    let forwardable = incoming_amount
         .checked_sub(swap_fee)
-        .and_then(|amt| amt.checked_sub(mining_fee))
+        .and_then(|amt| amt.checked_sub(sweep_fee))
         .ok_or(MakerError::General("Swap fee exceeds incoming amount"))?;
-    #[cfg(feature = "integration-test")]
-    let outgoing_amount = if maker.behavior() == super::handlers::MakerBehavior::FeeSkimming {
-        outgoing_amount
-            .checked_sub(Amount::from_sat(1))
-            .ok_or(MakerError::General("Test fee skim exceeds outgoing amount"))?
-    } else {
-        outgoing_amount
-    };
 
     log::info!(
-        "[{}] Incoming: {}, Fee: {}, MiningFee: {}, Outgoing: {}",
+        "[{}] Incoming: {}, Fee: {}, SweepFee: {}, Forwardable: {}",
         maker.network_port(),
         incoming_amount,
         swap_fee,
-        mining_fee,
-        outgoing_amount
+        sweep_fee,
+        forwardable
     );
 
     // Sync wallet before creating outgoing swaps to get fresh UTXO state.
@@ -369,39 +398,20 @@ fn process_proof_of_funding<M: Maker>(
         .map(|info| info.next_hashlock_nonce)
         .collect();
 
-    // Reserve UTXOs for this swap to prevent double-spending across concurrent swaps.
-    let excluded_utxos = maker.collect_excluded_utxos(&pof.id)?;
-    if !excluded_utxos.is_empty() {
-        log::info!(
-            "[{}] Excluding {} UTXOs from other active swaps",
-            maker.network_port(),
-            excluded_utxos.len()
-        );
-    }
-
-    let (funding_txes, mut outgoing_swapcoins, _mining_fees) = maker.initialize_openswap(
-        outgoing_amount,
+    // Executes the plan frozen at admission; its inputs are already reserved
+    // under the swap id.
+    let (funding_txes, mut outgoing_swapcoins, _mining_fees) = maker.initialize_swap(
+        &pof.id,
+        forwardable,
         &next_multisig_pubkeys,
         &next_hashlock_pubkeys,
         hashvalue,
         pof.refund_locktime,
-        pof.contract_feerate,
-        Some(excluded_utxos),
+        state.swap_feerate,
     )?;
     for outgoing in &mut outgoing_swapcoins {
         outgoing.swap_id = Some(pof.id.clone());
     }
-
-    // Store reserved outpoints from the funding transactions.
-    state.reserve_utxo = funding_txes
-        .iter()
-        .flat_map(|tx| {
-            (0..tx.output.len()).map(move |vout| bitcoin::OutPoint {
-                txid: tx.compute_txid(),
-                vout: vout as u32,
-            })
-        })
-        .collect();
 
     state.outgoing_swapcoins = outgoing_swapcoins.clone();
     state.pending_funding_txes = funding_txes.clone();
@@ -478,6 +488,26 @@ fn process_proof_of_funding<M: Maker>(
         outgoing_swapcoins.len()
     );
 
+    // QA: a response carrying more contracts than the negotiated maximum must
+    // be caught by the taker's count check.
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == super::handlers::MakerBehavior::OverproduceContractData {
+        if let Some(extra) = senders_contract_txs_info.first().cloned() {
+            senders_contract_txs_info.push(extra);
+        }
+    }
+
+    // QA: repeating one funded contract in place of another keeps count and
+    // total exact, so only the taker's duplicate-outpoint check can catch it.
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == super::handlers::MakerBehavior::DuplicateContractOutpoint
+        && senders_contract_txs_info.len() > 1
+    {
+        let last = senders_contract_txs_info.len() - 1;
+        senders_contract_txs_info[last].contract_tx =
+            senders_contract_txs_info[0].contract_tx.clone();
+    }
+
     let response = crate::protocol::legacy_messages::ReqContractSigsAsRecvrAndSender {
         receivers_contract_txs,
         senders_contract_txs_info,
@@ -525,6 +555,11 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
     if resp.senders_sigs.len() != state.outgoing_swapcoins.len() {
         return Err(MakerError::General("Invalid number of sender signatures"));
     }
+
+    // The sync, persistence and broadcast loop below can outlive the idle
+    // timeout; refresh the stored activity so the idle checker does not drain
+    // a live swap mid-broadcast.
+    maker.store_connection_state(&resp.id, state, false)?;
 
     // Verify all contract signatures before storing them
     super::legacy_verification::verify_contract_sigs(
@@ -579,8 +614,8 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
     }
 
     // Arm the watches before anything is committed. Failing here aborts with
-    // nothing on-chain; failing after a broadcast would leave funding txs live
-    // while recovery still reads `funding_broadcast == false` and discards them.
+    // nothing on-chain; failing after the first broadcast would leave a live
+    // funding tx the watchtower does not watch.
     for outgoing in &state.outgoing_swapcoins {
         let contract_txid = outgoing.contract_tx.compute_txid();
         for (vout, txout) in outgoing.contract_tx.output.iter().enumerate() {
@@ -612,7 +647,25 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
         state.pending_funding_txes.len()
     );
 
-    for funding_tx in &state.pending_funding_txes {
+    for (send_index, funding_tx) in state.pending_funding_txes.iter().enumerate() {
+        // The index only feeds the test hook below; touch it so production
+        // builds have no unused binding.
+        let _ = send_index;
+        #[cfg(feature = "integration-test")]
+        {
+            use super::handlers::MakerBehavior;
+            if maker.behavior() == MakerBehavior::FailSecondBroadcast && send_index == 1 {
+                log::warn!(
+                    "[{}] Test behavior: failing the second funding broadcast",
+                    maker.network_port()
+                );
+                return Err(MakerError::Wallet(WalletError::General(
+                    "Test: failing the second funding broadcast".to_string(),
+                )));
+            }
+        }
+
+        let txid = funding_tx.compute_txid();
         match maker.broadcast_transaction(funding_tx) {
             Ok(txid) => {
                 log::info!(
@@ -631,7 +684,6 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
                     || message.contains("txn-already-in-mempool")
             } =>
             {
-                let txid = funding_tx.compute_txid();
                 log::info!(
                     "[{}] Legacy funding tx {} for swap {} was already broadcast",
                     maker.network_port(),
@@ -643,8 +695,7 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
                 // This captures the Electrum counterpart of the rebroadcast error.
                 // Electrum doesn't throw a reliable error. So we manually check if the transaction
                 // is already broadcasted. An error here means the backend connection is down.
-                let txid = funding_tx.compute_txid();
-                if maker.is_transaction_known(&txid) {
+                if maker.is_transaction_known(&txid)? {
                     log::info!(
                         "[{}] Legacy funding tx {} for swap {} was already broadcast",
                         maker.network_port(),
@@ -656,10 +707,16 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
                 }
             }
         }
+
+        // Record each send before the next one can fail, so a mid-batch
+        // failure never reads back as "never broadcast".
+        if !state.funding_broadcast_txids.contains(&txid) {
+            state.funding_broadcast_txids.push(txid);
+        }
+        maker.record_funding_broadcast(&resp.id, &txid)?;
     }
 
     state.pending_funding_txes.clear();
-    state.funding_broadcast = true;
     state.phase = SwapPhase::AwaitingPrivateKeyHandover;
 
     maker.store_connection_state(&resp.id, state, false)?;

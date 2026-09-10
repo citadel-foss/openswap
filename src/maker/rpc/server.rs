@@ -22,7 +22,10 @@ use crate::{
         error::MakerError,
         rpc::messages::RpcMsgResp,
     },
-    utill::{parse_checked_address, read_message, send_message, HEART_BEAT_INTERVAL, UTXO},
+    utill::{
+        parse_checked_address, read_message, send_message, HEART_BEAT_INTERVAL, MIN_RELAY_FEE_RATE,
+        UTXO,
+    },
     wallet::{infer_address_type, AddressType, Destination, Wallet},
 };
 use std::{path::Path, sync::RwLock};
@@ -143,6 +146,13 @@ fn handle_request<M: MakerRpc>(
             feerate,
         } => {
             let amount = Amount::from_sat(amount);
+            // Below the relay floor the tx would not propagate; an invalid
+            // rate is the caller's error, not something to repair.
+            if !feerate.is_finite() || feerate < MIN_RELAY_FEE_RATE {
+                return Err(MakerError::General(
+                    "SendToAddress feerate must be finite and at least the 1 sats/vB relay floor",
+                ));
+            }
 
             let destination_address = parse_checked_address(&address, maker.config().network)
                 .map_err(MakerError::from)?;

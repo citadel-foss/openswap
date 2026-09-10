@@ -87,8 +87,6 @@ pub struct ProofOfFunding {
     pub next_openswap_info: Vec<NextHopInfo>,
     /// Refund locktime in blocks.
     pub refund_locktime: u16,
-    /// Fee rate for contract transactions.
-    pub contract_feerate: f64,
 }
 
 /// Contract transaction info for the Sender side (Maker's outgoing)

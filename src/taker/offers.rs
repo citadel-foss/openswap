@@ -288,6 +288,24 @@ impl OfferBookHandle {
         Ok(())
     }
 
+    /// Record a proven protocol violation: steps the maker down the
+    /// Good -> Unresponsive -> Bad state machine and persists the book.
+    /// Only for arithmetically or cryptographically proven misbehavior —
+    /// never timeouts or backend failures, which say nothing about the maker.
+    pub(crate) fn record_proven_violation(&self, address: &MakerAddress) -> Result<(), TakerError> {
+        log::warn!("Proven violation recorded against maker {address}");
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        let mut book = lock_debug!(self.inner.write())
+            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+        // A preferred maker may have no entry yet; the violation still counts.
+        book.upsert_address(address.clone(), None);
+        book.mark_failure(address, now_ts);
+        book.write_to_disk(&self.path)
+    }
+
     /// All current good makers
     pub fn active_makers(
         &self,
@@ -1451,6 +1469,31 @@ mod tests {
             book.makers[0].state,
             MakerState::Unresponsive { retries: 1 }
         );
+    }
+
+    #[test]
+    fn proven_violation_walks_the_state_machine_and_persists() {
+        let dir = std::env::temp_dir().join(format!("offerbook-violation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = OfferBookHandle::load_or_create(&dir).unwrap();
+        let address = addr("6107");
+
+        // A maker with no entry is inserted; each proven violation steps it
+        // down Good -> Unresponsive -> Bad.
+        handle.record_proven_violation(&address).unwrap();
+        let state = handle.snapshot().unwrap().makers[0].state.clone();
+        assert_eq!(state, MakerState::Unresponsive { retries: 1 });
+
+        for _ in 0..10 {
+            handle.record_proven_violation(&address).unwrap();
+        }
+        let state = handle.snapshot().unwrap().makers[0].state.clone();
+        assert_eq!(state, MakerState::Bad);
+
+        let persisted = OfferBook::read_from_disk(&dir.join("offerbook.json")).unwrap();
+        assert_eq!(persisted.makers[0].state, MakerState::Bad);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

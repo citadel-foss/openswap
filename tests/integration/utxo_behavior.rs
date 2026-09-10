@@ -10,7 +10,7 @@ use openswap::{
     maker::start_server,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    utill::MIN_FEE_RATE,
+    utill::MIN_RELAY_FEE_RATE,
     wallet::{AddressType, WalletError},
 };
 use std::{sync::atomic::Ordering::Relaxed, thread, time::Duration};
@@ -132,7 +132,13 @@ fn test_address_grouping_behavior() {
 
         // Call the coin selection algorithm we're testing
         let selected_utxos = wallet
-            .coin_select(target_amount, MIN_FEE_RATE, AddressType::P2TR, None, None)
+            .coin_select(
+                target_amount,
+                MIN_RELAY_FEE_RATE,
+                AddressType::P2TR,
+                None,
+                None,
+            )
             .unwrap();
 
         let selected_amounts: Vec<f64> = selected_utxos
@@ -260,7 +266,8 @@ fn test_separated_utxo_coin_selection() {
         println!("\n--- Test Case 1: Regular UTXOs Only ---");
         println!("Target: {} sats (< regular)", target_1.to_sat());
 
-        let result_1 = wallet.coin_select(target_1, MIN_FEE_RATE, AddressType::P2TR, None, None);
+        let result_1 =
+            wallet.coin_select(target_1, MIN_RELAY_FEE_RATE, AddressType::P2TR, None, None);
         assert!(
             result_1.is_ok(),
             "Test Case 1 failed: Expected success but got error: {:?}",
@@ -281,7 +288,8 @@ fn test_separated_utxo_coin_selection() {
             target_2.to_sat()
         );
 
-        let result_2 = wallet.coin_select(target_2, MIN_FEE_RATE, AddressType::P2TR, None, None);
+        let result_2 =
+            wallet.coin_select(target_2, MIN_RELAY_FEE_RATE, AddressType::P2TR, None, None);
         assert!(
             result_2.is_ok(),
             "Test Case 2 failed: Expected success but got error: {:?}",
@@ -302,7 +310,8 @@ fn test_separated_utxo_coin_selection() {
             target_3.to_sat()
         );
 
-        let result_3 = wallet.coin_select(target_3, MIN_FEE_RATE, AddressType::P2TR, None, None);
+        let result_3 =
+            wallet.coin_select(target_3, MIN_RELAY_FEE_RATE, AddressType::P2TR, None, None);
         assert!(
             result_3.is_err(),
             "Test Case 3 failed: Expected error but got success with {} UTXOs",
@@ -317,7 +326,7 @@ fn test_separated_utxo_coin_selection() {
             } => {
                 println!("Correctly failed with InsufficientFund");
                 println!("   Available: {available} sats, Required: {required} sats");
-                assert_eq!(*required, target_3.to_sat() + 222); // Should include 308 sats estimated fee
+                assert_eq!(*required, target_3.to_sat() + 112); // Should include the estimated fee
                 assert_eq!(*available, balances.swap.to_sat());
                 println!("Confirmed: Only swap balance reported in insufficient funds error");
             }
@@ -357,7 +366,7 @@ fn test_separated_utxo_coin_selection() {
         let target_3 = Amount::from_sat(46000000); // Same target
         println!("Retrying coin selection with additional regular funds...");
         let result_3_retry =
-            wallet.coin_select(target_3, MIN_FEE_RATE, AddressType::P2TR, None, None);
+            wallet.coin_select(target_3, MIN_RELAY_FEE_RATE, AddressType::P2TR, None, None);
         assert!(
             result_3_retry.is_ok(),
             "Test Case 3 retry failed: Expected success with additional regular funds, got: {:?}",
@@ -440,9 +449,13 @@ fn test_manual_coinselection() {
 
     let all_utxos = taker.get_wallet().read().unwrap().list_all_utxo();
 
+    // Manual selection caps the funding pool at the selected coins, so they
+    // must cover the 0.01 BTC swap alone: the first seven sum to 1,568,380
+    // sats against a 1,000,165 requirement. The remaining two (23,894 and
+    // 10,000 sats) must come through the swap untouched.
     let manually_selected_utxos: Vec<OutPoint> = amounts
         .iter()
-        .take(4)
+        .take(7)
         .cloned()
         .collect::<Vec<u64>>()
         .iter()
@@ -471,7 +484,9 @@ fn test_manual_coinselection() {
     let summary = taker
         .prepare_swap(swap_params)
         .expect("prepare_swap should succeed");
-    let _ = taker.start_swap(&summary.swap_id);
+    taker
+        .start_swap(&summary.swap_id)
+        .expect("the swap must complete funded only by the selected coins");
 
     // After Swap is done, wait for maker threads to conclude.
     makers
@@ -498,7 +513,10 @@ fn test_manual_coinselection() {
         wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
     }
 
-    // Check that the originally manually selected UTXOs were spent
+    // Manual selection caps the funding pool at the selected coins; the plan
+    // still picks the fewest of them that cover the spend. The cap is the
+    // guarantee: the two coins left out must survive, and the completed swap
+    // proves the selected pool alone covered it.
     let remaining_utxos: Vec<OutPoint> = taker
         .get_wallet()
         .read()
@@ -508,23 +526,31 @@ fn test_manual_coinselection() {
         .map(|utxo| OutPoint::new(utxo.txid, utxo.vout))
         .collect();
 
-    let manual_utxos_spent = manually_selected_utxos
+    let unselected_utxos: Vec<OutPoint> = all_utxos
         .iter()
-        .all(|manual_utxo| !remaining_utxos.contains(manual_utxo));
-
+        .map(|utxo| OutPoint::new(utxo.txid, utxo.vout))
+        .filter(|op| !manually_selected_utxos.contains(op))
+        .collect();
+    assert_eq!(unselected_utxos.len(), 2);
     assert!(
-        manual_utxos_spent,
-        "Not all manually selected UTXOs were spent in the openswap"
+        unselected_utxos
+            .iter()
+            .all(|op| remaining_utxos.contains(op)),
+        "unselected coins must come through the swap untouched"
     );
 
+    let selected_spent = manually_selected_utxos
+        .iter()
+        .filter(|op| !remaining_utxos.contains(op))
+        .count();
+    assert!(
+        selected_spent > 0,
+        "the swap must have drawn from the selected coins"
+    );
     println!(
-        "\nTest 1 : All {} originally selected UTXOs were used in the openswap",
+        "\nTest 1 : the swap spent {selected_spent} of {} selected UTXOs and touched nothing else",
         manually_selected_utxos.len()
     );
-
-    for outpoint in &manually_selected_utxos {
-        println!(" Used: {outpoint}");
-    }
 
     println!("\n === Post-Swap UTXO Analysis ===");
 
@@ -666,7 +692,7 @@ fn test_manual_coinselection() {
 
         let result = taker.get_wallet().read().unwrap().coin_select(
             target_amount,
-            MIN_FEE_RATE,
+            MIN_RELAY_FEE_RATE,
             AddressType::P2TR,
             manual_outpoints,
             None,
@@ -709,6 +735,83 @@ fn test_manual_coinselection() {
     }
 
     println!("All test cases completed successfully");
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// A maker with fragmented liquidity cannot fund the requested 3 splits within
+/// the input budget, so the planner degrades to 1 split (7 inputs, the excess
+/// over the budget is maker-paid) and the swap still completes. The taker's
+/// log line "3 receivers, 1 senders" pins the degradation.
+#[test]
+fn test_legacy_swap_completes_with_degraded_splits() {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            vec![(8404, Some(21701))],
+            vec![TakerBehavior::Normal],
+            vec![openswap::maker::MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker(
+        taker,
+        bitcoind,
+        3,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+    // Bond UTXO is exact (5,000,000 + 243 fee) so no change UTXO joins the
+    // pool; liquidity is exactly one 400k UTXO plus six 20k UTXOs.
+    fund_makers(
+        &makers,
+        bitcoind,
+        1,
+        Amount::from_sat(5_000_243),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        1,
+        Amount::from_sat(400_000),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        6,
+        Amount::from_sat(20_000),
+        AddressType::P2TR,
+    );
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker = maker.clone();
+            thread::spawn(move || start_server(maker).unwrap())
+        })
+        .collect::<Vec<_>>();
+    wait_for_makers_setup(&makers, 120);
+    generate_blocks(bitcoind, 1);
+
+    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+    let summary = taker.prepare_swap(swap_params).expect("prepare swap");
+    taker
+        .start_swap(&summary.swap_id)
+        .expect("swap must complete with degraded splits");
+
+    let taker_balance = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    info!("Degraded-split taker balance: {:?}", taker_balance);
+
+    makers
+        .iter()
+        .for_each(|maker| maker.shutdown.store(true, Relaxed));
+    maker_threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());
+    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    test_framework.assert_log("3 receivers, 1 senders", &log_path);
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

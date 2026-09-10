@@ -208,7 +208,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
 
     // Verify maker balances -- makers should have recovered their outgoing funds via timelock
     for (i, maker_balances) in maker_balances_all.iter().enumerate() {
-        let expected_regular = [14998926u64, 14998926][i];
+        let expected_regular = [14999463u64, 14999463][i];
         assert_eq!(
             maker_balances.regular.to_sat(),
             expected_regular,
@@ -239,7 +239,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
         );
         assert_eq!(
             maker_diff.to_sat(),
-            588,
+            294,
             "Maker {} spendable balance change mismatch",
             i
         );
@@ -248,7 +248,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
     // Verify taker balance
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14999412,
+        14999706,
         "Taker regular balance mismatch"
     );
     assert_eq!(
@@ -266,7 +266,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
     // The taker recovered its own funding, so it only pays the recovery fees.
     assert_eq!(
         balance_diff.to_sat(),
-        588,
+        294,
         "Taker spendable balance change mismatch"
     );
 

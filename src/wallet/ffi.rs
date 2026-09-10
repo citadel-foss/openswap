@@ -5,7 +5,7 @@
 
 use crate::{
     security::{load_sensitive_struct, KeyMaterial, SerdeJson},
-    utill::{get_taker_dir, parse_checked_address, MIN_FEE_RATE},
+    utill::{get_taker_dir, parse_checked_address, MIN_RELAY_FEE_RATE},
     wallet::{infer_address_type, AddressType, Destination, Wallet, WalletBackup, WalletError},
 };
 use bitcoin::{Amount, OutPoint, Txid};
@@ -174,9 +174,21 @@ impl Wallet {
             WalletError::General("Invalid address for the current wallet network".to_string())
         })?;
 
+        // Below the relay floor the tx would not propagate; reject instead
+        // of repairing the caller's rate.
+        let fee_rate = match fee_rate {
+            Some(rate) if !rate.is_finite() || rate < MIN_RELAY_FEE_RATE => {
+                return Err(WalletError::General(
+                    "fee rate must be finite and at least the 1 sats/vB relay floor".to_string(),
+                ));
+            }
+            Some(rate) => rate,
+            None => MIN_RELAY_FEE_RATE,
+        };
+
         let coins_to_spend = self.coin_select(
             amount,
-            fee_rate.unwrap_or(MIN_FEE_RATE),
+            fee_rate,
             infer_address_type(&addr.script_pubkey()),
             manually_selected_outpoints,
             None,
@@ -189,11 +201,7 @@ impl Wallet {
             change_address_type: AddressType::P2TR,
         };
 
-        let tx = self.spend_from_wallet(
-            fee_rate.unwrap_or(MIN_FEE_RATE),
-            destination,
-            &coins_to_spend,
-        )?;
+        let tx = self.spend_from_wallet(fee_rate, destination, &coins_to_spend)?;
 
         let txid = self.send_tx(&tx)?;
         self.sync_and_save(&crate::utill::NO_SHUTDOWN)?;

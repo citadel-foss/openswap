@@ -201,8 +201,8 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     // from real runs. A recovery that dropped the swapcoins without returning
     // the funds would still pass the zero-balance asserts, but not this one.
     let expected_diff = match protocol {
-        ProtocolVersion::Legacy => 7237,
-        ProtocolVersion::Taproot => 6367,
+        ProtocolVersion::Legacy => 4789,
+        ProtocolVersion::Taproot => 4126,
     };
     assert_eq!(
         balance_diff.to_sat(),

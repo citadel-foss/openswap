@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use bitcoin::{Amount, OutPoint, PublicKey};
+use bitcoin::{Amount, OutPoint, PublicKey, Txid};
 use bitcoind::bitcoincore_rpc::{jsonrpc::error::Error as JsonRpcError, Error as BitcoinRpcError};
 
 #[cfg(feature = "integration-test")]
@@ -10,12 +10,12 @@ use super::handlers::MakerBehavior;
 use super::{
     error::MakerError,
     handlers::{
-        incoming_within_swap_amount, ConnectionState, Maker, SwapPhase, MIN_CONTRACT_REACTION_TIME,
+        incoming_matches_swap_amount, ConnectionState, Maker, SwapPhase, MIN_CONTRACT_REACTION_TIME,
     },
 };
 use crate::{
     protocol::{
-        common_messages::{MakerToTakerMessage, PrivateKeyHandover, SwapPrivkey},
+        common_messages::{MakerToTakerMessage, PrivateKeyHandover, ProtocolVersion, SwapPrivkey},
         contract::calculate_pubkey_from_nonce,
         contract2::{
             check_taproot_hashlock_has_pubkey, create_hashlock_script, create_timelock_script,
@@ -24,12 +24,14 @@ use crate::{
         taproot_messages::{SerializableScalar, TaprootContractData, TaprootTakerMessage},
     },
     taker::api::REFUND_LOCKTIME_STEP,
-    utill::estimate_funding_tx_fee_sats,
+    utill::sweep_fee_policy_sats,
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         MakerReport, WalletError,
     },
 };
+#[cfg(feature = "integration-test")]
+use bitcoind::bitcoincore_rpc::jsonrpc::error::RpcError;
 
 /// Handle a Taproot protocol message.
 pub fn handle_taproot_message<M: Maker>(
@@ -125,17 +127,17 @@ fn process_taproot_contract<M: Maker>(
         maker.network_port(),
     )?;
 
-    // Contract count was agreed in SwapDetails and drives how many outgoing
-    // contracts we fund, so the taker must not change it here.
-    if data.contract_txs.len() != state.tx_count as usize {
+    // The declared incoming count is exact: the sweep fee and the next hop's
+    // plan were priced on it, so anything else short-changes one side.
+    if data.contract_txs.len() != state.incoming_count as usize {
         log::error!(
-            "[{}] Taproot contract count {} does not match negotiated {}",
+            "[{}] Taproot contract count {} != declared incoming count {}",
             maker.network_port(),
             data.contract_txs.len(),
-            state.tx_count
+            state.incoming_count
         );
         return Err(MakerError::General(
-            "Taproot contract count does not match the negotiated tx count",
+            "Taproot contract count does not match the declared incoming count",
         ));
     }
 
@@ -146,15 +148,15 @@ fn process_taproot_contract<M: Maker>(
             .checked_add(*amount)
             .ok_or(MakerError::General("Taproot contract amounts overflow"))?;
     }
-    if !incoming_within_swap_amount(total_incoming, state.swap_amount) {
+    if !incoming_matches_swap_amount(total_incoming, state.swap_amount) {
         log::error!(
-            "[{}] Taproot incoming amount {} exceeds negotiated swap amount {}",
+            "[{}] Taproot incoming amount {} does not match negotiated swap amount {}",
             maker.network_port(),
             total_incoming,
             state.swap_amount
         );
         return Err(MakerError::General(
-            "Taproot incoming amount exceeds the negotiated swap amount",
+            "Taproot incoming amount does not match the negotiated swap amount",
         ));
     }
 
@@ -171,11 +173,30 @@ fn process_taproot_contract<M: Maker>(
     let n = data.contract_txs.len();
     let mut incoming_swapcoins = Vec::with_capacity(n);
     let required_confirms = maker.get_config().required_confirms;
+    // Claim every incoming contract txid under the swaps lock before the
+    // confirmation wait: a concurrent swap carrying the same contract tx fails
+    // here, not after both waited and both funded the next hop. A same-swap
+    // reconnect re-claims its own txids and passes.
+    let incoming_txids: Vec<Txid> = data
+        .contract_txs
+        .iter()
+        .map(|tx| tx.compute_txid())
+        .collect();
+    maker.claim_incoming_contract_txids(&data.id, &incoming_txids)?;
     for j in 0..n {
         let incoming_contract_tx = data.contract_txs[j].clone();
+        let contract_txid = incoming_contract_tx.compute_txid();
         // A mempool-only contract may be replaced via RBF after we fund the next hop,
         // so require confirmations before proceeding.
-        maker.wait_for_tx_on_chain(&incoming_contract_tx.compute_txid(), required_confirms)?;
+        maker.wait_for_tx_on_chain(&data.id, &contract_txid, required_confirms)?;
+        // One incoming contract must never fund two outgoing hops: an already
+        // spent output, or a txid another swap already holds, is a replay.
+        if !maker.contract_output_unspent(&OutPoint::new(contract_txid, 0))? {
+            return Err(MakerError::General("Taproot contract output already spent"));
+        }
+        if maker.contract_txid_seen(&contract_txid, &data.id)? {
+            return Err(MakerError::General("Taproot contract txid already in use"));
+        }
         // Blocks passed while we waited. We have broadcast nothing yet, so aborting
         // here costs only the reserved UTXOs.
         check_sweep_margin(maker, state.timelock)?;
@@ -190,6 +211,7 @@ fn process_taproot_contract<M: Maker>(
             data.timelock_scripts[j].clone(),
             incoming_contract_tx,
             incoming_funding_amount,
+            state.swap_feerate as u64,
         );
         incoming_swapcoin.swap_id = Some(data.id.clone());
 
@@ -212,40 +234,27 @@ fn process_taproot_contract<M: Maker>(
     // amount; overwrite with the fee on the actual incoming amount so
     // success reports match what was really earned.
     state.service_fee_sats = swap_fee.to_sat();
-    let mining_fee = Amount::from_sat(estimate_funding_tx_fee_sats() * n as u64);
-    let fee = swap_fee + mining_fee;
-    let outgoing_total = total_incoming
-        .checked_sub(fee)
+    // The sweep reimbursement prices each incoming contract's cooperative
+    // spend; the funding fee comes out in the split plan, not here.
+    // The feerate is negotiated with the peer; an overflowing product would
+    // panic this connection thread, so fail the swap instead.
+    let sweep_fee = Amount::from_sat(
+        sweep_fee_policy_sats(ProtocolVersion::Taproot, state.swap_feerate)
+            .and_then(|per_contract| per_contract.checked_mul(n as u64))
+            .ok_or(MakerError::General("Sweep fee overflow"))?,
+    );
+    let forwardable = total_incoming
+        .checked_sub(swap_fee)
+        .and_then(|amt| amt.checked_sub(sweep_fee))
         .ok_or(MakerError::General("Fee exceeds incoming amount"))?;
-    let total_sat = total_incoming.to_sat() as u128;
-    let mut outgoing_amounts = data
-        .amounts
-        .iter()
-        .map(|amt| {
-            let share = (fee.to_sat() as u128 * amt.to_sat() as u128 / total_sat) as u64;
-            Amount::from_sat(amt.to_sat() - share)
-        })
-        .collect::<Vec<Amount>>();
-    // Flooring leaves the outgoing sum a few sats above total fee; deduct that remainder from the largest output so the totals stay exact and deterministic.
-    let remainder =
-        outgoing_amounts.iter().map(|amt| amt.to_sat()).sum::<u64>() - outgoing_total.to_sat();
-    if remainder > 0 {
-        let max_idx = outgoing_amounts
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, amt)| amt.to_sat())
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        outgoing_amounts[max_idx] -= Amount::from_sat(remainder);
-    }
 
     log::info!(
-        "[{}] Fee calculation: incoming_total={}, swap_fee={}, mining_fee={}, outgoing_total={}",
+        "[{}] Fee calculation: incoming_total={}, swap_fee={}, sweep_fee={}, forwardable={}",
         maker.network_port(),
         total_incoming,
         swap_fee,
-        mining_fee,
-        outgoing_total
+        sweep_fee,
+        forwardable
     );
 
     let hash = extract_hash_from_hashlock(&data.hashlock_script)
@@ -262,30 +271,11 @@ fn process_taproot_contract<M: Maker>(
     let next_hop_xonly = bitcoin::key::XOnlyPublicKey::from(next_hop_hashlock_pubkey.inner);
     let hashlock_script = create_hashlock_script(&hash, &next_hop_xonly);
 
-    // Build one outgoing contract (with its own keys/scripts/address) per contract.
-    let mut outgoing_swapcoins = Vec::with_capacity(n);
-    let mut response_pubkeys = Vec::with_capacity(n);
-    let mut response_internal_keys = Vec::with_capacity(n);
-    let mut response_tap_tweaks = Vec::with_capacity(n);
-    let mut response_timelock_scripts = Vec::with_capacity(n);
-    let mut response_contract_txs = Vec::with_capacity(n);
-    let mut response_amounts = Vec::with_capacity(n);
-    let mut reserved = Vec::with_capacity(n);
-    let mut spent_inputs: Vec<OutPoint> = Vec::new();
-
-    let base_excluded = maker.collect_excluded_utxos(&data.id)?;
-
-    for &expected_outgoing_amount in &outgoing_amounts {
-        #[cfg(feature = "integration-test")]
-        let outgoing_amount = if maker.behavior() == MakerBehavior::FeeSkimming {
-            expected_outgoing_amount
-                .checked_sub(Amount::from_sat(1))
-                .ok_or(MakerError::General("Test fee skim exceeds outgoing amount"))?
-        } else {
-            expected_outgoing_amount
-        };
-        #[cfg(not(feature = "integration-test"))]
-        let outgoing_amount = expected_outgoing_amount;
+    // Derive keys, scripts and addresses for exactly the splits in the frozen
+    // plan: admission already sized it, so the peer's requested ceiling never
+    // sizes an allocation or a loop here.
+    let mut contract_params = Vec::with_capacity(state.funding_plan.len());
+    for _ in 0..state.funding_plan.len() {
         let outgoing_nonce =
             bitcoin::secp256k1::SecretKey::new(&mut bitcoin::secp256k1::rand::thread_rng());
         let outgoing_privkey = tweakable_privkey
@@ -333,30 +323,56 @@ fn process_taproot_contract<M: Maker>(
         })?;
         let taproot_address =
             bitcoin::Address::p2tr_tweaked(tap_info.output_key(), maker.network());
+        let tap_tweak = tap_info.tap_tweak().to_scalar();
 
-        // Exclude UTXOs from other swaps and the inputs already spent this hop.
-        let mut excluded_utxos = base_excluded.clone();
-        excluded_utxos.extend(spent_inputs.iter().cloned());
+        contract_params.push((
+            outgoing_privkey,
+            outgoing_pubkey,
+            internal_key,
+            timelock_privkey,
+            timelock_script,
+            taproot_address,
+            tap_tweak,
+        ));
+    }
 
-        // QA: Integration-only malicious maker path for taker validation tests.
-        #[cfg(feature = "integration-test")]
-        let funding_amount = {
-            use super::handlers::MakerBehavior;
-            if maker.behavior() == MakerBehavior::UnderfundTaprootContract {
-                Amount::from_sat(10_000)
-            } else {
-                outgoing_amount
-            }
-        };
-        #[cfg(not(feature = "integration-test"))]
-        let funding_amount = outgoing_amount;
+    let contract_addresses: Vec<_> = contract_params
+        .iter()
+        .map(|params| params.5.clone())
+        .collect();
+    let (contract_txs, output_positions) = maker.create_funding_transactions(
+        &data.id,
+        forwardable,
+        &contract_addresses,
+        state.swap_feerate,
+    )?;
 
-        let (contract_tx, output_pos) = maker.create_funding_transaction(
-            funding_amount,
-            taproot_address.clone(),
-            Some(excluded_utxos),
-        )?;
-        spent_inputs.extend(contract_tx.input.iter().map(|i| i.previous_output));
+    // Build one outgoing contract per funded split; amounts come from the
+    // actual funding outputs, so the response can never claim more than was
+    // funded.
+    let mut outgoing_swapcoins = Vec::with_capacity(contract_txs.len());
+    let mut response_pubkeys = Vec::with_capacity(contract_txs.len());
+    let mut response_internal_keys = Vec::with_capacity(contract_txs.len());
+    let mut response_tap_tweaks = Vec::with_capacity(contract_txs.len());
+    let mut response_timelock_scripts = Vec::with_capacity(contract_txs.len());
+    let mut response_contract_txs = Vec::with_capacity(contract_txs.len());
+    let mut response_amounts = Vec::with_capacity(contract_txs.len());
+    let mut reserved = Vec::with_capacity(contract_txs.len());
+
+    for ((contract_tx, &output_pos), params) in contract_txs
+        .iter()
+        .zip(output_positions.iter())
+        .zip(contract_params.iter())
+    {
+        let (
+            outgoing_privkey,
+            outgoing_pubkey,
+            internal_key,
+            timelock_privkey,
+            timelock_script,
+            _,
+            tap_tweak,
+        ) = params;
         let contract_outpoint = OutPoint {
             txid: contract_tx.compute_txid(),
             vout: output_pos,
@@ -365,47 +381,33 @@ fn process_taproot_contract<M: Maker>(
         let contract_output_amount = contract_tx.output[output_pos as usize].value;
 
         let mut outgoing_swapcoin = OutgoingSwapCoin::new_taproot(
-            timelock_privkey,
+            *timelock_privkey,
             hashlock_script.clone(),
             timelock_script.clone(),
             contract_tx.clone(),
             contract_output_amount,
+            state.swap_feerate as u64,
         );
         outgoing_swapcoin.swap_id = Some(data.id.clone());
         outgoing_swapcoin.set_taproot_params(
-            outgoing_privkey,
-            outgoing_pubkey,
+            *outgoing_privkey,
+            *outgoing_pubkey,
             data.next_hop_point,
-            internal_key,
-            tap_info.tap_tweak().to_scalar(),
+            *internal_key,
+            *tap_tweak,
         );
 
-        // QA: Keep this claim inconsistent with the funded output when the test
-        // behavior is active, proving the taker binds metadata to transaction value.
-        #[cfg(feature = "integration-test")]
-        let response_amount = {
-            use super::handlers::MakerBehavior;
-            if maker.behavior() == MakerBehavior::UnderfundTaprootContract {
-                outgoing_amount
-            } else {
-                contract_output_amount
-            }
-        };
-        #[cfg(not(feature = "integration-test"))]
-        let response_amount = contract_output_amount;
-
-        response_pubkeys.push(outgoing_pubkey);
-        response_internal_keys.push(internal_key);
+        response_pubkeys.push(*outgoing_pubkey);
+        response_internal_keys.push(*internal_key);
         response_tap_tweaks.push(SerializableScalar::from_bytes(
-            tap_info.tap_tweak().to_scalar().to_be_bytes().to_vec(),
+            tap_tweak.to_be_bytes().to_vec(),
         ));
-        response_timelock_scripts.push(timelock_script);
-        response_contract_txs.push(contract_tx);
-        response_amounts.push(response_amount);
+        response_timelock_scripts.push(timelock_script.clone());
+        response_contract_txs.push(contract_tx.clone());
+        response_amounts.push(contract_output_amount);
         outgoing_swapcoins.push(outgoing_swapcoin);
     }
 
-    state.reserve_utxo = reserved.clone();
     state.incoming_swapcoins = incoming_swapcoins.clone();
     state.outgoing_swapcoins = outgoing_swapcoins.clone();
     #[cfg(debug_assertions)]
@@ -414,8 +416,12 @@ fn process_taproot_contract<M: Maker>(
         data.id,
         n,
         total_incoming.to_sat(),
-        state.reserve_utxo.len()
+        reserved.len()
     );
+
+    // Persist before the first broadcast: past that point recovery reads the
+    // stored state, not the copy in this handler.
+    maker.store_connection_state(&data.id, state, false)?;
 
     #[cfg(feature = "integration-test")]
     {
@@ -425,7 +431,10 @@ fn process_taproot_contract<M: Maker>(
                 "[{}] Test behavior: skipping Taproot funding broadcast",
                 maker.network_port()
             );
-            state.funding_broadcast = true;
+            state.funding_broadcast_txids = outgoing_swapcoins
+                .iter()
+                .map(|outgoing| outgoing.contract_tx.compute_txid())
+                .collect();
             state.phase = SwapPhase::AwaitingPrivateKeyHandover;
             for incoming in &incoming_swapcoins {
                 maker.save_incoming_swapcoin(incoming)?;
@@ -439,8 +448,8 @@ fn process_taproot_contract<M: Maker>(
     }
 
     // Arm the watches before anything is committed. Failing here aborts with
-    // nothing on-chain; failing after a broadcast would leave contract txs live
-    // while recovery still reads `funding_broadcast == false` and discards them.
+    // nothing on-chain; after the first send, recovery needs them for the
+    // contract txs recorded as broadcast.
     for (outgoing, contract_outpoint) in outgoing_swapcoins.iter().zip(reserved.iter()) {
         maker.register_watch_outpoint(
             *contract_outpoint,
@@ -461,9 +470,30 @@ fn process_taproot_contract<M: Maker>(
         maker.save_outgoing_swapcoin(outgoing)?;
     }
 
-    for outgoing in &outgoing_swapcoins {
+    for (index, outgoing) in outgoing_swapcoins.iter().enumerate() {
+        // The index only feeds the test hook below; touch it so production
+        // builds have no unused binding.
+        let _ = index;
+        // QA: a mid-batch failure must leave the earlier sends recorded, or
+        // recovery discards contract txs already on the wire. Inert for
+        // single-tx batches.
+        #[cfg(feature = "integration-test")]
+        if index == 1 && maker.behavior() == MakerBehavior::FailSecondBroadcast {
+            log::warn!(
+                "[{}] Test behavior: failing the second Taproot funding broadcast",
+                maker.network_port()
+            );
+            return Err(MakerError::Wallet(WalletError::Rpc(
+                BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError {
+                    code: -26,
+                    message: "Test: second funding broadcast rejected".to_string(),
+                    data: None,
+                })),
+            )));
+        }
+        let txid = outgoing.contract_tx.compute_txid();
         match maker.broadcast_transaction(&outgoing.contract_tx) {
-            Ok(txid) => {
+            Ok(_) => {
                 log::info!(
                     "[{}] Broadcast Taproot contract tx {} for swap {}",
                     maker.network_port(),
@@ -481,7 +511,6 @@ fn process_taproot_contract<M: Maker>(
                     || message.contains("txn-already-in-mempool")
             } =>
             {
-                let txid = outgoing.contract_tx.compute_txid();
                 log::info!(
                     "[{}] Taproot contract tx {} for swap {} was already broadcast",
                     maker.network_port(),
@@ -493,8 +522,7 @@ fn process_taproot_contract<M: Maker>(
                 // This captures the Electrum counterpart of the rebroadcast error.
                 // Electrum doesn't throw a reliable error. So we manually check if the transaction
                 // is already broadcasted. An error here means the backend connection is down.
-                let txid = outgoing.contract_tx.compute_txid();
-                if maker.is_transaction_known(&txid) {
+                if maker.is_transaction_known(&txid)? {
                     log::info!(
                         "[{}] Taproot contract tx {} for swap {} was already broadcast",
                         maker.network_port(),
@@ -506,9 +534,14 @@ fn process_taproot_contract<M: Maker>(
                 }
             }
         }
+        // Record each send before the next one, so a mid-batch failure never
+        // reads back as "never broadcast".
+        maker.record_funding_broadcast(&data.id, &txid)?;
+        if !state.funding_broadcast_txids.contains(&txid) {
+            state.funding_broadcast_txids.push(txid);
+        }
     }
 
-    state.funding_broadcast = true;
     state.phase = SwapPhase::AwaitingPrivateKeyHandover;
 
     maker.store_connection_state(&data.id, state, false)?;
@@ -534,6 +567,38 @@ fn process_taproot_contract<M: Maker>(
         n,
         data.id
     );
+
+    // QA: a response carrying more contracts than the negotiated maximum must
+    // be caught by the taker's count check; all per-contract arrays stay 1:1.
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == MakerBehavior::OverproduceContractData {
+        if let Some(first) = response_pubkeys.first().copied() {
+            response_pubkeys.push(first);
+            response_internal_keys.push(response_internal_keys[0]);
+            response_tap_tweaks.push(response_tap_tweaks[0].clone());
+            response_timelock_scripts.push(response_timelock_scripts[0].clone());
+            response_contract_txs.push(response_contract_txs[0].clone());
+            response_amounts.push(response_amounts[0]);
+        }
+    }
+
+    // QA: moving one sat between two claims keeps count and total exact, so
+    // only the taker's per-output amount binding can catch the lie.
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == MakerBehavior::InflateContractAmount && response_amounts.len() > 1 {
+        response_amounts[0] += Amount::from_sat(1);
+        response_amounts[1] -= Amount::from_sat(1);
+    }
+
+    // QA: repeating one funded contract keeps count and total exact, so only
+    // the taker's duplicate-outpoint check can catch the double claim.
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == MakerBehavior::DuplicateContractOutpoint
+        && response_contract_txs.len() > 1
+    {
+        let last = response_contract_txs.len() - 1;
+        response_contract_txs[last] = response_contract_txs[0].clone();
+    }
 
     let response = TaprootContractData::new(
         data.id.clone(),

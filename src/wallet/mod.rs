@@ -7,7 +7,7 @@ pub mod deniability;
 mod error;
 pub mod ffi;
 mod fidelity;
-mod funding;
+pub(crate) mod funding;
 mod report;
 mod spend;
 mod storage;
