@@ -5,8 +5,8 @@ use std::sync::{MutexGuard, PoisonError, RwLockReadGuard, RwLockWriteGuard};
 use bitcoin::{secp256k1, Amount};
 
 use crate::{
-    error::NetError, protocol::error::ProtocolError, utill::TorError, wallet::WalletError,
-    watch_tower::watcher_error::WatcherError,
+    blocklist::BlocklistError, error::NetError, protocol::error::ProtocolError, utill::TorError,
+    wallet::WalletError, watch_tower::watcher_error::WatcherError,
 };
 
 #[cfg(feature = "integration-test")]
@@ -49,6 +49,8 @@ pub enum MakerError {
     Secp(secp256k1::Error),
     /// Represents an error related to wallet operations.
     Wallet(WalletError),
+    /// Represents a funding-input blocklist error.
+    Blocklist(BlocklistError),
     /// Represents a network-related error.
     Net(NetError),
     /// Represents an error triggered by special maker behavior.
@@ -113,6 +115,12 @@ impl From<ProtocolError> for MakerError {
 impl From<WalletError> for MakerError {
     fn from(value: WalletError) -> Self {
         Self::Wallet(value)
+    }
+}
+
+impl From<BlocklistError> for MakerError {
+    fn from(value: BlocklistError) -> Self {
+        Self::Blocklist(value)
     }
 }
 

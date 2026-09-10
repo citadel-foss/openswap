@@ -10,6 +10,7 @@ mod abort2_case3;
 mod abort3_case1;
 mod abort3_case2;
 mod abort3_case3;
+mod blocklist_rejection;
 mod electrum_abort1;
 mod electrum_list_transactions;
 mod electrum_swap;

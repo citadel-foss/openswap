@@ -2,6 +2,7 @@ use std::{fs, net::TcpStream, path::PathBuf, time::Duration};
 
 use clap::Parser;
 use openswap::{
+    blocklist::BlocklistEntry,
     maker::{AuthenticatedRpcRequest, MakerError, RpcMsgReq, RpcMsgResp},
     utill::{get_maker_dir, read_message, send_message, MIN_FEE_RATE},
 };
@@ -77,6 +78,19 @@ enum Commands {
         #[arg(long, short = 's')]
         swap_id: String,
     },
+    /// Add or update an address in the funding-source blocklist.
+    BlocklistAdd {
+        /// Bitcoin address to block.
+        address: String,
+        /// Optional note explaining why the address is blocked.
+        #[arg(long, short = 'l')]
+        label: Option<String>,
+    },
+    /// Remove an address from the funding-source blocklist.
+    BlocklistRemove {
+        /// Bitcoin address to remove.
+        address: String,
+    },
 }
 
 fn main() -> Result<(), MakerError> {
@@ -148,6 +162,24 @@ fn main() -> Result<(), MakerError> {
                 stream,
                 &rpc_cookie,
                 RpcMsgReq::VerifyDeniability { swap_id },
+            )?;
+        }
+        Commands::BlocklistAdd { address, label } => {
+            send_rpc_req(
+                stream,
+                &rpc_cookie,
+                RpcMsgReq::BlocklistAdd {
+                    entries: vec![BlocklistEntry::new(address, label)],
+                },
+            )?;
+        }
+        Commands::BlocklistRemove { address } => {
+            send_rpc_req(
+                stream,
+                &rpc_cookie,
+                RpcMsgReq::BlocklistRemove {
+                    addresses: vec![address],
+                },
             )?;
         }
     }

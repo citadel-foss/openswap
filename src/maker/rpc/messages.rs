@@ -1,6 +1,9 @@
 use std::fmt::Display;
 
-use crate::utill::UTXO;
+use crate::{
+    blocklist::{AddOutcome, BlocklistEntry},
+    utill::UTXO,
+};
 use bitcoin::Txid;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, to_string_pretty};
@@ -61,6 +64,16 @@ pub enum RpcMsgReq {
         /// The swap ID to verify.
         swap_id: String,
     },
+    /// Add or update blocklist entries.
+    BlocklistAdd {
+        /// Address entries to add or update.
+        entries: Vec<BlocklistEntry>,
+    },
+    /// Remove addresses from the blocklist.
+    BlocklistRemove {
+        /// Addresses to remove.
+        addresses: Vec<String>,
+    },
 }
 
 /// Enum representing RPC message responses.
@@ -111,6 +124,10 @@ pub enum RpcMsgResp {
     ListBonds(String),
     /// Response to a verify-deniability request.
     VerifyDeniabilityResp(bool),
+    /// Response containing the number of added and updated blocklist entries.
+    BlocklistAddResp(AddOutcome),
+    /// Response containing the number of removed blocklist entries.
+    BlocklistRemoveResp(usize),
 }
 
 impl Display for RpcMsgResp {
@@ -156,6 +173,10 @@ impl Display for RpcMsgResp {
                     write!(f, "Proof invalid or not found for this swap ID")
                 }
             }
+            Self::BlocklistAddResp(outcome) => {
+                write!(f, "Added: {}, updated: {}", outcome.added, outcome.updated)
+            }
+            Self::BlocklistRemoveResp(removed) => write!(f, "Removed: {removed}"),
         }
     }
 }

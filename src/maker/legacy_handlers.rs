@@ -217,6 +217,11 @@ fn process_proof_of_funding<M: Maker>(
     }
 
     let hashvalue = maker.verify_proof_of_funding(&pof)?;
+
+    for funding_info in &pof.confirmed_funding_txes {
+        maker.screen_funding_tx(&funding_info.funding_tx)?;
+    }
+
     #[cfg(debug_assertions)]
     log::debug!(
         "[CONTRACT_STATE] Role: Maker | Protocol: Legacy | SwapID: {} | ProofFundingTxs: {} | NextHopKeys: {} | RefundLocktime: {} | Status: verified",

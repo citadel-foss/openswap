@@ -19,7 +19,7 @@ use crate::{
         },
         legacy_messages::SenderContractTxInfo,
     },
-    utill::redeemscript_to_scriptpubkey,
+    utill::{get_taker_dir, redeemscript_to_scriptpubkey},
 };
 
 use super::{api::Taker, error::TakerError};
@@ -180,6 +180,7 @@ impl Taker {
     pub(crate) fn verify_maker_sender_contracts(
         &self,
         senders_info: &[SenderContractTxInfo],
+        maker_idx: usize,
         next_multisig_pubkeys: &[PublicKey],
         next_hashlock_pubkeys: &[PublicKey],
         refund_locktime: u16,
@@ -196,7 +197,31 @@ impl Taker {
 
         let expected_hashvalue = Hash160::hash(&self.swap_state()?.preimage);
 
+        // The taker receives only the final maker's outgoing contracts.
+        let is_final_maker = maker_idx + 1 == self.swap_state()?.makers.len();
+        let blocklist_data_dir = if self.config.check_blocklist.unwrap_or(false) && is_final_maker {
+            Some(
+                self.config
+                    .data_dir
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(get_taker_dir)?,
+            )
+        } else {
+            None
+        };
+
         for (i, info) in senders_info.iter().enumerate() {
+            if let Some(data_dir) = &blocklist_data_dir {
+                let wallet = self.read_wallet()?;
+                crate::blocklist::screen_funding_tx(
+                    data_dir,
+                    wallet.store.network,
+                    &wallet,
+                    &info.funding_tx,
+                )?;
+            }
+
             // Validate 2-of-2 multisig format
             check_reedemscript_is_multisig(&info.multisig_redeemscript).map_err(|e| {
                 TakerError::General(format!(
