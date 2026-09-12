@@ -1,0 +1,91 @@
+name: examples
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  examples:
+    name: Run examples sequentially
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install protobuf compiler, tor, and gnupg
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler tor gnupg
+
+      - name: Cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-examples-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      # Each example starts and stops its own regtest node.
+      - name: Install Bitcoin Core 28.1
+        run: |
+          mkdir -p "$RUNNER_TEMP/bitcoin-download"
+          cd "$RUNNER_TEMP/bitcoin-download"
+          ARCHIVE=bitcoin-28.1-x86_64-linux-gnu.tar.gz
+          GUIX_SIGS=https://raw.githubusercontent.com/bitcoin-core/guix.sigs/3b667ee3ebb3dcd9e1990cf03e38a0935eec1683
+          curl --fail --location --retry 3 "https://bitcoincore.org/bin/bitcoin-core-28.1/$ARCHIVE" -o "$ARCHIVE"
+          curl --fail --location --retry 3 "$GUIX_SIGS/builder-keys/fanquake.gpg" -o fanquake.gpg
+          curl --fail --location --retry 3 "$GUIX_SIGS/28.1/fanquake/all.SHA256SUMS" -o SHA256SUMS
+          curl --fail --location --retry 3 "$GUIX_SIGS/28.1/fanquake/all.SHA256SUMS.asc" -o SHA256SUMS.asc
+          # Trust only the release signer's key from the pinned repository revision.
+          mkdir -m 700 gnupg
+          gpg --batch --homedir "$PWD/gnupg" --import fanquake.gpg
+          gpg --batch --homedir "$PWD/gnupg" --verify SHA256SUMS.asc SHA256SUMS
+          grep "  $ARCHIVE$" SHA256SUMS | sha256sum --check --strict
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP"
+          echo "BITCOIND_EXE=$RUNNER_TEMP/bitcoin-28.1/bin/bitcoind" >> "$GITHUB_ENV"
+
+      - name: Start tor with a control port
+        run: |
+          sudo systemctl stop tor@default.service tor.service || true
+          mkdir -p /tmp/tor-examples
+          # Empty control password: `check_tor_status` sends AUTHENTICATE "" and
+          # the test helpers default OPENSWAP_TOR_PASSWORD to empty.
+          HASH="$(tor --hash-password '' | tail -n 1)"
+          cat <<EOF > /tmp/tor-examples/torrc
+          SocksPort 9050
+          ControlPort 9051
+          HashedControlPassword $HASH
+          DataDirectory /tmp/tor-examples/data
+          Log notice file /tmp/tor-examples/tor.log
+          EOF
+          tor -f /tmp/tor-examples/torrc &
+          echo "waiting for tor to bootstrap..."
+          for _ in $(seq 1 60); do
+            if grep -q "Bootstrapped 100%" /tmp/tor-examples/tor.log 2>/dev/null; then
+              echo "tor bootstrapped"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "tor failed to bootstrap within 300s" >&2
+          cat /tmp/tor-examples/tor.log 2>/dev/null || true
+          exit 1
+
+      - name: Run wallet example
+        run: cargo run --example wallet_basic
+
+      - name: Run taker example
+        run: cargo run --example taker_basic
+
+      - name: Dump tor log
+        if: always()
+        run: cat /tmp/tor-examples/tor.log || true
