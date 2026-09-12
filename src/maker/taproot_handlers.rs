@@ -214,30 +214,8 @@ fn process_taproot_contract<M: Maker>(
     state.service_fee_sats = swap_fee.to_sat();
     let mining_fee = Amount::from_sat(estimate_funding_tx_fee_sats() * n as u64);
     let fee = swap_fee + mining_fee;
-    let outgoing_total = total_incoming
-        .checked_sub(fee)
-        .ok_or(MakerError::General("Fee exceeds incoming amount"))?;
-    let total_sat = total_incoming.to_sat() as u128;
-    let mut outgoing_amounts = data
-        .amounts
-        .iter()
-        .map(|amt| {
-            let share = (fee.to_sat() as u128 * amt.to_sat() as u128 / total_sat) as u64;
-            Amount::from_sat(amt.to_sat() - share)
-        })
-        .collect::<Vec<Amount>>();
-    // Flooring leaves the outgoing sum a few sats above total fee; deduct that remainder from the largest output so the totals stay exact and deterministic.
-    let remainder =
-        outgoing_amounts.iter().map(|amt| amt.to_sat()).sum::<u64>() - outgoing_total.to_sat();
-    if remainder > 0 {
-        let max_idx = outgoing_amounts
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, amt)| amt.to_sat())
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        outgoing_amounts[max_idx] -= Amount::from_sat(remainder);
-    }
+    let outgoing_amounts = calculate_outgoing_amounts(&data.amounts, fee, total_incoming)?;
+    let outgoing_total = outgoing_amounts.iter().copied().sum::<Amount>();
 
     log::info!(
         "[{}] Fee calculation: incoming_total={}, swap_fee={}, mining_fee={}, outgoing_total={}",
@@ -658,4 +636,95 @@ fn process_taproot_handover<M: Maker>(
     Ok(Some(MakerToTakerMessage::TaprootPrivateKeyHandover(
         response,
     )))
+}
+
+/// Distribute fees proportionally across contract amounts and adjust rounding remainder.
+pub(crate) fn calculate_outgoing_amounts(
+    amounts: &[Amount],
+    fee: Amount,
+    total_incoming: Amount,
+) -> Result<Vec<Amount>, MakerError> {
+    if total_incoming == Amount::ZERO {
+        return Err(MakerError::General("Incoming amount cannot be zero"));
+    }
+    let outgoing_total = total_incoming
+        .checked_sub(fee)
+        .ok_or(MakerError::General("Fee exceeds incoming amount"))?;
+
+    let total_sat = total_incoming.to_sat() as u128;
+    let mut outgoing_amounts = amounts
+        .iter()
+        .map(|amt| {
+            let share = (fee.to_sat() as u128 * amt.to_sat() as u128 / total_sat) as u64;
+            amt.to_sat()
+                .checked_sub(share)
+                .map(Amount::from_sat)
+                .ok_or(MakerError::General("Fee share exceeds contract amount"))
+        })
+        .collect::<Result<Vec<Amount>, MakerError>>()?;
+
+    // Flooring leaves the outgoing sum a few sats above total fee; deduct that remainder from the largest output so the totals stay exact and deterministic.
+    let outgoing_sum: u64 = outgoing_amounts.iter().map(|amt| amt.to_sat()).sum();
+    if let Some(remainder) = outgoing_sum.checked_sub(outgoing_total.to_sat()) {
+        if remainder > 0 && !outgoing_amounts.is_empty() {
+            let max_idx = outgoing_amounts
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, amt)| amt.to_sat())
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            outgoing_amounts[max_idx] = outgoing_amounts[max_idx]
+                .checked_sub(Amount::from_sat(remainder))
+                .ok_or(MakerError::General("Remainder exceeds max outgoing amount"))?;
+        }
+    }
+
+    Ok(outgoing_amounts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_outgoing_amounts_zero_incoming_fails() {
+        let amounts = [Amount::from_sat(0)];
+        let res = calculate_outgoing_amounts(&amounts, Amount::ZERO, Amount::ZERO);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_calculate_outgoing_amounts_single_output() {
+        let incoming = Amount::from_sat(100_000);
+        let fee = Amount::from_sat(5_000);
+        let amounts = [incoming];
+        let outgoing = calculate_outgoing_amounts(&amounts, fee, incoming).unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0], Amount::from_sat(95_000));
+    }
+
+    #[test]
+    fn test_calculate_outgoing_amounts_multiple_outputs_exact_sum() {
+        let amounts = [
+            Amount::from_sat(33_333),
+            Amount::from_sat(33_333),
+            Amount::from_sat(33_334),
+        ];
+        let incoming = Amount::from_sat(100_000);
+        let fee = Amount::from_sat(3_000);
+        let outgoing = calculate_outgoing_amounts(&amounts, fee, incoming).unwrap();
+        assert_eq!(outgoing.len(), 3);
+        let expected_total = incoming - fee;
+        let actual_total: Amount = outgoing.iter().copied().sum();
+        assert_eq!(actual_total, expected_total);
+    }
+
+    #[test]
+    fn test_calculate_outgoing_amounts_fee_exceeds_incoming_fails() {
+        let incoming = Amount::from_sat(5_000);
+        let fee = Amount::from_sat(6_000);
+        let amounts = [incoming];
+        let res = calculate_outgoing_amounts(&amounts, fee, incoming);
+        assert!(res.is_err());
+    }
 }
