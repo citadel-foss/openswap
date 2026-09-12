@@ -394,7 +394,10 @@ fn handle_relay_message(
             // Claim the txid before any RPC work, so duplicate events and
             // concurrent relay sessions don't repeat the fetch and validation.
             if !lock_debug!(seen_txid.lock())?.claim(txid) {
-                log::info!("Skipping already-seen txid {txid} via {relay_url}");
+                let refreshed = registry.touch_fidelity_announcement(txid, cursor)?;
+                log::info!(
+                    "Skipping already-seen txid {txid} via {relay_url}; refreshed={refreshed}"
+                );
                 registry.save_nostr_cursor(relay_url, cursor)?;
                 return Ok(false);
             }
@@ -418,7 +421,7 @@ fn handle_relay_message(
                 Some(fidelity) => {
                     let maker_address = fidelity.onion.clone();
                     let expires_at_height = fidelity.expires_at_height;
-                    if registry.insert_fidelity(txid, fidelity)? {
+                    if registry.insert_fidelity_announcement(txid, fidelity, cursor)? {
                         log::info!(
                                 "Stored verified fidelity | relay={} | event_id={} | txid={} | vout={} | maker_address={} | expires_at_height={}",
                                 relay_url,

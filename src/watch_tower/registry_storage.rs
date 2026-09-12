@@ -35,6 +35,9 @@ pub struct Fidelity {
     pub onion_address: String,
     /// Fidelity expiry height used later for pruning.
     pub expire_height: u32,
+    /// Creation time of the newest verified Nostr announcement for this bond.
+    /// Chain-only discovery has no announcement timestamp.
+    pub last_announcement_ts: Option<u64>,
 }
 
 /// Nostr cursors and fidelity records are per-boot by design: the relays are the
@@ -44,6 +47,7 @@ pub struct Fidelity {
 struct RegistryData {
     watches: HashMap<OutPoint, WatchRequest>,
     fidelity: HashSet<Fidelity>,
+    fidelity_announcement_ts: HashMap<Txid, u64>,
     nostr_cursors: HashMap<String, u64>,
 }
 
@@ -118,34 +122,90 @@ impl FileRegistry {
     /// Returns all stored maker fidelity records.
     pub fn list_fidelity(&self, height: u32) -> Result<HashSet<Fidelity>, WatcherError> {
         self.with_data(|data| {
-            data.fidelity = data
-                .fidelity
+            data.fidelity
+                .retain(|fidelity| fidelity.expire_height > height);
+            let active_txids: HashSet<_> =
+                data.fidelity.iter().map(|fidelity| fidelity.txid).collect();
+            data.fidelity_announcement_ts
+                .retain(|txid, _| active_txids.contains(txid));
+
+            data.fidelity
                 .iter()
-                .filter(|v| v.expire_height > height)
                 .cloned()
-                .collect();
-            data.fidelity.clone()
+                .map(|mut fidelity| {
+                    fidelity.last_announcement_ts =
+                        data.fidelity_announcement_ts.get(&fidelity.txid).copied();
+                    fidelity
+                })
+                .collect()
         })
     }
 
-    /// Inserts a new fidelity record.
+    /// Inserts a fidelity record learned directly from the chain.
     pub fn insert_fidelity(
         &self,
         txid: Txid,
         fidelity_announcement: FidelityAnnouncement,
     ) -> Result<bool, WatcherError> {
+        self.insert_fidelity_inner(txid, fidelity_announcement, None)
+    }
+
+    /// Inserts a fidelity record from a verified Nostr event and records the
+    /// event creation time used by offerbook stale-maker recovery.
+    pub fn insert_fidelity_announcement(
+        &self,
+        txid: Txid,
+        fidelity_announcement: FidelityAnnouncement,
+        announced_at_ts: u64,
+    ) -> Result<bool, WatcherError> {
+        self.insert_fidelity_inner(txid, fidelity_announcement, Some(announced_at_ts))
+    }
+
+    fn insert_fidelity_inner(
+        &self,
+        txid: Txid,
+        fidelity_announcement: FidelityAnnouncement,
+        announced_at_ts: Option<u64>,
+    ) -> Result<bool, WatcherError> {
         let fidelity = Fidelity {
             txid,
             onion_address: fidelity_announcement.onion,
             expire_height: fidelity_announcement.expires_at_height,
+            last_announcement_ts: None,
         };
-        let is_in = self.with_data(|data| data.fidelity.insert(fidelity))?;
+        let is_in = self.with_data(|data| {
+            if let Some(timestamp) = announced_at_ts {
+                let latest = data.fidelity_announcement_ts.entry(txid).or_default();
+                *latest = (*latest).max(timestamp);
+            }
+            data.fidelity.insert(fidelity)
+        })?;
         Ok(is_in)
+    }
+
+    /// Advances the announcement time for an already-verified fidelity record.
+    /// Returns `false` when the txid is not present in the registry.
+    pub fn touch_fidelity_announcement(
+        &self,
+        txid: Txid,
+        announced_at_ts: u64,
+    ) -> Result<bool, WatcherError> {
+        self.with_data(|data| {
+            let Some(latest) = data.fidelity_announcement_ts.get_mut(&txid) else {
+                return false;
+            };
+
+            *latest = (*latest).max(announced_at_ts);
+            true
+        })
     }
 
     /// Removes fidelity records matching the given txid.
     pub fn remove_fidelity(&mut self, txid: Txid) -> Result<(), WatcherError> {
-        self.with_data(|data| data.fidelity.retain(|f| f.txid != txid))?;
+        self.with_data(|data| {
+            data.fidelity.retain(|fidelity| fidelity.txid != txid);
+            data.fidelity_announcement_ts.remove(&txid);
+        })?;
         Ok(())
     }
 
@@ -305,6 +365,44 @@ mod tests {
 
         let list2 = reg.list_fidelity(0).unwrap();
         assert_eq!(list2.len(), 0);
+    }
+
+    #[test]
+    fn fidelity_announcement_timestamp_only_moves_forward() {
+        let mut reg = FileRegistry::new();
+        let txid = dummy_txid(1);
+        let announcement = FidelityAnnouncement {
+            onion: "abc.onion".to_string(),
+            expires_at_height: 212,
+        };
+
+        assert!(reg
+            .insert_fidelity_announcement(txid, announcement, 100)
+            .unwrap());
+        assert_eq!(
+            reg.list_fidelity(0)
+                .unwrap()
+                .iter()
+                .find(|fidelity| fidelity.txid == txid)
+                .unwrap()
+                .last_announcement_ts,
+            Some(100)
+        );
+
+        assert!(reg.touch_fidelity_announcement(txid, 99).unwrap());
+        assert!(reg.touch_fidelity_announcement(txid, 101).unwrap());
+        assert_eq!(
+            reg.list_fidelity(0)
+                .unwrap()
+                .iter()
+                .find(|fidelity| fidelity.txid == txid)
+                .unwrap()
+                .last_announcement_ts,
+            Some(101)
+        );
+
+        reg.remove_fidelity(txid).unwrap();
+        assert!(!reg.touch_fidelity_announcement(txid, 102).unwrap());
     }
 
     #[test]
