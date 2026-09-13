@@ -382,6 +382,15 @@ impl LightningBackend for MockLightningBackend {
             },
             _ => return Err(LightningError::PaymentNotFound),
         };
+        // Payer-side settlement event, mirroring the real backend where the
+        // claim releases the preimage to the payer via `PaymentSuccessful`.
+        // The mock plays both ends of the payment, so it queues both events.
+        state.events.push_back(LnEvent::PaymentSuccessful {
+            payment_id: PaymentId(payment_hash.to_string()),
+            payment_hash: Some(payment_hash),
+            preimage: Some(*preimage),
+            fee_paid_msat: Some(0),
+        });
         state.events.push_back(LnEvent::PaymentReceived {
             payment_id: PaymentId(payment_hash.to_string()),
             payment_hash: Some(payment_hash),
@@ -456,6 +465,19 @@ mod tests {
         }
 
         mock.claim_held_payment(&preimage).unwrap();
+        // The claim settles both ends: payer-side PaymentSuccessful (carrying
+        // the revealed preimage) first, then payee-side PaymentReceived.
+        match mock.poll_event().unwrap() {
+            Some(LnEvent::PaymentSuccessful {
+                payment_hash: hash,
+                preimage: released,
+                ..
+            }) => {
+                assert_eq!(hash, Some(payment_hash));
+                assert_eq!(released, Some(preimage));
+            }
+            other => panic!("expected PaymentSuccessful, got {:?}", other),
+        }
         match mock.poll_event().unwrap() {
             Some(LnEvent::PaymentReceived {
                 payment_hash: hash,
