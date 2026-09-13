@@ -20,6 +20,8 @@ mod error;
 mod ldk_server;
 #[cfg(any(test, feature = "integration-test"))]
 mod mock;
+pub mod swap;
+pub mod swap_out;
 mod types;
 
 pub use backend::LightningBackend;
@@ -30,6 +32,11 @@ pub use error::LightningError;
 pub use ldk_server::LdkServerBackend;
 #[cfg(any(test, feature = "integration-test"))]
 pub use mock::MockLightningBackend;
+pub use swap::{
+    HtlcFunded, SwapError, SwapHtlc, SwapInAccept, SwapInMaker, SwapInParams, SwapInRequest,
+    SwapInTaker,
+};
+pub use swap_out::{SwapOutAccept, SwapOutMaker, SwapOutParams, SwapOutRequest, SwapOutTaker};
 pub use types::{
     Balances, Bolt11Invoice, ChannelId, ChannelInfo, ChannelState, InvoiceParams, LnEvent,
     NodeInfo, OpenChannelRequest, PaymentId, Preimage,
