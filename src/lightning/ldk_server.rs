@@ -114,9 +114,12 @@ impl LdkServerBackend {
     where
         F: Future<Output = Result<T, LdkServerError>>,
     {
+        let timeout = self.timeout;
+        // The timeout future must be constructed *inside* the runtime: its
+        // timer registers with the reactor at creation time.
         match self
             .runtime
-            .block_on(tokio::time::timeout(self.timeout, fut))
+            .block_on(async move { tokio::time::timeout(timeout, fut).await })
         {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(e)) => Err(convert_error(e)),

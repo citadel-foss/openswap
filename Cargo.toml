@@ -61,3 +61,20 @@ lightning = ["dep:ldk-server-client", "dep:tokio"]
 
 [package.metadata.cargo-machete]
 ignored = ["rustls"]
+
+# Lightning examples only build with the `lightning` feature enabled.
+[[example]]
+name = "ldk_smoke"
+required-features = ["lightning"]
+
+[[example]]
+name = "ldk_cycle"
+required-features = ["lightning"]
+
+[[example]]
+name = "ln_swap_in"
+required-features = ["lightning"]
+
+[[example]]
+name = "ln_swap_out"
+required-features = ["lightning"]
