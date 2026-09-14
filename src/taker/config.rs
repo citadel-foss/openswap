@@ -19,6 +19,12 @@ pub struct TakerConfig {
     pub tor_auth_password: String,
     /// Whether funding inputs should be checked against the address blocklist.
     pub check_blocklist: bool,
+    /// LDK Server gRPC address (`host:port`, no scheme) for Lightning swaps.
+    pub ldk_server_url: Option<String>,
+    /// Path to the LDK Server API key file.
+    pub ldk_api_key_path: Option<String>,
+    /// Path to the LDK Server TLS certificate.
+    pub ldk_tls_cert_path: Option<String>,
 }
 
 impl Default for TakerConfig {
@@ -28,6 +34,9 @@ impl Default for TakerConfig {
             socks_port: 9050,
             tor_auth_password: "".to_string(),
             check_blocklist: false,
+            ldk_server_url: None,
+            ldk_api_key_path: None,
+            ldk_tls_cert_path: None,
         }
     }
 }
@@ -76,6 +85,9 @@ impl TakerConfig {
                 config_map.get("check_blocklist"),
                 default_config.check_blocklist,
             ),
+            ldk_server_url: config_map.get("ldk_server_url").cloned(),
+            ldk_api_key_path: config_map.get("ldk_api_key_path").cloned(),
+            ldk_tls_cert_path: config_map.get("ldk_tls_cert_path").cloned(),
         })
     }
 
@@ -94,6 +106,22 @@ tor_auth_password = {}
 check_blocklist = {}",
             self.control_port, self.socks_port, self.tor_auth_password, self.check_blocklist,
         );
+        let mut toml_data = toml_data;
+        if let Some(url) = &self.ldk_server_url {
+            toml_data.push_str(&format!(
+                "\n# LDK Server gRPC address (host:port, no scheme) for Lightning swaps\nldk_server_url = {url}"
+            ));
+        }
+        if let Some(path) = &self.ldk_api_key_path {
+            toml_data.push_str(&format!(
+                "\n# Path to the LDK Server API key file\nldk_api_key_path = {path}"
+            ));
+        }
+        if let Some(path) = &self.ldk_tls_cert_path {
+            toml_data.push_str(&format!(
+                "\n# Path to the LDK Server TLS certificate\nldk_tls_cert_path = {path}"
+            ));
+        }
 
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(

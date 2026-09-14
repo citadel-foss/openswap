@@ -1929,6 +1929,7 @@ impl MakerAddress {
             },
             tweak_chain_code: router_offer.tweak_chain_code,
             name: router_offer.name,
+            lightning: router_offer.lightning,
         };
 
         log::info!(
@@ -2126,6 +2127,7 @@ mod tests {
             },
             tweak_chain_code: bitcoin::bip32::ChainCode::from([0u8; 32]),
             name: "maker".to_string(),
+            lightning: None,
         }
     }
 

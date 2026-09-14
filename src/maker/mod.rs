@@ -15,6 +15,8 @@ mod rpc;
 
 pub mod legacy_handlers;
 mod legacy_verification;
+#[cfg(feature = "lightning")]
+pub mod lightning_handlers;
 pub mod taproot_handlers;
 mod taproot_verification;
 

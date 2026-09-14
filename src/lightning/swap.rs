@@ -194,6 +194,17 @@ impl SwapHtlc {
         }
     }
 
+    /// Rebuilds an HTLC from a stored witness script and locktime, for
+    /// recovery flows that persist the script rather than its parameters.
+    /// The caller is responsible for `redeemscript` actually being a swap
+    /// HTLC script with this `locktime`.
+    pub fn from_redeemscript(redeemscript: ScriptBuf, locktime: u16) -> Self {
+        Self {
+            redeemscript,
+            locktime,
+        }
+    }
+
     /// The HTLC witness script.
     pub fn redeemscript(&self) -> &ScriptBuf {
         &self.redeemscript

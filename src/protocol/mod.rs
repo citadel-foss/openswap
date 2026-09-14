@@ -2,6 +2,7 @@
 
 pub mod common_messages;
 pub mod legacy_messages;
+pub mod lightning_messages;
 pub mod taproot_messages;
 
 pub(crate) mod contract;

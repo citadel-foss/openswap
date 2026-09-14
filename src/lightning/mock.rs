@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use bitcoin::{
@@ -42,15 +42,34 @@ struct MockInvoice {
     preimage: Option<Preimage>,
     is_hold: bool,
     status: InvoiceStatus,
+    /// Node that created the invoice (receives `PaymentClaimable` /
+    /// `PaymentReceived`).
+    owner: usize,
+    /// Node that paid it, once paid (receives `PaymentSuccessful` /
+    /// `PaymentFailed`).
+    payer: Option<usize>,
 }
 
+/// Invoice ledger and event routing shared by all nodes of a mock network.
 #[derive(Debug, Default)]
-struct MockState {
+struct SharedLedger {
+    invoices: HashMap<sha256::Hash, MockInvoice>,
+    /// One event queue per node.
+    queues: Vec<VecDeque<LnEvent>>,
+    next_id: u64,
+}
+
+impl SharedLedger {
+    fn push(&mut self, node: usize, event: LnEvent) {
+        self.queues[node].push_back(event);
+    }
+}
+
+/// Per-node state (balances and channels are node-local).
+#[derive(Debug, Default)]
+struct LocalState {
     onchain_balance: Amount,
     channels: Vec<ChannelInfo>,
-    invoices: HashMap<sha256::Hash, MockInvoice>,
-    events: VecDeque<LnEvent>,
-    next_id: u64,
 }
 
 /// A deterministic, in-memory Lightning backend for unit and integration
@@ -58,11 +77,21 @@ struct MockState {
 ///
 /// State transitions that would normally be driven by the network (HTLC
 /// arrival, channel confirmation) are triggered explicitly through the
-/// `simulate_*` helpers. Events are queued FIFO and drained via
+/// `simulate_*` helpers. Events are queued FIFO per node and drained via
 /// [`LightningBackend::poll_event`].
+///
+/// [`MockLightningBackend::new`] creates a standalone node that plays both
+/// ends of its payments (its queue sees both payer- and payee-side events).
+/// [`MockLightningBackend::new_pair`] creates two nodes over one shared
+/// invoice ledger: a payment made on one node parks/settles on the other,
+/// and each node's queue only sees its own side's events — mirroring two
+/// real nodes.
 pub struct MockLightningBackend {
-    state: Mutex<MockState>,
+    local: Mutex<LocalState>,
+    ledger: Arc<Mutex<SharedLedger>>,
+    node_index: usize,
     node_id: PublicKey,
+    node_sk: SecretKey,
 }
 
 impl Default for MockLightningBackend {
@@ -72,31 +101,88 @@ impl Default for MockLightningBackend {
 }
 
 impl MockLightningBackend {
-    /// Creates a mock backend with a fixed node id and zero balances.
-    pub fn new() -> Self {
+    fn with_ledger(ledger: Arc<Mutex<SharedLedger>>, node_index: usize, key_byte: u8) -> Self {
         let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[0x42; 32]).expect("constant key is valid");
+        let sk = SecretKey::from_slice(&[key_byte; 32]).expect("constant key is valid");
         Self {
-            state: Mutex::new(MockState::default()),
+            local: Mutex::new(LocalState::default()),
+            ledger,
+            node_index,
             node_id: PublicKey::from_secret_key(&secp, &sk),
+            node_sk: sk,
         }
+    }
+
+    /// Builds a real, signed BOLT11 invoice string so code under test can
+    /// run genuine invoice verification against mock invoices.
+    fn build_bolt11(
+        &self,
+        payment_hash: sha256::Hash,
+        amount_msat: Option<u64>,
+        description: String,
+    ) -> String {
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+        let secp = Secp256k1::new();
+        let mut secret = [0u8; 32];
+        secret[..32].copy_from_slice(payment_hash.as_byte_array());
+        let builder = InvoiceBuilder::new(Currency::Regtest)
+            .description(description)
+            .payment_hash(payment_hash)
+            .payment_secret(PaymentSecret(secret))
+            .duration_since_epoch(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock after unix epoch"),
+            )
+            .min_final_cltv_expiry_delta(42);
+        let builder = match amount_msat {
+            Some(msat) => builder.amount_milli_satoshis(msat),
+            None => builder,
+        };
+        builder
+            .build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &self.node_sk))
+            .expect("mock invoice construction is infallible")
+            .to_string()
+    }
+
+    /// Creates a standalone mock node with a fixed node id and zero balances.
+    pub fn new() -> Self {
+        let ledger = Arc::new(Mutex::new(SharedLedger {
+            queues: vec![VecDeque::new()],
+            ..Default::default()
+        }));
+        Self::with_ledger(ledger, 0, 0x42)
+    }
+
+    /// Creates two mock nodes sharing one invoice ledger, so payments flow
+    /// between them like between two real nodes.
+    pub fn new_pair() -> (Arc<Self>, Arc<Self>) {
+        let ledger = Arc::new(Mutex::new(SharedLedger {
+            queues: vec![VecDeque::new(), VecDeque::new()],
+            ..Default::default()
+        }));
+        (
+            Arc::new(Self::with_ledger(Arc::clone(&ledger), 0, 0x42)),
+            Arc::new(Self::with_ledger(ledger, 1, 0x43)),
+        )
     }
 
     /// Sets the mock's on-chain balance.
     pub fn set_onchain_balance(&self, amount: Amount) {
-        self.state.lock().unwrap().onchain_balance = amount;
+        self.local.lock().unwrap().onchain_balance = amount;
     }
 
     /// Simulates the arrival of an HTLC paying the hold invoice registered
-    /// for `payment_hash`, queuing a [`LnEvent::PaymentClaimable`].
+    /// for `payment_hash`, queuing a [`LnEvent::PaymentClaimable`] on the
+    /// invoice owner's node.
     ///
     /// # Panics
     ///
     /// Panics if no hold invoice is registered for `payment_hash` or the
     /// invoice is not open (test misuse).
     pub fn simulate_htlc_arrival(&self, payment_hash: sha256::Hash, amount_msat: u64) {
-        let mut state = self.state.lock().unwrap();
-        let invoice = state
+        let mut ledger = self.ledger.lock().unwrap();
+        let invoice = ledger
             .invoices
             .get_mut(&payment_hash)
             .expect("simulate_htlc_arrival: unknown payment hash");
@@ -107,12 +193,16 @@ impl MockLightningBackend {
             "simulate_htlc_arrival: invoice not open"
         );
         invoice.status = InvoiceStatus::Held { amount_msat };
-        state.events.push_back(LnEvent::PaymentClaimable {
-            payment_id: PaymentId(payment_hash.to_string()),
-            payment_hash: Some(payment_hash),
-            amount_msat: Some(amount_msat),
-            claim_deadline: None,
-        });
+        let owner = invoice.owner;
+        ledger.push(
+            owner,
+            LnEvent::PaymentClaimable {
+                payment_id: PaymentId(payment_hash.to_string()),
+                payment_hash: Some(payment_hash),
+                amount_msat: Some(amount_msat),
+                claim_deadline: None,
+            },
+        );
     }
 
     /// Marks the channel `channel_id` as ready, queuing a
@@ -122,8 +212,8 @@ impl MockLightningBackend {
     ///
     /// Panics if the channel does not exist (test misuse).
     pub fn simulate_channel_ready(&self, channel_id: &ChannelId) {
-        let mut state = self.state.lock().unwrap();
-        let channel = state
+        let mut local = self.local.lock().unwrap();
+        let channel = local
             .channels
             .iter_mut()
             .find(|c| &c.user_channel_id == channel_id)
@@ -135,12 +225,13 @@ impl MockLightningBackend {
             counterparty: Some(channel.counterparty),
             state: ChannelState::Ready,
         };
-        state.events.push_back(event);
+        self.ledger.lock().unwrap().push(self.node_index, event);
     }
 
-    fn next_id(state: &mut MockState) -> u64 {
-        state.next_id += 1;
-        state.next_id
+    fn next_id(&self) -> u64 {
+        let mut ledger = self.ledger.lock().unwrap();
+        ledger.next_id += 1;
+        ledger.next_id
     }
 }
 
@@ -154,24 +245,23 @@ impl LightningBackend for MockLightningBackend {
     }
 
     fn balances(&self) -> Result<Balances, LightningError> {
-        let state = self.state.lock()?;
-        let total_lightning_msat: u64 = state
+        let local = self.local.lock()?;
+        let total_lightning_msat: u64 = local
             .channels
             .iter()
             .filter(|c| c.state == ChannelState::Ready || c.state == ChannelState::Pending)
             .map(|c| c.outbound_capacity_msat)
             .sum();
         Ok(Balances {
-            total_onchain: state.onchain_balance,
-            spendable_onchain: state.onchain_balance,
+            total_onchain: local.onchain_balance,
+            spendable_onchain: local.onchain_balance,
             anchor_reserve: Amount::ZERO,
             total_lightning: Amount::from_sat(total_lightning_msat / 1000),
         })
     }
 
     fn new_onchain_address(&self) -> Result<Address, LightningError> {
-        let mut state = self.state.lock()?;
-        let id = Self::next_id(&mut state);
+        let id = self.next_id();
         let secp = Secp256k1::new();
         let mut sk_bytes = [0u8; 32];
         sk_bytes[..8].copy_from_slice(&id.to_be_bytes());
@@ -188,32 +278,36 @@ impl LightningBackend for MockLightningBackend {
         amount: Option<Amount>,
         _fee_rate_sat_vb: Option<u64>,
     ) -> Result<Txid, LightningError> {
-        let mut state = self.state.lock()?;
+        let mut local = self.local.lock()?;
         match amount {
             Some(amount) => {
-                if amount > state.onchain_balance {
+                if amount > local.onchain_balance {
                     return Err(LightningError::InsufficientFunds);
                 }
-                state.onchain_balance -= amount;
+                local.onchain_balance -= amount;
             }
-            None => state.onchain_balance = Amount::ZERO,
+            None => local.onchain_balance = Amount::ZERO,
         }
-        let id = Self::next_id(&mut state);
+        drop(local);
+        let id = self.next_id();
         let mut txid_bytes = [0u8; 32];
         txid_bytes[..8].copy_from_slice(&id.to_be_bytes());
         Ok(Txid::from_byte_array(txid_bytes))
     }
 
     fn open_channel(&self, req: OpenChannelRequest) -> Result<ChannelId, LightningError> {
-        let mut state = self.state.lock()?;
-        if req.channel_amount > state.onchain_balance {
-            return Err(LightningError::InsufficientFunds);
+        {
+            let local = self.local.lock()?;
+            if req.channel_amount > local.onchain_balance {
+                return Err(LightningError::InsufficientFunds);
+            }
         }
-        state.onchain_balance -= req.channel_amount;
-        let id = Self::next_id(&mut state);
+        let id = self.next_id();
+        let mut local = self.local.lock()?;
+        local.onchain_balance -= req.channel_amount;
         let channel_id = ChannelId(format!("mock-chan-{id}"));
         let push_msat = req.push_to_counterparty_msat.unwrap_or(0);
-        state.channels.push(ChannelInfo {
+        local.channels.push(ChannelInfo {
             channel_id: format!("{id:064x}"),
             user_channel_id: channel_id.clone(),
             counterparty: req.node_pubkey,
@@ -234,8 +328,8 @@ impl LightningBackend for MockLightningBackend {
         counterparty: &PublicKey,
         _force: bool,
     ) -> Result<(), LightningError> {
-        let mut state = self.state.lock()?;
-        let channel = state
+        let mut local = self.local.lock()?;
+        let channel = local
             .channels
             .iter_mut()
             .find(|c| &c.user_channel_id == channel_id && &c.counterparty == counterparty)
@@ -253,24 +347,24 @@ impl LightningBackend for MockLightningBackend {
             counterparty: Some(channel.counterparty),
             state: ChannelState::Closed,
         };
-        state.onchain_balance += refund;
-        state.events.push_back(event);
+        local.onchain_balance += refund;
+        drop(local);
+        self.ledger.lock()?.push(self.node_index, event);
         Ok(())
     }
 
     fn list_channels(&self) -> Result<Vec<ChannelInfo>, LightningError> {
-        Ok(self.state.lock()?.channels.clone())
+        Ok(self.local.lock()?.channels.clone())
     }
 
     fn create_invoice(&self, params: InvoiceParams) -> Result<Bolt11Invoice, LightningError> {
-        let mut state = self.state.lock()?;
-        let id = Self::next_id(&mut state);
+        let id = self.next_id();
         let mut preimage_bytes = [0u8; 32];
         preimage_bytes[..8].copy_from_slice(&id.to_be_bytes());
         let preimage = Preimage(preimage_bytes);
         let payment_hash = preimage.payment_hash();
-        let invoice = format!("lnbcrt-mock-{payment_hash}");
-        state.invoices.insert(
+        let invoice = self.build_bolt11(payment_hash, params.amount_msat, params.description);
+        self.ledger.lock()?.invoices.insert(
             payment_hash,
             MockInvoice {
                 invoice: invoice.clone(),
@@ -278,6 +372,8 @@ impl LightningBackend for MockLightningBackend {
                 preimage: Some(preimage),
                 is_hold: false,
                 status: InvoiceStatus::Open,
+                owner: self.node_index,
+                payer: None,
             },
         );
         Ok(Bolt11Invoice {
@@ -291,8 +387,8 @@ impl LightningBackend for MockLightningBackend {
         invoice: &str,
         amount_msat: Option<u64>,
     ) -> Result<PaymentId, LightningError> {
-        let mut state = self.state.lock()?;
-        let (payment_hash, entry) = state
+        let mut ledger = self.ledger.lock()?;
+        let (payment_hash, entry) = ledger
             .invoices
             .iter_mut()
             .find(|(_, inv)| inv.invoice == invoice)
@@ -312,30 +408,41 @@ impl LightningBackend for MockLightningBackend {
                 ))
             }
         };
+        entry.payer = Some(self.node_index);
+        let owner = entry.owner;
         if entry.is_hold {
-            // Paying a hold invoice held by this same mock: the payment stays
-            // pending until claimed/failed by the receiver side.
+            // The payment parks at the invoice owner's node until it is
+            // claimed or failed by that side.
             entry.status = InvoiceStatus::Held { amount_msat };
-            state.events.push_back(LnEvent::PaymentClaimable {
-                payment_id: PaymentId(payment_hash.to_string()),
-                payment_hash: Some(payment_hash),
-                amount_msat: Some(amount_msat),
-                claim_deadline: None,
-            });
+            ledger.push(
+                owner,
+                LnEvent::PaymentClaimable {
+                    payment_id: PaymentId(payment_hash.to_string()),
+                    payment_hash: Some(payment_hash),
+                    amount_msat: Some(amount_msat),
+                    claim_deadline: None,
+                },
+            );
         } else {
             entry.status = InvoiceStatus::Settled;
             let preimage = entry.preimage;
-            state.events.push_back(LnEvent::PaymentSuccessful {
-                payment_id: PaymentId(payment_hash.to_string()),
-                payment_hash: Some(payment_hash),
-                preimage,
-                fee_paid_msat: Some(0),
-            });
-            state.events.push_back(LnEvent::PaymentReceived {
-                payment_id: PaymentId(payment_hash.to_string()),
-                payment_hash: Some(payment_hash),
-                amount_msat: Some(amount_msat),
-            });
+            ledger.push(
+                self.node_index,
+                LnEvent::PaymentSuccessful {
+                    payment_id: PaymentId(payment_hash.to_string()),
+                    payment_hash: Some(payment_hash),
+                    preimage,
+                    fee_paid_msat: Some(0),
+                },
+            );
+            ledger.push(
+                owner,
+                LnEvent::PaymentReceived {
+                    payment_id: PaymentId(payment_hash.to_string()),
+                    payment_hash: Some(payment_hash),
+                    amount_msat: Some(amount_msat),
+                },
+            );
         }
         Ok(PaymentId(payment_hash.to_string()))
     }
@@ -345,14 +452,14 @@ impl LightningBackend for MockLightningBackend {
         payment_hash: sha256::Hash,
         params: InvoiceParams,
     ) -> Result<Bolt11Invoice, LightningError> {
-        let mut state = self.state.lock()?;
-        if state.invoices.contains_key(&payment_hash) {
+        let invoice = self.build_bolt11(payment_hash, params.amount_msat, params.description);
+        let mut ledger = self.ledger.lock()?;
+        if ledger.invoices.contains_key(&payment_hash) {
             return Err(LightningError::General(format!(
                 "invoice already exists for hash: {payment_hash}"
             )));
         }
-        let invoice = format!("lnbcrt-mock-hold-{payment_hash}");
-        state.invoices.insert(
+        ledger.invoices.insert(
             payment_hash,
             MockInvoice {
                 invoice: invoice.clone(),
@@ -360,6 +467,8 @@ impl LightningBackend for MockLightningBackend {
                 preimage: None,
                 is_hold: true,
                 status: InvoiceStatus::Open,
+                owner: self.node_index,
+                payer: None,
             },
         );
         Ok(Bolt11Invoice {
@@ -369,52 +478,69 @@ impl LightningBackend for MockLightningBackend {
     }
 
     fn claim_held_payment(&self, preimage: &Preimage) -> Result<(), LightningError> {
-        let mut state = self.state.lock()?;
+        let mut ledger = self.ledger.lock()?;
         let payment_hash = preimage.payment_hash();
-        let amount_msat = match state.invoices.get_mut(&payment_hash) {
+        let (amount_msat, owner, payer) = match ledger.invoices.get_mut(&payment_hash) {
             Some(invoice) if invoice.is_hold => match invoice.status {
                 InvoiceStatus::Held { amount_msat } => {
                     invoice.status = InvoiceStatus::Settled;
                     invoice.preimage = Some(*preimage);
-                    amount_msat
+                    (amount_msat, invoice.owner, invoice.payer)
                 }
                 _ => return Err(LightningError::PaymentNotFound),
             },
             _ => return Err(LightningError::PaymentNotFound),
         };
-        // Payer-side settlement event, mirroring the real backend where the
-        // claim releases the preimage to the payer via `PaymentSuccessful`.
-        // The mock plays both ends of the payment, so it queues both events.
-        state.events.push_back(LnEvent::PaymentSuccessful {
-            payment_id: PaymentId(payment_hash.to_string()),
-            payment_hash: Some(payment_hash),
-            preimage: Some(*preimage),
-            fee_paid_msat: Some(0),
-        });
-        state.events.push_back(LnEvent::PaymentReceived {
-            payment_id: PaymentId(payment_hash.to_string()),
-            payment_hash: Some(payment_hash),
-            amount_msat: Some(amount_msat),
-        });
+        // The claim releases the preimage to the payer via
+        // `PaymentSuccessful` and settles the owner via `PaymentReceived`.
+        // A standalone node (or a simulated arrival with no payer) plays
+        // both ends and sees both events on its own queue.
+        ledger.push(
+            payer.unwrap_or(owner),
+            LnEvent::PaymentSuccessful {
+                payment_id: PaymentId(payment_hash.to_string()),
+                payment_hash: Some(payment_hash),
+                preimage: Some(*preimage),
+                fee_paid_msat: Some(0),
+            },
+        );
+        ledger.push(
+            owner,
+            LnEvent::PaymentReceived {
+                payment_id: PaymentId(payment_hash.to_string()),
+                payment_hash: Some(payment_hash),
+                amount_msat: Some(amount_msat),
+            },
+        );
         Ok(())
     }
 
     fn fail_held_payment(&self, payment_hash: sha256::Hash) -> Result<(), LightningError> {
-        let mut state = self.state.lock()?;
-        match state.invoices.get_mut(&payment_hash) {
+        let mut ledger = self.ledger.lock()?;
+        let payer = match ledger.invoices.get_mut(&payment_hash) {
             Some(invoice) if invoice.is_hold => match invoice.status {
                 InvoiceStatus::Open | InvoiceStatus::Held { .. } => {
                     invoice.status = InvoiceStatus::Cancelled;
-                    Ok(())
+                    invoice.payer
                 }
-                _ => Err(LightningError::PaymentNotFound),
+                _ => return Err(LightningError::PaymentNotFound),
             },
-            _ => Err(LightningError::PaymentNotFound),
+            _ => return Err(LightningError::PaymentNotFound),
+        };
+        if let Some(payer) = payer {
+            ledger.push(
+                payer,
+                LnEvent::PaymentFailed {
+                    payment_id: PaymentId(payment_hash.to_string()),
+                    payment_hash: Some(payment_hash),
+                },
+            );
         }
+        Ok(())
     }
 
     fn poll_event(&self) -> Result<Option<LnEvent>, LightningError> {
-        Ok(self.state.lock()?.events.pop_front())
+        Ok(self.ledger.lock()?.queues[self.node_index].pop_front())
     }
 }
 
@@ -494,6 +620,62 @@ mod tests {
         assert!(matches!(
             mock.claim_held_payment(&preimage),
             Err(LightningError::PaymentNotFound)
+        ));
+    }
+
+    /// The paired mode routes each side's events to its own node: the payer
+    /// sees `PaymentSuccessful`/`PaymentFailed`, the invoice owner sees
+    /// `PaymentClaimable`/`PaymentReceived`, and neither steals the other's.
+    #[test]
+    fn paired_nodes_route_events_to_their_own_queues() {
+        let (owner, payer) = MockLightningBackend::new_pair();
+        let preimage = Preimage([7u8; 32]);
+        let payment_hash = preimage.payment_hash();
+
+        let invoice = owner
+            .create_hold_invoice(payment_hash, InvoiceParams::default())
+            .unwrap();
+        payer.pay_invoice(&invoice.invoice, Some(50_000)).unwrap();
+
+        // The held payment parks at the owner; the payer sees nothing yet.
+        assert!(payer.poll_event().unwrap().is_none());
+        assert!(matches!(
+            owner.poll_event().unwrap(),
+            Some(LnEvent::PaymentClaimable { .. })
+        ));
+
+        owner.claim_held_payment(&preimage).unwrap();
+        // Settlement: preimage goes to the payer, receipt to the owner.
+        match payer.poll_event().unwrap() {
+            Some(LnEvent::PaymentSuccessful {
+                preimage: released, ..
+            }) => assert_eq!(released, Some(preimage)),
+            other => panic!("expected PaymentSuccessful, got {:?}", other),
+        }
+        assert!(matches!(
+            owner.poll_event().unwrap(),
+            Some(LnEvent::PaymentReceived { .. })
+        ));
+        assert!(payer.poll_event().unwrap().is_none());
+        assert!(owner.poll_event().unwrap().is_none());
+    }
+
+    /// Failing a held payment notifies the payer.
+    #[test]
+    fn paired_fail_held_payment_notifies_payer() {
+        let (owner, payer) = MockLightningBackend::new_pair();
+        let preimage = Preimage([9u8; 32]);
+        let payment_hash = preimage.payment_hash();
+        let invoice = owner
+            .create_hold_invoice(payment_hash, InvoiceParams::default())
+            .unwrap();
+        payer.pay_invoice(&invoice.invoice, Some(1_000)).unwrap();
+        let _ = owner.poll_event().unwrap();
+
+        owner.fail_held_payment(payment_hash).unwrap();
+        assert!(matches!(
+            payer.poll_event().unwrap(),
+            Some(LnEvent::PaymentFailed { .. })
         ));
     }
 
