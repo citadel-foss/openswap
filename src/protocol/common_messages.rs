@@ -9,6 +9,7 @@ use super::{
         ReqContractSigsForSender, RespContractSigsForRecvr, RespContractSigsForRecvrAndSender,
         RespContractSigsForSender,
     },
+    lightning_messages::{LightningMakerMessage, LightningOffer, LightningTakerMessage},
     taproot_messages::TaprootContractData,
 };
 use crate::wallet::FidelityBond;
@@ -79,6 +80,12 @@ pub struct Offer {
     pub fidelity: FidelityProof,
     /// Chain code for deterministic derivation of swap addresses from the tweakable point.
     pub tweak_chain_code: ChainCode,
+    /// Lightning submarine-swap terms, present only when the maker offers
+    /// them. Optional with a serde default so peers that predate Lightning
+    /// support keep (de)serializing offers unchanged: CBOR structs are maps,
+    /// unknown keys are ignored and missing keys fall back to `None`.
+    #[serde(default)]
+    pub lightning: Option<LightningOffer>,
 }
 
 impl Offer {
@@ -212,6 +219,15 @@ pub enum TakerToMakerMessage {
     TaprootPrivateKeyHandover(PrivateKeyHandover),
     /// Taker keepalive while waiting for funding confirmation.
     WaitingFundingConfirmation(String),
+    /// Lightning submarine-swap message family. Send only to makers whose
+    /// [`Offer::lightning`] advertised support; older peers fail to decode
+    /// unknown variants and drop the connection.
+    Lightning(Box<LightningTakerMessage>),
+    /// The peer sent a message family this side does not support. Carries
+    /// the rejected variant's name so the peer can log/report it. Added
+    /// alongside the Lightning family so future extensions can be declined
+    /// gracefully instead of by connection drop.
+    Unsupported(UnsupportedMessage),
 }
 
 /// All messages sent from Maker to Taker.
@@ -235,4 +251,22 @@ pub enum MakerToTakerMessage {
     TaprootContractData(Box<TaprootContractData>),
     /// Taproot private key handover.
     TaprootPrivateKeyHandover(PrivateKeyHandover),
+    /// Lightning submarine-swap message family.
+    Lightning(Box<LightningMakerMessage>),
+    /// The peer sent a message family this side does not support. See
+    /// [`TakerToMakerMessage::Unsupported`].
+    Unsupported(UnsupportedMessage),
+}
+
+/// Graceful rejection of a message family the receiver does not handle.
+///
+/// Both sides understand this variant from the release that introduced the
+/// Lightning family onward, so a capable-but-unconfigured peer can decline a
+/// request with a reason instead of a dropped connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnsupportedMessage {
+    /// Name of the message (family) that was rejected.
+    pub what: String,
+    /// Human-readable reason.
+    pub reason: String,
 }

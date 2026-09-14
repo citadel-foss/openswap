@@ -45,6 +45,7 @@ crossbeam-channel = "0.5.15"
 # `ldk-server-client` is unpublished; pinned to a specific upstream commit.
 ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "3e9e537144830d0b8debf62ebc1f723d75f45e31", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"], optional = true }
+lightning-invoice = { version = "0.32", features = ["std"], optional = true }
 
 [dev-dependencies]
 flate2 = {version = "1.0.35"}
@@ -58,7 +59,7 @@ default = []
 # Only used for running the integration tests
 integration-test = []
 # Lightning backend over an LDK Server sidecar (gRPC).
-lightning = ["dep:ldk-server-client", "dep:tokio"]
+lightning = ["dep:ldk-server-client", "dep:tokio", "dep:lightning-invoice"]
 
 [package.metadata.cargo-machete]
 ignored = ["rustls"]

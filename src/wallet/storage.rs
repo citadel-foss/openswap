@@ -218,6 +218,35 @@ pub(crate) struct WalletStore {
     /// swap, so one swap's release must never free another's inputs.
     #[serde(default)]
     pub(crate) swap_locks: HashMap<String, SwapReservation>,
+
+    /// Pending Lightning submarine swaps by swap_id (hex payment hash).
+    /// Everything needed to claim or refund the on-chain HTLC after a crash.
+    #[serde(default)]
+    pub(crate) ln_pending_swaps: HashMap<String, LnPendingSwap>,
+}
+
+/// Taker-side recovery record for a Lightning submarine swap.
+///
+/// Persisted (encrypted with the rest of the store) before any value is
+/// committed, so a crashed taker can always claim (preimage present) or
+/// refund (timelock branch) the on-chain HTLC.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LnPendingSwap {
+    /// Whether this is a swap-in (`true`: we funded, refund branch is ours)
+    /// or a swap-out (`false`: we claim via hashlock with the preimage).
+    pub is_swap_in: bool,
+    /// The swap preimage; only for swap-outs (we generated it).
+    pub preimage: Option<[u8; 32]>,
+    /// The HTLC witness script.
+    pub redeemscript: ScriptBuf,
+    /// Relative locktime (blocks, CSV) of the refund branch.
+    pub locktime: u16,
+    /// Our branch key: timelock (swap-in) or hashlock (swap-out).
+    pub privkey: bitcoin::secp256k1::SecretKey,
+    /// The HTLC funding outpoint, once known.
+    pub outpoint: Option<OutPoint>,
+    /// The HTLC funding value, once known.
+    pub value: Option<bitcoin::Amount>,
 }
 
 impl WalletStore {
@@ -250,6 +279,7 @@ impl WalletStore {
             wallet_birthday,
             utxo_cache: HashMap::new(),
             swap_locks: HashMap::new(),
+            ln_pending_swaps: HashMap::new(),
         };
         store.master_key.seal(store_enc_material)?;
 

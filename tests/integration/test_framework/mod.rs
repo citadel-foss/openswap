@@ -51,6 +51,13 @@ use openswap::{
 
 const BITCOIN_VERSION: &str = "28.1";
 
+/// Lightning backends to inject into the makers created by the next
+/// [`TestFramework::init`] call (popped one per maker, in reverse order).
+/// Lets a lightning test hand each in-process maker a mock Lightning node.
+#[cfg(feature = "lightning")]
+pub static LN_MAKER_INJECT: Mutex<Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>> =
+    Mutex::new(Vec::new());
+
 fn download_bitcoind_tarball(download_url: &str, retries: usize) -> Vec<u8> {
     for attempt in 1..=retries {
         let response = minreq::get(download_url).send();
@@ -1106,6 +1113,10 @@ impl TestFramework {
                     server.behavior = maker_behaviors.get(i).copied().unwrap_or_default();
                     *server.reserved_network_listener.lock().unwrap() = Some(network_listener);
                     *server.reserved_rpc_listener.lock().unwrap() = Some(rpc_listener);
+                    #[cfg(feature = "lightning")]
+                    if let Some(backend) = LN_MAKER_INJECT.lock().unwrap().pop() {
+                        server.set_lightning_backend(backend);
+                    }
                     Arc::new(server)
                 })
                 .collect();
