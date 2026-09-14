@@ -17,6 +17,12 @@ pub struct TakerConfig {
     pub socks_port: u16,
     /// Authentication password for Tor interface
     pub tor_auth_password: String,
+    /// LDK Server gRPC address (`host:port`, no scheme) for Lightning swaps.
+    pub ldk_server_url: Option<String>,
+    /// Path to the LDK Server API key file.
+    pub ldk_api_key_path: Option<String>,
+    /// Path to the LDK Server TLS certificate.
+    pub ldk_tls_cert_path: Option<String>,
 }
 
 impl Default for TakerConfig {
@@ -25,6 +31,9 @@ impl Default for TakerConfig {
             control_port: 9051,
             socks_port: 9050,
             tor_auth_password: "".to_string(),
+            ldk_server_url: None,
+            ldk_api_key_path: None,
+            ldk_tls_cert_path: None,
         }
     }
 }
@@ -69,6 +78,9 @@ impl TakerConfig {
                 config_map.get("tor_auth_password"),
                 default_config.tor_auth_password,
             ),
+            ldk_server_url: config_map.get("ldk_server_url").cloned(),
+            ldk_api_key_path: config_map.get("ldk_api_key_path").cloned(),
+            ldk_tls_cert_path: config_map.get("ldk_tls_cert_path").cloned(),
         })
     }
 
@@ -85,6 +97,22 @@ socks_port = {}
 tor_auth_password = {}",
             self.control_port, self.socks_port, self.tor_auth_password,
         );
+        let mut toml_data = toml_data;
+        if let Some(url) = &self.ldk_server_url {
+            toml_data.push_str(&format!(
+                "\n# LDK Server gRPC address (host:port, no scheme) for Lightning swaps\nldk_server_url = {url}"
+            ));
+        }
+        if let Some(path) = &self.ldk_api_key_path {
+            toml_data.push_str(&format!(
+                "\n# Path to the LDK Server API key file\nldk_api_key_path = {path}"
+            ));
+        }
+        if let Some(path) = &self.ldk_tls_cert_path {
+            toml_data.push_str(&format!(
+                "\n# Path to the LDK Server TLS certificate\nldk_tls_cert_path = {path}"
+            ));
+        }
 
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(

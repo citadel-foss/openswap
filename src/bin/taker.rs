@@ -172,6 +172,40 @@ enum Commands {
     /// Recover from all failed swaps
     Recover,
 
+    /// Swap on-chain BTC for Lightning balance via a maker (submarine swap-in).
+    #[cfg(feature = "lightning")]
+    LnSwapIn {
+        /// Swap amount in sats (received on Lightning).
+        #[clap(long, short = 'a')]
+        amount: u64,
+        /// Maker address; picked from the offerbook when omitted.
+        #[clap(long = "maker-address")]
+        maker_address: Option<String>,
+        /// On-chain refund locktime in blocks (default derived from the invoice CLTV).
+        #[clap(long)]
+        locktime: Option<u16>,
+        /// Confirmations required on the HTLC funding output.
+        #[clap(long, default_value = "1")]
+        min_confirmations: u32,
+    },
+
+    /// Swap Lightning balance for on-chain BTC via a maker (reverse submarine swap).
+    #[cfg(feature = "lightning")]
+    LnSwapOut {
+        /// Swap amount in sats (received on-chain).
+        #[clap(long, short = 'a')]
+        amount: u64,
+        /// Maker address; picked from the offerbook when omitted.
+        #[clap(long = "maker-address")]
+        maker_address: Option<String>,
+        /// On-chain refund locktime in blocks.
+        #[clap(long)]
+        locktime: Option<u16>,
+        /// Confirmations required on the HTLC funding output.
+        #[clap(long, default_value = "1")]
+        min_confirmations: u32,
+    },
+
     /// Backup the selected wallet.
     ///
     /// You can specify a custom wallet using the default `-w, --WALLET` parameter:
@@ -376,6 +410,9 @@ fn main() -> Result<(), TakerError> {
         data_dir: Some(data_dir),
         socks_port: file_config.socks_port,
         control_port: Some(file_config.control_port),
+        ldk_server_url: file_config.ldk_server_url.clone(),
+        ldk_api_key_path: file_config.ldk_api_key_path.clone(),
+        ldk_tls_cert_path: file_config.ldk_tls_cert_path.clone(),
         tor_auth_password: args.tor_auth.clone().or_else(|| {
             (!file_config.tor_auth_password.is_empty()).then_some(file_config.tor_auth_password)
         }),
@@ -663,6 +700,54 @@ fn main() -> Result<(), TakerError> {
             if !taker.wait_for_recovery() {
                 log::warn!("Recovery did not finish; re-run `taker recover`");
             }
+            #[cfg(feature = "lightning")]
+            for outcome in taker.recover_lightning_swaps()? {
+                println!("{outcome}");
+            }
+        }
+        #[cfg(feature = "lightning")]
+        Commands::LnSwapIn {
+            amount,
+            maker_address,
+            locktime,
+            min_confirmations,
+        } => {
+            let report =
+                taker.lightning_swap_in(openswap::taker::lightning_swap::LnSwapParams {
+                    amount: Amount::from_sat(*amount),
+                    maker_address: maker_address.clone(),
+                    locktime: *locktime,
+                    min_confirmations: *min_confirmations,
+                })?;
+            println!(
+                "swap-in complete: {} sats to Lightning via {} (fee {} sats, HTLC {})",
+                report.amount.to_sat(),
+                report.maker,
+                report.fee.to_sat(),
+                report.funding_outpoint
+            );
+        }
+        #[cfg(feature = "lightning")]
+        Commands::LnSwapOut {
+            amount,
+            maker_address,
+            locktime,
+            min_confirmations,
+        } => {
+            let report =
+                taker.lightning_swap_out(openswap::taker::lightning_swap::LnSwapParams {
+                    amount: Amount::from_sat(*amount),
+                    maker_address: maker_address.clone(),
+                    locktime: *locktime,
+                    min_confirmations: *min_confirmations,
+                })?;
+            println!(
+                "swap-out complete: {} sats to on-chain via {} (fee {} sats, claim {})",
+                report.amount.to_sat(),
+                report.maker,
+                report.fee.to_sat(),
+                report.claim_txid.map(|t| t.to_string()).unwrap_or_default()
+            );
         }
         Commands::Backup => {
             let wallet = lock_debug!(taker.get_wallet().read()).unwrap();

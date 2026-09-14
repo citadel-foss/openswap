@@ -12,6 +12,8 @@ pub mod api;
 mod background_services;
 mod legacy_swap;
 mod legacy_verification;
+#[cfg(feature = "lightning")]
+pub mod lightning_swap;
 mod payment;
 pub mod swap_tracker;
 mod taproot_swap;

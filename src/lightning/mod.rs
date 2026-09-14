@@ -17,6 +17,7 @@
 mod backend;
 mod config;
 mod error;
+pub mod invoice;
 mod ldk_server;
 #[cfg(any(test, feature = "integration-test"))]
 mod mock;
