@@ -397,6 +397,56 @@ pub trait Maker: Send + Sync {
     /// Get the test behavior override.
     #[cfg(feature = "integration-test")]
     fn behavior(&self) -> MakerBehavior;
+
+    /// The Lightning backend, when configured. Default: none, which makes
+    /// every Lightning request answer `Unsupported`.
+    #[cfg(feature = "lightning")]
+    fn lightning(&self) -> Option<std::sync::Arc<dyn crate::lightning::LightningBackend>> {
+        None
+    }
+
+    /// The Lightning event router, when a backend is configured.
+    #[cfg(feature = "lightning")]
+    fn ln_router(&self) -> Option<std::sync::Arc<super::lightning_handlers::LnEventRouter>> {
+        None
+    }
+
+    /// Store per-swap Lightning state.
+    #[cfg(feature = "lightning")]
+    fn store_ln_swap(
+        &self,
+        _swap_id: &str,
+        _swap: super::lightning_handlers::LnMakerSwap,
+    ) -> Result<(), MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Retrieve per-swap Lightning state.
+    #[cfg(feature = "lightning")]
+    fn get_ln_swap(
+        &self,
+        _swap_id: &str,
+    ) -> Result<Option<super::lightning_handlers::LnMakerSwap>, MakerError> {
+        Ok(None)
+    }
+
+    /// Remove per-swap Lightning state.
+    #[cfg(feature = "lightning")]
+    fn remove_ln_swap(&self, _swap_id: &str) -> Result<(), MakerError> {
+        Ok(())
+    }
+
+    /// A fresh wallet receive address (Lightning HTLC sweeps/refunds land here).
+    #[cfg(feature = "lightning")]
+    fn get_receive_address(&self) -> Result<bitcoin::Address, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Whether server shutdown was requested; bounds blocking waits.
+    #[cfg(feature = "lightning")]
+    fn shutdown_requested(&self) -> bool {
+        false
+    }
 }
 
 pub(super) fn emit_maker_success_report<M: Maker>(
@@ -526,6 +576,9 @@ pub struct MakerConfig {
     pub required_confirms: u32,
     /// Supported protocol versions.
     pub supported_protocols: Vec<ProtocolVersion>,
+    /// Lightning submarine-swap terms, when a Lightning backend is
+    /// configured and reachable.
+    pub lightning: Option<crate::protocol::lightning_messages::LightningOffer>,
 }
 
 /// Message handler
@@ -605,6 +658,37 @@ pub fn handle_message<M: Maker>(
             state.touch();
             Ok(None)
         }
+        TakerToMakerMessage::Lightning(ln_msg) => {
+            #[cfg(feature = "lightning")]
+            {
+                super::lightning_handlers::handle_lightning_message(maker, state, *ln_msg)
+            }
+            #[cfg(not(feature = "lightning"))]
+            {
+                // Decline gracefully: a dropped connection would leave the
+                // taker unable to distinguish "unsupported" from "down".
+                log::info!(
+                    "[{}] Declining Lightning message {} (built without lightning support)",
+                    maker.network_port(),
+                    ln_msg
+                );
+                Ok(Some(MakerToTakerMessage::Unsupported(
+                    crate::protocol::common_messages::UnsupportedMessage {
+                        what: "Lightning".to_string(),
+                        reason: "maker built without lightning support".to_string(),
+                    },
+                )))
+            }
+        }
+        TakerToMakerMessage::Unsupported(unsupported) => {
+            log::warn!(
+                "[{}] Peer declined {}: {}",
+                maker.network_port(),
+                unsupported.what,
+                unsupported.reason
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -665,6 +749,7 @@ fn handle_get_offer<M: Maker>(
         tweakable_point,
         fidelity,
         tweak_chain_code,
+        lightning: config.lightning,
     };
 
     log::info!(

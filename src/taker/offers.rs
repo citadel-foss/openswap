@@ -1262,6 +1262,7 @@ impl MakerAddress {
                 cert_sig: router_offer.fidelity.cert_sig,
             },
             tweak_chain_code: router_offer.tweak_chain_code,
+            lightning: router_offer.lightning,
         };
 
         log::info!(
@@ -1337,6 +1338,7 @@ mod tests {
                 cert_sig,
             },
             tweak_chain_code: bitcoin::bip32::ChainCode::from([0u8; 32]),
+            lightning: None,
         }
     }
 

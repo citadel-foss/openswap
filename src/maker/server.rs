@@ -247,6 +247,9 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         maker.check_swap_liquidity()?;
     }
 
+    #[cfg(feature = "lightning")]
+    spawn_lightning_threads(&maker)?;
+
     // Check for unfinished swapcoins from a previous run and start recovery.
     {
         let (inc, out) = lock_debug!(maker.wallet.read())
@@ -443,6 +446,45 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
 ///
 /// The thread re-reads `highest_fidelity_proof` on every broadcast cycle so
 /// that bond renewals are picked up.
+/// Spawns the Lightning event pump (routes node events to per-swap
+/// mailboxes) and the swap watchdog (settles/refunds swaps whose final
+/// message never arrived). No-ops when no Lightning backend is configured.
+#[cfg(feature = "lightning")]
+fn spawn_lightning_threads(maker: &Arc<MakerServer>) -> Result<(), MakerError> {
+    let Some(router) = maker.ln_router.clone() else {
+        return Ok(());
+    };
+
+    let pump_maker = maker.clone();
+    let pump = std::thread::Builder::new()
+        .name("ln-event-pump".to_string())
+        .spawn(move || {
+            log::info!("Lightning event pump started");
+            while !pump_maker.is_shutdown() {
+                if router.pump_once() == 0 {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            log::info!("Lightning event pump stopped");
+        })
+        .map_err(MakerError::IO)?;
+    maker.thread_pool.add_thread(pump)?;
+
+    let watchdog_maker = maker.clone();
+    let watchdog = std::thread::Builder::new()
+        .name("ln-watchdog".to_string())
+        .spawn(move || {
+            log::info!("Lightning swap watchdog started");
+            while watchdog_maker.wait_for_shutdown(Duration::from_secs(30)) {
+                super::lightning_handlers::ln_watchdog_tick(&watchdog_maker);
+            }
+            log::info!("Lightning swap watchdog stopped");
+        })
+        .map_err(MakerError::IO)?;
+    maker.thread_pool.add_thread(watchdog)?;
+    Ok(())
+}
+
 fn spawn_nostr_broadcast_thread(maker: &Arc<MakerServer>) -> Result<(), MakerError> {
     log::info!(
         "[{}] Spawning nostr background task",

@@ -5,6 +5,8 @@ pub extern crate bitcoind;
 
 pub mod error;
 pub mod fee_estimation;
+#[cfg(feature = "lightning")]
+pub mod lightning;
 pub mod maker;
 pub mod protocol;
 pub mod security;

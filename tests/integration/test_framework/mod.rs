@@ -50,6 +50,13 @@ use openswap::{
 
 const BITCOIN_VERSION: &str = "28.1";
 
+/// Lightning backends to inject into the makers created by the next
+/// [`TestFramework::init`] call (popped one per maker, in reverse order).
+/// Lets a lightning test hand each in-process maker a mock Lightning node.
+#[cfg(feature = "lightning")]
+pub static LN_MAKER_INJECT: Mutex<Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>> =
+    Mutex::new(Vec::new());
+
 fn download_bitcoind_tarball(download_url: &str, retries: usize) -> Vec<u8> {
     for attempt in 1..=retries {
         let response = minreq::get(download_url).send();
@@ -688,7 +695,14 @@ impl TestFramework {
         if temp_dir.exists() {
             fs::remove_dir_all::<PathBuf>(temp_dir.clone()).unwrap();
         }
-        setup_logger(log::LevelFilter::Debug, Some(temp_dir.clone()));
+        // Debug by default; override with e.g. OPENSWAP_TEST_LOG=warn (or
+        // `off`). Applies to both stdout (visible with --nocapture) and the
+        // debug.log files under the test's temp dir.
+        let log_level = env::var("OPENSWAP_TEST_LOG")
+            .ok()
+            .and_then(|level| level.parse().ok())
+            .unwrap_or(log::LevelFilter::Debug);
+        setup_logger(log_level, Some(temp_dir.clone()));
         log::info!("📁 temporary directory : {}", temp_dir.display());
         let zmq_addr = format!("tcp://127.0.0.1:{}", 28332 + rand::random::<u16>() % 1000);
         let bitcoind = init_bitcoind(&temp_dir, zmq_addr.clone());
@@ -780,6 +794,10 @@ impl TestFramework {
 
                     let mut server = MakerServer::init(config).unwrap();
                     server.behavior = maker_behaviors.get(i).copied().unwrap_or_default();
+                    #[cfg(feature = "lightning")]
+                    if let Some(backend) = LN_MAKER_INJECT.lock().unwrap().pop() {
+                        server.set_lightning_backend(backend);
+                    }
                     Arc::new(server)
                 })
                 .collect();
