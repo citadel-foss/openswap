@@ -108,6 +108,12 @@ pub enum MakerBehavior {
     /// Build funding splits at the relay floor while the taker reimburses the
     /// negotiated rate (funding-fee underpayment rejection tests).
     UnderpayFundingFee,
+    /// Ack one input fewer per split than the plan will fund with; only the
+    /// taker's per-split input-count binding can catch it.
+    UnderreportFundingInputs,
+    /// Hold at a barrier between admission planning and reservation, so two
+    /// concurrent admissions plan identical inputs before either may reserve.
+    AdmissionRaceBarrier,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).
@@ -877,6 +883,16 @@ fn handle_swap_details<M: Maker>(
         .map(|split| split.utxos.len() as u32)
         .collect();
     state.funding_plan = stored.funding_plan;
+
+    #[cfg(feature = "integration-test")]
+    let funding_splits = if maker.behavior() == MakerBehavior::UnderreportFundingInputs {
+        funding_splits
+            .iter()
+            .map(|count| count.saturating_sub(1))
+            .collect()
+    } else {
+        funding_splits
+    };
 
     log::info!(
         "[{}] Accepting swap (id: {})",

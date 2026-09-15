@@ -329,7 +329,7 @@ impl OfferBookHandle {
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
         // A preferred maker may have no entry yet; the violation still counts.
         if !book.makers.iter().any(|m| m.address == *address) {
-            book.insert_candidate(address.clone(), None, None, now_ts);
+            book.insert_candidate(address.clone(), None, None, now_ts, false);
         }
         book.mark_failure(address, now_ts);
         if let Some(m) = book.makers.iter_mut().find(|m| &m.address == address) {
@@ -1013,6 +1013,9 @@ fn verify_fidelity_with_backend(
 struct SuppressedMaker {
     fidelity_outpoint: Option<OutPoint>,
     fidelity_expiry_height: Option<u32>,
+    /// Pruning must not launder a proven violation; restore it on rediscovery.
+    #[serde(default)]
+    proven_violation: bool,
     retry_after_ts: u64,
 }
 
@@ -1068,6 +1071,10 @@ impl OfferBook {
             None => false,
         };
 
+        let proven_violation = self
+            .suppressed_makers
+            .get(&address)
+            .is_some_and(|suppressed| suppressed.proven_violation);
         self.suppressed_makers.remove(&address);
         let first_seen_ts = if recovery_probe {
             // A recovery attempt gets one probe. If it fails, this deliberately
@@ -1081,6 +1088,7 @@ impl OfferBook {
             fidelity_outpoint,
             fidelity_expiry_height,
             first_seen_ts,
+            proven_violation,
         );
         true
     }
@@ -1093,10 +1101,16 @@ impl OfferBook {
             return suppressed.is_some();
         }
 
-        let (outpoint, expiry_height) = suppressed
-            .map(|maker| (maker.fidelity_outpoint, maker.fidelity_expiry_height))
+        let (outpoint, expiry_height, proven_violation) = suppressed
+            .map(|maker| {
+                (
+                    maker.fidelity_outpoint,
+                    maker.fidelity_expiry_height,
+                    maker.proven_violation,
+                )
+            })
             .unwrap_or_default();
-        self.insert_candidate(address, outpoint, expiry_height, now_ts);
+        self.insert_candidate(address, outpoint, expiry_height, now_ts, proven_violation);
         true
     }
 
@@ -1106,6 +1120,7 @@ impl OfferBook {
         fidelity_outpoint: Option<OutPoint>,
         fidelity_expiry_height: Option<u32>,
         first_seen_ts: u64,
+        proven_violation: bool,
     ) {
         self.makers.push(MakerOfferCandidate {
             address,
@@ -1113,7 +1128,7 @@ impl OfferBook {
             fidelity_expiry_height,
             offer: None,
             state: MakerState::Unresponsive { retries: 0 },
-            proven_violation: false,
+            proven_violation,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(first_seen_ts),
@@ -1141,6 +1156,7 @@ impl OfferBook {
                     SuppressedMaker {
                         fidelity_outpoint: maker.fidelity_outpoint,
                         fidelity_expiry_height: maker.fidelity_expiry_height,
+                        proven_violation: maker.proven_violation,
                         retry_after_ts: now_ts.saturating_add(STALE_MAKER_AGE.as_secs()),
                     },
                 );
@@ -1702,7 +1718,7 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl);
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, false);
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
         assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), recovery_ts));
 
@@ -1728,6 +1744,34 @@ mod tests {
             MakerState::Unresponsive { retries: 1 }
         );
         assert_eq!(book.prune_stale_makers(retry_at), 1);
+    }
+
+    #[test]
+    fn proven_violation_survives_pruning_and_rediscovery() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let prune_ts = ttl * 2;
+        let now_ts = prune_ts + ttl;
+        let address = addr("violator");
+        let outpoint = Some(OutPoint::new(Txid::from_slice(&[2; 32]).unwrap(), 0));
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(address.clone(), outpoint, Some(500), 0, false);
+        book.makers[0].proven_violation = true;
+
+        // Pruning hides the maker but must keep the marker.
+        assert_eq!(book.prune_stale_makers(prune_ts), 1);
+        assert!(book.makers.is_empty());
+
+        // Rediscovery restores it: a poll success cannot launder a violator
+        // back into selection.
+        assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), now_ts));
+        assert!(book.makers[0].proven_violation);
+        book.makers[0].state = MakerState::Good;
+        assert!(book
+            .makers
+            .iter()
+            .filter(|m| !m.proven_violation)
+            .all(|m| m.address != address));
     }
 
     #[test]
@@ -1764,15 +1808,15 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[3; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(addr("fresh"), outpoint, Some(500), 0);
+        book.insert_candidate(addr("fresh"), outpoint, Some(500), 0, false);
         book.makers[0].last_offer_update_ts = Some(now_ts - ttl + 1);
 
-        book.insert_candidate(addr("boundary"), outpoint, Some(500), now_ts);
+        book.insert_candidate(addr("boundary"), outpoint, Some(500), now_ts, false);
         book.makers[1].last_offer_update_ts = Some(now_ts - ttl);
 
-        book.insert_candidate(addr("never"), outpoint, Some(500), now_ts - ttl);
+        book.insert_candidate(addr("never"), outpoint, Some(500), now_ts - ttl, false);
 
-        book.insert_candidate(addr("future"), outpoint, Some(500), now_ts);
+        book.insert_candidate(addr("future"), outpoint, Some(500), now_ts, false);
         book.makers[3].last_offer_update_ts = Some(now_ts + 1);
 
         assert_eq!(book.prune_stale_makers(now_ts), 2);
@@ -1795,7 +1839,7 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[4; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl);
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, false);
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
 
         assert!(!book.upsert_discovered(address.clone(), outpoint, Some(500), prune_ts + ttl - 1));
@@ -1814,7 +1858,7 @@ mod tests {
         let new_outpoint = Some(OutPoint::new(Txid::from_slice(&[11; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), old_outpoint, Some(500), 1_000);
+        book.insert_candidate(address.clone(), old_outpoint, Some(500), 1_000, false);
         assert!(book.upsert_discovered(address, new_outpoint, Some(600), 1_001));
 
         assert_eq!(book.makers[0].fidelity_outpoint, new_outpoint);
@@ -1830,7 +1874,13 @@ mod tests {
         let new_outpoint = Some(OutPoint::new(Txid::from_slice(&[7; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), old_outpoint, Some(500), prune_ts - ttl);
+        book.insert_candidate(
+            address.clone(),
+            old_outpoint,
+            Some(500),
+            prune_ts - ttl,
+            false,
+        );
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
         assert!(book.upsert_discovered(address.clone(), new_outpoint, Some(600), prune_ts + 1));
         assert_eq!(book.makers[0].first_seen_ts, Some(prune_ts + 1));
@@ -1852,7 +1902,7 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[12; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl);
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, false);
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
         assert!(book.upsert_for_poll(address.clone(), poll_ts));
 
@@ -1877,7 +1927,7 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[8; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), now_ts - ttl);
+        book.insert_candidate(address.clone(), outpoint, Some(500), now_ts - ttl, false);
         assert_eq!(book.prune_stale_makers(now_ts), 1);
         assert_eq!(book.prune_expired_suppressions(499), 0);
         assert_eq!(book.prune_expired_suppressions(500), 1);
@@ -1891,7 +1941,7 @@ mod tests {
         let address = addr("persisted");
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), None, None, now_ts - ttl);
+        book.insert_candidate(address.clone(), None, None, now_ts - ttl, false);
         assert_eq!(book.prune_stale_makers(now_ts), 1);
 
         let encoded = serde_json::to_string(&book).unwrap();
@@ -1908,7 +1958,7 @@ mod tests {
     fn legacy_candidate_fields_deserialize_and_backfill() {
         let now_ts = STALE_MAKER_AGE.as_secs();
         let mut book = OfferBook::default();
-        book.insert_candidate(addr("legacy"), None, None, now_ts);
+        book.insert_candidate(addr("legacy"), None, None, now_ts, false);
 
         let mut encoded = serde_json::to_value(&book).unwrap();
         let candidate = encoded
@@ -1972,7 +2022,7 @@ mod tests {
         let honest = addr("6108");
         {
             let mut book = lock_debug!(handle.inner.write()).unwrap();
-            book.insert_candidate(honest.clone(), None, None, 170000);
+            book.insert_candidate(honest.clone(), None, None, 170000, false);
             book.mark_failure(&honest, 170000);
             book.mark_success(
                 &honest,

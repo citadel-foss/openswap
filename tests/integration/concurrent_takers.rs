@@ -343,7 +343,7 @@ fn test_concurrent_admission_reservation_conflict() {
         TestFramework::init::<BitcoindBackend>(
             vec![(8102, Some(20811))],
             taker_behavior,
-            vec![MakerBehavior::Normal],
+            vec![MakerBehavior::AdmissionRaceBarrier],
         );
 
     let bitcoind = &test_framework.bitcoind;
@@ -444,8 +444,10 @@ fn test_concurrent_admission_reservation_conflict() {
         .expect("the losing taker must fail cleanly, not hang");
 
     let log_path = test_framework.taker_log_path();
-    // Maker-side: the losing admission was refused. Taker-side: the refusal
-    // arrived as a message and failed the swap fast.
+    // Maker-side: the losing admission was refused at the reservation
+    // conflict check, proving both admissions raced on identical plans.
+    // Taker-side: the refusal arrived as a message and failed the swap fast.
+    test_framework.assert_log("a concurrent admission claimed a planned input", &log_path);
     test_framework.assert_log("Rejecting swap ", &log_path);
     test_framework.assert_log("rejected swap", &log_path);
 

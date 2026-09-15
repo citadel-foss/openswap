@@ -537,7 +537,7 @@ pub struct ShutdownSignal {
 
 impl ShutdownSignal {
     /// Keeps construction private so both flags always start in the same state.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             requested: AtomicBool::new(false),
             backend: Arc::new(AtomicBool::new(false)),
@@ -1991,6 +1991,24 @@ impl MakerTrait for MakerServer {
             .collect();
         if planned.is_some() {
             let inputs = &reserved_inputs;
+            // Two racing admissions both reach this barrier with their plans
+            // in hand; only then may either reserve, so the conflict check
+            // below is what actually loses one of them. Later admissions
+            // (a retry after the race) pass straight through.
+            #[cfg(feature = "integration-test")]
+            if self.behavior() == MakerBehavior::AdmissionRaceBarrier {
+                static RACE_BARRIER: std::sync::LazyLock<std::sync::Barrier> =
+                    std::sync::LazyLock::new(|| std::sync::Barrier::new(2));
+                static RACE_ARRIVALS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if RACE_ARRIVALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    log::info!(
+                        "[{}] Test behavior: admission waiting at the reservation barrier",
+                        self.config.network_port
+                    );
+                    RACE_BARRIER.wait();
+                }
+            }
             // Planning ran outside this lock, so a concurrent admission may
             // have claimed an input since. Reserve only a conflict-free plan.
             let mut wallet = lock_debug!(self.wallet.write())

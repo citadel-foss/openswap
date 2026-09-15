@@ -256,9 +256,26 @@ fn test_standard_openswap() {
 /// swap still completes.
 #[test]
 fn test_swap_with_custom_feerate() {
+    run_swap_with_custom_feerate(ProtocolVersion::Taproot, 9203, 21503, 4170, 112);
+}
+
+/// Same 3 sats/vB swap on Legacy: funding txs price their real vsize and the
+/// multisig contract sweeps pay the 150 vB model at the negotiated rate.
+#[test]
+fn test_legacy_swap_with_custom_feerate() {
+    run_swap_with_custom_feerate(ProtocolVersion::Legacy, 9204, 21504, 4626, 150);
+}
+
+fn run_swap_with_custom_feerate(
+    protocol: ProtocolVersion,
+    port: u16,
+    rpc: u16,
+    expected_fee_paid: u64,
+    sweep_vsize_model: u64,
+) {
     warn!("Running Test: OpenSwap with a custom feerate");
 
-    let makers_config_map = vec![(9203, Some(21503))];
+    let makers_config_map = vec![(port, Some(rpc))];
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             makers_config_map,
@@ -273,7 +290,7 @@ fn test_swap_with_custom_feerate() {
     let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
     let swap_start_height = chain_tip(bitcoind) + 1;
 
-    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
+    let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
         .with_tx_count(2)
         .with_feerate(3)
         .with_required_confirms(1);
@@ -296,14 +313,18 @@ fn test_swap_with_custom_feerate() {
     info!("Taker fee at 3 sats/vB: {} sats", fee_paid.to_sat());
     // Pinned from a real run: 3722 at the old floor-priced sweeps, +448 because
     // the two cooperative sweeps now pay the negotiated rate (2 x 112 vB x (3-1)).
-    assert_eq!(fee_paid.to_sat(), 4170, "custom feerate cost mismatch");
+    assert_eq!(
+        fee_paid.to_sat(),
+        expected_fee_paid,
+        "custom feerate cost mismatch"
+    );
     assert!(
         fee_paid.to_sat() > 2_000,
         "a 3 sat/vB swap must cost clearly more than the floor rate"
     );
 
     // Same per-kind check at the negotiated 3 sat/vB: funding txs price their
-    // real vsize; the taproot key-path sweeps pay the 112 vB model (3 x 112).
+    // real vsize; the sweeps pay the protocol's fixed vsize model.
     // 1 maker x 2 splits: 4 funding txs (2 taker + 2 maker), 4 sweeps.
     let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[4, 4]);
     for txid in &depths[0] {
@@ -316,8 +337,17 @@ fn test_swap_with_custom_feerate() {
     }
     for txid in &depths[1] {
         let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
-        assert_eq!(fee, 336, "sweep tx {txid} must pay the 112 vB model at 3");
-        assert!(vsize <= 112, "sweep tx {} exceeds its 112 vB model", txid);
+        assert_eq!(
+            fee,
+            sweep_vsize_model * 3,
+            "sweep tx {txid} must pay the {sweep_vsize_model} vB model at 3"
+        );
+        assert!(
+            vsize as u64 <= sweep_vsize_model,
+            "sweep tx {} exceeds its {} vB model",
+            txid,
+            sweep_vsize_model
+        );
     }
 
     shutdown_makers(&makers, maker_threads);

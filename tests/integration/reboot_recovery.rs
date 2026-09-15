@@ -562,19 +562,46 @@ fn test_legacy_electrum_crash_after_contract_exchange() {
 /// Route: Taker -> Maker1 (Normal) -> Maker2 (skips its funding broadcast and
 /// records nothing). Maker2 is restarted inside the grace, and must come back
 /// still holding what it reserved.
+/// No Legacy variant: its skip-error path only fails the swap after the
+/// response timeout, by which point the reservation is older than
+/// UNBROADCAST_DISCARD_GRACE — expiring it then is the intended behavior, so
+/// the survival invariant has nothing to pin there.
 #[test]
 fn reservations_survive_a_maker_restart() {
+    run_reservations_survive_restart::<BitcoindBackend>(
+        ProtocolVersion::Taproot,
+        MakerBehavior::SkipFundingBroadcastUnrecorded,
+        (7452, 20951),
+        (17452, 20952),
+    );
+}
+
+/// Same restart on Electrum: the victim's startup recovery reads the indexer,
+/// not its own node, before it may free a reserved input.
+#[test]
+fn reservations_survive_a_maker_restart_electrum() {
+    run_reservations_survive_restart::<ElectrumBackend>(
+        ProtocolVersion::Taproot,
+        MakerBehavior::SkipFundingBroadcastUnrecorded,
+        (7453, 20953),
+        (17453, 20954),
+    );
+}
+
+fn run_reservations_survive_restart<B: TestBackend>(
+    protocol: ProtocolVersion,
+    skip_behavior: MakerBehavior,
+    maker1: (u16, u16),
+    maker2: (u16, u16),
+) {
     warn!("Running Test: swap input reservations survive a maker restart");
 
-    let makers_config_map = vec![(7452, Some(20951)), (17452, Some(20952))];
+    let makers_config_map = vec![(maker1.0, Some(maker1.1)), (maker2.0, Some(maker2.1))];
     let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![
-        MakerBehavior::Normal,
-        MakerBehavior::SkipFundingBroadcastUnrecorded,
-    ];
+    let maker_behaviors = vec![MakerBehavior::Normal, skip_behavior];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -594,10 +621,11 @@ fn reservations_survive_a_maker_restart() {
     wait_for_makers_setup(&makers, 120);
     sync_maker_wallets(&makers);
 
-    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+    let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
     generate_blocks(bitcoind, 1);
+    test_framework.wait_for_electrs_tip();
 
     let summary = taker
         .prepare_swap(swap_params)

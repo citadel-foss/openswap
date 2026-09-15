@@ -42,7 +42,7 @@ use crate::{
     utill::{
         compute_checksum, fee_at_rate_sats, generate_keypair, get_hd_path_from_descriptor,
         now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL, LEGACY_CONTRACT_SPEND_VSIZE,
-        TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
+        RECOVERY_FEE_RATE, TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
         UNBROADCAST_DISCARD_GRACE,
     },
 };
@@ -3194,7 +3194,9 @@ impl Wallet {
                     let spend = swapcoin.sign_spend_transaction(
                         input_value,
                         &address.script_pubkey(),
-                        swapcoin.negotiated_feerate as f64,
+                        // A stored rate below the relay floor can never relay;
+                        // recover at the floor instead of retrying it forever.
+                        (swapcoin.negotiated_feerate as f64).max(RECOVERY_FEE_RATE),
                     );
                     (Some(address), spend)
                 }

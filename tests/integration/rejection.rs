@@ -2809,6 +2809,68 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(
     block_generation_handle.join().unwrap();
 }
 
+/// An Ack that under-reports its split input counts must be caught by the
+/// taker's shape binding: the swap fails and the maker takes a proven
+/// violation, on both protocols.
+#[test]
+fn test_taproot_rejects_underreported_funding_inputs() {
+    run_rejects_underreported_funding_inputs(ProtocolVersion::Taproot, 9704, 21433);
+}
+
+#[test]
+fn test_legacy_rejects_underreported_funding_inputs() {
+    run_rejects_underreported_funding_inputs(ProtocolVersion::Legacy, 9705, 21434);
+}
+
+fn run_rejects_underreported_funding_inputs(protocol: ProtocolVersion, port: u16, rpc: u16) {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            vec![(port, Some(rpc))],
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::UnderreportFundingInputs],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let summary = taker
+        .prepare_swap(
+            SwapParams::new(protocol, Amount::from_sat(500_000), 1)
+                .with_tx_count(2)
+                .with_required_confirms(1),
+        )
+        .expect("prepare swap");
+    let error = taker
+        .start_swap(&summary.swap_id)
+        .expect_err("funding shaped differently from the Ack must be rejected");
+    assert!(
+        format!("{error:?}").contains("but its reported plan declared"),
+        "unexpected error: {:?}",
+        error
+    );
+
+    // The mismatch is arithmetically proven, so the maker's standing steps
+    // off Good.
+    let standing = taker
+        .fetch_offers()
+        .unwrap()
+        .all_makers()
+        .into_iter()
+        .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
+        .expect("the maker must be in the offerbook");
+    assert_eq!(
+        standing.state,
+        MakerState::Unresponsive { retries: 1 },
+        "a proven shape mismatch must step the maker Good -> Unresponsive"
+    );
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
 /// The maker reads this at drain time; the default matches production.
 const LIFETIME_ENV: &str = "OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS";
 

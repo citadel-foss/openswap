@@ -735,9 +735,20 @@ fn test_manual_coinselection() {
 /// log line "3 receivers, 1 senders" pins the degradation.
 #[test]
 fn test_legacy_swap_completes_with_degraded_splits() {
+    run_degraded_split_swap(ProtocolVersion::Legacy, 8404, 21701);
+}
+
+/// Same fragmented pool on Taproot: admission and funding share the planner
+/// with Legacy, so the same degradation must show on the other protocol.
+#[test]
+fn test_taproot_swap_completes_with_degraded_splits() {
+    run_degraded_split_swap(ProtocolVersion::Taproot, 8405, 21702);
+}
+
+fn run_degraded_split_swap(protocol: ProtocolVersion, port: u16, rpc: u16) {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(8404, Some(21701))],
+            vec![(port, Some(rpc))],
             vec![TakerBehavior::Normal],
             vec![openswap::maker::MakerBehavior::Normal],
         );
@@ -768,8 +779,9 @@ fn test_legacy_swap_completes_with_degraded_splits() {
         AddressType::P2TR,
     );
     let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    let swap_start_height = chain_tip(bitcoind) + 1;
 
-    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
+    let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
         .with_tx_count(3)
         .with_required_confirms(1);
     let summary = taker.prepare_swap(swap_params).expect("prepare swap");
@@ -782,7 +794,17 @@ fn test_legacy_swap_completes_with_degraded_splits() {
 
     shutdown_makers(&makers, maker_threads);
     let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("3 receivers, 1 senders", &log_path);
+    match protocol {
+        ProtocolVersion::Legacy => {
+            test_framework.assert_log("3 receivers, 1 senders", &log_path);
+        }
+        ProtocolVersion::Taproot => {
+            // The "receivers, senders" line is Legacy-only, so the degradation
+            // shows on-chain instead: 3 taker splits but only 1 maker funding
+            // tx at the first spend depth.
+            wait_for_tx_depths(bitcoind, swap_start_height, &[4]);
+        }
+    }
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

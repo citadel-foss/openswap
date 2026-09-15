@@ -88,6 +88,7 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);
+    test_framework.wait_for_electrs_tip();
 
     // Prepare should succeed; execution should fail because Maker2 closes the connection
     let summary = taker
@@ -215,6 +216,7 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
 
     // Mine a block to confirm recovery txs, then sync wallet
     generate_blocks(bitcoind, 1);
+    test_framework.wait_for_electrs_tip();
     taker
         .get_wallet()
         .write()
@@ -325,10 +327,21 @@ pub(crate) fn run_legacy_timelock_recovery_without_watcher() {
 ///    - Maker2 has nothing to recover (outgoing was never broadcast).
 #[test]
 fn test_taproot_timelock_only_recovery() {
+    run_taproot_timelock_only_recovery::<BitcoindBackend>((16102, 19161), (26102, 19162));
+}
+
+/// Same timelock-only recovery on Electrum: the grace and discard decisions
+/// read the indexer rather than the maker's own node.
+#[test]
+fn test_taproot_timelock_only_recovery_electrum() {
+    run_taproot_timelock_only_recovery::<ElectrumBackend>((16103, 19163), (26103, 19164));
+}
+
+fn run_taproot_timelock_only_recovery<B: TestBackend>(maker1: (u16, u16), maker2: (u16, u16)) {
     // ---- Setup ----
     warn!("Running Test: Taproot Timelock-Only Recovery");
 
-    let makers_config_map = vec![(16102, Some(19161)), (26102, Some(19162))];
+    let makers_config_map = vec![(maker1.0, Some(maker1.1)), (maker2.0, Some(maker2.1))];
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -336,7 +349,7 @@ fn test_taproot_timelock_only_recovery() {
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -382,6 +395,7 @@ fn test_taproot_timelock_only_recovery() {
         .with_required_confirms(1);
 
     generate_blocks(bitcoind, 1);
+    test_framework.wait_for_electrs_tip();
 
     // Prepare should succeed; execution should fail because Maker2 closes the connection
     let summary = taker
@@ -499,6 +513,7 @@ fn test_taproot_timelock_only_recovery() {
 
     // Mine a block to confirm recovery txs, then sync wallet
     generate_blocks(bitcoind, 1);
+    test_framework.wait_for_electrs_tip();
     taker
         .get_wallet()
         .write()

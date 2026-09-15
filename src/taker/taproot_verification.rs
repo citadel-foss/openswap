@@ -69,6 +69,26 @@ impl Taker {
                 expected_count
             )));
         }
+        // Each delivered contract tx must use the input count its split was
+        // declared with: the next hop's amount was priced from that shape, so
+        // a quiet change aborts the swap a hop later.
+        for (index, (tx, declared)) in contract
+            .contract_txs
+            .iter()
+            .zip(self.swap_state()?.makers[maker_idx].funding_splits.iter())
+            .enumerate()
+        {
+            if tx.input.len() as u32 != *declared {
+                self.note_proven_violation(maker_idx);
+                return Err(TakerError::General(format!(
+                    "Maker {} funded split {} with {} inputs, but its reported plan declared {}",
+                    maker_idx,
+                    index,
+                    tx.input.len(),
+                    declared
+                )));
+            }
+        }
         // One funded output must never back two claims: duplicates would let a
         // single output satisfy the total-amount check more than once.
         let mut seen_outpoints = HashSet::with_capacity(contract.contract_txs.len());
