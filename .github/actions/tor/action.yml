@@ -1,0 +1,38 @@
+name: Start tor with a control port
+description: >-
+  Stops Ubuntu's own tor so ours owns the ports, writes a torrc with an empty
+  control password, and waits for bootstrap.
+inputs:
+  data-dir:
+    description: Directory for the torrc, data and log.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Start tor with a control port
+      shell: bash
+      run: |
+        sudo systemctl stop tor@default.service tor.service || true
+        mkdir -p ${{ inputs.data-dir }}
+        # Empty control password: `check_tor_status` sends AUTHENTICATE "" and
+        # the test helpers default OPENSWAP_TOR_PASSWORD to empty.
+        HASH="$(tor --hash-password '' | tail -n 1)"
+        cat <<EOF > ${{ inputs.data-dir }}/torrc
+        SocksPort 9050
+        ControlPort 9051
+        HashedControlPassword $HASH
+        DataDirectory ${{ inputs.data-dir }}/data
+        Log notice file ${{ inputs.data-dir }}/tor.log
+        EOF
+        tor -f ${{ inputs.data-dir }}/torrc &
+        echo "waiting for tor to bootstrap..."
+        for _ in $(seq 1 60); do
+          if grep -q "Bootstrapped 100%" ${{ inputs.data-dir }}/tor.log 2>/dev/null; then
+            echo "tor bootstrapped"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "tor failed to bootstrap within 300s" >&2
+        cat ${{ inputs.data-dir }}/tor.log 2>/dev/null || true
+        exit 1

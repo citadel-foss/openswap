@@ -345,7 +345,7 @@ impl Wallet {
                 let base_wchange = tx_wchange.base_size();
                 let vsize_wchange = (base_wchange * 4 + total_witness_size + 2).div_ceil(4); // base * 4 + witness size + marker + flag
 
-                // Honor the caller's feerate here too; a fixed MIN_FEE_RATE fee
+                // Honor the caller's feerate here too; a fixed hardcoded fee
                 // strands every ordinary send and funding tx in a busy mempool.
                 let fee_wchange = rate.fee_vb(vsize_wchange as u64).ok_or_else(|| {
                     WalletError::General(format!(

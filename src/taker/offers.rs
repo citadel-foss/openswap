@@ -122,6 +122,12 @@ pub struct MakerOfferCandidate {
     /// Current state of maker
     pub state: MakerState,
 
+    /// Set on a proven protocol violation. Poll success refreshes the offer
+    /// and ladder state but must never clear this, so a proven cheater stays
+    /// out of selection.
+    #[serde(default)]
+    pub proven_violation: bool,
+
     /// Supporting protocol (Legacy or Taproot), if known
     pub protocol: Option<MakerProtocol>,
 
@@ -308,6 +314,28 @@ impl OfferBookHandle {
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?
             .mark_bad(&maker.address);
         Ok(())
+    }
+
+    /// Record a proven protocol violation. The marker is sticky so a later poll
+    /// success cannot return the maker to selection. Only for arithmetically or
+    /// cryptographically proven misbehavior, never timeouts or backend failures.
+    pub(crate) fn record_proven_violation(&self, address: &MakerAddress) -> Result<(), TakerError> {
+        log::warn!("Proven violation recorded against maker {address}");
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        let mut book = lock_debug!(self.inner.write())
+            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+        // A preferred maker may have no entry yet; the violation still counts.
+        if !book.makers.iter().any(|m| m.address == *address) {
+            book.insert_candidate(address.clone(), None, None, now_ts);
+        }
+        book.mark_failure(address, now_ts);
+        if let Some(m) = book.makers.iter_mut().find(|m| &m.address == address) {
+            m.proven_violation = true;
+        }
+        book.write_to_disk(&self.path)
     }
 
     /// All current good makers
@@ -1085,6 +1113,7 @@ impl OfferBook {
             fidelity_expiry_height,
             offer: None,
             state: MakerState::Unresponsive { retries: 0 },
+            proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(first_seen_ts),
@@ -1252,6 +1281,7 @@ impl OfferBook {
             .makers
             .iter()
             .filter(|m| m.state == MakerState::Good)
+            .filter(|m| !m.proven_violation)
             .filter(|m| {
                 m.protocol
                     .as_ref()
@@ -1575,6 +1605,7 @@ mod tests {
             fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Good,
+            proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
@@ -1618,6 +1649,7 @@ mod tests {
             fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Bad,
+            proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
@@ -1645,6 +1677,7 @@ mod tests {
             fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Unresponsive { retries: 3 },
+            proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
@@ -1695,6 +1728,33 @@ mod tests {
             MakerState::Unresponsive { retries: 1 }
         );
         assert_eq!(book.prune_stale_makers(retry_at), 1);
+    }
+
+    #[test]
+    fn backend_down_leaves_maker_state_unchanged() {
+        let now_ts = 170000;
+        let address = addr("6106");
+        let mut book = OfferBook::default();
+        book.makers.push(MakerOfferCandidate {
+            address: address.clone(),
+            fidelity_outpoint: Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0)),
+            fidelity_expiry_height: None,
+            offer: None,
+            state: MakerState::Good,
+            proven_violation: false,
+            protocol: None,
+            last_offer_update_ts: None,
+            first_seen_ts: Some(now_ts),
+            backend_retry_pending: false,
+            next_offer_check_ts: None,
+        });
+
+        // The state machine only steps on an answered check; #1017 schedules a
+        // non-penalizing retry for a silent backend instead.
+        let down = FidelityCheckError::BackendDown(TakerError::General("electrum down".into()));
+        book.record_fidelity_failure(&address, &down, now_ts);
+        assert_eq!(book.makers[0].state, MakerState::Good);
+        assert!(book.makers[0].backend_retry_pending);
     }
 
     #[test]
@@ -1870,6 +1930,73 @@ mod tests {
         assert!(decoded.backfill_first_seen_timestamps(now_ts));
         assert_eq!(decoded.makers[0].first_seen_ts, Some(now_ts));
         assert!(!decoded.backfill_first_seen_timestamps(now_ts + 1));
+    }
+
+    #[test]
+    fn proven_violation_walks_the_state_machine_and_persists() {
+        let dir = std::env::temp_dir().join(format!(
+            "offerbook-violation-{}",
+            bip39::rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = OfferBookHandle::load_or_create(&dir).unwrap();
+        let address = addr("6107");
+
+        // A maker with no entry is inserted; a proven violation steps it down
+        // the Good -> Unresponsive -> Bad ladder and sets a sticky flag.
+        handle.record_proven_violation(&address).unwrap();
+        let snapshot = handle.snapshot().unwrap();
+        assert_eq!(
+            snapshot.makers[0].state,
+            MakerState::Unresponsive { retries: 1 }
+        );
+        assert!(snapshot.makers[0].proven_violation);
+
+        // A successful poll refreshes the offer and the ladder state, but the
+        // proven violation keeps the maker out of selection.
+        lock_debug!(handle.inner.write()).unwrap().mark_success(
+            &address,
+            dummy_offer(&address.to_string()),
+            MakerProtocol::Taproot,
+            170000,
+        );
+        let snapshot = handle.snapshot().unwrap();
+        assert_eq!(snapshot.makers[0].state, MakerState::Good);
+        assert!(snapshot.makers[0].proven_violation);
+        assert!(handle
+            .active_makers(&MakerProtocol::Taproot)
+            .unwrap()
+            .is_empty());
+
+        // An ordinary Unresponsive maker still recovers on poll success.
+        let honest = addr("6108");
+        {
+            let mut book = lock_debug!(handle.inner.write()).unwrap();
+            book.insert_candidate(honest.clone(), None, None, 170000);
+            book.mark_failure(&honest, 170000);
+            book.mark_success(
+                &honest,
+                dummy_offer(&honest.to_string()),
+                MakerProtocol::Taproot,
+                170000,
+            );
+        }
+        let actives = handle.active_makers(&MakerProtocol::Taproot).unwrap();
+        assert_eq!(actives.len(), 1);
+        assert_eq!(actives[0].address, honest);
+
+        // 11 more violations walk the reset state back to Bad.
+        for _ in 0..11 {
+            handle.record_proven_violation(&address).unwrap();
+        }
+        let state = handle.snapshot().unwrap().makers[0].state.clone();
+        assert_eq!(state, MakerState::Bad);
+
+        let persisted = OfferBook::read_from_disk(&dir.join("offerbook.json")).unwrap();
+        assert_eq!(persisted.makers[0].state, MakerState::Bad);
+        assert!(persisted.makers[0].proven_violation);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

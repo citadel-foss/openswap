@@ -12,14 +12,12 @@ use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    sync::atomic::Ordering::Relaxed,
     thread,
     time::{Duration, Instant},
 };
@@ -45,22 +43,10 @@ fn test_malice1_taker_broadcast_contract() {
     let taker = takers.get_mut(0).unwrap();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
@@ -79,14 +65,7 @@ fn test_malice1_taker_broadcast_contract() {
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting malice1 test...");
@@ -133,7 +112,7 @@ fn test_malice1_taker_broadcast_contract() {
             maker_balances.contract,
             maker_balances.spendable,
         );
-        let expected_regular = [14996838u64, 14996838][i];
+        let expected_regular = [14998419u64, 14998419][i];
         assert_eq!(
             maker_balances.regular.to_sat(),
             expected_regular,
@@ -221,12 +200,7 @@ fn test_malice1_taker_broadcast_contract() {
     taker.log_tracker_state();
     info!("Malice1 test completed successfully!");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     test_framework.stop();
     block_generation_handle.join().unwrap();

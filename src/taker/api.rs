@@ -39,10 +39,11 @@ use crate::{
         contract::calculate_pubkey_from_nonce,
     },
     utill::{
-        estimate_funding_tx_fee_sats, generate_maker_keys, get_taker_dir, read_message,
-        send_message,
+        funding_fee_policy_sats, generate_maker_keys, get_taker_dir, read_message, send_message,
+        sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
+        funding::CreateFundingTxesResult,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig,
         MakerFeeInfo as ReportMakerFeeInfo, RecoveryOutcome, ReportUtxo, SwapStatus, TakerReport,
@@ -66,6 +67,8 @@ use super::{
     payment::{hop_net_sats, HopFeeTerms, PaymentQuote},
 };
 
+#[cfg(feature = "integration-test")]
+use crate::protocol::taproot_messages::TaprootContractData;
 #[cfg(not(feature = "integration-test"))]
 use crate::utill::check_tor_status;
 #[cfg(not(feature = "integration-test"))]
@@ -220,10 +223,17 @@ pub struct SwapParams {
     pub send_amount: Amount,
     /// Number of makers (hops) to use.
     pub maker_count: usize,
-    /// Number of funding transactions per hop. Each funding transaction creates
-    /// one contract transaction, so this also determines the number of contracts
-    /// per hop. Used by both Legacy and Taproot protocols; defaults to 1.
+    /// Maximum funding transactions per hop; each carries one contract. A maker
+    /// that cannot cover this many splits forwards fewer — the exact count it
+    /// commits to arrives per hop as `incoming_count`. Defaults to 2.
     pub tx_count: u32,
+    /// Maximum inputs per forwarding tx whose fee the taker covers.
+    /// The maker may use more inputs; that is not a violation —
+    /// the taker simply does not pay for the excess.
+    pub max_input_budget: u32,
+    /// Swap feerate in sats/vB for every transaction in this swap. Defaults
+    /// to the 1 sat/vB relay floor; lower values are rejected at prepare time.
+    pub feerate: u64,
     /// Required confirmations for funding transactions.
     pub required_confirms: u32,
     /// User-selected UTXOs (optional).
@@ -244,7 +254,9 @@ impl SwapParams {
             protocol,
             send_amount,
             maker_count,
-            tx_count: 1,
+            tx_count: 2,
+            max_input_budget: 2,
+            feerate: MIN_RELAY_FEE_RATE as u64,
             required_confirms: 1,
             manually_selected_outpoints: None,
             preferred_makers: None,
@@ -252,10 +264,29 @@ impl SwapParams {
         }
     }
 
-    /// Set the number of funding transactions per hop.
+    /// Set the maximum number of funding transactions per hop.
     pub fn with_tx_count(mut self, tx_count: u32) -> Self {
         self.tx_count = tx_count;
         self
+    }
+
+    /// Set the maximum inputs per forwarding tx whose fee the taker covers.
+    pub fn with_max_input_budget(mut self, max_input_budget: u32) -> Self {
+        self.max_input_budget = max_input_budget;
+        self
+    }
+
+    /// Set the swap feerate in sats/vB. Values below the 1 sat/vB relay floor
+    /// are rejected at prepare time, not repaired.
+    pub fn with_feerate(mut self, feerate: u64) -> Self {
+        self.feerate = feerate;
+        self
+    }
+
+    /// The configured swap feerate. `prepare_swap` rejects rates below the
+    /// relay floor, so this never repairs one.
+    pub(crate) fn swap_feerate(&self) -> f64 {
+        self.feerate as f64
     }
 
     /// Set the required confirmations.
@@ -317,9 +348,11 @@ pub struct SwapSummary {
     pub send_amount: Amount,
     /// Per-maker fee breakdown (one entry per hop, in route order).
     pub makers: Vec<MakerFeeInfo>,
-    /// Total estimated fees across all hops.
+    /// Ceiling on total swap cost: maker service fees plus the negotiated
+    /// maximum funding and sweep reimbursements, the taker's own funding,
+    /// and any PaySwap settlement budget.
     pub total_estimated_fee: Amount,
-    /// Estimated amount the taker will receive after all fees.
+    /// Amount the taker receives if every cost reaches its ceiling.
     pub estimated_receive_amount: Amount,
     /// PaySwap cost breakdown; present only when a payment-address was set.
     pub payment: Option<PaymentQuote>,
@@ -373,6 +406,14 @@ pub(crate) struct MakerConnection {
     /// The timelock value sent to this maker in `SwapDetails`.
     /// For Legacy this is a relative CSV offset; for Taproot an absolute CLTV height.
     pub(crate) negotiated_timelock: u32,
+    /// Exact incoming amount declared to this hop in `SwapDetails`.
+    /// Zero until negotiated; the next hop's amount derives from it.
+    pub(crate) amount: Amount,
+    /// Exact incoming contract count declared to this hop.
+    pub(crate) incoming_count: u32,
+    /// The maker's frozen plan shape from its ack: one entry per planned
+    /// funding tx, valued by input count. Empty until the ack arrives.
+    pub(crate) funding_splits: Vec<u32>,
     /// Protocol-specific exchange progress milestones.
     pub(crate) exchange: ExchangeProgress,
     /// Shared finalization milestones (preimage, privkey exchange).
@@ -380,6 +421,34 @@ pub(crate) struct MakerConnection {
 }
 
 impl MakerConnection {
+    /// A hop with nothing negotiated yet. `amount` and `incoming_count` stay
+    /// zero until this hop's own terms are agreed.
+    pub(crate) fn new(
+        address: MakerAddress,
+        protocol: ProtocolVersion,
+        offer: Option<Offer>,
+    ) -> Self {
+        Self {
+            address,
+            protocol,
+            tweakable_point: None,
+            offer,
+            negotiated_timelock: 0,
+            amount: Amount::ZERO,
+            incoming_count: 0,
+            funding_splits: Vec::new(),
+            exchange: match protocol {
+                ProtocolVersion::Legacy => {
+                    ExchangeProgress::Legacy(LegacyExchangeProgress::default())
+                }
+                ProtocolVersion::Taproot => {
+                    ExchangeProgress::Taproot(TaprootExchangeProgress::default())
+                }
+            },
+            finalization: FinalizationProgress::default(),
+        }
+    }
+
     /// Get mutable reference to Legacy exchange progress.
     pub(crate) fn legacy_exchange_mut(
         &mut self,
@@ -406,48 +475,28 @@ impl MakerConnection {
 }
 
 impl Taker {
-    /// Compute the exact expected output amount for a specific maker hop.
-    ///
-    /// Accounts for cumulative fees from all previous hops so that each maker's
-    /// output is compared against the correct input amount (not the original
-    /// `send_amount`). Taproot hops are priced on the negotiated locktime offset,
-    /// matching the maker's fee.
-    ///
-    /// Returns `None` if any maker along the route (up to and including `maker_idx`)
-    /// has no stored offer.
-    ///
-    /// Fee formula: `total_fee = base_fee + (amount * amt_pct)/100 + (amount * locktime * time_pct)/100`
-    /// TODO: Use fee estimation here
-    pub(crate) fn expected_amount_for_hop(&self, maker_idx: usize) -> Option<Amount> {
+    /// What a maker may forward for one hop: its declared incoming amount less
+    /// its advertised swap fee and the sweep price of the declared count. The
+    /// funding fee is priced later, at verification. `None` without an offer.
+    pub(crate) fn forwardable_for_hop(&self, maker_idx: usize) -> Option<Amount> {
         let swap = self.swap_state().ok()?;
-        let send_amount = swap.params.send_amount;
+        let maker = &swap.makers[maker_idx];
+        let offer = maker.offer.as_ref()?;
         let maker_count = swap.makers.len();
-
-        // TODO : Have the makers derive the fee & a smart messaging layer to send the estimated target to the taker sequentially.
-        let per_hop_mining_fee = estimate_funding_tx_fee_sats() * swap.params.tx_count as u64;
-
-        // Replay each hop's deduction exactly as the maker computes it. Any
-        // slack here is room for a cheating maker to underpay the next hop;
-        // the PaySwap solver shares this formula and relies on its exactness.
-        let mut amount_sats = send_amount.to_sat();
-        for i in 0..=maker_idx {
-            let maker = &swap.makers[i];
-            let offer = maker.offer.as_ref()?;
-            let locktime = match maker.protocol {
-                ProtocolVersion::Legacy => maker.negotiated_timelock,
-                ProtocolVersion::Taproot => {
-                    (REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - i - 1) as u16)
-                        as u32
-                }
-            };
-            amount_sats = hop_net_sats(
-                &HopFeeTerms::from_offer(offer, locktime),
-                per_hop_mining_fee,
-                amount_sats,
-            );
-        }
-
-        Some(Amount::from_sat(amount_sats))
+        let locktime = match maker.protocol {
+            ProtocolVersion::Legacy => maker.negotiated_timelock,
+            ProtocolVersion::Taproot => {
+                (REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - maker_idx - 1) as u16)
+                    as u32
+            }
+        };
+        let sweep_fee = sweep_fee_policy_sats(maker.protocol, swap.params.swap_feerate())
+            .and_then(|per_contract| per_contract.checked_mul(maker.incoming_count as u64))?;
+        Some(Amount::from_sat(hop_net_sats(
+            &HopFeeTerms::from_offer(offer, locktime),
+            sweep_fee,
+            maker.amount.to_sat(),
+        )))
     }
 }
 
@@ -553,6 +602,28 @@ impl Taker {
     }
 
     /// Get a shared reference to the ongoing swap state.
+    /// What a hop may forward once the policy funding fee for `input_counts`
+    /// comes off. The swap fee and sweep price are already inside
+    /// `forwardable`, so this is an exact figure, not a minimum.
+    pub(crate) fn expected_hop_total(
+        &self,
+        forwardable: Amount,
+        mut input_counts: impl Iterator<Item = usize>,
+    ) -> Result<Amount, TakerError> {
+        let params = &self.swap_state()?.params;
+        let funding_fee = input_counts
+            .try_fold(0u64, |acc, inputs| {
+                funding_fee_policy_sats(inputs, params.max_input_budget, params.swap_feerate())
+                    .and_then(|fee| acc.checked_add(fee))
+            })
+            .ok_or_else(|| TakerError::General("Maker funding fee overflow".to_string()))?;
+        forwardable
+            .checked_sub(Amount::from_sat(funding_fee))
+            .ok_or_else(|| {
+                TakerError::General("Maker funding fee exceeds the forwardable amount".to_string())
+            })
+    }
+
     pub(crate) fn swap_state(&self) -> Result<&OngoingSwapState, TakerError> {
         self.ongoing_swap
             .as_ref()
@@ -680,7 +751,6 @@ impl Taker {
             match Wallet::sweep_incoming_swapcoins(
                 &self.wallet,
                 chain,
-                2.0,
                 &crate::utill::NO_SHUTDOWN,
                 None,
             ) {
@@ -698,7 +768,7 @@ impl Taker {
             match Wallet::recover_timelocked_swapcoins(
                 &self.wallet,
                 chain,
-                2.0,
+                MIN_RELAY_FEE_RATE,
                 &crate::utill::NO_SHUTDOWN,
             ) {
                 Ok(ref recovered) if !recovered.is_empty() => {
@@ -864,15 +934,10 @@ impl Taker {
         }
     }
 
-    /// Block until every unresolved swap contract has been recovered.
-    ///
-    /// Returns whether recovery finished. `false` means contracts are still
-    /// unresolved with nothing retrying them, or that completion could not be
-    /// confirmed.
-    ///
-    /// A refund is unspendable until its timelock matures, so this can block for
-    /// as long as that takes — up to ~1.5 days on mainnet for Legacy. Interrupting
-    /// is safe: each step is persisted as it happens and a re-run resumes.
+    /// Block until every unresolved contract is recovered; `false` means some
+    /// are still unresolved with nothing retrying them. A refund waits out its
+    /// timelock, so this can block for days. Interrupting is safe — each step
+    /// is persisted as it happens and a re-run resumes.
     pub fn wait_for_recovery(&mut self) -> bool {
         if let Some(recovery) = self.recovery_loop.take() {
             return recovery.join();
@@ -900,6 +965,33 @@ impl Taker {
             params.maker_count,
             params.protocol
         );
+
+        // Below the relay floor the swap's transactions would not propagate;
+        // reject the rate here instead of repairing it later.
+        if params.feerate < MIN_RELAY_FEE_RATE as u64 {
+            return Err(TakerError::General(format!(
+                "Swap feerate {} sats/vB is below the {} sats/vB relay floor",
+                params.feerate, MIN_RELAY_FEE_RATE as u64
+            )));
+        }
+
+        // Zero splits fund nothing; above the cap the per-split messages grow
+        // unbounded. The maker refuses both too — failing here is clearer.
+        if params.tx_count == 0 || params.tx_count > MAX_TX_COUNT {
+            return Err(TakerError::General(format!(
+                "Transaction count {} is outside the protocol bounds 1..={}",
+                params.tx_count, MAX_TX_COUNT
+            )));
+        }
+
+        // The maker enforces the same bound on the input budget; an
+        // out-of-range value would otherwise only fail mid-negotiation.
+        if params.max_input_budget == 0 || params.max_input_budget > MAX_TX_COUNT {
+            return Err(TakerError::General(format!(
+                "Max input budget {} is outside the protocol bounds 1..={}",
+                params.max_input_budget, MAX_TX_COUNT
+            )));
+        }
 
         let available = self.read_wallet()?.get_balances()?.spendable;
         let required = params.send_amount + FUNDING_FEE_BUFFER;
@@ -1031,9 +1123,43 @@ impl Taker {
             amount_sats = (amount_sats - fee).max(0.0);
         }
 
-        let total_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
+        let service_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
+
+        // The headline number is a ceiling, so every cost is priced at its
+        // negotiated maximum: all splits delivered at the full input budget
+        // and every incoming contract swept at policy price.
+        let swap_feerate = swap.params.swap_feerate();
+        let policy_err = || TakerError::General("fee policy price overflow".to_string());
+        let split_funding_sats = funding_fee_policy_sats(
+            swap.params.max_input_budget as usize,
+            swap.params.max_input_budget,
+            swap_feerate,
+        )
+        .ok_or_else(policy_err)?;
+        let tx_count = swap.params.tx_count as u64;
+        let mut ceiling_sats = service_fee_sats;
+        for mc in &swap.makers {
+            let sweep_sats =
+                sweep_fee_policy_sats(mc.protocol, swap_feerate).ok_or_else(policy_err)?;
+            let hop_sats = split_funding_sats
+                .checked_add(sweep_sats)
+                .and_then(|per_split| tx_count.checked_mul(per_split))
+                .ok_or_else(policy_err)?;
+            ceiling_sats = ceiling_sats.checked_add(hop_sats).ok_or_else(policy_err)?;
+        }
+        // The taker's own hop-0 funding, priced at the same ceiling shape.
+        ceiling_sats = tx_count
+            .checked_mul(split_funding_sats)
+            .and_then(|own_funding| ceiling_sats.checked_add(own_funding))
+            .ok_or_else(policy_err)?;
+        if let Some(payment) = &swap.payment {
+            ceiling_sats = ceiling_sats
+                .checked_add(payment.settlement_budget.to_sat())
+                .ok_or_else(policy_err)?;
+        }
+
         let estimated_receive = send_amount
-            .checked_sub(Amount::from_sat(total_fee_sats))
+            .checked_sub(Amount::from_sat(ceiling_sats))
             .unwrap_or(Amount::ZERO);
 
         let summary = SwapSummary {
@@ -1041,7 +1167,7 @@ impl Taker {
             protocol,
             send_amount,
             makers: maker_fees,
-            total_estimated_fee: Amount::from_sat(total_fee_sats),
+            total_estimated_fee: Amount::from_sat(ceiling_sats),
             estimated_receive_amount: estimated_receive,
             payment: swap.payment.clone(),
         };
@@ -1107,21 +1233,18 @@ impl Taker {
             ProtocolVersion::Legacy => {
                 let mut exchange_result = self.exchange_legacy();
 
-                // Pre-funding spare substitution: if exchange failed before any
-                // funding was broadcast (phase < FundsBroadcast), try substituting
-                // the first maker with a spare and retrying from scratch.
+                // Pre-funding spare substitution: retry with a spare only
+                // while the broadcast loop was never entered. A partial batch
+                // must never reach reinitialization, which deletes recovery
+                // material.
                 while let Err(ref _e) = exchange_result {
-                    let phase = self
-                        .swap_state()
-                        .map(|s| s.phase)
-                        .unwrap_or(SwapPhase::MakersDiscovered);
                     // Payment routes cannot substitute makers (see
                     // negotiate_swap_details); aborting pre-funding is safe.
                     let payment_swap = self
                         .swap_state()
                         .map(|s| s.payment.is_some())
                         .unwrap_or(false);
-                    if phase < SwapPhase::FundsBroadcast && !payment_swap {
+                    if !payment_swap && self.no_outgoing_funding_on_chain() {
                         if let Some(spare) = {
                             let swap = self.swap_state_mut()?;
                             swap.spare_makers.pop()
@@ -1154,7 +1277,9 @@ impl Taker {
                             .swap_state()
                             .map(|s| s.phase)
                             .unwrap_or(SwapPhase::MakersDiscovered);
-                        if phase >= SwapPhase::FundsBroadcast {
+                        // Clean up only while the broadcast loop was never
+                        // entered; past it the swap goes to recovery.
+                        if !self.no_outgoing_funding_on_chain() {
                             log::warn!("Funding txs were broadcast, triggering recovery");
                             self.persist_failure(phase, &e);
                             if let Err(re) = self.recover_active_swap() {
@@ -1184,7 +1309,10 @@ impl Taker {
                         .swap_state()
                         .map(|s| s.phase)
                         .unwrap_or(SwapPhase::MakersDiscovered);
-                    if phase >= SwapPhase::FundsBroadcast {
+                    // Same predicate as Legacy: clean up only while the
+                    // broadcast loop was never entered; a swap_state failure
+                    // reads as uncertain, so fail toward recovery.
+                    if !self.no_outgoing_funding_on_chain() {
                         log::warn!("Funds were broadcast, triggering recovery");
                         self.persist_failure(phase, &e);
                         if let Err(re) = self.recover_active_swap() {
@@ -1294,7 +1422,6 @@ impl Taker {
         let swept = Wallet::sweep_incoming_swapcoins(
             &self.wallet,
             &chain,
-            2.0,
             &crate::utill::NO_SHUTDOWN,
             Some(&incoming_contract_txids),
         )?;
@@ -1382,25 +1509,7 @@ impl Taker {
             let spare_addrs = addrs.split_off(maker_count);
             let makers: Vec<MakerConnection> = addrs
                 .into_iter()
-                .map(|address| {
-                    let exchange = match protocol {
-                        ProtocolVersion::Legacy => {
-                            ExchangeProgress::Legacy(LegacyExchangeProgress::default())
-                        }
-                        ProtocolVersion::Taproot => {
-                            ExchangeProgress::Taproot(TaprootExchangeProgress::default())
-                        }
-                    };
-                    MakerConnection {
-                        address,
-                        protocol,
-                        tweakable_point: None,
-                        offer: None,
-                        negotiated_timelock: 0,
-                        exchange,
-                        finalization: FinalizationProgress::default(),
-                    }
-                })
+                .map(|address| MakerConnection::new(address, protocol, None))
                 .collect();
             (makers, spare_addrs)
         } else {
@@ -1445,25 +1554,7 @@ impl Taker {
                 spare_oas.into_iter().map(|oa| oa.address).collect();
             let makers: Vec<MakerConnection> = selected
                 .into_iter()
-                .map(|oa| {
-                    let exchange = match protocol {
-                        ProtocolVersion::Legacy => {
-                            ExchangeProgress::Legacy(LegacyExchangeProgress::default())
-                        }
-                        ProtocolVersion::Taproot => {
-                            ExchangeProgress::Taproot(TaprootExchangeProgress::default())
-                        }
-                    };
-                    MakerConnection {
-                        address: oa.address,
-                        protocol,
-                        tweakable_point: None,
-                        offer: Some(oa.offer),
-                        negotiated_timelock: 0,
-                        exchange,
-                        finalization: FinalizationProgress::default(),
-                    }
-                })
+                .map(|oa| MakerConnection::new(oa.address, protocol, Some(oa.offer)))
                 .collect();
             (makers, spare_addrs)
         };
@@ -1517,64 +1608,29 @@ impl Taker {
             };
         self.swap_state_mut()?.reference_height = Some(reference_height);
 
-        let mut i = 0;
-        while i < maker_count {
-            let result = self.negotiate_with_maker(
-                i,
-                &swap_id,
-                send_amount,
-                tx_count,
-                maker_count,
-                reference_height,
-            );
+        // Plan our own hop-0 funding before the first declaration: the planned
+        // count is what we declare to maker 0, and the funding build later
+        // replays the same deterministic plan on the same pool.
+        let planned_hop0_count = {
+            let swap = self.swap_state()?;
+            let wallet = self.read_wallet()?;
+            wallet
+                .plan_funding(
+                    send_amount,
+                    tx_count,
+                    swap.params.swap_feerate(),
+                    // Our own hop pays the fee on top: no input budget, no
+                    // over-budget guard, mirroring the funding call sites.
+                    u32::MAX,
+                    None,
+                    swap.params.manually_selected_outpoints.clone(),
+                    None,
+                )?
+                .len() as u32
+        };
+        self.payment_check_dust_floor()?;
 
-            match result {
-                Ok(()) => {
-                    i += 1;
-                }
-                Err(e) => {
-                    log::warn!("Maker {} failed during negotiation: {:?}", i, e);
-
-                    // Payment routes are priced against the exact makers they
-                    // were solved for; substitution would invalidate the gross.
-                    // Nothing is funded yet, so failing is safe.
-                    if self.swap_state()?.payment.is_some() {
-                        return Err(TakerError::General(format!(
-                            "Maker {} failed during payment swap negotiation: {:?}",
-                            i, e
-                        )));
-                    }
-                    let spare = self.swap_state_mut()?.spare_makers.pop();
-                    if let Some(spare_addr) = spare {
-                        log::info!("Substituting maker {} with spare at {}", i, spare_addr);
-                        let exchange = match protocol {
-                            ProtocolVersion::Legacy => {
-                                ExchangeProgress::Legacy(LegacyExchangeProgress::default())
-                            }
-                            ProtocolVersion::Taproot => {
-                                ExchangeProgress::Taproot(TaprootExchangeProgress::default())
-                            }
-                        };
-                        let replacement = MakerConnection {
-                            address: spare_addr,
-                            protocol,
-                            tweakable_point: None,
-                            offer: None,
-                            negotiated_timelock: 0,
-                            exchange,
-                            finalization: FinalizationProgress::default(),
-                        };
-                        self.swap_state_mut()?.makers[i] = replacement;
-                        // Don't increment i — retry with the replacement
-                    } else {
-                        return Err(TakerError::General(format!(
-                            "Maker {} failed and no spare makers available: {:?}",
-                            i, e
-                        )));
-                    }
-                }
-            }
-        }
+        self.walk_route(0, send_amount, planned_hop0_count, reference_height)?;
 
         #[cfg(debug_assertions)]
         log::debug!(
@@ -1588,12 +1644,115 @@ impl Taker {
         Ok(())
     }
 
+    /// Derive the next hop's declaration from maker `i`'s frozen shape:
+    /// amount = forwardable − Σ policy funding fee over the reported splits,
+    /// count = the reported split count.
+    fn derive_next_hop(&self, i: usize) -> Result<(Amount, u32), TakerError> {
+        let swap = self.swap_state()?;
+        let forwardable = self.forwardable_for_hop(i).ok_or_else(|| {
+            TakerError::General(format!(
+                "Maker {i} has no negotiated shape to derive the next hop from"
+            ))
+        })?;
+        let funding_fees = swap.makers[i]
+            .funding_splits
+            .iter()
+            .try_fold(0u64, |acc, &inputs| {
+                funding_fee_policy_sats(
+                    inputs as usize,
+                    swap.params.max_input_budget,
+                    swap.params.swap_feerate(),
+                )
+                .and_then(|fee| acc.checked_add(fee))
+            })
+            .ok_or_else(|| TakerError::General("Funding fee arithmetic overflow".to_string()))?;
+        let next_amount = forwardable
+            .checked_sub(Amount::from_sat(funding_fees))
+            .ok_or_else(|| {
+                TakerError::General(format!("Maker {i}'s fees exceed the hop amount"))
+            })?;
+        Ok((next_amount, swap.makers[i].funding_splits.len() as u32))
+    }
+
+    /// Declare the carried amount and count to each hop in turn, deriving the
+    /// next from the previous ack's frozen shape. A failed maker is swapped for
+    /// a spare and retried; payment routes abort instead, since their gross was
+    /// solved against the exact makers quoted.
+    fn walk_route(
+        &mut self,
+        start_idx: usize,
+        start_amount: Amount,
+        start_count: u32,
+        reference_height: u32,
+    ) -> Result<(), TakerError> {
+        let swap = self.swap_state()?;
+        let maker_count = swap.params.maker_count;
+        let swap_id = swap.id.clone();
+        let tx_count = swap.params.tx_count;
+        let protocol = swap.params.protocol;
+
+        let mut next_amount = start_amount;
+        let mut next_count = start_count;
+        let mut i = start_idx;
+        while i < maker_count {
+            let result = self.negotiate_with_maker(
+                i,
+                &swap_id,
+                next_amount,
+                next_count,
+                tx_count,
+                maker_count,
+                reference_height,
+            );
+
+            match result {
+                Ok(()) => {
+                    if i + 1 < maker_count {
+                        let (amount, count) = self.derive_next_hop(i)?;
+                        next_amount = amount;
+                        next_count = count;
+                    }
+                    i += 1;
+                }
+                Err(e) => {
+                    log::warn!("Maker {} failed during negotiation: {:?}", i, e);
+
+                    if self.swap_state()?.payment.is_some() {
+                        return Err(TakerError::General(format!(
+                            "Maker {} failed during payment swap negotiation: {:?}",
+                            i, e
+                        )));
+                    }
+                    let spare = self.swap_state_mut()?.spare_makers.pop();
+                    if let Some(spare_addr) = spare {
+                        log::info!("Substituting maker {} with spare at {}", i, spare_addr);
+                        let mut replacement = MakerConnection::new(spare_addr, protocol, None);
+                        replacement.amount = next_amount;
+                        replacement.incoming_count = next_count;
+                        self.swap_state_mut()?.makers[i] = replacement;
+                        // Don't increment i — retry with the replacement
+                    } else {
+                        return Err(TakerError::General(format!(
+                            "Maker {} failed and no spare makers available: {:?}",
+                            i, e
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Negotiate swap details with a single maker at the given route index.
+    /// `amount` and `incoming_count` are the exact per-hop declaration; the
+    /// negotiated shape is stored on the maker's connection on acceptance.
+    #[allow(clippy::too_many_arguments)]
     fn negotiate_with_maker(
         &mut self,
         maker_idx: usize,
         swap_id: &str,
-        send_amount: Amount,
+        amount: Amount,
+        incoming_count: u32,
         tx_count: u32,
         maker_count: usize,
         reference_height: u32,
@@ -1620,7 +1779,7 @@ impl Taker {
                     offer.amount_relative_fee_pct,
                     offer.time_relative_fee_pct
                 );
-                Self::validate_offer(&offer, maker_idx, send_amount)?;
+                Self::validate_offer(&offer, maker_idx, amount)?;
                 // A repricing since the payment quote would silently move the
                 // receiver's amount; abort while nothing is funded. Bitwise
                 // float comparison is intentional: any change is a repricing.
@@ -1660,11 +1819,31 @@ impl Taker {
             refund_locktime_offset as u32
         };
 
+        // The replayed contract's timelock script pins the absolute height the
+        // maker re-derives; declare the same timelock or structural
+        // verification rejects the replay before the spent/seen checks run.
+        #[cfg(feature = "integration-test")]
+        let timelock = match replay_contract_cache_get(&maker_address) {
+            Some((pinned, _))
+                if matches!(
+                    self.behavior,
+                    TakerBehavior::ReplayTaprootContractData
+                        | TakerBehavior::ReplayTaprootContractDataInFlight
+                ) =>
+            {
+                pinned
+            }
+            _ => timelock,
+        };
+
         let swap_details = SwapDetails {
             id: swap_id.to_string(),
             protocol_version: negotiated_protocol,
-            amount: send_amount,
+            amount,
             tx_count,
+            incoming_count,
+            max_input_budget: self.swap_state()?.params.max_input_budget,
+            feerate: self.swap_state()?.params.swap_feerate() as u64,
             timelock,
             refund_locktime_offset,
         };
@@ -1674,6 +1853,22 @@ impl Taker {
         #[cfg(feature = "integration-test")]
         if let TakerBehavior::ForgeBounds(amount) = self.behavior {
             swap_details.amount = amount;
+        }
+        #[cfg(feature = "integration-test")]
+        if let TakerBehavior::ForgeIncomingCount(count) = self.behavior {
+            swap_details.incoming_count = count;
+        }
+        #[cfg(feature = "integration-test")]
+        if let TakerBehavior::ForgeFeerate(feerate) = self.behavior {
+            swap_details.feerate = feerate;
+        }
+        #[cfg(feature = "integration-test")]
+        if let TakerBehavior::ForgeTxCount(count) = self.behavior {
+            swap_details.tx_count = count;
+        }
+        #[cfg(feature = "integration-test")]
+        if let TakerBehavior::ForgeMaxInputBudget(budget) = self.behavior {
+            swap_details.max_input_budget = budget;
         }
 
         send_message(
@@ -1687,10 +1882,23 @@ impl Taker {
         match msg {
             MakerToTakerMessage::AckSwapDetails(ack) => {
                 if let Some(tweakable_point) = ack.tweakable_point {
+                    // An accept must carry the frozen plan shape the next hop
+                    // derives from; an empty or over-ceiling shape is a rejection.
+                    if ack.funding_splits.is_empty() || ack.funding_splits.len() > tx_count as usize
+                    {
+                        return Err(TakerError::General(format!(
+                            "Maker {} accepted with an invalid plan shape: {} splits",
+                            maker_idx,
+                            ack.funding_splits.len()
+                        )));
+                    }
                     let swap = self.swap_state_mut()?;
                     swap.makers[maker_idx].tweakable_point = Some(tweakable_point);
                     swap.makers[maker_idx].protocol = negotiated_protocol;
                     swap.makers[maker_idx].negotiated_timelock = timelock;
+                    swap.makers[maker_idx].amount = amount;
+                    swap.makers[maker_idx].incoming_count = incoming_count;
+                    swap.makers[maker_idx].funding_splits = ack.funding_splits.clone();
                     log::info!("Maker {} accepted swap with tweakable point", maker_idx);
 
                     #[cfg(feature = "integration-test")]
@@ -1700,6 +1908,18 @@ impl Taker {
                         {
                             return Err(TakerError::General(
                                 "Maker rejected identical resent SwapDetails".to_string(),
+                            ));
+                        }
+                        // A resend with any negotiated field changed must be
+                        // rejected; amount is checked below, feerate here.
+                        swap_details.feerate += 1;
+                        let feerate_resend =
+                            self.resend_swap_details(&maker_address, &swap_details);
+                        swap_details.feerate -= 1;
+                        if matches!(feerate_resend, Ok(MakerToTakerMessage::AckSwapDetails(ref ack)) if ack.tweakable_point.is_some())
+                        {
+                            return Err(TakerError::General(
+                                "Maker accepted feerate-mutated resent SwapDetails".to_string(),
                             ));
                         }
                         swap_details.amount += Amount::from_sat(1);
@@ -1749,14 +1969,31 @@ impl Taker {
         }
     }
 
+    /// Send `details` to `maker_address` on a fresh connection and return the
+    /// maker's raw response, accept or reject. Test hook for replaying admission.
     #[cfg(feature = "integration-test")]
-    fn resend_swap_details(
+    pub fn resend_swap_details(
         &self,
         maker_address: &str,
         details: &SwapDetails,
     ) -> Result<MakerToTakerMessage, TakerError> {
         let mut stream = self.net_connect(maker_address)?;
-        self.net_handshake(&mut stream)?;
+        // net_handshake reads the live swap state, but a replay can target a
+        // swap that already aborted and cleared it; take the protocol from the
+        // details being replayed instead.
+        send_message(&mut stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
+        let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(&mut stream)?)?;
+        match msg {
+            MakerToTakerMessage::MakerHello(hello)
+                if hello
+                    .supported_protocols
+                    .contains(&details.protocol_version) => {}
+            _ => {
+                return Err(TakerError::General(
+                    "Expected MakerHello supporting the replayed protocol".to_string(),
+                ))
+            }
+        }
         send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
         read_message(&mut stream)?;
         send_message(
@@ -1764,6 +2001,63 @@ impl Taker {
             &TakerToMakerMessage::SwapDetails(details.clone()),
         )?;
         Ok(serde_cbor::from_slice(&read_message(&mut stream)?)?)
+    }
+
+    /// Rebuild the SwapDetails this swap negotiated with `maker_idx`, so test
+    /// hooks can resend them the way a reconnecting client would.
+    #[cfg(feature = "integration-test")]
+    pub fn current_swap_details(&self, maker_idx: usize) -> Result<SwapDetails, TakerError> {
+        let swap = self.swap_state()?;
+        let refund_locktime_offset = REFUND_LOCKTIME_BASE
+            + REFUND_LOCKTIME_STEP * (swap.makers.len() - maker_idx - 1) as u16;
+        Ok(SwapDetails {
+            id: swap.id.clone(),
+            protocol_version: swap.params.protocol,
+            amount: swap.makers[maker_idx].amount,
+            tx_count: swap.params.tx_count,
+            incoming_count: swap.makers[maker_idx].incoming_count,
+            max_input_budget: swap.params.max_input_budget,
+            feerate: swap.params.swap_feerate() as u64,
+            timelock: swap.makers[maker_idx].negotiated_timelock,
+            refund_locktime_offset,
+        })
+    }
+
+    /// Resend the negotiated SwapDetails to `maker_idx` on a fresh connection
+    /// and return the maker's raw response, accept or reject.
+    #[cfg(feature = "integration-test")]
+    pub fn test_resend_swap_details(
+        &self,
+        maker_idx: usize,
+    ) -> Result<MakerToTakerMessage, TakerError> {
+        let details = self.current_swap_details(maker_idx)?;
+        let address = self.swap_state()?.makers[maker_idx].address.to_string();
+        self.resend_swap_details(&address, &details)
+    }
+
+    /// Send a bare `WaitingFundingConfirmation` keepalive for `swap_id` on a
+    /// fresh connection, the way the route heartbeat does. Test hook for the
+    /// keepalive/lifetime tests; the maker answers with silence either way, so
+    /// acceptance vs refusal is observable in its log only.
+    #[cfg(feature = "integration-test")]
+    pub fn test_send_keepalive(
+        &self,
+        maker_address: &str,
+        swap_id: &str,
+    ) -> Result<(), TakerError> {
+        let mut stream = self.net_connect(maker_address)?;
+        send_message(&mut stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
+        let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(&mut stream)?)?;
+        if !matches!(msg, MakerToTakerMessage::MakerHello(_)) {
+            return Err(TakerError::General(
+                "Expected MakerHello before a keepalive".to_string(),
+            ));
+        }
+        send_message(
+            &mut stream,
+            &TakerToMakerMessage::WaitingFundingConfirmation(swap_id.to_string()),
+        )?;
+        Ok(())
     }
 
     /// Validate a maker's offer for fee sanity and size limits.
@@ -1830,11 +2124,10 @@ impl Taker {
         Ok(())
     }
 
-    /// Substitute a maker at the given route index with a spare, then negotiate with it.
-    ///
-    /// This is used during exchange when a maker fails mid-protocol. The spare address
-    /// is placed at `target_idx`, and the standard negotiation handshake (offer, swap
-    /// details, ack) is performed to populate its `tweakable_point` and `offer`.
+    /// Put a spare in a failed maker's place and negotiate only with it.
+    /// Downstream hops keep their admitted declarations, so the spare must
+    /// derive the identical next hop or the swap aborts. The last hop has no
+    /// downstream admission, so there the spare need only match the receive.
     pub(crate) fn substitute_and_negotiate_spare(
         &mut self,
         target_idx: usize,
@@ -1846,29 +2139,35 @@ impl Taker {
             spare_addr
         );
 
+        // Payment routes are priced against the exact makers they were solved
+        // for; substitution would invalidate the gross.
+        if self.swap_state()?.payment.is_some() {
+            return Err(TakerError::General(
+                "Cannot substitute a maker in a payment swap".to_string(),
+            ));
+        }
+
+        let (amount, incoming_count, swap_id, tx_count, maker_count) = {
+            let swap = self.swap_state()?;
+            let old = &swap.makers[target_idx];
+            (
+                old.amount,
+                old.incoming_count,
+                swap.id.clone(),
+                swap.params.tx_count,
+                swap.params.maker_count,
+            )
+        };
+        // For the last hop no downstream admission pins the spare's shape, so
+        // capture what the failed maker's stored terms delivered before
+        // overwriting them.
+        let prior_delivered = self.derive_next_hop(target_idx).ok().map(|(a, _)| a);
         let protocol = self.swap_state()?.params.protocol;
-        let exchange = match protocol {
-            ProtocolVersion::Legacy => ExchangeProgress::Legacy(LegacyExchangeProgress::default()),
-            ProtocolVersion::Taproot => {
-                ExchangeProgress::Taproot(TaprootExchangeProgress::default())
-            }
-        };
-        let replacement = MakerConnection {
-            address: spare_addr,
-            protocol,
-            tweakable_point: None,
-            offer: None,
-            negotiated_timelock: 0,
-            exchange,
-            finalization: FinalizationProgress::default(),
-        };
+        let mut replacement = MakerConnection::new(spare_addr, protocol, None);
+        replacement.amount = amount;
+        replacement.incoming_count = incoming_count;
         self.swap_state_mut()?.makers[target_idx] = replacement;
 
-        // Negotiate with the spare maker.
-        let swap_id = self.swap_state()?.id.clone();
-        let send_amount = self.swap_state()?.params.send_amount;
-        let tx_count = self.swap_state()?.params.tx_count;
-        let maker_count = self.swap_state()?.params.maker_count;
         let reference_height =
             {
                 let wallet = self.read_wallet()?;
@@ -1880,11 +2179,42 @@ impl Taker {
         self.negotiate_with_maker(
             target_idx,
             &swap_id,
-            send_amount,
+            amount,
+            incoming_count,
             tx_count,
             maker_count,
             reference_height,
         )?;
+        // A spare whose offer or plan shape prices the hop differently than
+        // the failed maker cannot take its place: the next hop's admitted
+        // terms would no longer match, so the swap must abort.
+        if target_idx + 1 < maker_count {
+            let (next_amount, next_count) = self.derive_next_hop(target_idx)?;
+            let downstream = &self.swap_state()?.makers[target_idx + 1];
+            if next_amount != downstream.amount || next_count != downstream.incoming_count {
+                return Err(TakerError::General(format!(
+                    "Spare at hop {} forwards a different shape than the failed maker; aborting swap",
+                    target_idx
+                )));
+            }
+        } else {
+            // The last hop has no downstream admission to check against, so
+            // compare what the hop actually delivers: forwardable minus the
+            // acked splits' funding fee. A shortfall aborts the swap.
+            let prior = prior_delivered.ok_or_else(|| {
+                TakerError::General(format!(
+                    "Maker {target_idx} has no negotiated shape to price the last hop from"
+                ))
+            })?;
+            let spare = self.derive_next_hop(target_idx)?.0;
+            if spare < prior {
+                return Err(TakerError::General(format!(
+                    "Spare at the last hop forwards {} sats where the failed maker forwarded {} sats; aborting swap",
+                    spare.to_sat(),
+                    prior.to_sat()
+                )));
+            }
+        }
         #[cfg(debug_assertions)]
         log::debug!(
             "[SWAP_ROUTE] Source: taker::api::substitute_and_negotiate_spare | SwapID: {} | Action: substitute_maker | MakerIndex: {} | Address: {} | ReferenceHeight: {}",
@@ -1896,10 +2226,20 @@ impl Taker {
         Ok(())
     }
 
-    /// Re-initialize funding after substituting the first maker.
-    ///
-    /// Clears old outgoing swapcoins from the wallet and swap state, then creates
-    /// new funding transactions using the new first maker's tweakable point.
+    /// True only while the funding broadcast loop was never entered. The phase
+    /// flips to FundsBroadcast before the first send, so past that point a
+    /// partial batch is possible, substitution is off the table, and a failure
+    /// goes to recovery.
+    fn no_outgoing_funding_on_chain(&self) -> bool {
+        match self.swap_state() {
+            Ok(swap) => swap.phase < SwapPhase::FundsBroadcast,
+            Err(_) => false,
+        }
+    }
+
+    /// Rebuild funding against a substituted first maker. This destroys the
+    /// old swapcoins' recovery material, so the call site must first prove
+    /// nothing is on-chain.
     pub(crate) fn funding_reinitialize(&mut self) -> Result<(), TakerError> {
         log::info!("Re-initializing funding after maker substitution");
 
@@ -1952,15 +2292,18 @@ impl Taker {
         let preimage = swap.preimage;
         let send_amount = swap.params.send_amount;
         let swap_id = swap.id.clone();
-        let swap_tx_count = swap.params.tx_count as usize;
+        // Fund hop 0 with the count declared at negotiation: the planned
+        // count, which may be below the `tx_count` ceiling on a thin wallet.
+        let hop0_tx_count = first_maker.incoming_count as usize;
         let manually_selected_outpoints = swap.params.manually_selected_outpoints.clone();
         let reference_height = swap.reference_height;
+        let swap_feerate = swap.params.swap_feerate();
 
         let (multisig_pubkeys, multisig_nonces, hashlock_pubkeys, hashlock_nonces) =
             generate_maker_keys(
                 &tweakable_point,
                 if protocol == ProtocolVersion::Legacy {
-                    swap.params.tx_count
+                    first_maker.incoming_count
                 } else {
                     1
                 },
@@ -2008,14 +2351,15 @@ impl Taker {
                 &swap_id,
                 network,
                 manually_selected_outpoints,
+                swap_feerate,
             )?,
             ProtocolVersion::Taproot => {
                 let hashlock_pubkey = taproot_hashlock_pubkey
                     .ok_or_else(|| TakerError::General("taproot hashlock pubkey not set".into()))?;
                 Self::funding_create_taproot(
                     &mut wallet,
-                    &vec![tweakable_point; swap_tx_count],
-                    &vec![hashlock_pubkey; swap_tx_count],
+                    &vec![tweakable_point; hop0_tx_count],
+                    &vec![hashlock_pubkey; hop0_tx_count],
                     preimage,
                     refund_locktime_offset,
                     send_amount,
@@ -2023,6 +2367,7 @@ impl Taker {
                     network,
                     manually_selected_outpoints,
                     reference_height,
+                    swap_feerate,
                 )?
             }
         };
@@ -2496,12 +2841,9 @@ impl Taker {
         }
     }
 
-    /// Generate a detailed swap report for audit trail (matches master's `generate_swap_report`).
-    ///
-    /// Computes UTXO diffs, per-maker fee breakdown, contract txids, and funding txids.
-    /// Prints the report to console and saves it beside the active wallet file.
-    /// `swept` carries the settlement outcome, and is `None` on failure paths
-    /// where no sweep ran.
+    /// Print the swap report and save it beside the wallet file: UTXO diffs,
+    /// per-maker fees, contract and funding txids. `swept` is `None` on failure
+    /// paths where no sweep ran.
     fn generate_swap_report(
         &self,
         initial_utxos: &[ListUnspentResultEntry],
@@ -2868,9 +3210,14 @@ impl Taker {
     /// and wallet cleanup are handled by the `RecoveryLoop`.
     pub fn recover_active_swap(&mut self) -> Result<(), TakerError> {
         // A crashed process never reaches its recovery. Gate here rather than at
-        // each failure site, so every path into recovery is covered.
+        // each failure site, so every path into recovery is covered. The legacy
+        // replay behavior dies the same way: its recovery would spend the
+        // funding the replayed proof presents.
         #[cfg(feature = "integration-test")]
-        if self.behavior == TakerBehavior::CrashBeforeRecovery {
+        if matches!(
+            self.behavior,
+            TakerBehavior::CrashBeforeRecovery | TakerBehavior::ReplayLegacyProofOfFunding
+        ) {
             log::warn!("Test behavior: crashing instead of recovering");
             return Ok(());
         }
@@ -3093,6 +3440,101 @@ impl Taker {
     }
 }
 
+/// Replay caches for the `Replay*` test behaviors, keyed by maker address so a
+/// second taker can replay what the first cached against the same maker
+/// (concurrent-replay tests) without same-process tests sharing entries.
+#[cfg(feature = "integration-test")]
+static REPLAY_CONTRACT_CACHE: std::sync::Mutex<Vec<(String, (u32, TaprootContractData))>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(feature = "integration-test")]
+static REPLAY_POF_CACHE: std::sync::Mutex<
+    Vec<(String, crate::protocol::legacy_messages::ProofOfFunding)>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Fund every destination of the taker's own hop, or none of them. The taker
+/// pays this hop's fee on top, so it takes no input budget and no over-budget
+/// guard, and a degraded plan is a funding failure rather than a smaller swap.
+pub(crate) fn fund_all_or_nothing(
+    wallet: &mut Wallet,
+    send_amount: Amount,
+    destinations: &[bitcoin::Address],
+    feerate: f64,
+    manually_selected_outpoints: Option<Vec<OutPoint>>,
+) -> Result<CreateFundingTxesResult, TakerError> {
+    let plan = wallet.plan_funding(
+        send_amount,
+        destinations.len() as u32,
+        feerate,
+        u32::MAX,
+        None,
+        manually_selected_outpoints,
+        None,
+    )?;
+    if plan.len() != destinations.len() {
+        return Err(TakerError::General(format!(
+            "wallet can fund only {} of the {} funding transactions",
+            plan.len(),
+            destinations.len()
+        )));
+    }
+    Ok(wallet.execute_funding_plan(&plan, destinations, feerate)?)
+}
+
+/// Last value stashed for `maker_address`, if any.
+#[cfg(feature = "integration-test")]
+fn replay_cache_get<T: Clone>(
+    cache: &std::sync::Mutex<Vec<(String, T)>>,
+    maker_address: &str,
+) -> Option<T> {
+    cache
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(addr, _)| addr == maker_address)
+        .map(|(_, value)| value.clone())
+}
+
+/// Replaces whatever `maker_address` had stashed.
+#[cfg(feature = "integration-test")]
+fn replay_cache_put<T>(cache: &std::sync::Mutex<Vec<(String, T)>>, maker_address: &str, value: T) {
+    let mut cache = cache.lock().unwrap();
+    cache.retain(|(addr, _)| addr != maker_address);
+    cache.push((maker_address.to_string(), value));
+}
+
+#[cfg(feature = "integration-test")]
+pub(crate) fn replay_contract_cache_get(maker_address: &str) -> Option<(u32, TaprootContractData)> {
+    replay_cache_get(&REPLAY_CONTRACT_CACHE, maker_address)
+}
+
+#[cfg(feature = "integration-test")]
+pub(crate) fn replay_contract_cache_put(
+    maker_address: &str,
+    timelock: u32,
+    data: &TaprootContractData,
+) {
+    replay_cache_put(
+        &REPLAY_CONTRACT_CACHE,
+        maker_address,
+        (timelock, data.clone()),
+    );
+}
+
+#[cfg(feature = "integration-test")]
+pub(crate) fn replay_pof_cache_get(
+    maker_address: &str,
+) -> Option<crate::protocol::legacy_messages::ProofOfFunding> {
+    replay_cache_get(&REPLAY_POF_CACHE, maker_address)
+}
+
+#[cfg(feature = "integration-test")]
+pub(crate) fn replay_pof_cache_put(
+    maker_address: &str,
+    pof: &crate::protocol::legacy_messages::ProofOfFunding,
+) {
+    replay_cache_put(&REPLAY_POF_CACHE, maker_address, pof.clone());
+}
+
 /// Taker behavior for testing.
 #[cfg(feature = "integration-test")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -3106,6 +3548,9 @@ pub enum TakerBehavior {
     StopWatcherAfterSentinels,
     /// Replace the validated amount before sending SwapDetails.
     ForgeBounds(Amount),
+    /// Declare a different incoming count than planned, so the contract data
+    /// that follows cannot match it (maker count-equality rejection tests).
+    ForgeIncomingCount(u32),
     /// Re-send identical then mutated SwapDetails after admission.
     ResendMutatedDetails,
     /// Close connection early (after maker selection).
@@ -3154,4 +3599,38 @@ pub enum TakerBehavior {
     /// Alter the cached PaySwap quote before negotiation so the freshly fetched
     /// maker offer exercises the repricing guard.
     AlterPaymentQuoteBeforeNegotiation,
+    /// Fail the Legacy taker's second funding-tx broadcast, leaving a partial
+    /// batch with only the first split in the mempool (taker-side
+    /// partial-broadcast recovery).
+    FailSecondFundingBroadcast,
+    /// Re-send the previous swap's Taproot contract data under the new swap id.
+    /// The maker must reject the replay instead of funding a second hop.
+    ReplayTaprootContractData,
+    /// Like `ReplayTaprootContractData`, but the first swap dies right after the
+    /// maker answers its contract data, so the replay lands while the first
+    /// swap's claim is still in flight.
+    ReplayTaprootContractDataInFlight,
+    /// Cache the first swap's Legacy proof of funding, die right after the maker
+    /// answers it (no recovery, which would spend the funding), then resend the
+    /// cached proof under the second swap's id.
+    ReplayLegacyProofOfFunding,
+    /// Send a different feerate than negotiated on the wire, so the maker's own
+    /// admission guard is what refuses (relay-floor rejection tests).
+    ForgeFeerate(u64),
+    /// Send a different split count than planned on the wire (maker admission
+    /// rejection tests).
+    ForgeTxCount(u32),
+    /// Send a different input budget than planned on the wire (maker admission
+    /// rejection tests).
+    ForgeMaxInputBudget(u32),
+    /// When the maker drops mid-exchange, re-admit this swap on a fresh
+    /// connection and resend the same contract data (resume-after-partial-
+    /// broadcast test). Only the maker's same-swap exemptions let this pass.
+    ResumeAfterMakerDrop,
+    /// Broadcast the contract txs but skip the confirmation wait, so contract
+    /// data reaches the maker while the funding is only mempool-visible.
+    SkipFundingConfirmWait,
+    /// Withhold the contract tx broadcast and skip the wait, so the maker
+    /// claims funding txids no backend can see (evidence-gated keepalive).
+    WithholdFundingBroadcast,
 }

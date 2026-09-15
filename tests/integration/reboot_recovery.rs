@@ -16,7 +16,6 @@ use openswap::{
     maker::{start_server, MakerBehavior, MakerServer},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, Taker, TakerBehavior},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
@@ -63,20 +62,8 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
     info!("Starting Maker servers...");
     let maker_threads = makers
@@ -91,14 +78,7 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
 
     wait_for_makers_setup(&makers, 120);
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -143,12 +123,7 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
         before_incoming, before_outgoing
     );
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     drop(victim);
     drop(makers);
@@ -165,7 +140,7 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
         })
     };
 
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
     // Recovery takes longer under parallel load; wait for the markers instead
     // of asserting at a fixed wall-clock point.
     if watcher_available {
@@ -293,20 +268,8 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
     info!("Starting Maker servers...");
     let maker_threads = makers
@@ -321,14 +284,7 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
 
     wait_for_makers_setup(&makers, 120);
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -395,12 +351,7 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
     // Dropping the taker and stopping the makers leaves every watcher empty, so
     // each restart has to rebuild from its own wallet.
     drop(takers);
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
     drop(makers);
 
     // The claims still need confirmations, so mine by hand — slowly enough that
@@ -417,7 +368,7 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
         })
     };
 
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
     let log_len = || std::fs::read_to_string(&log_path).unwrap_or_default().len();
     let since = |offset: usize| {
         let all = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -602,4 +553,99 @@ fn test_legacy_electrum_crash_after_contract_exchange() {
         ProtocolVersion::Legacy,
         TakerBehavior::CrashAfterContractExchange,
     );
+}
+
+/// A maker that reserved inputs for a funding it never sent must still hold
+/// them after a restart: that funding can still reach the network, and handing
+/// those inputs to another swap would invite a conflicting transaction.
+///
+/// Route: Taker -> Maker1 (Normal) -> Maker2 (skips its funding broadcast and
+/// records nothing). Maker2 is restarted inside the grace, and must come back
+/// still holding what it reserved.
+#[test]
+fn reservations_survive_a_maker_restart() {
+    warn!("Running Test: swap input reservations survive a maker restart");
+
+    let makers_config_map = vec![(7452, Some(20951)), (17452, Some(20952))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![
+        MakerBehavior::Normal,
+        MakerBehavior::SkipFundingBroadcastUnrecorded,
+    ];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || {
+                start_server(maker_clone).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+    generate_blocks(bitcoind, 1);
+
+    let summary = taker
+        .prepare_swap(swap_params)
+        .expect("Prepare should succeed");
+    let swap_result = taker.start_swap(&summary.swap_id);
+    assert!(
+        swap_result.is_err(),
+        "Swap should fail: Maker2 skips its funding broadcast"
+    );
+
+    let victim = makers[1].clone();
+    let before = victim.live_reserved_inputs().unwrap();
+    assert!(
+        before > 0,
+        "Maker2 must reserve the inputs of the funding it planned"
+    );
+    info!("Maker2 holds {} reserved inputs before restart", before);
+
+    // The first init consumed the passphrase, so re-supply it as an operator
+    // would on restart.
+    let mut victim_config = victim.config.clone();
+    victim_config.password = Some("integration-test".to_string());
+
+    shutdown_makers(&makers, maker_threads);
+    drop(victim);
+    drop(makers);
+
+    // Init only reloads state; `start_server` is what runs startup recovery.
+    // The reservation has to survive that too, or a maker could reuse an input
+    // from a funding transaction that can still be broadcast.
+    let restarted = Arc::new(MakerServer::init(victim_config).unwrap());
+    let restarted_thread = {
+        let maker_clone = restarted.clone();
+        thread::spawn(move || {
+            start_server(maker_clone).unwrap();
+        })
+    };
+    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+    thread::sleep(Duration::from_secs(5));
+
+    let after = restarted.live_reserved_inputs().unwrap();
+    assert_eq!(
+        after, before,
+        "startup recovery must not free inputs the planned funding can still spend"
+    );
+
+    restarted.shutdown.store(true, Relaxed);
+    restarted_thread.join().unwrap();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
 }

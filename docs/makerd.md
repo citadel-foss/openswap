@@ -37,7 +37,7 @@ fidelity_amount = 10000
 # Fidelity Bond timelock in blocks (must be between 12960 and 25920)
 fidelity_timelock = 15000
 # Fee rate in sats/vB for the fidelity bond transaction (must be at least 1.0)
-fidelity_feerate = 2.0
+fidelity_feerate = 1.0
 # A fixed base fee charged by the Maker for providing its services (in satoshis)
 base_fee = 500
 # A percentage fee based on the swap amount
@@ -55,11 +55,12 @@ required_confirms = 1
 - `min_swap_amount`: Minimum swap amount (in satoshis). Values below the protocol minimum of 10,000 sats are rejected at startup.
 - `fidelity_amount`: Amount (in satoshis) locked as a fidelity bond to deter Sybil attacks. Defaults to 10,000 sats.
 - `fidelity_timelock`: Lock duration in block heights for the fidelity bond. Defaults to 15,000 blocks; must be within the accepted range of 12,960–25,920 blocks.
-- `fidelity_feerate`: Fee rate (in sats/vB) for the fidelity bond transaction. Defaults to 2.0; lower values are allowed, but anything below the relay minimum of 1.0 sats/vB is clamped to 1.0.
+- `fidelity_feerate`: Fee rate (in sats/vB) for the fidelity bond transaction. Defaults to 1.0, the relay minimum; lower values are clamped to it.
 - `base_fee`: A fixed fee charged by the Maker for providing its services (in satoshis).
 - `amount_relative_fee_pct`: A percentage fee based on the swap amount.
 - `time_relative_fee_pct`: A percentage fee based on the swap duration.
 - `required_confirms`: Number of confirmations required for funding transactions (default: 1).
+- The per-hop parameters the taker negotiates (`tx_count`, `max_input_budget`, `feerate`) — and what the maker is reimbursed on top of its service fees — are covered in [the fee policy](./fee-policy.md).
 
 > **Note:**  
 > On the first run, if the default `network_port` or `rpc_port` is already in use, `makerd` automatically discovers a free port and persists it to `config.toml`.
@@ -276,7 +277,7 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   INFO openswap::maker::api - Fidelity timelock 15000 blocks
   ```
 
-  > **Note**: The fidelity bond transaction fee is calculated from the `fidelity_feerate` config value (default 2.0 sats/vB, clamped to the 1.0 sats/vB relay minimum), not a fixed amount.
+  > **Note**: The fidelity bond transaction fee is calculated from the `fidelity_feerate` config value (default 1.0 sats/vB, the relay minimum; lower values are clamped to it), not a fixed amount.
 
 - **Funding Requirements**: If creating a new fidelity bond and the maker wallet is empty, you'll need to fund it — `makerd` will tell you exactly how much is missing and where to send it:
 

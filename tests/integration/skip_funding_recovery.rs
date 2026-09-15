@@ -9,14 +9,12 @@ use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    sync::atomic::Ordering::Relaxed,
     thread,
     time::{Duration, Instant},
 };
@@ -50,22 +48,10 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     let taker = takers.get_mut(0).unwrap();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
@@ -84,14 +70,7 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     // Use post-fidelity, pre-swap balances as the correct baseline
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
@@ -122,6 +101,23 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     taker.log_tracker_state();
 
+    // Maker2 planned a funding it never sent. Its swapcoins must still be
+    // there: only the grace may release them, never the failure itself.
+    let victim_held = makers[1]
+        .wallet
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count()
+        + makers[1]
+            .wallet
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count();
+    assert!(
+        victim_held > 0,
+        "Maker2 must keep its swapcoins when the swap fails"
+    );
+
     if stop_watcher {
         assert!(
             makers[0]
@@ -138,6 +134,45 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     // 5 blocks/3s; remaining ~105s is scheduling margin.
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
+
+    // Maker2 never broadcast, so its record stays empty. It must not drop the
+    // swapcoins on the first pass — a real broadcast can be in flight but
+    // unseen — so the grace has to be waited out first. Both lines must appear.
+    let log_path = test_framework.taker_log_path();
+    test_framework.assert_log("shows no funding broadcast after", &log_path);
+    test_framework.assert_log("nothing to recover. Discarding swapcoins.", &log_path);
+
+    // Order matters: the wait has to come before the drop, or the grace did
+    // nothing. And once it expires the swapcoins really are released.
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let waited = log.find("shows no funding broadcast after").unwrap();
+    let dropped = log
+        .find("nothing to recover. Discarding swapcoins.")
+        .unwrap();
+    assert!(
+        waited < dropped,
+        "the maker must wait out the grace before dropping the swapcoins"
+    );
+    makers[1]
+        .wallet
+        .write()
+        .unwrap()
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    let victim_after = makers[1]
+        .wallet
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count()
+        + makers[1]
+            .wallet
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count();
+    assert_eq!(
+        victim_after, 0,
+        "Maker2 must release its swapcoins once the grace has run out"
+    );
 
     // Verify maker balances after recovery
     for (i, maker) in makers.iter().enumerate() {
@@ -258,12 +293,7 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     taker.log_tracker_state();
     info!("Legacy timelock-only recovery test completed successfully!");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     tracker_logger.stop();
     test_framework.stop();
@@ -300,7 +330,10 @@ fn test_taproot_timelock_only_recovery() {
 
     let makers_config_map = vec![(16102, Some(19161)), (26102, Some(19162))];
     let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::SkipFundingBroadcast];
+    let maker_behaviors = vec![
+        MakerBehavior::Normal,
+        MakerBehavior::SkipFundingBroadcastUnrecorded,
+    ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
@@ -309,22 +342,10 @@ fn test_taproot_timelock_only_recovery() {
     let taker = takers.get_mut(0).unwrap();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
@@ -343,14 +364,7 @@ fn test_taproot_timelock_only_recovery() {
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     // Use post-fidelity, pre-swap balances as the correct baseline
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
@@ -381,11 +395,67 @@ fn test_taproot_timelock_only_recovery() {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     taker.log_tracker_state();
 
+    // Maker2 planned a funding it never sent. Its swapcoins must still be
+    // there: only the grace may release them, never the failure itself.
+    let victim_held = makers[1]
+        .wallet
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count()
+        + makers[1]
+            .wallet
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count();
+    assert!(
+        victim_held > 0,
+        "Maker2 must keep its swapcoins when the swap fails"
+    );
+
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
     // 5 blocks/3s; remaining ~105s is scheduling margin.
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
+
+    // Maker2 left its broadcast unrecorded, so recovery must wait out the
+    // grace before dropping the swapcoins rather than trusting one backend
+    // answer. Both lines must appear, in that order.
+    let log_path = test_framework.taker_log_path();
+    test_framework.assert_log("shows no funding broadcast after", &log_path);
+    test_framework.assert_log("nothing to recover. Discarding swapcoins.", &log_path);
+
+    // Order matters: the wait has to come before the drop, or the grace did
+    // nothing. And once it expires the swapcoins really are released.
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let waited = log.find("shows no funding broadcast after").unwrap();
+    let dropped = log
+        .find("nothing to recover. Discarding swapcoins.")
+        .unwrap();
+    assert!(
+        waited < dropped,
+        "the maker must wait out the grace before dropping the swapcoins"
+    );
+    makers[1]
+        .wallet
+        .write()
+        .unwrap()
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    let victim_after = makers[1]
+        .wallet
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count()
+        + makers[1]
+            .wallet
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count();
+    assert_eq!(
+        victim_after, 0,
+        "Maker2 must release its swapcoins once the grace has run out"
+    );
 
     // Verify maker balances after recovery
     for (i, maker) in makers.iter().enumerate() {
@@ -507,12 +577,7 @@ fn test_taproot_timelock_only_recovery() {
     taker.log_tracker_state();
     info!("Taproot timelock-only recovery test completed successfully!");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     tracker_logger.stop();
     test_framework.stop();

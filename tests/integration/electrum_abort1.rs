@@ -22,14 +22,12 @@ use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    sync::atomic::Ordering::Relaxed,
     thread,
     time::{Duration, Instant},
 };
@@ -47,21 +45,21 @@ pub(crate) struct ExpectedBalances {
 }
 
 pub(crate) const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14499076,
-    taker_swap: 493687,
-    taker_spendable_diff: 7237,
-    maker_regular: [14500865, 14503103],
-    maker_swap: [498200, 495925],
-    maker_spendable: [14999065, 14999028],
+    taker_regular: 14499538,
+    taker_swap: 495673,
+    taker_spendable_diff: 4789,
+    maker_regular: [14501027, 14502722],
+    maker_swap: [499100, 497368],
+    maker_spendable: [15000127, 15000090],
 };
 
 pub(crate) const TAPROOT_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14499076,
-    taker_swap: 494557,
-    taker_spendable_diff: 6367,
-    maker_regular: [14500865, 14503103],
-    maker_swap: [499070, 496795],
-    maker_spendable: [14999935, 14999898],
+    taker_regular: 14499538,
+    taker_swap: 496336,
+    taker_spendable_diff: 4126,
+    maker_regular: [14500913, 14502494],
+    maker_swap: [499535, 497917],
+    maker_spendable: [15000448, 15000411],
 };
 
 /// Run the abort1 scenario (taker drops after funds broadcast) with the given
@@ -84,22 +82,10 @@ pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &E
     let taker = takers.get_mut(0).unwrap();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the maker server threads
     log::info!("Initiating Maker servers");
@@ -118,14 +104,7 @@ pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &E
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     verify_maker_pre_swap_balances(&makers);
 
@@ -310,19 +289,12 @@ pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &E
     taker.log_tracker_state();
     info!("Electrum abort1 test ({protocol:?}) completed successfully!");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     tracker_logger.stop();
     // Drop the taker while relay, electrs, and bitcoind are still up, so its
     // background services shut down against live servers instead of dead ones.
-    drop(takers);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    test_framework.finish(takers, block_generation_handle);
 }
 
 #[test]
@@ -357,38 +329,13 @@ fn electrum_sweeps_after_breach() {
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
+    let maker_threads = spawn_makers(&makers);
 
     wait_for_makers_setup(&makers, 120);
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -397,8 +344,9 @@ fn electrum_sweeps_after_breach() {
         .with_required_confirms(0);
 
     generate_blocks(bitcoind, 1);
+    let swap_start_height = chain_tip(bitcoind) + 1;
 
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
     let summary = taker
         .prepare_swap(swap_params)
         .expect("Prepare should succeed");
@@ -445,25 +393,36 @@ fn electrum_sweeps_after_breach() {
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        493_687,
+        495_673,
         "Swept swap balance mismatch"
     );
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14_499_076,
+        14_499_538,
         "Taker regular balance mismatch"
     );
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    // Recovery sweeps sit at depth 2 (they spend the broadcast contract txs).
+    // Each pays the relay floor at the 150 vB legacy spend model — the
+    // accepted B12 fallback until recovery fees are estimated at spend time.
+    let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[0, 0, 3]);
+    for txid in &depths[2] {
+        let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
+        assert_eq!(
+            fee, 150,
+            "recovery sweep {} must pay the 150 vB model",
+            txid
+        );
+        assert!(
+            vsize <= 150,
+            "recovery sweep {} exceeds its 150 vB model",
+            txid
+        );
+    }
 
-    drop(takers);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    shutdown_makers(&makers, maker_threads);
+
+    test_framework.finish(takers, block_generation_handle);
 }
 
 /// Plan A4: a swapcoin whose contract output is spent only in the mempool
@@ -485,38 +444,13 @@ fn electrum_discards_only_on_confirmed_spend() {
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
+    let maker_threads = spawn_makers(&makers);
 
     wait_for_makers_setup(&makers, 120);
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -524,7 +458,7 @@ fn electrum_discards_only_on_confirmed_spend() {
 
     generate_blocks(bitcoind, 1);
 
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
     let summary = taker
         .prepare_swap(swap_params)
         .expect("Prepare should succeed");
@@ -577,14 +511,7 @@ fn electrum_discards_only_on_confirmed_spend() {
         thread::sleep(Duration::from_secs(5));
     }
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
-    drop(takers);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    test_framework.finish(takers, block_generation_handle);
 }

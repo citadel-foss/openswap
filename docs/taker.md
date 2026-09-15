@@ -377,7 +377,11 @@ Options:
   -a, --amount <AMOUNT>
           Sets the swap amount in sats [default: 20000]
       --tx-count <TX_COUNT>
-          [default: 1]
+          Maximum funding splits per hop; makers may forward fewer [default: 2]
+      --max-input-budget <MAX_INPUT_BUDGET>
+          Maximum inputs per funding tx whose fee you cover; extra inputs are the maker's cost [default: 2]
+      --feerate <FEERATE>
+          Swap feerate in sats/vB; values below the 1 sat/vB relay floor are rejected [default: 1]
       --protocol <PROTOCOL>
           Protocol version to use: "legacy" or "taproot" [default: legacy]
       --maker-address <MAKER_ADDRESSES>
@@ -391,6 +395,8 @@ Options:
   -h, --help
           Print help
 ```
+
+The `--tx-count`, `--max-input-budget`, and `--feerate` parameters are explained in [the fee policy](./fee-policy.md).
 
 By default, the command opens an interactive UTXO picker so you can choose which coins fund the swap; pass `--auto-select` to let the wallet pick them automatically.
 
