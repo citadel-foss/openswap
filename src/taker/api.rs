@@ -91,8 +91,11 @@ pub const CONNECT_TIMEOUT_SECS: u64 = 30;
 /// that wait is block-bound, not message-bound.
 #[cfg(not(feature = "integration-test"))]
 const MAKER_RESPONSE_TIMEOUT_SECS: u64 = 1800;
+/// Over Electrum-via-Tor the maker's answer (confirmation wait plus three
+/// broadcasts) has measured past 60s on a slow circuit day; 180s keeps a dead
+/// maker failing fast without timing out a live one.
 #[cfg(feature = "integration-test")]
-const MAKER_RESPONSE_TIMEOUT_SECS: u64 = 60;
+const MAKER_RESPONSE_TIMEOUT_SECS: u64 = 180;
 
 /// How long the taker waits for a maker's funding to show on-chain before
 /// declaring the swap failed. A live maker broadcasts right after processing;
