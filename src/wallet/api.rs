@@ -364,6 +364,7 @@ pub struct RecoveryOutcome {
 }
 
 /// Chain state of one swapcoin's contract output on a recovery pass.
+#[derive(Debug, PartialEq, Eq)]
 enum ContractChainState {
     /// The output is on-chain or was just broadcast; recovery can proceed.
     OnChain,
@@ -946,6 +947,50 @@ impl Wallet {
         let signed_contract_tx = match swapcoin.create_signed_contract_tx() {
             Ok(tx) => tx,
             Err(e) => {
+                // If the contract tx cannot be signed (e.g. missing maker's signature),
+                // check if the swapcoin can be safely discarded because the funding
+                // transaction can never confirm due to its inputs being confirmed spent.
+                if let Some(ref funding_tx) = swapcoin.funding_tx {
+                    let funding_txid = funding_tx.compute_txid();
+                    let funding_confirmed = chain.tx_block_height(&funding_txid)?.is_some();
+
+                    if !funding_confirmed {
+                        let mut any_input_confirmed_spent = false;
+                        for input in &funding_tx.input {
+                            let outpoint = input.previous_output;
+                            if let Ok(parent_tx) = chain.get_raw_transaction(&outpoint.txid, None) {
+                                if let Some(output) = parent_tx.output.get(outpoint.vout as usize) {
+                                    if chain.is_confirmed_spend(&outpoint, &output.script_pubkey)? {
+                                        any_input_confirmed_spent = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if any_input_confirmed_spent {
+                            log::info!(
+                                "Contract tx for {} cannot be signed and funding tx inputs were spent — discarding swapcoin",
+                                swap_id
+                            );
+                            return Ok(ContractChainState::Discarded);
+                        }
+                    }
+                } else if let Some(input) = swapcoin.contract_tx.input.first() {
+                    let input_outpoint = input.previous_output;
+                    if let Ok(parent_tx) = chain.get_raw_transaction(&input_outpoint.txid, None) {
+                        if let Some(output) = parent_tx.output.get(input_outpoint.vout as usize) {
+                            if chain.is_confirmed_spend(&input_outpoint, &output.script_pubkey)? {
+                                log::info!(
+                                    "Contract tx for {} cannot be signed and input outpoint was confirmed spent — discarding swapcoin",
+                                    swap_id,
+                                );
+                                return Ok(ContractChainState::Discarded);
+                            }
+                        }
+                    }
+                }
+
                 log::warn!(
                     "Failed to sign contract tx for {}: {:?} — skipping recovery",
                     swap_id,
@@ -4218,5 +4263,757 @@ mod recovery_address_tests {
 
         assert_eq!(selected, expected);
         assert!(created);
+    }
+}
+
+#[cfg(test)]
+mod legacy_recovery_tests {
+    use super::*;
+    use crate::wallet::{
+        blockchain::{CoreRPC, CoreRpcConfig, Electrum},
+        swapcoin::OutgoingSwapCoin,
+    };
+    use bitcoin::{
+        consensus::encode::serialize_hex, hashes::Hash, secp256k1::SecretKey, Amount, OutPoint,
+        PublicKey, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    };
+    use serde_json::{json, Value};
+    use std::{
+        io::{BufRead, BufReader, Read, Write as IoWrite},
+        net::TcpListener,
+    };
+
+    fn start_electrum_recovery_stub(known_txs: Vec<(Transaction, Option<u64>, bool)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = genesis.block_hash().to_string();
+        let header_hex = serialize_hex(&genesis.header);
+
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(stream) = incoming else { continue };
+                let _ = stream.set_nodelay(true);
+                let (hash, header) = (genesis_hash.clone(), header_hex.clone());
+                let txs = known_txs.clone();
+                std::thread::spawn(move || {
+                    let mut out = stream.try_clone().expect("clone stub stream");
+                    for line in BufReader::new(stream).lines() {
+                        let Ok(line) = line else { return };
+                        let req: serde_json::Value = match serde_json::from_str(&line) {
+                            Ok(v) => v,
+                            Err(_) => return,
+                        };
+                        let id = req["id"].clone();
+                        let method = req["method"].as_str().unwrap_or_default();
+                        let resp = match method {
+                            "server.features" => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "server_version": "stub",
+                                    "genesis_hash": hash,
+                                    "protocol_min": "1.4",
+                                    "protocol_max": "1.4",
+                                    "hash_function": "sha256",
+                                    "pruning": serde_json::Value::Null,
+                                }
+                            }),
+                            "blockchain.headers.subscribe" => {
+                                json!({"jsonrpc": "2.0", "id": id, "result": {"height": 100, "hex": header}})
+                            }
+                            "blockchain.block.header" => {
+                                json!({"jsonrpc": "2.0", "id": id, "result": header})
+                            }
+                            "blockchain.scripthash.listunspent" => {
+                                let mut unspent = Vec::new();
+                                for (tx, height, is_unspent) in &txs {
+                                    let is_spent_by_known = txs.iter().any(|(t, _, _)| {
+                                        t.input.iter().any(|i| {
+                                            i.previous_output.txid == tx.compute_txid()
+                                                && i.previous_output.vout == 0
+                                        })
+                                    });
+                                    if *is_unspent && !is_spent_by_known {
+                                        let h = height.map(|h| h as i64).unwrap_or(0);
+                                        unspent.push(json!({
+                                            "height": h,
+                                            "tx_hash": tx.compute_txid().to_string(),
+                                            "tx_pos": 0,
+                                            "value": tx.output[0].value.to_sat(),
+                                        }));
+                                    }
+                                }
+                                json!({"jsonrpc": "2.0", "id": id, "result": unspent})
+                            }
+                            "blockchain.scripthash.get_history" => {
+                                let mut history = Vec::new();
+                                for (tx, height, _) in &txs {
+                                    let h = height.map(|h| h as i64).unwrap_or(0);
+                                    history.push(json!({
+                                        "height": h,
+                                        "tx_hash": tx.compute_txid().to_string(),
+                                    }));
+                                }
+                                json!({"jsonrpc": "2.0", "id": id, "result": history})
+                            }
+                            "blockchain.transaction.get" => {
+                                let txid_requested = req["params"][0].as_str().unwrap_or_default();
+                                if let Some((tx, _, _)) = txs.iter().find(|(tx, _, _)| {
+                                    tx.compute_txid().to_string() == txid_requested
+                                }) {
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": serialize_hex(tx)
+                                    })
+                                } else {
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "error": {
+                                            "code": 1,
+                                            "message": "No such mempool or blockchain transaction"
+                                        }
+                                    })
+                                }
+                            }
+                            _ => {
+                                json!({"jsonrpc": "2.0", "id": id, "result": serde_json::Value::Null})
+                            }
+                        };
+                        if writeln!(out, "{resp}").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        url
+    }
+
+    fn start_core_recovery_stub(known_txs: Vec<(Transaction, Option<u64>, bool)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind core stub");
+        let addr = listener.local_addr().unwrap();
+        let url = format!("{}:{}", addr.ip(), addr.port());
+
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(mut stream) = incoming else { continue };
+                let _ = stream.set_nodelay(true);
+                let txs = known_txs.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone core stream"));
+                    loop {
+                        let mut content_length = 0;
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                break;
+                            }
+                            if let Some((k, v)) = trimmed.split_once(':') {
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    content_length = v.trim().parse::<usize>().unwrap_or(0);
+                                }
+                            }
+                        }
+
+                        if content_length == 0 {
+                            return;
+                        }
+
+                        let mut body_buf = vec![0u8; content_length];
+                        if reader.read_exact(&mut body_buf).is_err() {
+                            return;
+                        }
+
+                        let Ok(req): Result<serde_json::Value, _> =
+                            serde_json::from_slice(&body_buf)
+                        else {
+                            return;
+                        };
+                        let id = req["id"].clone();
+                        let method = req["method"].as_str().unwrap_or_default();
+                        let params = &req["params"];
+
+                        let (status_code, resp_body) = match method {
+                            "getrawtransaction" => {
+                                let txid_req = params[0].as_str().unwrap_or_default();
+                                let verbose = params
+                                    .get(1)
+                                    .map(|v| {
+                                        v.as_bool().unwrap_or(false)
+                                            || v.as_i64().unwrap_or(0) != 0
+                                            || v.as_u64().unwrap_or(0) != 0
+                                    })
+                                    .unwrap_or(false);
+                                if let Some((tx, height, _)) = txs
+                                    .iter()
+                                    .find(|(t, _, _)| t.compute_txid().to_string() == txid_req)
+                                {
+                                    if verbose {
+                                        let blockhash = height.map(|h| format!("{:064x}", h));
+                                        let vin: Vec<Value> = tx
+                                            .input
+                                            .iter()
+                                            .map(|i| {
+                                                json!({
+                                                    "txid": i.previous_output.txid.to_string(),
+                                                    "vout": i.previous_output.vout,
+                                                    "scriptSig": {"asm": "", "hex": serialize_hex(&i.script_sig)},
+                                                    "sequence": i.sequence.0,
+                                                })
+                                            })
+                                            .collect();
+                                        let vout: Vec<Value> = tx
+                                            .output
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(n, o)| {
+                                                json!({
+                                                    "value": o.value.to_btc(),
+                                                    "n": n,
+                                                    "scriptPubKey": {
+                                                        "asm": "",
+                                                        "hex": serialize_hex(&o.script_pubkey),
+                                                        "type": null,
+                                                    }
+                                                })
+                                            })
+                                            .collect();
+                                        let result = json!({
+                                            "in_active_chain": null,
+                                            "hex": serialize_hex(tx),
+                                            "txid": txid_req,
+                                            "hash": tx.compute_wtxid().to_string(),
+                                            "size": tx.total_size(),
+                                            "vsize": tx.vsize(),
+                                            "version": tx.version.0 as u32,
+                                            "locktime": tx.lock_time.to_consensus_u32(),
+                                            "vin": vin,
+                                            "vout": vout,
+                                            "blockhash": blockhash,
+                                            "confirmations": if height.is_some() { 1 } else { 0 },
+                                            "time": 100,
+                                            "blocktime": 100,
+                                        });
+                                        (
+                                            200,
+                                            json!({"jsonrpc": "1.0", "id": id, "result": result, "error": Value::Null}),
+                                        )
+                                    } else {
+                                        (
+                                            200,
+                                            json!({"jsonrpc": "1.0", "id": id, "result": serialize_hex(tx), "error": Value::Null}),
+                                        )
+                                    }
+                                } else {
+                                    (
+                                        500,
+                                        json!({
+                                            "jsonrpc": "1.0",
+                                            "id": id,
+                                            "result": Value::Null,
+                                            "error": {
+                                                "code": -5,
+                                                "message": "No such mempool or blockchain transaction"
+                                            }
+                                        }),
+                                    )
+                                }
+                            }
+                            "getblockheader" => {
+                                let hash_req = params[0].as_str().unwrap_or_default();
+                                let height =
+                                    u64::from_str_radix(hash_req.trim_start_matches('0'), 16)
+                                        .unwrap_or(1);
+                                let result = json!({
+                                    "hash": hash_req,
+                                    "confirmations": 1,
+                                    "height": height as usize,
+                                    "version": 1,
+                                    "versionHex": "00000001",
+                                    "merkleroot": "0000000000000000000000000000000000000000000000000000000000000000",
+                                    "time": 100,
+                                    "mediantime": 100,
+                                    "nonce": 0,
+                                    "bits": "1d00ffff",
+                                    "difficulty": 1.0,
+                                    "chainwork": "0000000000000000000000000000000000000000000000000000000000000001",
+                                    "nTx": 1,
+                                    "previousblockhash": Value::Null,
+                                    "nextblockhash": Value::Null,
+                                });
+                                (
+                                    200,
+                                    json!({"jsonrpc": "1.0", "id": id, "result": result, "error": Value::Null}),
+                                )
+                            }
+                            "getmempoolentry" => {
+                                let txid_req = params[0].as_str().unwrap_or_default();
+                                if let Some((tx, height, _)) = txs
+                                    .iter()
+                                    .find(|(t, _, _)| t.compute_txid().to_string() == txid_req)
+                                {
+                                    if height.is_none() {
+                                        let result = json!({
+                                            "vsize": tx.vsize(),
+                                            "weight": tx.weight().to_wu() as usize,
+                                            "time": 100,
+                                            "height": 0,
+                                            "descendantcount": 1,
+                                            "descendantsize": 100,
+                                            "ancestorcount": 1,
+                                            "ancestorsize": 100,
+                                            "wtxid": tx.compute_wtxid().to_string(),
+                                            "fees": {"base": 0.00001}
+                                        });
+                                        (
+                                            200,
+                                            json!({"jsonrpc": "1.0", "id": id, "result": result, "error": Value::Null}),
+                                        )
+                                    } else {
+                                        (
+                                            500,
+                                            json!({
+                                                "jsonrpc": "1.0",
+                                                "id": id,
+                                                "result": Value::Null,
+                                                "error": {
+                                                    "code": -5,
+                                                    "message": "Transaction not in mempool"
+                                                }
+                                            }),
+                                        )
+                                    }
+                                } else {
+                                    (
+                                        500,
+                                        json!({
+                                            "jsonrpc": "1.0",
+                                            "id": id,
+                                            "result": Value::Null,
+                                            "error": {
+                                                "code": -5,
+                                                "message": "Transaction not in mempool"
+                                            }
+                                        }),
+                                    )
+                                }
+                            }
+                            "gettxout" => {
+                                let txid_req = params[0].as_str().unwrap_or_default();
+                                let vout_req = params[1].as_u64().unwrap_or(0) as u32;
+                                let include_mempool = params[2].as_bool().unwrap_or(true);
+                                if let Some((tx, height, is_unspent)) = txs
+                                    .iter()
+                                    .find(|(t, _, _)| t.compute_txid().to_string() == txid_req)
+                                {
+                                    let is_confirmed_spent = txs.iter().any(|(t, h, _)| {
+                                        h.is_some()
+                                            && t.input.iter().any(|i| {
+                                                i.previous_output.txid == tx.compute_txid()
+                                                    && i.previous_output.vout == vout_req
+                                            })
+                                    });
+                                    let is_mempool_spent = txs.iter().any(|(t, h, _)| {
+                                        h.is_none()
+                                            && t.input.iter().any(|i| {
+                                                i.previous_output.txid == tx.compute_txid()
+                                                    && i.previous_output.vout == vout_req
+                                            })
+                                    });
+                                    let is_spent = if include_mempool {
+                                        is_confirmed_spent || is_mempool_spent
+                                    } else {
+                                        is_confirmed_spent
+                                    };
+                                    if *is_unspent
+                                        && !is_spent
+                                        && (height.is_some() || include_mempool)
+                                    {
+                                        let result = json!({
+                                            "bestblock": "0000000000000000000000000000000000000000000000000000000000000000",
+                                            "confirmations": if height.is_some() { 1 } else { 0 },
+                                            "value": tx.output[vout_req as usize].value.to_btc(),
+                                            "scriptPubKey": {
+                                                "asm": "",
+                                                "hex": serialize_hex(&tx.output[vout_req as usize].script_pubkey),
+                                                "type": null,
+                                            },
+                                            "coinbase": false
+                                        });
+                                        (
+                                            200,
+                                            json!({"jsonrpc": "1.0", "id": id, "result": result, "error": Value::Null}),
+                                        )
+                                    } else {
+                                        (
+                                            200,
+                                            json!({"jsonrpc": "1.0", "id": id, "result": Value::Null, "error": Value::Null}),
+                                        )
+                                    }
+                                } else {
+                                    (
+                                        200,
+                                        json!({"jsonrpc": "1.0", "id": id, "result": Value::Null, "error": Value::Null}),
+                                    )
+                                }
+                            }
+                            _ => (
+                                200,
+                                json!({"jsonrpc": "1.0", "id": id, "result": Value::Null, "error": Value::Null}),
+                            ),
+                        };
+
+                        let resp_str = resp_body.to_string();
+                        let status_text = if status_code == 200 {
+                            "200 OK"
+                        } else {
+                            "500 Internal Server Error"
+                        };
+                        let http_resp = format!(
+                            "HTTP/1.1 {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{resp_str}",
+                            resp_str.len()
+                        );
+                        if stream.write_all(http_resp.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        url
+    }
+
+    fn for_both_backends<F: Fn(AnyBlockchain)>(
+        known_txs: Vec<(Transaction, Option<u64>, bool)>,
+        test_fn: F,
+    ) {
+        let electrum_url = start_electrum_recovery_stub(known_txs.clone());
+        let electrum = Electrum::new(&crate::wallet::ElectrumConfig {
+            url: electrum_url,
+            ..Default::default()
+        })
+        .expect("connect to electrum stub");
+        test_fn(AnyBlockchain::Electrum(electrum));
+
+        let core_url = start_core_recovery_stub(known_txs);
+        let core = CoreRPC::new(&CoreRpcConfig {
+            url: core_url,
+            ..Default::default()
+        })
+        .expect("connect to core stub");
+        test_fn(AnyBlockchain::CoreRPC(core));
+    }
+
+    fn make_legacy_outgoing_swapcoin(funding_tx: Option<Transaction>) -> OutgoingSwapCoin {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let my_privkey = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let other_privkey = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let other_pubkey = PublicKey {
+            compressed: true,
+            inner: bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &other_privkey),
+        };
+        let timelock_privkey = SecretKey::from_slice(&[4u8; 32]).unwrap();
+
+        let dummy_contract_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([10u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let mut sc = OutgoingSwapCoin::new_legacy(
+            my_privkey,
+            other_pubkey,
+            dummy_contract_tx,
+            ScriptBuf::new(),
+            timelock_privkey,
+            Amount::from_sat(50_000),
+        );
+        sc.funding_tx = funding_tx;
+        sc.others_contract_sig = None;
+        sc
+    }
+
+    #[test]
+    fn test_ensure_contract_unsigned_legacy_with_spent_wallet_inputs_is_discarded() {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+        let parent_txid = parent_tx.compute_txid();
+
+        let funding_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let spending_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let sc = make_legacy_outgoing_swapcoin(Some(funding_tx));
+        for_both_backends(
+            vec![(parent_tx, Some(10), false), (spending_tx, Some(11), true)],
+            |blockchain| {
+                let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-spent", &sc).unwrap();
+                assert_eq!(res, ContractChainState::Discarded);
+            },
+        );
+    }
+
+    #[test]
+    fn test_ensure_contract_unsigned_legacy_with_no_funding_tx_and_spent_parent_is_discarded() {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+        let parent_txid = parent_tx.compute_txid();
+
+        let spending_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let dummy_contract_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let my_privkey = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let other_privkey = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let other_pubkey = PublicKey {
+            compressed: true,
+            inner: bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &other_privkey),
+        };
+        let timelock_privkey = SecretKey::from_slice(&[4u8; 32]).unwrap();
+
+        let mut sc = OutgoingSwapCoin::new_legacy(
+            my_privkey,
+            other_pubkey,
+            dummy_contract_tx,
+            ScriptBuf::new(),
+            timelock_privkey,
+            Amount::from_sat(50_000),
+        );
+        sc.funding_tx = None;
+        sc.others_contract_sig = None;
+
+        for_both_backends(
+            vec![(parent_tx, Some(10), false), (spending_tx, Some(11), true)],
+            |blockchain| {
+                let res =
+                    Wallet::ensure_contract_on_chain(&blockchain, "swap-no-funding-spent", &sc)
+                        .unwrap();
+                assert_eq!(res, ContractChainState::Discarded);
+            },
+        );
+    }
+
+    #[test]
+    fn test_ensure_contract_unsigned_legacy_with_unspent_wallet_inputs_is_not_yet() {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+        let parent_txid = parent_tx.compute_txid();
+
+        let funding_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let sc = make_legacy_outgoing_swapcoin(Some(funding_tx));
+        for_both_backends(vec![(parent_tx, Some(10), true)], |blockchain| {
+            let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-unspent", &sc).unwrap();
+            assert_eq!(res, ContractChainState::NotYet);
+        });
+    }
+
+    #[test]
+    fn test_ensure_contract_unsigned_legacy_with_no_funding_tx_and_no_onchain_input_is_not_yet() {
+        let sc = make_legacy_outgoing_swapcoin(None);
+        for_both_backends(vec![], |blockchain| {
+            let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-no-input", &sc).unwrap();
+            assert_eq!(res, ContractChainState::NotYet);
+        });
+    }
+
+    #[test]
+    fn test_ensure_contract_unsigned_legacy_with_funding_tx_in_mempool_is_not_yet() {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+        let parent_txid = parent_tx.compute_txid();
+
+        let funding_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let sc = make_legacy_outgoing_swapcoin(Some(funding_tx.clone()));
+        for_both_backends(
+            vec![(parent_tx, Some(10), true), (funding_tx, None, true)],
+            |blockchain| {
+                let res =
+                    Wallet::ensure_contract_on_chain(&blockchain, "swap-mempool-funding", &sc)
+                        .unwrap();
+                assert_eq!(res, ContractChainState::NotYet);
+            },
+        );
+    }
+
+    #[test]
+    fn test_ensure_contract_unsigned_legacy_with_no_funding_tx_and_parent_in_mempool_is_not_yet() {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+
+        let dummy_contract_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_tx.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let my_privkey = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let other_privkey = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let other_pubkey = PublicKey {
+            compressed: true,
+            inner: bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &other_privkey),
+        };
+        let timelock_privkey = SecretKey::from_slice(&[4u8; 32]).unwrap();
+
+        let mut sc = OutgoingSwapCoin::new_legacy(
+            my_privkey,
+            other_pubkey,
+            dummy_contract_tx,
+            ScriptBuf::new(),
+            timelock_privkey,
+            Amount::from_sat(50_000),
+        );
+        sc.funding_tx = None;
+        sc.others_contract_sig = None;
+
+        for_both_backends(vec![(parent_tx, None, true)], |blockchain| {
+            let res =
+                Wallet::ensure_contract_on_chain(&blockchain, "swap-mempool-parent", &sc).unwrap();
+            assert_eq!(res, ContractChainState::NotYet);
+        });
     }
 }
