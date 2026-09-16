@@ -40,7 +40,7 @@ fn setup(test_name: String) -> (PathBuf, CoreRpcConfig, PathBuf, BitcoinD, PathB
 
     let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
 
-    let bitcoind = init_bitcoind(&temp_dir, zmq_addr);
+    let bitcoind = init_bitcoind(&temp_dir, zmq_addr).expect("bitcoind failed to start");
 
     let url = bitcoind.rpc_url().split_at(7).1.to_string();
     let auth = Auth::CookieFile(bitcoind.params.cookie_file.clone());
@@ -199,7 +199,7 @@ fn setup_electrum(test_name: &str) -> ElectrumSetup {
     // bitcoind still mines and funds; electrs indexes for the wallet.
     let port_zmq = 28332 + rand::random::<u16>() % 1000;
     let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
-    let bitcoind = init_bitcoind(&temp_dir, zmq_addr);
+    let bitcoind = init_bitcoind(&temp_dir, zmq_addr).expect("bitcoind failed to start");
     let electrsd = init_electrsd(&bitcoind, &temp_dir);
     let electrum_url = format!("tcp://{}", electrsd.electrum_url);
     std::thread::sleep(std::time::Duration::from_secs(2));

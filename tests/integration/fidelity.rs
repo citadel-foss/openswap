@@ -46,7 +46,8 @@ fn test_mempool_only_spend_reads_as_spent() {
         .local_addr()
         .unwrap()
         .port();
-    let bitcoind = init_bitcoind(&temp_dir, format!("tcp://127.0.0.1:{}", zmq_port));
+    let bitcoind = init_bitcoind(&temp_dir, format!("tcp://127.0.0.1:{}", zmq_port))
+        .expect("bitcoind failed to start");
 
     let rpc_config = CoreRpcConfig {
         url: bitcoind.rpc_url().split_at(7).1.to_string(),

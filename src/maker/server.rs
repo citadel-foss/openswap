@@ -200,14 +200,23 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         maker.watch_service.stop_watcher_for_test();
     }
     let listener = if maker.watch_service.is_alive() {
-        let listener = TcpListener::bind(("127.0.0.1", maker.config.network_port)).map_err(|e| {
-            log::warn!(
-                "Failed to bind network port {}: {}. Fidelity bond funds may be locked to this port.",
-                maker.config.network_port,
-                e
-            );
-            MakerError::IO(e)
-        })?;
+        // Tests reserve the port at allocation and hand the socket over, so a
+        // parallel test cannot take it between allocation and start.
+        #[cfg(feature = "integration-test")]
+        let reserved = maker.reserved_network_listener.lock().unwrap().take();
+        #[cfg(not(feature = "integration-test"))]
+        let reserved: Option<TcpListener> = None;
+        let listener = match reserved {
+            Some(listener) => listener,
+            None => TcpListener::bind(("127.0.0.1", maker.config.network_port)).map_err(|e| {
+                log::warn!(
+                    "Failed to bind network port {}: {}. Fidelity bond funds may be locked to this port.",
+                    maker.config.network_port,
+                    e
+                );
+                MakerError::IO(e)
+            })?,
+        };
         listener.set_nonblocking(true).map_err(MakerError::IO)?;
         Some(listener)
     } else {

@@ -137,7 +137,8 @@ fn setup(name: &str) -> Setup {
     let temp_dir = root_dir.join(name);
     std::fs::create_dir_all(&temp_dir).unwrap();
 
-    let bitcoind = init_bitcoind(&temp_dir, "tcp://127.0.0.1:48332".to_string());
+    let bitcoind = init_bitcoind(&temp_dir, "tcp://127.0.0.1:48332".to_string())
+        .expect("bitcoind failed to start");
     let electrsd = init_electrsd(&bitcoind, &temp_dir);
     generate_blocks(&bitcoind, 101);
 

@@ -71,6 +71,10 @@ pub trait MakerRpc {
     fn data_dir(&self) -> &Path;
     fn config(&self) -> &MakerServerConfig;
     fn shutdown(&self) -> &ShutdownSignal;
+    #[cfg(feature = "integration-test")]
+    fn take_reserved_rpc_listener(&self) -> Option<TcpListener> {
+        None
+    }
     #[cfg(not(feature = "integration-test"))]
     fn get_tor_hostname(&self) -> Result<String, TorError>;
 }
@@ -251,7 +255,16 @@ fn handle_request<M: MakerRpc>(
 
 pub(crate) fn start_rpc_server<M: MakerRpc>(maker: Arc<M>) -> Result<(), MakerError> {
     let rpc_port = maker.config().rpc_port;
-    let listener = TcpListener::bind(("127.0.0.1", rpc_port))?;
+    // A reserved socket means the framework already holds this port; binding
+    // again would fail against our own reservation.
+    #[cfg(feature = "integration-test")]
+    let reserved = maker.take_reserved_rpc_listener();
+    #[cfg(not(feature = "integration-test"))]
+    let reserved: Option<TcpListener> = None;
+    let listener = match reserved {
+        Some(listener) => listener,
+        None => TcpListener::bind(("127.0.0.1", rpc_port))?,
+    };
     let rpc_cookie = write_rpc_cookie(maker.data_dir())?;
     let rpc_socket = format!("127.0.0.1:{rpc_port}");
     let listener = Arc::new(listener);

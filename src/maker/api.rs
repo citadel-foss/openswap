@@ -1,5 +1,7 @@
 //! Maker API for both Legacy (ECDSA) and Taproot (MuSig2) protocols.
 
+#[cfg(feature = "integration-test")]
+use std::net::TcpListener;
 use std::{
     collections::HashMap,
     convert::TryFrom,
@@ -60,6 +62,23 @@ pub const MIN_SWAP_AMOUNT: u64 = 10_000;
 /// It spans two windows in sequence: the taker confirming its own funding, then
 /// this maker's one batched contract wait.
 const UNFUNDED_SWAP_LIFETIME: Duration = Duration::from_secs(2 * TX_CONFIRMATION_TIMEOUT.as_secs());
+
+/// One source for the lifetime so the drain and the confirmation wait agree;
+/// tests override it through the env to skip the two-hour default.
+fn unfunded_swap_lifetime() -> Duration {
+    #[cfg(feature = "integration-test")]
+    {
+        env::var("OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(UNFUNDED_SWAP_LIFETIME)
+    }
+    #[cfg(not(feature = "integration-test"))]
+    {
+        UNFUNDED_SWAP_LIFETIME
+    }
+}
 
 /// The terms fixed by the taker's `SwapDetails` at negotiation, including the
 /// fee rate. Compared as one value on reconnect so no field can silently
@@ -602,6 +621,13 @@ pub struct MakerServer {
     /// Test-only behavior override.
     #[cfg(feature = "integration-test")]
     pub behavior: MakerBehavior,
+    /// Reserved by the framework at allocation; taken at server start so no
+    /// parallel test can snipe the port in between.
+    #[cfg(feature = "integration-test")]
+    pub reserved_network_listener: Mutex<Option<TcpListener>>,
+    /// Same handoff for the RPC port.
+    #[cfg(feature = "integration-test")]
+    pub reserved_rpc_listener: Mutex<Option<TcpListener>>,
 }
 
 /// Idle swap data returned by [`MakerServer::drain_idle_swaps`].
@@ -706,6 +732,10 @@ impl MakerServer {
             nostr_relays,
             #[cfg(feature = "integration-test")]
             behavior: MakerBehavior::default(),
+            #[cfg(feature = "integration-test")]
+            reserved_network_listener: Mutex::new(None),
+            #[cfg(feature = "integration-test")]
+            reserved_rpc_listener: Mutex::new(None),
         })
     }
 
@@ -1098,14 +1128,7 @@ impl MakerServer {
         // there is nothing on-chain to recover, so it is dropped without recovery.
         // Activity refreshes the idle timer, but the admission lifetime is a hard
         // bound: keepalives cannot pin a reservation forever.
-        #[cfg(feature = "integration-test")]
-        let lifetime = env::var("OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(UNFUNDED_SWAP_LIFETIME);
-        #[cfg(not(feature = "integration-test"))]
-        let lifetime = UNFUNDED_SWAP_LIFETIME;
+        let lifetime = unfunded_swap_lifetime();
         let released_ids: Vec<(String, bool)> = swaps
             .iter()
             .filter_map(|(id, state)| {
@@ -1659,13 +1682,18 @@ impl MakerTrait for MakerServer {
             .map_err(MakerError::Wallet)?;
         // The wait can outlast the idle-drain timeout, so the per-poll hook
         // refreshes this swap's stored activity: a live handler never drains.
+        // The admission lifetime stays a hard bound though: once it fires (or
+        // the drain already reaped the state) the wait must stop instead of
+        // holding the funding plan past the lifetime.
+        let lifetime = unfunded_swap_lifetime();
         let keep_alive = || {
             if let Ok(mut swaps) = lock_debug!(self.ongoing_swaps.lock()) {
                 if let Some(state) = swaps.get_mut(swap_id) {
                     state.last_activity = Instant::now();
+                    return state.swap_start_time.elapsed() > lifetime;
                 }
             }
-            false
+            true
         };
         crate::wallet::wait_for_tx_confirmation(
             &chain,
@@ -2640,6 +2668,11 @@ impl MakerRpc for MakerServer {
 
     fn shutdown(&self) -> &ShutdownSignal {
         &self.shutdown
+    }
+
+    #[cfg(feature = "integration-test")]
+    fn take_reserved_rpc_listener(&self) -> Option<TcpListener> {
+        self.reserved_rpc_listener.lock().unwrap().take()
     }
 
     #[cfg(not(feature = "integration-test"))]

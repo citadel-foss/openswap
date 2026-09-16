@@ -126,8 +126,12 @@ fn get_bitcoind_filename(os: &str, arch: &str) -> String {
     }
 }
 
-/// Initiate the bitcoind backend.
-pub(crate) fn init_bitcoind(datadir: &std::path::Path, zmq_addr: String) -> BitcoinD {
+/// Initiate the bitcoind backend. Fallible so the caller can retry on a fresh
+/// ZMQ port: a released free-port pick can be sniped before bitcoind binds it.
+pub(crate) fn init_bitcoind(
+    datadir: &std::path::Path,
+    zmq_addr: String,
+) -> Result<BitcoinD, bitcoind::anyhow::Error> {
     let mut conf = bitcoind::Conf::default();
     conf.args.push("-txindex=1"); //txindex is must, or else wallet sync won't work.
                                   // Bitcoin Core 28 changed `getblockchaininfo`'s `warnings` field to an array of strings;
@@ -191,13 +195,13 @@ pub(crate) fn init_bitcoind(datadir: &std::path::Path, zmq_addr: String) -> Bitc
 
     log::info!("📁 Executable path: {exe_path:?}");
 
-    let bitcoind = BitcoinD::with_conf(exe_path, &conf).unwrap();
+    let bitcoind = BitcoinD::with_conf(exe_path, &conf)?;
 
     // Generate initial 101 blocks
     generate_blocks(&bitcoind, 101);
     log::info!("🚀 bitcoind initiated!!");
 
-    bitcoind
+    Ok(bitcoind)
 }
 
 /// Spawn an electrs process attached to `bitcoind`. The bitcoind instance must
@@ -786,6 +790,10 @@ const BLOCK_TICK_INTERVAL: Duration = Duration::from_secs(3);
 /// Ask the OS for `n` unused ports, sorted as the taker will sort them: maker
 /// addresses order as strings ('127.0.0.1:10000' < '127.0.0.1:9999'), and
 /// that order decides route order and the golden balances.
+///
+/// Only for child processes (bitcoind, nostr relay), which cannot inherit a
+/// socket: the port is released at return, so the caller must retry pick +
+/// spawn as one operation. In-process consumers use [`reserve_listeners`].
 fn free_ports(n: usize) -> Vec<u16> {
     let listeners: Vec<TcpListener> = (0..n)
         .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("OS refused a free port"))
@@ -796,6 +804,17 @@ fn free_ports(n: usize) -> Vec<u16> {
         .collect();
     ports.sort_by_key(|port| format!("127.0.0.1:{port}"));
     ports
+}
+
+/// Bind `n` ports and keep the sockets, sorted like [`free_ports`]. Makers
+/// take theirs at server start, closing the gap where another test's OS pick
+/// could land on a released port.
+fn reserve_listeners(n: usize) -> Vec<TcpListener> {
+    let mut listeners: Vec<TcpListener> = (0..n)
+        .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("OS refused a free port"))
+        .collect();
+    listeners.sort_by_key(|l| format!("127.0.0.1:{}", l.local_addr().unwrap().port()));
+    listeners
 }
 
 /// How long abort tests must sleep for makers to detect a drop and for the
@@ -955,17 +974,32 @@ impl TestFramework {
         }
         setup_logger(log::LevelFilter::Debug, Some(temp_dir.clone()));
         log::info!("📁 temporary directory : {}", temp_dir.display());
-        let zmq_addr = format!("tcp://127.0.0.1:{}", free_ports(1)[0]);
-        let bitcoind = init_bitcoind(&temp_dir, zmq_addr.clone());
+        let (bitcoind, zmq_addr) = (0..3)
+            .find_map(|_| {
+                let zmq_addr = format!("tcp://127.0.0.1:{}", free_ports(1)[0]);
+                init_bitcoind(&temp_dir, zmq_addr.clone())
+                    .ok()
+                    .map(|b| (b, zmq_addr))
+            })
+            .expect("bitcoind failed to start on three fresh ZMQ ports");
         let rpc_config = CoreRpcConfig {
             url: bitcoind.rpc_url().split_at(7).1.to_string(),
             auth: Auth::CookieFile(bitcoind.params.cookie_file.clone()),
             ..Default::default()
         };
-        let nostr_port = free_ports(1)[0];
+        let (nostr_port, nostr_relay) = (0..3)
+            .find_map(|_| {
+                let port = free_ports(1)[0];
+                let mut relay = spawn_nostr_relay(&temp_dir, port);
+                if wait_for_relay_healthy(port) {
+                    Some((port, relay))
+                } else {
+                    let _ = relay.kill().and_then(|_| relay.wait());
+                    None
+                }
+            })
+            .expect("nostr relay failed to start on three fresh ports");
         let nostr_relay_url = format!("ws://127.0.0.1:{nostr_port}");
-        let nostr_relay = spawn_nostr_relay(&temp_dir, nostr_port);
-        wait_for_relay_healthy(nostr_port);
         let mut electrsd: Option<ElectrsD> = None;
         let (takers, makers) = {
             let mut electrum_url: Option<String> = None;
@@ -1005,18 +1039,21 @@ impl TestFramework {
                 })
                 .collect();
 
-            // Sorted OS-assigned ports, one block per role. Network ports must
-            // ascend with the maker index: the taker sorts makers by address,
-            // so port order decides route order and the golden balances.
-            let network_ports = free_ports(makers_config_map.len());
-            let rpc_ports = free_ports(makers_config_map.len());
+            // Reserved sockets, one block per role, held until each maker
+            // takes its pair at server start. Network ports must ascend with
+            // the maker index: the taker sorts makers by address, so port
+            // order decides route order and the golden balances.
+            let mut network_listeners = reserve_listeners(makers_config_map.len()).into_iter();
+            let mut rpc_listeners = reserve_listeners(makers_config_map.len()).into_iter();
 
             // Create the MakerServers with message handling
             let makers: Vec<Arc<MakerServer>> = makers_config_map
                 .into_iter()
                 .enumerate()
                 .map(|(i, _)| {
-                    let network_port = network_ports[i];
+                    let network_listener = network_listeners.next().expect("one port per maker");
+                    let rpc_listener = rpc_listeners.next().expect("one port per maker");
+                    let network_port = network_listener.local_addr().unwrap().port();
                     let maker_id = format!("maker{network_port}");
                     thread::sleep(Duration::from_secs(5)); // Avoid resource unavailable error
                     let backend =
@@ -1026,7 +1063,7 @@ impl TestFramework {
                         data_dir: temp_dir.join(network_port.to_string()),
                         wallet_name: maker_id,
                         network_port,
-                        rpc_port: rpc_ports[i],
+                        rpc_port: rpc_listener.local_addr().unwrap().port(),
                         base_fee: fee.map_or(500, |f| f.base_fee),
                         amount_relative_fee_pct: fee.map_or(0.0025, |f| f.amount_relative_fee_pct),
                         time_relative_fee_pct: 0.0001,
@@ -1050,6 +1087,8 @@ impl TestFramework {
 
                     let mut server = MakerServer::init(config).unwrap();
                     server.behavior = maker_behaviors.get(i).copied().unwrap_or_default();
+                    *server.reserved_network_listener.lock().unwrap() = Some(network_listener);
+                    *server.reserved_rpc_listener.lock().unwrap() = Some(rpc_listener);
                     Arc::new(server)
                 })
                 .collect();
@@ -1346,7 +1385,7 @@ fn spawn_nostr_relay(temp_dir: &Path, port: u16) -> Child {
         })
 }
 
-fn wait_for_relay_healthy(port: u16) {
+fn wait_for_relay_healthy(port: u16) -> bool {
     let addr = format!("127.0.0.1:{port}");
     let timeout = Duration::from_secs(10);
     let start = Instant::now();
@@ -1354,12 +1393,13 @@ fn wait_for_relay_healthy(port: u16) {
     while start.elapsed() < timeout {
         if TcpStream::connect(&addr).is_ok() {
             log::info!("Nostr relay is alive on port {port}");
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 
     log::warn!("Nostr relay did not become healthy on port {port} within 10s");
+    false
 }
 
 /// Verifies that a swap report file contains the expected number of deniability proofs,
