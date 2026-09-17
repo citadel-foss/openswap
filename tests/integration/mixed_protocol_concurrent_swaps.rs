@@ -30,7 +30,7 @@ fn test_concurrent_legacy_and_taproot_swaps() {
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(8002, Some(21001)), (18002, Some(21002))],
+            2,
             vec![TakerBehavior::Normal, TakerBehavior::Normal],
             vec![],
         );

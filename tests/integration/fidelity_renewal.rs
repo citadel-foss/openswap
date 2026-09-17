@@ -15,11 +15,11 @@ use std::{sync::atomic::Ordering::Relaxed, thread, time::Duration};
 #[test]
 fn test_fidelity_auto_renewal() {
     // ---- Setup ----
-    let makers_config_map = vec![(8202, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     log::info!("Running Test: Fidelity Bond Auto-Renewal ");
 

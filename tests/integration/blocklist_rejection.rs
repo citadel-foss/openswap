@@ -44,11 +44,11 @@ fn taproot_populated_blocklist_is_ignored_when_disabled() {
 }
 
 fn run_disabled_blocklist(protocol: ProtocolVersion) {
-    let makers_config_map = vec![(6102, None)];
+    let maker_count = 1;
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal];
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
@@ -156,12 +156,12 @@ fn run_disabled_blocklist(protocol: ProtocolVersion) {
 }
 
 fn run_maker_rejection(protocol: ProtocolVersion) {
-    let makers_config_map = vec![(6102, None), (16102, None)];
+    let maker_count = 2;
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init_with_blocklist::<BitcoindBackend>(
-            makers_config_map,
+            maker_count,
             taker_behaviors,
             maker_behaviors,
         );
@@ -275,12 +275,12 @@ fn run_maker_rejection(protocol: ProtocolVersion) {
 }
 
 fn run_taker_rejection(protocol: ProtocolVersion) {
-    let makers_config_map = vec![(6102, None)];
+    let maker_count = 1;
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal];
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init_with_blocklist::<BitcoindBackend>(
-            makers_config_map,
+            maker_count,
             taker_behaviors,
             maker_behaviors,
         );

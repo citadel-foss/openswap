@@ -36,16 +36,14 @@ fn good_maker_count(taker: &openswap::taker::Taker) -> usize {
 fn test_repeated_manual_sync_is_bounded() {
     warn!("Running Test: Staged maker discovery across repeated syncs ");
 
-    let expected_makers = 11;
-    let makers_config_map: Vec<(u16, Option<u16>)> =
-        (0..expected_makers).map(|i| (8201 + i, None)).collect();
+    let expected_makers = 11usize;
     let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors: Vec<MakerBehavior> = (0..expected_makers as usize)
+    let maker_behaviors: Vec<MakerBehavior> = (0..expected_makers)
         .map(|_| MakerBehavior::Normal)
         .collect();
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(expected_makers, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = &mut takers[0];
@@ -92,7 +90,7 @@ fn test_repeated_manual_sync_is_bounded() {
 
     let good = good_maker_count(taker);
     assert_eq!(
-        good, expected_makers as usize,
+        good, expected_makers,
         "expected {expected_makers} good makers after staged syncs, got {good}"
     );
 

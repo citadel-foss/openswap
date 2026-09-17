@@ -48,12 +48,12 @@ fn test_taproot_taker_restart_recovery() {
 }
 
 fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavior) {
-    let makers_config_map = vec![(9302, Some(21601)), (19302, Some(21602))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, last_maker];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     // Owned, not borrowed: this taker gets dropped mid-test.

@@ -15,7 +15,7 @@ use super::test_framework::*;
 fn maker_rejects_new_swaps_after_watcher_exit() {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(7902, Some(20901))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
@@ -82,7 +82,7 @@ fn maker_rejects_new_swaps_after_watcher_exit() {
 fn taker_refuses_swap_before_funding_after_watcher_exit() {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(7903, Some(20902))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );

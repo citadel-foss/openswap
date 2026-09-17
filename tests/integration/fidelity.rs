@@ -96,11 +96,11 @@ fn test_mempool_only_spend_reads_as_spent() {
 #[test]
 fn test_fidelity_creation() {
     // ---- Setup ----
-    let makers_config_map = vec![(8102, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     log::info!("Running Test: Fidelity Bond Creation and Redemption ");
 
@@ -352,11 +352,11 @@ fn test_fidelity_spending() {
     const FIDELITY_AMOUNT: u64 = 5_000_000;
     const REGULAR_TX_AMOUNT: u64 = 100_000;
 
-    let makers_config_map = vec![(8102, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     log::info!("Running Test: Assert Fidelity Spending Behavior ");
 
@@ -749,11 +749,11 @@ fn assert_single_adopted_bond(maker: &MakerServer, bond_txid: Txid) {
 #[test]
 fn test_unconfirmed_fidelity_bond_not_duplicated() {
     // ---- Setup ----
-    let makers_config_map = vec![(8102, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     log::info!("Running Test: Unconfirmed Fidelity Bond Survives Maker Restart");
 
@@ -862,10 +862,10 @@ fn test_unconfirmed_fidelity_bond_not_duplicated() {
 #[test]
 fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
     // ---- Setup ----
-    let makers_config_map = vec![(8104, None)];
+    let maker_count = 1;
 
     let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, vec![], vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, vec![], vec![]);
 
     log::info!("Running Test: Evicted Fidelity Bond Rebroadcast On Restart");
 
@@ -1007,10 +1007,10 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
 #[test]
 fn test_unconfirmed_fidelity_bond_not_duplicated_electrum() {
     // ---- Setup ----
-    let makers_config_map = vec![(8105, None)];
+    let maker_count = 1;
 
     let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<ElectrumBackend>(makers_config_map, vec![], vec![]);
+        TestFramework::init::<ElectrumBackend>(maker_count, vec![], vec![]);
 
     log::info!("Running Test: Unconfirmed Fidelity Bond Survives Maker Restart (Electrum)");
 
@@ -1095,10 +1095,10 @@ fn test_unconfirmed_fidelity_bond_not_duplicated_electrum() {
 #[test]
 fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum() {
     // ---- Setup ----
-    let makers_config_map = vec![(8106, None)];
+    let maker_count = 1;
 
     let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<ElectrumBackend>(makers_config_map, vec![], vec![]);
+        TestFramework::init::<ElectrumBackend>(maker_count, vec![], vec![]);
 
     log::info!("Running Test: Evicted Fidelity Bond Rebroadcast On Restart (Electrum)");
 

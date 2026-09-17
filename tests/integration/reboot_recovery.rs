@@ -50,7 +50,7 @@ pub(crate) fn run_reboot_recovery_without_watcher<B: TestBackend>() {
 fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
     warn!("Running Test: Taproot Maker Reboot Recovery Preserves Funded Swapcoins");
 
-    let makers_config_map = vec![(7602, Some(20601)), (17602, Some(20602))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -58,7 +58,7 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<B>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -277,8 +277,8 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
 ) {
     warn!("Running Test: Restart Rebuilds Watches ({protocol:?}, {crash_behavior:?})");
 
-    // The framework assigns real ports itself; these entries only set the count.
-    let makers_config_map = vec![(0, None), (0, None)];
+    // The framework assigns real ports; this specifies how many makers to start.
+    let maker_count = 2;
     // All three die holding unclaimed contracts, none of them recovering in
     // process, so only the restarts can settle anything.
     let taker_behavior = vec![crash_behavior];
@@ -288,7 +288,7 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<B>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

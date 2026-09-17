@@ -48,11 +48,11 @@ const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
 /// exact post-swap taker / maker balances.
 fn run_electrum_swap(protocol: ProtocolVersion, expected: &ExpectedBalances) {
     info!("Running Test: Electrum OpenSwap Procedure ({protocol:?})");
-    let makers_config_map = vec![(6102, Some(19051)), (16102, Some(19052))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<ElectrumBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<ElectrumBackend>(maker_count, taker_behavior, maker_behaviors);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
     let taker_original_balance = fund_taker(

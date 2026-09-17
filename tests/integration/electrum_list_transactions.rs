@@ -22,7 +22,7 @@ const SEND_AMOUNT: Amount = Amount::from_sat(1_000_000);
 fn test_electrum_list_transactions() {
     info!("Running Test: Electrum wallet transaction history");
     let (test_framework, mut takers, _makers, block_generation_handle) =
-        TestFramework::init::<ElectrumBackend>(vec![], vec![TakerBehavior::Normal], vec![]);
+        TestFramework::init::<ElectrumBackend>(0, vec![TakerBehavior::Normal], vec![]);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 

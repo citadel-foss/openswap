@@ -33,7 +33,7 @@ fn test_taproot_maker_abort2() {
     // ---- Setup ----
     warn!("Running Test: Taproot Maker Abort2 - CloseAtPrivateKeyHandover");
 
-    let makers_config_map = vec![(7202, Some(20201)), (17202, Some(20202))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -41,7 +41,7 @@ fn test_taproot_maker_abort2() {
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

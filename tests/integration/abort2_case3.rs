@@ -35,12 +35,12 @@ use std::{
 fn maker_abort2_case3() {
     warn!("Running Test: Maker Abort2 Case 3 - CloseAtProofOfFunding (recovery)");
 
-    let makers_config_map = vec![(6202, Some(19201)), (16202, Some(19202))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::CloseAtProofOfFunding];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

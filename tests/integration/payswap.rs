@@ -29,12 +29,12 @@ fn test_taproot_payswap() {
     // ---- Setup ----
     warn!("Running Test: Taproot PaySwap - exact payment to third-party receiver");
 
-    let makers_config_map = vec![(6012, Some(19011)), (16012, Some(19012))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -245,12 +245,12 @@ fn test_legacy_payswap() {
     // ---- Setup ----
     warn!("Running Test: Legacy PaySwap - exact payment to third-party receiver");
 
-    let makers_config_map = vec![(7012, Some(19021)), (17012, Some(19022))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -348,6 +348,7 @@ fn test_legacy_payswap() {
         .as_ref()
         .expect("payment swap report must carry a payment result");
     assert!(payment_result.confirmed);
+    assert_eq!(payment_result.requested_amount, payment_amount.to_sat());
     assert_eq!(payment_result.delivered_amount, payment_amount.to_sat());
     assert_eq!(report.incoming_amount, 0);
     assert!(report.incoming_utxos.is_empty());
@@ -419,7 +420,7 @@ fn test_payswap_negotiation_guards_abort_before_funding() {
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(8012, Some(19031)), (18012, Some(19032))],
+            2,
             vec![
                 TakerBehavior::Normal,
                 TakerBehavior::AlterPaymentQuoteBeforeNegotiation,

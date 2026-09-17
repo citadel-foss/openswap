@@ -31,12 +31,12 @@ fn test_taproot_taker_abort1() {
     // ---- Setup ----
     warn!("Running Test: Taproot Taker Abort1 - Close at AckResponse");
 
-    let makers_config_map = vec![(6802, Some(19801)), (16802, Some(19802))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::CloseAtAckResponse];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

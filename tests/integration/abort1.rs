@@ -30,12 +30,12 @@ fn taker_abort_1_legacy_corerpc() {
     // ---- Setup ----
     warn!("Running Test: Taker Drops After Full Setup");
 
-    let makers_config_map = vec![(6102, None), (16102, None)];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::DropAfterFundsBroadcast];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -288,12 +288,12 @@ fn taker_abort_1_legacy_corerpc() {
 fn maker_recovers_swap_past_refund_deadline() {
     warn!("Running Test: Maker recovers a swap that outlived its refund deadline");
 
-    let makers_config_map = vec![(8902, Some(21307))];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::StallAfterProofOfFunding];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            makers_config_map,
+            maker_count,
             taker_behavior,
             vec![MakerBehavior::Normal],
         );

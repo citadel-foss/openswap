@@ -22,17 +22,12 @@ fn test_taproot_multi_maker_openswap() {
     // ---- Setup ----
     warn!("Running Test: Multi-Maker OpenSwap with Taproot (MuSig2) Protocol - 4 Makers");
 
-    let makers_config_map = vec![
-        (7802, Some(20801)),
-        (17802, Some(20802)),
-        (27802, Some(20803)),
-        (37802, Some(20804)),
-    ];
+    let maker_count = 4;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     // Initialize test framework with 1 taker and 4 makers
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

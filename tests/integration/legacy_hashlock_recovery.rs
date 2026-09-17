@@ -32,12 +32,12 @@ use std::{
 fn test_legacy_hashlock_recovery() {
     warn!("Running Test: Legacy Hashlock Recovery - CloseAfterSweep");
 
-    let makers_config_map = vec![(9402, Some(21701)), (19402, Some(21702))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::CloseAfterSweep];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

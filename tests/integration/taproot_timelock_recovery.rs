@@ -33,7 +33,7 @@ fn test_taproot_timelock_recovery() {
     // ---- Setup ----
     warn!("Running Test: Taproot Timelock Recovery - CloseAtContractSigsExchange");
 
-    let makers_config_map = vec![(7402, Some(20401)), (17402, Some(20402))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -41,7 +41,7 @@ fn test_taproot_timelock_recovery() {
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

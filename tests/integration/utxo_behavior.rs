@@ -63,11 +63,11 @@ const TEST_CASES: &[(f64, &[f64], &str, &str)] = &[
 #[test]
 fn test_address_grouping_behavior() {
     // Initialize test environment with one maker (no swap needed, just wallet testing)
-    let makers_config_map = vec![(8702, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     println!("=== Testing Smart Address Grouping Behavior ===");
 
@@ -180,11 +180,11 @@ fn test_address_grouping_behavior() {
 #[test]
 fn test_separated_utxo_coin_selection() {
     // Initialize test environment with TWO makers and one taker
-    let makers_config_map = vec![(8702, None), (18702, None)];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     warn!("Running Test: Separated UTXO Coin Selection");
     let bitcoind = &test_framework.bitcoind;
@@ -386,11 +386,11 @@ fn test_separated_utxo_coin_selection() {
 
 #[test]
 fn test_manual_coinselection() {
-    let makers_config_map = vec![(28702, None), (38702, None)];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = &mut takers[0];

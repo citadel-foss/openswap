@@ -680,36 +680,26 @@ impl TestFramework {
     /// timelocks can mature during a test.
     #[allow(clippy::type_complexity)]
     pub fn init<B: TestBackend>(
-        makers_config_map: Vec<(u16, Option<u16>)>,
+        maker_count: usize,
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        Self::init_with_blocklist_setting::<B>(
-            makers_config_map,
-            taker_behavior,
-            maker_behaviors,
-            false,
-        )
+        Self::init_with_blocklist_setting::<B>(maker_count, taker_behavior, maker_behaviors, false)
     }
 
     /// Initialize the test framework with runtime blocklist screening enabled.
     #[allow(clippy::type_complexity)]
     pub fn init_with_blocklist<B: TestBackend>(
-        makers_config_map: Vec<(u16, Option<u16>)>,
+        maker_count: usize,
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        Self::init_with_blocklist_setting::<B>(
-            makers_config_map,
-            taker_behavior,
-            maker_behaviors,
-            true,
-        )
+        Self::init_with_blocklist_setting::<B>(maker_count, taker_behavior, maker_behaviors, true)
     }
 
     #[allow(clippy::type_complexity)]
     fn init_with_blocklist_setting<B: TestBackend>(
-        makers_config_map: Vec<(u16, Option<u16>)>,
+        maker_count: usize,
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
         check_blocklist: bool,
@@ -777,10 +767,8 @@ impl TestFramework {
             let base_maker_port = 10000 + rand::random::<u16>() % 40000;
 
             // Create the MakerServers with message handling
-            let makers: Vec<Arc<MakerServer>> = makers_config_map
-                .into_iter()
-                .enumerate()
-                .map(|(i, _)| {
+            let makers: Vec<Arc<MakerServer>> = (0..maker_count)
+                .map(|i| {
                     base_rpc_port += 1;
                     let network_port = base_maker_port + i as u16;
                     let maker_id = format!("maker{network_port}");

@@ -56,12 +56,12 @@ fn rpc_call(rpc_port: u16, cookie: &str, request: RpcMsgReq) -> RpcMsgResp {
 fn test_maker_rpc_server() {
     warn!("Running Test: Maker RPC Server");
 
-    let makers_config_map = vec![(9502, Some(21801)), (19502, Some(21802))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

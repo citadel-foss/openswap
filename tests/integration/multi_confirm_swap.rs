@@ -36,44 +36,28 @@ const REQUIRED_CONFIRMS: u32 = 15;
 #[test]
 fn test_legacy_multi_confirm_swap() {
     warn!("Running Test: Legacy Swap With required_confirms > 1");
-    run_multi_confirm_swap(
-        ProtocolVersion::Legacy,
-        vec![(9102, Some(21401)), (19102, Some(21402))],
-        false,
-    );
+    run_multi_confirm_swap(ProtocolVersion::Legacy, 2, false);
 }
 
 #[test]
 fn test_taproot_multi_confirm_swap() {
     warn!("Running Test: Taproot Swap With required_confirms > 1");
-    run_multi_confirm_swap(
-        ProtocolVersion::Taproot,
-        vec![(9202, Some(21501)), (19202, Some(21502))],
-        false,
-    );
+    run_multi_confirm_swap(ProtocolVersion::Taproot, 2, false);
 }
 
 #[test]
 fn test_legacy_confirmation_wait_exceeds_admission_deadline() {
-    run_multi_confirm_swap(
-        ProtocolVersion::Legacy,
-        vec![(9402, Some(21701)), (19402, Some(21702))],
-        true,
-    );
+    run_multi_confirm_swap(ProtocolVersion::Legacy, 2, true);
 }
 
 #[test]
 fn test_taproot_confirmation_wait_exceeds_admission_deadline() {
-    run_multi_confirm_swap(
-        ProtocolVersion::Taproot,
-        vec![(9302, Some(21601)), (19302, Some(21602))],
-        true,
-    );
+    run_multi_confirm_swap(ProtocolVersion::Taproot, 2, true);
 }
 
 fn run_multi_confirm_swap(
     protocol: ProtocolVersion,
-    makers_config_map: Vec<(u16, Option<u16>)>,
+    maker_count: usize,
     delay_first_confirmation: bool,
 ) {
     let required_confirms = if delay_first_confirmation {
@@ -85,7 +69,7 @@ fn run_multi_confirm_swap(
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

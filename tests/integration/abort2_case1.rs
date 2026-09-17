@@ -21,7 +21,7 @@ use std::{sync::atomic::Ordering::Relaxed, thread};
 fn maker_abort2_case1() {
     warn!("Running Test: Maker drops before sending sender's sigs. Taker continues with spare.");
 
-    let makers_config_map = vec![(6102, None), (16102, None), (26102, None)];
+    let maker_count = 3;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -30,7 +30,7 @@ fn maker_abort2_case1() {
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

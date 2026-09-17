@@ -52,7 +52,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     // ---- Setup ----
     warn!("Running Test: Malice2 - Maker Broadcasts Contract After Setup");
 
-    let makers_config_map = vec![(6702, Some(19701)), (16702, Some(19702))];
+    let maker_count = 2;
     let taker_behavior = vec![taker_behavior];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -60,7 +60,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<B>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

@@ -30,25 +30,17 @@ const RESULT_FAILED: u8 = 2;
 
 #[test]
 fn test_concurrent_takers_legacy() {
-    concurrent_takers(
-        ProtocolVersion::Legacy,
-        vec![(7802, Some(20801)), (17802, Some(20802))],
-        [1250081, 1250044],
-    );
+    concurrent_takers(ProtocolVersion::Legacy, 2, [1250081, 1250044]);
 }
 
 #[test]
 fn test_concurrent_takers_taproot() {
-    concurrent_takers(
-        ProtocolVersion::Taproot,
-        vec![(7902, Some(20901)), (17902, Some(20902))],
-        [1250309, 1250272],
-    );
+    concurrent_takers(ProtocolVersion::Taproot, 2, [1250309, 1250272]);
 }
 
 fn concurrent_takers(
     protocol: ProtocolVersion,
-    makers_config_map: Vec<(u16, Option<u16>)>,
+    maker_count: usize,
     expected_maker_spendable: [u64; 2],
 ) {
     // ---- Setup ----
@@ -61,7 +53,7 @@ fn concurrent_takers(
 
     // Initialize test framework with 2 takers and 2 makers
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     let bitcoind = &test_framework.bitcoind;
 
