@@ -68,7 +68,6 @@ impl Taker {
         let mut prev_txs: HashMap<Txid, Transaction> = HashMap::new();
         for (i, tx) in funding_txs.iter().enumerate() {
             let mut input_sum = Amount::ZERO;
-            let mut witness_est = 0u64;
             for input in &tx.input {
                 let prev_outpoint = input.previous_output;
                 if let Entry::Vacant(e) = prev_txs.entry(prev_outpoint.txid) {
@@ -113,17 +112,6 @@ impl Taker {
                 input_sum = input_sum.checked_add(prevout.value).ok_or_else(|| {
                     TakerError::General(format!("Maker {maker_idx} funding tx {i} input overflow"))
                 })?;
-                // The builder's per-input witness estimates, so an honest
-                // maker's fee lands exactly on the bound.
-                witness_est += if prevout.script_pubkey.is_p2wpkh() {
-                    107
-                } else if prevout.script_pubkey.is_p2tr() {
-                    66
-                } else {
-                    return Err(TakerError::General(format!(
-                        "Maker {maker_idx} funding tx {i} input type cannot be priced"
-                    )));
-                };
             }
             let output_sum = tx
                 .output
@@ -137,7 +125,10 @@ impl Taker {
                     "Maker {maker_idx} funding tx {i} outputs exceed its inputs"
                 ))
             })?;
-            let vsize = (tx.base_size() as u64 * 4 + witness_est + 2).div_ceil(4);
+            // Price the real transaction: a witness-size estimate can be
+            // exceeded by a larger valid witness, quietly dropping the
+            // effective feerate below what was negotiated.
+            let vsize = tx.vsize() as u64;
             let expected = fee_at_rate_sats(vsize, feerate)
                 .ok_or_else(|| TakerError::General("funding fee overflow".to_string()))?;
             // One-sided bound: overpaying costs only the maker. A dropped

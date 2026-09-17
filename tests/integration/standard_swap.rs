@@ -358,9 +358,9 @@ fn run_swap_with_custom_feerate(
 /// A maker blocked in its contract-confirmation wait refreshes the swap's
 /// stored activity on every poll, so a contract tx sitting unconfirmed past
 /// the 30s idle timeout is not drained mid-wait. Mining is paused before the
-/// swap starts so the maker blocks in `wait_for_tx_on_chain`; the resume is
-/// timed against the maker's wait-start log line so its ~30s poll slot catches
-/// the confirming block inside the taker's 60s response window.
+/// swap starts so the maker blocks in `wait_for_tx_on_chain`; the 40s hold
+/// crosses an idle-drain pass, and the +60s poll slot catches the confirming
+/// block inside the taker's 180s response window.
 #[test]
 fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     warn!("Running Test: maker confirmation wait survives the idle timeout");

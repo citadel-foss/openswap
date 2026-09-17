@@ -423,6 +423,11 @@ fn process_proof_of_funding<M: Maker>(
 
     state.outgoing_swapcoins = outgoing_swapcoins.clone();
     state.pending_funding_txes = funding_txes.clone();
+    // The response below carries these txs fully signed: once sent, the taker
+    // can broadcast them even if we never do. Record them now, or recovery
+    // reads an exposed funding as never-broadcast and discards the swapcoins
+    // it would still need. Input locks release only when a real send lands.
+    state.funding_broadcast_txids = funding_txes.iter().map(|tx| tx.compute_txid()).collect();
 
     let receivers_contract_txs: Vec<bitcoin::Transaction> = state
         .incoming_swapcoins

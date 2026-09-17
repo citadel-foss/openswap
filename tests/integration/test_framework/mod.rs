@@ -17,7 +17,7 @@ use std::{
     env,
     fs::{self, create_dir_all, File},
     io::{BufReader, Read},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -991,7 +991,7 @@ impl TestFramework {
             .find_map(|_| {
                 let port = free_ports(1)[0];
                 let mut relay = spawn_nostr_relay(&temp_dir, port);
-                if wait_for_relay_healthy(port) {
+                if wait_for_relay_healthy(port, &mut relay) {
                     Some((port, relay))
                 } else {
                     let _ = relay.kill().and_then(|_| relay.wait());
@@ -1385,13 +1385,19 @@ fn spawn_nostr_relay(temp_dir: &Path, port: u16) -> Child {
         })
 }
 
-fn wait_for_relay_healthy(port: u16) -> bool {
-    let addr = format!("127.0.0.1:{port}");
-    let timeout = Duration::from_secs(10);
+/// Healthy means the child is alive AND a real WebSocket handshake completes:
+/// a bare TCP connect can answer from an unrelated listener holding the port
+/// after our relay died mid-spawn.
+fn wait_for_relay_healthy(port: u16, child: &mut Child) -> bool {
+    let url = format!("ws://127.0.0.1:{port}");
     let start = Instant::now();
 
-    while start.elapsed() < timeout {
-        if TcpStream::connect(&addr).is_ok() {
+    while start.elapsed() < Duration::from_secs(10) {
+        if let Ok(Some(status)) = child.try_wait() {
+            log::warn!("Nostr relay exited early ({status}) on port {port}");
+            return false;
+        }
+        if tungstenite::connect(&url).is_ok() {
             log::info!("Nostr relay is alive on port {port}");
             return true;
         }

@@ -973,6 +973,24 @@ impl Wallet {
                 .get_tx_out(&input_outpoint.txid, input_outpoint.vout, Some(true))?
                 .is_none();
             if input_gone {
+                // The funding output is invisible because its tx never reached
+                // the chain — but the peer holds it fully signed and can
+                // broadcast it at any time. Discard only once the funding is
+                // permanently invalid: every input confirmed spent elsewhere
+                // (confirmed view — a mempool spend can still be evicted).
+                // No stored funding tx means we cannot prove that, so keep.
+                let Some(funding_tx) = &swapcoin.funding_tx else {
+                    return Ok(ContractChainState::NotYet);
+                };
+                for input in &funding_tx.input {
+                    let prev = input.previous_output;
+                    if chain
+                        .get_tx_out(&prev.txid, prev.vout, Some(false))?
+                        .is_some()
+                    {
+                        return Ok(ContractChainState::NotYet);
+                    }
+                }
                 return Ok(ContractChainState::Discarded);
             }
             log::warn!(

@@ -664,7 +664,14 @@ fn run_reservations_survive_restart<B: TestBackend>(
         })
     };
     wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
-    thread::sleep(Duration::from_secs(5));
+    // Startup recovery runs on its own thread, past is_setup_complete: wait
+    // until it has started on the unfinished swap before reading the
+    // reservation count, or the assertion can pass without recovery running.
+    wait_for_log(
+        &test_framework.taker_log_path(),
+        "recover_from_swap started",
+        Duration::from_secs(60),
+    );
 
     let after = restarted.live_reserved_inputs().unwrap();
     assert_eq!(

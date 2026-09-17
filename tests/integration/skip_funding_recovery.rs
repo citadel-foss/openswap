@@ -102,8 +102,10 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     taker.log_tracker_state();
 
-    // Maker2 planned a funding it never sent. Its swapcoins must still be
-    // there: only the grace may release them, never the failure itself.
+    // Maker2 planned a funding it never sent, but the taker already holds it
+    // fully signed: exposure came with the contract-sig request, one message
+    // before the skip. Recovery must keep the swapcoins — discarding them
+    // would strand the funds if the taker ever broadcasts.
     let victim_held = makers[1]
         .wallet
         .read()
@@ -136,23 +138,13 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
 
-    // Maker2 never broadcast, so its record stays empty. It must not drop the
-    // swapcoins on the first pass — a real broadcast can be in flight but
-    // unseen — so the grace has to be waited out first. Both lines must appear.
+    // Exposed funding is never discarded: no grace wait, no drop. The taker's
+    // timelock recovery still resolves the on-chain side (checked below).
     let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("shows no funding broadcast after", &log_path);
-    test_framework.assert_log("nothing to recover. Discarding swapcoins.", &log_path);
-
-    // Order matters: the wait has to come before the drop, or the grace did
-    // nothing. And once it expires the swapcoins really are released.
     let log = std::fs::read_to_string(&log_path).unwrap();
-    let waited = log.find("shows no funding broadcast after").unwrap();
-    let dropped = log
-        .find("nothing to recover. Discarding swapcoins.")
-        .unwrap();
     assert!(
-        waited < dropped,
-        "the maker must wait out the grace before dropping the swapcoins"
+        !log.contains("nothing to recover. Discarding swapcoins."),
+        "an exposed funding must never read as never-broadcast"
     );
     makers[1]
         .wallet
@@ -160,19 +152,14 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
         .unwrap()
         .sync_and_save(&openswap::utill::NO_SHUTDOWN)
         .unwrap();
-    let victim_after = makers[1]
+    let victim_outgoing = makers[1]
         .wallet
         .read()
         .unwrap()
-        .get_outgoing_swapcoins_count()
-        + makers[1]
-            .wallet
-            .read()
-            .unwrap()
-            .get_incoming_swapcoins_count();
+        .get_outgoing_swapcoins_count();
     assert_eq!(
-        victim_after, 0,
-        "Maker2 must release its swapcoins once the grace has run out"
+        victim_outgoing, 3,
+        "Maker2 must keep the swapcoins for its exposed funding"
     );
 
     // Verify maker balances after recovery
