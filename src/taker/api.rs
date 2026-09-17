@@ -1634,6 +1634,7 @@ impl Taker {
                         || quoted.time_relative_fee_pct.to_bits()
                             != offer.time_relative_fee_pct.to_bits()
                     {
+                        let _ = self.ban_maker(&maker_address);
                         return Err(TakerError::General(format!(
                             "Maker {} repriced its offer between the payment quote and negotiation",
                             maker_idx
@@ -1643,6 +1644,7 @@ impl Taker {
                 self.swap_state_mut()?.makers[maker_idx].offer = Some(*offer);
             }
             other => {
+                let _ = self.ban_maker(&maker_address);
                 return Err(TakerError::General(format!(
                     "Expected Offer from maker {}, got {:?}",
                     maker_idx, other
@@ -3027,6 +3029,20 @@ impl Taker {
         let parsed = MakerAddress::try_from(address)
             .map_err(|e| TakerError::General(format!("Invalid maker address: {e}")))?;
         self.offerbook.remove(&parsed)
+    }
+
+    /// Marks a maker as banned in the offerbook.
+    pub fn ban_maker(&self, address: &str) -> Result<(), TakerError> {
+        let parsed = MakerAddress::try_from(address.to_string())
+            .map_err(|e| TakerError::General(format!("Invalid maker address: {e}")))?;
+        self.offerbook.ban_maker(&parsed)
+    }
+
+    /// Checks if a maker is currently banned in the offerbook.
+    pub fn is_maker_banned(&self, address: &str) -> Result<bool, TakerError> {
+        let parsed = MakerAddress::try_from(address.to_string())
+            .map_err(|e| TakerError::General(format!("Invalid maker address: {e}")))?;
+        self.offerbook.is_banned(&parsed)
     }
 
     /// Add a funding-source address to the shared blocklist, or update its label.

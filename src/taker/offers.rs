@@ -301,13 +301,31 @@ impl OfferBookHandle {
             .clone())
     }
 
-    /// Tag a maker as bad
+    /// Tag a maker as bad / banned and persist to disk.
     pub fn add_bad_maker(&self, maker: &OfferAndAddress) -> Result<(), TakerError> {
-        log::info!("Bad Maker added: {}", maker.address);
-        lock_debug!(self.inner.write())
-            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?
-            .mark_bad(&maker.address);
+        self.ban_maker(&maker.address)
+    }
+
+    /// Ban a maker by address directly and persist the updated state to disk.
+    pub fn ban_maker(&self, address: &MakerAddress) -> Result<(), TakerError> {
+        log::info!("Banning maker: {}", address);
+        let mut book = lock_debug!(self.inner.write())
+            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+        book.mark_bad(address);
+        book.write_to_disk(&self.path)?;
         Ok(())
+    }
+
+    /// Check if a maker is banned (state is Bad).
+    pub fn is_banned(&self, address: &MakerAddress) -> Result<bool, TakerError> {
+        let offerbook = lock_debug!(self.inner.read())
+            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+        Ok(offerbook
+            .makers
+            .iter()
+            .find(|m| &m.address == address)
+            .map(|m| m.state == MakerState::Bad)
+            .unwrap_or(false))
     }
 
     /// All current good makers
@@ -669,16 +687,19 @@ impl OfferSyncService {
             .download_offer_with_retries(socks_port, shutdown);
         // Verify before taking the guard. The backend calls in here can block on a
         // slow server, which would serialize every worker in the pool behind it.
-        let outcome = downloaded.map(|oa| {
-            let verdict = verify_fidelity_with_backend(
-                blockchain,
-                &oa.offer.fidelity,
-                &oa.address.to_string(),
-                &oa.offer.tweakable_point,
-                &oa.offer.tweak_chain_code,
-            );
-            (oa, verdict)
-        });
+        let outcome = match &downloaded {
+            OfferFetchResult::Success(oa) => {
+                let verdict = verify_fidelity_with_backend(
+                    blockchain,
+                    &oa.offer.fidelity,
+                    &oa.address.to_string(),
+                    &oa.offer.tweakable_point,
+                    &oa.offer.tweak_chain_code,
+                );
+                Some((oa.clone(), verdict))
+            }
+            _ => None,
+        };
         // Poison means a worker panicked mid-update; skip this maker instead
         // of panicking the whole worker pool.
         let mut book = match lock_debug!(offerbook.write()) {
@@ -688,10 +709,21 @@ impl OfferSyncService {
                 return None;
             }
         };
-        match outcome {
-            Some((oa, Ok(_))) => book.mark_success(&oa.address, oa.offer, oa.protocol, now),
-            Some((oa, Err(e))) => book.record_fidelity_failure(&oa.address, &e, now),
-            None => book.mark_failure(&addr, now),
+        match (downloaded, outcome) {
+            (OfferFetchResult::Success(_), Some((oa, Ok(_)))) => {
+                book.mark_success(&oa.address, oa.offer, oa.protocol, now)
+            }
+            (OfferFetchResult::Success(_), Some((oa, Err(e)))) => {
+                book.record_fidelity_failure(&oa.address, &e, now)
+            }
+            (OfferFetchResult::ProtocolViolation(e), _) => {
+                log::warn!("Protocol violation from {addr}: {e:?}; banning maker");
+                book.mark_bad(&addr);
+            }
+            (OfferFetchResult::NetworkFailure, _) => {
+                book.mark_failure(&addr, now);
+            }
+            _ => unreachable!(),
         }
         // Capture the maker's final state while we still hold the write lock so
         // a concurrent `remove` can't yank it out from under the caller.
@@ -1014,6 +1046,11 @@ impl OfferBook {
             if let Some(outpoint) = fidelity_outpoint {
                 if existing.fidelity_outpoint != Some(outpoint) {
                     existing.fidelity_outpoint = Some(outpoint);
+                    if existing.state == MakerState::Bad {
+                        existing.state = MakerState::Unresponsive { retries: 0 };
+                        existing.offer = None;
+                        existing.next_offer_check_ts = None;
+                    }
                     changed = true;
                 }
             }
@@ -1194,8 +1231,8 @@ impl OfferBook {
     ) {
         match err {
             FidelityCheckError::BadBond(e) => {
-                log::warn!("Fidelity verification failed for {address}: {e:?}");
-                self.mark_failure(address, now_ts);
+                log::warn!("Fidelity verification failed for {address}: {e:?}; banning maker");
+                self.mark_bad(address);
             }
             FidelityCheckError::BackendDown(e) => {
                 let retry_at = now_ts.saturating_add(OFFER_SYNC_INTERVAL.as_secs());
@@ -1241,6 +1278,7 @@ impl OfferBook {
                 );
             }
             m.state = MakerState::Bad;
+            m.offer = None;
             m.backend_retry_pending = false;
         }
     }
@@ -1350,18 +1388,31 @@ impl TryFrom<String> for MakerAddress {
     }
 }
 
+#[derive(Debug)]
+enum OfferFetchResult {
+    Success(Box<OfferAndAddress>),
+    ProtocolViolation(TakerError),
+    NetworkFailure,
+}
+
 impl MakerAddress {
     fn download_offer_with_retries(
         self,
         socks_port: u16,
         shutdown: &AtomicBool,
-    ) -> Option<OfferAndAddress> {
+    ) -> OfferFetchResult {
         for attempt in 1..=FIRST_CONNECT_ATTEMPTS {
             if shutdown.load(Ordering::Relaxed) {
-                return None;
+                return OfferFetchResult::NetworkFailure;
             }
             match self.clone().download_offer_auto(socks_port) {
-                Ok(offer) => return Some(offer),
+                Ok(offer) => return OfferFetchResult::Success(Box::new(offer)),
+                Err(TakerError::Wallet(WalletError::Protocol(e))) => {
+                    log::warn!("Protocol error fetching offer from {}: {:?}", self, e);
+                    return OfferFetchResult::ProtocolViolation(TakerError::Wallet(
+                        WalletError::Protocol(e),
+                    ));
+                }
                 Err(e) if attempt < FIRST_CONNECT_ATTEMPTS => {
                     log::debug!(
                         "Failed to fetch offer from {} (attempt {}/{}): {:?}",
@@ -1374,7 +1425,7 @@ impl MakerAddress {
                     let mut remaining = delay;
                     while !remaining.is_zero() {
                         if shutdown.load(Ordering::Relaxed) {
-                            return None;
+                            return OfferFetchResult::NetworkFailure;
                         }
                         let slice = remaining.min(Duration::from_millis(100));
                         sleep(slice);
@@ -1386,7 +1437,7 @@ impl MakerAddress {
                 }
             }
         }
-        None
+        OfferFetchResult::NetworkFailure
     }
 
     fn download_offer_auto(self, socks_port: u16) -> Result<OfferAndAddress, TakerError> {
@@ -1465,6 +1516,20 @@ impl MakerAddress {
                 .into());
             }
         };
+
+        // Sanity validate offer parameters
+        if router_offer.min_size > router_offer.max_size
+            || router_offer.amount_relative_fee_pct.is_nan()
+            || router_offer.amount_relative_fee_pct.is_infinite()
+            || router_offer.amount_relative_fee_pct < 0.0
+            || router_offer.amount_relative_fee_pct >= 100.0
+            || router_offer.time_relative_fee_pct.is_nan()
+            || router_offer.time_relative_fee_pct.is_infinite()
+            || router_offer.time_relative_fee_pct < 0.0
+            || router_offer.time_relative_fee_pct >= 100.0
+        {
+            return Err(ProtocolError::General("Malformed offer parameters").into());
+        }
 
         // Convert router offer to legacy Offer format for storage
         let offer = Offer {
@@ -1690,10 +1755,7 @@ mod tests {
         book.record_fidelity_failure(&address, &bad, retry_at);
 
         assert!(!book.makers[0].backend_retry_pending);
-        assert_eq!(
-            book.makers[0].state,
-            MakerState::Unresponsive { retries: 1 }
-        );
+        assert_eq!(book.makers[0].state, MakerState::Bad);
         assert_eq!(book.prune_stale_makers(retry_at), 1);
     }
 
@@ -1878,5 +1940,90 @@ mod tests {
 
         sync_and_wait(&cmd_tx, Duration::ZERO).unwrap();
         assert!(matches!(cmd_rx.recv().unwrap(), SyncCommand::SyncNow(_)));
+    }
+
+    #[test]
+    fn bad_bond_immediately_bans_maker() {
+        let address = addr("bad-bond-maker");
+        let now_ts = 1000;
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), None, None, now_ts);
+        book.makers[0].offer = Some(dummy_offer(&address.to_string()));
+        book.makers[0].state = MakerState::Good;
+
+        let err = FidelityCheckError::BadBond(TakerError::General("invalid signature".into()));
+        book.record_fidelity_failure(&address, &err, now_ts);
+
+        assert_eq!(book.makers[0].state, MakerState::Bad);
+        assert!(book.makers[0].offer.is_none());
+        assert!(!book.makers[0].backend_retry_pending);
+    }
+
+    #[test]
+    fn banned_maker_not_resurrected_by_same_bond_discovery() {
+        let address = addr("banned-maker");
+        let outpoint = Some(OutPoint::new(Txid::from_slice(&[2; 32]).unwrap(), 0));
+        let now_ts = 1000;
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), outpoint, Some(500), now_ts);
+        book.mark_bad(&address);
+        assert_eq!(book.makers[0].state, MakerState::Bad);
+
+        let changed = book.upsert_discovered(address.clone(), outpoint, Some(500), now_ts + 60);
+        assert!(!changed);
+        assert_eq!(book.makers[0].state, MakerState::Bad);
+    }
+
+    #[test]
+    fn banned_maker_reconsidered_on_bond_rotation() {
+        let address = addr("rotating-maker");
+        let old_outpoint = Some(OutPoint::new(Txid::from_slice(&[2; 32]).unwrap(), 0));
+        let new_outpoint = Some(OutPoint::new(Txid::from_slice(&[3; 32]).unwrap(), 0));
+        let now_ts = 1000;
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), old_outpoint, Some(500), now_ts);
+        book.mark_bad(&address);
+        assert_eq!(book.makers[0].state, MakerState::Bad);
+
+        let changed = book.upsert_discovered(address.clone(), new_outpoint, Some(600), now_ts + 60);
+        assert!(changed);
+        assert_eq!(
+            book.makers[0].state,
+            MakerState::Unresponsive { retries: 0 }
+        );
+        assert_eq!(book.makers[0].fidelity_outpoint, new_outpoint);
+        assert_eq!(book.makers[0].fidelity_expiry_height, Some(600));
+        assert!(book.makers[0].offer.is_none());
+    }
+
+    #[test]
+    fn banned_maker_excluded_from_active_and_polling() {
+        let address = addr("banned-poll-maker");
+        let now_ts = 1000;
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), None, None, now_ts);
+        book.mark_bad(&address);
+
+        assert!(book.makers_to_poll(now_ts + 3600).is_empty());
+        assert!(book.active_makers(&MakerProtocol::Taproot).is_empty());
+    }
+
+    #[test]
+    fn ban_maker_handle_persists_state() {
+        let dir = bitcoind::tempfile::TempDir::new().unwrap();
+        let handle = OfferBookHandle::load_or_create(dir.path()).unwrap();
+
+        let address = addr("bad-handle-maker");
+        {
+            let mut book = handle.inner.write().unwrap();
+            book.insert_candidate(address.clone(), None, None, 1000);
+        }
+
+        assert!(!handle.is_banned(&address).unwrap());
+        handle.ban_maker(&address).unwrap();
+        assert!(handle.is_banned(&address).unwrap());
+
+        let reopened = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        assert!(reopened.is_banned(&address).unwrap());
     }
 }
