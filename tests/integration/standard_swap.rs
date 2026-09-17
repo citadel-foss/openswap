@@ -405,10 +405,11 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     // "confirmation(s) on tx" is logged only by the maker's wait_for_tx_on_chain.
     wait_for_log(&log_path, "confirmation(s) on tx", Duration::from_secs(120));
 
-    // The wait's poll backoff is 10s, 20s, 30s: resume and mine so the +30s
-    // poll sees the block, well inside the taker's 60s response window. By
-    // then the maker has been in the wait past the 30s idle timeout.
-    thread::sleep(Duration::from_secs(25));
+    // Hold the block past the maker's 30s idle timeout so an idle-drain pass
+    // (every 3s) fires while the handler is parked: only the wait's activity
+    // refresh keeps the swap alive. The next poll after mining (+60s backoff)
+    // then sees the block, well inside the taker's 180s response window.
+    thread::sleep(Duration::from_secs(40));
     test_framework.set_block_gen_paused(false);
     generate_blocks(bitcoind, 1);
 

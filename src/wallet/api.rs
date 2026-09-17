@@ -43,7 +43,7 @@ use crate::{
         compute_checksum, fee_at_rate_sats, generate_keypair, get_hd_path_from_descriptor,
         now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL, LEGACY_CONTRACT_SPEND_VSIZE,
         RECOVERY_FEE_RATE, TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
-        UNBROADCAST_DISCARD_GRACE,
+        UNFUNDED_SWAP_LIFETIME,
     },
 };
 
@@ -1250,7 +1250,10 @@ impl Wallet {
 
         let vsize = contract_and_timelock_vsize(swapcoin.protocol, SpendKind::Timelock);
 
-        let fee = Amount::from_sat((vsize as f64 * fee_rate) as u64);
+        let fee = Amount::from_sat(
+            fee_at_rate_sats(vsize, fee_rate)
+                .ok_or_else(|| WalletError::General("unusable feerate".to_string()))?,
+        );
         let output_amount = contract_output.value.checked_sub(fee).ok_or_else(|| {
             WalletError::General("Insufficient funds for recovery fee".to_string())
         })?;
@@ -1556,7 +1559,7 @@ impl Wallet {
         let now = now_secs();
         self.store.swap_locks.values().any(|locks| {
             locks.outpoints.contains(outpoint)
-                && now.saturating_sub(locks.reserved_at) < UNBROADCAST_DISCARD_GRACE.as_secs()
+                && now.saturating_sub(locks.reserved_at) < UNFUNDED_SWAP_LIFETIME.as_secs()
         })
     }
 
@@ -1567,7 +1570,7 @@ impl Wallet {
         self.store
             .swap_locks
             .values()
-            .filter(|l| now.saturating_sub(l.reserved_at) < UNBROADCAST_DISCARD_GRACE.as_secs())
+            .filter(|l| now.saturating_sub(l.reserved_at) < UNFUNDED_SWAP_LIFETIME.as_secs())
             .map(|l| l.outpoints.len())
             .sum()
     }
@@ -1579,7 +1582,7 @@ impl Wallet {
         let before = self.store.swap_locks.len();
         self.store
             .swap_locks
-            .retain(|_, l| now.saturating_sub(l.reserved_at) < UNBROADCAST_DISCARD_GRACE.as_secs());
+            .retain(|_, l| now.saturating_sub(l.reserved_at) < UNFUNDED_SWAP_LIFETIME.as_secs());
         self.store.swap_locks.len() != before
     }
 
@@ -4057,7 +4060,7 @@ mod swap_reservation_tests {
             .swap_locks
             .get_mut("swap-2")
             .unwrap()
-            .reserved_at -= UNBROADCAST_DISCARD_GRACE.as_secs() + 1;
+            .reserved_at -= UNFUNDED_SWAP_LIFETIME.as_secs() + 1;
 
         assert!(!wallet.is_swap_reserved(&reserved));
         assert!(wallet.expire_swap_locks());

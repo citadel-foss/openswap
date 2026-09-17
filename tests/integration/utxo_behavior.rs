@@ -5,6 +5,7 @@
 //! - Manual coin selection with regular/swap coin clause testing
 
 use bitcoin::{Amount, OutPoint};
+use bitcoind::bitcoincore_rpc::RpcApi;
 use log::{info, warn};
 use openswap::{
     maker::start_server,
@@ -800,9 +801,31 @@ fn run_degraded_split_swap(protocol: ProtocolVersion, port: u16, rpc: u16) {
         }
         ProtocolVersion::Taproot => {
             // The "receivers, senders" line is Legacy-only, so the degradation
-            // shows on-chain instead: 3 taker splits but only 1 maker funding
-            // tx at the first spend depth.
-            wait_for_tx_depths(bitcoind, swap_start_height, &[4]);
+            // shows on-chain instead. Count alone would not prove the split:
+            // the taker's 3 splits spend one 0.05 BTC UTXO each, while the
+            // maker's single funding tx must gather its fragmented pool.
+            let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[4]);
+            let input_counts: Vec<usize> = depths[0]
+                .iter()
+                .map(|txid| {
+                    bitcoind
+                        .client
+                        .get_raw_transaction(txid, None)
+                        .unwrap()
+                        .input
+                        .len()
+                })
+                .collect();
+            assert_eq!(
+                input_counts.iter().filter(|&&n| n == 1).count(),
+                3,
+                "the taker must fund with 3 single-input splits: {input_counts:?}"
+            );
+            assert!(
+                input_counts.iter().any(|&n| n > 1),
+                "the maker's one funding tx must gather multiple inputs: {:?}",
+                input_counts
+            );
         }
     }
     test_framework.stop();

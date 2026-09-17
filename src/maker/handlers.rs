@@ -73,6 +73,9 @@ pub enum MakerBehavior {
     BroadcastContractAfterSetup,
     /// Close connection after sending AckSwapDetails (taproot maker abort).
     CloseAfterAckResponse,
+    /// Refuse every SwapDetails with a reject-ack. Arms a test to prove the
+    /// taker never reaches negotiation: any contact fails the swap differently.
+    RefuseSwapDetails,
     /// Close connection at private key handover phase (taproot maker abort).
     CloseAtPrivateKeyHandover,
     /// Close connection at contract sigs exchange (taproot recovery test).
@@ -787,6 +790,18 @@ fn handle_swap_details<M: Maker>(
     details: SwapDetails,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     state.expect_phase(&[SwapPhase::AwaitingSwapDetails])?;
+
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == MakerBehavior::RefuseSwapDetails {
+        log::warn!(
+            "[{}] Test behavior: refusing SwapDetails for {}",
+            Maker::network_port(maker.as_ref()),
+            details.id
+        );
+        return Ok(Some(MakerToTakerMessage::AckSwapDetails(
+            AckSwapDetails::reject(),
+        )));
+    }
 
     if !maker.is_watchtower_alive() {
         log::error!(

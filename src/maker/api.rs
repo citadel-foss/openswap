@@ -37,7 +37,7 @@ use crate::{
     watch_tower::service::WatchService,
 };
 
-use crate::utill::TX_CONFIRMATION_TIMEOUT;
+use crate::utill::UNFUNDED_SWAP_LIFETIME;
 
 #[cfg(feature = "integration-test")]
 use std::env;
@@ -57,11 +57,6 @@ use super::{
 
 /// Minimum swap amount in satoshis.
 pub const MIN_SWAP_AMOUNT: u64 = 10_000;
-
-/// Hard lifetime of a swap with no on-chain evidence, counted from admission.
-/// It spans two windows in sequence: the taker confirming its own funding, then
-/// this maker's one batched contract wait.
-const UNFUNDED_SWAP_LIFETIME: Duration = Duration::from_secs(2 * TX_CONFIRMATION_TIMEOUT.as_secs());
 
 /// One source for the lifetime so the drain and the confirmation wait agree;
 /// tests override it through the env to skip the two-hour default.

@@ -4,7 +4,7 @@ use bitcoin::{
     hashes::Hash,
     key::{rand::thread_rng, Keypair},
     secp256k1::{All, Secp256k1, SecretKey},
-    Address, Amount, FeeRate, Network, PublicKey, ScriptBuf, WitnessProgram, WitnessVersion,
+    Address, Amount, Network, PublicKey, ScriptBuf, WitnessProgram, WitnessVersion,
 };
 use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 #[cfg(not(feature = "integration-test"))]
@@ -94,6 +94,14 @@ pub const UNBROADCAST_DISCARD_GRACE: Duration = TX_CONFIRMATION_TIMEOUT;
 #[cfg(feature = "integration-test")]
 pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(120);
 
+/// Hard lifetime of a swap with no on-chain evidence, counted from admission.
+/// It spans two windows in sequence: the taker confirming its own funding, then
+/// the maker's one batched contract wait. Also the reservation TTL: a swap's
+/// locked inputs must stay locked for as long as the swap itself can live, or
+/// a second admission can claim them under the first swap's frozen plan.
+pub(crate) const UNFUNDED_SWAP_LIFETIME: Duration =
+    Duration::from_secs(2 * TX_CONFIRMATION_TIMEOUT.as_secs());
+
 /// Floor for funding-tx confirmations: applied when the configured
 /// `required_confirms` is absent or 0.
 pub const MIN_REQUIRED_CONFIRM: u32 = 1;
@@ -169,12 +177,17 @@ pub(crate) fn funding_tx_vsize(inputs: usize) -> u64 {
     11 + 43 + 43 + 68 * inputs as u64
 }
 
-/// Fee in sats for `vbytes` at `feerate`, using the same FeeRate convention
-/// as the wallet's tx building, so the policy price and the real build agree.
+/// Fee for `vbytes` at `feerate` sats/vB, rounded up after the multiply: a
+/// fractional rate is valid and must never underpay. None for unusable rates.
 pub(crate) fn fee_at_rate_sats(vbytes: u64, feerate: f64) -> Option<u64> {
-    FeeRate::from_sat_per_vb(feerate as u64)
-        .and_then(|rate| rate.fee_vb(vbytes))
-        .map(|fee| fee.to_sat())
+    if is_unusable_fee_rate(feerate) {
+        return None;
+    }
+    let fee = feerate * vbytes as f64;
+    if fee > u64::MAX as f64 {
+        return None;
+    }
+    Some(fee.ceil() as u64)
 }
 
 /// Policy price of one forwarding tx at the negotiated swap feerate: the

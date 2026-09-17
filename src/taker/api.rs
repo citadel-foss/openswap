@@ -390,6 +390,10 @@ pub(crate) struct OngoingSwapState {
     /// Reference block height captured during negotiation for consistent Taproot CLTV timelocks.
     /// Taproot uses absolute heights, so all timelock calculations must use the same base height.
     pub(crate) reference_height: Option<u32>,
+    /// Our own hop-0 funding plan shape from negotiation: one entry per planned
+    /// funding tx, valued by input count. The funding build replays this plan,
+    /// so the fee ceiling prices hop 0 from it exactly.
+    pub(crate) hop0_funding_splits: Vec<u32>,
     /// PaySwap state; `None` for regular swaps. When set, `params.send_amount`
     /// holds the solved gross route amount.
     pub(crate) payment: Option<PaymentQuote>,
@@ -1042,6 +1046,7 @@ impl Taker {
             spare_makers: Vec::new(),
             phase: SwapPhase::MakersDiscovered,
             reference_height: None,
+            hop0_funding_splits: Vec::new(),
             payment: None,
         });
 
@@ -1150,11 +1155,17 @@ impl Taker {
                 .ok_or_else(policy_err)?;
             ceiling_sats = ceiling_sats.checked_add(hop_sats).ok_or_else(policy_err)?;
         }
-        // The taker's own hop-0 funding, priced at the same ceiling shape.
-        ceiling_sats = tx_count
-            .checked_mul(split_funding_sats)
-            .and_then(|own_funding| ceiling_sats.checked_add(own_funding))
+        // The taker's own hop-0 funding pays its real plan: hop 0 has no input
+        // budget, so the ceiling must price every input it actually takes.
+        let hop0_sats = swap
+            .hop0_funding_splits
+            .iter()
+            .try_fold(0u64, |acc, &inputs| {
+                funding_fee_policy_sats(inputs as usize, u32::MAX, swap_feerate)
+                    .and_then(|fee| acc.checked_add(fee))
+            })
             .ok_or_else(policy_err)?;
+        ceiling_sats = ceiling_sats.checked_add(hop0_sats).ok_or_else(policy_err)?;
         if let Some(payment) = &swap.payment {
             ceiling_sats = ceiling_sats
                 .checked_add(payment.settlement_budget.to_sat())
@@ -1614,23 +1625,26 @@ impl Taker {
         // Plan our own hop-0 funding before the first declaration: the planned
         // count is what we declare to maker 0, and the funding build later
         // replays the same deterministic plan on the same pool.
-        let planned_hop0_count = {
+        let planned_hop0 = {
             let swap = self.swap_state()?;
             let wallet = self.read_wallet()?;
-            wallet
-                .plan_funding(
-                    send_amount,
-                    tx_count,
-                    swap.params.swap_feerate(),
-                    // Our own hop pays the fee on top: no input budget, no
-                    // over-budget guard, mirroring the funding call sites.
-                    u32::MAX,
-                    None,
-                    swap.params.manually_selected_outpoints.clone(),
-                    None,
-                )?
-                .len() as u32
+            wallet.plan_funding(
+                send_amount,
+                tx_count,
+                swap.params.swap_feerate(),
+                // Our own hop pays the fee on top: no input budget, no
+                // over-budget guard, mirroring the funding call sites.
+                u32::MAX,
+                None,
+                swap.params.manually_selected_outpoints.clone(),
+                None,
+            )?
         };
+        let planned_hop0_count = planned_hop0.len() as u32;
+        self.swap_state_mut()?.hop0_funding_splits = planned_hop0
+            .iter()
+            .map(|split| split.utxos.len() as u32)
+            .collect();
         self.payment_check_dust_floor()?;
 
         self.walk_route(0, send_amount, planned_hop0_count, reference_height)?;

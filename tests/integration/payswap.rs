@@ -374,7 +374,9 @@ fn test_payswap_dust_floor_rejects_before_funding() {
 
     let makers_config_map = vec![(9012, Some(19041))];
     let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal];
+    // Armed to refuse SwapDetails: if the dust check ever ran after walk_route,
+    // the refusal error would replace the dust error and this test fails.
+    let maker_behaviors = vec![MakerBehavior::RefuseSwapDetails];
 
     // The default 10_000 sat min_size would refuse the quote before the dust
     // floor is reached, so this maker advertises a lower one.

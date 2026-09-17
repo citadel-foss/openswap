@@ -11,13 +11,16 @@ use bitcoin::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::TryInto;
 
-use crate::protocol::{
-    common_messages::ProtocolVersion,
-    contract2::calculate_contract_sighash,
-    musig_interface::{
-        aggregate_partial_signatures_compat, generate_new_nonce_pair_compat,
-        generate_partial_signature_compat, get_aggregated_nonce_compat,
+use crate::{
+    protocol::{
+        common_messages::ProtocolVersion,
+        contract2::calculate_contract_sighash,
+        musig_interface::{
+            aggregate_partial_signatures_compat, generate_new_nonce_pair_compat,
+            generate_partial_signature_compat, get_aggregated_nonce_compat,
+        },
     },
+    utill::fee_at_rate_sats,
 };
 
 use super::{contract_and_timelock_vsize, SpendKind, WalletError};
@@ -363,7 +366,10 @@ impl IncomingSwapCoin {
             },
         );
 
-        let fee = Amount::from_sat((feerate * vsize as f64) as u64);
+        let fee = Amount::from_sat(
+            fee_at_rate_sats(vsize, feerate)
+                .ok_or_else(|| WalletError::General("unusable feerate".to_string()))?,
+        );
         let output_value = input_value
             .checked_sub(fee)
             .ok_or_else(|| WalletError::General("Fee exceeds input value".to_string()))?;
