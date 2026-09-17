@@ -146,7 +146,6 @@ fn maker_abort2_case1() {
 /// per-maker fee overrides and a prepared 2-hop Legacy route.
 #[allow(clippy::type_complexity)]
 fn heterogeneous_route_setup(
-    maker_count: u16,
     fee_overrides: Vec<Option<MakerFeeOverride>>,
     maker_behaviors: Vec<MakerBehavior>,
 ) -> (
@@ -159,7 +158,7 @@ fn heterogeneous_route_setup(
     Vec<Amount>,
     SwapSummary,
 ) {
-    let makers_config_map = (0..maker_count)
+    let makers_config_map = (0..maker_behaviors.len() as u16)
         .map(|i| (6102 + i * 10000, None))
         .collect::<Vec<_>>();
 
@@ -255,7 +254,7 @@ fn heterogeneous_substitution_aborts_without_cascade() {
         taker_original_balance,
         maker_spendable_balance,
         summary,
-    ) = heterogeneous_route_setup(4, fee_overrides, maker_behaviors);
+    ) = heterogeneous_route_setup(fee_overrides, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -441,7 +440,7 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing() {
         taker_original_balance,
         maker_spendable_balance,
         summary,
-    ) = heterogeneous_route_setup(3, fee_overrides, maker_behaviors);
+    ) = heterogeneous_route_setup(fee_overrides, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -591,7 +590,7 @@ fn last_hop_equal_priced_spare_completes() {
         taker_original_balance,
         maker_spendable_balance,
         summary,
-    ) = heterogeneous_route_setup(3, fee_overrides, maker_behaviors);
+    ) = heterogeneous_route_setup(fee_overrides, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();

@@ -199,15 +199,15 @@ fn smallest_cover(pool_desc: &[(OutPoint, Amount)], n: usize, need: u64) -> Opti
     None
 }
 
-/// Rejects when the plan costs the maker more above the taker's input budget
-/// than the hop earns. Extra inputs are real fees the taker never reimburses,
-/// so a swap that costs more than it earns is a drain on the maker.
 /// Miner fee a funding tx with `inputs` inputs really costs at `fee_rate`.
 fn funding_fee(inputs: usize, fee_rate: f64) -> Result<u64, WalletError> {
     fee_at_rate_sats(funding_tx_vsize(inputs), fee_rate)
         .ok_or_else(|| WalletError::General("funding fee arithmetic overflow".to_string()))
 }
 
+/// Rejects when the plan costs the maker more above the taker's input budget
+/// than the hop earns. Extra inputs are real fees the taker never reimburses,
+/// so a swap that costs more than it earns is a drain on the maker.
 fn check_over_budget_spend(
     plan: &[SplitPlan],
     max_input_budget: u32,

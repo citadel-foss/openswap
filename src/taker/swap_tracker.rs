@@ -520,6 +520,16 @@ impl SwapTracker {
         self.data.swaps.get(swap_id)
     }
 
+    /// True when any unfinished swap already sent a ProofOfFunding: those
+    /// funding txs are in the maker's hands and can land on-chain at any time.
+    pub(crate) fn any_legacy_proof_sent(&self) -> bool {
+        self.incomplete_swaps().iter().any(|record| {
+            record.makers.iter().any(
+                |m| matches!(&m.exchange, ExchangeProgress::Legacy(l) if l.proof_of_funding_sent),
+            )
+        })
+    }
+
     /// Get a mutable reference to a swap record by ID.
     pub fn get_record_mut(&mut self, swap_id: &str) -> Option<&mut SwapRecord> {
         self.data.swaps.get_mut(swap_id)

@@ -902,6 +902,7 @@ impl Wallet {
         chain: &AnyBlockchain,
         swap_id: &str,
         swapcoin: &super::swapcoin::OutgoingSwapCoin,
+        funding_shared_with_peer: bool,
     ) -> Result<ContractChainState, WalletError> {
         let contract_txid = swapcoin.contract_tx.compute_txid();
         let contract_vout = swapcoin.get_contract_output_vout();
@@ -973,12 +974,16 @@ impl Wallet {
                 .get_tx_out(&input_outpoint.txid, input_outpoint.vout, Some(true))?
                 .is_none();
             if input_gone {
-                // The funding output is invisible because its tx never reached
-                // the chain — but the peer holds it fully signed and can
-                // broadcast it at any time. Discard only once the funding is
-                // permanently invalid: every input confirmed spent elsewhere
-                // (confirmed view — a mempool spend can still be evicted).
-                // No stored funding tx means we cannot prove that, so keep.
+                // Only we ever held this funding tx and never sent it: nothing
+                // can put it on-chain, so the insurance is dead weight.
+                if !funding_shared_with_peer {
+                    return Ok(ContractChainState::Discarded);
+                }
+                // The peer holds the funding fully signed and can broadcast it
+                // at any time. Discard only once it is permanently invalid:
+                // every input confirmed spent elsewhere (confirmed view — a
+                // mempool spend can still be evicted). No stored funding tx
+                // means we cannot prove that, so keep.
                 let Some(funding_tx) = &swapcoin.funding_tx else {
                     return Ok(ContractChainState::NotYet);
                 };
@@ -1015,11 +1020,18 @@ impl Wallet {
     ///
     /// `feerate` must be our own: the peer that abandoned the swap does not get
     /// to price our refund. Callers pass [`crate::utill::RECOVERY_FEE_RATE`].
+    ///
+    /// `funding_shared_with_peer` marks whether the funding txs may be in the
+    /// peer's hands (maker: always, they ride the contract-sig response; taker:
+    /// once ProofOfFunding was sent). Unshared funding can never land on-chain,
+    /// so its swapcoin is discardable; shared funding must be kept until its
+    /// inputs are confirmed spent elsewhere.
     pub fn recover_timelocked_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
         fee_rate: f64,
         shutdown: &std::sync::atomic::AtomicBool,
+        funding_shared_with_peer: bool,
     ) -> Result<RecoveryOutcome, WalletError> {
         let mut outcome = RecoveryOutcome::default();
 
@@ -1095,7 +1107,12 @@ impl Wallet {
         for (swap_id, swapcoin, timelock) in to_recover {
             let contract_txid = swapcoin.contract_tx.compute_txid();
             let contract_vout = swapcoin.get_contract_output_vout();
-            match Self::ensure_contract_on_chain(chain, &swap_id, &swapcoin)? {
+            match Self::ensure_contract_on_chain(
+                chain,
+                &swap_id,
+                &swapcoin,
+                funding_shared_with_peer,
+            )? {
                 ContractChainState::OnChain => {}
                 ContractChainState::Discarded => {
                     discarded.push(swap_id.clone());

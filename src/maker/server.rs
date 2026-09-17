@@ -1100,15 +1100,24 @@ fn recover_from_swap(
             // committed money, so age the record before believing that. Age is
             // measured from creation: recovery progress refreshes `updated_at`,
             // which would hold the grace open forever.
+            //
+            // Legacy never reaches this discard: its outgoing swapcoins are
+            // persisted only with the contract-sig response, which carries the
+            // funding txs fully signed — so the peer may hold and broadcast
+            // them even when we never did. Only Taproot, which broadcasts
+            // before responding, can prove never-exposed here.
+            let legacy_exposed = outgoing_swapcoins
+                .first()
+                .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy);
             let unrecorded_for = lock_debug!(maker.swap_tracker.lock())
                 .map_err(|_| MakerError::MutexPossion)?
                 .get_record(&swap_id)
                 .filter(|r| r.funding_broadcast_txids.is_empty())
                 .map(|r| now_secs().saturating_sub(r.created_at));
-            let never_recorded =
-                unrecorded_for.is_some_and(|age| age >= UNBROADCAST_DISCARD_GRACE.as_secs());
-            discard_pending = unrecorded_for.is_some() && !never_recorded;
-            if let Some(age) = unrecorded_for.filter(|_| !never_recorded) {
+            let never_recorded = !legacy_exposed
+                && unrecorded_for.is_some_and(|age| age >= UNBROADCAST_DISCARD_GRACE.as_secs());
+            discard_pending = !legacy_exposed && unrecorded_for.is_some() && !never_recorded;
+            if let Some(age) = unrecorded_for.filter(|_| discard_pending) {
                 if !discard_deferred_logged {
                     discard_deferred_logged = true;
                     log::info!(
@@ -1370,6 +1379,12 @@ fn recover_from_swap(
                 chain,
                 RECOVERY_FEE_RATE,
                 &maker.shutdown,
+                // Legacy funding rides the contract-sig response, so the peer
+                // may hold it even when we never broadcast. Taproot never
+                // reaches the check this flag gates.
+                outgoing_swapcoins
+                    .first()
+                    .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy),
             )
             .map_err(MakerError::Wallet)?;
 

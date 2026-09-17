@@ -270,7 +270,7 @@ impl Wallet {
         // non-finite would collapse to a zero rate at conversion.
         if is_unusable_fee_rate(feerate) {
             return Err(WalletError::General(format!(
-                "feerate {feerate} sat/vB is below the 1 sat/vB minimum"
+                "feerate {feerate} sat/vB must be finite and at least the 1 sat/vB relay floor"
             )));
         }
 

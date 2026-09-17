@@ -772,11 +772,15 @@ impl Taker {
             }
 
             // Wallet-driven recovery: recover timelocked. Also takes the lock itself.
+            let funding_shared = lock_debug!(self.swap_tracker.lock())
+                .map(|tracker| tracker.any_legacy_proof_sent())
+                .unwrap_or(true);
             match Wallet::recover_timelocked_swapcoins(
                 &self.wallet,
                 chain,
                 MIN_RELAY_FEE_RATE,
                 &crate::utill::NO_SHUTDOWN,
+                funding_shared,
             ) {
                 Ok(ref recovered) if !recovered.is_empty() => {
                     log::info!(

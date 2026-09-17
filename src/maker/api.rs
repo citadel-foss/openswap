@@ -2050,7 +2050,9 @@ impl MakerTrait for MakerServer {
             }
             wallet.reserve_swap_locks(swap_id, inputs);
             if let Err(e) = wallet.save_to_disk() {
-                wallet.release_swap_locks(swap_id, None);
+                // A concurrent admission under the same id shares the entry —
+                // roll back only our own inputs, never its persisted ones.
+                wallet.release_swap_locks(swap_id, Some(inputs));
                 log::error!(
                     "[{}] Could not persist the reservation for swap {}: {:?}; refusing admission",
                     self.config.network_port,
