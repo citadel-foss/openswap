@@ -232,27 +232,11 @@ fn process_proof_of_funding<M: Maker>(
         ));
     }
 
-    let hashvalue = maker.verify_proof_of_funding(&pof)?;
-
-    for funding_info in &pof.confirmed_funding_txes {
-        maker.screen_funding_tx(&funding_info.funding_tx)?;
-    }
-
-    #[cfg(debug_assertions)]
-    log::debug!(
-        "[CONTRACT_STATE] Role: Maker | Protocol: Legacy | SwapID: {} | ProofFundingTxs: {} | NextHopKeys: {} | RefundLocktime: {} | Status: verified",
-        pof.id,
-        pof.confirmed_funding_txes.len(),
-        pof.next_openswap_info.len(),
-        pof.refund_locktime
-    );
-
-    log::info!(
-        "[{}] Verified proof of funding, hashvalue: {:?}",
-        maker.network_port(),
-        hashvalue
-    );
-
+    // Claim the incoming contract txids before the confirmation wait inside
+    // `verify_proof_of_funding`, matching the Taproot order: a concurrent
+    // duplicate is rejected here, not after parking a handler for a full
+    // confirmation window. A same-swap retry re-claims its own txids. An
+    // error after this point leaves the claim to the swap drain.
     let (tweakable_privkey, _, _) = maker.get_tweakable_keypair()?;
     let secp = bitcoin::secp256k1::Secp256k1::new();
 
@@ -318,15 +302,33 @@ fn process_proof_of_funding<M: Maker>(
 
     state.incoming_swapcoins = incoming_swapcoins;
 
-    // Claim these contract txids under the swaps lock before funding the next
-    // hop: a concurrent swap carrying the same funding fails here, not after
-    // both spent. A same-swap retry re-claims its own txids and passes.
     let incoming_txids: Vec<bitcoin::Txid> = state
         .incoming_swapcoins
         .iter()
         .map(|sc| sc.contract_tx.compute_txid())
         .collect();
     maker.claim_incoming_contract_txids(&pof.id, &incoming_txids)?;
+
+    let hashvalue = maker.verify_proof_of_funding(&pof)?;
+
+    for funding_info in &pof.confirmed_funding_txes {
+        maker.screen_funding_tx(&funding_info.funding_tx)?;
+    }
+
+    #[cfg(debug_assertions)]
+    log::debug!(
+        "[CONTRACT_STATE] Role: Maker | Protocol: Legacy | SwapID: {} | ProofFundingTxs: {} | NextHopKeys: {} | RefundLocktime: {} | Status: verified",
+        pof.id,
+        pof.confirmed_funding_txes.len(),
+        pof.next_openswap_info.len(),
+        pof.refund_locktime
+    );
+
+    log::info!(
+        "[{}] Verified proof of funding, hashvalue: {:?}",
+        maker.network_port(),
+        hashvalue
+    );
 
     // Register incoming contract outputs with watchtower so we detect
     // if the taker broadcasts the maker's incoming contract tx.

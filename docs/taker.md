@@ -415,7 +415,7 @@ Sending:   20000 sats
          Fees: base=500 sats, amt=0.0025%, time=0.000100%
          Locktime: 24 blocks, Estimated fee: 530 sats
 
-Total estimated fee: 1080 sats
+Maximum total cost (ceiling): 1080 sats
 Estimated receive:   18920 sats
 ==================================
 

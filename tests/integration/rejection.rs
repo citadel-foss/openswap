@@ -2458,9 +2458,9 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
     block_generation_handle.join().unwrap();
 }
 
-/// The genuinely concurrent Legacy arm: both maker handlers block in the
-/// proof's confirmation wait, then race out — exactly one swap may be
-/// funded, no matter which guard fires first.
+/// The genuinely concurrent Legacy arm: swap 1's handler parks in the proof's
+/// confirmation wait holding the claim, so swap 2's replay is rejected at the
+/// claim without ever waiting. Exactly one swap may be funded.
 #[test]
 fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
     warn!("Running Test: maker rejects concurrent replayed Legacy proof of funding");
@@ -2505,28 +2505,19 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
 
     let swap2 = run_swap(taker2, maker_address.clone());
 
-    // Barrier: swap 2's replayed proof reached the maker and its handler is
-    // blocked in the same wait. Both waits must observe the confirmation
-    // within the maker's broadcast timeout once mining resumes.
-    wait_for_log_after(
-        &log_path,
-        log_offset,
-        "confirmation(s) on tx",
-        2,
-        Duration::from_secs(120),
-    );
-
-    test_framework.set_block_gen_paused(false);
-
-    // Racing out of the wait, exactly one swap is rejected — by the claim or
-    // by the seen-check, depending on how the handlers interleave.
+    // The claim sits before the confirmation wait: swap 2's replay is
+    // rejected while swap 1 is still parked — no block is needed for it.
     wait_for_log_after(
         &log_path,
         log_offset,
         "already in use",
         1,
-        Duration::from_secs(180),
+        Duration::from_secs(120),
     );
+
+    test_framework.set_block_gen_paused(false);
+
+    // Swap 1's wait observes the confirmation and funds exactly one hop.
     wait_for_log_after(
         &log_path,
         log_offset,

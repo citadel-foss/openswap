@@ -653,6 +653,11 @@ fn run_reservations_survive_restart<B: TestBackend>(
     drop(victim);
     drop(makers);
 
+    // The marker must come from the restarted maker: the first Maker2's idle
+    // recovery can log it before the restart, so only scan past this offset.
+    let log_path = test_framework.taker_log_path();
+    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+
     // Init only reloads state; `start_server` is what runs startup recovery.
     // The reservation has to survive that too, or a maker could reuse an input
     // from a funding transaction that can still be broadcast.
@@ -667,11 +672,21 @@ fn run_reservations_survive_restart<B: TestBackend>(
     // Startup recovery runs on its own thread, past is_setup_complete: wait
     // until it has started on the unfinished swap before reading the
     // reservation count, or the assertion can pass without recovery running.
-    wait_for_log(
-        &test_framework.taker_log_path(),
-        "recover_from_swap started",
-        Duration::from_secs(60),
-    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if contents
+            .get(log_offset as usize..)
+            .is_some_and(|tail| tail.contains("recover_from_swap started"))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart recovery never started on the unfinished swap"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
 
     let after = restarted.live_reserved_inputs().unwrap();
     assert_eq!(
