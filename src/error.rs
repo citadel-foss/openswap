@@ -54,32 +54,3 @@ impl From<serde_cbor::Error> for NetError {
         Self::Cbor(value)
     }
 }
-
-/// Represents various errors that can occur while doing Fee Estimation
-#[derive(Debug)]
-pub enum FeeEstimatorError {
-    /// Error from Bitcoin Core RPC
-    CoreRpc(bitcoind::bitcoincore_rpc::Error),
-    /// Error while receiving or parsing an HTTP Response
-    HttpError(minreq::Error),
-    /// Missing expected data in API response
-    MissingData(String),
-    /// No wallet configured for Bitcoin Core estimates
-    NoWallet,
-    /// No sources available or all sources failed
-    NoFeeSources,
-    /// A scoped thread panicked
-    ThreadError,
-}
-
-impl From<bitcoind::bitcoincore_rpc::Error> for FeeEstimatorError {
-    fn from(err: bitcoind::bitcoincore_rpc::Error) -> Self {
-        FeeEstimatorError::CoreRpc(err)
-    }
-}
-
-impl From<minreq::Error> for FeeEstimatorError {
-    fn from(err: minreq::Error) -> Self {
-        FeeEstimatorError::HttpError(err)
-    }
-}

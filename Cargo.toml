@@ -27,7 +27,6 @@ bitcoind = "0.36"
 electrum-client = { version = "0.24", default-features = false, features = ["proxy", "use-rustls-ring"] }
 log4rs = "1.3.0"
 secp256k1 = { version = "0.33.0", features = ["rand", "global-context"] }
-minreq = { version = "2.12.0", features = ["https"] }
 pbkdf2 = { version = "0.12", features = ["simple"] }
 aes-gcm = "0.10.3"
 zeroize = { version = "1", features = ["derive"] }
@@ -45,6 +44,7 @@ crossbeam-channel = "0.5.15"
 flate2 = {version = "1.0.35"}
 tar = {version = "0.4.43"}
 electrsd = { version = "0.28", features = ["electrs_0_9_11"] }
+minreq = { version = "2.12.0", features = ["https"] }
 
 #Empty default feature set, (helpful to generalise in github actions)
 [features]
