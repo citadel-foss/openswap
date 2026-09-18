@@ -180,12 +180,6 @@ impl Taker {
             ))
         })?;
 
-        if params.tx_count == 0 {
-            return Err(TakerError::General(
-                "A payment swap needs at least one transaction split".into(),
-            ));
-        }
-
         Ok(Some(address))
     }
 

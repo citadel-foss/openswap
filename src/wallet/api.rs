@@ -1625,6 +1625,13 @@ impl Wallet {
         self.store.swap_locks.len() != before
     }
 
+    /// When this swap's inputs were reserved, if the reservation still exists.
+    /// Restart recovery reads it to age the unbroadcast grace from the event,
+    /// not from the restart.
+    pub(crate) fn reservation_created_at(&self, swap_id: &str) -> Option<u64> {
+        self.store.swap_locks.get(swap_id).map(|l| l.reserved_at)
+    }
+
     /// Checks if a UTXO belongs to fidelity bonds, and then returns corresponding UTXOSpendInfo
     fn check_if_fidelity(&self, utxo: &ListUnspentResultEntry) -> Option<UTXOSpendInfo> {
         self.store

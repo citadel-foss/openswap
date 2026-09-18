@@ -101,7 +101,8 @@ pub struct SwapDetails {
     /// the taker simply does not pay for the excess.
     pub max_input_budget: u32,
     /// Swap feerate in sats/vB for every transaction in this swap.
-    /// Never below the 1 sat/vB relay floor.
+    /// Peer-supplied: recipients must reject values below the 1 sat/vB
+    /// relay floor.
     pub feerate: u64,
     /// Timelock value.
     /// - Legacy: relative block count (CSV).

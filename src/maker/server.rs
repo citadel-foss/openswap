@@ -1031,7 +1031,9 @@ fn recover_from_swap(
     incoming_swapcoins: Vec<crate::wallet::swapcoin::IncomingSwapCoin>,
     outgoing_swapcoins: Vec<crate::wallet::swapcoin::OutgoingSwapCoin>,
 ) -> Result<(), MakerError> {
-    use super::swap_tracker::{now_secs, MakerRecoveryPhase, MakerSwapPhase};
+    use super::swap_tracker::{
+        now_secs, MakerRecoveryPhase, MakerRecoveryState, MakerSwapPhase, MakerSwapRecord,
+    };
 
     // For Taproot, get_timelock() returns an absolute CLTV height.
     // For Legacy, it returns a relative CSV offset — but Legacy recovery
@@ -1078,6 +1080,46 @@ fn recover_from_swap(
         Ok(true)
     };
     let mut timelock_recovery_txids = Vec::new();
+
+    // A restart reaches here with no record: the drain that would create one
+    // never ran. Create it aged from the reservation, so the unbroadcast grace
+    // runs from the event, not from the restart.
+    {
+        let record_missing = lock_debug!(maker.swap_tracker.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .get_record(&swap_id)
+            .is_none();
+        if record_missing {
+            let created_at = lock_debug!(maker.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                .reservation_created_at(&swap_id)
+                .unwrap_or_else(now_secs);
+            let now = now_secs();
+            let protocol = outgoing_swapcoins
+                .first()
+                .map(|sc| sc.protocol)
+                .or_else(|| incoming_swapcoins.first().map(|sc| sc.protocol))
+                .unwrap_or(ProtocolVersion::Taproot);
+            let record = MakerSwapRecord {
+                swap_id: swap_id.clone(),
+                protocol,
+                phase: MakerSwapPhase::TakerDropped,
+                swap_amount_sat: 0,
+                incoming_count: incoming_swapcoins.len(),
+                outgoing_count: outgoing_swapcoins.len(),
+                funding_broadcast_txids: Vec::new(),
+                recovery: MakerRecoveryState::default(),
+                created_at,
+                updated_at: now,
+            };
+            if let Err(e) = lock_debug!(maker.swap_tracker.lock())
+                .map_err(|_| MakerError::MutexPossion)?
+                .save_record(&record)
+            {
+                log::error!("Failed to save swap tracker record: {:?}", e);
+            }
+        }
+    }
 
     // Tracker: Recovering + Monitoring
     update_tracker(&maker, &swap_id, |r| {
@@ -1200,6 +1242,9 @@ fn recover_from_swap(
                             let key = incoming.contract_tx.compute_txid().to_string();
                             wallet.remove_incoming_swapcoin(&key);
                         }
+                        // The swap is settled as never funded: its input
+                        // reservation goes with it, not at the 4h TTL.
+                        wallet.release_swap_locks(&swap_id, None);
                         wallet.save_to_disk().map_err(MakerError::Wallet)?;
                     }
 

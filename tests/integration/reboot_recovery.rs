@@ -694,6 +694,31 @@ fn run_reservations_survive_restart<B: TestBackend>(
         "startup recovery must not free inputs the planned funding can still spend"
     );
 
+    // The grace ages from the reservation, not the restart: past it, the swap
+    // is provably never funded and the reservation is released with it.
+    let deadline = std::time::Instant::now()
+        + openswap::utill::UNBROADCAST_DISCARD_GRACE
+        + Duration::from_secs(60);
+    loop {
+        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if contents
+            .get(log_offset as usize..)
+            .is_some_and(|tail| tail.contains("nothing to recover. Discarding swapcoins."))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the restarted maker never discarded the unbroadcast funding"
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
+    let released = restarted.live_reserved_inputs().unwrap();
+    assert_eq!(
+        released, 0,
+        "past the grace the never-funded swap must release its inputs"
+    );
+
     restarted.shutdown.store(true, Relaxed);
     restarted_thread.join().unwrap();
     test_framework.stop();

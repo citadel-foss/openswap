@@ -419,9 +419,8 @@ impl Taker {
             if total_amount != expected {
                 self.note_proven_violation(maker_idx);
                 return Err(TakerError::General(format!(
-                    "Maker {} Taproot contract total amount {} does not match expected {} \
-                     (based on maker's advertised fee schedule)",
-                    maker_idx, total_amount, expected
+                    "Maker {maker_idx} Taproot contract total amount {total_amount} does not \
+                     match the negotiated hop total {expected}"
                 )));
             }
         }

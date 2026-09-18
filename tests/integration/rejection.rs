@@ -1145,7 +1145,7 @@ fn test_taproot_rejects_underfunded_maker_contract() {
     match error {
         TakerError::General(message) => {
             assert!(
-                message.contains("does not match expected"),
+                message.contains("does not match the negotiated hop total"),
                 "unexpected taker error: {}",
                 message
             );
@@ -1155,7 +1155,7 @@ fn test_taproot_rejects_underfunded_maker_contract() {
 
     // Assert the rejection came from the exact-amount check.
     let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("does not match expected", &log_path);
+    test_framework.assert_log("does not match the negotiated hop total", &log_path);
 
     // ---- Cleanup ----
     shutdown_makers(&makers, maker_threads);
@@ -1169,7 +1169,7 @@ fn test_taproot_rejects_fee_skimming_maker() {
         7103,
         19062,
         MakerBehavior::FeeSkimming,
-        "does not match expected",
+        "does not match the negotiated hop total",
     );
 }
 

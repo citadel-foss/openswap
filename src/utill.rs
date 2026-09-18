@@ -184,7 +184,9 @@ pub(crate) fn fee_at_rate_sats(vbytes: u64, feerate: f64) -> Option<u64> {
         return None;
     }
     let fee = feerate * vbytes as f64;
-    if fee > u64::MAX as f64 {
+    // `u64::MAX as f64` rounds up to 2^64, so `>` alone would pass a fee of
+    // exactly 2^64 and saturate the cast instead of failing it.
+    if fee >= u64::MAX as f64 {
         return None;
     }
     Some(fee.ceil() as u64)
@@ -1294,6 +1296,9 @@ mod tests {
         assert_eq!(fee_at_rate_sats(112, 3.0), Some(336));
         assert_eq!(fee_at_rate_sats(10, f64::NAN), None);
         assert_eq!(fee_at_rate_sats(10, 0.5), None);
+        // The product equal to 2^64 must fail, not saturate the cast.
+        assert_eq!(fee_at_rate_sats(155, 119011252088448713.0), None);
+        assert!(fee_at_rate_sats(155, 119011252088448712.0).is_some());
     }
 
     #[test]
