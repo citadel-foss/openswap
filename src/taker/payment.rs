@@ -37,8 +37,9 @@ pub struct PaymentQuote {
     /// Fee budget for settling the final swapcoins; the final hop is funded
     /// with `amount + settlement_budget`.
     pub settlement_budget: Amount,
-    /// Estimated mining fee for the taker's own funding transactions, paid by
-    /// the wallet on top of the route amount.
+    /// Miner-cost ceiling priced into each hop of the route (funding plus
+    /// sweep at the policy rate, times the split count). Already inside the
+    /// route amount — not an extra on top of it.
     pub taker_funding_fee_estimate: Amount,
 }
 

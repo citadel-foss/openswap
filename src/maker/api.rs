@@ -2020,16 +2020,29 @@ impl MakerTrait for MakerServer {
             // (a retry after the race) pass straight through.
             #[cfg(feature = "integration-test")]
             if self.behavior() == MakerBehavior::AdmissionRaceBarrier {
-                static RACE_BARRIER: std::sync::LazyLock<std::sync::Barrier> =
-                    std::sync::LazyLock::new(|| std::sync::Barrier::new(2));
-                static RACE_ARRIVALS: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                if RACE_ARRIVALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                // Per maker port: a two-maker route must pair each maker's own
+                // requests, never one maker's request with the other's.
+                type RaceBarriers = std::sync::Mutex<
+                    std::collections::HashMap<u16, (Arc<std::sync::Barrier>, usize)>,
+                >;
+                static RACE_BARRIERS: std::sync::LazyLock<RaceBarriers> =
+                    std::sync::LazyLock::new(|| {
+                        std::sync::Mutex::new(std::collections::HashMap::new())
+                    });
+                let barrier = {
+                    let mut map = RACE_BARRIERS.lock().unwrap();
+                    let (barrier, arrivals) = map
+                        .entry(self.config.network_port)
+                        .or_insert_with(|| (Arc::new(std::sync::Barrier::new(2)), 0));
+                    *arrivals += 1;
+                    (*arrivals <= 2).then(|| barrier.clone())
+                };
+                if let Some(barrier) = barrier {
                     log::info!(
                         "[{}] Test behavior: admission waiting at the reservation barrier",
                         self.config.network_port
                     );
-                    RACE_BARRIER.wait();
+                    barrier.wait();
                 }
             }
             // Planning ran outside this lock, so a concurrent admission may

@@ -7,6 +7,7 @@
 
 use bitcoin::Amount;
 use openswap::{
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
     wallet::AddressType,
@@ -31,7 +32,12 @@ fn test_concurrent_legacy_and_taproot_swaps() {
         TestFramework::init::<BitcoindBackend>(
             vec![(8002, Some(21001)), (18002, Some(21002))],
             vec![TakerBehavior::Normal, TakerBehavior::Normal],
-            vec![],
+            // Hold each maker's two admissions at the post-plan, pre-reservation
+            // boundary, so both plans provably form over the same pool view.
+            vec![
+                MakerBehavior::AdmissionRaceBarrier,
+                MakerBehavior::AdmissionRaceBarrier,
+            ],
         );
     let bitcoind = &test_framework.bitcoind;
 

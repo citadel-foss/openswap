@@ -668,13 +668,11 @@ fn main() -> Result<(), TakerError> {
                 println!("Receiver gets:       {} (exact)", payment.amount);
                 println!("Settlement budget:   {}", payment.settlement_budget);
                 println!("Route amount:        {}", summary.send_amount);
+                // Miner fees priced into the route, not an extra on top; the
+                // ceiling line above is the whole-cost bound, hop-0 included.
                 println!(
-                    "Funding fee (est.):  {}",
+                    "Route miner fees (est.): {}",
                     payment.taker_funding_fee_estimate
-                );
-                println!(
-                    "Total openswap cost: {}",
-                    summary.send_amount + payment.taker_funding_fee_estimate
                 );
             } else {
                 println!("Estimated receive:   {}", summary.estimated_receive_amount);

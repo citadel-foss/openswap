@@ -263,6 +263,8 @@ fn test_fidelity_creation() {
     log::info!("Waiting for fidelity bonds to mature and testing redemption");
     // Wait for the bonds to mature, redeem them, and validate the process.
     let mut required_height = first_maturity_height;
+    // Set by the wrapper redemption below; the loop's only exit assigns it.
+    let redemption_proof;
 
     loop {
         let current_height = bitcoind.client.get_block_count().unwrap() as u32;
@@ -294,9 +296,18 @@ fn test_fidelity_creation() {
             } else {
                 log::info!("Second Fidelity Bond is matured. Sending redemption transaction");
 
+                // The wrapper's expiry check is strict (`tip > lock_time`),
+                // and this branch runs at the boundary — mine one block past it.
+                generate_blocks(bitcoind, 1);
+                // Hold the mempool still so the probe below can find the tx.
+                test_framework.set_block_gen_paused(true);
+                // Through the wrapper at a distinct rate: proves the caller's
+                // feerate reaches the broadcast tx rather than a fixed fallback.
+                let bond_outpoint = wallet_write.get_fidelity_bonds()[1].outpoint();
                 wallet_write
-                    .redeem_fidelity(1, MIN_RELAY_FEE_RATE, AddressType::P2TR)
+                    .redeem_expired_fidelity_bonds(3.0, AddressType::P2TR)
                     .unwrap();
+                redemption_proof = Some(bond_outpoint);
 
                 log::info!("Second Fidelity Bond is successfully redeemed");
 
@@ -307,6 +318,35 @@ fn test_fidelity_creation() {
             }
         }
     }
+
+    // Locate the wrapper's redemption tx by its bond input and measure what it
+    // really pays: the fee must be the requested 3 sat/vB over the real vsize.
+    let bond_outpoint = redemption_proof.expect("the second redemption ran");
+    let redemption_txid = bitcoind
+        .client
+        .get_raw_mempool()
+        .unwrap()
+        .into_iter()
+        .find(|txid| {
+            bitcoind
+                .client
+                .get_raw_transaction(txid, None)
+                .unwrap()
+                .input
+                .iter()
+                .any(|input| input.previous_output == bond_outpoint)
+        })
+        .expect("the redemption tx must be in the mempool");
+    let (fee, vsize) = tx_fee_and_vsize(bitcoind, &redemption_txid);
+    // The builder prices its witness estimate, which can overshoot the real
+    // vsize by a byte: never below the requested rate, at most 1 vB above it.
+    assert!(
+        fee >= 3 * vsize as u64 && fee <= 3 * (vsize as u64 + 1),
+        "the redemption must pay the requested 3 sat/vB, not a fallback: fee {:?} for {:?} vB",
+        fee,
+        vsize
+    );
+    test_framework.set_block_gen_paused(false);
 
     thread::sleep(Duration::from_secs(10));
 
@@ -331,7 +371,7 @@ fn test_fidelity_creation() {
         let balances = wallet_read.get_balances().unwrap();
 
         assert_eq!(balances.fidelity.to_sat(), 0);
-        assert_eq!(balances.regular.to_sat(), 103999413);
+        assert_eq!(balances.regular.to_sat(), 103999165);
     }
 
     thread::sleep(Duration::from_secs(10));
