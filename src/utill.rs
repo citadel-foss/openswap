@@ -1286,6 +1286,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fee_at_rate_sats_rounds_fractional_rates_up() {
+        // Ceil after the multiply: a fractional rate must never underpay.
+        assert_eq!(fee_at_rate_sats(10, 1.01), Some(11));
+        assert_eq!(fee_at_rate_sats(150, 1.5), Some(225));
+        // Integral rates stay exact; unusable rates return None.
+        assert_eq!(fee_at_rate_sats(112, 3.0), Some(336));
+        assert_eq!(fee_at_rate_sats(10, f64::NAN), None);
+        assert_eq!(fee_at_rate_sats(10, 0.5), None);
+    }
+
+    #[test]
     fn test_send_message() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

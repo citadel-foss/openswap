@@ -669,6 +669,51 @@ mod tests {
     }
 
     #[test]
+    fn any_legacy_proof_sent_only_for_incomplete_legacy_with_pof() {
+        let dir = TempDir::new().unwrap();
+        let mut tracker = SwapTracker::load_or_create(dir.path()).unwrap();
+        assert!(!tracker.any_legacy_proof_sent());
+
+        let legacy_maker = |proof_of_funding_sent: bool| MakerProgress {
+            address: String::new(),
+            negotiated: true,
+            exchange: ExchangeProgress::Legacy(LegacyExchangeProgress {
+                proof_of_funding_sent,
+                ..Default::default()
+            }),
+            finalization: FinalizationProgress::default(),
+        };
+
+        // Unsent proof: the funding is still ours alone.
+        let mut record = make_test_record("swap-unsent", SwapPhase::FundsBroadcast);
+        record.makers = vec![legacy_maker(false)];
+        tracker.save_record(&record).unwrap();
+        assert!(!tracker.any_legacy_proof_sent());
+
+        // A sent proof on an incomplete Legacy swap: the maker holds the
+        // funding and can broadcast it at any time.
+        let mut record = make_test_record("swap-sent", SwapPhase::FundsBroadcast);
+        record.makers = vec![legacy_maker(true)];
+        tracker.save_record(&record).unwrap();
+        assert!(tracker.any_legacy_proof_sent());
+
+        // Completed records and Taproot records never count.
+        tracker.remove_record("swap-sent").unwrap();
+        let mut record = make_test_record("swap-done", SwapPhase::Completed);
+        record.makers = vec![legacy_maker(true)];
+        tracker.save_record(&record).unwrap();
+        let mut record = make_test_record("swap-taproot", SwapPhase::FundsBroadcast);
+        record.makers = vec![MakerProgress {
+            address: String::new(),
+            negotiated: true,
+            exchange: ExchangeProgress::Taproot(TaprootExchangeProgress::default()),
+            finalization: FinalizationProgress::default(),
+        }];
+        tracker.save_record(&record).unwrap();
+        assert!(!tracker.any_legacy_proof_sent());
+    }
+
+    #[test]
     fn test_save_and_reload() {
         let dir = TempDir::new().unwrap();
 

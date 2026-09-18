@@ -120,7 +120,8 @@ pub struct MakerSwapRecord {
     pub incoming_count: usize,
     pub outgoing_count: usize,
     /// Funding txids broadcast so far, one per tx as the batch progresses.
-    /// Empty means nothing is on-chain and recovery material can be discarded.
+    /// Empty only means no broadcast was recorded; recovery must still prove
+    /// cleanup is safe (grace, backend checks, Legacy exposure) first.
     #[serde(default)]
     pub funding_broadcast_txids: Vec<Txid>,
     pub recovery: MakerRecoveryState,

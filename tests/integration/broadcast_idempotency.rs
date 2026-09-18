@@ -72,7 +72,7 @@ fn run_rebroadcast_mined<B: TestBackend>(core_backend: bool) {
     let taker = takers.get_mut(0).unwrap();
 
     fund_taker_default(taker, bitcoind, 3);
-    let (txid, tx) = spend_once(taker, bitcoind);
+    let (_, tx) = spend_once(taker, bitcoind);
     generate_blocks(bitcoind, 1);
     test_framework.wait_for_electrs_tip();
 
@@ -99,7 +99,6 @@ fn run_rebroadcast_mined<B: TestBackend>(core_backend: bool) {
             other => panic!("expected an Electrum protocol error, got {:?}", other),
         }
     }
-    let _ = txid;
 
     test_framework.stop();
     block_generation_handle.join().unwrap();

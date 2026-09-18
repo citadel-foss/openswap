@@ -265,14 +265,14 @@ fn heterogeneous_substitution_aborts_without_cascade() {
     assert!(
         summary.makers[0]
             .address
-            .ends_with(&makers[0].config.network_port.to_string()),
+            .ends_with(&format!(":{}", makers[0].config.network_port)),
         "hop 0 should be maker0 (the dropper), got {}",
         summary.makers[0].address
     );
     assert!(
         summary.makers[1]
             .address
-            .ends_with(&makers[1].config.network_port.to_string()),
+            .ends_with(&format!(":{}", makers[1].config.network_port)),
         "hop 1 should be maker1 (downstream), got {}",
         summary.makers[1].address
     );
@@ -451,7 +451,7 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing() {
     assert!(
         summary.makers[1]
             .address
-            .ends_with(&makers[1].config.network_port.to_string()),
+            .ends_with(&format!(":{}", makers[1].config.network_port)),
         "hop 1 should be maker1 (the cheap dropper), got {}",
         summary.makers[1].address
     );
