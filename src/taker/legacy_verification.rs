@@ -533,9 +533,8 @@ impl Taker {
             if total_funding != expected {
                 self.note_proven_violation(maker_idx);
                 return Err(TakerError::General(format!(
-                    "Maker sender contracts total funding {} does not match expected {} \
-                     (based on maker's advertised fee schedule)",
-                    total_funding, expected
+                    "Maker {maker_idx} sender contracts total funding {total_funding} does not \
+                     match the negotiated hop total {expected}"
                 )));
             }
         }

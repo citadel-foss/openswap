@@ -122,7 +122,7 @@ fn test_standard_openswap() {
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        496123,
+        496447,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -140,7 +140,7 @@ fn test_standard_openswap() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        4339,
+        4015,
         "Taker spendable balance change mismatch"
     );
 
@@ -164,8 +164,8 @@ fn test_standard_openswap() {
             balances.spendable,
         );
 
-        let expected_regular = [14501027u64, 14502722][i];
-        let expected_swap = [499550u64, 497818][i];
+        let expected_regular = [14500865u64, 14502398][i];
+        let expected_swap = [499550u64, 497980][i];
         assert_eq!(
             balances.regular.to_sat(),
             expected_regular,
@@ -193,7 +193,7 @@ fn test_standard_openswap() {
 
         info!("Maker {} fee earned: {} sats", i, maker_fee.to_sat());
 
-        let expected_fee = [820u64, 783][i];
+        let expected_fee = [658u64, 621][i];
         assert_eq!(
             maker_fee.to_sat(),
             expected_fee,
@@ -256,14 +256,14 @@ fn test_standard_openswap() {
 /// swap still completes.
 #[test]
 fn test_swap_with_custom_feerate() {
-    run_swap_with_custom_feerate(ProtocolVersion::Taproot, 9203, 21503, 4170, 112);
+    run_swap_with_custom_feerate(ProtocolVersion::Taproot, 9203, 21503, 3846, 112);
 }
 
 /// Same 3 sats/vB swap on Legacy: funding txs price their real vsize and the
 /// multisig contract sweeps pay the 150 vB model at the negotiated rate.
 #[test]
 fn test_legacy_swap_with_custom_feerate() {
-    run_swap_with_custom_feerate(ProtocolVersion::Legacy, 9204, 21504, 4626, 150);
+    run_swap_with_custom_feerate(ProtocolVersion::Legacy, 9204, 21504, 4302, 150);
 }
 
 fn run_swap_with_custom_feerate(
@@ -311,8 +311,8 @@ fn run_swap_with_custom_feerate(
         .checked_sub(balances.spendable)
         .unwrap();
     info!("Taker fee at 3 sats/vB: {} sats", fee_paid.to_sat());
-    // Pinned from a real run: 3722 at the old floor-priced sweeps, +448 because
-    // the two cooperative sweeps now pay the negotiated rate (2 x 112 vB x (3-1)).
+    // Pinned from a real run: the two cooperative sweeps pay the bare sweep
+    // vsize model at the negotiated 3 sats/vB rate.
     assert_eq!(
         fee_paid.to_sat(),
         expected_fee_paid,
@@ -448,7 +448,7 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     // Pinned from a real run: one maker, two splits, all at the 1 sat/vB floor.
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14998218,
+        14998326,
         "Taker spendable balance mismatch"
     );
     assert_eq!(taker_balances.contract, Amount::ZERO);
@@ -467,10 +467,10 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
         .checked_sub(maker_spendable_balance[0])
         .unwrap_or(Amount::ZERO);
     info!("Maker fee earned across the pause: {} sats", maker_fee);
-    // Pinned from a real run: pre-swap 14999757 + the 718 sats hop fee.
+    // Pinned from a real run: pre-swap 14999757 + the 610 sats hop fee.
     assert_eq!(
         maker_balances.spendable.to_sat(),
-        15000475,
+        15000367,
         "Maker spendable balance mismatch"
     );
     assert_eq!(maker_balances.contract, Amount::ZERO);

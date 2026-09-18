@@ -201,8 +201,8 @@ fn run_multi_confirm_swap(
 
     let expected_taker_regular = 14499538;
     let expected_taker_swap = match protocol {
-        ProtocolVersion::Legacy => 496123,
-        ProtocolVersion::Taproot => 496465,
+        ProtocolVersion::Legacy => 496447,
+        ProtocolVersion::Taproot => 496789,
     };
     assert_eq!(
         taker_balances.regular.to_sat(),
@@ -227,8 +227,8 @@ fn run_multi_confirm_swap(
         .unwrap();
     info!("Taker fees paid: {} sats", balance_diff.to_sat());
     let expected_diff = match protocol {
-        ProtocolVersion::Legacy => 4339,
-        ProtocolVersion::Taproot => 3997,
+        ProtocolVersion::Legacy => 4015,
+        ProtocolVersion::Taproot => 3673,
     };
     assert_eq!(
         balance_diff.to_sat(),
@@ -237,14 +237,14 @@ fn run_multi_confirm_swap(
     );
 
     let expected_regular = match protocol {
-        ProtocolVersion::Legacy => [14501027u64, 14502722],
-        ProtocolVersion::Taproot => [14500913u64, 14502494],
+        ProtocolVersion::Legacy => [14500865u64, 14502398],
+        ProtocolVersion::Taproot => [14500751u64, 14502170],
     };
     let expected_swap = match protocol {
-        ProtocolVersion::Legacy => [499550u64, 497818],
-        ProtocolVersion::Taproot => [499664u64, 498046],
+        ProtocolVersion::Legacy => [499550u64, 497980],
+        ProtocolVersion::Taproot => [499664u64, 498208],
     };
-    let expected_fee = [820u64, 783];
+    let expected_fee = [658u64, 621];
 
     for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
         let balances = maker.wallet.read().unwrap().get_balances().unwrap();

@@ -571,11 +571,28 @@ pub fn wait_for_tx_depths(
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let by_depth = txs_by_spend_depth(bitcoind, from_height);
-        let reached = expected
+        // Exact counts, not minimums: an extra transaction at an expected
+        // depth is a real anomaly, so fail fast instead of passing over it.
+        let counts: Vec<usize> = by_depth.iter().map(Vec::len).collect();
+        assert!(
+            !expected
+                .iter()
+                .enumerate()
+                .any(|(d, &n)| by_depth.get(d).map_or(0, Vec::len) > n),
+            "more transactions than expected: wanted {:?}, got {:?}",
+            expected,
+            counts
+        );
+        let settled = expected
             .iter()
             .enumerate()
-            .all(|(d, &n)| by_depth.get(d).map_or(0, Vec::len) >= n);
-        if reached {
+            .all(|(d, &n)| by_depth.get(d).map_or(0, Vec::len) == n);
+        if settled {
+            assert!(
+                by_depth.iter().skip(expected.len()).all(Vec::is_empty),
+                "unexpected transactions past the expected depths: {:?}",
+                counts
+            );
             return by_depth;
         }
         assert!(

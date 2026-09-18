@@ -168,7 +168,7 @@ fn test_taproot_maker_abort2() {
         14499538,
         "Taker regular balance mismatch"
     );
-    assert_eq!(taker_balances.swap.to_sat(), 496336, "Taker swap balance");
+    assert_eq!(taker_balances.swap.to_sat(), 496660, "Taker swap balance");
     assert_eq!(
         taker_balances.contract.to_sat(),
         0,
@@ -189,14 +189,14 @@ fn test_taproot_maker_abort2() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        4126,
+        3802,
         "Taker spendable balance change"
     );
 
     // Verify maker balances
-    let expected_regular = [14500913, 14502494];
-    let expected_swap = [499664, 497917];
-    let expected_spendable = [15000577, 15000411];
+    let expected_regular = [14500751, 14502170];
+    let expected_swap = [499664, 498079];
+    let expected_spendable = [15000415, 15000249];
     for (i, maker) in makers.iter().enumerate() {
         maker
             .wallet

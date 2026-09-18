@@ -343,7 +343,10 @@ impl Wallet {
         let regular_pool = to_pool(self.list_descriptor_utxo_spend_info());
         let swap_pool = to_pool(self.list_swept_incoming_swap_utxos());
 
-        let required = total.to_sat() + funding_fee(1, fee_rate)?;
+        let required = total
+            .to_sat()
+            .checked_add(funding_fee(1, fee_rate)?)
+            .ok_or_else(|| WalletError::General("funding threshold overflow".to_string()))?;
 
         let manual = manually_selected_outpoints
             .filter(|outpoints| !outpoints.is_empty())

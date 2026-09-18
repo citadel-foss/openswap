@@ -145,7 +145,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
             maker_balances.contract,
             maker_balances.spendable,
         );
-        let expected_regular = [14999311u64, 14501554][i];
+        let expected_regular = [14999311u64, 14501446][i];
         assert_eq!(
             maker_balances.regular.to_sat(),
             expected_regular,
@@ -208,7 +208,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        497749,
+        497857,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -227,7 +227,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     );
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        15497303,
+        15497411,
         "Taker spendable balance mismatch"
     );
 

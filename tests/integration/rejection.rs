@@ -1080,7 +1080,7 @@ fn test_legacy_taker_rejects_fee_skimming_maker() {
         .start_swap(&summary.swap_id)
         .expect_err("reject fee skim");
     assert!(
-        format!("{error:?}").contains("does not match expected"),
+        format!("{error:?}").contains("does not match the negotiated hop total"),
         "unexpected error: {:?}",
         error
     );

@@ -103,7 +103,7 @@ fn maker_abort2_case1() {
 
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14995661,
+        14995985,
         "Taker spendable balance mismatch"
     );
     assert_eq!(
@@ -120,7 +120,7 @@ fn maker_abort2_case1() {
             "Maker {} balances: original={}, after={}",
             i, original, balances.spendable
         );
-        let expected_spendable = [15000577, 14999757, 15000540][i];
+        let expected_spendable = [15000415, 14999757, 15000378][i];
         assert_eq!(
             balances.spendable.to_sat(),
             expected_spendable,
@@ -633,7 +633,7 @@ fn last_hop_equal_priced_spare_completes() {
     // (identical on the dropper and the spare) plus the default hop-0 fee.
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14996071,
+        14996395,
         "Taker spendable balance mismatch"
     );
     assert_eq!(taker_balances.contract, Amount::ZERO);
@@ -648,7 +648,7 @@ fn last_hop_equal_priced_spare_completes() {
             "Maker {} balances: original={}, after={}",
             i, original, balances.spendable
         );
-        let expected_spendable = [15000577u64, 14999757, 15000130][i];
+        let expected_spendable = [15000415u64, 14999757, 14999968][i];
         assert_eq!(
             balances.spendable.to_sat(),
             expected_spendable,

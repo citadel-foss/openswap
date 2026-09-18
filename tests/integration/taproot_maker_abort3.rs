@@ -108,7 +108,7 @@ fn test_taproot_maker_abort3() {
 
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14996003,
+        14996327,
         "Taker spendable balance mismatch"
     );
     assert_eq!(
@@ -119,7 +119,7 @@ fn test_taproot_maker_abort3() {
     assert_eq!(taker_balances.fidelity, Amount::ZERO);
 
     // Verify makers earned fees (only the two that participated)
-    let expected_spendable = [15000577, 14999757, 15000540];
+    let expected_spendable = [15000415, 14999757, 15000378];
     for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
         let balances = maker.wallet.read().unwrap().get_balances().unwrap();
         info!(

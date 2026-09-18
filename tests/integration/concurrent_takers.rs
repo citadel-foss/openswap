@@ -36,7 +36,7 @@ fn test_concurrent_takers_legacy() {
     concurrent_takers(
         ProtocolVersion::Legacy,
         vec![(7802, Some(20801)), (17802, Some(20802))],
-        [1250635, 1250598],
+        [1250473, 1250436],
     );
 }
 
@@ -45,7 +45,7 @@ fn test_concurrent_takers_taproot() {
     concurrent_takers(
         ProtocolVersion::Taproot,
         vec![(7902, Some(20901)), (17902, Some(20902))],
-        [1250635, 1250598],
+        [1250473, 1250436],
     );
 }
 

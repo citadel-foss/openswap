@@ -150,11 +150,11 @@ fn test_concurrent_legacy_and_taproot_swaps() {
     );
 
     let expected_taker_regular = [14_499_538, 14_299_538];
-    let expected_taker_swap = [496_123, 696_380];
-    let expected_taker_fees = [4_339, 4_082];
-    let expected_maker_regular = [302_476, 305_787];
-    let expected_maker_swap = [1_199_214, 1_195_814];
-    let expected_maker_earnings = [1_690, 1_601];
+    let expected_taker_swap = [496_447, 696_704];
+    let expected_taker_fees = [4_015, 3_758];
+    let expected_maker_regular = [302_152, 305_139];
+    let expected_maker_swap = [1_199_214, 1_196_138];
+    let expected_maker_earnings = [1_366, 1_277];
 
     // Sync and log every party before any assert, so one stale golden value
     // does not hide the rest.

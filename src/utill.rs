@@ -203,14 +203,15 @@ pub fn funding_fee_policy_sats(
 }
 
 /// Sweep reimbursement per incoming contract at the negotiated swap feerate:
-/// one input, one output, cooperative spend of the protocol's shape.
-/// Batching gains are the maker's; costs above the model are too.
+/// the cooperative spend's complete vsize model — the constants already
+/// include the transaction overhead and output. Batching gains are the
+/// maker's; costs above the model are too.
 pub fn sweep_fee_policy_sats(protocol: ProtocolVersion, feerate: f64) -> Option<u64> {
     let spend_vsize = match protocol {
         ProtocolVersion::Legacy => LEGACY_CONTRACT_SPEND_VSIZE,
         ProtocolVersion::Taproot => TAPROOT_KEYPATH_VSIZE,
     };
-    fee_at_rate_sats(11 + 43 + spend_vsize, feerate)
+    fee_at_rate_sats(spend_vsize, feerate)
 }
 
 /// Sets up the logger for the taker component.

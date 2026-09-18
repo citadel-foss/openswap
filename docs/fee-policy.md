@@ -75,7 +75,7 @@ can measure the transactions in advance. The policy prices them with fixed
 sizes instead:
 
 - **Funding transaction:** 97 virtual bytes, plus 68 per input.
-- **Claim transaction:** 166 virtual bytes for taproot, 204 for legacy.
+- **Claim transaction:** 112 virtual bytes for taproot, 150 for legacy.
 
 Taproot and legacy are the two transaction types the swap supports. Taproot
 is the newer one.
@@ -105,12 +105,12 @@ funding transactions with 1 input each.
 **Funding fee:** one transaction costs 97 + 68 = 165 virtual bytes. That is
 165 sats at 1 sat/vB. Two transactions: **330 sats**.
 
-**Sweep fee:** one taproot claim costs 166 virtual bytes. That is 166 sats.
-Two contracts: **332 sats**.
+**Sweep fee:** one taproot claim costs 112 virtual bytes. That is 112 sats.
+Two contracts: **224 sats**.
 
-**What you receive:** 500,000 − 523 − 330 − 332 = **498,815 sats**.
+**What you receive:** 500,000 − 523 − 330 − 224 = **498,923 sats**.
 
-The hop costs 1,185 sats in total, about 0.24%. You also pay the miner fee
+The hop costs 1,077 sats in total, about 0.22%. You also pay the miner fee
 for your own funding transaction on top. Raising the feerate raises the two
 miner fees in step. The service fee stays the same.
 
