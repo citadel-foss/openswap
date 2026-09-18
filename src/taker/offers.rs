@@ -122,6 +122,12 @@ pub struct MakerOfferCandidate {
     /// Current state of maker
     pub state: MakerState,
 
+    /// Set on a proven protocol violation. Poll success refreshes the offer
+    /// and ladder state but must never clear this, so a proven cheater stays
+    /// out of selection.
+    #[serde(default)]
+    pub proven_violation: bool,
+
     /// Supporting protocol (Legacy or Taproot), if known
     pub protocol: Option<MakerProtocol>,
 
@@ -308,6 +314,28 @@ impl OfferBookHandle {
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?
             .mark_bad(&maker.address);
         Ok(())
+    }
+
+    /// Record a proven protocol violation. The marker is sticky so a later poll
+    /// success cannot return the maker to selection. Only for arithmetically or
+    /// cryptographically proven misbehavior, never timeouts or backend failures.
+    pub(crate) fn record_proven_violation(&self, address: &MakerAddress) -> Result<(), TakerError> {
+        log::warn!("Proven violation recorded against maker {address}");
+        let now_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        let mut book = lock_debug!(self.inner.write())
+            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+        // A preferred maker may have no entry yet; the violation still counts.
+        if !book.makers.iter().any(|m| m.address == *address) {
+            book.insert_candidate(address.clone(), None, None, now_ts, false);
+        }
+        book.mark_failure(address, now_ts);
+        if let Some(m) = book.makers.iter_mut().find(|m| &m.address == address) {
+            m.proven_violation = true;
+        }
+        book.write_to_disk(&self.path)
     }
 
     /// All current good makers
@@ -985,6 +1013,9 @@ fn verify_fidelity_with_backend(
 struct SuppressedMaker {
     fidelity_outpoint: Option<OutPoint>,
     fidelity_expiry_height: Option<u32>,
+    /// Pruning must not launder a proven violation; restore it on rediscovery.
+    #[serde(default)]
+    proven_violation: bool,
     retry_after_ts: u64,
 }
 
@@ -1040,6 +1071,10 @@ impl OfferBook {
             None => false,
         };
 
+        let proven_violation = self
+            .suppressed_makers
+            .get(&address)
+            .is_some_and(|suppressed| suppressed.proven_violation);
         self.suppressed_makers.remove(&address);
         let first_seen_ts = if recovery_probe {
             // A recovery attempt gets one probe. If it fails, this deliberately
@@ -1053,6 +1088,7 @@ impl OfferBook {
             fidelity_outpoint,
             fidelity_expiry_height,
             first_seen_ts,
+            proven_violation,
         );
         true
     }
@@ -1065,10 +1101,16 @@ impl OfferBook {
             return suppressed.is_some();
         }
 
-        let (outpoint, expiry_height) = suppressed
-            .map(|maker| (maker.fidelity_outpoint, maker.fidelity_expiry_height))
+        let (outpoint, expiry_height, proven_violation) = suppressed
+            .map(|maker| {
+                (
+                    maker.fidelity_outpoint,
+                    maker.fidelity_expiry_height,
+                    maker.proven_violation,
+                )
+            })
             .unwrap_or_default();
-        self.insert_candidate(address, outpoint, expiry_height, now_ts);
+        self.insert_candidate(address, outpoint, expiry_height, now_ts, proven_violation);
         true
     }
 
@@ -1078,6 +1120,7 @@ impl OfferBook {
         fidelity_outpoint: Option<OutPoint>,
         fidelity_expiry_height: Option<u32>,
         first_seen_ts: u64,
+        proven_violation: bool,
     ) {
         self.makers.push(MakerOfferCandidate {
             address,
@@ -1085,6 +1128,7 @@ impl OfferBook {
             fidelity_expiry_height,
             offer: None,
             state: MakerState::Unresponsive { retries: 0 },
+            proven_violation,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(first_seen_ts),
@@ -1112,6 +1156,7 @@ impl OfferBook {
                     SuppressedMaker {
                         fidelity_outpoint: maker.fidelity_outpoint,
                         fidelity_expiry_height: maker.fidelity_expiry_height,
+                        proven_violation: maker.proven_violation,
                         retry_after_ts: now_ts.saturating_add(STALE_MAKER_AGE.as_secs()),
                     },
                 );
@@ -1252,6 +1297,7 @@ impl OfferBook {
             .makers
             .iter()
             .filter(|m| m.state == MakerState::Good)
+            .filter(|m| !m.proven_violation)
             .filter(|m| {
                 m.protocol
                     .as_ref()
@@ -1575,6 +1621,7 @@ mod tests {
             fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Good,
+            proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
@@ -1618,6 +1665,7 @@ mod tests {
             fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Bad,
+            proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
@@ -1645,6 +1693,7 @@ mod tests {
             fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Unresponsive { retries: 3 },
+            proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
@@ -1669,7 +1718,7 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl);
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, false);
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
         assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), recovery_ts));
 
@@ -1698,21 +1747,76 @@ mod tests {
     }
 
     #[test]
+    fn proven_violation_survives_pruning_and_rediscovery() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let prune_ts = ttl * 2;
+        let now_ts = prune_ts + ttl;
+        let address = addr("violator");
+        let outpoint = Some(OutPoint::new(Txid::from_slice(&[2; 32]).unwrap(), 0));
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(address.clone(), outpoint, Some(500), 0, false);
+        book.makers[0].proven_violation = true;
+
+        // Pruning hides the maker but must keep the marker.
+        assert_eq!(book.prune_stale_makers(prune_ts), 1);
+        assert!(book.makers.is_empty());
+
+        // Rediscovery restores it: a poll success cannot launder a violator
+        // back into selection.
+        assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), now_ts));
+        assert!(book.makers[0].proven_violation);
+        book.makers[0].state = MakerState::Good;
+        assert!(book
+            .makers
+            .iter()
+            .filter(|m| !m.proven_violation)
+            .all(|m| m.address != address));
+    }
+
+    #[test]
+    fn backend_down_leaves_maker_state_unchanged() {
+        let now_ts = 170000;
+        let address = addr("6106");
+        let mut book = OfferBook::default();
+        book.makers.push(MakerOfferCandidate {
+            address: address.clone(),
+            fidelity_outpoint: Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0)),
+            fidelity_expiry_height: None,
+            offer: None,
+            state: MakerState::Good,
+            proven_violation: false,
+            protocol: None,
+            last_offer_update_ts: None,
+            first_seen_ts: Some(now_ts),
+            backend_retry_pending: false,
+            next_offer_check_ts: None,
+        });
+
+        // The state machine only steps on an answered check; #1017 schedules a
+        // non-penalizing retry for a silent backend instead.
+        let down = FidelityCheckError::BackendDown(TakerError::General("electrum down".into()));
+        book.record_fidelity_failure(&address, &down, now_ts);
+        assert_eq!(book.makers[0].state, MakerState::Good);
+        assert!(book.makers[0].backend_retry_pending);
+    }
+
+    #[test]
     fn stale_pruning_is_inclusive_and_uses_the_right_age_anchor() {
         let ttl = STALE_MAKER_AGE.as_secs();
         let now_ts = ttl * 2;
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[3; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(addr("fresh"), outpoint, Some(500), 0);
+        book.insert_candidate(addr("fresh"), outpoint, Some(500), 0, false);
         book.makers[0].last_offer_update_ts = Some(now_ts - ttl + 1);
 
-        book.insert_candidate(addr("boundary"), outpoint, Some(500), now_ts);
+        book.insert_candidate(addr("boundary"), outpoint, Some(500), now_ts, false);
         book.makers[1].last_offer_update_ts = Some(now_ts - ttl);
 
-        book.insert_candidate(addr("never"), outpoint, Some(500), now_ts - ttl);
+        book.insert_candidate(addr("never"), outpoint, Some(500), now_ts - ttl, false);
 
-        book.insert_candidate(addr("future"), outpoint, Some(500), now_ts);
+        book.insert_candidate(addr("future"), outpoint, Some(500), now_ts, false);
         book.makers[3].last_offer_update_ts = Some(now_ts + 1);
 
         assert_eq!(book.prune_stale_makers(now_ts), 2);
@@ -1735,7 +1839,7 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[4; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl);
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, false);
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
 
         assert!(!book.upsert_discovered(address.clone(), outpoint, Some(500), prune_ts + ttl - 1));
@@ -1754,7 +1858,7 @@ mod tests {
         let new_outpoint = Some(OutPoint::new(Txid::from_slice(&[11; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), old_outpoint, Some(500), 1_000);
+        book.insert_candidate(address.clone(), old_outpoint, Some(500), 1_000, false);
         assert!(book.upsert_discovered(address, new_outpoint, Some(600), 1_001));
 
         assert_eq!(book.makers[0].fidelity_outpoint, new_outpoint);
@@ -1770,7 +1874,13 @@ mod tests {
         let new_outpoint = Some(OutPoint::new(Txid::from_slice(&[7; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), old_outpoint, Some(500), prune_ts - ttl);
+        book.insert_candidate(
+            address.clone(),
+            old_outpoint,
+            Some(500),
+            prune_ts - ttl,
+            false,
+        );
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
         assert!(book.upsert_discovered(address.clone(), new_outpoint, Some(600), prune_ts + 1));
         assert_eq!(book.makers[0].first_seen_ts, Some(prune_ts + 1));
@@ -1792,7 +1902,7 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[12; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl);
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, false);
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
         assert!(book.upsert_for_poll(address.clone(), poll_ts));
 
@@ -1817,7 +1927,7 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[8; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), now_ts - ttl);
+        book.insert_candidate(address.clone(), outpoint, Some(500), now_ts - ttl, false);
         assert_eq!(book.prune_stale_makers(now_ts), 1);
         assert_eq!(book.prune_expired_suppressions(499), 0);
         assert_eq!(book.prune_expired_suppressions(500), 1);
@@ -1831,7 +1941,7 @@ mod tests {
         let address = addr("persisted");
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), None, None, now_ts - ttl);
+        book.insert_candidate(address.clone(), None, None, now_ts - ttl, false);
         assert_eq!(book.prune_stale_makers(now_ts), 1);
 
         let encoded = serde_json::to_string(&book).unwrap();
@@ -1848,7 +1958,7 @@ mod tests {
     fn legacy_candidate_fields_deserialize_and_backfill() {
         let now_ts = STALE_MAKER_AGE.as_secs();
         let mut book = OfferBook::default();
-        book.insert_candidate(addr("legacy"), None, None, now_ts);
+        book.insert_candidate(addr("legacy"), None, None, now_ts, false);
 
         let mut encoded = serde_json::to_value(&book).unwrap();
         let candidate = encoded
@@ -1870,6 +1980,73 @@ mod tests {
         assert!(decoded.backfill_first_seen_timestamps(now_ts));
         assert_eq!(decoded.makers[0].first_seen_ts, Some(now_ts));
         assert!(!decoded.backfill_first_seen_timestamps(now_ts + 1));
+    }
+
+    #[test]
+    fn proven_violation_walks_the_state_machine_and_persists() {
+        let dir = std::env::temp_dir().join(format!(
+            "offerbook-violation-{}",
+            bip39::rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = OfferBookHandle::load_or_create(&dir).unwrap();
+        let address = addr("6107");
+
+        // A maker with no entry is inserted; a proven violation steps it down
+        // the Good -> Unresponsive -> Bad ladder and sets a sticky flag.
+        handle.record_proven_violation(&address).unwrap();
+        let snapshot = handle.snapshot().unwrap();
+        assert_eq!(
+            snapshot.makers[0].state,
+            MakerState::Unresponsive { retries: 1 }
+        );
+        assert!(snapshot.makers[0].proven_violation);
+
+        // A successful poll refreshes the offer and the ladder state, but the
+        // proven violation keeps the maker out of selection.
+        lock_debug!(handle.inner.write()).unwrap().mark_success(
+            &address,
+            dummy_offer(&address.to_string()),
+            MakerProtocol::Taproot,
+            170000,
+        );
+        let snapshot = handle.snapshot().unwrap();
+        assert_eq!(snapshot.makers[0].state, MakerState::Good);
+        assert!(snapshot.makers[0].proven_violation);
+        assert!(handle
+            .active_makers(&MakerProtocol::Taproot)
+            .unwrap()
+            .is_empty());
+
+        // An ordinary Unresponsive maker still recovers on poll success.
+        let honest = addr("6108");
+        {
+            let mut book = lock_debug!(handle.inner.write()).unwrap();
+            book.insert_candidate(honest.clone(), None, None, 170000, false);
+            book.mark_failure(&honest, 170000);
+            book.mark_success(
+                &honest,
+                dummy_offer(&honest.to_string()),
+                MakerProtocol::Taproot,
+                170000,
+            );
+        }
+        let actives = handle.active_makers(&MakerProtocol::Taproot).unwrap();
+        assert_eq!(actives.len(), 1);
+        assert_eq!(actives[0].address, honest);
+
+        // 11 more violations walk the reset state back to Bad.
+        for _ in 0..11 {
+            handle.record_proven_violation(&address).unwrap();
+        }
+        let state = handle.snapshot().unwrap().makers[0].state.clone();
+        assert_eq!(state, MakerState::Bad);
+
+        let persisted = OfferBook::read_from_disk(&dir.join("offerbook.json")).unwrap();
+        assert_eq!(persisted.makers[0].state, MakerState::Bad);
+        assert!(persisted.makers[0].proven_violation);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

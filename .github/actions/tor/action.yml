@@ -1,0 +1,48 @@
+name: Start tor with a control port
+description: >-
+  Stops Ubuntu's own tor so ours owns the ports, writes a torrc with an empty
+  control password, and waits for bootstrap.
+inputs:
+  data-dir:
+    description: Directory for the torrc, data and log.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Start tor with a control port
+      shell: bash
+      # Via env, never interpolated into the script: a caller-supplied value
+      # reaching the shell source could run commands on the runner.
+      env:
+        TOR_DATA_DIR: ${{ inputs.data-dir }}
+      run: |
+        sudo systemctl stop tor@default.service tor.service || true
+        # Whitespace or control characters would break the torrc tokens or
+        # inject extra config lines, so accept only a plain path character set.
+        # (Quoting is not the fix: tor's config parser does not strip quotes.)
+        case "$TOR_DATA_DIR" in
+          *[!a-zA-Z0-9._/-]*|"") echo "unsafe data-dir: '$TOR_DATA_DIR'" >&2; exit 1 ;;
+        esac
+        mkdir -p -- "$TOR_DATA_DIR"
+        # Empty control password: `check_tor_status` sends AUTHENTICATE "" and
+        # the test helpers default OPENSWAP_TOR_PASSWORD to empty.
+        HASH="$(tor --hash-password '' | tail -n 1)"
+        cat <<EOF > "$TOR_DATA_DIR/torrc"
+        SocksPort 9050
+        ControlPort 9051
+        HashedControlPassword $HASH
+        DataDirectory $TOR_DATA_DIR/data
+        Log notice file $TOR_DATA_DIR/tor.log
+        EOF
+        tor -f "$TOR_DATA_DIR/torrc" &
+        echo "waiting for tor to bootstrap..."
+        for _ in $(seq 1 60); do
+          if grep -q "Bootstrapped 100%" "$TOR_DATA_DIR/tor.log" 2>/dev/null; then
+            echo "tor bootstrapped"
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "tor failed to bootstrap within 300s" >&2
+        cat "$TOR_DATA_DIR/tor.log" 2>/dev/null || true
+        exit 1

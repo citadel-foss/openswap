@@ -10,13 +10,12 @@ use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::{sync::atomic::Ordering::Relaxed, thread};
+use std::thread;
 
 /// Test: Maker drops after sending AckSwapDetails (Taproot). Taker finds spare maker.
 ///
@@ -46,22 +45,10 @@ fn test_taproot_maker_abort3() {
     let taker = takers.get_mut(0).unwrap();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
@@ -80,14 +67,7 @@ fn test_taproot_maker_abort3() {
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup to ensure fidelity bonds are accounted for
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
 
@@ -116,14 +96,7 @@ fn test_taproot_maker_abort3() {
 
     generate_blocks(bitcoind, 1);
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     // Verify taker balance
     let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
@@ -135,7 +108,7 @@ fn test_taproot_maker_abort3() {
 
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14993891,
+        14996327,
         "Taker spendable balance mismatch"
     );
     assert_eq!(
@@ -146,7 +119,7 @@ fn test_taproot_maker_abort3() {
     assert_eq!(taker_balances.fidelity, Amount::ZERO);
 
     // Verify makers earned fees (only the two that participated)
-    let expected_spendable = [15000193, 14999514, 15000156];
+    let expected_spendable = [15000415, 14999757, 15000378];
     for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
         let balances = maker.wallet.read().unwrap().get_balances().unwrap();
         info!(
@@ -169,12 +142,7 @@ fn test_taproot_maker_abort3() {
     }
 
     info!("Taproot maker abort3 test completed successfully!");
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

@@ -17,7 +17,7 @@ use bitcoind::bitcoincore_rpc::{Auth, RpcApi};
 use openswap::{
     maker::{start_server, MakerServer, MakerServerConfig},
     taker::TakerBehavior,
-    utill::MIN_FEE_RATE,
+    utill::MIN_RELAY_FEE_RATE,
     wallet::{AddressType, Blockchain, CoreRPC, CoreRpcConfig, Destination, ElectrumConfig},
 };
 
@@ -46,7 +46,8 @@ fn test_mempool_only_spend_reads_as_spent() {
         .local_addr()
         .unwrap()
         .port();
-    let bitcoind = init_bitcoind(&temp_dir, format!("tcp://127.0.0.1:{}", zmq_port));
+    let bitcoind = init_bitcoind(&temp_dir, format!("tcp://127.0.0.1:{}", zmq_port))
+        .expect("bitcoind failed to start");
 
     let rpc_config = CoreRpcConfig {
         url: bitcoind.rpc_url().split_at(7).1.to_string(),
@@ -127,8 +128,8 @@ fn test_fidelity_creation() {
 
     thread::sleep(Duration::from_secs(6));
 
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
-    test_framework.assert_log("Send at least 0.01000222 BTC to", &log_path);
+    let log_path = test_framework.taker_log_path();
+    test_framework.assert_log("Send at least 0.01000112 BTC to", &log_path);
 
     log::info!("Adding sufficient funds for fidelity bond creation");
     // Provide the Maker with more funds.
@@ -203,7 +204,7 @@ fn test_fidelity_creation() {
                 LockTime::from_height((bitcoind.client.get_block_count().unwrap() as u32) + 950)
                     .unwrap(),
                 None,
-                MIN_FEE_RATE,
+                MIN_RELAY_FEE_RATE,
                 AddressType::P2TR,
             )
             .unwrap();
@@ -256,12 +257,14 @@ fn test_fidelity_creation() {
             balances.fidelity
         );
         assert_eq!(balances.fidelity.to_sat(), 13000000);
-        assert_eq!(balances.regular.to_sat(), 90999322);
+        assert_eq!(balances.regular.to_sat(), 90999661);
     }
 
     log::info!("Waiting for fidelity bonds to mature and testing redemption");
     // Wait for the bonds to mature, redeem them, and validate the process.
     let mut required_height = first_maturity_height;
+    // Set by the wrapper redemption below; the loop's only exit assigns it.
+    let redemption_proof;
 
     loop {
         let current_height = bitcoind.client.get_block_count().unwrap() as u32;
@@ -278,7 +281,7 @@ fn test_fidelity_creation() {
                 log::info!("First Fidelity Bond is matured. Sending redemption transaction");
 
                 wallet_write
-                    .redeem_fidelity(0, MIN_FEE_RATE, AddressType::P2TR)
+                    .redeem_fidelity(0, MIN_RELAY_FEE_RATE, AddressType::P2TR)
                     .unwrap();
 
                 log::info!("First Fidelity Bond is successfully redeemed");
@@ -293,9 +296,18 @@ fn test_fidelity_creation() {
             } else {
                 log::info!("Second Fidelity Bond is matured. Sending redemption transaction");
 
+                // The wrapper's expiry check is strict (`tip > lock_time`),
+                // and this branch runs at the boundary — mine one block past it.
+                generate_blocks(bitcoind, 1);
+                // Hold the mempool still so the probe below can find the tx.
+                test_framework.set_block_gen_paused(true);
+                // Through the wrapper at a distinct rate: proves the caller's
+                // feerate reaches the broadcast tx rather than a fixed fallback.
+                let bond_outpoint = wallet_write.get_fidelity_bonds()[1].outpoint();
                 wallet_write
-                    .redeem_fidelity(1, MIN_FEE_RATE, AddressType::P2TR)
+                    .redeem_expired_fidelity_bonds(3.0, AddressType::P2TR)
                     .unwrap();
+                redemption_proof = Some(bond_outpoint);
 
                 log::info!("Second Fidelity Bond is successfully redeemed");
 
@@ -306,6 +318,35 @@ fn test_fidelity_creation() {
             }
         }
     }
+
+    // Locate the wrapper's redemption tx by its bond input and measure what it
+    // really pays: the fee must be the requested 3 sat/vB over the real vsize.
+    let bond_outpoint = redemption_proof.expect("the second redemption ran");
+    let redemption_txid = bitcoind
+        .client
+        .get_raw_mempool()
+        .unwrap()
+        .into_iter()
+        .find(|txid| {
+            bitcoind
+                .client
+                .get_raw_transaction(txid, None)
+                .unwrap()
+                .input
+                .iter()
+                .any(|input| input.previous_output == bond_outpoint)
+        })
+        .expect("the redemption tx must be in the mempool");
+    let (fee, vsize) = tx_fee_and_vsize(bitcoind, &redemption_txid);
+    // The builder prices its witness estimate, which can overshoot the real
+    // vsize by a byte: never below the requested rate, at most 1 vB above it.
+    assert!(
+        fee >= 3 * vsize as u64 && fee <= 3 * (vsize as u64 + 1),
+        "the redemption must pay the requested 3 sat/vB, not a fallback: fee {:?} for {:?} vB",
+        fee,
+        vsize
+    );
+    test_framework.set_block_gen_paused(false);
 
     thread::sleep(Duration::from_secs(10));
 
@@ -330,7 +371,7 @@ fn test_fidelity_creation() {
         let balances = wallet_read.get_balances().unwrap();
 
         assert_eq!(balances.fidelity.to_sat(), 0);
-        assert_eq!(balances.regular.to_sat(), 103998826);
+        assert_eq!(balances.regular.to_sat(), 103999165);
     }
 
     thread::sleep(Duration::from_secs(10));
@@ -385,7 +426,7 @@ fn test_fidelity_spending() {
                 fidelity_amount,
                 LockTime::from_height(short_timelock_height).unwrap(),
                 None,
-                MIN_FEE_RATE,
+                MIN_RELAY_FEE_RATE,
                 AddressType::P2TR,
             )
             .unwrap();
@@ -497,7 +538,7 @@ fn test_fidelity_spending() {
             let selected_utxos = wallet
                 .coin_select(
                     Amount::from_sat(REGULAR_TX_AMOUNT),
-                    MIN_FEE_RATE,
+                    MIN_RELAY_FEE_RATE,
                     AddressType::P2TR,
                     None,
                     None,
@@ -518,7 +559,7 @@ fn test_fidelity_spending() {
                     op_return_data: None,
                     change_address_type: AddressType::P2TR,
                 };
-                match wallet.spend_from_wallet(MIN_FEE_RATE, destination, &selected_utxos) {
+                match wallet.spend_from_wallet(MIN_RELAY_FEE_RATE, destination, &selected_utxos) {
                     Ok(tx) => Ok(Some(tx)),
                     Err(e) => Err(e),
                 }
@@ -559,7 +600,7 @@ fn test_fidelity_spending() {
     {
         let mut wallet = maker.wallet.write().unwrap();
         wallet
-            .redeem_fidelity(fidelity_index, MIN_FEE_RATE, AddressType::P2TR)
+            .redeem_fidelity(fidelity_index, MIN_RELAY_FEE_RATE, AddressType::P2TR)
             .unwrap();
     }
 
@@ -616,7 +657,7 @@ fn test_fidelity_spending() {
                 LockTime::from_height((bitcoind.client.get_block_count().unwrap() as u32) + 100)
                     .unwrap(),
                 None,
-                MIN_FEE_RATE,
+                MIN_RELAY_FEE_RATE,
                 AddressType::P2TR,
             )
             .unwrap();
@@ -759,7 +800,7 @@ fn test_unconfirmed_fidelity_bond_not_duplicated() {
 
     let bitcoind = &test_framework.bitcoind;
     let maker = makers.first().unwrap();
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
 
     fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
 
@@ -871,7 +912,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
 
     let bitcoind = &test_framework.bitcoind;
     let maker = makers.first().unwrap();
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
 
     fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
 
@@ -1016,7 +1057,7 @@ fn test_unconfirmed_fidelity_bond_not_duplicated_electrum() {
 
     let bitcoind = &test_framework.bitcoind;
     let maker = makers.first().unwrap();
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
 
     fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
 
@@ -1104,7 +1145,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum() {
 
     let bitcoind = &test_framework.bitcoind;
     let maker = makers.first().unwrap();
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
 
     fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
 

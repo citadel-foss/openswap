@@ -19,14 +19,12 @@ use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    sync::atomic::Ordering::Relaxed,
     thread,
     time::{Duration, Instant},
 };
@@ -42,10 +40,10 @@ fn test_taproot_taker_abort3() {
         "close at maker's contract data response",
         TakerBehavior::CloseAtSendersContractFromMaker,
         vec![(7002, Some(20001)), (17002, Some(20002))],
-        [14997750, 14999514],
-        [1764, 0],
-        14998236,
-        1764,
+        [14998875, 14999757],
+        [882, 0],
+        14999118,
+        882,
     );
 }
 
@@ -60,10 +58,10 @@ fn test_taproot_taker_abort_after_full_setup() {
         "drop after full setup",
         TakerBehavior::BroadcastContractAfterFullSetup,
         vec![(8502, Some(21101)), (18502, Some(21102))],
-        [14997750, 14997750],
-        [1764, 1764],
-        14499076,
-        500924,
+        [14998875, 14998875],
+        [882, 882],
+        14499538,
+        500462,
     );
 }
 
@@ -90,20 +88,8 @@ fn run_taproot_taker_abort(
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
     info!("Starting Maker servers...");
     let maker_threads = makers
@@ -118,14 +104,7 @@ fn run_taproot_taker_abort(
 
     wait_for_makers_setup(&makers, 120);
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
 
@@ -274,12 +253,7 @@ fn run_taproot_taker_abort(
     taker.log_tracker_state();
     info!("Taproot taker abort ({case}) completed successfully!");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     tracker_logger.stop();
     test_framework.stop();

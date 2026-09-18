@@ -1,6 +1,6 @@
 use crate::{
     protocol::common_messages::FidelityProof,
-    utill::{redeemscript_to_scriptpubkey, MIN_FEE_RATE},
+    utill::redeemscript_to_scriptpubkey,
     wallet::{infer_address_type, AddressType, Blockchain, Wallet},
 };
 use bitcoin::{
@@ -631,6 +631,7 @@ impl Wallet {
     /// Redeems all expired fidelity bonds in the wallet ,if found any.
     pub fn redeem_expired_fidelity_bonds(
         &mut self,
+        feerate: f64,
         destination_address_type: AddressType,
     ) -> Result<(), WalletError> {
         let curr_height = self.blockchain.get_block_count()? as u32;
@@ -651,7 +652,7 @@ impl Wallet {
 
         expired_bond_indices.into_iter().try_for_each(|i| {
             log::info!("Fidelity Bond at index: {i:?} expired | Redeeming it.");
-            self.redeem_fidelity(i, MIN_FEE_RATE, destination_address_type)
+            self.redeem_fidelity(i, feerate, destination_address_type)
                 .map(|_| ())
         })
     }

@@ -37,7 +37,8 @@ impl TakerCli {
 
         let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
 
-        let bitcoind = init_bitcoind(&temp_dir, zmq_addr.clone());
+        let bitcoind =
+            init_bitcoind(&temp_dir, zmq_addr.clone()).expect("bitcoind failed to start");
         let data_dir = temp_dir.join("taker");
 
         TakerCli {

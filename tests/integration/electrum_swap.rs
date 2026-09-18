@@ -11,7 +11,6 @@ use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
 };
 use std::{sync::atomic::Ordering::Relaxed, thread};
 
@@ -27,21 +26,21 @@ struct ExpectedBalances {
 }
 
 const TAPROOT_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14_499_076,
-    taker_swap: 494_815,
-    taker_fee: 6_109,
-    maker_regular: [14_500_865, 14_503_103],
-    maker_swap: [499_328, 497_053],
-    maker_earnings: [679, 642],
+    taker_regular: 14_499_538,
+    taker_swap: 496_789,
+    taker_fee: 3_673,
+    maker_regular: [14_500_751, 14_502_170],
+    maker_swap: [499_664, 498_208],
+    maker_earnings: [658, 621],
 };
 
 const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14_499_076,
-    taker_swap: 494_587,
-    taker_fee: 6_337,
-    maker_regular: [14_500_865, 14_503_103],
-    maker_swap: [499_100, 496_825],
-    maker_earnings: [451, 414],
+    taker_regular: 14_499_538,
+    taker_swap: 496_447,
+    taker_fee: 4_015,
+    maker_regular: [14_500_865, 14_502_398],
+    maker_swap: [499_550, 497_980],
+    maker_earnings: [658, 621],
 };
 
 /// Run an Electrum-only openswap with the given protocol version and assert the
@@ -55,20 +54,8 @@ fn run_electrum_swap(protocol: ProtocolVersion, expected: &ExpectedBalances) {
         TestFramework::init::<ElectrumBackend>(makers_config_map, taker_behavior, maker_behaviors);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
     info!("Initiating Maker servers");
     let maker_threads = makers
         .iter()
@@ -80,14 +67,7 @@ fn run_electrum_swap(protocol: ProtocolVersion, expected: &ExpectedBalances) {
         })
         .collect::<Vec<_>>();
     wait_for_makers_setup(&makers, 180);
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
         .with_tx_count(3)
@@ -109,14 +89,7 @@ fn run_electrum_swap(protocol: ProtocolVersion, expected: &ExpectedBalances) {
         .unwrap();
     generate_blocks(bitcoind, 1);
     test_framework.wait_for_electrs_tip();
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
     let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
     let balance_diff = taker_original_balance
         .checked_sub(taker_balances.spendable)
