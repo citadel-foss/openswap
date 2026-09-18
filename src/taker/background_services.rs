@@ -46,11 +46,13 @@ impl RecoveryLoop {
     /// Spawn the background recovery thread.
     ///
     /// The `swap_tracker` is used to update per-contract resolution outcomes
-    /// as contracts are resolved in the background.
+    /// as contracts are resolved in the background. `swap_scope` restricts the
+    /// timelock pass to one swap's coins — the sharing state is per swap.
     pub(crate) fn start(
         wallet: Arc<RwLock<Wallet>>,
         swap_tracker: Arc<Mutex<SwapTracker>>,
         data_dir: PathBuf,
+        swap_scope: Option<String>,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let complete = Arc::new(AtomicBool::new(false));
@@ -107,13 +109,19 @@ impl RecoveryLoop {
                     // The funding is shared with the maker once ProofOfFunding
                     // went out; before that, only we can put it on-chain.
                     let funding_shared = lock_debug!(swap_tracker.lock())
-                        .map(|tracker| tracker.any_legacy_proof_sent())
+                        .map(|tracker| {
+                            swap_scope.as_deref().map_or_else(
+                                || tracker.any_legacy_proof_sent(),
+                                |id| tracker.legacy_proof_sent_for(id),
+                            )
+                        })
                         .unwrap_or(true);
                     let outgoing_result = match Wallet::recover_timelocked_swapcoins(
                         &wallet,
                         &chain,
                         RECOVERY_FEE_RATE,
                         &shutdown_clone,
+                        swap_scope.as_deref(),
                         funding_shared,
                     ) {
                         Ok(ref recovered) if !recovered.is_empty() => {

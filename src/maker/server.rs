@@ -1379,6 +1379,7 @@ fn recover_from_swap(
                 chain,
                 RECOVERY_FEE_RATE,
                 &maker.shutdown,
+                Some(&swap_id),
                 // Legacy funding rides the contract-sig response, so the peer
                 // may hold it even when we never broadcast. Taproot never
                 // reaches the check this flag gates.

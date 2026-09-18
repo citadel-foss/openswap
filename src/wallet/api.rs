@@ -1025,12 +1025,15 @@ impl Wallet {
     /// peer's hands (maker: always, they ride the contract-sig response; taker:
     /// once ProofOfFunding was sent). Unshared funding can never land on-chain,
     /// so its swapcoin is discardable; shared funding must be kept until its
-    /// inputs are confirmed spent elsewhere.
+    /// inputs are confirmed spent elsewhere. `swap_scope` restricts the pass
+    /// to one swap's coins: the sharing state is per swap, so a wallet-wide
+    /// pass with one swap's state would misjudge the rest.
     pub fn recover_timelocked_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
         fee_rate: f64,
         shutdown: &std::sync::atomic::AtomicBool,
+        swap_scope: Option<&str>,
         funding_shared_with_peer: bool,
     ) -> Result<RecoveryOutcome, WalletError> {
         let mut outcome = RecoveryOutcome::default();
@@ -1045,6 +1048,7 @@ impl Wallet {
                 .outgoing_swapcoins
                 .iter()
                 .filter(|(_, sc)| sc.my_privkey.is_some())
+                .filter(|(_, sc)| swap_scope.is_none_or(|id| sc.swap_id.as_deref() == Some(id)))
                 .filter_map(|(swap_id, sc)| {
                     sc.get_timelock()
                         .map(|timelock| (swap_id.clone(), sc.clone(), timelock))

@@ -814,11 +814,14 @@ impl Taker {
         // Test hook: send contract data while the funding is mempool-only or
         // withheld entirely, so keepalives meet the maker's evidence gate.
         #[cfg(feature = "integration-test")]
-        if matches!(
+        let skip_wait = matches!(
             self.behavior,
             super::api::TakerBehavior::SkipFundingConfirmWait
                 | super::api::TakerBehavior::WithholdFundingBroadcast
-        ) {
+        );
+        #[cfg(not(feature = "integration-test"))]
+        let skip_wait = false;
+        if skip_wait {
             log::warn!("Test behavior: skipping the funding confirmation wait");
         } else {
             self.wait_for_funding_confirmation(
@@ -827,12 +830,6 @@ impl Taker {
                 crate::utill::TX_BROADCAST_TIMEOUT,
             )?;
         }
-        #[cfg(not(feature = "integration-test"))]
-        self.wait_for_funding_confirmation(
-            &contract_txids,
-            required_confirms,
-            crate::utill::TX_BROADCAST_TIMEOUT,
-        )?;
 
         #[cfg(debug_assertions)]
         log::debug!(

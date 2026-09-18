@@ -780,6 +780,7 @@ impl Taker {
                 chain,
                 MIN_RELAY_FEE_RATE,
                 &crate::utill::NO_SHUTDOWN,
+                None,
                 funding_shared,
             ) {
                 Ok(ref recovered) if !recovered.is_empty() => {
@@ -818,7 +819,12 @@ impl Taker {
                     return;
                 }
             };
-            match RecoveryLoop::start(self.wallet.clone(), self.swap_tracker.clone(), data_dir) {
+            match RecoveryLoop::start(
+                self.wallet.clone(),
+                self.swap_tracker.clone(),
+                data_dir,
+                None,
+            ) {
                 Ok(rl) => self.recovery_loop = Some(rl),
                 // Without the loop, remaining contracts are never swept.
                 Err(e) => log::error!("Failed to spawn recovery loop: {e}"),
@@ -3294,6 +3300,7 @@ impl Taker {
             self.wallet.clone(),
             self.swap_tracker.clone(),
             data_dir,
+            Some(swap_id),
         )?);
 
         Ok(())

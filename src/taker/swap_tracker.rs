@@ -523,11 +523,23 @@ impl SwapTracker {
     /// True when any unfinished swap already sent a ProofOfFunding: those
     /// funding txs are in the maker's hands and can land on-chain at any time.
     pub(crate) fn any_legacy_proof_sent(&self) -> bool {
-        self.incomplete_swaps().iter().any(|record| {
-            record.makers.iter().any(
-                |m| matches!(&m.exchange, ExchangeProgress::Legacy(l) if l.proof_of_funding_sent),
-            )
-        })
+        self.incomplete_swaps()
+            .iter()
+            .any(|record| Self::record_legacy_proof_sent(record))
+    }
+
+    /// Same check scoped to one swap's record.
+    pub(crate) fn legacy_proof_sent_for(&self, swap_id: &str) -> bool {
+        self.get_record(swap_id)
+            .is_some_and(Self::record_legacy_proof_sent)
+    }
+
+    /// One record's Legacy exposure: any maker was sent the ProofOfFunding.
+    fn record_legacy_proof_sent(record: &SwapRecord) -> bool {
+        record
+            .makers
+            .iter()
+            .any(|m| matches!(&m.exchange, ExchangeProgress::Legacy(l) if l.proof_of_funding_sent))
     }
 
     /// Get a mutable reference to a swap record by ID.
@@ -696,6 +708,9 @@ mod tests {
         record.makers = vec![legacy_maker(true)];
         tracker.save_record(&record).unwrap();
         assert!(tracker.any_legacy_proof_sent());
+        assert!(tracker.legacy_proof_sent_for("swap-sent"));
+        assert!(!tracker.legacy_proof_sent_for("swap-unsent"));
+        assert!(!tracker.legacy_proof_sent_for("swap-missing"));
 
         // Completed records and Taproot records never count.
         tracker.remove_record("swap-sent").unwrap();
