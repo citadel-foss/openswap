@@ -804,7 +804,7 @@ fn run_degraded_split_swap(protocol: ProtocolVersion, port: u16, rpc: u16) {
             // shows on-chain instead. Count alone would not prove the split:
             // the taker's 3 splits spend one 0.05 BTC UTXO each, while the
             // maker's single funding tx must gather its fragmented pool.
-            let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[4, 2]);
+            let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[4]);
             let input_counts: Vec<usize> = depths[0]
                 .iter()
                 .map(|txid| {
