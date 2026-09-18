@@ -1419,6 +1419,9 @@ fn recover_from_swap(
 
             let chain = chain.as_ref().expect("connection created for this branch");
 
+            let legacy_funding_shared = outgoing_swapcoins
+                .first()
+                .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy);
             let recovered = Wallet::recover_timelocked_swapcoins(
                 &maker.wallet,
                 chain,
@@ -1427,10 +1430,9 @@ fn recover_from_swap(
                 Some(&swap_id),
                 // Legacy funding rides the contract-sig response, so the peer
                 // may hold it even when we never broadcast. Taproot never
-                // reaches the check this flag gates.
-                outgoing_swapcoins
-                    .first()
-                    .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy),
+                // reaches the check this predicate gates. The pass is scoped
+                // to one swap, so the answer is the same for every coin.
+                &|_| legacy_funding_shared,
             )
             .map_err(MakerError::Wallet)?;
 

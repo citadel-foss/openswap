@@ -106,23 +106,22 @@ impl RecoveryLoop {
 
                     // Try timelock recovery (outgoing). Same deal — it manages the
                     // lock itself and never holds it across a confirmation wait.
-                    // The funding is shared with the maker once ProofOfFunding
-                    // went out; before that, only we can put it on-chain.
-                    let funding_shared = lock_debug!(swap_tracker.lock())
-                        .map(|tracker| {
-                            swap_scope.as_deref().map_or_else(
-                                || tracker.any_legacy_proof_sent(),
-                                |id| tracker.legacy_proof_sent_for(id),
-                            )
+                    // The tracker answers per coin's swap: shared once the
+                    // ProofOfFunding went out, unknown ids stay kept.
+                    let funding_shared = |coin_swap: Option<&str>| {
+                        coin_swap.is_none_or(|id| {
+                            lock_debug!(swap_tracker.lock())
+                                .map(|tracker| tracker.legacy_proof_sent_for(id))
+                                .unwrap_or(true)
                         })
-                        .unwrap_or(true);
+                    };
                     let outgoing_result = match Wallet::recover_timelocked_swapcoins(
                         &wallet,
                         &chain,
                         RECOVERY_FEE_RATE,
                         &shutdown_clone,
                         swap_scope.as_deref(),
-                        funding_shared,
+                        &funding_shared,
                     ) {
                         Ok(ref recovered) if !recovered.is_empty() => {
                             log::info!(

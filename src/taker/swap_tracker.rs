@@ -520,15 +520,8 @@ impl SwapTracker {
         self.data.swaps.get(swap_id)
     }
 
-    /// True when any unfinished swap already sent a ProofOfFunding: those
-    /// funding txs are in the maker's hands and can land on-chain at any time.
-    pub(crate) fn any_legacy_proof_sent(&self) -> bool {
-        self.incomplete_swaps()
-            .iter()
-            .any(|record| Self::record_legacy_proof_sent(record))
-    }
-
-    /// Same check scoped to one swap's record.
+    /// True when this swap already sent a ProofOfFunding: its funding txs are
+    /// in the maker's hands and can land on-chain at any time.
     pub(crate) fn legacy_proof_sent_for(&self, swap_id: &str) -> bool {
         self.get_record(swap_id)
             .is_some_and(Self::record_legacy_proof_sent)
@@ -681,10 +674,10 @@ mod tests {
     }
 
     #[test]
-    fn any_legacy_proof_sent_only_for_incomplete_legacy_with_pof() {
+    fn legacy_proof_sent_only_for_a_legacy_swap_with_pof() {
         let dir = TempDir::new().unwrap();
         let mut tracker = SwapTracker::load_or_create(dir.path()).unwrap();
-        assert!(!tracker.any_legacy_proof_sent());
+        assert!(!tracker.legacy_proof_sent_for("swap-missing"));
 
         let legacy_maker = |proof_of_funding_sent: bool| MakerProgress {
             address: String::new(),
@@ -700,23 +693,23 @@ mod tests {
         let mut record = make_test_record("swap-unsent", SwapPhase::FundsBroadcast);
         record.makers = vec![legacy_maker(false)];
         tracker.save_record(&record).unwrap();
-        assert!(!tracker.any_legacy_proof_sent());
+        assert!(!tracker.legacy_proof_sent_for("swap-unsent"));
 
-        // A sent proof on an incomplete Legacy swap: the maker holds the
-        // funding and can broadcast it at any time.
+        // A sent proof: the maker holds the funding and can broadcast it
+        // at any time.
         let mut record = make_test_record("swap-sent", SwapPhase::FundsBroadcast);
         record.makers = vec![legacy_maker(true)];
         tracker.save_record(&record).unwrap();
-        assert!(tracker.any_legacy_proof_sent());
         assert!(tracker.legacy_proof_sent_for("swap-sent"));
         assert!(!tracker.legacy_proof_sent_for("swap-unsent"));
-        assert!(!tracker.legacy_proof_sent_for("swap-missing"));
 
-        // Completed records and Taproot records never count.
-        tracker.remove_record("swap-sent").unwrap();
+        // A sent proof stays sent once the swap completes, so the answer
+        // does not change. Taproot never sends one.
         let mut record = make_test_record("swap-done", SwapPhase::Completed);
         record.makers = vec![legacy_maker(true)];
         tracker.save_record(&record).unwrap();
+        assert!(tracker.legacy_proof_sent_for("swap-done"));
+
         let mut record = make_test_record("swap-taproot", SwapPhase::FundsBroadcast);
         record.makers = vec![MakerProgress {
             address: String::new(),
@@ -725,7 +718,7 @@ mod tests {
             finalization: FinalizationProgress::default(),
         }];
         tracker.save_record(&record).unwrap();
-        assert!(!tracker.any_legacy_proof_sent());
+        assert!(!tracker.legacy_proof_sent_for("swap-taproot"));
     }
 
     #[test]

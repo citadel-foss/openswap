@@ -572,13 +572,26 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
     maker.store_connection_state(&resp.id, state, false)?;
 
     // Verify all contract signatures before storing them
-    super::legacy_verification::verify_contract_sigs(
+    if let Err(e) = super::legacy_verification::verify_contract_sigs(
         &resp.receivers_sigs,
         &resp.senders_sigs,
         &state.incoming_swapcoins,
         &state.outgoing_swapcoins,
         maker.network_port(),
-    )?;
+    ) {
+        // Bad sigs kill the swap: drop the persisted state and free the
+        // admission reservation, or a failing taker holds our inputs by
+        // reconnecting and repeating the request.
+        if let Err(cleanup) = maker.remove_connection_state(&resp.id) {
+            log::error!(
+                "[{}] failed to drop swap {} after bad signatures: {:?}",
+                maker.network_port(),
+                resp.id,
+                cleanup
+            );
+        }
+        return Err(e);
+    }
     #[cfg(debug_assertions)]
     log::debug!(
         "[CONTRACT_STATE] Role: Maker | Protocol: Legacy | SwapID: {} | ReceiverSigs: {} | SenderSigs: {} | Status: verified",

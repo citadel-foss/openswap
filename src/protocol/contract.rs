@@ -410,6 +410,14 @@ pub(crate) fn create_senders_contract_tx(
         .ok_or(ProtocolError::General(
             "Funding output below contract tx fee",
         ))?;
+    let script_pubkey = redeemscript_to_scriptpubkey(contract_redeemscript)?;
+    // A dust contract output never relays: the recovery broadcast fails and
+    // the locked funding sits unclaimed. Refuse the swap instead.
+    if contract_value < script_pubkey.minimal_non_dust() {
+        return Err(ProtocolError::General(
+            "Contract output below the dust threshold",
+        ));
+    }
 
     Ok(Transaction {
         input: vec![TxIn {
@@ -419,7 +427,7 @@ pub(crate) fn create_senders_contract_tx(
             script_sig: ScriptBuf::new(),
         }],
         output: vec![TxOut {
-            script_pubkey: redeemscript_to_scriptpubkey(contract_redeemscript)?,
+            script_pubkey,
             value: contract_value,
         }],
         lock_time: LockTime::ZERO,
@@ -1463,6 +1471,51 @@ mod test {
         assert_eq!(
             sum_claimed_amounts(std::iter::repeat_n(Amount::MAX_MONEY, 10_000)),
             Err(Amount::MAX_MONEY)
+        );
+    }
+
+    #[test]
+    fn sender_contract_rejects_dust_outputs() {
+        let secp = Secp256k1::new();
+        let pubkey = |byte: u8| {
+            PrivateKey::from_slice(&[byte; 32], bitcoin::NetworkKind::Test)
+                .unwrap()
+                .public_key(&secp)
+        };
+        let redeemscript = create_contract_redeemscript(
+            &pubkey(1),
+            &pubkey(2),
+            &Hash160::from_slice(&[0u8; 20]).unwrap(),
+            &50,
+        );
+        let input = OutPoint::null();
+        let fee = fee_at_rate_sats(CONTRACT_TX_VSIZE, MIN_RELAY_FEE_RATE).unwrap();
+
+        // An input below the fee fails at the fee check.
+        let err = create_senders_contract_tx(input, Amount::from_sat(fee - 1), &redeemscript, 1.0)
+            .expect_err("an input below the fee must fail");
+        assert!(
+            format!("{err:?}").contains("below contract tx fee"),
+            "{:?}",
+            err
+        );
+
+        // Zero or dust after the fee never relays: fails at the dust check.
+        for input_value in [fee, fee + 100] {
+            let err = create_senders_contract_tx(
+                input,
+                Amount::from_sat(input_value),
+                &redeemscript,
+                1.0,
+            )
+            .expect_err("a zero or dust contract output must fail");
+            assert!(format!("{err:?}").contains("dust"), "{:?}", err);
+        }
+
+        // Above the dust threshold it builds.
+        assert!(
+            create_senders_contract_tx(input, Amount::from_sat(fee + 500), &redeemscript, 1.0)
+                .is_ok()
         );
     }
 }
