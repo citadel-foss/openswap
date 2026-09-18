@@ -19,6 +19,7 @@ runs:
         sudo systemctl stop tor@default.service tor.service || true
         # Whitespace or control characters would break the torrc tokens or
         # inject extra config lines, so accept only a plain path character set.
+        # (Quoting is not the fix: tor's config parser does not strip quotes.)
         case "$TOR_DATA_DIR" in
           *[!a-zA-Z0-9._/-]*|"") echo "unsafe data-dir: '$TOR_DATA_DIR'" >&2; exit 1 ;;
         esac
@@ -30,8 +31,8 @@ runs:
         SocksPort 9050
         ControlPort 9051
         HashedControlPassword $HASH
-        DataDirectory "$TOR_DATA_DIR/data"
-        Log notice file "$TOR_DATA_DIR/tor.log"
+        DataDirectory $TOR_DATA_DIR/data
+        Log notice file $TOR_DATA_DIR/tor.log
         EOF
         tor -f "$TOR_DATA_DIR/torrc" &
         echo "waiting for tor to bootstrap..."
