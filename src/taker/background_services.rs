@@ -106,8 +106,9 @@ impl RecoveryLoop {
 
                     // Try timelock recovery (outgoing). Same deal — it manages the
                     // lock itself and never holds it across a confirmation wait.
-                    // The tracker answers per coin's swap: shared once the
-                    // ProofOfFunding went out, unknown ids stay kept.
+                    // Shared once this coin's swap sent its ProofOfFunding. A
+                    // swap the tracker no longer knows is already resolved, so
+                    // its coin is discardable.
                     let funding_shared = |coin_swap: Option<&str>| {
                         coin_swap.is_none_or(|id| {
                             lock_debug!(swap_tracker.lock())

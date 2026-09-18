@@ -1429,9 +1429,8 @@ fn recover_from_swap(
                 &maker.shutdown,
                 Some(&swap_id),
                 // Legacy funding rides the contract-sig response, so the peer
-                // may hold it even when we never broadcast. Taproot never
-                // reaches the check this predicate gates. The pass is scoped
-                // to one swap, so the answer is the same for every coin.
+                // may hold it even when we never broadcast. The pass is scoped
+                // to one swap, so every coin gets the same answer.
                 &|_| legacy_funding_shared,
             )
             .map_err(MakerError::Wallet)?;
