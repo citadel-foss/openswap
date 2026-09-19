@@ -83,6 +83,16 @@ impl Taker {
         sigs: &[bitcoin::ecdsa::Signature],
         senders_info: &[SenderContractTxInfo],
     ) -> Result<(), TakerError> {
+        // The zip below silently stops at the shorter side, so a maker that
+        // returns fewer signatures than contracts would otherwise pass here.
+        if sigs.len() != senders_info.len() {
+            return Err(TakerError::General(format!(
+                "Wrong number of forwarded sender signatures: expected {}, got {}",
+                senders_info.len(),
+                sigs.len()
+            )));
+        }
+
         for (i, (sig, info)) in sigs.iter().zip(senders_info.iter()).enumerate() {
             let (pubkey1, pubkey2) =
                 read_pubkeys_from_multisig_redeemscript(&info.multisig_redeemscript)?;

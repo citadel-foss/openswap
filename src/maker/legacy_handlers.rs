@@ -111,6 +111,22 @@ fn process_req_contract_sigs_for_sender<M: Maker>(
     let sigs =
         maker.verify_and_sign_sender_contract_txs(&req.txs_info, &req.hashvalue, req.locktime)?;
 
+    #[cfg(feature = "integration-test")]
+    let sigs = {
+        use super::handlers::MakerBehavior;
+        let mut sigs = sigs;
+        if maker.behavior() == MakerBehavior::ShortSenderSigs {
+            sigs.pop();
+            log::warn!(
+                "[{}] Test behavior: returning {} of {} sender signatures",
+                maker.network_port(),
+                sigs.len(),
+                req.txs_info.len()
+            );
+        }
+        sigs
+    };
+
     log::info!(
         "[{}] Generated {} signatures for sender contracts",
         maker.network_port(),

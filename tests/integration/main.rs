@@ -47,6 +47,7 @@ mod watchtower_liveness;
 mod concurrent_takers;
 mod legacy_hashlock_recovery;
 mod legacy_reboot_recovery;
+mod legacy_short_sender_sigs;
 mod offerbook_restart;
 mod offerbook_sync_race;
 mod rejection;

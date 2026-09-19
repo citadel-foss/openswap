@@ -67,6 +67,9 @@ pub enum MakerBehavior {
     UnderfundTaprootContract,
     /// Deduct one extra satoshi beyond the advertised fee.
     FeeSkimming,
+    /// Answer ReqContractSigsForSender with one signature fewer than the
+    /// number of contracts (Legacy forwarded-signature count check).
+    ShortSenderSigs,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).
