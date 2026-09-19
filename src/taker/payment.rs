@@ -141,6 +141,69 @@ fn solve_route_gross_sats(
 
 /// Dust-floor decision, free of `Taker` so a unit test can drive it; the
 /// method above supplies the quote and split count from the swap state.
+/// Settlement output values for `funding_amounts`: each keeps an equal share
+/// of `settlement_budget` for its claim fee, and the surplus over
+/// `receiver_amount` is shaved off the largest outputs, never below dust.
+fn settlement_outputs(
+    funding_amounts: &[Amount],
+    settlement_budget: Amount,
+    receiver_amount: Amount,
+) -> Result<Vec<u64>, TakerError> {
+    let coin_count = funding_amounts.len() as u64;
+    if coin_count == 0 {
+        return Err(TakerError::General(
+            "Payment swap produced no incoming swapcoins to settle".into(),
+        ));
+    }
+    let per_coin_budget = settlement_budget.to_sat() / coin_count;
+
+    let mut outputs = Vec::with_capacity(funding_amounts.len());
+    for funding_amount in funding_amounts {
+        outputs.push(
+            funding_amount
+                .to_sat()
+                .checked_sub(per_coin_budget)
+                .filter(|value| *value >= MIN_PAYMENT_OUTPUT_SATS)
+                .ok_or_else(|| {
+                    TakerError::General(format!(
+                        "Incoming swapcoin funding {funding_amount} cannot retain the \
+                         {per_coin_budget} sat settlement budget above dust"
+                    ))
+                })?,
+        );
+    }
+
+    // Shave the ceiling surplus off the largest outputs and burn it as
+    // settlement-tx miner fee. Returning it needs a change output, which
+    // would link the settlement back to us — the one thing this swap buys.
+    let mut surplus = outputs
+        .iter()
+        .sum::<u64>()
+        .checked_sub(receiver_amount.to_sat())
+        .ok_or_else(|| {
+            TakerError::General("Settlement outputs cannot cover the receiver amount".into())
+        })?;
+    while surplus > 0 {
+        let Some((_, output)) = outputs
+            .iter_mut()
+            .enumerate()
+            .max_by_key(|(_, value)| **value)
+        else {
+            return Err(TakerError::General("No settlement outputs".into()));
+        };
+        let reducible = output.saturating_sub(MIN_PAYMENT_OUTPUT_SATS);
+        if reducible == 0 {
+            return Err(TakerError::General(
+                "Cannot remove the surplus without breaching dust".into(),
+            ));
+        }
+        let cut = reducible.min(surplus);
+        *output -= cut;
+        surplus -= cut;
+    }
+    Ok(outputs)
+}
+
 fn check_payment_dust_floor(
     payment: Option<&PaymentQuote>,
     tx_count: u32,
@@ -305,60 +368,13 @@ impl Taker {
         let script_pubkey: ScriptBuf = payment.address.script_pubkey();
 
         let swap = self.swap_state_mut()?;
-        let coin_count = swap.incoming_swapcoins.len() as u64;
-        if coin_count == 0 {
-            return Err(TakerError::General(
-                "Payment swap produced no incoming swapcoins to settle".into(),
-            ));
-        }
-        let per_coin_budget = payment.settlement_budget.to_sat() / coin_count;
-
-        let mut outputs = Vec::with_capacity(swap.incoming_swapcoins.len());
-        for swapcoin in &swap.incoming_swapcoins {
-            outputs.push(
-                swapcoin
-                    .funding_amount
-                    .to_sat()
-                    .checked_sub(per_coin_budget)
-                    .filter(|v| *v >= MIN_PAYMENT_OUTPUT_SATS)
-                    .ok_or_else(|| {
-                        TakerError::General(format!(
-                            "Incoming swapcoin funding {} cannot retain the {per_coin_budget} sat \
-                             settlement budget above dust",
-                            swapcoin.funding_amount
-                        ))
-                    })?,
-            );
-        }
-
-        // Shave the ceiling surplus off the largest outputs and burn it as
-        // settlement-tx miner fee. Returning it needs a change output, which
-        // would link the settlement back to us — the one thing this swap buys.
-        let mut surplus = outputs
+        let funding_amounts: Vec<Amount> = swap
+            .incoming_swapcoins
             .iter()
-            .sum::<u64>()
-            .checked_sub(payment.amount.to_sat())
-            .ok_or_else(|| {
-                TakerError::General("Settlement outputs cannot cover the receiver amount".into())
-            })?;
-        while surplus > 0 {
-            let Some((_, output)) = outputs
-                .iter_mut()
-                .enumerate()
-                .max_by_key(|(_, value)| **value)
-            else {
-                return Err(TakerError::General("No settlement outputs".into()));
-            };
-            let reducible = output.saturating_sub(MIN_PAYMENT_OUTPUT_SATS);
-            if reducible == 0 {
-                return Err(TakerError::General(
-                    "Cannot remove the surplus without breaching dust".into(),
-                ));
-            }
-            let cut = reducible.min(surplus);
-            *output -= cut;
-            surplus -= cut;
-        }
+            .map(|swapcoin| swapcoin.funding_amount)
+            .collect();
+        let outputs =
+            settlement_outputs(&funding_amounts, payment.settlement_budget, payment.amount)?;
 
         let mut total = 0;
         for (swapcoin, output_sats) in swap.incoming_swapcoins.iter_mut().zip(outputs) {
@@ -379,7 +395,7 @@ impl Taker {
 
         log::info!(
             "Pinned {} settlement outputs totaling exactly {} sats to receiver {}",
-            coin_count,
+            funding_amounts.len(),
             total,
             payment.address
         );
@@ -390,6 +406,59 @@ impl Taker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_outputs_split_the_budget_and_shave_the_surplus() {
+        let sat = Amount::from_sat;
+
+        // Equal shares, nothing to shave: each coin keeps its funding less
+        // its share of the budget, and the total is the receiver amount.
+        let outputs =
+            settlement_outputs(&[sat(50_000), sat(50_000)], sat(2_000), sat(98_000)).unwrap();
+        assert_eq!(outputs, vec![49_000, 49_000]);
+
+        // A surplus comes off the largest output first, never the smallest.
+        let outputs =
+            settlement_outputs(&[sat(80_000), sat(20_000)], sat(2_000), sat(90_000)).unwrap();
+        assert_eq!(outputs.iter().sum::<u64>(), 90_000);
+        assert_eq!(outputs, vec![71_000, 19_000]);
+
+        // Exact total: the shaving loop never runs.
+        let outputs = settlement_outputs(&[sat(10_000)], sat(1_000), sat(9_000)).unwrap();
+        assert_eq!(outputs, vec![9_000]);
+    }
+
+    #[test]
+    fn settlement_outputs_refuse_what_dust_cannot_absorb() {
+        let sat = Amount::from_sat;
+
+        // Outputs cannot cover the receiver amount.
+        let err = settlement_outputs(&[sat(10_000)], sat(1_000), sat(50_000)).unwrap_err();
+        assert!(format!("{err:?}").contains("cannot cover"), "{:?}", err);
+
+        // A coin too small to keep its budget share above dust.
+        let err =
+            settlement_outputs(&[sat(1_000), sat(1_000)], sat(1_000), sat(1_000)).unwrap_err();
+        assert!(format!("{err:?}").contains("above dust"), "{:?}", err);
+
+        // The surplus cannot be shaved without breaching dust: both outputs
+        // sit at the floor, so there is nothing left to cut.
+        let err = settlement_outputs(
+            &[sat(MIN_PAYMENT_OUTPUT_SATS), sat(MIN_PAYMENT_OUTPUT_SATS)],
+            sat(0),
+            sat(MIN_PAYMENT_OUTPUT_SATS),
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("breaching dust"), "{:?}", err);
+
+        // No coins at all.
+        let err = settlement_outputs(&[], sat(1_000), sat(1_000)).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("no incoming swapcoins"),
+            "{:?}",
+            err
+        );
+    }
 
     #[test]
     fn swap_feerate_returns_the_configured_rate() {

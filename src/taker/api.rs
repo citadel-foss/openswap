@@ -12,9 +12,9 @@ use std::{
 
 pub(crate) use super::swap_tracker::SwapPhase;
 use super::swap_tracker::{
-    now_secs, ContractOutcome, ContractResolution, ExchangeProgress, FinalizationProgress,
-    LegacyExchangeProgress, MakerProgress, RecoveryState, SerializableSecretKey, SwapRecord,
-    SwapTracker, TaprootExchangeProgress,
+    funding_shared, now_secs, ContractOutcome, ContractResolution, ExchangeProgress,
+    FinalizationProgress, LegacyExchangeProgress, MakerProgress, RecoveryState,
+    SerializableSecretKey, SwapRecord, SwapTracker, TaprootExchangeProgress,
 };
 
 use bitcoin::{
@@ -355,7 +355,8 @@ pub struct SwapSummary {
     /// maximum funding and sweep reimbursements, the taker's own funding,
     /// and any PaySwap settlement budget.
     pub total_estimated_fee: Amount,
-    /// Amount the taker receives if every cost reaches its ceiling.
+    /// Amount the taker receives if every cost reaches its ceiling. Zero on a
+    /// PaySwap: the receiver is paid `payment.amount` and nothing comes back.
     pub estimated_receive_amount: Amount,
     /// PaySwap cost breakdown; present only when a payment-address was set.
     pub payment: Option<PaymentQuote>,
@@ -772,21 +773,13 @@ impl Taker {
             }
 
             // Wallet-driven recovery: recover timelocked. Also takes the lock itself.
-            // The tracker answers per coin's swap; an unknown id stays kept.
-            let funding_shared = |coin_swap: Option<&str>| {
-                coin_swap.is_none_or(|id| {
-                    lock_debug!(self.swap_tracker.lock())
-                        .map(|tracker| tracker.legacy_proof_sent_for(id))
-                        .unwrap_or(true)
-                })
-            };
             match Wallet::recover_timelocked_swapcoins(
                 &self.wallet,
                 chain,
                 MIN_RELAY_FEE_RATE,
                 &crate::utill::NO_SHUTDOWN,
                 None,
-                &funding_shared,
+                &|coin_swap| funding_shared(&self.swap_tracker, coin_swap),
             ) {
                 Ok(ref recovered) if !recovered.is_empty() => {
                     log::info!(
@@ -1187,9 +1180,16 @@ impl Taker {
                 .ok_or_else(policy_err)?;
         }
 
-        let estimated_receive = send_amount
-            .checked_sub(Amount::from_sat(ceiling_sats))
-            .unwrap_or(Amount::ZERO);
+        // A PaySwap route is priced gross, so subtracting the ceiling here
+        // would leave a residual the taker never receives. Nothing returns to
+        // the taker: the receiver is paid and any surplus burns as miner fee.
+        let estimated_receive = if swap.payment.is_some() {
+            Amount::ZERO
+        } else {
+            send_amount
+                .checked_sub(Amount::from_sat(ceiling_sats))
+                .unwrap_or(Amount::ZERO)
+        };
 
         let summary = SwapSummary {
             swap_id,
@@ -2900,7 +2900,11 @@ impl Taker {
             })
             .collect();
 
-        let current_outpoints: HashSet<OutPoint> = all_regular_utxo
+        // Every category the wallet still holds, not just seed coins: a coin
+        // the taker swapped earlier rests as a swept or swap coin, and reading
+        // only seed coins would count it as spent by this swap.
+        let current_outpoints: HashSet<OutPoint> = wallet
+            .list_all_utxo_spend_info()
             .iter()
             .map(|(utxo, _)| OutPoint {
                 txid: utxo.txid,

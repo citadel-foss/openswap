@@ -10,12 +10,13 @@ use std::{
     convert::TryInto,
     fmt,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use bitcoin::{secp256k1::SecretKey, Txid};
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::common_messages::ProtocolVersion;
+use crate::{lock_debug, protocol::common_messages::ProtocolVersion};
 
 use super::error::TakerError;
 
@@ -413,6 +414,18 @@ struct SwapTrackerData {
 }
 
 /// Persistent swap tracker backed by a CBOR file with atomic writes.
+/// Whether a coin's funding is already in a maker's hands, so recovery must
+/// keep it rather than discard it. A coin with no swap id, or one the tracker
+/// no longer knows, counts as shared: recovery never drops money it cannot
+/// account for.
+pub(crate) fn funding_shared(tracker: &Arc<Mutex<SwapTracker>>, coin_swap: Option<&str>) -> bool {
+    coin_swap.is_none_or(|id| {
+        lock_debug!(tracker.lock())
+            .map(|tracker| tracker.legacy_proof_sent_for(id))
+            .unwrap_or(true)
+    })
+}
+
 pub struct SwapTracker {
     path: PathBuf,
     data: SwapTrackerData,
@@ -520,19 +533,14 @@ impl SwapTracker {
         self.data.swaps.get(swap_id)
     }
 
-    /// True when this swap already sent a ProofOfFunding: its funding txs are
-    /// in the maker's hands and can land on-chain at any time.
+    /// True when this swap already sent a ProofOfFunding to any maker: its
+    /// funding txs are in that maker's hands and can land on-chain at any time.
     pub(crate) fn legacy_proof_sent_for(&self, swap_id: &str) -> bool {
-        self.get_record(swap_id)
-            .is_some_and(Self::record_legacy_proof_sent)
-    }
-
-    /// One record's Legacy exposure: any maker was sent the ProofOfFunding.
-    fn record_legacy_proof_sent(record: &SwapRecord) -> bool {
-        record
-            .makers
-            .iter()
-            .any(|m| matches!(&m.exchange, ExchangeProgress::Legacy(l) if l.proof_of_funding_sent))
+        self.get_record(swap_id).is_some_and(|record| {
+            record.makers.iter().any(
+                |m| matches!(&m.exchange, ExchangeProgress::Legacy(l) if l.proof_of_funding_sent),
+            )
+        })
     }
 
     /// Get a mutable reference to a swap record by ID.

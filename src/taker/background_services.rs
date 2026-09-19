@@ -23,7 +23,9 @@ use crate::{
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
 
-use super::swap_tracker::{ContractOutcome, ContractResolution, RecoveryPhase, SwapTracker};
+use super::swap_tracker::{
+    funding_shared, ContractOutcome, ContractResolution, RecoveryPhase, SwapTracker,
+};
 
 /// Interval between recovery retry attempts.
 #[cfg(not(feature = "integration-test"))]
@@ -106,23 +108,13 @@ impl RecoveryLoop {
 
                     // Try timelock recovery (outgoing). Same deal — it manages the
                     // lock itself and never holds it across a confirmation wait.
-                    // Shared once this coin's swap sent its ProofOfFunding. A
-                    // swap the tracker no longer knows is already resolved, so
-                    // its coin is discardable.
-                    let funding_shared = |coin_swap: Option<&str>| {
-                        coin_swap.is_none_or(|id| {
-                            lock_debug!(swap_tracker.lock())
-                                .map(|tracker| tracker.legacy_proof_sent_for(id))
-                                .unwrap_or(true)
-                        })
-                    };
                     let outgoing_result = match Wallet::recover_timelocked_swapcoins(
                         &wallet,
                         &chain,
                         RECOVERY_FEE_RATE,
                         &shutdown_clone,
                         swap_scope.as_deref(),
-                        &funding_shared,
+                        &|coin_swap| funding_shared(&swap_tracker, coin_swap),
                     ) {
                         Ok(ref recovered) if !recovered.is_empty() => {
                             log::info!(

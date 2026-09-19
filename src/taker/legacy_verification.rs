@@ -54,10 +54,9 @@ impl Taker {
         }
     }
 
-    /// Require every maker funding tx to pay the agreed feerate, derived from
-    /// its prevouts and the builder's own convention (`spend_coins`: rate x
-    /// estimated vsize). Backend failure retries then aborts; a shortfall is
-    /// recorded as a proven violation.
+    /// Require every maker funding tx to pay the agreed feerate, priced from
+    /// its prevouts and the transaction's own vsize. Backend failure retries
+    /// then aborts; a shortfall is recorded as a proven violation.
     pub(crate) fn verify_maker_funding_feerate(
         &self,
         funding_txs: &[Transaction],

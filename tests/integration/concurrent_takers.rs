@@ -491,6 +491,13 @@ fn test_concurrent_admission_reservation_conflict() {
             Amount::ZERO,
             "Maker must hold no contract balance after both swaps settle"
         );
+        // The retry only proves the maker can serve again. A reservation that
+        // leaked on inputs the retry never needed would still let it through.
+        assert_eq!(
+            maker.live_reserved_inputs().unwrap(),
+            0,
+            "the rejected admission must leave no reserved input behind"
+        );
     }
 
     info!("Concurrent admission reservation conflict test completed successfully!");

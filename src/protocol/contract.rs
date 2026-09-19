@@ -934,7 +934,7 @@ mod test {
     }
 
     #[test]
-    fn test_contract_tx_dust_funding_output() {
+    fn contract_tx_rejects_funding_below_the_fee() {
         let contract_script = ScriptBuf::from(
             Vec::from_hex(
                 "827ca91414cdf8fe0b7b2db2bd976f27fb6f3cd5f9228633876321038cc778b555c3fe2b01d1b550a07\
@@ -948,18 +948,15 @@ mod test {
         .unwrap();
 
         // A funding output worth less than the fee must fail the swap, not
-        // panic the handler thread on the checked_sub.
-        let dust = Amount::from_sat(CONTRACT_TX_VSIZE);
-        for result in [
-            create_senders_contract_tx(spending_utxo, dust, &contract_script, 3.0),
-            create_receivers_contract_tx(spending_utxo, dust, &contract_script, 3.0),
-        ] {
-            if let ProtocolError::General(message) = result.unwrap_err() {
-                assert_eq!(message, "Funding output below contract tx fee");
-            } else {
-                panic!();
-            }
-        }
+        // panic the handler thread on the checked_sub. The sender entry point
+        // is covered by `sender_contract_rejects_dust_outputs`.
+        let below_fee = Amount::from_sat(CONTRACT_TX_VSIZE);
+        let error = create_receivers_contract_tx(spending_utxo, below_fee, &contract_script, 3.0)
+            .expect_err("a funding output below the fee must fail");
+        let ProtocolError::General(message) = error else {
+            panic!("expected a general protocol error, got {:?}", error);
+        };
+        assert_eq!(message, "Funding output below contract tx fee");
     }
 
     #[test]
