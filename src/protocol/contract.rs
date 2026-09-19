@@ -398,6 +398,10 @@ pub(crate) fn create_senders_contract_tx(
     contract_redeemscript: &ScriptBuf,
 ) -> Result<Transaction, ProtocolError> {
     let fee_amount = calculate_fee_sats(CONTRACT_TX_VSIZE);
+    let fee = Amount::from_sat(fee_amount);
+    let output_value = input_value.checked_sub(fee).ok_or(ProtocolError::General(
+        "Contract funding amount cannot cover mining fee",
+    ))?;
 
     Ok(Transaction {
         input: vec![TxIn {
@@ -408,7 +412,7 @@ pub(crate) fn create_senders_contract_tx(
         }],
         output: vec![TxOut {
             script_pubkey: redeemscript_to_scriptpubkey(contract_redeemscript)?,
-            value: input_value - Amount::from_sat(fee_amount),
+            value: output_value,
         }],
         lock_time: LockTime::ZERO,
         version: Version::TWO,
@@ -1377,6 +1381,37 @@ mod test {
         assert_eq!(
             sum_claimed_amounts(std::iter::repeat_n(Amount::MAX_MONEY, 10_000)),
             Err(Amount::MAX_MONEY)
+        );
+    }
+
+    #[test]
+    fn test_create_senders_contract_tx_insufficient_amount_fails() {
+        let dummy_op = OutPoint::null();
+        let script = ScriptBuf::new();
+
+        let fee_amount = calculate_fee_sats(CONTRACT_TX_VSIZE);
+        let insufficient_amount = Amount::from_sat(fee_amount.saturating_sub(1));
+        let res = create_senders_contract_tx(dummy_op, insufficient_amount, &script);
+        assert!(matches!(
+            res,
+            Err(ProtocolError::General(
+                "Contract funding amount cannot cover mining fee"
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_create_senders_contract_tx_exact_fee_deduction() {
+        let dummy_op = OutPoint::null();
+        let script = ScriptBuf::new();
+        let input_amount = Amount::from_sat(50_000);
+        let tx = create_senders_contract_tx(dummy_op, input_amount, &script).unwrap();
+
+        let fee_amount = calculate_fee_sats(CONTRACT_TX_VSIZE);
+        assert_eq!(tx.output.len(), 1);
+        assert_eq!(
+            tx.output[0].value,
+            input_amount - Amount::from_sat(fee_amount)
         );
     }
 }
