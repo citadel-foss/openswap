@@ -13,14 +13,12 @@ use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    sync::atomic::Ordering::Relaxed,
     thread,
     time::{Duration, Instant},
 };
@@ -41,22 +39,10 @@ fn taker_abort_1_legacy_corerpc() {
     let taker = takers.get_mut(0).unwrap();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the maker server threads
     log::info!("Initiating Maker servers");
@@ -75,14 +61,7 @@ fn taker_abort_1_legacy_corerpc() {
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     verify_maker_pre_swap_balances(&makers);
 
@@ -179,12 +158,12 @@ fn taker_abort_1_legacy_corerpc() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499076,
+        14499538,
         "Taker regular balance mismatch"
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        493687,
+        495997,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -207,7 +186,7 @@ fn taker_abort_1_legacy_corerpc() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        7237,
+        4465,
         "Taker spendable balance change mismatch"
     );
 
@@ -231,8 +210,8 @@ fn taker_abort_1_legacy_corerpc() {
             maker_balances.spendable,
         );
 
-        let expected_regular = [14500865u64, 14503103][i];
-        let expected_swap = [498200u64, 495925][i];
+        let expected_regular = [14500865u64, 14502398][i];
+        let expected_swap = [499100u64, 497530][i];
         assert_eq!(
             maker_balances.regular.to_sat(),
             expected_regular,
@@ -253,7 +232,7 @@ fn taker_abort_1_legacy_corerpc() {
         );
         assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
 
-        let expected_spendable = [14999065u64, 14999028][i];
+        let expected_spendable = [14999965u64, 14999928][i];
         assert_eq!(
             maker_balances.spendable.to_sat(),
             expected_spendable,
@@ -265,12 +244,7 @@ fn taker_abort_1_legacy_corerpc() {
     taker.log_tracker_state();
     info!("Abort1 test completed successfully!");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     tracker_logger.stop();
     test_framework.stop();
@@ -301,38 +275,13 @@ fn maker_recovers_swap_past_refund_deadline() {
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
+    let maker_threads = spawn_makers(&makers);
 
     wait_for_makers_setup(&makers, 120);
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
     generate_blocks(bitcoind, 1);
 
     // Legacy so the deadline is counted from the funding confirmation height the
@@ -348,7 +297,7 @@ fn maker_recovers_swap_past_refund_deadline() {
         "The swap must fail once the maker gives up on it"
     );
 
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
     test_framework.assert_log(
         "Test behavior: stalling 180s so the maker's refund deadline passes",
         &log_path,
@@ -358,14 +307,7 @@ fn maker_recovers_swap_past_refund_deadline() {
     test_framework.assert_log("reached its refund deadline; recovering now", &log_path);
     test_framework.assert_log("Recovering from swap", &log_path);
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
-    drop(takers);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    test_framework.finish(takers, block_generation_handle);
 }

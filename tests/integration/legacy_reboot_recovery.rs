@@ -17,7 +17,6 @@ use openswap::{
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
     utill::NO_SHUTDOWN,
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
@@ -46,20 +45,8 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
     info!("Starting Maker servers...");
     let maker_threads = makers
@@ -74,14 +61,7 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
 
     wait_for_makers_setup(&makers, 120);
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -126,12 +106,7 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
         before_incoming, before_outgoing
     );
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     drop(victim);
     drop(makers);
@@ -149,7 +124,7 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
     // Legacy has to broadcast each contract tx and wait for it to confirm before
     // it can sweep, so the swapcoins clear much later than in Taproot, where the
     // funding tx already is the contract tx.
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
     let deadline = Instant::now() + Duration::from_secs(300);
     while !std::fs::read_to_string(&log_path)
         .unwrap()
@@ -200,12 +175,12 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
     // swept incoming funds rather than only its own refunded funding.
     assert_eq!(
         maker_balances.regular.to_sat(),
-        14503103,
+        14502398,
         "Restarted maker regular balance mismatch"
     );
     assert_eq!(
         maker_balances.swap.to_sat(),
-        495925,
+        497530,
         "Restarted maker swap balance mismatch"
     );
     assert_eq!(
@@ -216,7 +191,7 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
     assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
     assert_eq!(
         maker_balances.spendable.to_sat(),
-        14999028,
+        14999928,
         "Restarted maker spendable balance mismatch"
     );
 

@@ -2,12 +2,12 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{error::TakerError, SwapParams, TakerBehavior},
     wallet::AddressType,
 };
-use std::{sync::atomic::Ordering::Relaxed, thread};
+use std::sync::atomic::Ordering::Relaxed;
 
 use super::test_framework::*;
 
@@ -22,13 +22,7 @@ fn maker_rejects_new_swaps_after_watcher_exit() {
     let bitcoind = &test_framework.bitcoind;
 
     let taker = &mut takers[0];
-    fund_taker(
-        taker,
-        bitcoind,
-        2,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_taker_default(taker, bitcoind, 2);
     fund_makers(
         &makers,
         bitcoind,
@@ -37,13 +31,7 @@ fn maker_rejects_new_swaps_after_watcher_exit() {
         AddressType::P2TR,
     );
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
+    let maker_threads = spawn_makers(&makers);
     wait_for_makers_setup(&makers, 120);
 
     let maker = &makers[0];
@@ -89,13 +77,7 @@ fn taker_refuses_swap_before_funding_after_watcher_exit() {
     let bitcoind = &test_framework.bitcoind;
     let taker = &mut takers[0];
 
-    fund_taker(
-        taker,
-        bitcoind,
-        2,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_taker_default(taker, bitcoind, 2);
     fund_makers(
         &makers,
         bitcoind,
@@ -104,13 +86,7 @@ fn taker_refuses_swap_before_funding_after_watcher_exit() {
         AddressType::P2TR,
     );
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
+    let maker_threads = spawn_makers(&makers);
     wait_for_makers_setup(&makers, 120);
 
     let summary = taker

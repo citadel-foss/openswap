@@ -20,14 +20,12 @@ use openswap::{
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, Taker, TakerBehavior},
     utill::NO_SHUTDOWN,
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    sync::atomic::Ordering::Relaxed,
     thread,
     time::{Duration, Instant},
 };
@@ -59,20 +57,8 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     // Owned, not borrowed: this taker gets dropped mid-test.
     let mut taker = takers.remove(0);
 
-    let taker_original_balance = fund_taker(
-        &taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(&taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
     info!("Starting Maker servers...");
     let maker_threads = makers
@@ -87,14 +73,7 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
 
     wait_for_makers_setup(&makers, 120);
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -152,12 +131,7 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     info!("Waiting for timelocks to mature...");
     thread::sleep(Duration::from_secs(300));
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     info!("Waiting for the restarted taker's recovery loop to finish...");
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -201,8 +175,8 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     // from real runs. A recovery that dropped the swapcoins without returning
     // the funds would still pass the zero-balance asserts, but not this one.
     let expected_diff = match protocol {
-        ProtocolVersion::Legacy => 7237,
-        ProtocolVersion::Taproot => 6367,
+        ProtocolVersion::Legacy => 4465,
+        ProtocolVersion::Taproot => 3802,
     };
     assert_eq!(
         balance_diff.to_sat(),
@@ -247,7 +221,7 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
 
     // If the cross-session lookup had come up empty, recover_active_swap would
     // have bailed with this instead of recovering.
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
     let log_contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         !log_contents.contains("No persisted swapcoins found for recovery"),

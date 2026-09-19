@@ -7,7 +7,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::start_server,
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
     wallet::AddressType,
@@ -32,48 +32,64 @@ fn test_concurrent_legacy_and_taproot_swaps() {
         TestFramework::init::<BitcoindBackend>(
             vec![(8002, Some(21001)), (18002, Some(21002))],
             vec![TakerBehavior::Normal, TakerBehavior::Normal],
-            vec![],
+            // Hold each maker's two admissions at the post-plan, pre-reservation
+            // boundary, so both plans provably form over the same pool view.
+            vec![
+                MakerBehavior::AdmissionRaceBarrier,
+                MakerBehavior::AdmissionRaceBarrier,
+            ],
         );
     let bitcoind = &test_framework.bitcoind;
 
     let taker_original_balances = takers
         .iter()
-        .map(|taker| {
-            fund_taker(
-                taker,
-                bitcoind,
-                3,
-                Amount::from_btc(0.05).unwrap(),
-                AddressType::P2TR,
-            )
-        })
+        .map(|taker| fund_taker_default(taker, bitcoind, 3))
         .collect::<Vec<_>>();
+    // Concurrent admissions plan over the same pool before either reserves,
+    // and identical needs plan onto identical coins — so the two plans must
+    // be disjoint by construction. Legacy splits (~167k) fit the 200k coins,
+    // taproot splits (~233k) need the 300k ones; the bond takes its exact
+    // UTXO and leaves no change in the pool.
     fund_makers(
         &makers,
         bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
+        1,
+        Amount::from_sat(5_000_243),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        3,
+        Amount::from_sat(200_000),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        3,
+        Amount::from_sat(300_000),
         AddressType::P2TR,
     );
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
+    let maker_threads = spawn_makers(&makers);
 
     wait_for_makers_setup(&makers, 120);
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
-    let maker_original_balances = verify_maker_pre_swap_balances(&makers);
+    sync_maker_wallets(&makers);
+    // Not verify_maker_pre_swap_balances: that helper pins the 4-UTXO funding
+    // shape, and this test needs more UTXOs for two concurrent frozen plans.
+    let maker_original_balances: Vec<Amount> = makers
+        .iter()
+        .map(|maker| {
+            maker
+                .wallet
+                .read()
+                .unwrap()
+                .get_balances()
+                .unwrap()
+                .spendable
+        })
+        .collect();
     generate_blocks(bitcoind, 1);
 
     let start = Arc::new(Barrier::new(2));
@@ -139,23 +155,42 @@ fn test_concurrent_legacy_and_taproot_swaps() {
         "Taproot swap should succeed while the makers also process a Legacy swap"
     );
 
-    let expected_taker_regular = [14_499_076, 14_299_076];
-    let expected_taker_swap = [494_587, 694_730];
-    let expected_taker_fees = [6_337, 6_194];
+    let expected_taker_regular = [14_499_538, 14_299_538];
+    let expected_taker_swap = [496_447, 696_704];
+    let expected_taker_fees = [4_015, 3_758];
+    let expected_maker_regular = [302_152, 305_139];
+    let expected_maker_swap = [1_199_214, 1_196_138];
+    let expected_maker_earnings = [1_366, 1_277];
 
-    for (i, (taker, original_balance)) in takers
+    // Sync and log every party before any assert, so one stale golden value
+    // does not hide the rest.
+    let taker_balances: Vec<_> = takers
         .iter()
-        .zip(taker_original_balances.iter())
-        .enumerate()
-    {
-        taker
-            .get_wallet()
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+        .map(|taker| {
+            taker
+                .get_wallet()
+                .write()
+                .unwrap()
+                .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+                .unwrap();
+            taker.get_wallet().read().unwrap().get_balances().unwrap()
+        })
+        .collect();
+    generate_blocks(bitcoind, 1);
+    let maker_balances: Vec<_> = makers
+        .iter()
+        .map(|maker| {
+            maker
+                .wallet
+                .write()
+                .unwrap()
+                .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+                .unwrap();
+            maker.wallet.read().unwrap().get_balances().unwrap()
+        })
+        .collect();
 
+    for (i, balances) in taker_balances.iter().enumerate() {
         info!(
             "Taker {} final balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
             i,
@@ -165,7 +200,32 @@ fn test_concurrent_legacy_and_taproot_swaps() {
             balances.fidelity,
             balances.spendable,
         );
+    }
+    for (i, (balances, original_balance)) in maker_balances
+        .iter()
+        .zip(maker_original_balances.iter())
+        .enumerate()
+    {
+        info!(
+            "Maker {} final balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
+            i,
+            balances.regular,
+            balances.swap,
+            balances.contract,
+            balances.fidelity,
+            balances.spendable,
+        );
+        info!(
+            "Maker {i} earnings: {}",
+            balances.spendable.to_sat() as i64 - original_balance.to_sat() as i64
+        );
+    }
 
+    for (i, (balances, original_balance)) in taker_balances
+        .iter()
+        .zip(taker_original_balances.iter())
+        .enumerate()
+    {
         assert_eq!(
             balances.regular.to_sat(),
             expected_taker_regular[i],
@@ -199,34 +259,11 @@ fn test_concurrent_legacy_and_taproot_swaps() {
         );
     }
 
-    generate_blocks(bitcoind, 1);
-    let expected_maker_regular = [13_802_266, 13_806_777];
-    let expected_maker_swap = [1_198_428, 1_193_828];
-    let expected_maker_earnings = [1_180, 1_091];
-
-    for (i, (maker, original_balance)) in makers
+    for (i, (balances, original_balance)) in maker_balances
         .iter()
         .zip(maker_original_balances.iter())
         .enumerate()
     {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
-
-        info!(
-            "Maker {} final balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i,
-            balances.regular,
-            balances.swap,
-            balances.contract,
-            balances.fidelity,
-            balances.spendable,
-        );
-
         assert_eq!(
             balances.regular.to_sat(),
             expected_maker_regular[i],
@@ -266,7 +303,5 @@ fn test_concurrent_legacy_and_taproot_swaps() {
     maker_threads
         .into_iter()
         .for_each(|handle| handle.join().unwrap());
-    drop(takers);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    test_framework.finish(takers, block_generation_handle);
 }

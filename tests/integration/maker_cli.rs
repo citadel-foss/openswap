@@ -14,7 +14,6 @@ use openswap::{
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
     utill::{read_message, send_message, NO_SHUTDOWN},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
@@ -66,20 +65,8 @@ fn test_maker_rpc_server() {
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
     info!("Starting Maker servers...");
     let maker_threads = makers
@@ -94,14 +81,7 @@ fn test_maker_rpc_server() {
 
     wait_for_makers_setup(&makers, 120);
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
 
@@ -128,14 +108,7 @@ fn test_maker_rpc_server() {
         .sync_and_save(&NO_SHUTDOWN)
         .unwrap();
     generate_blocks(bitcoind, 1);
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
     info!(
@@ -147,12 +120,12 @@ fn test_maker_rpc_server() {
     );
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499076,
+        14499538,
         "Taker regular balance mismatch"
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        494815,
+        496789,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -166,13 +139,13 @@ fn test_maker_rpc_server() {
             .checked_sub(taker_balances.spendable)
             .unwrap()
             .to_sat(),
-        6109,
+        3673,
         "Taker spendable balance change mismatch"
     );
 
-    let expected_regular = [14500865u64, 14503103];
-    let expected_swap = [499328u64, 497053];
-    let expected_fee = [679u64, 642];
+    let expected_regular = [14500751u64, 14502170];
+    let expected_swap = [499664u64, 498208];
+    let expected_fee = [658u64, 621];
     for (i, (maker, original)) in makers.iter().zip(&maker_spendable_balance).enumerate() {
         let balances = maker.wallet.read().unwrap().get_balances().unwrap();
         info!(
@@ -422,12 +395,7 @@ fn test_maker_rpc_server() {
     }
     info!("Maker 0 shut down via RPC Stop");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     info!("Maker RPC server test completed successfully!");
 

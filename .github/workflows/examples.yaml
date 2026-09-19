@@ -54,31 +54,9 @@ jobs:
           echo "BITCOIND_EXE=$RUNNER_TEMP/bitcoin-28.1/bin/bitcoind" >> "$GITHUB_ENV"
 
       - name: Start tor with a control port
-        run: |
-          sudo systemctl stop tor@default.service tor.service || true
-          mkdir -p /tmp/tor-examples
-          # Empty control password: `check_tor_status` sends AUTHENTICATE "" and
-          # the test helpers default OPENSWAP_TOR_PASSWORD to empty.
-          HASH="$(tor --hash-password '' | tail -n 1)"
-          cat <<EOF > /tmp/tor-examples/torrc
-          SocksPort 9050
-          ControlPort 9051
-          HashedControlPassword $HASH
-          DataDirectory /tmp/tor-examples/data
-          Log notice file /tmp/tor-examples/tor.log
-          EOF
-          tor -f /tmp/tor-examples/torrc &
-          echo "waiting for tor to bootstrap..."
-          for _ in $(seq 1 60); do
-            if grep -q "Bootstrapped 100%" /tmp/tor-examples/tor.log 2>/dev/null; then
-              echo "tor bootstrapped"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "tor failed to bootstrap within 300s" >&2
-          cat /tmp/tor-examples/tor.log 2>/dev/null || true
-          exit 1
+        uses: ./.github/actions/tor
+        with:
+          data-dir: /tmp/tor-examples
 
       - name: Run wallet example
         run: cargo run --example wallet_basic

@@ -3,7 +3,7 @@
 use bitcoin::{Amount, Network};
 use openswap::{
     blocklist::BlocklistError,
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{error::TakerError, SwapParams, TakerBehavior},
     wallet::AddressType,
@@ -101,13 +101,7 @@ fn run_disabled_blocklist(protocol: ProtocolVersion) {
         )
         .unwrap();
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
+    let maker_threads = spawn_makers(&makers);
     wait_for_makers_setup(&makers, 120);
     makers[0]
         .wallet
@@ -206,30 +200,11 @@ fn run_maker_rejection(protocol: ProtocolVersion) {
     assert_eq!(outcome.added, 1);
     assert_eq!(outcome.updated, 0);
 
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
+    let maker_threads = spawn_makers(&makers);
     wait_for_makers_setup(&makers, 120);
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
     let maker_spendable_before = verify_maker_pre_swap_balances(&makers);
 
     let params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
@@ -287,13 +262,7 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_taker_default(taker, bitcoind, 3);
 
     // Reuse one maker address for the initial deposits. Fidelity setup later
     // consolidates them into the regular UTXO used for swap funding.
@@ -328,13 +297,7 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
         Amount::from_btc(0.20).unwrap()
     );
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
+    let maker_threads = spawn_makers(&makers);
     wait_for_makers_setup(&makers, 120);
     makers[0]
         .wallet

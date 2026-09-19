@@ -134,31 +134,9 @@ jobs:
       # Ubuntu's tor package starts its own instance; stop it so ours owns the
       # ports and we control the control-port auth.
       - name: Start tor with a control port
-        run: |
-          sudo systemctl stop tor@default.service tor.service || true
-          mkdir -p /tmp/tor-it
-          # Empty control password: `check_tor_status` sends AUTHENTICATE "" and
-          # the test helpers default OPENSWAP_TOR_PASSWORD to empty.
-          HASH="$(tor --hash-password '' | tail -n 1)"
-          cat <<EOF > /tmp/tor-it/torrc
-          SocksPort 9050
-          ControlPort 9051
-          HashedControlPassword $HASH
-          DataDirectory /tmp/tor-it/data
-          Log notice file /tmp/tor-it/tor.log
-          EOF
-          tor -f /tmp/tor-it/torrc &
-          echo "waiting for tor to bootstrap..."
-          for _ in $(seq 1 60); do
-            if grep -q "Bootstrapped 100%" /tmp/tor-it/tor.log 2>/dev/null; then
-              echo "tor bootstrapped"
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "tor failed to bootstrap within 300s" >&2
-          cat /tmp/tor-it/tor.log 2>/dev/null || true
-          exit 1
+        uses: ./.github/actions/tor
+        with:
+          data-dir: /tmp/tor-it
 
       # `--retries 2` gives the test 3 attempts in a fresh process each time, which
       # is what absorbs Tor weather. Kept as a flag rather than a nextest profile

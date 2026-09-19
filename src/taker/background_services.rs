@@ -18,7 +18,7 @@ use bitcoin::{OutPoint, ScriptBuf, Txid};
 use crate::{
     lock_debug,
     taker::error::TakerError,
-    utill::HEART_BEAT_INTERVAL,
+    utill::{HEART_BEAT_INTERVAL, RECOVERY_FEE_RATE},
     wallet::{AnyBlockchain, Blockchain, RecoveryReport, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
@@ -46,11 +46,13 @@ impl RecoveryLoop {
     /// Spawn the background recovery thread.
     ///
     /// The `swap_tracker` is used to update per-contract resolution outcomes
-    /// as contracts are resolved in the background.
+    /// as contracts are resolved in the background. `swap_scope` restricts the
+    /// timelock pass to one swap's coins — the sharing state is per swap.
     pub(crate) fn start(
         wallet: Arc<RwLock<Wallet>>,
         swap_tracker: Arc<Mutex<SwapTracker>>,
         data_dir: PathBuf,
+        swap_scope: Option<String>,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let complete = Arc::new(AtomicBool::new(false));
@@ -85,7 +87,6 @@ impl RecoveryLoop {
                     let incoming_result = match Wallet::sweep_incoming_swapcoins(
                         &wallet,
                         &chain,
-                        2.0,
                         &shutdown_clone,
                         None,
                     ) {
@@ -105,11 +106,23 @@ impl RecoveryLoop {
 
                     // Try timelock recovery (outgoing). Same deal — it manages the
                     // lock itself and never holds it across a confirmation wait.
+                    // Shared once this coin's swap sent its ProofOfFunding. A
+                    // swap the tracker no longer knows is already resolved, so
+                    // its coin is discardable.
+                    let funding_shared = |coin_swap: Option<&str>| {
+                        coin_swap.is_none_or(|id| {
+                            lock_debug!(swap_tracker.lock())
+                                .map(|tracker| tracker.legacy_proof_sent_for(id))
+                                .unwrap_or(true)
+                        })
+                    };
                     let outgoing_result = match Wallet::recover_timelocked_swapcoins(
                         &wallet,
                         &chain,
-                        2.0,
+                        RECOVERY_FEE_RATE,
                         &shutdown_clone,
+                        swap_scope.as_deref(),
+                        &funding_shared,
                     ) {
                         Ok(ref recovered) if !recovered.is_empty() => {
                             log::info!(

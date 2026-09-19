@@ -9,13 +9,12 @@ use openswap::{
     maker::start_server,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::{sync::atomic::Ordering::Relaxed, thread};
+use std::thread;
 
 #[test]
 fn test_taproot_multi_maker_openswap() {
@@ -39,22 +38,10 @@ fn test_taproot_multi_maker_openswap() {
 
     // Fund the taker with 5 UTXOs of 0.05 BTC each (P2TR for Taproot)
     // Need more UTXOs for a 4-maker route
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        5,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 5);
 
     // Fund makers with 4 UTXOs of 0.05 BTC each
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
@@ -73,14 +60,7 @@ fn test_taproot_multi_maker_openswap() {
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup to ensure fidelity bonds are accounted for
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting end-to-end swap test with Taproot protocol and 4 makers...");
@@ -151,7 +131,7 @@ fn test_taproot_multi_maker_openswap() {
 
     assert_eq!(
         taker_balances_after.spendable.to_sat(),
-        24989231,
+        24993303,
         "Taker spendable balance mismatch"
     );
     assert_eq!(
@@ -160,12 +140,12 @@ fn test_taproot_multi_maker_openswap() {
         "Taker contract balance mismatch"
     );
     assert_eq!(taker_balances_after.fidelity, Amount::ZERO);
-    assert_eq!(balance_diff.to_sat(), 10769, "Taker fee paid mismatch");
+    assert_eq!(balance_diff.to_sat(), 6697, "Taker fee paid mismatch");
 
     // Verify all 4 makers earned fees
-    let expected_regular = [14500940, 14503252, 14505526, 14507763];
-    let expected_swap = [499328, 496978, 494666, 492392];
-    let expected_fees = [754, 716, 678, 641];
+    let expected_regular = [14500826, 14502320, 14503776, 14505194];
+    let expected_swap = [499664, 498133, 496639, 495183];
+    let expected_fees = [733, 696, 658, 620];
     for (i, (maker, original_spendable)) in makers.iter().zip(maker_spendable_balance).enumerate() {
         let wallet = maker.wallet.read().unwrap();
         let balances = wallet.get_balances().unwrap();
@@ -212,12 +192,7 @@ fn test_taproot_multi_maker_openswap() {
 
     info!("All multi-maker swap tests (Taproot, 4 makers) completed successfully!");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     test_framework.stop();
     block_generation_handle.join().unwrap();

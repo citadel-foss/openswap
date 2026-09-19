@@ -4,7 +4,7 @@ use clap::Parser;
 use openswap::{
     blocklist::BlocklistEntry,
     maker::{AuthenticatedRpcRequest, MakerError, RpcMsgReq, RpcMsgResp},
-    utill::{get_maker_dir, read_message, send_message, MIN_FEE_RATE},
+    utill::{get_maker_dir, is_unusable_fee_rate, read_message, send_message, MIN_RELAY_FEE_RATE},
 };
 
 /// A simple command line app to operate the makerd server.
@@ -58,7 +58,8 @@ enum Commands {
         /// Amount to send in sats
         #[arg(long, short = 'a')]
         amount: u64,
-        /// Feerate in sats/vByte. Defaults to 2 sats/vByte
+        /// Feerate in sats/vByte. Defaults to the 1 sats/vByte relay floor;
+        /// below-floor or non-finite values are rejected.
         #[arg(long, short = 'f')]
         feerate: Option<f64>,
     },
@@ -132,13 +133,23 @@ fn main() -> Result<(), MakerError> {
             amount,
             feerate,
         } => {
+            let feerate = match feerate {
+                // Below the relay floor the tx would not propagate.
+                Some(rate) if is_unusable_fee_rate(rate) => {
+                    return Err(MakerError::General(
+                        "feerate must be finite and at least the 1 sats/vB relay floor",
+                    ));
+                }
+                Some(rate) => rate,
+                None => MIN_RELAY_FEE_RATE,
+            };
             send_rpc_req(
                 stream,
                 &rpc_cookie,
                 RpcMsgReq::SendToAddress {
                     address,
                     amount,
-                    feerate: feerate.unwrap_or(MIN_FEE_RATE),
+                    feerate,
                 },
             )?;
         }

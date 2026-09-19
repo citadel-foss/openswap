@@ -10,7 +10,6 @@ use std::{
     convert::TryInto,
     fmt,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bitcoin::{secp256k1::SecretKey, Txid};
@@ -521,6 +520,21 @@ impl SwapTracker {
         self.data.swaps.get(swap_id)
     }
 
+    /// True when this swap already sent a ProofOfFunding: its funding txs are
+    /// in the maker's hands and can land on-chain at any time.
+    pub(crate) fn legacy_proof_sent_for(&self, swap_id: &str) -> bool {
+        self.get_record(swap_id)
+            .is_some_and(Self::record_legacy_proof_sent)
+    }
+
+    /// One record's Legacy exposure: any maker was sent the ProofOfFunding.
+    fn record_legacy_proof_sent(record: &SwapRecord) -> bool {
+        record
+            .makers
+            .iter()
+            .any(|m| matches!(&m.exchange, ExchangeProgress::Legacy(l) if l.proof_of_funding_sent))
+    }
+
     /// Get a mutable reference to a swap record by ID.
     pub fn get_record_mut(&mut self, swap_id: &str) -> Option<&mut SwapRecord> {
         self.data.swaps.get_mut(swap_id)
@@ -621,13 +635,7 @@ impl fmt::Display for SwapTracker {
     }
 }
 
-/// Current time as seconds since UNIX epoch.
-pub(crate) fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
+pub(crate) use crate::utill::now_secs;
 
 #[cfg(test)]
 mod tests {
@@ -663,6 +671,54 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let tracker = SwapTracker::load_or_create(dir.path()).unwrap();
         assert!(tracker.incomplete_swaps().is_empty());
+    }
+
+    #[test]
+    fn legacy_proof_sent_only_for_a_legacy_swap_with_pof() {
+        let dir = TempDir::new().unwrap();
+        let mut tracker = SwapTracker::load_or_create(dir.path()).unwrap();
+        assert!(!tracker.legacy_proof_sent_for("swap-missing"));
+
+        let legacy_maker = |proof_of_funding_sent: bool| MakerProgress {
+            address: String::new(),
+            negotiated: true,
+            exchange: ExchangeProgress::Legacy(LegacyExchangeProgress {
+                proof_of_funding_sent,
+                ..Default::default()
+            }),
+            finalization: FinalizationProgress::default(),
+        };
+
+        // Unsent proof: the funding is still ours alone.
+        let mut record = make_test_record("swap-unsent", SwapPhase::FundsBroadcast);
+        record.makers = vec![legacy_maker(false)];
+        tracker.save_record(&record).unwrap();
+        assert!(!tracker.legacy_proof_sent_for("swap-unsent"));
+
+        // A sent proof: the maker holds the funding and can broadcast it
+        // at any time.
+        let mut record = make_test_record("swap-sent", SwapPhase::FundsBroadcast);
+        record.makers = vec![legacy_maker(true)];
+        tracker.save_record(&record).unwrap();
+        assert!(tracker.legacy_proof_sent_for("swap-sent"));
+        assert!(!tracker.legacy_proof_sent_for("swap-unsent"));
+
+        // A sent proof stays sent once the swap completes, so the answer
+        // does not change. Taproot never sends one.
+        let mut record = make_test_record("swap-done", SwapPhase::Completed);
+        record.makers = vec![legacy_maker(true)];
+        tracker.save_record(&record).unwrap();
+        assert!(tracker.legacy_proof_sent_for("swap-done"));
+
+        let mut record = make_test_record("swap-taproot", SwapPhase::FundsBroadcast);
+        record.makers = vec![MakerProgress {
+            address: String::new(),
+            negotiated: true,
+            exchange: ExchangeProgress::Taproot(TaprootExchangeProgress::default()),
+            finalization: FinalizationProgress::default(),
+        }];
+        tracker.save_record(&record).unwrap();
+        assert!(!tracker.legacy_proof_sent_for("swap-taproot"));
     }
 
     #[test]

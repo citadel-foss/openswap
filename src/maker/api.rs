@@ -1,5 +1,7 @@
 //! Maker API for both Legacy (ECDSA) and Taproot (MuSig2) protocols.
 
+#[cfg(feature = "integration-test")]
+use std::net::TcpListener;
 use std::{
     collections::HashMap,
     convert::TryFrom,
@@ -14,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin::{bip32::ChainCode, Amount, Network, OutPoint, PublicKey, Transaction};
+use bitcoin::{bip32::ChainCode, Amount, Network, OutPoint, PublicKey, Transaction, Txid};
 
 use crate::{
     blocklist::AddressBlocklist,
@@ -22,14 +24,23 @@ use crate::{
     maker::nostr::NOSTR_RELAYS,
     protocol::common_messages::{FidelityProof, ProtocolVersion, SwapDetails},
     taker::api::REFUND_LOCKTIME_STEP,
-    utill::{get_maker_dir, parse_field, parse_toml, MIN_FEE_RATE, MIN_RELAY_FEE_RATE},
+    utill::{
+        funding_fee_policy_sats, get_maker_dir, parse_field, parse_toml, sweep_fee_policy_sats,
+        MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
+    },
     wallet::{
+        funding::{net_policy_fees, SplitPlan},
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FidelityError,
         RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::service::WatchService,
 };
+
+use crate::utill::UNFUNDED_SWAP_LIFETIME;
+
+#[cfg(feature = "integration-test")]
+use std::env;
 
 #[cfg(feature = "integration-test")]
 pub use super::handlers::MakerBehavior;
@@ -47,41 +58,90 @@ use super::{
 /// Minimum swap amount in satoshis.
 pub const MIN_SWAP_AMOUNT: u64 = 10_000;
 
+/// One source for the lifetime so the drain and the confirmation wait agree;
+/// tests override it through the env to skip the two-hour default.
+fn unfunded_swap_lifetime() -> Duration {
+    #[cfg(feature = "integration-test")]
+    {
+        env::var("OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(UNFUNDED_SWAP_LIFETIME)
+    }
+    #[cfg(not(feature = "integration-test"))]
+    {
+        UNFUNDED_SWAP_LIFETIME
+    }
+}
+
+/// The terms fixed by the taker's `SwapDetails` at negotiation, including the
+/// fee rate. Compared as one value on reconnect so no field can silently
+/// change between connections — a hand-written field list dropped the feerate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NegotiatedTerms {
+    swap_amount: Amount,
+    tx_count: u32,
+    incoming_count: u32,
+    max_input_budget: u32,
+    timelock: u32,
+    protocol: ProtocolVersion,
+    /// Locked duration declared at negotiation; kept so a fee recomputed on a
+    /// later message comes out the same.
+    refund_locktime_offset: u16,
+    /// The wire feerate as an f64; the u64-to-f64 conversion is exact for
+    /// every valid rate, so a plain `==` detects a changed rate.
+    swap_feerate: f64,
+}
+
+impl From<&ConnectionState> for NegotiatedTerms {
+    fn from(state: &ConnectionState) -> Self {
+        Self {
+            swap_amount: state.swap_amount,
+            tx_count: state.tx_count,
+            incoming_count: state.incoming_count,
+            max_input_budget: state.max_input_budget,
+            timelock: state.timelock,
+            protocol: state.protocol,
+            refund_locktime_offset: state.refund_locktime_offset,
+            swap_feerate: state.swap_feerate,
+        }
+    }
+}
+
 /// Swap state tracked per swap_id (persisted across connections).
 #[derive(Debug, Clone)]
 struct SwapState {
-    /// Swap amount.
-    swap_amount: Amount,
-    /// Number of contract transactions agreed at negotiation.
-    tx_count: u32,
-    /// Timelock value (Legacy: relative CSV, Taproot: absolute CLTV height).
-    timelock: u32,
-    /// Protocol version for this swap.
-    protocol: ProtocolVersion,
+    /// The negotiated terms, stored as one value so a replayed SwapDetails is
+    /// checked against the whole agreement.
+    negotiated: NegotiatedTerms,
     /// Current phase of the swap.
     phase: SwapPhase,
     /// Incoming swapcoins (we receive).
     incoming_swapcoins: Vec<IncomingSwapCoin>,
     /// Outgoing swapcoins (we send).
     outgoing_swapcoins: Vec<OutgoingSwapCoin>,
+    /// Incoming contract txids claimed at contract-data admission, before the
+    /// swapcoins exist. This is what makes a concurrent duplicate fail at
+    /// claim time instead of after both swaps funded the next hop.
+    claimed_incoming_txids: Vec<Txid>,
     /// Pending funding transactions (for Legacy protocol).
     /// Stored until signature exchange completes, then broadcast.
     pending_funding_txes: Vec<Transaction>,
-    /// Whether the funding transaction was actually broadcast to the network.
-    funding_broadcast: bool,
-    /// Contract fee rate for multi-hop swap creation.
-    contract_feerate: f64,
+    /// Funding txids broadcast so far, one per tx as the batch progresses. A
+    /// partial batch must not read as never broadcast, or recovery discards
+    /// recovery material for transactions already on-chain.
+    funding_broadcast_txids: Vec<Txid>,
     /// Maker service fee calculated from the accepted offer, excluding mining reimbursement.
     service_fee_sats: u64,
-    /// Reserved UTXOs for this swap (prevents concurrent double-spending).
-    reserve_utxo: Vec<OutPoint>,
+    /// The funding plan frozen at admission, netted of policy fees. Executed
+    /// as-is; a maker never re-plans a live swap. Its inputs sit in the
+    /// wallet's swap-keyed reservation map, the single owner of reservations.
+    funding_plan: Vec<SplitPlan>,
     /// Last activity timestamp.
     last_activity: Instant,
     /// Time when this swap was accepted by the maker.
     swap_start_time: Instant,
-    /// How many blocks the funds stay locked, fixed when the swap is accepted.
-    /// Persisted so a fee recomputed on a later message comes out the same.
-    refund_locktime_offset: u16,
     /// Height our incoming funding confirmed at. A Legacy refund deadline is counted
     /// from it, and it cannot be derived later once the swap has moved on.
     /// `None` until that confirmation is observed.
@@ -91,21 +151,26 @@ struct SwapState {
 impl Default for SwapState {
     fn default() -> Self {
         SwapState {
-            swap_amount: Amount::ZERO,
-            tx_count: 0,
-            timelock: 0,
-            protocol: ProtocolVersion::Legacy,
+            negotiated: NegotiatedTerms {
+                swap_amount: Amount::ZERO,
+                tx_count: 0,
+                incoming_count: 0,
+                max_input_budget: 0,
+                timelock: 0,
+                protocol: ProtocolVersion::Legacy,
+                refund_locktime_offset: 0,
+                swap_feerate: 0.0,
+            },
             phase: SwapPhase::AwaitingHello,
             incoming_swapcoins: Vec::new(),
             outgoing_swapcoins: Vec::new(),
+            claimed_incoming_txids: Vec::new(),
             pending_funding_txes: Vec::new(),
-            funding_broadcast: false,
-            contract_feerate: 0.0,
+            funding_broadcast_txids: Vec::new(),
             service_fee_sats: 0,
-            reserve_utxo: Vec::new(),
+            funding_plan: Vec::new(),
             last_activity: Instant::now(),
             swap_start_time: Instant::now(),
-            refund_locktime_offset: 0,
             funding_confirmation_height: None,
         }
     }
@@ -139,8 +204,8 @@ pub struct MakerServerConfig {
     /// Fidelity bond timelock in blocks.
     pub fidelity_timelock: u32,
     /// Fee rate in sats/vB for the fidelity bond transaction.
-    /// Defaults to `MIN_FEE_RATE`; may go lower, but never below
-    /// `MIN_RELAY_FEE_RATE`.
+    /// Defaults to `MIN_RELAY_FEE_RATE`, which is also the floor — lower
+    /// rates stop relaying.
     pub fidelity_feerate: f64,
     /// Bitcoin network.
     pub network: Network,
@@ -175,7 +240,7 @@ impl Default for MakerServerConfig {
             supported_protocols: vec![ProtocolVersion::Legacy, ProtocolVersion::Taproot],
             fidelity_amount: 10_000,   // 0.0001 BTC
             fidelity_timelock: 15_000, // ~6 months (MAX_FIDELITY_TIMELOCK)
-            fidelity_feerate: MIN_FEE_RATE,
+            fidelity_feerate: MIN_RELAY_FEE_RATE,
             network: Network::Regtest,
             backend: BackendConfig::CoreRpc(CoreRpcConfig::default()),
             // "maker" predates this branch; changing it would strand an upgrading
@@ -246,10 +311,9 @@ impl MakerServerConfig {
             config_map.get("fidelity_feerate"),
             default_config.fidelity_feerate,
         );
-        // The default is MIN_FEE_RATE, but an operator may go lower on
-        // purpose; the only hard floor is the relay minimum. Non-finite
-        // values (TOML allows `nan`/`inf`) bypass a `<` comparison, so they
-        // must be filtered out explicitly.
+        // Non-finite values (TOML allows `nan`/`inf`) bypass a `<` comparison,
+        // so they must be filtered out explicitly; rates below the relay floor
+        // would not propagate.
         let fidelity_feerate = if fidelity_feerate.is_finite()
             && fidelity_feerate >= MIN_RELAY_FEE_RATE
         {
@@ -487,7 +551,7 @@ pub struct ShutdownSignal {
 
 impl ShutdownSignal {
     /// Keeps construction private so both flags always start in the same state.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             requested: AtomicBool::new(false),
             backend: Arc::new(AtomicBool::new(false)),
@@ -552,6 +616,13 @@ pub struct MakerServer {
     /// Test-only behavior override.
     #[cfg(feature = "integration-test")]
     pub behavior: MakerBehavior,
+    /// Reserved by the framework at allocation; taken at server start so no
+    /// parallel test can snipe the port in between.
+    #[cfg(feature = "integration-test")]
+    pub reserved_network_listener: Mutex<Option<TcpListener>>,
+    /// Same handoff for the RPC port.
+    #[cfg(feature = "integration-test")]
+    pub reserved_rpc_listener: Mutex<Option<TcpListener>>,
 }
 
 /// Idle swap data returned by [`MakerServer::drain_idle_swaps`].
@@ -566,8 +637,8 @@ pub struct IdleSwapData {
     pub incoming_swapcoins: Vec<IncomingSwapCoin>,
     /// Outgoing swapcoins (maker sends).
     pub outgoing_swapcoins: Vec<OutgoingSwapCoin>,
-    /// Whether the funding transaction was actually broadcast.
-    pub funding_broadcast: bool,
+    /// Funding txids broadcast so far; carried into the tracker record.
+    pub funding_broadcast_txids: Vec<Txid>,
 }
 
 impl MakerServer {
@@ -656,6 +727,10 @@ impl MakerServer {
             nostr_relays,
             #[cfg(feature = "integration-test")]
             behavior: MakerBehavior::default(),
+            #[cfg(feature = "integration-test")]
+            reserved_network_listener: Mutex::new(None),
+            #[cfg(feature = "integration-test")]
+            reserved_rpc_listener: Mutex::new(None),
         })
     }
 
@@ -1046,26 +1121,42 @@ impl MakerServer {
 
         // An accepted swap with no funding material only reserves liquidity;
         // there is nothing on-chain to recover, so it is dropped without recovery.
-        let released_ids: Vec<String> = swaps
+        // Activity refreshes the idle timer, but the admission lifetime is a hard
+        // bound: keepalives cannot pin a reservation forever.
+        let lifetime = unfunded_swap_lifetime();
+        let released_ids: Vec<(String, bool)> = swaps
             .iter()
-            .filter(|(_, state)| {
-                state.phase == SwapPhase::AwaitingContractData
+            .filter_map(|(id, state)| {
+                let unfunded = state.phase == SwapPhase::AwaitingContractData
                     && state.incoming_swapcoins.is_empty()
                     && state.outgoing_swapcoins.is_empty()
                     && state.pending_funding_txes.is_empty()
-                    && !state.funding_broadcast
-                    && state.last_activity.elapsed() > timeout
+                    && state.funding_broadcast_txids.is_empty();
+                if !unfunded {
+                    return None;
+                }
+                let expired = state.swap_start_time.elapsed() > lifetime;
+                (expired || state.last_activity.elapsed() > timeout).then(|| (id.clone(), expired))
             })
-            .map(|(id, _)| id.clone())
             .collect();
 
-        for id in released_ids {
+        let mut unfunded_ids = Vec::new();
+        for (id, expired) in released_ids {
             swaps.remove(&id);
-            log::info!(
-                "[{}] Released idle unfunded reservation for swap {}",
-                self.config.network_port,
-                id
-            );
+            if expired {
+                log::warn!(
+                    "[{}] Released unfunded swap {} past its admission lifetime",
+                    self.config.network_port,
+                    id
+                );
+            } else {
+                log::info!(
+                    "[{}] Released idle unfunded reservation for swap {}",
+                    self.config.network_port,
+                    id
+                );
+            }
+            unfunded_ids.push(id);
         }
 
         // Carries why each swap was drained: an operator reading "dropped connection"
@@ -1078,8 +1169,8 @@ impl MakerServer {
                 }
                 let past_deadline = current_height.is_some_and(|height| {
                     past_refund_deadline(
-                        state.protocol,
-                        state.timelock,
+                        state.negotiated.protocol,
+                        state.negotiated.timelock,
                         state.funding_confirmation_height,
                         height,
                     )
@@ -1100,12 +1191,35 @@ impl MakerServer {
             if let Some(state) = swaps.remove(&id) {
                 idle.push(IdleSwapData {
                     swap_id: id,
-                    protocol: state.protocol,
-                    swap_amount_sat: state.swap_amount.to_sat(),
+                    protocol: state.negotiated.protocol,
+                    swap_amount_sat: state.negotiated.swap_amount.to_sat(),
                     incoming_swapcoins: state.incoming_swapcoins,
                     outgoing_swapcoins: state.outgoing_swapcoins,
-                    funding_broadcast: state.funding_broadcast,
+                    funding_broadcast_txids: state.funding_broadcast_txids,
                 });
+            }
+        }
+
+        drop(swaps);
+        // An unfunded drain never reached contract data, so this maker will
+        // never fund it and holding its inputs would strand the balance.
+        // A committed swap keeps them: funding may still land, so only age frees those.
+        {
+            let mut wallet = lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            let mut freed = false;
+            for id in &unfunded_ids {
+                freed |= wallet.release_swap_locks(id, None);
+            }
+            if wallet.expire_swap_locks() {
+                log::info!(
+                    "[{}] Released swap reservations past the grace",
+                    self.config.network_port
+                );
+                freed = true;
+            }
+            if freed {
+                wallet.save_to_disk().map_err(MakerError::Wallet)?;
             }
         }
 
@@ -1114,9 +1228,15 @@ impl MakerServer {
 
     /// Remove a completed swap's entry from `ongoing_swaps`.
     pub fn remove_swap_state(&self, swap_id: &str) -> Result<(), MakerError> {
-        let mut swaps =
-            lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
-        swaps.remove(swap_id);
+        lock_debug!(self.ongoing_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .remove(swap_id);
+        // The swap is over; any reservation it still holds ends with it.
+        let mut wallet = lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        if wallet.release_swap_locks(swap_id, None) {
+            wallet.save_to_disk().map_err(MakerError::Wallet)?;
+        }
         Ok(())
     }
 
@@ -1125,6 +1245,14 @@ impl MakerServer {
         Ok(!lock_debug!(self.ongoing_swaps.lock())
             .map_err(|_| MakerError::MutexPossion)?
             .is_empty())
+    }
+
+    /// Outpoints this maker still holds reserved for in-flight swaps.
+    #[cfg(feature = "integration-test")]
+    pub fn live_reserved_inputs(&self) -> Result<usize, MakerError> {
+        Ok(lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .live_reserved_inputs())
     }
 
     /// Whether this maker has an unfinished outgoing swapcoin for `swap_id`.
@@ -1144,6 +1272,187 @@ impl MakerServer {
             .map_err(|e| std::io::Error::other(format!("wallet lock poisoned: {e}")))?
             .verify_deniability(swap_id)
     }
+
+    /// Plan this hop's forwarding at admission, on the forwardable amount:
+    /// the declared amount minus the service fee and the sweep price of every
+    /// incoming contract. Failures map to a liquidity rejection so the taker
+    /// hears a refusal, not a dropped connection.
+    fn plan_admission(&self, state: &ConnectionState) -> Result<Vec<SplitPlan>, MakerError> {
+        let sweep_fee = sweep_fee_policy_sats(state.protocol, state.swap_feerate)
+            .and_then(|per_contract| per_contract.checked_mul(state.incoming_count as u64))
+            .ok_or(MakerError::General("Sweep fee arithmetic overflow"))?;
+        let forwardable = state
+            .swap_amount
+            .to_sat()
+            .checked_sub(state.service_fee_sats)
+            .and_then(|rest| rest.checked_sub(sweep_fee))
+            .ok_or(MakerError::General("Swap fees exceed the declared amount"))?;
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let mut plan = wallet
+            .plan_funding(
+                Amount::from_sat(forwardable),
+                state.tx_count,
+                state.swap_feerate,
+                state.max_input_budget,
+                Some(state.service_fee_sats),
+                None,
+                None,
+            )
+            .map_err(|e| {
+                log::warn!(
+                    "[{}] Rejecting swap at admission: cannot fund {} sats forwardable: {:?}",
+                    self.config.network_port,
+                    forwardable,
+                    e
+                );
+                match e {
+                    WalletError::InsufficientFund {
+                        available,
+                        required,
+                    } => MakerError::InsufficientLiquidity {
+                        available: Amount::from_sat(available),
+                        reserved: Amount::ZERO,
+                        requested: Amount::from_sat(required),
+                    },
+                    _ => MakerError::InsufficientLiquidity {
+                        available: Amount::ZERO,
+                        reserved: Amount::ZERO,
+                        requested: state.swap_amount,
+                    },
+                }
+            })?;
+        // Forwarding nets the taker-reimbursed fee out of each split; a split
+        // the netting pushes below the floor is a refusal, not a smaller swap.
+        net_policy_fees(&mut plan, state.max_input_budget, state.swap_feerate).map_err(|e| {
+            log::warn!(
+                "[{}] Rejecting swap at admission: policy netting failed: {:?}",
+                self.config.network_port,
+                e
+            );
+            MakerError::InsufficientLiquidity {
+                available: Amount::ZERO,
+                reserved: Amount::ZERO,
+                requested: state.swap_amount,
+            }
+        })?;
+        Ok(plan)
+    }
+
+    /// The funding plan frozen at admission. `amount` must equal the plan's
+    /// pre-netting total: the frozen values plus each split's policy fee,
+    /// derived from the plan shape at the negotiated rate. A missing or
+    /// mismatched plan is a protocol error — the maker never re-plans.
+    fn frozen_funding_plan(
+        &self,
+        swap_id: &str,
+        amount: Amount,
+    ) -> Result<Vec<SplitPlan>, MakerError> {
+        let swaps = lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        let state = swaps
+            .get(swap_id)
+            .filter(|state| !state.funding_plan.is_empty())
+            .ok_or(MakerError::General("No frozen funding plan for this swap"))?;
+        let mut gross = 0u64;
+        for split in &state.funding_plan {
+            let policy_fee = funding_fee_policy_sats(
+                split.utxos.len(),
+                state.negotiated.max_input_budget,
+                state.negotiated.swap_feerate,
+            )
+            .ok_or(MakerError::General("Funding fee arithmetic overflow"))?;
+            gross = gross
+                .checked_add(policy_fee)
+                .and_then(|total| total.checked_add(split.value.to_sat()))
+                .ok_or(MakerError::General("Funding plan total overflow"))?;
+        }
+        if gross != amount.to_sat() {
+            return Err(MakerError::General(
+                "Requested amount does not match the frozen funding plan",
+            ));
+        }
+        Ok(state.funding_plan.clone())
+    }
+
+    /// Build and sign one funding tx per split of an already-frozen plan.
+    /// A failure here is before any broadcast, so the whole reservation is
+    /// released rather than left half-spent.
+    fn execute_frozen_plan(
+        &self,
+        swap_id: &str,
+        plan: &[SplitPlan],
+        addresses: &[bitcoin::Address],
+        feerate: f64,
+    ) -> Result<(Vec<Transaction>, Vec<u32>, u64), MakerError> {
+        // Malice hook: build every split at the relay floor while the taker
+        // reimburses the negotiated rate; its real-fee check must catch the
+        // shortfall.
+        #[cfg(feature = "integration-test")]
+        let feerate = if self.behavior() == MakerBehavior::UnderpayFundingFee {
+            MIN_RELAY_FEE_RATE
+        } else {
+            feerate
+        };
+
+        let mut funding_txes = Vec::with_capacity(plan.len());
+        let mut payment_output_positions = Vec::with_capacity(plan.len());
+        let mut total_miner_fee = 0u64;
+        // One wallet lock per split, not per batch: holding it across one
+        // RPC-and-sign per split stalls every other connection.
+        for (split, address) in plan.iter().zip(addresses.iter()) {
+            let executed = {
+                let mut wallet = lock_debug!(self.wallet.write())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                wallet.execute_funding_plan(
+                    std::slice::from_ref(split),
+                    std::slice::from_ref(address),
+                    feerate,
+                )
+            };
+            match executed {
+                Ok(result) => {
+                    total_miner_fee += result.total_miner_fee;
+                    funding_txes.extend(result.funding_txes);
+                    payment_output_positions.extend(result.payment_output_positions);
+                }
+                Err(e) => {
+                    if let Ok(mut wallet) = lock_debug!(self.wallet.write()) {
+                        // Persist it: `swap_locks` is restored from disk, so an
+                        // unsaved release comes back as a stale reservation.
+                        if wallet.release_swap_locks(swap_id, None) {
+                            let _ = wallet.save_to_disk();
+                        }
+                    }
+                    return Err(MakerError::Wallet(e));
+                }
+            }
+        }
+        Ok((funding_txes, payment_output_positions, total_miner_fee))
+    }
+}
+
+/// True when a swap other than `except_swap_id` already holds one of `txids`,
+/// whether it claimed them up front or carries them on a live swapcoin.
+fn live_swap_holds(
+    swaps: &HashMap<String, SwapState>,
+    except_swap_id: &str,
+    txids: &[Txid],
+) -> bool {
+    swaps.iter().any(|(id, state)| {
+        id.as_str() != except_swap_id
+            && (state
+                .claimed_incoming_txids
+                .iter()
+                .any(|claimed| txids.contains(claimed))
+                || state
+                    .incoming_swapcoins
+                    .iter()
+                    .any(|sc| txids.contains(&sc.contract_tx.compute_txid()))
+                || state
+                    .outgoing_swapcoins
+                    .iter()
+                    .any(|sc| txids.contains(&sc.contract_tx.compute_txid())))
+    })
 }
 
 impl MakerTrait for MakerServer {
@@ -1186,6 +1495,35 @@ impl MakerTrait for MakerServer {
 
         let config = self.get_config();
 
+        // Zero knobs are meaningless: no splits to build, no inputs to price.
+        if details.tx_count == 0 {
+            return Err(MakerError::General("Transaction count must be non-zero"));
+        }
+        if details.max_input_budget == 0 {
+            return Err(MakerError::General("Input budget must be non-zero"));
+        }
+        // These counts drive peer-controlled allocation and keygen downstream.
+        if details.tx_count > MAX_TX_COUNT {
+            return Err(MakerError::General(
+                "Transaction count above the protocol maximum",
+            ));
+        }
+        if details.max_input_budget > MAX_TX_COUNT {
+            return Err(MakerError::General(
+                "Input budget above the protocol maximum",
+            ));
+        }
+        // The declared incoming count is exact and drives the sweep-fee math.
+        if details.incoming_count == 0 || details.incoming_count > MAX_TX_COUNT {
+            return Err(MakerError::General(
+                "Incoming count outside the protocol bounds",
+            ));
+        }
+        // Below the relay floor none of the swap's transactions propagate.
+        if details.feerate < MIN_RELAY_FEE_RATE as u64 {
+            return Err(MakerError::General("Swap feerate below the relay floor"));
+        }
+
         // Check amount is within bounds
         let amount_sat = details.amount.to_sat();
         if amount_sat < config.min_swap_amount {
@@ -1202,18 +1540,6 @@ impl MakerTrait for MakerServer {
             .contains(&details.protocol_version)
         {
             return Err(MakerError::General("Protocol version not supported"));
-        }
-
-        // Check maker has enough liquidity to fund the outgoing swap
-        if let Ok(wallet) = lock_debug!(self.wallet.read()) {
-            if let Ok(balances) = wallet.get_balances() {
-                let swap_liquidity = balances.regular + balances.swap;
-                if swap_liquidity < details.amount {
-                    return Err(MakerError::General(
-                        "Not enough liquidity for this swap amount",
-                    ));
-                }
-            }
         }
 
         // Check timelock bounds and work out how long the funds stay locked.
@@ -1283,38 +1609,39 @@ impl MakerTrait for MakerServer {
         self.watch_service.is_alive()
     }
 
-    fn create_funding_transaction(
+    fn create_funding_transactions(
         &self,
+        swap_id: &str,
         amount: Amount,
-        address: bitcoin::Address,
-        excluded_outpoints: Option<Vec<OutPoint>>,
-    ) -> Result<(Transaction, u32), MakerError> {
-        let mut wallet = lock_debug!(self.wallet.write())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        addresses: &[bitcoin::Address],
+        feerate: f64,
+    ) -> Result<(Vec<Transaction>, Vec<u32>), MakerError> {
+        let plan = self.frozen_funding_plan(swap_id, amount)?;
 
-        let result = wallet
-            .create_funding_txes(
-                amount,
-                &[address],
-                crate::utill::MIN_FEE_RATE,
-                None,
-                excluded_outpoints,
-            )
-            .map_err(MakerError::Wallet)?;
+        // Malice hooks: tamper with the frozen plan's values after
+        // verification, so the taker's exact checks are what catch it.
+        #[cfg(feature = "integration-test")]
+        let plan = match self.behavior() {
+            MakerBehavior::FeeSkimming => {
+                let mut skimmed = plan;
+                skimmed[0].value = Amount::from_sat(skimmed[0].value.to_sat() - 1);
+                skimmed
+            }
+            MakerBehavior::UnderfundTaprootContract => {
+                // Keep the reported shape; fund only 10_000 sats in total.
+                let mut underfunded = plan;
+                let per_split = Amount::from_sat(10_000 / underfunded.len() as u64);
+                for split in &mut underfunded {
+                    split.value = per_split;
+                }
+                underfunded
+            }
+            _ => plan,
+        };
 
-        // Return the first (and only) funding tx and its output position
-        let tx = result
-            .funding_txes
-            .into_iter()
-            .next()
-            .ok_or(MakerError::General("No funding tx created"))?;
-        let output_position = result
-            .payment_output_positions
-            .first()
-            .copied()
-            .unwrap_or(0);
-
-        Ok((tx, output_position))
+        let (funding_txes, payment_output_positions, _) =
+            self.execute_frozen_plan(swap_id, &plan, addresses, feerate)?;
+        Ok((funding_txes, payment_output_positions))
     }
 
     fn get_current_height(&self) -> Result<u32, MakerError> {
@@ -1329,31 +1656,47 @@ impl MakerTrait for MakerServer {
 
     /// Waits on a fresh backend connection so no wallet lock is held for the
     /// wait's duration; the shared wait bounds arrival and confirmation.
-    fn wait_for_tx_on_chain(
+    fn wait_for_txs_on_chain(
         &self,
-        txid: &bitcoin::Txid,
+        swap_id: &str,
+        txids: &[bitcoin::Txid],
         required_confirms: u32,
     ) -> Result<(), MakerError> {
         let required_confirms = required_confirms.max(crate::utill::MIN_REQUIRED_CONFIRM);
 
         log::info!(
-            "[{}] Waiting for {} confirmation(s) on tx {}",
+            "[{}] Waiting for {} confirmation(s) on tx batch of {}",
             self.config.network_port,
             required_confirms,
-            txid
+            txids.len()
         );
         let chain = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
             .blockchain
             .new_connection()
             .map_err(MakerError::Wallet)?;
+        // The wait can outlast the idle-drain timeout, so the per-poll hook
+        // refreshes this swap's stored activity: a live handler never drains.
+        // The admission lifetime stays a hard bound though: once it fires (or
+        // the drain already reaped the state) the wait must stop instead of
+        // holding the funding plan past the lifetime.
+        let lifetime = unfunded_swap_lifetime();
+        let keep_alive = || {
+            if let Ok(mut swaps) = lock_debug!(self.ongoing_swaps.lock()) {
+                if let Some(state) = swaps.get_mut(swap_id) {
+                    state.last_activity = Instant::now();
+                    return state.swap_start_time.elapsed() > lifetime;
+                }
+            }
+            true
+        };
         crate::wallet::wait_for_tx_confirmation(
             &chain,
-            &[*txid],
+            txids,
             required_confirms,
             crate::utill::TX_BROADCAST_TIMEOUT,
             Some(&self.shutdown),
-            None,
+            Some(&keep_alive),
         )
         .map_err(MakerError::Wallet)?;
         Ok(())
@@ -1377,10 +1720,116 @@ impl MakerTrait for MakerServer {
             .map_err(MakerError::Blocklist)
     }
 
-    fn is_transaction_known(&self, txid: &bitcoin::Txid) -> bool {
-        lock_debug!(self.wallet.read())
-            .map(|wallet| wallet.blockchain.get_raw_transaction(txid, None).is_ok())
-            .unwrap_or(false)
+    fn is_transaction_known(&self, txid: &Txid) -> Result<bool, MakerError> {
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // A failed query must surface as an error, never as "not known".
+        Ok(!wallet
+            .blockchain
+            .is_tx_unknown(txid)
+            .map_err(MakerError::Wallet)?)
+    }
+
+    fn record_funding_broadcast(&self, swap_id: &str, txid: &Txid) -> Result<(), MakerError> {
+        let mut swaps =
+            lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        let state = swaps
+            .get_mut(swap_id)
+            .ok_or(MakerError::General("No stored state for this swap"))?;
+        // Reconnects re-run the broadcast loop; one entry per txid, not per send.
+        if !state.funding_broadcast_txids.contains(txid) {
+            state.funding_broadcast_txids.push(*txid);
+        }
+        // Each proved send is activity: a long batch must not read as idle.
+        state.last_activity = Instant::now();
+        // Broadcast accepted is a proved outcome, so this tx's reserved inputs
+        // are released. Legacy keeps its funding txs in `pending_funding_txes`
+        // until the batch is sent; Taproot's contract tx is the funding tx.
+        let funding_tx = match state.negotiated.protocol {
+            ProtocolVersion::Legacy => state
+                .pending_funding_txes
+                .iter()
+                .find(|tx| tx.compute_txid() == *txid),
+            ProtocolVersion::Taproot => state
+                .outgoing_swapcoins
+                .iter()
+                .map(|sc| &sc.contract_tx)
+                .find(|tx| tx.compute_txid() == *txid),
+        };
+        let spent_inputs: Vec<OutPoint> = funding_tx
+            .map(|tx| tx.input.iter().map(|i| i.previous_output).collect())
+            .unwrap_or_default();
+        drop(swaps);
+        if !spent_inputs.is_empty() {
+            let mut wallet = lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            if wallet.release_swap_locks(swap_id, Some(&spent_inputs)) {
+                wallet.save_to_disk().map_err(MakerError::Wallet)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn contract_output_unspent(&self, outpoint: &OutPoint) -> Result<bool, MakerError> {
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        Ok(wallet
+            .blockchain
+            .get_tx_out(&outpoint.txid, outpoint.vout, None)
+            .map_err(MakerError::Wallet)?
+            .is_some())
+    }
+
+    fn contract_txid_seen(&self, txid: &Txid, except_swap_id: &str) -> Result<bool, MakerError> {
+        let swaps = lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        let live_hit = live_swap_holds(&swaps, except_swap_id, &[*txid]);
+        drop(swaps);
+        if live_hit {
+            return Ok(true);
+        }
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // A reconnecting taker replays this swap's own persisted contracts;
+        // only another swap's swapcoin makes the txid a replay.
+        let txid_string = txid.to_string();
+        if let Some(swapcoin) = wallet.find_incoming_swapcoin(&txid_string) {
+            return Ok(swapcoin.swap_id.as_deref() != Some(except_swap_id));
+        }
+        if wallet
+            .outgoing_keys_for_swap(except_swap_id)
+            .contains(&txid_string)
+        {
+            return Ok(false);
+        }
+        Ok(wallet
+            .outgoing_contract_outpoints()
+            .into_iter()
+            .any(|(outpoint, _)| outpoint.txid == *txid))
+    }
+
+    fn claim_incoming_contract_txids(
+        &self,
+        swap_id: &str,
+        txids: &[Txid],
+    ) -> Result<(), MakerError> {
+        let mut swaps =
+            lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        let claimed_elsewhere = live_swap_holds(&swaps, swap_id, txids);
+        if claimed_elsewhere {
+            return Err(MakerError::General("Contract txid already in use"));
+        }
+        let state = swaps
+            .get_mut(swap_id)
+            .ok_or(MakerError::General("No stored state for this swap"))?;
+        // A retry re-sends the same contracts. A different list would drop the
+        // first claim while its handler still holds those contracts, freeing
+        // them for another swap to claim.
+        if !state.claimed_incoming_txids.is_empty() && state.claimed_incoming_txids != txids {
+            return Err(MakerError::General("Contract txids differ from the claim"));
+        }
+        state.claimed_incoming_txids = txids.to_vec();
+        state.last_activity = Instant::now();
+        Ok(())
     }
 
     fn save_incoming_swapcoin(
@@ -1469,7 +1918,6 @@ impl MakerTrait for MakerServer {
         let sweep_outcome = Wallet::sweep_incoming_swapcoins(
             &self.wallet,
             &chain,
-            MIN_FEE_RATE,
             &self.shutdown,
             Some(&contract_txids),
         )
@@ -1502,72 +1950,168 @@ impl MakerTrait for MakerServer {
         state: &ConnectionState,
         admission: bool,
     ) -> Result<(), MakerError> {
-        // Fetch the balance before taking the swaps lock: reading the wallet
-        // under it would stall every handler thread behind a mid-sync writer.
-        let swap_liquidity = if admission {
-            let balances = lock_debug!(self.wallet.read())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .get_balances()
-                .map_err(MakerError::Wallet)?;
-            Some(balances.regular + balances.swap)
+        // Plan before taking the swaps lock for the write: the pool snapshot,
+        // the planner's sort and the policy netting are the expensive part, and
+        // the wallet read lock is shared. Cheap rejections come first: a fresh
+        // swap id costs the sender nothing, so the cap is enforced before any
+        // planning runs.
+        let planned = if admission {
+            let known = lock_debug!(self.ongoing_swaps.lock())?.contains_key(swap_id);
+            if known {
+                None
+            } else {
+                // After a restart `ongoing_swaps` is empty, so a replayed
+                // SwapDetails for a swap still open on disk would re-admit and
+                // double-fund it. The open swap is recovered, never re-admitted.
+                let tracked_open = lock_debug!(self.swap_tracker.lock())?
+                    .incomplete_swaps()
+                    .iter()
+                    .any(|record| record.swap_id == swap_id);
+                let (unfinished_incoming, unfinished_outgoing) = lock_debug!(self.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                    .find_unfinished_swapcoins();
+                let persisted_open = unfinished_incoming
+                    .iter()
+                    .any(|sc| sc.swap_id.as_deref() == Some(swap_id))
+                    || unfinished_outgoing
+                        .iter()
+                        .any(|sc| sc.swap_id.as_deref() == Some(swap_id));
+                if tracked_open || persisted_open {
+                    log::warn!(
+                        "[{}] Rejecting SwapDetails for {}: swap id belongs to an unfinished swap on disk",
+                        self.config.network_port,
+                        swap_id,
+                    );
+                    return Err(MakerError::General("Swap id belongs to an unfinished swap"));
+                }
+                let active_swaps = lock_debug!(self.ongoing_swaps.lock())?
+                    .values()
+                    .filter(|state| state.phase != SwapPhase::Completed)
+                    .count();
+                if active_swaps >= MAX_CONCURRENT_SWAPS {
+                    log::warn!(
+                        "[{}] Rejecting swap {}: {} active swaps at the {} cap",
+                        self.config.network_port,
+                        swap_id,
+                        active_swaps,
+                        MAX_CONCURRENT_SWAPS
+                    );
+                    return Err(MakerError::TooManySwaps);
+                }
+                Some(self.plan_admission(state)?)
+            }
         } else {
             None
         };
 
-        let mut swaps = lock_debug!(self.ongoing_swaps.lock())?;
-        let is_new = !swaps.contains_key(swap_id);
-        if let Some(swap_liquidity) = swap_liquidity.filter(|_| is_new) {
-            let active_swaps = swaps
-                .values()
-                .filter(|state| state.phase != SwapPhase::Completed)
-                .count();
-            if active_swaps >= MAX_CONCURRENT_SWAPS {
-                log::warn!(
-                    "[{}] Rejecting swap {}: {} active swaps at the {} cap",
-                    self.config.network_port,
-                    swap_id,
-                    active_swaps,
-                    MAX_CONCURRENT_SWAPS
-                );
-                return Err(MakerError::TooManySwaps);
+        // Reserve and persist before the swap is published. Once it appears in
+        // `ongoing_swaps` another connection can be accepted onto it and reach
+        // funding, so the admission it acts on must already be on disk.
+        let reserved_inputs: Vec<OutPoint> = planned
+            .iter()
+            .flatten()
+            .flat_map(|split| split.utxos.iter().copied())
+            .collect();
+        if planned.is_some() {
+            let inputs = &reserved_inputs;
+            // Two racing admissions both reach this barrier with their plans
+            // in hand; only then may either reserve, so the conflict check
+            // below is what actually loses one of them. Later admissions
+            // (a retry after the race) pass straight through.
+            #[cfg(feature = "integration-test")]
+            if self.behavior() == MakerBehavior::AdmissionRaceBarrier {
+                // Per maker port: a two-maker route must pair each maker's own
+                // requests, never one maker's request with the other's.
+                type RaceBarriers = std::sync::Mutex<
+                    std::collections::HashMap<u16, (Arc<std::sync::Barrier>, usize)>,
+                >;
+                static RACE_BARRIERS: std::sync::LazyLock<RaceBarriers> =
+                    std::sync::LazyLock::new(|| {
+                        std::sync::Mutex::new(std::collections::HashMap::new())
+                    });
+                let barrier = {
+                    let mut map = RACE_BARRIERS.lock().unwrap();
+                    let (barrier, arrivals) = map
+                        .entry(self.config.network_port)
+                        .or_insert_with(|| (Arc::new(std::sync::Barrier::new(2)), 0));
+                    *arrivals += 1;
+                    (*arrivals <= 2).then(|| barrier.clone())
+                };
+                if let Some(barrier) = barrier {
+                    log::info!(
+                        "[{}] Test behavior: admission waiting at the reservation barrier",
+                        self.config.network_port
+                    );
+                    barrier.wait();
+                }
             }
-
-            let reserved_liquidity = swaps
-                .values()
-                .filter(|state| state.phase != SwapPhase::Completed)
-                .fold(Amount::ZERO, |total, state| total + state.swap_amount);
-            let required_liquidity = reserved_liquidity + state.swap_amount;
-
-            if swap_liquidity < required_liquidity {
+            // Planning ran outside this lock, so a concurrent admission may
+            // have claimed an input since. Reserve only a conflict-free plan.
+            let mut wallet = lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            if inputs.iter().any(|input| wallet.is_swap_reserved(input)) {
                 log::warn!(
-                    "[{}] Rejecting swap {}: available liquidity {}, active reservations {}, requested {}",
+                    "[{}] Rejecting swap {}: a concurrent admission claimed a planned input",
                     self.config.network_port,
                     swap_id,
-                    swap_liquidity,
-                    reserved_liquidity,
-                    state.swap_amount,
                 );
                 return Err(MakerError::InsufficientLiquidity {
-                    available: swap_liquidity,
-                    reserved: reserved_liquidity,
+                    available: Amount::ZERO,
+                    reserved: Amount::ZERO,
                     requested: state.swap_amount,
                 });
             }
+            wallet.reserve_swap_locks(swap_id, inputs);
+            if let Err(e) = wallet.save_to_disk() {
+                // A concurrent admission under the same id shares the entry —
+                // roll back only our own inputs, never its persisted ones.
+                wallet.release_swap_locks(swap_id, Some(inputs));
+                // The failed save may already have renamed the reservation
+                // onto disk, so the rollback has to reach it too or a restart
+                // brings the reservation back.
+                if let Err(rollback) = wallet.save_to_disk() {
+                    log::error!(
+                        "[{}] Could not persist the reservation rollback for swap {}: {:?}",
+                        self.config.network_port,
+                        swap_id,
+                        rollback
+                    );
+                }
+                log::error!(
+                    "[{}] Could not persist the reservation for swap {}: {:?}; refusing admission",
+                    self.config.network_port,
+                    swap_id,
+                    e
+                );
+                return Err(MakerError::Wallet(e));
+            }
         }
+
+        let mut swaps = lock_debug!(self.ongoing_swaps.lock())?;
 
         // A resent SwapDetails for a live swap is a reconnect after a dropped
         // connection: identical parameters just refresh the idle timer, while
         // different ones must never overwrite the stored swap.
-        if admission && !is_new {
+        if admission && swaps.contains_key(swap_id) {
             let swap_state = swaps
                 .get_mut(swap_id)
-                .expect("entry exists under this lock when !is_new");
-            if swap_state.swap_amount != state.swap_amount
-                || swap_state.tx_count != state.tx_count
-                || swap_state.timelock != state.timelock
-                || swap_state.protocol != state.protocol
-                || swap_state.refund_locktime_offset != state.refund_locktime_offset
-            {
+                .expect("entry exists under this lock");
+            let mismatched = swap_state.negotiated != NegotiatedTerms::from(state);
+            if !mismatched {
+                swap_state.last_activity = Instant::now();
+            }
+            drop(swaps);
+            // Another connection published this swap while we planned, so the plan
+            // we just reserved is never funded. Hand back exactly our own inputs:
+            // the conflict check above proves they are disjoint from the winner's.
+            if !reserved_inputs.is_empty() {
+                let mut wallet = lock_debug!(self.wallet.write())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                if wallet.release_swap_locks(swap_id, Some(&reserved_inputs)) {
+                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                }
+            }
+            if mismatched {
                 log::warn!(
                     "[{}] Rejecting duplicate SwapDetails for {}: parameters differ from stored swap",
                     self.config.network_port,
@@ -1575,43 +2119,72 @@ impl MakerTrait for MakerServer {
                 );
                 return Err(MakerError::SwapParamMismatch);
             }
-            swap_state.last_activity = Instant::now();
             return Ok(());
+        }
+
+        // The cap read before planning is only a cheap early reject: planning
+        // runs unlocked, so racing admissions with distinct ids can all clear
+        // it. Only a re-check under the guard that inserts actually binds.
+        if planned.is_some()
+            && swaps
+                .values()
+                .filter(|state| state.phase != SwapPhase::Completed)
+                .count()
+                >= MAX_CONCURRENT_SWAPS
+        {
+            drop(swaps);
+            log::warn!(
+                "[{}] Rejecting swap {}: the {} cap filled while we planned",
+                self.config.network_port,
+                swap_id,
+                MAX_CONCURRENT_SWAPS,
+            );
+            // Same cleanup as the reconnect branch: the conflict check proved
+            // these inputs are ours, so hand back exactly them.
+            if !reserved_inputs.is_empty() {
+                let mut wallet = lock_debug!(self.wallet.write())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                if wallet.release_swap_locks(swap_id, Some(&reserved_inputs)) {
+                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                }
+            }
+            return Err(MakerError::TooManySwaps);
         }
 
         let swap_state = swaps.entry(swap_id.to_string()).or_default();
         #[cfg(debug_assertions)]
         if swap_state.phase != state.phase
-            || swap_state.funding_broadcast != state.funding_broadcast
+            || swap_state.funding_broadcast_txids.len() != state.funding_broadcast_txids.len()
             || swap_state.incoming_swapcoins.len() != state.incoming_swapcoins.len()
             || swap_state.outgoing_swapcoins.len() != state.outgoing_swapcoins.len()
-            || swap_state.reserve_utxo.len() != state.reserve_utxo.len()
+            || swap_state.funding_plan.len() != state.funding_plan.len()
         {
             log::debug!(
-                "[SWAP_STATE] Source: maker::api::store_connection_state | Role: Maker | SwapID: {} | Phase: {:?} | FundingBroadcast: {} | Incoming: {} | Outgoing: {} | ReservedUtxos: {}",
+                "[SWAP_STATE] Source: maker::api::store_connection_state | Role: Maker | SwapID: {} | Phase: {:?} | FundingBroadcastTxids: {} | Incoming: {} | Outgoing: {} | FundingSplits: {}",
                 swap_id,
                 state.phase,
-                state.funding_broadcast,
+                state.funding_broadcast_txids.len(),
                 state.incoming_swapcoins.len(),
                 state.outgoing_swapcoins.len(),
-                state.reserve_utxo.len()
+                state.funding_plan.len()
             );
         }
-        swap_state.swap_amount = state.swap_amount;
-        swap_state.tx_count = state.tx_count;
-        swap_state.timelock = state.timelock;
-        swap_state.protocol = state.protocol;
+        swap_state.negotiated = NegotiatedTerms::from(state);
         swap_state.phase = state.phase;
         swap_state.incoming_swapcoins = state.incoming_swapcoins.clone();
         swap_state.outgoing_swapcoins = state.outgoing_swapcoins.clone();
         swap_state.pending_funding_txes = state.pending_funding_txes.clone();
-        swap_state.funding_broadcast = state.funding_broadcast;
-        swap_state.contract_feerate = state.contract_feerate;
+        swap_state.funding_broadcast_txids = state.funding_broadcast_txids.clone();
         swap_state.service_fee_sats = state.service_fee_sats;
-        swap_state.reserve_utxo = state.reserve_utxo.clone();
+        // The plan frozen at admission wins over the handler's empty one;
+        // later stores carry the same plan back.
+        if let Some(plan) = planned {
+            swap_state.funding_plan = plan;
+        } else {
+            swap_state.funding_plan = state.funding_plan.clone();
+        }
         swap_state.last_activity = Instant::now();
         swap_state.swap_start_time = state.swap_start_time;
-        swap_state.refund_locktime_offset = state.refund_locktime_offset;
         log::debug!(
             "[{}] Stored connection state for {}: amount={}, timelock={}, protocol={:?}, outgoing_count={}",
             self.config.network_port,
@@ -1621,6 +2194,7 @@ impl MakerTrait for MakerServer {
             state.protocol,
             state.outgoing_swapcoins.len()
         );
+        drop(swaps);
 
         Ok(())
     }
@@ -1628,21 +2202,23 @@ impl MakerTrait for MakerServer {
     fn get_connection_state(&self, swap_id: &str) -> Result<Option<ConnectionState>, MakerError> {
         let swaps = lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
         Ok(swaps.get(swap_id).map(|s| {
-            let mut state = ConnectionState::new(s.protocol);
+            let mut state = ConnectionState::new(s.negotiated.protocol);
             state.swap_id = Some(swap_id.to_string());
-            state.swap_amount = s.swap_amount;
-            state.tx_count = s.tx_count;
-            state.timelock = s.timelock;
+            state.swap_amount = s.negotiated.swap_amount;
+            state.tx_count = s.negotiated.tx_count;
+            state.incoming_count = s.negotiated.incoming_count;
+            state.max_input_budget = s.negotiated.max_input_budget;
+            state.timelock = s.negotiated.timelock;
             state.phase = s.phase;
             state.incoming_swapcoins = s.incoming_swapcoins.clone();
             state.outgoing_swapcoins = s.outgoing_swapcoins.clone();
             state.pending_funding_txes = s.pending_funding_txes.clone();
-            state.funding_broadcast = s.funding_broadcast;
-            state.contract_feerate = s.contract_feerate;
+            state.funding_broadcast_txids = s.funding_broadcast_txids.clone();
+            state.swap_feerate = s.negotiated.swap_feerate;
             state.service_fee_sats = s.service_fee_sats;
-            state.reserve_utxo = s.reserve_utxo.clone();
+            state.funding_plan = s.funding_plan.clone();
             state.swap_start_time = s.swap_start_time;
-            state.refund_locktime_offset = s.refund_locktime_offset;
+            state.refund_locktime_offset = s.negotiated.refund_locktime_offset;
             state.last_activity = s.last_activity;
             state
         }))
@@ -1657,12 +2233,58 @@ impl MakerTrait for MakerServer {
         let swaps = lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
         Ok(swaps.get(swap_id).is_some_and(|state| {
             past_refund_deadline(
-                state.protocol,
-                state.timelock,
+                state.negotiated.protocol,
+                state.negotiated.timelock,
                 state.funding_confirmation_height,
                 current_height,
             )
         }))
+    }
+
+    fn claimed_funding_unseen(&self, swap_id: &str) -> Result<bool, MakerError> {
+        let claimed: Vec<Txid> = {
+            let swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            let Some(state) = swaps.get(swap_id) else {
+                return Ok(false);
+            };
+            // Evidence is the taker's money moving, not our own artifacts.
+            // Taproot's claimed txs carry the funding on-chain; a legacy
+            // receiver contract is maker-built and never broadcast, so the
+            // taker's funding tx behind it is the only live evidence there.
+            let legacy = state.negotiated.protocol == ProtocolVersion::Legacy;
+            state
+                .claimed_incoming_txids
+                .iter()
+                .copied()
+                .filter(|_| !legacy)
+                .chain(state.incoming_swapcoins.iter().filter_map(|sc| {
+                    if legacy {
+                        sc.contract_tx.input.first().map(|i| i.previous_output.txid)
+                    } else {
+                        Some(sc.contract_tx.compute_txid())
+                    }
+                }))
+                .collect()
+        };
+        // No funding named yet: the unfunded lifetime, not this check, bounds
+        // the keepalive refresh.
+        if claimed.is_empty() {
+            return Ok(false);
+        }
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // Mempool counts: a broadcast-but-unconfirmed funding is live evidence.
+        for txid in &claimed {
+            if !wallet
+                .blockchain
+                .is_tx_unknown(txid)
+                .map_err(MakerError::Wallet)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn data_dir(&self) -> &std::path::Path {
@@ -1671,15 +2293,6 @@ impl MakerTrait for MakerServer {
 
     fn wallet_name(&self) -> &str {
         &self.config.wallet_name
-    }
-
-    fn collect_excluded_utxos(&self, current_swap_id: &str) -> Result<Vec<OutPoint>, MakerError> {
-        let swaps = lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
-        Ok(swaps
-            .iter()
-            .filter(|(id, _)| id.as_str() != current_swap_id)
-            .flat_map(|(_, state)| state.reserve_utxo.clone())
-            .collect())
     }
 
     fn verify_and_sign_sender_contract_txs(
@@ -1781,6 +2394,45 @@ impl MakerTrait for MakerServer {
         let mut seen_outpoints = HashSet::with_capacity(message.confirmed_funding_txes.len());
         let mut funding_confirmed_at: Option<u32> = None;
 
+        // Validate the cheap shape of every proof before waiting: a bad locktime
+        // must cost the peer a rejection, not the whole confirmation window.
+        let mut funding_txids = Vec::with_capacity(message.confirmed_funding_txes.len());
+        for funding_info in &message.confirmed_funding_txes {
+            let locktime = read_contract_locktime(&funding_info.contract_redeemscript)?;
+            if locktime.saturating_sub(message.refund_locktime) < min_reaction_time {
+                return Err(MakerError::General(
+                    "Next hop locktime too close to current hop locktime",
+                ));
+            }
+            let multisig_spk = redeemscript_to_scriptpubkey(&funding_info.multisig_redeemscript)?;
+            let funding_output_index = funding_info
+                .funding_tx
+                .output
+                .iter()
+                .position(|o| o.script_pubkey == multisig_spk)
+                .ok_or(MakerError::General("Funding output not found"))?
+                as u32;
+            let funding_txid = funding_info.funding_tx.compute_txid();
+            // Each proof can be valid on its own, but repeating one outpoint makes
+            // the maker count the same incoming value twice and fund excess outgoing.
+            if !seen_outpoints.insert(OutPoint {
+                txid: funding_txid,
+                vout: funding_output_index,
+            }) {
+                return Err(MakerError::General("Duplicate funding outpoint"));
+            }
+            funding_txids.push(funding_txid);
+        }
+
+        // Check the funding txs are confirmed to required depth, one wait for the
+        // whole batch. Same confirm source as the taproot path: the operator's
+        // config, not a hardcoded 1.
+        self.wait_for_txs_on_chain(
+            &message.id,
+            &funding_txids,
+            self.config.required_confirms.max(MIN_REQUIRED_CONFIRM),
+        )?;
+
         for funding_info in &message.confirmed_funding_txes {
             // Check that the new locktime is sufficiently short enough
             let locktime = read_contract_locktime(&funding_info.contract_redeemscript)?;
@@ -1807,16 +2459,6 @@ impl MakerTrait for MakerServer {
                 txid: funding_txid,
                 vout: funding_output_index,
             };
-            if !seen_outpoints.insert(funding_outpoint) {
-                return Err(MakerError::General("Duplicate funding outpoint"));
-            }
-
-            // Check the funding_tx is confirmed to required depth
-            // Same source as the taproot path: the operator's config, not a hardcoded 1.
-            self.wait_for_tx_on_chain(
-                &funding_txid,
-                self.config.required_confirms.max(MIN_REQUIRED_CONFIRM),
-            )?;
 
             let wallet_read = lock_debug!(self.wallet.read())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -1899,15 +2541,15 @@ impl MakerTrait for MakerServer {
         Ok(hashvalue)
     }
 
-    fn initialize_openswap(
+    fn initialize_swap(
         &self,
+        swap_id: &str,
         send_amount: Amount,
         next_multisig_pubkeys: &[PublicKey],
         next_hashlock_pubkeys: &[PublicKey],
         hashvalue: crate::protocol::Hash160,
         locktime: u16,
         contract_feerate: f64,
-        excluded_outpoints: Option<Vec<OutPoint>>,
     ) -> Result<(Vec<Transaction>, Vec<OutgoingSwapCoin>, Amount), MakerError> {
         log::info!(
             "[{}] Initializing openswap: amount={} sats, {} pubkeys",
@@ -1916,35 +2558,48 @@ impl MakerTrait for MakerServer {
             next_multisig_pubkeys.len()
         );
 
-        let mut wallet = lock_debug!(self.wallet.write())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let plan = self.frozen_funding_plan(swap_id, send_amount)?;
+        // The taker derived its key bundles from the shape reported in the
+        // Ack: one bundle per frozen split, no more and no fewer.
+        if next_multisig_pubkeys.len() != plan.len() {
+            return Err(MakerError::General(
+                "Next-hop key count does not match the frozen funding plan",
+            ));
+        }
 
-        let (openswap_addresses, my_multisig_privkeys): (Vec<_>, Vec<_>) = next_multisig_pubkeys
-            .iter()
-            .map(|other_key| wallet.create_and_import_swap_address(other_key))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(MakerError::Wallet)?
-            .into_iter()
-            .unzip();
+        // Malice hook: forward one sat less than the frozen plan promised, so
+        // the taker's exact-amount check is what catches the skim.
+        #[cfg(feature = "integration-test")]
+        let plan = if self.behavior() == MakerBehavior::FeeSkimming {
+            let mut skimmed = plan;
+            skimmed[0].value = Amount::from_sat(skimmed[0].value.to_sat() - 1);
+            skimmed
+        } else {
+            plan
+        };
 
-        let create_funding_txes_result = wallet
-            .create_funding_txes(
-                send_amount,
-                &openswap_addresses,
-                contract_feerate,
-                None,
-                excluded_outpoints,
-            )
-            .map_err(MakerError::Wallet)?;
+        let (openswap_addresses, my_multisig_privkeys): (Vec<_>, Vec<_>) = {
+            let mut wallet = lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            next_multisig_pubkeys
+                .iter()
+                .map(|other_key| wallet.create_and_import_swap_address(other_key))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(MakerError::Wallet)?
+                .into_iter()
+                .unzip()
+        };
+
+        let (funding_txes, payment_output_positions, total_miner_fee) =
+            self.execute_frozen_plan(swap_id, &plan, &openswap_addresses, contract_feerate)?;
 
         let mut outgoing_swapcoins = Vec::new();
         for (
             (((my_funding_tx, &utxo_index), &my_multisig_privkey), &other_multisig_pubkey),
             hashlock_pubkey,
-        ) in create_funding_txes_result
-            .funding_txes
+        ) in funding_txes
             .iter()
-            .zip(create_funding_txes_result.payment_output_positions.iter())
+            .zip(payment_output_positions.iter())
             .zip(my_multisig_privkeys.iter())
             .zip(next_multisig_pubkeys.iter())
             .zip(next_hashlock_pubkeys.iter())
@@ -1964,6 +2619,7 @@ impl MakerTrait for MakerServer {
                 },
                 funding_amount,
                 &contract_redeemscript,
+                contract_feerate,
             )?;
 
             let mut outgoing_swapcoin = OutgoingSwapCoin::new_legacy(
@@ -1973,26 +2629,23 @@ impl MakerTrait for MakerServer {
                 contract_redeemscript,
                 timelock_privkey,
                 funding_amount,
+                contract_feerate as u64,
             );
             outgoing_swapcoin.funding_tx = Some(my_funding_tx.clone());
             outgoing_swapcoins.push(outgoing_swapcoin);
         }
 
-        let mining_fees = Amount::from_sat(create_funding_txes_result.total_miner_fee);
+        let mining_fees = Amount::from_sat(total_miner_fee);
 
         log::info!(
             "[{}] Created {} funding txs and {} outgoing swapcoins, mining_fees={}",
             self.config.network_port,
-            create_funding_txes_result.funding_txes.len(),
+            funding_txes.len(),
             outgoing_swapcoins.len(),
             mining_fees
         );
 
-        Ok((
-            create_funding_txes_result.funding_txes,
-            outgoing_swapcoins,
-            mining_fees,
-        ))
+        Ok((funding_txes, outgoing_swapcoins, mining_fees))
     }
 
     fn find_outgoing_swapcoin(
@@ -2065,6 +2718,11 @@ impl MakerRpc for MakerServer {
 
     fn shutdown(&self) -> &ShutdownSignal {
         &self.shutdown
+    }
+
+    #[cfg(feature = "integration-test")]
+    fn take_reserved_rpc_listener(&self) -> Option<TcpListener> {
+        self.reserved_rpc_listener.lock().unwrap().take()
     }
 
     #[cfg(not(feature = "integration-test"))]

@@ -21,14 +21,12 @@ use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    sync::atomic::Ordering::Relaxed,
     thread,
     time::{Duration, Instant},
 };
@@ -66,22 +64,10 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     let taker = takers.get_mut(0).unwrap();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
@@ -100,14 +86,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let _maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting malice2 test...");
@@ -137,7 +116,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     if expect_direct_breach_detection {
         wait_for_log(
-            &format!("{}/taker/debug.log", test_framework.temp_dir.display()),
+            &test_framework.taker_log_path(),
             "Breach detector: contract tx",
             Duration::from_secs(30),
         );
@@ -166,7 +145,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
             maker_balances.contract,
             maker_balances.spendable,
         );
-        let expected_regular = [14998622u64, 14501519][i];
+        let expected_regular = [14999311u64, 14501446][i];
         assert_eq!(
             maker_balances.regular.to_sat(),
             expected_regular,
@@ -224,12 +203,12 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14999108,
+        14999554,
         "Taker regular balance mismatch"
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        497087,
+        497857,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -248,19 +227,14 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     );
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        15496195,
+        15497411,
         "Taker spendable balance mismatch"
     );
 
     taker.log_tracker_state();
     info!("Malice2 test completed successfully!");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     tracker_logger.stop();
     test_framework.stop();

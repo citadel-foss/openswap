@@ -9,13 +9,12 @@ use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::{sync::atomic::Ordering::Relaxed, thread};
+use std::thread;
 
 #[test]
 fn maker_abort2_case2() {
@@ -36,22 +35,10 @@ fn maker_abort2_case2() {
     let taker = takers.get_mut(0).unwrap();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
@@ -70,14 +57,7 @@ fn maker_abort2_case2() {
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup to ensure fidelity bonds are accounted for
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
 
@@ -106,14 +86,7 @@ fn maker_abort2_case2() {
 
     generate_blocks(bitcoind, 1);
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     // Verify taker balance
     let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
@@ -125,7 +98,7 @@ fn maker_abort2_case2() {
 
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14993663,
+        14995985,
         "Taker spendable balance mismatch"
     );
     assert_eq!(
@@ -142,7 +115,7 @@ fn maker_abort2_case2() {
             "Maker {} balances: original={}, after={}",
             i, original, balances.spendable
         );
-        let expected_spendable = [14999514, 14999928, 14999965][i];
+        let expected_spendable = [14999757, 15000378, 15000415][i];
         assert_eq!(
             balances.spendable.to_sat(),
             expected_spendable,
@@ -159,12 +132,7 @@ fn maker_abort2_case2() {
     }
 
     info!("maker_abort2_case2 completed successfully!");
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

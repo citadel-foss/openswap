@@ -15,7 +15,7 @@ use openswap::{
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::{sync::atomic::Ordering::Relaxed, thread};
+use std::thread;
 
 #[test]
 fn test_taproot_multi_taker_openswap() {
@@ -36,20 +36,8 @@ fn test_taproot_multi_taker_openswap() {
     let mut taker1_original_balance = Amount::ZERO;
     let mut taker2_original_balance = Amount::ZERO;
     for _ in 0..3 {
-        taker1_original_balance = fund_taker(
-            &takers[0],
-            bitcoind,
-            1,
-            Amount::from_btc(0.05).unwrap(),
-            AddressType::P2TR,
-        );
-        taker2_original_balance = fund_taker(
-            &takers[1],
-            bitcoind,
-            1,
-            Amount::from_btc(0.05).unwrap(),
-            AddressType::P2TR,
-        );
+        taker1_original_balance = fund_taker_default(&takers[0], bitcoind, 1);
+        taker2_original_balance = fund_taker_default(&takers[1], bitcoind, 1);
     }
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each, one per call (distinct addresses).
@@ -80,14 +68,7 @@ fn test_taproot_multi_taker_openswap() {
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup to ensure fidelity bonds are accounted for
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
 
@@ -121,14 +102,7 @@ fn test_taproot_multi_taker_openswap() {
     generate_blocks(bitcoind, 5);
 
     // Sync maker wallets between swaps
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     // ---- Swap 2: Second taker ----
     log::info!("Starting swap for Taker 2 (Taproot protocol)...");
@@ -190,7 +164,7 @@ fn test_taproot_multi_taker_openswap() {
 
     assert_eq!(
         taker1_balances_after.spendable.to_sat(),
-        14993891,
+        14996327,
         "Taker 1 spendable balance mismatch"
     );
     assert_eq!(
@@ -199,7 +173,7 @@ fn test_taproot_multi_taker_openswap() {
         "Taker 1 contract balance mismatch"
     );
     assert_eq!(taker1_balances_after.fidelity, Amount::ZERO);
-    assert_eq!(balance_diff1.to_sat(), 6109, "Taker 1 fee paid mismatch");
+    assert_eq!(balance_diff1.to_sat(), 3673, "Taker 1 fee paid mismatch");
 
     // ---- Verify Taker 2 ----
     let taker2_balances_after = takers[1]
@@ -218,7 +192,7 @@ fn test_taproot_multi_taker_openswap() {
 
     assert_eq!(
         taker2_balances_after.spendable.to_sat(),
-        14993891,
+        14996327,
         "Taker 2 spendable balance mismatch"
     );
     assert_eq!(
@@ -227,12 +201,12 @@ fn test_taproot_multi_taker_openswap() {
         "Taker 2 contract balance mismatch"
     );
     assert_eq!(taker2_balances_after.fidelity, Amount::ZERO);
-    assert_eq!(balance_diff2.to_sat(), 6109, "Taker 2 fee paid mismatch");
+    assert_eq!(balance_diff2.to_sat(), 3673, "Taker 2 fee paid mismatch");
 
     // ---- Verify Makers earned fees ----
-    let expected_regular = [14002216, 14006692];
-    let expected_swap = [998656, 994106];
-    let expected_fee = [1358, 1284];
+    let expected_regular = [14001745, 14004583];
+    let expected_swap = [999328, 996416];
+    let expected_fee = [1316, 1242];
     for (i, (maker, original_spendable)) in makers.iter().zip(maker_spendable_balance).enumerate() {
         let wallet = maker.wallet.read().unwrap();
         let balances = wallet.get_balances().unwrap();
@@ -278,12 +252,7 @@ fn test_taproot_multi_taker_openswap() {
 
     info!("All multi-taker swap tests (Taproot) completed successfully!");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     test_framework.stop();
     block_generation_handle.join().unwrap();

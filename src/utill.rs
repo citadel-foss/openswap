@@ -4,7 +4,7 @@ use bitcoin::{
     hashes::Hash,
     key::{rand::thread_rng, Keypair},
     secp256k1::{All, Secp256k1, SecretKey},
-    Address, Amount, FeeRate, Network, PublicKey, ScriptBuf, WitnessProgram, WitnessVersion,
+    Address, Amount, Network, PublicKey, ScriptBuf, WitnessProgram, WitnessVersion,
 };
 use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 #[cfg(not(feature = "integration-test"))]
@@ -52,7 +52,10 @@ pub(crate) fn global_secp() -> &'static Secp256k1<All> {
 use crate::{
     error::NetError,
     lock_debug,
-    protocol::{contract::derive_maker_pubkey_and_nonce, error::ProtocolError},
+    protocol::{
+        common_messages::ProtocolVersion, contract::derive_maker_pubkey_and_nonce,
+        error::ProtocolError,
+    },
     wallet::{SecretMnemonic, UTXOSpendInfo, WalletError},
 };
 
@@ -74,24 +77,62 @@ pub static NO_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// How long to wait for a peer's tx to reach our mempool. Covers relay propagation
 /// and backend lag only. Sized above a full Electrum reconnect cycle so a transport
 /// blip does not fail an honest swap.
-pub const TX_BROADCAST_TIMEOUT: Duration = Duration::from_secs(120);
+pub const TX_BROADCAST_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Total deadline for a watched tx to confirm. Without it a low-fee counterparty
-/// tx parks a swap thread forever and quietly spends the timelock reaction margin.
-pub const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Total deadline for a batch of watched txs to confirm, however many there are.
+/// Without it a low-fee counterparty tx parks a swap thread forever and quietly
+/// spends the timelock reaction margin.
+pub const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(7200);
+
+/// Grace before a swap with no recorded broadcast may be treated as never
+/// funded. A broadcast that has not reached our backend yet must not read as
+/// absent, so wait out the same window a confirmation is given.
+#[cfg(not(feature = "integration-test"))]
+pub const UNBROADCAST_DISCARD_GRACE: Duration = TX_CONFIRMATION_TIMEOUT;
+/// Shortened so a test can watch the grace expire, but longer than a maker
+/// restart takes, so a restart test still sees a live reservation.
+#[cfg(feature = "integration-test")]
+pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(120);
+
+/// Hard lifetime of a swap with no on-chain evidence, counted from admission.
+/// It spans two windows in sequence: the taker confirming its own funding, then
+/// the maker's one batched contract wait. Also the reservation TTL: a swap's
+/// locked inputs must stay locked for as long as the swap itself can live, or
+/// a second admission can claim them under the first swap's frozen plan.
+pub(crate) const UNFUNDED_SWAP_LIFETIME: Duration =
+    Duration::from_secs(2 * TX_CONFIRMATION_TIMEOUT.as_secs());
 
 /// Floor for funding-tx confirmations: applied when the configured
 /// `required_confirms` is absent or 0.
 pub const MIN_REQUIRED_CONFIRM: u32 = 1;
 
-/// Minimum fee rate in sats/vb for all transactions
-/// This replaces the hardcoded MINER_FEE constant
-pub const MIN_FEE_RATE: f64 = 2.0;
-
-/// Absolute fee rate floor in sats/vb — Bitcoin Core's default
-/// `minrelaytxfee`. Configurable fee rates (e.g. the fidelity bond) may go
-/// below [`MIN_FEE_RATE`] but never below this, or transactions stop relaying.
+/// Default fee rate in sats/vb for all transactions, and the absolute floor:
+/// Bitcoin Core's default `minrelaytxfee`. Lower rates stop relaying.
 pub const MIN_RELAY_FEE_RATE: f64 = 1.0;
+
+/// True when a caller-supplied fee rate cannot be used: not a real number, or
+/// under the floor Bitcoin nodes forward at. Callers word their own refusal.
+pub fn is_unusable_fee_rate(rate: f64) -> bool {
+    !rate.is_finite() || rate < MIN_RELAY_FEE_RATE
+}
+
+/// Fee rate for our own recovery transactions, shared by both roles.
+/// TODO: read the fee market at recovery time — a live node cannot be
+/// reconfigured mid-swap, and a startup value is stale by then.
+pub const RECOVERY_FEE_RATE: f64 = MIN_RELAY_FEE_RATE;
+
+/// Current time as seconds since UNIX epoch.
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Maximum split count a peer may request. `tx_count` and the per-split input
+/// budget drive peer-controlled allocation and keygen work on both sides;
+/// 10 splits is already economically silly.
+pub const MAX_TX_COUNT: u32 = 10;
 
 /// Maximum size of a length-prefixed protocol or RPC message.
 /// 10 MiB limit
@@ -124,28 +165,55 @@ pub fn get_taker_dir() -> io::Result<PathBuf> {
     Ok(get_data_dir()?.join("taker"))
 }
 
-/// Creates a FeeRate from the global MIN_FEE_RATE constant
-/// This provides type-safe fee calculations throughout the codebase
-pub fn get_min_fee_rate() -> Option<FeeRate> {
-    FeeRate::from_sat_per_vb(MIN_FEE_RATE as u64)
+/// P2WSH ECDSA: 2 sigs/sig+preimage + full redeemscript (~149)
+pub(crate) const LEGACY_CONTRACT_SPEND_VSIZE: u64 = 150;
+/// key-path: one 64B Schnorr sig, no script (~111)
+pub(crate) const TAPROOT_KEYPATH_VSIZE: u64 = 112;
+
+/// Vsize model of one forwarding tx: overhead 11 + payment output 43 +
+/// P2TR change 43 + 68 per input. Each leg upper-bounds the wallet's real
+/// P2TR shapes, so the model fee never underprices the real one.
+pub(crate) fn funding_tx_vsize(inputs: usize) -> u64 {
+    11 + 43 + 43 + 68 * inputs as u64
 }
 
-/// Calculate fee in satoshis for given virtual bytes using MIN_FEE_RATE
-pub fn calculate_fee_sats(vbytes: u64) -> u64 {
-    let fee_rate = get_min_fee_rate().expect("MIN_FEE_RATE should be valid");
-    fee_rate
-        .fee_vb(vbytes)
-        .expect("fee calculation should not overflow")
-        .to_sat()
+/// Fee for `vbytes` at `feerate` sats/vB, rounded up after the multiply: a
+/// fractional rate is valid and must never underpay. None for unusable rates.
+pub(crate) fn fee_at_rate_sats(vbytes: u64, feerate: f64) -> Option<u64> {
+    if is_unusable_fee_rate(feerate) {
+        return None;
+    }
+    let fee = feerate * vbytes as f64;
+    // `u64::MAX as f64` rounds up to 2^64, so `>` alone would pass a fee of
+    // exactly 2^64 and saturate the cast instead of failing it.
+    if fee >= u64::MAX as f64 {
+        return None;
+    }
+    Some(fee.ceil() as u64)
 }
 
-/// Estimated on-chain miner cost (sats) a maker bears per swap contract: a funding tx
-/// (overhead 11 + P2WPKH input 68 + P2WSPK change 31 + (P2TR/P2WSPK) payment output 43 = 153 vB)
-/// plus a sweep tx (overhead 11 + input 68 + self-payment output 43 = 122 vB).
-///
-/// Used both by the maker (for routed amount) and by taker's `expected_amount_for_hop`
-pub fn estimate_funding_tx_fee_sats() -> u64 {
-    calculate_fee_sats((11 + 68 + 31 + 43) + (11 + 68 + 43))
+/// Policy price of one forwarding tx at the negotiated swap feerate: the
+/// taker covers at most `max_input_budget` inputs per tx. More inputs are the
+/// maker's own cost, never a violation.
+pub fn funding_fee_policy_sats(
+    input_count: usize,
+    max_input_budget: u32,
+    feerate: f64,
+) -> Option<u64> {
+    let priced_inputs = input_count.max(1).min(max_input_budget as usize);
+    fee_at_rate_sats(funding_tx_vsize(priced_inputs), feerate)
+}
+
+/// Sweep reimbursement per incoming contract at the negotiated swap feerate:
+/// the cooperative spend's complete vsize model — the constants already
+/// include the transaction overhead and output. Batching gains are the
+/// maker's; costs above the model are too.
+pub fn sweep_fee_policy_sats(protocol: ProtocolVersion, feerate: f64) -> Option<u64> {
+    let spend_vsize = match protocol {
+        ProtocolVersion::Legacy => LEGACY_CONTRACT_SPEND_VSIZE,
+        ProtocolVersion::Taproot => TAPROOT_KEYPATH_VSIZE,
+    };
+    fee_at_rate_sats(spend_vsize, feerate)
 }
 
 /// Sets up the logger for the taker component.
@@ -785,13 +853,6 @@ impl Drop for RawModeGuard {
     }
 }
 /// Returns the current time as seconds since the Unix epoch.
-pub(crate) fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Prompts the user for a password using the given prompt string.
 /// Temporarily disables canonical mode and echo to mask each typed
 /// character with `*` as feedback.
@@ -1225,6 +1286,20 @@ mod tests {
     use crate::protocol::common_messages::{MakerHello, MakerToTakerMessage, ProtocolVersion};
 
     use super::*;
+
+    #[test]
+    fn fee_at_rate_sats_rounds_fractional_rates_up() {
+        // Ceil after the multiply: a fractional rate must never underpay.
+        assert_eq!(fee_at_rate_sats(10, 1.01), Some(11));
+        assert_eq!(fee_at_rate_sats(150, 1.5), Some(225));
+        // Integral rates stay exact; unusable rates return None.
+        assert_eq!(fee_at_rate_sats(112, 3.0), Some(336));
+        assert_eq!(fee_at_rate_sats(10, f64::NAN), None);
+        assert_eq!(fee_at_rate_sats(10, 0.5), None);
+        // The product equal to 2^64 must fail, not saturate the cast.
+        assert_eq!(fee_at_rate_sats(155, 119011252088448713.0), None);
+        assert!(fee_at_rate_sats(155, 119011252088448712.0).is_some());
+    }
 
     #[test]
     fn test_send_message() {

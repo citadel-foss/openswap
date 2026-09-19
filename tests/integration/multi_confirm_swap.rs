@@ -14,14 +14,12 @@ use openswap::{
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
     utill::NO_SHUTDOWN,
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    sync::atomic::Ordering::Relaxed,
     thread,
     time::{Duration, Instant},
 };
@@ -90,20 +88,8 @@ fn run_multi_confirm_swap(
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
     info!("Starting Maker servers...");
     let maker_threads = makers
@@ -118,14 +104,7 @@ fn run_multi_confirm_swap(
 
     wait_for_makers_setup(&makers, 120);
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
 
@@ -138,7 +117,7 @@ fn run_multi_confirm_swap(
     let summary = taker
         .prepare_swap(swap_params)
         .expect("Failed to prepare openswap");
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
     let swap_result = if delay_first_confirmation {
         test_framework.set_block_gen_paused(true);
         // Let any in-flight mining tick finish before broadcasting funding.
@@ -193,12 +172,7 @@ fn run_multi_confirm_swap(
 
     info!("OpenSwap completed with required_confirms = {required_confirms}");
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     taker
         .get_wallet()
@@ -207,14 +181,7 @@ fn run_multi_confirm_swap(
         .sync_and_save(&NO_SHUTDOWN)
         .unwrap();
     generate_blocks(bitcoind, 1);
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     // Verify the requested confirmation count and that route heartbeats ran.
     test_framework.assert_log(
@@ -232,10 +199,10 @@ fn run_multi_confirm_swap(
         taker_balances.spendable,
     );
 
-    let expected_taker_regular = 14499076;
+    let expected_taker_regular = 14499538;
     let expected_taker_swap = match protocol {
-        ProtocolVersion::Legacy => 494587,
-        ProtocolVersion::Taproot => 494815,
+        ProtocolVersion::Legacy => 496447,
+        ProtocolVersion::Taproot => 496789,
     };
     assert_eq!(
         taker_balances.regular.to_sat(),
@@ -260,8 +227,8 @@ fn run_multi_confirm_swap(
         .unwrap();
     info!("Taker fees paid: {} sats", balance_diff.to_sat());
     let expected_diff = match protocol {
-        ProtocolVersion::Legacy => 6337,
-        ProtocolVersion::Taproot => 6109,
+        ProtocolVersion::Legacy => 4015,
+        ProtocolVersion::Taproot => 3673,
     };
     assert_eq!(
         balance_diff.to_sat(),
@@ -269,15 +236,15 @@ fn run_multi_confirm_swap(
         "Taker spendable balance change mismatch"
     );
 
-    let expected_regular = [14500865u64, 14503103];
+    let expected_regular = match protocol {
+        ProtocolVersion::Legacy => [14500865u64, 14502398],
+        ProtocolVersion::Taproot => [14500751u64, 14502170],
+    };
     let expected_swap = match protocol {
-        ProtocolVersion::Legacy => [499100u64, 496825],
-        ProtocolVersion::Taproot => [499328u64, 497053],
+        ProtocolVersion::Legacy => [499550u64, 497980],
+        ProtocolVersion::Taproot => [499664u64, 498208],
     };
-    let expected_fee = match protocol {
-        ProtocolVersion::Legacy => [451u64, 414],
-        ProtocolVersion::Taproot => [679u64, 642],
-    };
+    let expected_fee = [658u64, 621];
 
     for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
         let balances = maker.wallet.read().unwrap().get_balances().unwrap();

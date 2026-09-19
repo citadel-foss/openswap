@@ -25,7 +25,7 @@ use openswap::{
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::{sync::atomic::Ordering::Relaxed, thread, time::Duration};
+use std::{thread, time::Duration};
 
 /// Maker addresses currently in the taker's offerbook, as strings.
 fn listed_addresses(taker: &Taker) -> Vec<String> {
@@ -150,12 +150,7 @@ fn test_offerbook_removal_survives_restart() {
         raw
     );
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     info!("Offerbook restart test completed successfully!");
 

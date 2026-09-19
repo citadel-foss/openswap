@@ -5,12 +5,15 @@
 //! parsing mechanisms for transaction inputs and outputs.
 
 use bitcoin::{
-    absolute::LockTime, script::PushBytesBuf, transaction::Version, Address, Amount, FeeRate,
-    OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    absolute::LockTime, script::PushBytesBuf, transaction::Version, Address, Amount, OutPoint,
+    ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
 use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 
-use crate::wallet::{api::UTXOSpendInfo, FidelityError};
+use crate::{
+    utill::{fee_at_rate_sats, is_unusable_fee_rate},
+    wallet::{api::UTXOSpendInfo, FidelityError},
+};
 
 use super::{error::WalletError, AddressType, Blockchain, Wallet};
 
@@ -263,16 +266,13 @@ impl Wallet {
             }
         }
 
-        // Reject sub-1 sat/vB up front; `feerate as u64` would truncate it to a
-        // zero rate and build a transaction that never relays.
-        if feerate < 1.0 {
+        // Reject unusable rates up front: below the floor never relays, and
+        // non-finite would collapse to a zero rate at conversion.
+        if is_unusable_fee_rate(feerate) {
             return Err(WalletError::General(format!(
-                "feerate {feerate} sat/vB is below the 1 sat/vB minimum"
+                "feerate {feerate} sat/vB must be finite and at least the 1 sat/vB relay floor"
             )));
         }
-        let rate = FeeRate::from_sat_per_vb(feerate as u64).ok_or_else(|| {
-            WalletError::General(format!("feerate {feerate} sat/vB is out of range"))
-        })?;
 
         match destination {
             Destination::Sweep(addr) => {
@@ -287,11 +287,13 @@ impl Wallet {
 
                 // An absurdly high feerate overflows the fee amount, so the
                 // conversion fails instead of panicking.
-                let fee = rate.fee_vb(vsize as u64).ok_or_else(|| {
-                    WalletError::General(format!(
-                        "fee at {feerate} sat/vB overflows for a {vsize} vB transaction"
-                    ))
-                })?;
+                let fee = fee_at_rate_sats(vsize as u64, feerate)
+                    .map(Amount::from_sat)
+                    .ok_or_else(|| {
+                        WalletError::General(format!(
+                            "fee at {feerate} sat/vB overflows for a {vsize} vB transaction"
+                        ))
+                    })?;
 
                 // I don't know if this case is even possible?
                 if fee > total_input_value {
@@ -345,13 +347,15 @@ impl Wallet {
                 let base_wchange = tx_wchange.base_size();
                 let vsize_wchange = (base_wchange * 4 + total_witness_size + 2).div_ceil(4); // base * 4 + witness size + marker + flag
 
-                // Honor the caller's feerate here too; a fixed MIN_FEE_RATE fee
+                // Honor the caller's feerate here too; a fixed hardcoded fee
                 // strands every ordinary send and funding tx in a busy mempool.
-                let fee_wchange = rate.fee_vb(vsize_wchange as u64).ok_or_else(|| {
-                    WalletError::General(format!(
-                        "fee at {feerate} sat/vB overflows for a {vsize_wchange} vB transaction"
-                    ))
-                })?;
+                let fee_wchange = fee_at_rate_sats(vsize_wchange as u64, feerate)
+                    .map(Amount::from_sat)
+                    .ok_or_else(|| {
+                        WalletError::General(format!(
+                            "fee at {feerate} sat/vB overflows for a {vsize_wchange} vB transaction"
+                        ))
+                    })?;
 
                 let remaining_wchange =
                     if let Some(diff) = total_input_value.checked_sub(total_output_value) {

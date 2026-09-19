@@ -11,12 +11,13 @@
 //! The test data also includes the backend bitcoind data-directory, which is useful for observing the blockchain states after a swap.
 
 use bip39::rand;
-use bitcoin::Amount;
+use bitcoin::{Amount, Txid};
 use std::{
+    collections::HashMap,
     env,
     fs::{self, create_dir_all, File},
     io::{BufReader, Read},
-    net::TcpStream,
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -38,10 +39,10 @@ use bitcoind::{
 use electrsd::ElectrsD;
 use log::info;
 use openswap::{
-    maker::{MakerBehavior, MakerServer, MakerServerConfig},
+    maker::{start_server, MakerBehavior, MakerServer, MakerServerConfig},
     protocol::common_messages::{ProtocolVersion, OPENSWAP_PORT},
     taker::{Taker, TakerBehavior, TakerInitConfig},
-    utill::{check_tor_status, get_ephemeral_address, setup_logger},
+    utill::{check_tor_status, get_ephemeral_address, setup_logger, NO_SHUTDOWN},
     wallet::{
         verify_deniability, AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRPC,
         CoreRpcConfig, Electrum, ElectrumConfig,
@@ -125,8 +126,12 @@ fn get_bitcoind_filename(os: &str, arch: &str) -> String {
     }
 }
 
-/// Initiate the bitcoind backend.
-pub(crate) fn init_bitcoind(datadir: &std::path::Path, zmq_addr: String) -> BitcoinD {
+/// Initiate the bitcoind backend. Fallible so the caller can retry on a fresh
+/// ZMQ port: a released free-port pick can be sniped before bitcoind binds it.
+pub(crate) fn init_bitcoind(
+    datadir: &std::path::Path,
+    zmq_addr: String,
+) -> Result<BitcoinD, bitcoind::anyhow::Error> {
     let mut conf = bitcoind::Conf::default();
     conf.args.push("-txindex=1"); //txindex is must, or else wallet sync won't work.
                                   // Bitcoin Core 28 changed `getblockchaininfo`'s `warnings` field to an array of strings;
@@ -190,13 +195,13 @@ pub(crate) fn init_bitcoind(datadir: &std::path::Path, zmq_addr: String) -> Bitc
 
     log::info!("📁 Executable path: {exe_path:?}");
 
-    let bitcoind = BitcoinD::with_conf(exe_path, &conf).unwrap();
+    let bitcoind = BitcoinD::with_conf(exe_path, &conf)?;
 
     // Generate initial 101 blocks
     generate_blocks(&bitcoind, 101);
     log::info!("🚀 bitcoind initiated!!");
 
-    bitcoind
+    Ok(bitcoind)
 }
 
 /// Spawn an electrs process attached to `bitcoind`. The bitcoind instance must
@@ -264,6 +269,54 @@ pub fn wait_for_makers_setup(makers: &[Arc<MakerServer>], timeout_secs: u64) {
     }
 }
 
+/// Spawns every maker server on its own thread, in maker order.
+#[allow(dead_code)]
+pub fn spawn_makers(makers: &[Arc<MakerServer>]) -> Vec<JoinHandle<()>> {
+    makers
+        .iter()
+        .map(|maker| {
+            let maker = maker.clone();
+            thread::spawn(move || start_server(maker).unwrap())
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Spawns all makers, waits for their setup, then mines one block.
+#[allow(dead_code)]
+pub fn spawn_ready_makers_and_mine(
+    makers: &[Arc<MakerServer>],
+    bitcoind: &bitcoind::BitcoinD,
+) -> Vec<JoinHandle<()>> {
+    let maker_threads = spawn_makers(makers);
+    wait_for_makers_setup(makers, 120);
+    generate_blocks(bitcoind, 1);
+    maker_threads
+}
+
+/// Stops every maker server and joins its thread, in maker order.
+#[allow(dead_code)]
+pub fn shutdown_makers(makers: &[Arc<MakerServer>], maker_threads: Vec<JoinHandle<()>>) {
+    makers
+        .iter()
+        .for_each(|maker| maker.shutdown.store(true, Relaxed));
+    maker_threads
+        .into_iter()
+        .for_each(|thread| thread.join().unwrap());
+}
+
+/// Syncs every maker's wallet against the backend and saves it.
+#[allow(dead_code)]
+pub fn sync_maker_wallets(makers: &[Arc<MakerServer>]) {
+    for maker in makers {
+        maker
+            .wallet
+            .write()
+            .unwrap()
+            .sync_and_save(&NO_SHUTDOWN)
+            .unwrap();
+    }
+}
+
 /// Fund taker and verify balance
 #[allow(dead_code)]
 pub fn fund_taker(
@@ -300,6 +353,18 @@ pub fn fund_taker(
     );
 
     balances.spendable
+}
+
+/// Fund the taker with `utxo_count` 0.05 BTC P2TR UTXOs.
+#[allow(dead_code)]
+pub fn fund_taker_default(taker: &Taker, bitcoind: &bitcoind::BitcoinD, utxo_count: u32) -> Amount {
+    fund_taker(
+        taker,
+        bitcoind,
+        utxo_count,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    )
 }
 
 /// Poll a wallet, calling `sync_and_save`, until its `regular` balance reaches `expected_regular`
@@ -372,6 +437,21 @@ pub fn fund_makers(
     spendable_balances
 }
 
+/// Fund makers with the usual four 0.05 BTC P2TR UTXOs each.
+#[allow(dead_code)]
+pub fn fund_makers_default(
+    makers: &[Arc<MakerServer>],
+    bitcoind: &bitcoind::BitcoinD,
+) -> Vec<Amount> {
+    fund_makers(
+        makers,
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    )
+}
+
 /// Verify maker pre-swap balances
 #[allow(dead_code)]
 pub fn verify_maker_pre_swap_balances(makers: &[Arc<MakerServer>]) -> Vec<Amount> {
@@ -396,7 +476,7 @@ pub fn verify_maker_pre_swap_balances(makers: &[Arc<MakerServer>]) -> Vec<Amount
         // Regular balance after fidelity bond creation
         let regular = balances.regular.to_sat();
         assert!(
-            regular == 14999514,
+            regular == 14999757,
             "Maker regular balance check after fidelity bond creation: {}",
             regular
         );
@@ -420,6 +500,107 @@ pub fn verify_maker_pre_swap_balances(makers: &[Arc<MakerServer>]) -> Vec<Amount
     }
 
     maker_spendable_balance
+}
+
+/// Current chain tip height.
+pub fn chain_tip(bitcoind: &BitcoinD) -> u64 {
+    bitcoind.client.get_block_count().unwrap()
+}
+
+/// Fee and vsize of a transaction the node knows, derived from the chain:
+/// prevout values minus output values, never the wallet's own books.
+pub fn tx_fee_and_vsize(bitcoind: &BitcoinD, txid: &Txid) -> (u64, usize) {
+    let client = &bitcoind.client;
+    let tx = client
+        .get_raw_transaction(txid, None)
+        .unwrap_or_else(|e| panic!("getrawtransaction {} failed: {}", txid, e));
+    let mut input_sats = 0u64;
+    for input in &tx.input {
+        let prev_txid = input.previous_output.txid;
+        let prev = client
+            .get_raw_transaction(&prev_txid, None)
+            .unwrap_or_else(|e| panic!("prevout tx {} missing: {}", prev_txid, e));
+        input_sats += prev.output[input.previous_output.vout as usize]
+            .value
+            .to_sat();
+    }
+    let output_sats: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+    (input_sats - output_sats, tx.vsize())
+}
+
+/// Non-coinbase transactions mined at or above `from_height`, grouped by spend
+/// depth: funding txs (depth 0) spend pre-swap wallet coins; contract txs,
+/// sweeps and recovery txs each spend an in-window parent.
+pub fn txs_by_spend_depth(bitcoind: &BitcoinD, from_height: u64) -> Vec<Vec<Txid>> {
+    let client = &bitcoind.client;
+    let tip = client.get_block_count().unwrap();
+    let mut depth_of: HashMap<Txid, usize> = HashMap::new();
+    let mut by_depth: Vec<Vec<Txid>> = Vec::new();
+    // Blocks are topologically ordered, so a single pass resolves every parent.
+    for height in from_height..=tip {
+        let hash = client.get_block_hash(height).unwrap();
+        for tx in client.get_block(&hash).unwrap().txdata {
+            if tx.is_coinbase() {
+                continue;
+            }
+            let txid = tx.compute_txid();
+            let depth = tx
+                .input
+                .iter()
+                .filter_map(|i| depth_of.get(&i.previous_output.txid))
+                .max()
+                .map(|d| d + 1)
+                .unwrap_or(0);
+            depth_of.insert(txid, depth);
+            if by_depth.len() <= depth {
+                by_depth.resize_with(depth + 1, Vec::new);
+            }
+            by_depth[depth].push(txid);
+        }
+    }
+    by_depth
+}
+
+/// Poll [`txs_by_spend_depth`] until each depth reaches its expected count, so
+/// the caller does not race a broadcast-but-unmined sweep.
+pub fn wait_for_tx_depths(
+    bitcoind: &BitcoinD,
+    from_height: u64,
+    expected: &[usize],
+) -> Vec<Vec<Txid>> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let by_depth = txs_by_spend_depth(bitcoind, from_height);
+        // Exact counts, not minimums: an extra transaction at an expected
+        // depth is a real anomaly, so fail fast instead of passing over it.
+        let counts: Vec<usize> = by_depth.iter().map(Vec::len).collect();
+        assert!(
+            !expected
+                .iter()
+                .enumerate()
+                .any(|(d, &n)| by_depth.get(d).map_or(0, Vec::len) > n),
+            "more transactions than expected: wanted {:?}, got {:?}",
+            expected,
+            counts
+        );
+        let settled = expected
+            .iter()
+            .enumerate()
+            .all(|(d, &n)| by_depth.get(d).map_or(0, Vec::len) == n);
+        if settled {
+            // No trailing-depth rejection: a recovery cascade can still be
+            // landing past the asserted depths, and that count is timing,
+            // not correctness.
+            return by_depth;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {:?} txs per depth, got {:?}",
+            expected,
+            by_depth.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
 }
 
 /// Test-only marker selecting which backend a [`TestFramework::init`] run uses.
@@ -621,6 +802,36 @@ const BLOCKS_PER_TICK: u64 = 5;
 /// outlast the wall-clock recovery delays exercised by the abort tests.
 const BLOCK_TICK_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Ask the OS for `n` unused ports, sorted as the taker will sort them: maker
+/// addresses order as strings ('127.0.0.1:10000' < '127.0.0.1:9999'), and
+/// that order decides route order and the golden balances.
+///
+/// Only for child processes (bitcoind, nostr relay), which cannot inherit a
+/// socket: the port is released at return, so the caller must retry pick +
+/// spawn as one operation. In-process consumers use [`reserve_listeners`].
+fn free_ports(n: usize) -> Vec<u16> {
+    let listeners: Vec<TcpListener> = (0..n)
+        .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("OS refused a free port"))
+        .collect();
+    let mut ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().port())
+        .collect();
+    ports.sort_by_key(|port| format!("127.0.0.1:{port}"));
+    ports
+}
+
+/// Bind `n` ports and keep the sockets, sorted like [`free_ports`]. Makers
+/// take theirs at server start, closing the gap where another test's OS pick
+/// could land on a released port.
+fn reserve_listeners(n: usize) -> Vec<TcpListener> {
+    let mut listeners: Vec<TcpListener> = (0..n)
+        .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("OS refused a free port"))
+        .collect();
+    listeners.sort_by_key(|l| format!("127.0.0.1:{}", l.local_addr().unwrap().port()));
+    listeners
+}
+
 /// How long abort tests must sleep for makers to detect a drop and for the
 /// outer-hop timelock (225 blocks) to mature, at backend `B`'s block cadence.
 pub(crate) fn timelock_recovery_wait<B: TestBackend>() -> Duration {
@@ -652,7 +863,33 @@ pub struct TestFramework {
     nostr_relay: Mutex<Option<Child>>,
 }
 
+/// Per-maker offer override for [`TestFramework::init_with_fee_overrides`].
+/// `None` keeps the shared default, so existing tests stay homogeneous.
+#[derive(Clone, Copy, Debug)]
+pub struct MakerFeeOverride {
+    pub base_fee: u64,
+    pub amount_relative_fee_pct: f64,
+    /// Smallest swap the maker advertises. Lower it to let a test reach a
+    /// guard that the default 10_000 sat floor would otherwise mask.
+    pub min_swap_amount: u64,
+}
+
+impl Default for MakerFeeOverride {
+    fn default() -> Self {
+        Self {
+            base_fee: 500,
+            amount_relative_fee_pct: 0.0025,
+            min_swap_amount: 10_000,
+        }
+    }
+}
+
 impl TestFramework {
+    /// Path to the taker's debug.log inside this framework's temp dir.
+    pub fn taker_log_path(&self) -> String {
+        format!("{}/taker/debug.log", self.temp_dir.display())
+    }
+
     /// Assert that a log message exists in the debug.log file
     pub fn assert_log(&self, expected_message: &str, log_path: &str) {
         match std::fs::read_to_string(log_path) {
@@ -684,8 +921,10 @@ impl TestFramework {
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        Self::init_with_blocklist_setting::<B>(
+        let fee_overrides = vec![None; makers_config_map.len()];
+        Self::init_with_settings::<B>(
             makers_config_map,
+            fee_overrides,
             taker_behavior,
             maker_behaviors,
             false,
@@ -699,21 +938,48 @@ impl TestFramework {
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        Self::init_with_blocklist_setting::<B>(
+        let fee_overrides = vec![None; makers_config_map.len()];
+        Self::init_with_settings::<B>(
             makers_config_map,
+            fee_overrides,
             taker_behavior,
             maker_behaviors,
             true,
         )
     }
 
+    /// Like [`TestFramework::init`], but each maker advertises its own fee
+    /// schedule. Heterogeneous offers are what makes spare substitution derive
+    /// a different next-hop shape than the failed maker's.
     #[allow(clippy::type_complexity)]
-    fn init_with_blocklist_setting<B: TestBackend>(
+    pub fn init_with_fee_overrides<B: TestBackend>(
         makers_config_map: Vec<(u16, Option<u16>)>,
+        fee_overrides: Vec<Option<MakerFeeOverride>>,
+        taker_behavior: Vec<TakerBehavior>,
+        maker_behaviors: Vec<MakerBehavior>,
+    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
+        Self::init_with_settings::<B>(
+            makers_config_map,
+            fee_overrides,
+            taker_behavior,
+            maker_behaviors,
+            false,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn init_with_settings<B: TestBackend>(
+        makers_config_map: Vec<(u16, Option<u16>)>,
+        fee_overrides: Vec<Option<MakerFeeOverride>>,
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
         check_blocklist: bool,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
+        assert_eq!(
+            fee_overrides.len(),
+            makers_config_map.len(),
+            "one fee override slot per maker"
+        );
         // Setup directory — use a unique suffix so tests can run in parallel
         let unique_id = format!("openswap-{}", rand::random::<u64>());
         let temp_dir = env::temp_dir().join(unique_id);
@@ -723,17 +989,32 @@ impl TestFramework {
         }
         setup_logger(log::LevelFilter::Debug, Some(temp_dir.clone()));
         log::info!("📁 temporary directory : {}", temp_dir.display());
-        let zmq_addr = format!("tcp://127.0.0.1:{}", 28332 + rand::random::<u16>() % 1000);
-        let bitcoind = init_bitcoind(&temp_dir, zmq_addr.clone());
+        let (bitcoind, zmq_addr) = (0..3)
+            .find_map(|_| {
+                let zmq_addr = format!("tcp://127.0.0.1:{}", free_ports(1)[0]);
+                init_bitcoind(&temp_dir, zmq_addr.clone())
+                    .ok()
+                    .map(|b| (b, zmq_addr))
+            })
+            .expect("bitcoind failed to start on three fresh ZMQ ports");
         let rpc_config = CoreRpcConfig {
             url: bitcoind.rpc_url().split_at(7).1.to_string(),
             auth: Auth::CookieFile(bitcoind.params.cookie_file.clone()),
             ..Default::default()
         };
-        let nostr_port = 8000 + rand::random::<u16>() % 1000;
+        let (nostr_port, nostr_relay) = (0..3)
+            .find_map(|_| {
+                let port = free_ports(1)[0];
+                let mut relay = spawn_nostr_relay(&temp_dir, port);
+                if wait_for_relay_healthy(port, &mut relay) {
+                    Some((port, relay))
+                } else {
+                    let _ = relay.kill().and_then(|_| relay.wait());
+                    None
+                }
+            })
+            .expect("nostr relay failed to start on three fresh ports");
         let nostr_relay_url = format!("ws://127.0.0.1:{nostr_port}");
-        let nostr_relay = spawn_nostr_relay(&temp_dir, nostr_port);
-        wait_for_relay_healthy(nostr_port);
         let mut electrsd: Option<ElectrsD> = None;
         let (takers, makers) = {
             let mut electrum_url: Option<String> = None;
@@ -773,29 +1054,35 @@ impl TestFramework {
                 })
                 .collect();
 
-            let mut base_rpc_port = 4500 + (rand::random::<u16>() % 5000);
-            let base_maker_port = 10000 + rand::random::<u16>() % 40000;
+            // Reserved sockets, one block per role, held until each maker
+            // takes its pair at server start. Network ports must ascend with
+            // the maker index: the taker sorts makers by address, so port
+            // order decides route order and the golden balances.
+            let mut network_listeners = reserve_listeners(makers_config_map.len()).into_iter();
+            let mut rpc_listeners = reserve_listeners(makers_config_map.len()).into_iter();
 
             // Create the MakerServers with message handling
             let makers: Vec<Arc<MakerServer>> = makers_config_map
                 .into_iter()
                 .enumerate()
                 .map(|(i, _)| {
-                    base_rpc_port += 1;
-                    let network_port = base_maker_port + i as u16;
+                    let network_listener = network_listeners.next().expect("one port per maker");
+                    let rpc_listener = rpc_listeners.next().expect("one port per maker");
+                    let network_port = network_listener.local_addr().unwrap().port();
                     let maker_id = format!("maker{network_port}");
                     thread::sleep(Duration::from_secs(5)); // Avoid resource unavailable error
                     let backend =
                         B::make_backend_config(&rpc_config, &zmq_addr, &mut ensure_electrum_url);
+                    let fee = fee_overrides.get(i).copied().flatten();
                     let config = MakerServerConfig {
                         data_dir: temp_dir.join(network_port.to_string()),
                         wallet_name: maker_id,
                         network_port,
-                        rpc_port: base_rpc_port,
-                        base_fee: 500,
-                        amount_relative_fee_pct: 0.0025,
+                        rpc_port: rpc_listener.local_addr().unwrap().port(),
+                        base_fee: fee.map_or(500, |f| f.base_fee),
+                        amount_relative_fee_pct: fee.map_or(0.0025, |f| f.amount_relative_fee_pct),
                         time_relative_fee_pct: 0.0001,
-                        min_swap_amount: 10_000,
+                        min_swap_amount: fee.map_or(10_000, |f| f.min_swap_amount),
                         required_confirms: 1,
                         check_blocklist,
                         supported_protocols: vec![
@@ -815,6 +1102,8 @@ impl TestFramework {
 
                     let mut server = MakerServer::init(config).unwrap();
                     server.behavior = maker_behaviors.get(i).copied().unwrap_or_default();
+                    *server.reserved_network_listener.lock().unwrap() = Some(network_listener);
+                    *server.reserved_rpc_listener.lock().unwrap() = Some(rpc_listener);
                     Arc::new(server)
                 })
                 .collect();
@@ -940,6 +1229,15 @@ impl TestFramework {
         if self.temp_dir.exists() {
             let _ = fs::remove_dir_all(&self.temp_dir);
         }
+    }
+
+    /// Drops the takers, stops the framework, then joins the block generator.
+    /// Joining before stopping would hang the miner thread.
+    #[allow(dead_code)]
+    pub fn finish(&self, takers: Vec<Taker>, block_generation_handle: JoinHandle<()>) {
+        drop(takers);
+        self.stop();
+        block_generation_handle.join().unwrap();
     }
 }
 
@@ -1068,7 +1366,7 @@ pub fn spawn_tracker_logger(data_dir: PathBuf, interval: Duration) -> TrackerLog
 
 /// Spawns a dedicated `nostr-rs-relay` process for a single test.
 ///
-/// Each test gets its own relay on its own random port with an in-memory
+/// Each test gets its own relay on its own OS-assigned port with an in-memory
 /// database, so concurrently running tests never share nostr state. The relay
 /// binary is located via the `OPENSWAP_TEST_NOSTR_RELAY_BIN` env var, falling
 /// back to `nostr-rs-relay` on `PATH`.
@@ -1076,7 +1374,7 @@ fn spawn_nostr_relay(temp_dir: &Path, port: u16) -> Child {
     let data_dir = temp_dir.join("nostr-relay");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // Minimal per-test relay config: bind the random port and use an in-memory
+    // Minimal per-test relay config: bind the given port and use an in-memory
     // SQLite DB so nothing persists across or leaks between tests.
     let config_path = data_dir.join("config.toml");
     let config = format!(
@@ -1102,20 +1400,27 @@ fn spawn_nostr_relay(temp_dir: &Path, port: u16) -> Child {
         })
 }
 
-fn wait_for_relay_healthy(port: u16) {
-    let addr = format!("127.0.0.1:{port}");
-    let timeout = Duration::from_secs(10);
+/// Healthy means the child is alive AND a real WebSocket handshake completes:
+/// a bare TCP connect can answer from an unrelated listener holding the port
+/// after our relay died mid-spawn.
+fn wait_for_relay_healthy(port: u16, child: &mut Child) -> bool {
+    let url = format!("ws://127.0.0.1:{port}");
     let start = Instant::now();
 
-    while start.elapsed() < timeout {
-        if TcpStream::connect(&addr).is_ok() {
+    while start.elapsed() < Duration::from_secs(10) {
+        if let Ok(Some(status)) = child.try_wait() {
+            log::warn!("Nostr relay exited early ({status}) on port {port}");
+            return false;
+        }
+        if tungstenite::connect(&url).is_ok() {
             log::info!("Nostr relay is alive on port {port}");
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 
     log::warn!("Nostr relay did not become healthy on port {port} within 10s");
+    false
 }
 
 /// Verifies that a swap report file contains the expected number of deniability proofs,
