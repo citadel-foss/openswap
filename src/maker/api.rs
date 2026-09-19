@@ -44,8 +44,10 @@ use super::{
     swap_tracker::MakerSwapTracker,
 };
 
-/// Minimum swap amount in satoshis.
-pub const MIN_SWAP_AMOUNT: u64 = 10_000;
+/// Default minimum swap amount in satoshis for maker configuration.
+pub const DEFAULT_MIN_SWAP_AMOUNT: u64 = 10_000;
+/// Deprecated alias for backwards compatibility.
+pub const MIN_SWAP_AMOUNT: u64 = DEFAULT_MIN_SWAP_AMOUNT;
 
 /// Swap state tracked per swap_id (persisted across connections).
 #[derive(Debug, Clone)]
@@ -126,7 +128,8 @@ pub struct MakerServerConfig {
     pub amount_relative_fee_pct: f64,
     /// Time-relative fee percentage.
     pub time_relative_fee_pct: f64,
-    /// Minimum swap amount in satoshis.
+    /// Operator-configured economic minimum swap amount in satoshis.
+    /// Technical fee, dust, and spendability floors are enforced separately.
     pub min_swap_amount: u64,
     /// Required confirmations for funding transactions.
     pub required_confirms: u32,
@@ -230,15 +233,26 @@ impl MakerServerConfig {
             config_map.get("min_swap_amount"),
             default_config.min_swap_amount,
         );
-        if min_swap_amount < MIN_SWAP_AMOUNT {
+        let technical_floor = default_config
+            .supported_protocols
+            .iter()
+            .map(|p| crate::utill::per_output_floor(*p, crate::utill::MIN_FEE_RATE))
+            .max()
+            .unwrap_or_else(|| {
+                crate::utill::per_output_floor(
+                    crate::protocol::ProtocolVersion::Legacy,
+                    crate::utill::MIN_FEE_RATE,
+                )
+            });
+        if min_swap_amount < technical_floor {
             log::error!(
-                "Configured min_swap_amount {} is below protocol minimum {} sats",
+                "Configured min_swap_amount {} is below technical dust/fee floor {} sats",
                 min_swap_amount,
-                MIN_SWAP_AMOUNT
+                technical_floor
             );
             return Err(WalletError::InsufficientFund {
                 available: min_swap_amount,
-                required: MIN_SWAP_AMOUNT,
+                required: technical_floor,
             });
         }
 
@@ -1186,15 +1200,6 @@ impl MakerTrait for MakerServer {
 
         let config = self.get_config();
 
-        // Check amount is within bounds
-        let amount_sat = details.amount.to_sat();
-        if amount_sat < config.min_swap_amount {
-            return Err(MakerError::General("Swap amount below minimum"));
-        }
-        if amount_sat > config.max_swap_amount {
-            return Err(MakerError::General("Swap amount above maximum"));
-        }
-
         // Check protocol is supported
         if !self
             .config
@@ -1202,6 +1207,45 @@ impl MakerTrait for MakerServer {
             .contains(&details.protocol_version)
         {
             return Err(MakerError::General("Protocol version not supported"));
+        }
+
+        let amount_sat = details.amount.to_sat();
+
+        // Technical constraint 1: Swap amount must strictly exceed the maker's own fee schedule
+        let own_fee = self
+            .calculate_swap_fee(details.amount, details.refund_locktime_offset as u32)
+            .to_sat();
+        if amount_sat <= own_fee {
+            log::warn!(
+                "Swap amount {} sats cannot cover maker fee of {} sats",
+                amount_sat,
+                own_fee
+            );
+            return Err(MakerError::General("Swap amount does not exceed maker fee"));
+        }
+
+        // Technical constraint 2: Each split output must be above dust and cover its spend cost
+        let per_output =
+            crate::utill::per_output_floor(details.protocol_version, crate::utill::MIN_FEE_RATE);
+        let output_minimum = (details.tx_count.max(1) as u64).saturating_mul(per_output);
+        if amount_sat < output_minimum {
+            log::warn!(
+                "Swap amount {} sats is below output spendability floor {} sats (tx_count={})",
+                amount_sat,
+                output_minimum,
+                details.tx_count
+            );
+            return Err(MakerError::General(
+                "Swap amount below output spendability floor",
+            ));
+        }
+
+        // Operator economic bounds
+        if amount_sat < config.min_swap_amount {
+            return Err(MakerError::General("Swap amount below minimum"));
+        }
+        if amount_sat > config.max_swap_amount {
+            return Err(MakerError::General("Swap amount above maximum"));
         }
 
         // Check maker has enough liquidity to fund the outgoing swap
@@ -2123,6 +2167,34 @@ mod tests {
         assert_eq!(resolve("inf"), MIN_RELAY_FEE_RATE);
         assert_eq!(resolve("0.5"), MIN_RELAY_FEE_RATE);
         assert_eq!(resolve("3.0"), 3.0);
+    }
+
+    #[test]
+    fn min_swap_amount_allows_flexible_economic_floor_above_dust() {
+        let timelock = if cfg!(feature = "integration-test") {
+            1
+        } else {
+            15_000
+        };
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // An economic floor of 1,000 sats is above technical dust/fee floor (554 sats) and must be accepted
+        std::fs::write(
+            &path,
+            format!("fidelity_timelock = {timelock}\nmin_swap_amount = 1000\n"),
+        )
+        .unwrap();
+        let config = MakerServerConfig::new(Some(&path)).unwrap();
+        assert_eq!(config.min_swap_amount, 1000);
+
+        // An amount below the admission MIN_FEE_RATE floor (e.g. 500 sats < 554 sats) must be rejected
+        std::fs::write(
+            &path,
+            format!("fidelity_timelock = {timelock}\nmin_swap_amount = 500\n"),
+        )
+        .unwrap();
+        assert!(MakerServerConfig::new(Some(&path)).is_err());
     }
 
     /// Keeps wallet inspection usable without clearing the terminal server latch.

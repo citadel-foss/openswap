@@ -52,7 +52,7 @@ required_confirms = 1
 - `socks_port`: The Tor Socks Port.  Check the [tor doc](tor.md) for more details.
 - `control_port`: The Tor Control Port. Check the [tor doc](tor.md) for more details.
 - `tor_auth_password`: Optional password for Tor control authentication; empty by default.
-- `min_swap_amount`: Minimum swap amount (in satoshis). Values below the protocol minimum of 10,000 sats are rejected at startup.
+- `min_swap_amount`: Minimum swap amount (in satoshis) the maker will accept as an economic floor (defaults to 10,000 sats). The protocol also enforces a technical floor at admission derived from output dust limits, spend vbytes, and fee schedules.
 - `fidelity_amount`: Amount (in satoshis) locked as a fidelity bond to deter Sybil attacks. Defaults to 10,000 sats.
 - `fidelity_timelock`: Lock duration in block heights for the fidelity bond. Defaults to 15,000 blocks; must be within the accepted range of 12,960–25,920 blocks.
 - `fidelity_feerate`: Fee rate (in sats/vB) for the fidelity bond transaction. Defaults to 2.0; lower values are allowed, but anything below the relay minimum of 1.0 sats/vB is clamped to 1.0.

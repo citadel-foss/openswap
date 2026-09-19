@@ -931,7 +931,6 @@ impl Taker {
         let swap_id = format!("{:016x}", OsRng.next_u64());
         log::info!("Preparing openswap with id: {}", swap_id);
 
-        let maker_count = params.maker_count;
         let should_sync_offerbook = params.preferred_makers.is_none();
 
         self.ongoing_swap = Some(OngoingSwapState {
@@ -997,41 +996,14 @@ impl Taker {
         let swap = self.swap_state()?;
         let send_amount = swap.params.send_amount;
         let protocol = swap.params.protocol;
-        let mut maker_fees = Vec::with_capacity(maker_count);
-        let mut amount_sats = send_amount.to_sat() as f64;
-
-        for (i, mc) in swap.makers.iter().enumerate() {
-            let locktime =
-                REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - i - 1) as u16;
-
-            let (base_fee, amt_pct, time_pct) = match &mc.offer {
-                Some(offer) => (
-                    offer.base_fee,
-                    offer.amount_relative_fee_pct,
-                    offer.time_relative_fee_pct,
-                ),
-                None => (0, 0.0, 0.0),
-            };
-
-            let fee = base_fee as f64
-                + (amount_sats * amt_pct) / 100.0
-                + (amount_sats * locktime as f64 * time_pct) / 100.0;
-            let fee_sats = fee.ceil() as u64;
-
-            maker_fees.push(MakerFeeInfo {
-                address: mc.address.to_string(),
-                protocol: mc.protocol,
-                base_fee,
-                amount_relative_fee_pct: amt_pct,
-                time_relative_fee_pct: time_pct,
-                locktime,
-                estimated_fee_sats: fee_sats,
-            });
-
-            amount_sats = (amount_sats - fee).max(0.0);
-        }
-
-        let total_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
+        let maker_hops: Vec<(String, ProtocolVersion, Option<Offer>)> = swap
+            .makers
+            .iter()
+            .map(|mc| (mc.address.to_string(), mc.protocol, mc.offer.clone()))
+            .collect();
+        let per_hop_mining_fee = estimate_funding_tx_fee_sats() * swap.params.tx_count as u64;
+        let (maker_fees, total_fee_sats) =
+            Self::compute_route_maker_fees(send_amount, &maker_hops, per_hop_mining_fee)?;
         let estimated_receive = send_amount
             .checked_sub(Amount::from_sat(total_fee_sats))
             .unwrap_or(Amount::ZERO);
@@ -1794,12 +1766,19 @@ impl Taker {
             )));
         }
 
-        // Base fee must not exceed the send amount (that would consume everything)
-        if offer.base_fee > send_amount.to_sat() {
+        // Full maker fee must not consume or exceed the send amount
+        let maker_fee = crate::protocol::contract::calculate_swap_fee(
+            send_amount.to_sat(),
+            offer.minimum_locktime,
+            offer.base_fee,
+            offer.amount_relative_fee_pct,
+            offer.time_relative_fee_pct,
+        );
+        if maker_fee >= send_amount.to_sat() {
             return Err(TakerError::General(format!(
-                "Maker {} offer base_fee ({} sats) exceeds send amount ({} sats)",
+                "Maker {} total fee ({} sats) consumes send amount ({} sats)",
                 maker_idx,
-                offer.base_fee,
+                maker_fee,
                 send_amount.to_sat()
             )));
         }
@@ -1828,6 +1807,57 @@ impl Taker {
         }
 
         Ok(())
+    }
+
+    /// Compute cumulative maker fees across all hops on a route and ensure they do not consume the send amount.
+    pub(crate) fn compute_route_maker_fees(
+        send_amount: Amount,
+        makers: &[(String, ProtocolVersion, Option<Offer>)],
+        per_hop_mining_fee: u64,
+    ) -> Result<(Vec<MakerFeeInfo>, u64), TakerError> {
+        let maker_count = makers.len();
+        let mut maker_fees = Vec::with_capacity(maker_count);
+        let mut amount_sats = send_amount.to_sat();
+
+        for (i, (address, protocol, offer_opt)) in makers.iter().enumerate() {
+            let locktime =
+                REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - i - 1) as u16;
+
+            let (base_fee, amt_pct, time_pct) = match offer_opt {
+                Some(offer) => (
+                    offer.base_fee,
+                    offer.amount_relative_fee_pct,
+                    offer.time_relative_fee_pct,
+                ),
+                None => (0, 0.0, 0.0),
+            };
+
+            let fee = base_fee as f64
+                + (amount_sats as f64 * amt_pct) / 100.0
+                + (amount_sats as f64 * locktime as f64 * time_pct) / 100.0;
+            let fee_sats = fee.ceil() as u64;
+
+            maker_fees.push(MakerFeeInfo {
+                address: address.clone(),
+                protocol: *protocol,
+                base_fee,
+                amount_relative_fee_pct: amt_pct,
+                time_relative_fee_pct: time_pct,
+                locktime,
+                estimated_fee_sats: fee_sats,
+            });
+
+            amount_sats = amount_sats.saturating_sub(fee_sats + per_hop_mining_fee);
+        }
+
+        let total_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
+        if total_fee_sats >= send_amount.to_sat() {
+            return Err(TakerError::General(
+                "Cumulative maker fees consume the send amount".into(),
+            ));
+        }
+
+        Ok((maker_fees, total_fee_sats))
     }
 
     /// Substitute a maker at the given route index with a spare, then negotiate with it.

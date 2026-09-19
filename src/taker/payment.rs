@@ -405,4 +405,220 @@ mod tests {
         let hop = terms(0, 60.0, 0.5, 100);
         assert!(hop_gross_for_net(&hop, 0, 500_000).is_err());
     }
+
+    #[test]
+    fn validate_offer_rejects_fee_exceeding_send_amount() {
+        use bitcoin::hashes::Hash;
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let secp_pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+        let pubkey = bitcoin::PublicKey::new(secp_pubkey);
+
+        let bond = crate::wallet::FidelityBond {
+            outpoint: bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([2; 32]),
+                vout: 0,
+            },
+            amount: Amount::from_sat(1000),
+            lock_time: bitcoin::locktime::absolute::LockTime::from_height(1000)
+                .expect("valid height locktime"),
+            pubkey,
+            conf_height: Some(1000),
+            is_spent: false,
+            bond_index: 0,
+            tx: None,
+        };
+
+        let cert_hash = bond.generate_cert_hash("127.0.0.1:8000", &pubkey);
+        let msg = bitcoin::secp256k1::Message::from_digest_slice(cert_hash.as_byte_array())
+            .expect("32-byte digest");
+        let cert_sig = secp.sign_ecdsa(&msg, &secret_key);
+
+        let offer = crate::protocol::common_messages::Offer {
+            base_fee: 1000,
+            amount_relative_fee_pct: 10.0,
+            time_relative_fee_pct: 0.1,
+            required_confirms: 1,
+            minimum_locktime: 100,
+            max_size: 1_000_000,
+            min_size: 100,
+            tweakable_point: pubkey,
+            fidelity: crate::protocol::common_messages::FidelityProof {
+                bond,
+                cert_hash,
+                cert_sig,
+            },
+            tweak_chain_code: bitcoin::bip32::ChainCode::from([0u8; 32]),
+        };
+
+        // Send amount of 1,000 sats: base fee 1000 + rel fee 100 + time fee 100 = 1200 >= 1000 -> must error
+        assert!(Taker::validate_offer(&offer, 0, Amount::from_sat(1000)).is_err());
+
+        // Send amount of 2,000 sats: base fee 1000 + rel fee 200 + time fee 200 = 1400 < 2000 -> must pass
+        assert!(Taker::validate_offer(&offer, 0, Amount::from_sat(2000)).is_ok());
+    }
+
+    #[test]
+    fn cumulative_route_fees_consuming_send_amount() {
+        use super::TakerError;
+        use crate::protocol::{
+            common_messages::{FidelityProof, Offer},
+            ProtocolVersion,
+        };
+        use bitcoin::hashes::Hash;
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let secp_pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+        let pubkey = bitcoin::PublicKey::new(secp_pubkey);
+
+        let bond = crate::wallet::FidelityBond {
+            outpoint: bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([3; 32]),
+                vout: 0,
+            },
+            amount: Amount::from_sat(1000),
+            lock_time: bitcoin::locktime::absolute::LockTime::from_height(1000)
+                .expect("valid height locktime"),
+            pubkey,
+            conf_height: Some(1000),
+            is_spent: false,
+            bond_index: 0,
+            tx: None,
+        };
+
+        let cert_hash = bond.generate_cert_hash("127.0.0.1:8000", &pubkey);
+        let msg = bitcoin::secp256k1::Message::from_digest_slice(cert_hash.as_byte_array())
+            .expect("32-byte digest");
+        let cert_sig = secp.sign_ecdsa(&msg, &secret_key);
+
+        let mock_offer = |base_fee: u64| -> Option<Offer> {
+            Some(Offer {
+                base_fee,
+                amount_relative_fee_pct: 0.0,
+                time_relative_fee_pct: 0.0,
+                required_confirms: 1,
+                minimum_locktime: 100,
+                max_size: 1_000_000,
+                min_size: 100,
+                tweakable_point: pubkey,
+                fidelity: FidelityProof {
+                    bond: bond.clone(),
+                    cert_hash,
+                    cert_sig,
+                },
+                tweak_chain_code: bitcoin::bip32::ChainCode::from([0u8; 32]),
+            })
+        };
+
+        // Two hops with 600 sat base fee each on 1000 sat send amount:
+        // Individual offers (< 1000) pass validate_offer, but cumulative route total (1200 sats) >= send_amount
+        let hops = vec![
+            (
+                "127.0.0.1:8001".to_string(),
+                ProtocolVersion::Taproot,
+                mock_offer(600),
+            ),
+            (
+                "127.0.0.1:8002".to_string(),
+                ProtocolVersion::Taproot,
+                mock_offer(600),
+            ),
+        ];
+
+        let err = Taker::compute_route_maker_fees(Amount::from_sat(1000), &hops, 0).unwrap_err();
+        assert!(
+            matches!(err, TakerError::General(ref msg) if msg.contains("Cumulative maker fees consume the send amount")),
+            "Expected cumulative fee exhaustion error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn route_maker_fees_advances_forwarded_amount_with_mining_fee() {
+        use super::Taker;
+        use crate::protocol::{
+            common_messages::{FidelityProof, Offer},
+            ProtocolVersion,
+        };
+        use bitcoin::hashes::Hash;
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let secp_pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+        let pubkey = bitcoin::PublicKey::new(secp_pubkey);
+
+        let bond = crate::wallet::FidelityBond {
+            outpoint: bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([4; 32]),
+                vout: 0,
+            },
+            amount: Amount::from_sat(1000),
+            lock_time: bitcoin::locktime::absolute::LockTime::from_height(1000)
+                .expect("valid height locktime"),
+            pubkey,
+            conf_height: Some(1000),
+            is_spent: false,
+            bond_index: 0,
+            tx: None,
+        };
+
+        let cert_hash = bond.generate_cert_hash("127.0.0.1:8000", &pubkey);
+        let msg = bitcoin::secp256k1::Message::from_digest_slice(cert_hash.as_byte_array())
+            .expect("32-byte digest");
+        let cert_sig = secp.sign_ecdsa(&msg, &secret_key);
+
+        // Hop 0: 10% amount fee, 0 base fee. On 10,000 sats -> 1,000 sats fee.
+        // With per_hop_mining_fee = 500, amount forwarded to Hop 1 is 10,000 - 1,000 - 500 = 8,500 sats.
+        // Hop 1: 10% amount fee. On 8,500 sats -> 850 sats fee.
+        let hops = vec![
+            (
+                "127.0.0.1:8001".to_string(),
+                ProtocolVersion::Taproot,
+                Some(Offer {
+                    base_fee: 0,
+                    amount_relative_fee_pct: 10.0,
+                    time_relative_fee_pct: 0.0,
+                    required_confirms: 1,
+                    minimum_locktime: 100,
+                    max_size: 1_000_000,
+                    min_size: 100,
+                    tweakable_point: pubkey,
+                    fidelity: FidelityProof {
+                        bond: bond.clone(),
+                        cert_hash,
+                        cert_sig,
+                    },
+                    tweak_chain_code: bitcoin::bip32::ChainCode::from([0u8; 32]),
+                }),
+            ),
+            (
+                "127.0.0.1:8002".to_string(),
+                ProtocolVersion::Taproot,
+                Some(Offer {
+                    base_fee: 0,
+                    amount_relative_fee_pct: 10.0,
+                    time_relative_fee_pct: 0.0,
+                    required_confirms: 1,
+                    minimum_locktime: 100,
+                    max_size: 1_000_000,
+                    min_size: 100,
+                    tweakable_point: pubkey,
+                    fidelity: FidelityProof {
+                        bond,
+                        cert_hash,
+                        cert_sig,
+                    },
+                    tweak_chain_code: bitcoin::bip32::ChainCode::from([0u8; 32]),
+                }),
+            ),
+        ];
+
+        let (fees, total) =
+            Taker::compute_route_maker_fees(Amount::from_sat(10_000), &hops, 500).unwrap();
+        assert_eq!(fees[0].estimated_fee_sats, 1000);
+        assert_eq!(fees[1].estimated_fee_sats, 850);
+        assert_eq!(total, 1850);
+    }
 }

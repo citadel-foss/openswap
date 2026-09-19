@@ -124,6 +124,11 @@ pub fn get_taker_dir() -> io::Result<PathBuf> {
     Ok(get_data_dir()?.join("taker"))
 }
 
+/// P2WSH ECDSA: 2 sigs/sig+preimage + full redeemscript (~149 vB)
+pub const LEGACY_CONTRACT_SPEND_VSIZE: u64 = 150;
+/// Taproot key-path: one 64B Schnorr sig, no script (~111 vB)
+pub const TAPROOT_KEYPATH_VSIZE: u64 = 112;
+
 /// Creates a FeeRate from the global MIN_FEE_RATE constant
 /// This provides type-safe fee calculations throughout the codebase
 pub fn get_min_fee_rate() -> Option<FeeRate> {
@@ -137,6 +142,41 @@ pub fn calculate_fee_sats(vbytes: u64) -> u64 {
         .fee_vb(vbytes)
         .expect("fee calculation should not overflow")
         .to_sat()
+}
+
+/// Calculate fee in satoshis for given virtual bytes at a specific feerate (sats/vB).
+pub fn calculate_fee_sats_at_feerate(vbytes: u64, feerate: f64) -> u64 {
+    let feerate = if feerate.is_finite() {
+        feerate.max(MIN_RELAY_FEE_RATE)
+    } else {
+        MIN_FEE_RATE
+    };
+    ((vbytes as f64) * feerate).ceil() as u64
+}
+
+/// Compute the technical minimum floor for a single swap output.
+///
+/// Each output created for a swap contract must carry enough value to:
+/// 1. Satisfy the Bitcoin script dust threshold (`minimal_non_dust()`).
+/// 2. Cover the future mining fee to sweep/spend the output at the given feerate.
+pub fn per_output_floor(protocol: crate::protocol::ProtocolVersion, feerate: f64) -> u64 {
+    use crate::protocol::ProtocolVersion;
+    let spend_vsize = match protocol {
+        ProtocolVersion::Legacy => LEGACY_CONTRACT_SPEND_VSIZE,
+        ProtocolVersion::Taproot => TAPROOT_KEYPATH_VSIZE,
+    };
+    let dummy_spk = match protocol {
+        ProtocolVersion::Legacy => ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::all_zeros()),
+        ProtocolVersion::Taproot => {
+            let dummy_xonly = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[2u8; 32]).unwrap();
+            ScriptBuf::new_p2tr_tweaked(bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+                dummy_xonly,
+            ))
+        }
+    };
+    let dust = dummy_spk.minimal_non_dust().to_sat();
+    let spend_fee = calculate_fee_sats_at_feerate(spend_vsize, feerate);
+    dust.saturating_add(spend_fee)
 }
 
 /// Estimated on-chain miner cost (sats) a maker bears per swap contract: a funding tx
@@ -1586,5 +1626,24 @@ mod tests {
             assert!(msg.contains("Address Network Mismatch"));
             assert!(msg.contains("Details"));
         }
+    }
+
+    #[test]
+    fn test_per_output_floor_derivation() {
+        use crate::protocol::ProtocolVersion;
+
+        // Dust for segwit/taproot is 330 sats.
+        // For feerate 2.0:
+        // Taproot (112 vB): 330 + ceil(112 * 2.0) = 330 + 224 = 554 sats.
+        // Legacy (150 vB): 330 + ceil(150 * 2.0) = 330 + 300 = 630 sats.
+        let taproot_floor = per_output_floor(ProtocolVersion::Taproot, 2.0);
+        assert_eq!(taproot_floor, 554);
+
+        let legacy_floor = per_output_floor(ProtocolVersion::Legacy, 2.0);
+        assert_eq!(legacy_floor, 630);
+
+        // Sub-relay feerates (e.g. 0.5) must clamp to MIN_RELAY_FEE_RATE (1.0).
+        let taproot_relay_floor = per_output_floor(ProtocolVersion::Taproot, 0.5);
+        assert_eq!(taproot_relay_floor, 330 + 112); // 442 sats
     }
 }
