@@ -8,7 +8,7 @@ use bitcoin::Amount;
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
+    taker::{BanReason, BanRecord, MakerState, SwapParams, TakerBehavior},
 };
 
 use super::test_framework::*;
@@ -584,4 +584,126 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>(maker1: (u16, u16), maker2
     tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
+}
+
+/// A maker that answers normally but never sends its funding is not a dropped
+/// connection: the taker waits, our own node confirms every tx is absent, and
+/// that maker alone is banned.
+fn run_withheld_funding_bans_its_maker<B: TestBackend>(
+    protocol: ProtocolVersion,
+    maker1: (u16, u16),
+    maker2: (u16, u16),
+) {
+    warn!("Running Test: Withheld Funding Bans Its Maker ({protocol:?})");
+
+    let makers_config_map = vec![(maker1.0, Some(maker1.1)), (maker2.0, Some(maker2.1))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![
+        MakerBehavior::Normal,
+        MakerBehavior::WithholdFundingSilently,
+    ];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || {
+                start_server(maker_clone).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+
+    let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+
+    generate_blocks(bitcoind, 1);
+    test_framework.wait_for_electrs_tip();
+
+    let summary = taker
+        .prepare_swap(swap_params)
+        .expect("Prepare should succeed");
+    let swap_result = taker.start_swap(&summary.swap_id);
+    assert!(
+        swap_result.is_err(),
+        "Swap must fail when a maker withholds its funding"
+    );
+    info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
+
+    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standing_of = |port: u16| {
+        standings
+            .iter()
+            .find(|m| m.address.to_string() == format!("127.0.0.1:{port}"))
+            .unwrap_or_else(|| panic!("maker on {} must be in the offerbook", port))
+            .state
+            .clone()
+    };
+
+    let withholder = standing_of(makers[1].config.network_port);
+    assert!(
+        matches!(
+            withholder,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::FundingWithheld,
+                ..
+            })
+        ),
+        "the maker that withheld funding must be banned, got {:?}",
+        withholder
+    );
+
+    let honest = standing_of(makers[0].config.network_port);
+    assert!(
+        !matches!(honest, MakerState::Banned(_)),
+        "the honest maker must not be blamed, got {:?}",
+        honest
+    );
+
+    info!("Withheld funding test completed successfully!");
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+#[test]
+fn withheld_taproot_funding_bans_only_its_own_maker() {
+    run_withheld_funding_bans_its_maker::<BitcoindBackend>(
+        ProtocolVersion::Taproot,
+        (22102, 22111),
+        (22202, 22112),
+    );
+}
+
+#[test]
+fn withheld_legacy_funding_bans_only_its_own_maker() {
+    run_withheld_funding_bans_its_maker::<BitcoindBackend>(
+        ProtocolVersion::Legacy,
+        (22302, 22113),
+        (22402, 22114),
+    );
+}
+
+/// Same policy on Electrum: the indexer's definite "no such transaction" is
+/// taken at its word, exactly as our own node's would be.
+#[test]
+fn withheld_taproot_funding_bans_only_its_own_maker_electrum() {
+    run_withheld_funding_bans_its_maker::<ElectrumBackend>(
+        ProtocolVersion::Taproot,
+        (22902, 22119),
+        (23002, 22120),
+    );
 }

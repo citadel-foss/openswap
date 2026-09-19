@@ -13,7 +13,11 @@ use openswap::{
     wallet::{AddressType, CoreRpcConfig, Wallet},
 };
 use serde_json::{json, to_string_pretty};
-use std::{path::PathBuf, str::FromStr};
+use std::{
+    path::PathBuf,
+    str::FromStr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 /// A simple command line app to operate as openswap client.
 ///
@@ -254,21 +258,28 @@ fn display_makers_with_summary(
     wallet: &Wallet,
     makers: &[MakerOfferCandidate],
 ) -> Result<(), TakerError> {
-    let (mut good, mut bad, mut unresponsive) = (0, 0, 0);
+    let (mut good, mut banned, mut unavailable) = (0, 0, 0);
     let (tip_height, tip_time) = wallet.chain_tip()?;
+    let now_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
     for maker in makers {
         match maker.state {
             MakerState::Good => good += 1,
-            MakerState::Bad => bad += 1,
-            MakerState::Unresponsive { .. } => unresponsive += 1,
+            MakerState::Banned(_) => banned += 1,
+            MakerState::Unavailable(_) => unavailable += 1,
         }
-        println!("{}", display_offer(wallet, maker, tip_height, tip_time)?);
+        println!(
+            "{}",
+            display_offer(wallet, maker, tip_height, tip_time, now_ts)?
+        );
     }
     println!(
-        "\nOfferbook summary → good: {}, bad: {}, unresponsive: {} (total: {})",
+        "\nOfferbook summary → good: {}, banned: {}, unavailable: {} (total: {})",
         good,
-        bad,
-        unresponsive,
+        banned,
+        unavailable,
         makers.len()
     );
     Ok(())
@@ -280,6 +291,7 @@ fn display_offer(
     candidate: &MakerOfferCandidate,
     tip_height: u64,
     tip_time: u64,
+    now_ts: u64,
 ) -> Result<String, TakerError> {
     let header = format!(
         r#"
@@ -295,7 +307,7 @@ fn display_offer(
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_else(|| "Unknown".into()),
-        state = format_state(&candidate.state),
+        state = format_state(&candidate.state, now_ts),
     );
 
     let Some(offer) = &candidate.offer else {
@@ -567,7 +579,14 @@ fn main() -> Result<(), TakerError> {
             let result = taker.poll_maker(address.clone())?;
             let wallet = lock_debug!(taker.get_wallet().read()).unwrap();
             let (tip_height, tip_time) = wallet.chain_tip()?;
-            println!("{}", display_offer(&wallet, &result, tip_height, tip_time)?);
+            let now_ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_secs();
+            println!(
+                "{}",
+                display_offer(&wallet, &result, tip_height, tip_time, now_ts)?
+            );
         }
         Commands::RemoveMaker { address } => {
             let removed = taker.remove_maker(address.clone())?;

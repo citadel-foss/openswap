@@ -509,6 +509,17 @@ fn process_taproot_contract<M: Maker>(
             )));
         }
         let txid = outgoing.contract_tx.compute_txid();
+        // Answer normally but send nothing, so the taker waits on funding that
+        // never arrives rather than on a closed connection.
+        #[cfg(feature = "integration-test")]
+        if maker.behavior() == MakerBehavior::WithholdFundingSilently {
+            log::warn!(
+                "[{}] Test behavior: withholding Taproot funding tx {}",
+                maker.network_port(),
+                txid
+            );
+            continue;
+        }
         match maker.broadcast_transaction(&outgoing.contract_tx) {
             Ok(_) => {
                 log::info!(

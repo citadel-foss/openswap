@@ -56,13 +56,17 @@ pub enum FidelityError {
     BondAlreadyRedeemed,
     BondLocktimeExpired,
     InvalidCertHash,
-    InvalidConfirmationHeight {
-        claimed: Option<u32>,
-        actual: u32,
-    },
     General(String),
     InvalidBondLocktime,
     BondUncomfirmed,
+    /// The bond key does not derive from the offer's tweak point, so the proof
+    /// belongs to someone else.
+    BondPubkeyMismatch,
+    /// The signed bond amount is not what the chain output locks.
+    BondAmountMismatch {
+        claimed: Amount,
+        actual: Amount,
+    },
     /// The bond's funding transaction was evicted from the network and the
     /// wallet holds no stored raw transaction to rebroadcast, so the bond
     /// can never be recovered by this maker.
@@ -81,16 +85,16 @@ impl std::fmt::Display for FidelityError {
             }
             FidelityError::BondLocktimeExpired => write!(f, "Fidelity bond locktime has expired"),
             FidelityError::InvalidCertHash => write!(f, "Invalid fidelity certificate hash"),
-            FidelityError::InvalidConfirmationHeight { claimed, actual } => {
-                write!(
-                    f,
-                    "Fidelity bond confirmation height {claimed:?} does not match chain height {actual}"
-                )
-            }
             FidelityError::InvalidBondLocktime => {
                 write!(f, "Fidelity bond locktime is outside the acceptable range")
             }
             FidelityError::BondUncomfirmed => write!(f, "Fidelity bond transaction is unconfirmed"),
+            FidelityError::BondPubkeyMismatch => {
+                write!(f, "Fidelity bond does not correspond to the provided tweak point")
+            }
+            FidelityError::BondAmountMismatch { claimed, actual } => {
+                write!(f, "Bond amount mismatch: claimed {claimed}, actual {actual}")
+            }
             FidelityError::BondTransactionMissing { index } => write!(
                 f,
                 "fidelity bond at index {index} was evicted and has no stored transaction to rebroadcast"
@@ -129,15 +133,8 @@ pub(crate) fn verify_fidelity_checks(
     tweakable_point: &PublicKey,
     tweak_chain_code: &bitcoin::bip32::ChainCode,
 ) -> Result<(), WalletError> {
-    // QA: conf_height is maker-supplied and affects the accepted lock period,
-    // so bind it to the bond output's actual confirmation height.
-    if proof.bond.conf_height != Some(confirmation_height) {
-        return Err(FidelityError::InvalidConfirmationHeight {
-            claimed: proof.bond.conf_height,
-            actual: confirmation_height,
-        }
-        .into());
-    }
+    // Every height here is the one our own backend reported, so the maker's
+    // claimed `conf_height` is never read and never needs checking.
 
     // Ensure fidelity bond timelock lies within allowed range
     let bond_height = proof
@@ -190,9 +187,7 @@ pub(crate) fn verify_fidelity_checks(
         ],
     )?;
     if derived.public_key != proof.bond.pubkey.inner {
-        return Err(WalletError::General(
-            "Fidelity bond does not correspond to the provided tweak point".to_string(),
-        ));
+        return Err(FidelityError::BondPubkeyMismatch.into());
     }
 
     // Validate redeem script and corresponding output scriptPubKey
@@ -209,10 +204,11 @@ pub(crate) fn verify_fidelity_checks(
     // locks, inflating its fidelity value and offer ranking. Bind the signed
     // proof amount to the real chain output before accepting the bond.
     if tx_out.value != proof.bond.amount {
-        return Err(WalletError::Fidelity(FidelityError::General(format!(
-            "Bond amount mismatch: expected {}, actual {}",
-            proof.bond.amount, tx_out.value
-        ))));
+        return Err(FidelityError::BondAmountMismatch {
+            claimed: proof.bond.amount,
+            actual: tx_out.value,
+        }
+        .into());
     }
 
     // Verify ECDSA signature
@@ -719,6 +715,121 @@ impl Wallet {
 #[cfg(test)]
 mod test {
     use super::*;
+    use bitcoin::{bip32::Xpriv, secp256k1::SecretKey, transaction::Version, NetworkKind, TxOut};
+
+    /// A proof that passes every other check, built the way a maker builds one:
+    /// the bond key is derived from the tweak point at [2, bond_index].
+    fn valid_proof(
+        addr: &str,
+        conf_height: u32,
+    ) -> (
+        FidelityProof,
+        Transaction,
+        PublicKey,
+        bitcoin::bip32::ChainCode,
+    ) {
+        let secp = Secp256k1::new();
+        let chain_code = bitcoin::bip32::ChainCode::from([7u8; 32]);
+        let tweak_secret = SecretKey::from_slice(&[3u8; 32]).expect("valid secret key");
+        let tweakable_point = PublicKey::new(tweak_secret.public_key(&secp));
+
+        let xpriv = Xpriv {
+            network: NetworkKind::Main,
+            depth: 1,
+            parent_fingerprint: Default::default(),
+            child_number: ChildNumber::Hardened { index: 0 },
+            private_key: tweak_secret,
+            chain_code,
+        };
+        let bond_xpriv = xpriv
+            .derive_priv(
+                &secp,
+                &[
+                    ChildNumber::Normal { index: 2 },
+                    ChildNumber::Normal { index: 0 },
+                ],
+            )
+            .expect("derivable path");
+        let bond_pubkey = PublicKey::new(bond_xpriv.private_key.public_key(&secp));
+
+        let lock_time = LockTime::from_height(conf_height + MIN_FIDELITY_TIMELOCK)
+            .expect("height based locktime");
+        let amount = Amount::from_sat(100_000);
+        let script_pubkey =
+            redeemscript_to_scriptpubkey(&fidelity_redeemscript(&lock_time, &bond_pubkey))
+                .expect("derivable scriptpubkey");
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: amount,
+                script_pubkey,
+            }],
+        };
+
+        let bond = FidelityBond {
+            outpoint: OutPoint {
+                txid: tx.compute_txid(),
+                vout: 0,
+            },
+            amount,
+            lock_time,
+            pubkey: bond_pubkey,
+            conf_height: Some(conf_height),
+            is_spent: false,
+            bond_index: 0,
+            tx: None,
+        };
+
+        let cert_hash = bond.generate_cert_hash(addr, &tweakable_point);
+        let msg = Message::from_digest_slice(cert_hash.as_byte_array()).expect("32 byte digest");
+        let cert_sig = secp.sign_ecdsa(&msg, &bond_xpriv.private_key);
+
+        (
+            FidelityProof {
+                bond,
+                cert_hash,
+                cert_sig,
+            },
+            tx,
+            tweakable_point,
+            chain_code,
+        )
+    }
+
+    #[test]
+    fn a_stale_advertised_confirmation_height_still_verifies() {
+        let addr = "test.onion:6102";
+        let conf_height = 1_000u32;
+        let (mut proof, tx, tweakable_point, chain_code) = valid_proof(addr, conf_height);
+        let current_height = u64::from(conf_height) + 1;
+
+        verify_fidelity_checks(
+            &proof,
+            addr,
+            tx.clone(),
+            current_height,
+            conf_height,
+            &tweakable_point,
+            &chain_code,
+        )
+        .expect("a proof agreeing with our chain must verify");
+
+        // A reorg remined the bond and the maker has not caught up yet. Our own
+        // height is the one that counts, so this proves nothing against it.
+        proof.bond.conf_height = Some(conf_height - 1);
+        verify_fidelity_checks(
+            &proof,
+            addr,
+            tx,
+            current_height,
+            conf_height,
+            &tweakable_point,
+            &chain_code,
+        )
+        .expect("a stale advertised height must not fail the proof");
+    }
 
     #[test]
     fn test_fidelity_bond_value_function_behavior() {

@@ -6,8 +6,14 @@ use bip39::rand;
 use bitcoin::{address::NetworkChecked, Address, Amount};
 use bitcoind::{bitcoincore_rpc::RpcApi, tempfile::env::temp_dir, BitcoinD};
 
-use serde_json::Value;
-use std::{fs, path::PathBuf, process::Command, str::FromStr};
+use serde_json::{json, Value};
+use std::{
+    fs,
+    path::PathBuf,
+    process::Command,
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use super::test_framework::{generate_blocks, init_bitcoind, send_to_address};
 
@@ -195,4 +201,101 @@ fn test_taker_cli() {
     }
 
     info!("Taker CLI test completed successfully!");
+}
+
+/// The CLI is the only place a maker's standing is put into words, so a state
+/// the binary stops printing would go unnoticed everywhere else.
+#[test]
+fn taker_cli_shows_maker_states() {
+    info!("Running Test: Taker CLI renders maker states");
+
+    let taker_cli = TakerCli::new();
+    let bitcoind = &taker_cli.bitcoind;
+
+    // Creating the wallet also creates the directory the offerbook lives in.
+    taker_cli.execute(&["get-new-address"]);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let banned_at = now - 3_600;
+    // Recent enough that stale-maker pruning leaves it in the visible book.
+    let failing_since = now - 7_200;
+
+    // Seeded rather than earned: reaching these two states for real needs live
+    // makers, which this binary-driven harness does not run.
+    let offerbook = json!({
+        "makers": [
+            {
+                "address": "127.0.0.1:6102",
+                "fidelity_outpoint": null,
+                "fidelity_expiry_height": null,
+                "offer": null,
+                "state": {
+                    "Banned": {
+                        "reason": "InvalidFidelityProof",
+                        "recorded_at_ts": banned_at
+                    }
+                },
+                "protocol": null,
+                "last_offer_update_ts": null,
+                "first_seen_ts": banned_at,
+                "backend_retry_pending": false,
+                "next_offer_check_ts": null
+            },
+            {
+                "address": "127.0.0.1:6103",
+                "fidelity_outpoint": null,
+                "fidelity_expiry_height": null,
+                "offer": null,
+                "state": {
+                    "Unavailable": {
+                        "reason": "NoOfferResponse",
+                        "since_ts": failing_since,
+                        "last_attempt_ts": now,
+                        "attempts": 7
+                    }
+                },
+                "protocol": null,
+                "last_offer_update_ts": null,
+                "first_seen_ts": now,
+                "backend_retry_pending": false,
+                "next_offer_check_ts": null
+            }
+        ]
+    });
+    fs::write(
+        taker_cli.data_dir.join("offerbook.json"),
+        serde_json::to_string_pretty(&offerbook).unwrap(),
+    )
+    .unwrap();
+
+    let output = taker_cli.execute(&["list-offers"]);
+    info!("list-offers printed:\n{output}");
+
+    // Exact ages: the seeded offsets are an hour and two hours, and the run
+    // takes seconds, so nothing here can round to a different word.
+    assert!(
+        output.contains("Banned: an invalid fidelity proof (1 hour ago)"),
+        "a ban must name its reason and how long ago, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("Unavailable: no answer to an offer poll (7 tries over 2 hours)"),
+        "an unavailable maker must name its reason and the length of the run, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("good: 0, banned: 1, unavailable: 1 (total: 2)"),
+        "the summary must count each state, got:\n{}",
+        output
+    );
+
+    info!("Shutting down bitcoind");
+    bitcoind.client.stop().unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    if taker_cli.temp_dir.exists() {
+        let _ = fs::remove_dir_all(&taker_cli.temp_dir);
+    }
 }

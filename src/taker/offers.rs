@@ -22,10 +22,10 @@ use std::{
 use std::net::TcpStream;
 
 use bitcoin::OutPoint;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    atomic_file::write_json_atomically,
+    atomic_file::{read_json, write_json_atomically},
     lock_debug,
     protocol::{
         common_messages::{
@@ -36,7 +36,9 @@ use crate::{
         error::ProtocolError,
     },
     utill::{read_message, send_message},
-    wallet::{verify_fidelity_checks, AnyBlockchain, Blockchain, FidelityBond, WalletError},
+    wallet::{
+        verify_fidelity_checks, AnyBlockchain, Blockchain, FidelityBond, FidelityError, WalletError,
+    },
     watch_tower::{registry_storage::FileRegistry, utils::is_valid_maker_address},
 };
 
@@ -122,13 +124,13 @@ pub struct MakerOfferCandidate {
     pub offer: Option<Offer>,
 
     /// Current state of maker
+    #[serde(deserialize_with = "deserialize_state")]
     pub state: MakerState,
 
-    /// Set on a proven protocol violation. Poll success refreshes the offer
-    /// and ladder state but must never clear this, so a proven cheater stays
-    /// out of selection.
-    #[serde(default)]
-    pub proven_violation: bool,
+    /// The old sticky violation flag. Read once at load so an existing
+    /// violation migrates into a ban, and never written back.
+    #[serde(default, rename = "proven_violation", skip_serializing)]
+    legacy_proven_violation: bool,
 
     /// Supporting protocol (Legacy or Taproot), if known
     pub protocol: Option<MakerProtocol>,
@@ -151,6 +153,15 @@ pub struct MakerOfferCandidate {
 
 impl MakerOfferCandidate {
     fn mark_success(&mut self, offer: Offer, protocol: MakerProtocol, now_ts: u64) {
+        if let MakerState::Banned(ban) = &self.state {
+            log::warn!(
+                "Ignoring offer from banned maker {}, banned at {}",
+                self.address,
+                ban.recorded_at_ts
+            );
+            return;
+        }
+
         #[cfg(debug_assertions)]
         if self.state != MakerState::Good {
             log::debug!(
@@ -167,21 +178,33 @@ impl MakerOfferCandidate {
         self.state = MakerState::Good;
     }
 
-    fn mark_failure(&mut self, now_ts: u64) {
+    fn mark_failure(&mut self, reason: UnavailableReason, now_ts: u64) {
+        if matches!(self.state, MakerState::Banned(_)) {
+            return;
+        }
+
         self.backend_retry_pending = false;
         let step_secs = UNRESPONSIVE_MAKER_BACKOFF_STEP.as_secs();
         let base = self.next_offer_check_ts.unwrap_or(now_ts).max(now_ts);
         self.next_offer_check_ts = Some(base.saturating_add(step_secs));
 
         let previous_state = self.state.clone();
-        self.state = match &previous_state {
-            MakerState::Good => MakerState::Unresponsive { retries: 1 },
-            MakerState::Unresponsive { retries } if *retries < 10 => MakerState::Unresponsive {
-                retries: *retries + 1,
+        self.state = MakerState::Unavailable(match &previous_state {
+            // An unbroken run of failures keeps its original start, so a changed
+            // reason does not hide how long the maker has been failing.
+            MakerState::Unavailable(previous) => UnavailableState {
+                reason,
+                since_ts: previous.since_ts,
+                last_attempt_ts: Some(now_ts),
+                attempts: previous.attempts.saturating_add(1),
             },
-            MakerState::Unresponsive { .. } => MakerState::Bad,
-            MakerState::Bad => MakerState::Bad,
-        };
+            _ => UnavailableState {
+                reason,
+                since_ts: Some(now_ts),
+                last_attempt_ts: Some(now_ts),
+                attempts: 1,
+            },
+        });
         #[cfg(debug_assertions)]
         if previous_state != self.state {
             log::debug!(
@@ -210,17 +233,106 @@ impl MakerOfferCandidate {
 /// Represents the Maker connection state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MakerState {
-    /// Maker is responding to offer calls.
+    /// Maker returned a valid offer and a verified fidelity proof.
     Good,
-    /// Maker is not responding to offer calls.
-    Unresponsive {
-        /// We allow only 10 retries before marking
-        /// a maker as bad.
-        retries: u8,
-    },
-    /// Maker either explicitly or because not responding
-    /// is marked bad.
+    /// Maker failed in a way it can come back from.
+    Unavailable(UnavailableState),
+    /// Maker is barred from every route until the user removes it.
+    Banned(BanRecord),
+}
+
+/// Why a maker is out of selection, and how long it has been out.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnavailableState {
+    /// The most recent failure.
+    pub reason: UnavailableReason,
+    /// Start of the unbroken run of failures. `None` on a record migrated from
+    /// the old state ladder, which kept no failure times.
+    pub since_ts: Option<u64>,
+    /// When this maker was last tried.
+    pub last_attempt_ts: Option<u64>,
+    /// Failures in the current run.
+    pub attempts: u32,
+}
+
+/// The recoverable ways a maker can fail. None of these is the maker's fault
+/// in a way we can prove, so every one of them can be undone by a good offer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UnavailableReason {
+    /// Discovered, but no offer downloaded yet.
+    AwaitingOffer,
+    /// The offer poll went unanswered. This says nothing about whose fault it
+    /// is: an unreachable maker and an unreachable taker look the same here.
+    NoOfferResponse,
+    /// The bond's funding transaction is not confirmed.
+    BondUnconfirmed,
+    /// The bond's locktime has passed, so it no longer backs anything.
+    BondExpired,
+    /// The bond output vanished from a chain that still calls it locked.
+    BondReorged,
+    /// The bond check failed in a way we did not anticipate, so it blames no one.
+    BondUnverified,
+    /// The offer cannot price any amount. A maker whose liquidity has fallen
+    /// below its own minimum publishes exactly this, and recovers by funding.
+    UnpriceableOffer,
+    /// Migrated from the old state ladder, which recorded no reason.
+    LegacyStatus,
+}
+
+/// A ban, kept for as long as the maker stays in the offerbook.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BanRecord {
+    /// What the maker was proven to have done.
+    pub reason: BanReason,
+    /// When it was recorded. Only the first ban of a maker is kept.
+    pub recorded_at_ts: u64,
+}
+
+/// What earns a maker a ban. Every variant is something we proved, never
+/// something we suspected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BanReason {
+    /// A violation proven by arithmetic or by a failed signature check.
+    ProvenViolation,
+    /// The fidelity proof does not bind to this maker's bond.
+    InvalidFidelityProof,
+    /// Funding the maker committed to never reached the network, and the
+    /// backend confirmed the absence of every one of its transactions.
+    FundingWithheld,
+    /// Carried over from the old sticky violation flag when the record migrated.
+    LegacyProvenViolation,
+}
+
+/// The old on-disk state ladder, kept only so an offerbook written before typed
+/// states still loads.
+#[derive(Deserialize)]
+enum LegacyMakerState {
+    Unresponsive { retries: u8 },
     Bad,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredMakerState {
+    Current(MakerState),
+    Legacy(LegacyMakerState),
+}
+
+/// Reads either the current state or the old ladder. The old retry count is
+/// real evidence, so it carries over; the old ladder kept no failure times.
+fn deserialize_state<'de, D: Deserializer<'de>>(deserializer: D) -> Result<MakerState, D::Error> {
+    let attempts = match StoredMakerState::deserialize(deserializer)? {
+        StoredMakerState::Current(state) => return Ok(state),
+        StoredMakerState::Legacy(LegacyMakerState::Unresponsive { retries }) => retries.into(),
+        StoredMakerState::Legacy(LegacyMakerState::Bad) => 0,
+    };
+
+    Ok(MakerState::Unavailable(UnavailableState {
+        reason: UnavailableReason::LegacyStatus,
+        since_ts: None,
+        last_attempt_ts: None,
+        attempts,
+    }))
 }
 
 /// Protocol which maker follows
@@ -310,34 +422,30 @@ impl OfferBookHandle {
         Ok(snapshot)
     }
 
-    /// Tag a maker as bad
-    pub fn add_bad_maker(&self, maker: &OfferAndAddress) -> Result<(), TakerError> {
-        log::info!("Bad Maker added: {}", maker.address);
-        lock_debug!(self.inner.write())
-            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?
-            .mark_bad(&maker.address);
-        Ok(())
-    }
-
-    /// Record a proven protocol violation. The marker is sticky so a later poll
-    /// success cannot return the maker to selection. Only for arithmetically or
-    /// cryptographically proven misbehavior, never timeouts or backend failures.
-    pub(crate) fn record_proven_violation(&self, address: &MakerAddress) -> Result<(), TakerError> {
-        log::warn!("Proven violation recorded against maker {address}");
+    /// Record a proven protocol violation. The ban is permanent: polling,
+    /// discovery, and stale pruning cannot lift it, only explicit removal can.
+    /// Only for arithmetically or cryptographically proven misbehavior, never
+    /// timeouts or backend failures.
+    pub(crate) fn record_proven_violation(
+        &self,
+        address: &MakerAddress,
+        reason: BanReason,
+    ) -> Result<(), TakerError> {
+        log::warn!("Violation recorded against maker {address}: {reason:?}");
         let now_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
         let mut book = lock_debug!(self.inner.write())
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+        // The ban lives on the visible record, so a suppression record for the
+        // same address would only linger where nothing can reach it again.
+        book.suppressed_makers.remove(address);
         // A preferred maker may have no entry yet; the violation still counts.
         if !book.makers.iter().any(|m| m.address == *address) {
-            book.insert_candidate(address.clone(), None, None, now_ts, false);
+            book.insert_candidate(address.clone(), None, None, now_ts, None);
         }
-        book.mark_failure(address, now_ts);
-        if let Some(m) = book.makers.iter_mut().find(|m| &m.address == address) {
-            m.proven_violation = true;
-        }
+        book.ban(address, reason, now_ts);
         book.write_to_disk(&self.path)
     }
 
@@ -358,7 +466,7 @@ impl OfferBookHandle {
             .good_makers())
     }
 
-    /// All bad makers
+    /// All banned makers
     pub fn get_bad_makers(
         &self,
         protocol: &MakerProtocol,
@@ -368,26 +476,27 @@ impl OfferBookHandle {
             .get_bad_makers(protocol))
     }
 
-    /// Fetch all makers good, bad, and unresponsive
+    /// Whether a ban is on record for this address, whether the maker is
+    /// visible or parked in suppression. An address never seen is not banned.
+    pub fn is_banned(&self, address: &MakerAddress) -> Result<bool, TakerError> {
+        let book = lock_debug!(self.inner.read())
+            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+        let visible = book
+            .makers
+            .iter()
+            .any(|m| &m.address == address && matches!(m.state, MakerState::Banned(_)));
+        let suppressed = book
+            .suppressed_makers
+            .get(address)
+            .is_some_and(|s| matches!(s.state, Some(MakerState::Banned(_))));
+        Ok(visible || suppressed)
+    }
+
+    /// Fetch all makers, whatever state they are in
     pub fn all_makers(&self) -> Result<Vec<MakerOfferCandidate>, TakerError> {
         Ok(lock_debug!(self.inner.read())
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?
             .all_makers())
-    }
-
-    /// Checks if an address is bad or not
-    pub fn is_bad_maker(&self, offer_and_address: &OfferAndAddress) -> Result<bool, TakerError> {
-        let offerbook = lock_debug!(self.inner.read())
-            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
-        let value = offerbook
-            .makers
-            .iter()
-            .find(|offer| offer.address == offer_and_address.address);
-
-        if let Some(offer) = value {
-            return Ok(offer.state == MakerState::Bad);
-        }
-        Ok(true)
     }
 
     /// Persist offerbook on disk
@@ -404,7 +513,10 @@ impl OfferBookHandle {
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
         let before = book.makers.len();
         book.makers.retain(|m| &m.address != address);
-        let removed = book.makers.len() < before;
+        // Both collections, or a suppressed record would recreate the maker -
+        // and its ban - on the next discovery cycle.
+        let removed =
+            book.suppressed_makers.remove(address).is_some() || book.makers.len() < before;
         if removed {
             book.write_to_disk(&self.path)?;
         }
@@ -422,7 +534,15 @@ impl OfferBookHandle {
                     book
                 }
                 Err(e) => {
-                    log::error!("Offerbook corrupted at {path:?}. Recreating. Error: {e:?}");
+                    // Starting empty forgives every recorded ban, so keep the
+                    // unreadable file rather than deleting the only evidence.
+                    let kept = path.with_extension("corrupt");
+                    if let Err(rename_error) = std::fs::rename(&path, &kept) {
+                        log::error!("Could not set aside the corrupt offerbook: {rename_error:?}");
+                    }
+                    log::error!(
+                        "Offerbook corrupted at {path:?}, kept at {kept:?}. Starting empty; every recorded ban is lost. Error: {e:?}"
+                    );
                     let book = OfferBook::default();
                     book.write_to_disk(&path)?;
                     book
@@ -439,7 +559,9 @@ impl OfferBookHandle {
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
-        if offerbook.backfill_first_seen_timestamps(now) {
+        let backfilled = offerbook.backfill_first_seen_timestamps(now);
+        let migrated = offerbook.migrate_legacy_states(now);
+        if backfilled || migrated {
             // Persist the migration immediately so repeated unclean shutdowns
             // cannot keep resetting the two-day age of legacy candidates.
             offerbook.write_to_disk(&path)?;
@@ -788,15 +910,31 @@ impl OfferSyncService {
             .download_offer_with_retries(socks_port, shutdown);
         // Verify before taking the guard. The backend calls in here can block on a
         // slow server, which would serialize every worker in the pool behind it.
-        let outcome = downloaded.map(|oa| {
-            let verdict = verify_fidelity_with_backend(
-                blockchain,
-                &oa.offer.fidelity,
-                &oa.address.to_string(),
-                announced_outpoint,
-                &oa.offer.tweakable_point,
-                &oa.offer.tweak_chain_code,
-            );
+        let outcome = downloaded.map(|mut oa| {
+            let verdict = oa
+                .offer
+                .validate_shape()
+                .map_err(|e| {
+                    OfferCheckError::Lifecycle(
+                        UnavailableReason::UnpriceableOffer,
+                        TakerError::General(e),
+                    )
+                })
+                .and_then(|()| {
+                    verify_fidelity_with_backend(
+                        blockchain,
+                        &oa.offer.fidelity,
+                        &oa.address.to_string(),
+                        announced_outpoint,
+                        &oa.offer.tweakable_point,
+                        &oa.offer.tweak_chain_code,
+                    )
+                });
+            // The height our backend saw is the one we price the bond at, so a
+            // maker that reorged, or lied, cannot age its own bond.
+            if let Ok(height) = verdict.as_ref() {
+                oa.offer.fidelity.bond.conf_height = Some(*height);
+            }
             (oa, verdict)
         });
         // Poison means a worker panicked mid-update; skip this maker instead
@@ -810,8 +948,8 @@ impl OfferSyncService {
         };
         match outcome {
             Some((oa, Ok(_))) => book.mark_success(&oa.address, oa.offer, oa.protocol, now),
-            Some((oa, Err(e))) => book.record_fidelity_failure(&oa.address, &e, now),
-            None => book.mark_failure(&addr, now),
+            Some((oa, Err(e))) => book.record_offer_failure(&oa.address, &e, now),
+            None => book.mark_failure(&addr, UnavailableReason::NoOfferResponse, now),
         }
         // Capture the maker's final state while we still hold the write lock so
         // a concurrent `remove` can't yank it out from under the caller.
@@ -834,13 +972,26 @@ impl OfferSyncService {
 
         // An explicit poll overrides automatic stale-maker suppression.
         // Same poison policy as fetch_and_record_one: skip this poll.
-        match lock_debug!(self.offerbook.inner.write()) {
-            Ok(mut book) => book.upsert_for_poll(address.clone(), now),
+        let banned = match lock_debug!(self.offerbook.inner.write()) {
+            Ok(mut book) => {
+                book.upsert_for_poll(address.clone(), now);
+                book.makers
+                    .iter()
+                    .find(|m| m.address == address)
+                    .filter(|m| matches!(m.state, MakerState::Banned(_)))
+                    .cloned()
+            }
             Err(_) => {
                 log::error!("offerbook lock poisoned; skipping poll of {address}");
                 return None;
             }
         };
+
+        // Contacting a banned maker could only produce an offer we must ignore.
+        if let Some(banned) = banned {
+            log::warn!("Refusing to poll banned maker {address}");
+            return Some(banned);
+        }
 
         Self::fetch_and_record_one(
             address,
@@ -1045,26 +1196,61 @@ impl OfferSyncService {
 /// Why a fidelity check failed. Only `BadBond` is the maker's doing; a backend
 /// outage is ours and must not count against them.
 #[derive(Debug)]
-enum FidelityCheckError {
+enum OfferCheckError {
+    /// The backend did not answer, so the maker is not judged at all.
     BackendDown(TakerError),
-    BadBond(TakerError),
+    /// Something the maker can recover from.
+    Lifecycle(UnavailableReason, TakerError),
+    /// Something the maker is proven to have done.
+    Proven(BanReason, TakerError),
+}
+
+/// Splits a failed bond check into what a maker recovers from and what it is
+/// proven to have forged. An error we did not anticipate proves nothing.
+fn classify_bond_failure(error: WalletError) -> OfferCheckError {
+    use FidelityError::*;
+
+    if matches!(
+        &error,
+        WalletError::Fidelity(
+            WrongScriptType
+                | BondDoesNotExist
+                | InvalidCertHash
+                | InvalidBondLocktime
+                | BondPubkeyMismatch
+                | BondAmountMismatch { .. }
+        )
+    ) {
+        return OfferCheckError::Proven(BanReason::InvalidFidelityProof, TakerError::Wallet(error));
+    }
+
+    let reason = match &error {
+        WalletError::Fidelity(BondLocktimeExpired) => UnavailableReason::BondExpired,
+        WalletError::Fidelity(BondUncomfirmed) => UnavailableReason::BondUnconfirmed,
+        _ => UnavailableReason::BondUnverified,
+    };
+    OfferCheckError::Lifecycle(reason, TakerError::Wallet(error))
 }
 
 fn ensure_announced_outpoint_matches(
     announced_outpoint: Option<OutPoint>,
     offered_outpoint: OutPoint,
-) -> Result<(), FidelityCheckError> {
+) -> Result<(), OfferCheckError> {
     if let Some(expected) = announced_outpoint {
         if expected != offered_outpoint {
-            return Err(FidelityCheckError::BadBond(TakerError::General(format!(
-                "Maker offered fidelity bond {offered_outpoint}, but discovery announced {expected}"
-            ))));
+            return Err(OfferCheckError::Lifecycle(
+                UnavailableReason::BondUnverified,
+                TakerError::General(format!(
+                    "Maker offered fidelity bond {offered_outpoint}, but discovery announced {expected}"
+                )),
+            ));
         }
     }
     Ok(())
 }
 
-/// Verifies a fidelity proof against the blockchain.
+/// Verifies a fidelity proof against the blockchain, returning the height our
+/// own backend confirmed the bond at.
 fn verify_fidelity_with_backend(
     blockchain: &AnyBlockchain,
     proof: &FidelityProof,
@@ -1072,8 +1258,8 @@ fn verify_fidelity_with_backend(
     announced_outpoint: Option<OutPoint>,
     tweakable_point: &bitcoin::PublicKey,
     tweak_chain_code: &bitcoin::bip32::ChainCode,
-) -> Result<(), FidelityCheckError> {
-    let backend_down = |e: WalletError| FidelityCheckError::BackendDown(TakerError::Wallet(e));
+) -> Result<u32, OfferCheckError> {
+    let backend_down = |e: WalletError| OfferCheckError::BackendDown(TakerError::Wallet(e));
     ensure_announced_outpoint_matches(announced_outpoint, proof.bond.outpoint)?;
 
     let txid = proof.bond.outpoint.txid;
@@ -1081,25 +1267,17 @@ fn verify_fidelity_with_backend(
     let transaction = blockchain
         .get_raw_transaction(&txid, None)
         .map_err(backend_down)?;
-    // The bond output must still be unspent. `Ok(None)` is the backend
-    // answering "spent or absent", so it is the maker's problem, not ours.
-    if blockchain
-        .get_tx_out(&txid, vout, Some(true))
-        .map_err(backend_down)?
-        .is_none()
-    {
-        return Err(FidelityCheckError::BadBond(TakerError::General(format!(
-            "Fidelity bond output {txid}:{vout} is spent or does not exist"
-        ))));
-    }
     let current_height = blockchain.get_block_count().map_err(backend_down)?;
     let confirmation_height = blockchain
         .tx_block_height(&txid)
         .map_err(backend_down)?
         .ok_or_else(|| {
-            FidelityCheckError::BadBond(TakerError::General(format!(
-                "Fidelity bond transaction {txid} is not yet confirmed"
-            )))
+            OfferCheckError::Lifecycle(
+                UnavailableReason::BondUnconfirmed,
+                TakerError::General(format!(
+                    "Fidelity bond transaction {txid} is not yet confirmed"
+                )),
+            )
         })? as u32;
 
     verify_fidelity_checks(
@@ -1111,7 +1289,22 @@ fn verify_fidelity_with_backend(
         tweakable_point,
         tweak_chain_code,
     )
-    .map_err(|e| FidelityCheckError::BadBond(TakerError::Wallet(e)))
+    .map_err(classify_bond_failure)?;
+
+    // The bond is genuine and its locktime has not passed, so consensus forbids
+    // spending it. A missing output here means the chain moved under us.
+    if blockchain
+        .get_tx_out(&txid, vout, Some(true))
+        .map_err(backend_down)?
+        .is_none()
+    {
+        return Err(OfferCheckError::Lifecycle(
+            UnavailableReason::BondReorged,
+            TakerError::General(format!("Fidelity bond output {txid}:{vout} is gone")),
+        ));
+    }
+
+    Ok(confirmation_height)
 }
 
 /// Minimal record retained after a stale maker is removed from the visible book.
@@ -1121,9 +1314,14 @@ fn verify_fidelity_with_backend(
 struct SuppressedMaker {
     fidelity_outpoint: Option<OutPoint>,
     fidelity_expiry_height: Option<u32>,
-    /// Pruning must not launder a proven violation; restore it on rediscovery.
+    /// The state the maker had when it was hidden, restored on rediscovery so
+    /// suppression cannot launder a ban or reset a run of failures. Pruning
+    /// skips banned makers, so only a migrated record holds a ban here.
     #[serde(default)]
-    proven_violation: bool,
+    state: Option<MakerState>,
+    /// The old sticky violation flag, read once at load and never written back.
+    #[serde(default, rename = "proven_violation", skip_serializing)]
+    legacy_proven_violation: bool,
     retry_after_ts: u64,
 }
 
@@ -1194,11 +1392,10 @@ impl OfferBook {
             None => false,
         };
 
-        let proven_violation = self
+        let restored = self
             .suppressed_makers
-            .get(&address)
-            .is_some_and(|suppressed| suppressed.proven_violation);
-        self.suppressed_makers.remove(&address);
+            .remove(&address)
+            .and_then(|suppressed| suppressed.state);
         let first_seen_ts = if recovery_probe {
             // A recovery attempt gets one probe. If it fails, this deliberately
             // old timestamp returns it to suppression on the following cycle.
@@ -1211,7 +1408,7 @@ impl OfferBook {
             fidelity_outpoint,
             fidelity_expiry_height,
             first_seen_ts,
-            proven_violation,
+            restored,
         );
         true
     }
@@ -1224,16 +1421,16 @@ impl OfferBook {
             return suppressed.is_some();
         }
 
-        let (outpoint, expiry_height, proven_violation) = suppressed
+        let (outpoint, expiry_height, restored) = suppressed
             .map(|maker| {
                 (
                     maker.fidelity_outpoint,
                     maker.fidelity_expiry_height,
-                    maker.proven_violation,
+                    maker.state,
                 )
             })
             .unwrap_or_default();
-        self.insert_candidate(address, outpoint, expiry_height, now_ts, proven_violation);
+        self.insert_candidate(address, outpoint, expiry_height, now_ts, restored);
         true
     }
 
@@ -1243,15 +1440,27 @@ impl OfferBook {
         fidelity_outpoint: Option<OutPoint>,
         fidelity_expiry_height: Option<u32>,
         first_seen_ts: u64,
-        proven_violation: bool,
+        restored: Option<MakerState>,
     ) {
+        // This record carries no offer, so a restored `Good` would claim
+        // something it cannot show. Only a ban or a failure run survives.
+        let state = match restored {
+            Some(MakerState::Banned(ban)) => MakerState::Banned(ban),
+            Some(MakerState::Unavailable(unavailable)) => MakerState::Unavailable(unavailable),
+            _ => MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::AwaitingOffer,
+                since_ts: Some(first_seen_ts),
+                last_attempt_ts: None,
+                attempts: 0,
+            }),
+        };
         self.makers.push(MakerOfferCandidate {
             address,
             fidelity_outpoint,
             fidelity_expiry_height,
             offer: None,
-            state: MakerState::Unresponsive { retries: 0 },
-            proven_violation,
+            state,
+            legacy_proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(first_seen_ts),
@@ -1267,6 +1476,12 @@ impl OfferBook {
         let suppressed_makers = &mut self.suppressed_makers;
 
         self.makers.retain(|maker| {
+            // Hiding a ban would drop the one record that keeps a proven cheat
+            // out of every route.
+            if matches!(maker.state, MakerState::Banned(_)) {
+                return true;
+            }
+
             let age_anchor = maker.last_offer_update_ts.or(maker.first_seen_ts);
             let stale = !maker.backend_retry_pending
                 && age_anchor.is_some_and(|timestamp| {
@@ -1279,7 +1494,8 @@ impl OfferBook {
                     SuppressedMaker {
                         fidelity_outpoint: maker.fidelity_outpoint,
                         fidelity_expiry_height: maker.fidelity_expiry_height,
-                        proven_violation: maker.proven_violation,
+                        state: Some(maker.state.clone()),
+                        legacy_proven_violation: false,
                         retry_after_ts: now_ts.saturating_add(STALE_MAKER_AGE.as_secs()),
                     },
                 );
@@ -1343,6 +1559,32 @@ impl OfferBook {
         self.makers.len() != before || self.suppressed_makers.len() != before_suppressed
     }
 
+    /// Converts records written before makers had a ban state. The old flag
+    /// kept no time of its own, so the ban is stamped at migration.
+    fn migrate_legacy_states(&mut self, now_ts: u64) -> bool {
+        let ban = BanRecord {
+            reason: BanReason::LegacyProvenViolation,
+            recorded_at_ts: now_ts,
+        };
+
+        let mut changed = false;
+        for maker in &mut self.makers {
+            if maker.legacy_proven_violation {
+                maker.legacy_proven_violation = false;
+                maker.state = MakerState::Banned(ban.clone());
+                changed = true;
+            }
+        }
+        for suppressed in self.suppressed_makers.values_mut() {
+            if suppressed.legacy_proven_violation {
+                suppressed.legacy_proven_violation = false;
+                suppressed.state = Some(MakerState::Banned(ban.clone()));
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub(crate) fn mark_success(
         &mut self,
         address: &MakerAddress,
@@ -1355,32 +1597,31 @@ impl OfferBook {
         }
     }
 
-    fn mark_failure(&mut self, address: &MakerAddress, now_ts: u64) {
+    fn mark_failure(&mut self, address: &MakerAddress, reason: UnavailableReason, now_ts: u64) {
         if let Some(m) = self.makers.iter_mut().find(|m| &m.address == address) {
-            m.mark_failure(now_ts);
+            m.mark_failure(reason, now_ts);
         }
     }
 
     /// Scores a failed fidelity check only when the backend answered. A local
     /// outage schedules a non-penalizing retry and protects a stale recovery
     /// candidate from pruning until that retry is attempted.
-    fn record_fidelity_failure(
-        &mut self,
-        address: &MakerAddress,
-        err: &FidelityCheckError,
-        now_ts: u64,
-    ) {
+    fn record_offer_failure(&mut self, address: &MakerAddress, err: &OfferCheckError, now_ts: u64) {
         match err {
-            FidelityCheckError::BadBond(e) => {
-                log::warn!("Fidelity verification failed for {address}: {e:?}");
-                self.mark_failure(address, now_ts);
+            OfferCheckError::Proven(reason, e) => {
+                log::warn!("Banning {address} for {reason:?}: {e:?}");
+                self.ban(address, reason.clone(), now_ts);
             }
-            FidelityCheckError::BackendDown(e) => {
+            OfferCheckError::Lifecycle(reason, e) => {
+                log::warn!("Offer check failed for {address} with {reason:?}: {e:?}");
+                self.mark_failure(address, reason.clone(), now_ts);
+            }
+            OfferCheckError::BackendDown(e) => {
                 let retry_at = now_ts.saturating_add(OFFER_SYNC_INTERVAL.as_secs());
                 if let Some(maker) = self
                     .makers
                     .iter_mut()
-                    .find(|m| &m.address == address && m.state != MakerState::Bad)
+                    .find(|m| &m.address == address && !matches!(m.state, MakerState::Banned(_)))
                 {
                     maker.backend_retry_pending = true;
                     maker.next_offer_check_ts = Some(retry_at);
@@ -1397,7 +1638,7 @@ impl OfferBook {
     ) -> Vec<MakerAddress> {
         self.makers
             .iter()
-            .filter(|m| !matches!(m.state, MakerState::Bad))
+            .filter(|m| !matches!(m.state, MakerState::Banned(_)))
             .filter(|m| match m.fidelity_outpoint {
                 None => true,
                 Some(outpoint) => live_candidates.get(&m.address) == Some(&Some(outpoint)),
@@ -1416,19 +1657,27 @@ impl OfferBook {
             .collect()
     }
 
-    fn mark_bad(&mut self, address: &MakerAddress) {
-        if let Some(m) = self.makers.iter_mut().find(|m| &m.address == address) {
-            #[cfg(debug_assertions)]
-            if m.state != MakerState::Bad {
-                log::debug!(
-                    "[MAKER_STATE] Source: taker::offers::OfferBook::mark_bad | Address: {} | State: {:?} -> Bad",
-                    m.address,
-                    m.state
-                );
-            }
-            m.state = MakerState::Bad;
-            m.backend_retry_pending = false;
+    /// Bans a maker. The first ban wins, so a later violation cannot overwrite
+    /// the reason we originally proved.
+    fn ban(&mut self, address: &MakerAddress, reason: BanReason, now_ts: u64) {
+        let Some(maker) = self.makers.iter_mut().find(|m| &m.address == address) else {
+            return;
+        };
+        if matches!(maker.state, MakerState::Banned(_)) {
+            return;
         }
+
+        #[cfg(debug_assertions)]
+        log::debug!(
+            "[MAKER_STATE] Source: taker::offers::OfferBook::ban | Address: {} | State: {:?} -> Banned({reason:?})",
+            maker.address,
+            maker.state
+        );
+        maker.state = MakerState::Banned(BanRecord {
+            reason,
+            recorded_at_ts: now_ts,
+        });
+        maker.backend_retry_pending = false;
     }
 
     /// Gets all active (good) offers for a given protocol.
@@ -1438,7 +1687,6 @@ impl OfferBook {
             .makers
             .iter()
             .filter(|m| m.state == MakerState::Good)
-            .filter(|m| !m.proven_violation)
             .filter(|m| {
                 m.protocol
                     .as_ref()
@@ -1454,7 +1702,7 @@ impl OfferBook {
     fn good_makers(&self) -> Vec<OfferAndAddress> {
         self.makers
             .iter()
-            .filter(|m| !matches!(m.state, MakerState::Bad))
+            .filter(|m| !matches!(m.state, MakerState::Banned(_)))
             .filter_map(|m| m.as_offer_and_address())
             .collect()
     }
@@ -1464,13 +1712,13 @@ impl OfferBook {
         self.makers.to_vec()
     }
 
-    /// Gets the list of bad makers.
+    /// Gets the list of banned makers.
     /// Makers are included for both Legacy and Taproot requests.
     fn get_bad_makers(&self, protocol: &MakerProtocol) -> Vec<OfferAndAddress> {
         let mut result: Vec<_> = self
             .makers
             .iter()
-            .filter(|m| m.state == MakerState::Bad)
+            .filter(|m| matches!(m.state, MakerState::Banned(_)))
             .filter(|m| {
                 m.protocol
                     .as_ref()
@@ -1483,7 +1731,8 @@ impl OfferBook {
         result
     }
 
-    /// Atomically writes the offerbook to disk.
+    /// Writes through a temporary file and a rename. A failed write leaves the
+    /// previous offerbook, and every ban it holds, intact on disk.
     fn write_to_disk(&self, path: &Path) -> Result<(), TakerError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1491,10 +1740,10 @@ impl OfferBook {
         Ok(write_json_atomically(path, self)?)
     }
 
-    /// Reads from a path, removes invalid addresses, and best-effort rewrites the cleaned book.
+    /// Reads from a path, dropping invalid addresses and rewriting the cleaned
+    /// book. A missing file yields an empty offerbook.
     fn read_from_disk(path: &Path) -> Result<Self, TakerError> {
-        let content = std::fs::read_to_string(path)?;
-        let mut book: Self = serde_json::from_str(&content)?;
+        let mut book: Self = read_json(path)?;
         let removed = book.retain_valid_addresses();
         if removed > 0 {
             log::warn!("Removed {removed} invalid offerbook record(s) from {path:?}");
@@ -1670,13 +1919,68 @@ impl MakerAddress {
 }
 
 /// Format state
-pub fn format_state(state: &MakerState) -> String {
+pub fn format_state(state: &MakerState, now_ts: u64) -> String {
     match state {
         MakerState::Good => "Good".into(),
-        MakerState::Unresponsive { retries } => {
-            format!("Unresponsive (retries: {retries})")
+        MakerState::Unavailable(unavailable) => {
+            let mut line = format!("Unavailable: {}", unavailable.reason);
+            if unavailable.attempts > 0 {
+                line.push_str(&format!(" ({} tries", unavailable.attempts));
+                match unavailable.since_ts {
+                    Some(since) => {
+                        line.push_str(&format!(" over {})", elapsed_since(since, now_ts)))
+                    }
+                    None => line.push(')'),
+                }
+            }
+            line
         }
-        MakerState::Bad => "Bad".into(),
+        MakerState::Banned(ban) => format!(
+            "Banned: {} ({} ago)",
+            ban.reason,
+            elapsed_since(ban.recorded_at_ts, now_ts)
+        ),
+    }
+}
+
+/// Plain-words age for the maker listing, so a reader never meets a raw
+/// timestamp.
+fn elapsed_since(then_ts: u64, now_ts: u64) -> String {
+    let seconds = now_ts.saturating_sub(then_ts);
+    let (count, unit) = match seconds {
+        s if s < 60 => (s, "second"),
+        s if s < 3_600 => (s / 60, "minute"),
+        s if s < 86_400 => (s / 3_600, "hour"),
+        s => (s / 86_400, "day"),
+    };
+    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
+}
+
+impl fmt::Display for UnavailableReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UnavailableReason::AwaitingOffer => f.write_str("waiting for its first offer"),
+            UnavailableReason::NoOfferResponse => f.write_str("no answer to an offer poll"),
+            UnavailableReason::BondUnconfirmed => f.write_str("fidelity bond not confirmed"),
+            UnavailableReason::BondExpired => f.write_str("fidelity bond expired"),
+            UnavailableReason::BondReorged => f.write_str("fidelity bond gone from the chain"),
+            UnavailableReason::BondUnverified => f.write_str("fidelity bond could not be checked"),
+            UnavailableReason::UnpriceableOffer => f.write_str("an offer nobody can price"),
+            UnavailableReason::LegacyStatus => f.write_str("failing before this version"),
+        }
+    }
+}
+
+impl fmt::Display for BanReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BanReason::ProvenViolation => f.write_str("a proven protocol violation"),
+            BanReason::InvalidFidelityProof => f.write_str("an invalid fidelity proof"),
+            BanReason::FundingWithheld => f.write_str("funding it never broadcast"),
+            BanReason::LegacyProvenViolation => {
+                f.write_str("a violation proven before this version")
+            }
+        }
     }
 }
 
@@ -1745,8 +2049,13 @@ mod tests {
             fidelity_outpoint: None,
             fidelity_expiry_height: None,
             offer: None,
-            state: MakerState::Unresponsive { retries: 0 },
-            proven_violation: false,
+            state: MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::NoOfferResponse,
+                since_ts: None,
+                last_attempt_ts: None,
+                attempts: 0,
+            }),
+            legacy_proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: None,
@@ -1826,7 +2135,10 @@ mod tests {
         assert!(ensure_announced_outpoint_matches(Some(offered), offered).is_ok());
         assert!(matches!(
             ensure_announced_outpoint_matches(Some(announced), offered),
-            Err(FidelityCheckError::BadBond(_))
+            Err(OfferCheckError::Lifecycle(
+                UnavailableReason::BondUnverified,
+                _
+            ))
         ));
     }
 
@@ -1901,7 +2213,8 @@ mod tests {
         let suppression = SuppressedMaker {
             fidelity_outpoint: None,
             fidelity_expiry_height: None,
-            proven_violation: false,
+            state: None,
+            legacy_proven_violation: false,
             retry_after_ts: 1,
         };
         let book = OfferBook {
@@ -1955,7 +2268,7 @@ mod tests {
                 fidelity_expiry_height: Some(1_000),
                 offer: Some(offer),
                 state: MakerState::Good,
-                proven_violation: false,
+                legacy_proven_violation: false,
                 protocol: Some(MakerProtocol::Taproot),
                 last_offer_update_ts: Some(now),
                 first_seen_ts: Some(now),
@@ -2018,7 +2331,7 @@ mod tests {
     fn manual_offer_does_not_gain_a_registry_outpoint() {
         let address = addr("6110");
         let mut book = OfferBook::default();
-        book.insert_candidate(address.clone(), None, None, 1, false);
+        book.insert_candidate(address.clone(), None, None, 1, None);
 
         book.mark_success(
             &address,
@@ -2031,7 +2344,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_failure_state_and_backoff_growth() {
+    fn mark_failure_keeps_one_unbroken_run() {
         let now_ts = 170000;
         let mut candidate = MakerOfferCandidate {
             address: addr("6104"),
@@ -2039,7 +2352,7 @@ mod tests {
             fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Good,
-            proven_violation: false,
+            legacy_proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
@@ -2050,15 +2363,17 @@ mod tests {
         let mut prev_backoff_from_now = 0u64;
         let step = UNRESPONSIVE_MAKER_BACKOFF_STEP.as_secs();
 
-        for i in 1..=11 {
-            candidate.mark_failure(now_ts);
+        for i in 1..=11u32 {
+            candidate.mark_failure(UnavailableReason::NoOfferResponse, now_ts);
 
-            // State transitions: Good -> Unresponsive{1} .. Unresponsive{10} -> Bad (on 11th)
-            if i <= 10 {
-                assert_eq!(candidate.state, MakerState::Unresponsive { retries: i });
-            } else {
-                assert_eq!(candidate.state, MakerState::Bad);
-            }
+            // Repeated failure counts attempts. It can never reach a ban, and
+            // the run keeps the start of its first failure.
+            let MakerState::Unavailable(state) = &candidate.state else {
+                panic!("a silent maker must not be banned");
+            };
+            assert_eq!(state.attempts, i);
+            assert_eq!(state.since_ts, Some(now_ts));
+            assert_eq!(state.last_attempt_ts, Some(now_ts));
 
             let next_ts = candidate
                 .next_offer_check_ts
@@ -2070,20 +2385,25 @@ mod tests {
             assert!(backoff_from_now > prev_backoff_from_now);
             prev_backoff_from_now = backoff_from_now;
 
-            assert_eq!(backoff_from_now, step.saturating_mul(i as u64));
+            assert_eq!(backoff_from_now, step.saturating_mul(i.into()));
         }
     }
 
     #[test]
-    fn mark_success_rehabilitates_bad_state() {
+    fn mark_success_clears_an_unavailable_state() {
         let now_ts = 170000;
         let mut candidate = MakerOfferCandidate {
             address: addr("6105"),
             fidelity_outpoint: Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0)),
             fidelity_expiry_height: None,
             offer: None,
-            state: MakerState::Bad,
-            proven_violation: false,
+            state: MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::BondUnverified,
+                since_ts: Some(now_ts),
+                last_attempt_ts: Some(now_ts),
+                attempts: 4,
+            }),
+            legacy_proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
@@ -2110,8 +2430,13 @@ mod tests {
             fidelity_outpoint: Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0)),
             fidelity_expiry_height: None,
             offer: None,
-            state: MakerState::Unresponsive { retries: 3 },
-            proven_violation: false,
+            state: MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::AwaitingOffer,
+                since_ts: Some(now_ts),
+                last_attempt_ts: None,
+                attempts: 3,
+            }),
+            legacy_proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
@@ -2147,17 +2472,20 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, false);
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, None);
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
         assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), recovery_ts));
 
-        let down = FidelityCheckError::BackendDown(TakerError::General("electrum down".into()));
-        book.record_fidelity_failure(&address, &down, recovery_ts);
+        let down = OfferCheckError::BackendDown(TakerError::General("electrum down".into()));
+        book.record_offer_failure(&address, &down, recovery_ts);
 
-        assert_eq!(
+        assert!(matches!(
             book.makers[0].state,
-            MakerState::Unresponsive { retries: 0 }
-        );
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::AwaitingOffer,
+                ..
+            })
+        ));
         assert!(book.makers[0].backend_retry_pending);
         assert_eq!(book.makers[0].next_offer_check_ts, Some(retry_at));
         assert_eq!(book.prune_stale_makers(recovery_ts + 1), 0);
@@ -2170,19 +2498,26 @@ mod tests {
             vec![address.clone()]
         );
 
-        let bad = FidelityCheckError::BadBond(TakerError::General("bond is spent".into()));
-        book.record_fidelity_failure(&address, &bad, retry_at);
+        let bad = OfferCheckError::Lifecycle(
+            UnavailableReason::BondExpired,
+            TakerError::General("bond locktime passed".into()),
+        );
+        book.record_offer_failure(&address, &bad, retry_at);
 
         assert!(!book.makers[0].backend_retry_pending);
-        assert_eq!(
+        assert!(matches!(
             book.makers[0].state,
-            MakerState::Unresponsive { retries: 1 }
-        );
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::BondExpired,
+                attempts: 1,
+                ..
+            })
+        ));
         assert_eq!(book.prune_stale_makers(retry_at), 1);
     }
 
     #[test]
-    fn proven_violation_survives_pruning_and_rediscovery() {
+    fn a_ban_is_never_pruned_or_polled() {
         let ttl = STALE_MAKER_AGE.as_secs();
         let prune_ts = ttl * 2;
         let now_ts = prune_ts + ttl;
@@ -2190,23 +2525,251 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[2; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), 0, false);
-        book.makers[0].proven_violation = true;
+        book.insert_candidate(address.clone(), outpoint, Some(500), 0, None);
+        book.ban(&address, BanReason::ProvenViolation, 1);
 
-        // Pruning hides the maker but must keep the marker.
+        // Nothing about a ban ages out, so pruning leaves it in plain sight.
+        assert_eq!(book.prune_stale_makers(prune_ts), 0);
+        assert!(book.suppressed_makers.is_empty());
+        assert_eq!(
+            book.makers[0].state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                recorded_at_ts: 1,
+            })
+        );
+
+        // Discovery meets it again, and an offer cannot launder it back in.
+        assert!(!book.upsert_discovered(address.clone(), outpoint, Some(500), now_ts));
+        book.mark_success(
+            &address,
+            dummy_offer(&address.to_string()),
+            MakerProtocol::Taproot,
+            now_ts,
+        );
+        assert!(matches!(book.makers[0].state, MakerState::Banned(_)));
+        assert!(book.active_makers(&MakerProtocol::Taproot).is_empty());
+        let live_candidates = HashMap::from([(address, outpoint)]);
+        assert!(book.makers_to_poll(now_ts, &live_candidates).is_empty());
+    }
+
+    #[test]
+    fn maker_states_read_as_plain_words() {
+        let now_ts = 1_000_000;
+        assert_eq!(format_state(&MakerState::Good, now_ts), "Good");
+
+        let waiting = MakerState::Unavailable(UnavailableState {
+            reason: UnavailableReason::AwaitingOffer,
+            since_ts: Some(now_ts),
+            last_attempt_ts: None,
+            attempts: 0,
+        });
+        assert_eq!(
+            format_state(&waiting, now_ts),
+            "Unavailable: waiting for its first offer"
+        );
+
+        let silent = MakerState::Unavailable(UnavailableState {
+            reason: UnavailableReason::NoOfferResponse,
+            since_ts: Some(now_ts - 172_800),
+            last_attempt_ts: Some(now_ts),
+            attempts: 7,
+        });
+        assert_eq!(
+            format_state(&silent, now_ts),
+            "Unavailable: no answer to an offer poll (7 tries over 2 days)"
+        );
+
+        let banned = MakerState::Banned(BanRecord {
+            reason: BanReason::InvalidFidelityProof,
+            recorded_at_ts: now_ts - 3_600,
+        });
+        assert_eq!(
+            format_state(&banned, now_ts),
+            "Banned: an invalid fidelity proof (1 hour ago)"
+        );
+    }
+
+    #[test]
+    fn bond_failures_split_into_recoverable_and_proven() {
+        let now_ts = 170_000;
+        let address = addr("bond-check");
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), None, None, now_ts, None);
+
+        // An expired bond is the bond's own lifecycle, not a lie about it.
+        let expired = classify_bond_failure(FidelityError::BondLocktimeExpired.into());
+        book.record_offer_failure(&address, &expired, now_ts);
+        assert!(matches!(
+            book.makers[0].state,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::BondExpired,
+                ..
+            })
+        ));
+
+        // An error nobody anticipated proves nothing either.
+        let surprise = classify_bond_failure(WalletError::General("something else".into()));
+        book.record_offer_failure(&address, &surprise, now_ts);
+        assert!(matches!(
+            book.makers[0].state,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::BondUnverified,
+                ..
+            })
+        ));
+
+        // A certificate signed over the wrong thing is proof, and proof is final.
+        let forged = classify_bond_failure(FidelityError::InvalidCertHash.into());
+        book.record_offer_failure(&address, &forged, now_ts);
+        assert!(matches!(
+            book.makers[0].state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::InvalidFidelityProof,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_unpriceable_offer_does_not_ban_its_maker() {
+        let now_ts = 170_000;
+        let address = addr("malformed");
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), None, None, now_ts, None);
+
+        let offer = dummy_offer(&address.to_string());
+        offer.validate_shape().expect("the test offer must be sane");
+
+        for broken in [
+            Offer {
+                amount_relative_fee_pct: f64::NAN,
+                ..offer.clone()
+            },
+            Offer {
+                time_relative_fee_pct: 100.0,
+                ..offer.clone()
+            },
+            Offer {
+                min_size: offer.max_size + 1,
+                ..offer.clone()
+            },
+        ] {
+            let error = broken
+                .validate_shape()
+                .map_err(|e| {
+                    OfferCheckError::Lifecycle(
+                        UnavailableReason::UnpriceableOffer,
+                        TakerError::General(e),
+                    )
+                })
+                .expect_err("an offer nobody can price must be refused");
+            book.record_offer_failure(&address, &error, now_ts);
+        }
+
+        // A maker low on liquidity publishes exactly this, so it must recover.
+        assert!(matches!(
+            book.makers[0].state,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::UnpriceableOffer,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn suppression_carries_the_failure_run_back() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let prune_ts = ttl * 2;
+        let address = addr("returning-run");
+        let outpoint = Some(OutPoint::new(Txid::from_slice(&[13; 32]).unwrap(), 0));
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, None);
+        book.mark_failure(&address, UnavailableReason::BondUnverified, prune_ts - ttl);
+        book.mark_failure(&address, UnavailableReason::BondUnverified, prune_ts - 1);
+        let before = book.makers[0].state.clone();
+
+        // Hiding and rediscovering a maker is not evidence that it recovered.
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
-        assert!(book.makers.is_empty());
+        assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), prune_ts + ttl));
+        assert_eq!(book.makers[0].state, before);
+    }
 
-        // Rediscovery restores it: a poll success cannot launder a violator
-        // back into selection.
-        assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), now_ts));
-        assert!(book.makers[0].proven_violation);
-        book.makers[0].state = MakerState::Good;
-        assert!(book
-            .makers
-            .iter()
-            .filter(|m| !m.proven_violation)
-            .all(|m| m.address != address));
+    #[test]
+    fn a_ban_is_visible_by_address_wherever_it_sits() {
+        let dir = std::env::temp_dir().join(format!(
+            "offerbook-isbanned-{}",
+            bip39::rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = OfferBookHandle::load_or_create(&dir).unwrap();
+        let banned = addr("banned-addr");
+        let honest = addr("honest-addr");
+
+        handle
+            .record_proven_violation(&banned, BanReason::ProvenViolation)
+            .unwrap();
+        lock_debug!(handle.inner.write()).unwrap().insert_candidate(
+            honest.clone(),
+            None,
+            None,
+            0,
+            None,
+        );
+
+        assert!(handle.is_banned(&banned).unwrap());
+        assert!(!handle.is_banned(&honest).unwrap());
+        // An address the book has never met carries no ban.
+        assert!(!handle.is_banned(&addr("never-seen")).unwrap());
+
+        // A ban parked in an older suppression record still counts.
+        let parked = addr("parked");
+        lock_debug!(handle.inner.write())
+            .unwrap()
+            .suppressed_makers
+            .insert(
+                parked.clone(),
+                SuppressedMaker {
+                    fidelity_outpoint: None,
+                    fidelity_expiry_height: None,
+                    state: Some(MakerState::Banned(BanRecord {
+                        reason: BanReason::InvalidFidelityProof,
+                        recorded_at_ts: 1,
+                    })),
+                    legacy_proven_violation: false,
+                    retry_after_ts: 0,
+                },
+            );
+        assert!(handle.is_banned(&parked).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn removal_clears_the_suppression_record_too() {
+        let dir = std::env::temp_dir().join(format!(
+            "offerbook-removal-{}",
+            bip39::rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = OfferBookHandle::load_or_create(&dir).unwrap();
+        let address = addr("forgotten");
+
+        {
+            let mut book = lock_debug!(handle.inner.write()).unwrap();
+            book.insert_candidate(address.clone(), None, None, 0, None);
+            assert_eq!(book.prune_stale_makers(STALE_MAKER_AGE.as_secs()), 1);
+            assert!(book.suppressed_makers.contains_key(&address));
+        }
+
+        assert!(handle.remove(&address).unwrap());
+        let snapshot = handle.snapshot().unwrap();
+        assert!(snapshot.makers.is_empty());
+        assert!(snapshot.suppressed_makers.is_empty());
+        assert!(!handle.remove(&address).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2220,7 +2783,7 @@ mod tests {
             fidelity_expiry_height: None,
             offer: None,
             state: MakerState::Good,
-            proven_violation: false,
+            legacy_proven_violation: false,
             protocol: None,
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
@@ -2230,8 +2793,8 @@ mod tests {
 
         // The state machine only steps on an answered check; #1017 schedules a
         // non-penalizing retry for a silent backend instead.
-        let down = FidelityCheckError::BackendDown(TakerError::General("electrum down".into()));
-        book.record_fidelity_failure(&address, &down, now_ts);
+        let down = OfferCheckError::BackendDown(TakerError::General("electrum down".into()));
+        book.record_offer_failure(&address, &down, now_ts);
         assert_eq!(book.makers[0].state, MakerState::Good);
         assert!(book.makers[0].backend_retry_pending);
     }
@@ -2243,15 +2806,15 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[3; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(addr("fresh"), outpoint, Some(500), 0, false);
+        book.insert_candidate(addr("fresh"), outpoint, Some(500), 0, None);
         book.makers[0].last_offer_update_ts = Some(now_ts - ttl + 1);
 
-        book.insert_candidate(addr("boundary"), outpoint, Some(500), now_ts, false);
+        book.insert_candidate(addr("boundary"), outpoint, Some(500), now_ts, None);
         book.makers[1].last_offer_update_ts = Some(now_ts - ttl);
 
-        book.insert_candidate(addr("never"), outpoint, Some(500), now_ts - ttl, false);
+        book.insert_candidate(addr("never"), outpoint, Some(500), now_ts - ttl, None);
 
-        book.insert_candidate(addr("future"), outpoint, Some(500), now_ts, false);
+        book.insert_candidate(addr("future"), outpoint, Some(500), now_ts, None);
         book.makers[3].last_offer_update_ts = Some(now_ts + 1);
 
         assert_eq!(book.prune_stale_makers(now_ts), 2);
@@ -2274,7 +2837,7 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[4; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, false);
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, None);
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
 
         assert!(!book.upsert_discovered(address.clone(), outpoint, Some(500), prune_ts + ttl - 1));
@@ -2282,7 +2845,7 @@ mod tests {
 
         let retry_ts = prune_ts + ttl;
         assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), retry_ts));
-        book.mark_failure(&address, retry_ts);
+        book.mark_failure(&address, UnavailableReason::BondUnverified, retry_ts);
         assert_eq!(book.prune_stale_makers(retry_ts), 1);
     }
 
@@ -2293,7 +2856,7 @@ mod tests {
         let new_outpoint = Some(OutPoint::new(Txid::from_slice(&[11; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), Some(old_outpoint), Some(500), 1_000, false);
+        book.insert_candidate(address.clone(), Some(old_outpoint), Some(500), 1_000, None);
         assert!(!book.upsert_discovered(address.clone(), new_outpoint, Some(600), 1_001));
         assert!(book.remove_fidelity_outpoint(old_outpoint));
         assert!(book.upsert_discovered(address, new_outpoint, Some(600), 1_001));
@@ -2316,7 +2879,7 @@ mod tests {
             old_outpoint,
             Some(500),
             prune_ts - ttl,
-            false,
+            None,
         );
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
         assert!(book.upsert_discovered(address.clone(), new_outpoint, Some(600), prune_ts + 1));
@@ -2339,14 +2902,14 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[12; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, false);
+        book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, None);
         assert_eq!(book.prune_stale_makers(prune_ts), 1);
         assert!(book.upsert_for_poll(address.clone(), poll_ts));
 
         assert_eq!(book.makers[0].fidelity_outpoint, outpoint);
         assert_eq!(book.makers[0].fidelity_expiry_height, Some(500));
 
-        book.mark_failure(&address, poll_ts);
+        book.mark_failure(&address, UnavailableReason::BondUnverified, poll_ts);
         let second_prune_ts = poll_ts + ttl;
         assert_eq!(book.prune_stale_makers(second_prune_ts), 1);
 
@@ -2364,7 +2927,7 @@ mod tests {
         let outpoint = Some(OutPoint::new(Txid::from_slice(&[8; 32]).unwrap(), 0));
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), outpoint, Some(500), now_ts - ttl, false);
+        book.insert_candidate(address.clone(), outpoint, Some(500), now_ts - ttl, None);
         assert_eq!(book.prune_stale_makers(now_ts), 1);
         assert_eq!(book.prune_expired_suppressions(499), 0);
         assert_eq!(book.prune_expired_suppressions(500), 1);
@@ -2378,7 +2941,7 @@ mod tests {
         let address = addr("persisted");
         let mut book = OfferBook::default();
 
-        book.insert_candidate(address.clone(), None, None, now_ts - ttl, false);
+        book.insert_candidate(address.clone(), None, None, now_ts - ttl, None);
         assert_eq!(book.prune_stale_makers(now_ts), 1);
 
         let encoded = serde_json::to_string(&book).unwrap();
@@ -2395,7 +2958,7 @@ mod tests {
     fn legacy_candidate_fields_deserialize_and_backfill() {
         let now_ts = STALE_MAKER_AGE.as_secs();
         let mut book = OfferBook::default();
-        book.insert_candidate(addr("legacy"), None, None, now_ts, false);
+        book.insert_candidate(addr("legacy"), None, None, now_ts, None);
 
         let mut encoded = serde_json::to_value(&book).unwrap();
         let candidate = encoded
@@ -2420,7 +2983,111 @@ mod tests {
     }
 
     #[test]
-    fn proven_violation_walks_the_state_machine_and_persists() {
+    fn legacy_states_migrate_without_inventing_evidence() {
+        let now_ts = 170_000;
+        let mut book = OfferBook::default();
+        book.insert_candidate(addr("silent"), None, None, 1, None);
+        book.insert_candidate(addr("violator"), None, None, 1, None);
+
+        let mut encoded = serde_json::to_value(&book).unwrap();
+        let makers = encoded
+            .get_mut("makers")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap();
+        makers[0]["state"] = serde_json::json!({ "Unresponsive": { "retries": 3 } });
+        makers[1]["state"] = serde_json::json!("Bad");
+        makers[1]["proven_violation"] = serde_json::json!(true);
+        let mut decoded: OfferBook = serde_json::from_value(encoded).unwrap();
+
+        // The old ladder kept no failure times, so none are invented. Its retry
+        // count is real evidence, so it carries over.
+        assert_eq!(
+            decoded.makers[0].state,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::LegacyStatus,
+                since_ts: None,
+                last_attempt_ts: None,
+                attempts: 3,
+            })
+        );
+
+        let migrated_ban = BanRecord {
+            reason: BanReason::LegacyProvenViolation,
+            recorded_at_ts: now_ts,
+        };
+        assert!(decoded.migrate_legacy_states(now_ts));
+        assert_eq!(
+            decoded.makers[1].state,
+            MakerState::Banned(migrated_ban.clone())
+        );
+        assert!(!decoded.migrate_legacy_states(now_ts + 1));
+
+        // The old flag is never written back, so the migration runs once.
+        let rewritten = serde_json::to_value(&decoded).unwrap();
+        assert!(rewritten["makers"][1].get("proven_violation").is_none());
+
+        // A violation parked in a suppression record migrates the same way.
+        let legacy_suppressed: SuppressedMaker = serde_json::from_value(serde_json::json!({
+            "fidelity_outpoint": null,
+            "fidelity_expiry_height": null,
+            "proven_violation": true,
+            "retry_after_ts": 0,
+        }))
+        .unwrap();
+        decoded
+            .suppressed_makers
+            .insert(addr("pruned"), legacy_suppressed);
+        assert!(decoded.migrate_legacy_states(now_ts));
+        assert_eq!(
+            decoded.suppressed_makers[&addr("pruned")].state,
+            Some(MakerState::Banned(migrated_ban))
+        );
+    }
+
+    #[test]
+    fn a_violation_clears_the_suppression_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "offerbook-suppressed-violation-{}",
+            bip39::rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = OfferBookHandle::load_or_create(&dir).unwrap();
+        let address = addr("6109");
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let prune_ts = ttl * 2;
+
+        // Park the maker in suppression, then prove it cheated while it sits there.
+        {
+            let mut book = lock_debug!(handle.inner.write()).unwrap();
+            book.insert_candidate(
+                address.clone(),
+                Some(OutPoint::new(Txid::from_slice(&[9; 32]).unwrap(), 0)),
+                Some(500),
+                prune_ts - ttl,
+                None,
+            );
+            assert_eq!(book.prune_stale_makers(prune_ts), 1);
+            assert!(book.suppressed_makers.contains_key(&address));
+        }
+
+        handle
+            .record_proven_violation(&address, BanReason::ProvenViolation)
+            .unwrap();
+
+        let snapshot = handle.snapshot().unwrap();
+        assert_eq!(snapshot.makers.len(), 1);
+        assert!(matches!(snapshot.makers[0].state, MakerState::Banned(_)));
+        assert!(
+            snapshot.suppressed_makers.is_empty(),
+            "the suppression record must not outlive the ban that replaced it"
+        );
+        assert!(handle.is_banned(&address).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_ban_is_terminal_and_persists() {
         let dir = std::env::temp_dir().join(format!(
             "offerbook-violation-{}",
             bip39::rand::random::<u64>()
@@ -2429,18 +3096,18 @@ mod tests {
         let handle = OfferBookHandle::load_or_create(&dir).unwrap();
         let address = addr("6107");
 
-        // A maker with no entry is inserted; a proven violation steps it down
-        // the Good -> Unresponsive -> Bad ladder and sets a sticky flag.
-        handle.record_proven_violation(&address).unwrap();
+        // A maker with no entry is inserted, and the violation bans it outright.
+        handle
+            .record_proven_violation(&address, BanReason::ProvenViolation)
+            .unwrap();
         let snapshot = handle.snapshot().unwrap();
-        assert_eq!(
-            snapshot.makers[0].state,
-            MakerState::Unresponsive { retries: 1 }
-        );
-        assert!(snapshot.makers[0].proven_violation);
+        let MakerState::Banned(ban) = &snapshot.makers[0].state else {
+            panic!("a proven violation must ban");
+        };
+        assert_eq!(ban.reason, BanReason::ProvenViolation);
+        let first_ban = ban.clone();
 
-        // A successful poll refreshes the offer and the ladder state, but the
-        // proven violation keeps the maker out of selection.
+        // A later offer cannot lift the ban.
         lock_debug!(handle.inner.write()).unwrap().mark_success(
             &address,
             dummy_offer(&address.to_string()),
@@ -2448,19 +3115,21 @@ mod tests {
             170000,
         );
         let snapshot = handle.snapshot().unwrap();
-        assert_eq!(snapshot.makers[0].state, MakerState::Good);
-        assert!(snapshot.makers[0].proven_violation);
+        assert_eq!(
+            snapshot.makers[0].state,
+            MakerState::Banned(first_ban.clone())
+        );
         assert!(handle
             .active_makers(&MakerProtocol::Taproot)
             .unwrap()
             .is_empty());
 
-        // An ordinary Unresponsive maker still recovers on poll success.
+        // An unavailable maker still recovers on poll success.
         let honest = addr("6108");
         {
             let mut book = lock_debug!(handle.inner.write()).unwrap();
-            book.insert_candidate(honest.clone(), None, None, 170000, false);
-            book.mark_failure(&honest, 170000);
+            book.insert_candidate(honest.clone(), None, None, 170000, None);
+            book.mark_failure(&honest, UnavailableReason::NoOfferResponse, 170000);
             book.mark_success(
                 &honest,
                 dummy_offer(&honest.to_string()),
@@ -2472,16 +3141,15 @@ mod tests {
         assert_eq!(actives.len(), 1);
         assert_eq!(actives[0].address, honest);
 
-        // 11 more violations walk the reset state back to Bad.
-        for _ in 0..11 {
-            handle.record_proven_violation(&address).unwrap();
-        }
+        // A second violation keeps the reason and time we first proved.
+        handle
+            .record_proven_violation(&address, BanReason::ProvenViolation)
+            .unwrap();
         let state = handle.snapshot().unwrap().makers[0].state.clone();
-        assert_eq!(state, MakerState::Bad);
+        assert_eq!(state, MakerState::Banned(first_ban.clone()));
 
         let persisted = OfferBook::read_from_disk(&dir.join("offerbook.json")).unwrap();
-        assert_eq!(persisted.makers[0].state, MakerState::Bad);
-        assert!(persisted.makers[0].proven_violation);
+        assert_eq!(persisted.makers[0].state, MakerState::Banned(first_ban));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

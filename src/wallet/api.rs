@@ -3500,6 +3500,32 @@ pub(crate) fn wait_for_tx_confirmation(
                 unseen.len(),
                 arrival_timeout.as_secs()
             );
+
+            // Never seeing a tx is not the same as the backend telling us it has
+            // none. Only a definite answer for every missing tx names a withheld
+            // broadcast; an error means we could not ask.
+            let mut missing: Vec<Txid> = unseen.iter().copied().collect();
+            missing.sort();
+            let mut confirmed_absent = true;
+            for txid in &missing {
+                match blockchain.is_tx_unknown(txid) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        log::warn!("Tx {txid} is known to the backend after all");
+                        confirmed_absent = false;
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("Cannot confirm {txid} is absent: {e:?}");
+                        confirmed_absent = false;
+                        break;
+                    }
+                }
+            }
+
+            if confirmed_absent {
+                return Err(WalletError::TxNeverBroadcast(missing));
+            }
             return Err(WalletError::TxConfirmationTimeout(
                 "Tx did not reach our mempool before the broadcast timeout".to_string(),
             ));

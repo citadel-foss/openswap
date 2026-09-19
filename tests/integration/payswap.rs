@@ -11,7 +11,7 @@ use bitcoin::Amount;
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
+    taker::{MakerState, SwapParams, TakerBehavior},
     wallet::AddressType,
 };
 
@@ -540,6 +540,18 @@ fn test_payswap_negotiation_guards_abort_before_funding() {
         !makers[1].has_ongoing_swaps().unwrap(),
         "the spare maker must not be negotiated"
     );
+
+    // The quoted maker closed a connection. Refusing to substitute it is a
+    // routing decision, not a verdict, so neither maker may be blamed.
+    let standings = takers[0].fetch_offers().unwrap().all_makers();
+    for standing in &standings {
+        assert!(
+            !matches!(standing.state, MakerState::Banned(_)),
+            "aborting a payment swap must blame nobody, but {} is {:?}",
+            standing.address,
+            standing.state
+        );
+    }
 
     let receiver = bitcoind
         .client

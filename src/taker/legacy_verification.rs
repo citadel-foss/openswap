@@ -6,6 +6,7 @@
 
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
+    convert::TryFrom,
     thread::sleep,
     time::Duration,
 };
@@ -26,10 +27,14 @@ use crate::{
         legacy_messages::SenderContractTxInfo,
     },
     utill::{fee_at_rate_sats, get_taker_dir, redeemscript_to_scriptpubkey},
-    wallet::Blockchain,
+    wallet::{Blockchain, WalletError},
 };
 
-use super::{api::Taker, error::TakerError};
+use super::{
+    api::Taker,
+    error::TakerError,
+    offers::{BanReason, MakerAddress},
+};
 
 /// Prevout lookups before the funding-fee check gives up. A backend blip must
 /// not abort a swap the taker has already funded.
@@ -43,14 +48,46 @@ impl Taker {
     /// failure is only logged: it must not mask the verification error
     /// that proves the violation.
     pub(crate) fn note_proven_violation(&self, maker_idx: usize) {
+        self.note_violation(maker_idx, BanReason::ProvenViolation);
+    }
+
+    /// Record a violation that carries its own reason.
+    pub(crate) fn note_violation(&self, maker_idx: usize, reason: BanReason) {
         let Ok(swap) = self.swap_state() else {
             return;
         };
         let Some(maker) = swap.makers.get(maker_idx) else {
             return;
         };
-        if let Err(e) = self.offerbook.record_proven_violation(&maker.address) {
+        if let Err(e) = self
+            .offerbook
+            .record_proven_violation(&maker.address, reason)
+        {
             log::warn!("Failed to record maker {maker_idx} violation: {e:?}");
+        }
+    }
+
+    /// Record a proven violation against a maker we know only by address.
+    /// Same policy as [`Taker::note_proven_violation`]: a persistence failure
+    /// is logged, never raised over the proof itself.
+    pub(crate) fn note_proven_violation_at(&self, maker_address: &str) {
+        let Ok(address) = MakerAddress::try_from(maker_address.to_string()) else {
+            log::warn!("Cannot record a violation for unreadable address {maker_address}");
+            return;
+        };
+        if let Err(e) = self
+            .offerbook
+            .record_proven_violation(&address, BanReason::ProvenViolation)
+        {
+            log::warn!("Failed to record violation for {maker_address}: {e:?}");
+        }
+    }
+
+    /// Ban a maker whose funding never arrived. The backend's definite "I have
+    /// none of these" is taken at its word, whichever backend answered.
+    pub(crate) fn note_withheld_funding(&self, maker_idx: usize, error: &TakerError) {
+        if matches!(error, TakerError::Wallet(WalletError::TxNeverBroadcast(_))) {
+            self.note_violation(maker_idx, BanReason::FundingWithheld);
         }
     }
 
@@ -151,9 +188,20 @@ impl Taker {
     /// contract tx, multisig redeemscript, funding amount, and the maker's pubkey.
     pub(crate) fn verify_sender_sigs(
         &self,
+        maker_address: &str,
         sigs: &[bitcoin::ecdsa::Signature],
     ) -> Result<(), TakerError> {
         let outgoing = &self.swap_state()?.outgoing_swapcoins;
+        // `zip` stops at the shorter side, so a short reply would leave later
+        // contracts unsigned and still pass.
+        if sigs.len() != outgoing.len() {
+            self.note_proven_violation_at(maker_address);
+            return Err(TakerError::General(format!(
+                "Maker sent {} sender signatures for {} outgoing contracts",
+                sigs.len(),
+                outgoing.len()
+            )));
+        }
 
         for (i, (sig, swapcoin)) in sigs.iter().zip(outgoing.iter()).enumerate() {
             let other_pubkey = swapcoin.other_pubkey.ok_or_else(|| {
@@ -180,6 +228,7 @@ impl Taker {
                 &sig.signature,
             )
             .map_err(|e| {
+                self.note_proven_violation_at(maker_address);
                 TakerError::General(format!(
                     "Invalid sender contract signature {} from maker: {:?}",
                     i, e
@@ -200,9 +249,21 @@ impl Taker {
     /// outgoing swapcoins (which only exist for the first hop).
     pub(crate) fn verify_sender_sigs_from_info(
         &self,
+        maker_address: &str,
         sigs: &[bitcoin::ecdsa::Signature],
         senders_info: &[SenderContractTxInfo],
     ) -> Result<(), TakerError> {
+        // `zip` stops at the shorter side, so a short reply would leave later
+        // contracts unsigned and still pass.
+        if sigs.len() != senders_info.len() {
+            self.note_proven_violation_at(maker_address);
+            return Err(TakerError::General(format!(
+                "Maker sent {} sender signatures for {} forwarded contracts",
+                sigs.len(),
+                senders_info.len()
+            )));
+        }
+
         for (i, (sig, info)) in sigs.iter().zip(senders_info.iter()).enumerate() {
             let (pubkey1, pubkey2) =
                 read_pubkeys_from_multisig_redeemscript(&info.multisig_redeemscript)?;
@@ -226,6 +287,7 @@ impl Taker {
                 .is_ok();
 
             if !valid {
+                self.note_proven_violation_at(maker_address);
                 return Err(TakerError::General(format!(
                     "Invalid forwarded sender contract signature {} from maker",
                     i

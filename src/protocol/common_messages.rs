@@ -81,6 +81,30 @@ pub struct Offer {
     pub tweak_chain_code: ChainCode,
 }
 
+impl Offer {
+    /// Checks the parts of an offer that are wrong whatever the swap amount is.
+    /// A maker that fails this has published something nobody can price.
+    pub(crate) fn validate_shape(&self) -> Result<(), String> {
+        for (name, pct) in [
+            ("amount_relative_fee_pct", self.amount_relative_fee_pct),
+            ("time_relative_fee_pct", self.time_relative_fee_pct),
+        ] {
+            if !pct.is_finite() || !(0.0..100.0).contains(&pct) {
+                return Err(format!("offer has invalid {name}: {pct}"));
+            }
+        }
+
+        if self.min_size > self.max_size {
+            return Err(format!(
+                "offer has min_size ({}) above max_size ({})",
+                self.min_size, self.max_size
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Swap details from Taker to Maker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SwapDetails {

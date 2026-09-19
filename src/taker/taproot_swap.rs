@@ -11,7 +11,9 @@ use bitcoin::{
 use crate::{
     protocol::{
         common_messages::{MakerToTakerMessage, TakerToMakerMessage},
-        contract2::{create_hashlock_script, create_timelock_script},
+        contract2::{
+            check_taproot_hashlock_has_pubkey, create_hashlock_script, create_timelock_script,
+        },
         taproot_messages::{SerializableScalar, TaprootContractData},
     },
     utill::{read_message, send_message},
@@ -464,23 +466,31 @@ impl Taker {
 
                     // Verify hashlock pubkey matches expected key
                     if i + 1 < num_makers {
-                        // Non-last maker: pubkey should be derived from next_hop_point + nonce
-                        if let (Some(nonce), Some(next_tp)) = (
+                        // Non-last maker: pubkey should be derived from next_hop_point + nonce.
+                        // Without both we cannot check it, and an unchecked hashlock
+                        // lets the next hop be paid to a key we never agreed to.
+                        let (Some(nonce), Some(next_tp)) = (
                             hashlock_nonces.get(i + 1),
                             self.swap_state()?.makers[i + 1].tweakable_point,
-                        ) {
-                            crate::protocol::contract2::check_taproot_hashlock_has_pubkey(
-                                &maker_contract.hashlock_script,
-                                &next_tp,
-                                nonce,
-                            )
-                            .map_err(|e| {
-                                TakerError::General(format!(
-                                    "Maker {} Taproot hashlock pubkey verification failed: {:?}",
-                                    i, e
-                                ))
-                            })?;
-                        }
+                        ) else {
+                            return Err(TakerError::General(format!(
+                                "Maker {} hashlock cannot be checked: hop {} has no nonce or tweak point",
+                                i,
+                                i + 1
+                            )));
+                        };
+
+                        check_taproot_hashlock_has_pubkey(
+                            &maker_contract.hashlock_script,
+                            &next_tp,
+                            nonce,
+                        )
+                        .map_err(|e| {
+                            TakerError::General(format!(
+                                "Maker {} Taproot hashlock pubkey verification failed: {:?}",
+                                i, e
+                            ))
+                        })?;
                     } else {
                         // Last maker: hashlock pubkey should be taker's own key
                         let (expected_xonly, _) = my_pubkey.inner.x_only_public_key();
@@ -489,23 +499,31 @@ impl Taker {
                         for _ in 0..3 {
                             hl_instructions.next();
                         }
-                        if let Some(Ok(bitcoin::script::Instruction::PushBytes(pk_bytes))) =
+                        // A script without a pubkey here used to skip the check,
+                        // which would accept a hashlock only the maker can claim.
+                        let Some(Ok(bitcoin::script::Instruction::PushBytes(pk_bytes))) =
                             hl_instructions.next()
-                        {
-                            let script_xonly =
-                                secp256k1::XOnlyPublicKey::from_slice(pk_bytes.as_bytes())
-                                    .map_err(|_| {
-                                        TakerError::General(format!(
-                                            "Last maker {} Taproot hashlock has invalid pubkey",
-                                            i
-                                        ))
-                                    })?;
-                            if script_xonly != expected_xonly {
-                                return Err(TakerError::General(format!(
-                                    "Last maker {} Taproot hashlock pubkey doesn't match taker's key",
-                                    i
-                                )));
-                            }
+                        else {
+                            return Err(TakerError::General(format!(
+                                "Last maker {} Taproot hashlock script carries no pubkey",
+                                i
+                            )));
+                        };
+
+                        let script_xonly = secp256k1::XOnlyPublicKey::from_slice(
+                            pk_bytes.as_bytes(),
+                        )
+                        .map_err(|_| {
+                            TakerError::General(format!(
+                                "Last maker {} Taproot hashlock has invalid pubkey",
+                                i
+                            ))
+                        })?;
+                        if script_xonly != expected_xonly {
+                            return Err(TakerError::General(format!(
+                                "Last maker {} Taproot hashlock pubkey doesn't match taker's key",
+                                i
+                            )));
                         }
                     }
 
@@ -566,11 +584,14 @@ impl Taker {
                         i,
                         maker_funding_txids.len()
                     );
+                    // Absence the backend confirmed for every tx is the maker
+                    // withholding funding it committed to.
                     self.wait_for_funding_confirmation(
                         &maker_funding_txids,
                         required_confirms,
                         super::api::MAKER_FUNDING_TIMEOUT,
-                    )?;
+                    )
+                    .inspect_err(|e| self.note_withheld_funding(i, e))?;
 
                     received_contracts.push(*maker_contract);
                     self.swap_state_mut()?.makers[i]

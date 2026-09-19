@@ -571,7 +571,7 @@ impl Taker {
                     }
                     Err(e) => {
                         // Next maker failed — try substituting with a spare.
-                        let spare = self.swap_state_mut()?.spare_makers.pop();
+                        let spare = self.take_eligible_spare()?;
                         if let Some(spare_addr) = spare {
                             log::warn!(
                                 "Next maker {} failed: {:?}. Substituting with spare at {}",
@@ -706,11 +706,15 @@ impl Taker {
                 .collect();
 
             let required_confirms = self.swap_state()?.params.required_confirms;
-            let maker_confirm_height = self.wait_for_legacy_funding_confirmation(
-                &maker_funding_txids,
-                required_confirms,
-                super::api::MAKER_FUNDING_TIMEOUT,
-            )?;
+            // Absence the backend confirmed for every tx is the maker
+            // withholding funding it committed to.
+            let maker_confirm_height = self
+                .wait_for_legacy_funding_confirmation(
+                    &maker_funding_txids,
+                    required_confirms,
+                    super::api::MAKER_FUNDING_TIMEOUT,
+                )
+                .inspect_err(|e| self.note_withheld_funding(maker_idx, e))?;
 
             // Verify that the maker's funding confirmed within a few blocks of the
             // previous hop. For legacy (CSV relative locktime), a large gap between
@@ -981,6 +985,7 @@ impl Taker {
         match msg {
             MakerToTakerMessage::RespContractSigsForSender(resp) => {
                 if resp.sigs.len() != outgoing_swapcoins.len() {
+                    self.note_proven_violation_at(maker_address);
                     return Err(TakerError::General(format!(
                         "Wrong number of signatures: expected {}, got {}",
                         outgoing_swapcoins.len(),
@@ -992,7 +997,7 @@ impl Taker {
                     resp.sigs.len()
                 );
                 // Verify each signature against the corresponding outgoing swapcoin
-                self.verify_sender_sigs(&resp.sigs)?;
+                self.verify_sender_sigs(maker_address, &resp.sigs)?;
                 Ok(resp.sigs)
             }
             other => Err(TakerError::General(format!(
@@ -1357,7 +1362,7 @@ impl Taker {
             MakerToTakerMessage::RespContractSigsForSender(resp) => {
                 log::info!("Received {} sender signatures", resp.sigs.len());
                 // Verify each forwarded signature against the sender contract info
-                self.verify_sender_sigs_from_info(&resp.sigs, senders_info)?;
+                self.verify_sender_sigs_from_info(maker_address, &resp.sigs, senders_info)?;
                 Ok(resp.sigs)
             }
             other => Err(TakerError::General(format!(

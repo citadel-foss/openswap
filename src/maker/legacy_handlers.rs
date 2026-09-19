@@ -11,6 +11,8 @@ use super::{
     },
 };
 #[cfg(feature = "integration-test")]
+use crate::protocol::contract::sign_contract_tx;
+#[cfg(feature = "integration-test")]
 use crate::wallet::WalletError;
 use crate::{
     protocol::{
@@ -113,6 +115,31 @@ fn process_req_contract_sigs_for_sender<M: Maker>(
     // Verify and sign the sender's contract transactions
     let sigs =
         maker.verify_and_sign_sender_contract_txs(&req.txs_info, &req.hashvalue, req.locktime)?;
+
+    // Well formed signatures over the right contracts, made with a key the
+    // taker never agreed to: only its own verification can catch this.
+    #[cfg(feature = "integration-test")]
+    let sigs =
+        if maker.behavior() == super::handlers::MakerBehavior::SignSenderContractsWithWrongKey {
+            log::warn!(
+                "[{}] Test behavior: signing sender contracts with the wrong key",
+                maker.network_port()
+            );
+            let wrong_key = SecretKey::from_slice(&[7u8; 32]).expect("valid test key");
+            req.txs_info
+                .iter()
+                .map(|info| {
+                    sign_contract_tx(
+                        &info.senders_contract_tx,
+                        &info.multisig_redeemscript,
+                        info.funding_input_value,
+                        &wrong_key,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            sigs
+        };
 
     log::info!(
         "[{}] Generated {} signatures for sender contracts",
@@ -689,6 +716,17 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
         }
 
         let txid = funding_tx.compute_txid();
+        // Answer normally but send nothing, so the taker waits on funding that
+        // never arrives rather than on a closed connection.
+        #[cfg(feature = "integration-test")]
+        if maker.behavior() == super::handlers::MakerBehavior::WithholdFundingSilently {
+            log::warn!(
+                "[{}] Test behavior: withholding Legacy funding tx {}",
+                maker.network_port(),
+                txid
+            );
+            continue;
+        }
         match maker.broadcast_transaction(funding_tx) {
             Ok(txid) => {
                 log::info!(

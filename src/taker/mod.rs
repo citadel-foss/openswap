@@ -22,5 +22,8 @@ pub use config::TakerConfig;
 #[cfg(feature = "integration-test")]
 pub use api::TakerBehavior;
 pub use api::{MakerFeeInfo, SwapParams, SwapSummary, Taker, TakerInitConfig};
-pub use offers::{format_state, MakerOfferCandidate, MakerProtocol, MakerState, OfferBook};
+pub use offers::{
+    format_state, BanReason, BanRecord, MakerOfferCandidate, MakerProtocol, MakerState, OfferBook,
+    UnavailableReason, UnavailableState,
+};
 pub use payment::PaymentQuote;

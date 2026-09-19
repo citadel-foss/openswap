@@ -59,6 +59,15 @@ pub enum MakerBehavior {
     /// Like [`MakerBehavior::SkipFundingBroadcast`], but leaves the broadcast
     /// record empty, so recovery reads the swap as never funded.
     SkipFundingBroadcastUnrecorded,
+    /// Withhold the funding broadcast while answering normally, so the taker
+    /// reaches its funding wait instead of seeing a dropped connection.
+    WithholdFundingSilently,
+    /// Advertise an offer whose minimum exceeds its maximum, so no amount can
+    /// be priced against it.
+    SendMalformedOffer,
+    /// Sign the sender contracts with a key nobody agreed to, so the signatures
+    /// are well formed and still wrong.
+    SignSenderContractsWithWrongKey,
     /// Close connection when receiving ReqContractSigsForSender (abort2 scenarios).
     CloseAtReqContractSigsForSender,
     /// Close connection when receiving ProofOfFunding (abort2 scenario).
@@ -771,6 +780,20 @@ fn handle_get_offer<M: Maker>(
         tweakable_point,
         fidelity,
         tweak_chain_code,
+    };
+
+    #[cfg(feature = "integration-test")]
+    let offer = if maker.behavior() == MakerBehavior::SendMalformedOffer {
+        log::warn!(
+            "[{}] Test behavior: advertising an offer nobody can price",
+            Maker::network_port(maker.as_ref())
+        );
+        Offer {
+            min_size: offer.max_size.saturating_add(1),
+            ..offer
+        }
+    } else {
+        offer
     };
 
     log::info!(

@@ -78,6 +78,12 @@ pub enum WalletError {
     /// on the wait is recoverable for them.
     TxConfirmationTimeout(String),
 
+    /// Transactions that never reached our mempool, and whose absence the
+    /// backend confirmed for every one of them. Separate from
+    /// `TxConfirmationTimeout` because only this one names a withheld
+    /// broadcast rather than a wait we gave up on.
+    TxNeverBroadcast(Vec<bitcoin::Txid>),
+
     /// Waiting was interrupted by an external signal (shutdown/abort).
     Interrupted(&'static str),
 
@@ -262,6 +268,9 @@ impl std::fmt::Display for WalletError {
             WalletError::BIP39(e) => write!(f, "BIP39 error: {}", e),
             WalletError::General(msg) => write!(f, "{}", msg),
             WalletError::TxConfirmationTimeout(msg) => write!(f, "{}", msg),
+            WalletError::TxNeverBroadcast(txids) => {
+                write!(f, "Transactions never broadcast: {txids:?}")
+            }
             WalletError::Interrupted(reason) => write!(f, "Interrupted: {}", reason),
             WalletError::Protocol(e) => write!(f, "Protocol error: {}", e),
             WalletError::Fidelity(e) => write!(f, "Fidelity error: {}", e),

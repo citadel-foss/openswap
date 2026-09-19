@@ -27,7 +27,8 @@ use openswap::{
     taker::{
         error::TakerError,
         swap_tracker::{ExchangeProgress, SwapTracker},
-        MakerState, SwapParams, Taker, TakerBehavior,
+        BanReason, BanRecord, MakerState, SwapParams, Taker, TakerBehavior, UnavailableReason,
+        UnavailableState,
     },
     utill::{MAX_TX_COUNT, MIN_RELAY_FEE_RATE, NO_SHUTDOWN, TX_BROADCAST_TIMEOUT},
     wallet::{AddressType, Destination},
@@ -1215,7 +1216,7 @@ fn test_taproot_rejection(port: u16, rpc: u16, behavior: MakerBehavior, expected
         error
     );
 
-    // The lie is arithmetically proven, so the maker's standing steps off Good.
+    // The lie is arithmetically proven, so the maker is banned outright.
     let standing = taker
         .fetch_offers()
         .unwrap()
@@ -1223,10 +1224,15 @@ fn test_taproot_rejection(port: u16, rpc: u16, behavior: MakerBehavior, expected
         .into_iter()
         .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
         .expect("the maker must be in the offerbook");
-    assert_eq!(
-        standing.state,
-        MakerState::Unresponsive { retries: 1 },
-        "a proven contract violation must step the maker Good -> Unresponsive"
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a proven contract violation must ban the maker"
     );
 
     shutdown_makers(&makers, maker_threads);
@@ -1525,10 +1531,15 @@ fn run_corrupt_contract_response(
         .into_iter()
         .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
         .expect("the maker must be in the offerbook");
-    assert_eq!(
-        standing.state,
-        MakerState::Unresponsive { retries: 1 },
-        "a proven contract violation must step the maker Good -> Unresponsive"
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a proven contract violation must ban the maker"
     );
 
     shutdown_makers(&makers, maker_threads);
@@ -2789,10 +2800,15 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(
         .into_iter()
         .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
         .expect("the maker must be in the offerbook");
-    assert_eq!(
-        standing.state,
-        MakerState::Unresponsive { retries: 1 },
-        "a proven fee shortfall must step the maker Good -> Unresponsive"
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a proven fee shortfall must ban the maker"
     );
 
     shutdown_makers(&makers, maker_threads);
@@ -2851,10 +2867,15 @@ fn run_rejects_underreported_funding_inputs(protocol: ProtocolVersion, port: u16
         .into_iter()
         .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
         .expect("the maker must be in the offerbook");
-    assert_eq!(
-        standing.state,
-        MakerState::Unresponsive { retries: 1 },
-        "a proven shape mismatch must step the maker Good -> Unresponsive"
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a proven shape mismatch must ban the maker"
     );
 
     shutdown_makers(&makers, maker_threads);
@@ -3271,4 +3292,178 @@ fn swap_cap_rejects_before_planning() {
 
     shutdown_makers(&makers, maker_threads);
     test_framework.finish(takers, block_generation_handle);
+}
+
+/// An offer whose minimum exceeds its maximum cannot price any amount. That is
+/// also what a maker low on liquidity publishes, so it must sideline the maker
+/// without banning it.
+#[test]
+fn an_unpriceable_offer_sidelines_without_banning() {
+    warn!("Running Test: Unpriceable Offer Sidelines Without Banning");
+
+    let makers_config_map = vec![(22502, Some(22115)), (22602, Some(22116))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![MakerBehavior::SendMalformedOffer, MakerBehavior::Normal];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || start_server(maker_clone).unwrap())
+        })
+        .collect::<Vec<_>>();
+
+    wait_for_makers_setup(&makers, 120);
+    generate_blocks(bitcoind, 1);
+
+    // One hop, so the honest maker alone can carry the route while the
+    // malformed offer is judged during the same offerbook sync.
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 1)
+        .with_tx_count(2)
+        .with_required_confirms(1);
+    let _ = taker.prepare_swap(swap_params);
+
+    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standing_of = |port: u16| {
+        standings
+            .iter()
+            .find(|m| m.address.to_string() == format!("127.0.0.1:{}", port))
+            .unwrap_or_else(|| panic!("maker on {} must be in the offerbook", port))
+            .state
+            .clone()
+    };
+
+    let publisher = standing_of(makers[0].config.network_port);
+    assert!(
+        matches!(
+            publisher,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::UnpriceableOffer,
+                ..
+            })
+        ),
+        "an unpriceable offer must sideline its publisher, not ban it, got {:?}",
+        publisher
+    );
+
+    let honest = standing_of(makers[1].config.network_port);
+    assert!(
+        !matches!(honest, MakerState::Banned(_)),
+        "the honest maker must not be blamed, got {:?}",
+        honest
+    );
+
+    info!("Unpriceable offer test completed successfully!");
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// Signatures made with a key nobody agreed to are well formed and still
+/// wrong. Only the maker that produced them is banned.
+#[test]
+fn wrong_key_sender_signatures_ban_their_signer() {
+    warn!("Running Test: Wrong-Key Sender Signatures Ban Their Signer");
+
+    let makers_config_map = vec![(22702, Some(22117)), (22802, Some(22118))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![
+        MakerBehavior::SignSenderContractsWithWrongKey,
+        MakerBehavior::Normal,
+    ];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || start_server(maker_clone).unwrap())
+        })
+        .collect::<Vec<_>>();
+
+    wait_for_makers_setup(&makers, 120);
+    generate_blocks(bitcoind, 1);
+
+    // Both makers are on the route, so there is no spare to substitute and the
+    // failure lands on the signer wherever it sits in the order.
+    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
+        .with_tx_count(2)
+        .with_required_confirms(1);
+    let summary = taker
+        .prepare_swap(swap_params)
+        .expect("prepare must succeed");
+    let swap_result = taker.start_swap(&summary.swap_id);
+    assert!(
+        swap_result.is_err(),
+        "a swap signed with the wrong key must fail"
+    );
+
+    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standing_of = |port: u16| {
+        standings
+            .iter()
+            .find(|m| m.address.to_string() == format!("127.0.0.1:{}", port))
+            .unwrap_or_else(|| panic!("maker on {} must be in the offerbook", port))
+            .state
+            .clone()
+    };
+
+    let signer = standing_of(makers[0].config.network_port);
+    assert!(
+        matches!(
+            signer,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "the wrong-key signer must be banned, got {:?}",
+        signer
+    );
+
+    let honest = standing_of(makers[1].config.network_port);
+    assert!(
+        !matches!(honest, MakerState::Banned(_)),
+        "the honest maker must not be blamed, got {:?}",
+        honest
+    );
+
+    // Naming the banned maker by address must not get it back into a route:
+    // the only candidate is refused, so no route can be built at all.
+    let banned_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let refusal = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 1)
+                .with_tx_count(2)
+                .with_required_confirms(1)
+                .with_preferred_makers(vec![banned_address]),
+        )
+        .expect_err("a banned maker must not be usable by address");
+    assert!(
+        format!("{refusal:?}").contains("preferred makers"),
+        "unexpected refusal for a banned preferred maker: {:?}",
+        refusal
+    );
+
+    info!("Wrong-key signature test completed successfully!");
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
 }
