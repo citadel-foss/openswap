@@ -2556,4 +2556,35 @@ mod tests {
         assert!(!book.upsert_discovered(address.clone(), None, None, future_ts + 60));
         assert!(book.is_banned(&address));
     }
+
+    #[test]
+    fn validate_offer_bounds_and_protocol_violations() {
+        let mut offer = dummy_offer("validate-offer-maker");
+        offer.min_size = 10_000;
+        offer.max_size = 1_000_000;
+        offer.base_fee = 100;
+        offer.amount_relative_fee_pct = 1.0;
+        offer.time_relative_fee_pct = 0.1;
+
+        // Valid send amount
+        assert!(super::super::api::Taker::validate_offer(&offer, 0, Amount::from_sat(50_000)).is_ok());
+
+        // Range mismatch
+        assert!(super::super::api::Taker::validate_offer(&offer, 0, Amount::from_sat(5_000)).is_err());
+        assert!(super::super::api::Taker::validate_offer(&offer, 0, Amount::from_sat(2_000_000)).is_err());
+
+        // Invalid fee percentage (protocol violation)
+        offer.amount_relative_fee_pct = f64::NAN;
+        assert!(super::super::api::Taker::validate_offer(&offer, 0, Amount::from_sat(50_000)).is_err());
+        offer.amount_relative_fee_pct = -1.0;
+        assert!(super::super::api::Taker::validate_offer(&offer, 0, Amount::from_sat(50_000)).is_err());
+        offer.amount_relative_fee_pct = 100.0;
+        assert!(super::super::api::Taker::validate_offer(&offer, 0, Amount::from_sat(50_000)).is_err());
+        offer.amount_relative_fee_pct = 1.0;
+
+        // min_size > max_size (protocol violation)
+        offer.min_size = 2_000_000;
+        offer.max_size = 1_000_000;
+        assert!(super::super::api::Taker::validate_offer(&offer, 0, Amount::from_sat(50_000)).is_err());
+    }
 }

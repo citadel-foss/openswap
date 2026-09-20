@@ -1658,12 +1658,17 @@ impl Taker {
                     offer.time_relative_fee_pct
                 );
                 if let Err(val_err) = Self::validate_offer(&offer, maker_idx, send_amount) {
-                    if let Err(ban_err) = self.ban_maker(&maker_address) {
-                        log::warn!(
-                            "Failed to persist ban for maker {}: {:?}",
-                            maker_address,
-                            ban_err
-                        );
+                    let send_sats = send_amount.to_sat();
+                    let is_range_mismatch = (send_sats < offer.min_size || send_sats > offer.max_size)
+                        && offer.min_size <= offer.max_size;
+                    if !is_range_mismatch {
+                        if let Err(ban_err) = self.ban_maker(&maker_address) {
+                            log::warn!(
+                                "Failed to persist ban for maker {}: {:?}",
+                                maker_address,
+                                ban_err
+                            );
+                        }
                     }
                     return Err(val_err);
                 }
@@ -1819,13 +1824,6 @@ impl Taker {
 
                     Ok(())
                 } else {
-                    if let Err(ban_err) = self.ban_maker(&maker_address) {
-                        log::warn!(
-                            "Failed to persist ban for maker {}: {:?}",
-                            maker_address,
-                            ban_err
-                        );
-                    }
                     Err(TakerError::General(format!(
                         "Maker {} rejected swap",
                         maker_idx
