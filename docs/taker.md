@@ -424,7 +424,9 @@ Proceed with this swap? [y/N]
 
 The swap ID is randomly generated and independent of the swap's cryptographic material, so it cannot be used to locate the swap's contracts on-chain. It is a local handle for referring to the swap, for example with `verify-deniability`.
 
-Confirm with `y` (or pass `-y`/`--yes` upfront) to execute the swap. With `--payment-address <addr>` (PaySwap), the summary instead shows the receiver, the exact amount the receiver gets, and the total openswap cost.
+Confirm with `y` (or pass `-y`/`--yes` upfront) to execute the swap.
+
+With `--payment-address <addr>` (PaySwap), the summary changes. **Maximum total cost (ceiling)** still bounds what you pay. Your estimated receive then reads 0. The money settles to the receiver instead of returning to you. A payment section lists the receiver, the exact amount the receiver gets, and **Route miner fees (est.)**. Those miner fees already sit inside the ceiling. They are not an extra charge.
 
 The process typically takes several minutes to complete. You can monitor the swap progress by watching the debug log in a new terminal:
 
