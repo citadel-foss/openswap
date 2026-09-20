@@ -11,13 +11,16 @@ use bitcoin::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::TryInto;
 
-use crate::protocol::{
-    common_messages::ProtocolVersion,
-    contract2::calculate_contract_sighash,
-    musig_interface::{
-        aggregate_partial_signatures_compat, generate_new_nonce_pair_compat,
-        generate_partial_signature_compat, get_aggregated_nonce_compat,
+use crate::{
+    protocol::{
+        common_messages::ProtocolVersion,
+        contract2::calculate_contract_sighash,
+        musig_interface::{
+            aggregate_partial_signatures_compat, generate_new_nonce_pair_compat,
+            generate_partial_signature_compat, get_aggregated_nonce_compat,
+        },
     },
+    utill::fee_at_rate_sats,
 };
 
 use super::{contract_and_timelock_vsize, SpendKind, WalletError};
@@ -49,6 +52,11 @@ mod option_scalar_serde {
         })
         .transpose()
     }
+}
+
+/// Feerate stored on swapcoins persisted before the field existed.
+fn default_negotiated_feerate() -> u64 {
+    crate::utill::MIN_RELAY_FEE_RATE as u64
 }
 
 /// Exact settlement destination for a PaySwap incoming swapcoin.
@@ -111,6 +119,11 @@ pub struct IncomingSwapCoin {
     pub spending_tx: Option<Transaction>,
     /// PaySwap settlement destination; `None` sweeps to a wallet-internal address.
     pub payment_target: Option<PaymentTarget>,
+    /// Negotiated swap feerate (sats/vB). Settlement sweeps pay this rate:
+    /// the peer was charged for it, so sweeping cheaper pockets the
+    /// difference and can leave the sweep underpriced.
+    #[serde(default = "default_negotiated_feerate")]
+    pub negotiated_feerate: u64,
 }
 
 impl IncomingSwapCoin {
@@ -121,6 +134,7 @@ impl IncomingSwapCoin {
         contract_redeemscript: ScriptBuf,
         hashlock_privkey: SecretKey,
         funding_amount: Amount,
+        negotiated_feerate: u64,
     ) -> Self {
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let my_pubkey = PublicKey {
@@ -152,6 +166,7 @@ impl IncomingSwapCoin {
             internal_key: None,
             spending_tx: None,
             payment_target: None,
+            negotiated_feerate,
         }
     }
 
@@ -162,6 +177,7 @@ impl IncomingSwapCoin {
         timelock_script: ScriptBuf,
         contract_tx: Transaction,
         funding_amount: Amount,
+        negotiated_feerate: u64,
     ) -> Self {
         IncomingSwapCoin {
             protocol: ProtocolVersion::Taproot,
@@ -184,6 +200,7 @@ impl IncomingSwapCoin {
             internal_key: None,
             spending_tx: None,
             payment_target: None,
+            negotiated_feerate,
         }
     }
 
@@ -349,7 +366,10 @@ impl IncomingSwapCoin {
             },
         );
 
-        let fee = Amount::from_sat((feerate * vsize as f64) as u64);
+        let fee = Amount::from_sat(
+            fee_at_rate_sats(vsize, feerate)
+                .ok_or_else(|| WalletError::General("unusable feerate".to_string()))?,
+        );
         let output_value = input_value
             .checked_sub(fee)
             .ok_or_else(|| WalletError::General("Fee exceeds input value".to_string()))?;
@@ -826,6 +846,9 @@ pub struct OutgoingSwapCoin {
     /// Destination reused by every timelock recovery retry.
     #[serde(default)]
     pub recovery_address: Option<Address<NetworkUnchecked>>,
+    /// Negotiated swap feerate (sats/vB) at creation.
+    #[serde(default = "default_negotiated_feerate")]
+    pub negotiated_feerate: u64,
 }
 
 impl OutgoingSwapCoin {
@@ -837,6 +860,7 @@ impl OutgoingSwapCoin {
         contract_redeemscript: ScriptBuf,
         timelock_privkey: SecretKey,
         funding_amount: Amount,
+        negotiated_feerate: u64,
     ) -> Self {
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let my_pubkey = PublicKey {
@@ -863,6 +887,7 @@ impl OutgoingSwapCoin {
             tap_tweak: None,
             internal_key: None,
             recovery_address: None,
+            negotiated_feerate,
         }
     }
 
@@ -873,6 +898,7 @@ impl OutgoingSwapCoin {
         timelock_script: ScriptBuf,
         contract_tx: Transaction,
         funding_amount: Amount,
+        negotiated_feerate: u64,
     ) -> Self {
         OutgoingSwapCoin {
             protocol: ProtocolVersion::Taproot,
@@ -893,6 +919,7 @@ impl OutgoingSwapCoin {
             tap_tweak: None,
             internal_key: None,
             recovery_address: None,
+            negotiated_feerate,
         }
     }
 

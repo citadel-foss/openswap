@@ -16,14 +16,12 @@ use openswap::{
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
     utill::NO_SHUTDOWN,
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    sync::atomic::Ordering::Relaxed,
     thread,
     time::{Duration, Instant},
 };
@@ -42,20 +40,8 @@ fn test_legacy_hashlock_recovery() {
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
 
     info!("Starting Maker servers...");
     let maker_threads = makers
@@ -70,14 +56,7 @@ fn test_legacy_hashlock_recovery() {
 
     wait_for_makers_setup(&makers, 120);
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
 
@@ -109,12 +88,7 @@ fn test_legacy_hashlock_recovery() {
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
+    shutdown_makers(&makers, maker_threads);
 
     for (i, maker) in makers.iter().enumerate() {
         maker
@@ -176,19 +150,19 @@ fn test_legacy_hashlock_recovery() {
 
     // The point of the test: the preimage was on-chain, so recovery must have
     // gone through the hashlock branch, not the timelock one.
-    let log_path = format!("{}/taker/debug.log", test_framework.temp_dir.display());
+    let log_path = test_framework.taker_log_path();
     test_framework.assert_log("Signing legacy hashlock spend with preimage", &log_path);
 
     // The hashlock sweep is a separate tx per contract, so the taker pays more
-    // than the 6337 sats a clean legacy swap costs.
+    // than the 4339 sats a clean legacy swap costs.
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499076,
+        14499538,
         "Taker regular balance mismatch"
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        493687,
+        495997,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -199,15 +173,15 @@ fn test_legacy_hashlock_recovery() {
     assert_eq!(taker_balances.fidelity, Amount::ZERO);
     assert_eq!(
         balance_diff.to_sat(),
-        7237,
+        4465,
         "Taker spendable balance change mismatch"
     );
 
     // Both makers still earn their full fee: maker 1 completed the swap and
     // maker 2 swept before dropping.
-    let expected_regular = [14500865u64, 14503103];
-    let expected_swap = [499100u64, 496825];
-    let expected_fee = [451u64, 414];
+    let expected_regular = [14500865u64, 14502398];
+    let expected_swap = [499550u64, 497980];
+    let expected_fee = [658u64, 621];
     for (i, maker) in makers.iter().enumerate() {
         let mb = maker.wallet.read().unwrap().get_balances().unwrap();
         let original = maker_spendable_balance[i];

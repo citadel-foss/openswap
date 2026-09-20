@@ -5,7 +5,7 @@
 
 use crate::{
     security::{load_sensitive_struct, KeyMaterial, SerdeJson},
-    utill::{get_taker_dir, parse_checked_address, MIN_FEE_RATE},
+    utill::{get_taker_dir, is_unusable_fee_rate, parse_checked_address, MIN_RELAY_FEE_RATE},
     wallet::{infer_address_type, AddressType, Destination, Wallet, WalletBackup, WalletError},
 };
 use bitcoin::{Amount, OutPoint, Txid};
@@ -88,6 +88,19 @@ pub fn restore_wallet_gui_app(
         log::error!("Wallet restore failed: {e:?}");
     } else {
         println!("Wallet restore succeeded!");
+    }
+}
+
+/// The rate a send will actually pay. Below the relay floor the tx would not
+/// propagate, so an unusable rate is refused rather than repaired; an unset one
+/// falls back to the floor. Free of `Wallet` so a unit test can pin both.
+fn checked_fee_rate(fee_rate: Option<f64>) -> Result<f64, WalletError> {
+    match fee_rate {
+        Some(rate) if is_unusable_fee_rate(rate) => Err(WalletError::General(format!(
+            "fee rate must be finite and at least the {MIN_RELAY_FEE_RATE} sats/vB relay floor"
+        ))),
+        Some(rate) => Ok(rate),
+        None => Ok(MIN_RELAY_FEE_RATE),
     }
 }
 
@@ -174,9 +187,11 @@ impl Wallet {
             WalletError::General("Invalid address for the current wallet network".to_string())
         })?;
 
+        let fee_rate = checked_fee_rate(fee_rate)?;
+
         let coins_to_spend = self.coin_select(
             amount,
-            fee_rate.unwrap_or(MIN_FEE_RATE),
+            fee_rate,
             infer_address_type(&addr.script_pubkey()),
             manually_selected_outpoints,
             None,
@@ -189,15 +204,73 @@ impl Wallet {
             change_address_type: AddressType::P2TR,
         };
 
-        let tx = self.spend_from_wallet(
-            fee_rate.unwrap_or(MIN_FEE_RATE),
-            destination,
-            &coins_to_spend,
-        )?;
+        let tx = self.spend_from_wallet(fee_rate, destination, &coins_to_spend)?;
 
         let txid = self.send_tx(&tx)?;
         self.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
 
         Ok(txid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::api::test_support::test_wallet;
+    use bitcoin::{
+        secp256k1::{Keypair, Secp256k1, SecretKey},
+        Address, Network,
+    };
+    use bitcoind::tempfile::tempdir;
+
+    /// A Regtest address the wallet accepts, so the fee rate is what decides
+    /// the outcome rather than address parsing.
+    fn destination() -> String {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[7u8; 32]).unwrap());
+        Address::p2tr(&secp, keypair.x_only_public_key().0, None, Network::Regtest).to_string()
+    }
+
+    fn send(fee_rate: Option<f64>) -> Result<Txid, WalletError> {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet.cbor"));
+        wallet.send_to_address(10_000, destination(), fee_rate, None)
+    }
+
+    #[test]
+    fn unusable_fee_rates_are_refused() {
+        for rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.999] {
+            let err = send(Some(rate)).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("relay floor"),
+                "rate {} must be refused by the relay floor, got {:?}",
+                rate,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn the_floor_and_the_default_clear_the_rate_check() {
+        // The wallet holds no coins, so each of these fails at coin selection.
+        // The point is that none of them is turned away by the rate check.
+        for rate in [Some(MIN_RELAY_FEE_RATE), Some(5.0), None] {
+            let err = send(rate).unwrap_err();
+            assert!(
+                !format!("{err:?}").contains("relay floor"),
+                "rate {:?} must clear the rate check, got {:?}",
+                rate,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn an_unset_rate_pays_exactly_the_relay_floor() {
+        // Accepting `None` is not enough: a caller that omits the rate must
+        // pay the floor, not whatever a future default happens to be.
+        assert_eq!(checked_fee_rate(None).unwrap(), MIN_RELAY_FEE_RATE);
+        assert_eq!(checked_fee_rate(Some(7.5)).unwrap(), 7.5);
+        assert!(checked_fee_rate(Some(f64::NAN)).is_err());
     }
 }

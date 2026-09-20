@@ -13,7 +13,7 @@ use bitcoin::{Address, Amount, ScriptBuf};
 
 use crate::{
     protocol::common_messages::Offer,
-    utill::estimate_funding_tx_fee_sats,
+    utill::{funding_fee_policy_sats, sweep_fee_policy_sats},
     wallet::{payment_settlement_budget_sats, swapcoin::PaymentTarget},
 };
 
@@ -37,8 +37,9 @@ pub struct PaymentQuote {
     /// Fee budget for settling the final swapcoins; the final hop is funded
     /// with `amount + settlement_budget`.
     pub settlement_budget: Amount,
-    /// Estimated mining fee for the taker's own funding transactions, paid by
-    /// the wallet on top of the route amount.
+    /// Miner-cost ceiling priced into each hop of the route (funding plus
+    /// sweep at the policy rate, times the split count). Already inside the
+    /// route amount — not an extra on top of it.
     pub taker_funding_fee_estimate: Amount,
 }
 
@@ -66,7 +67,7 @@ impl HopFeeTerms {
 
 /// Replay one maker hop's deduction exactly as the maker computes it.
 /// The single forward formula shared by the quote solver and
-/// [`Taker::expected_amount_for_hop`] — any drift between them either
+/// [`Taker::forwardable_for_hop`] — any drift between them either
 /// misprices the payment or aborts a correct swap.
 pub(crate) fn hop_net_sats(terms: &HopFeeTerms, per_hop_mining_fee: u64, gross_sats: u64) -> u64 {
     let fee = (terms.base_fee as f64
@@ -138,11 +139,95 @@ fn solve_route_gross_sats(
     Ok(required)
 }
 
+/// Settlement output values for `funding_amounts`: each keeps an equal share
+/// of `settlement_budget` for its claim fee, and the surplus over
+/// `receiver_amount` is shaved off the largest outputs, never below dust.
+fn settlement_outputs(
+    funding_amounts: &[Amount],
+    settlement_budget: Amount,
+    receiver_amount: Amount,
+) -> Result<Vec<u64>, TakerError> {
+    let coin_count = funding_amounts.len() as u64;
+    if coin_count == 0 {
+        return Err(TakerError::General(
+            "Payment swap produced no incoming swapcoins to settle".into(),
+        ));
+    }
+    let per_coin_budget = settlement_budget.to_sat() / coin_count;
+
+    let mut outputs = Vec::with_capacity(funding_amounts.len());
+    for funding_amount in funding_amounts {
+        outputs.push(
+            funding_amount
+                .to_sat()
+                .checked_sub(per_coin_budget)
+                .filter(|value| *value >= MIN_PAYMENT_OUTPUT_SATS)
+                .ok_or_else(|| {
+                    TakerError::General(format!(
+                        "Incoming swapcoin funding {funding_amount} cannot retain the \
+                         {per_coin_budget} sat settlement budget above dust"
+                    ))
+                })?,
+        );
+    }
+
+    // Shave the ceiling surplus off the largest outputs and burn it as
+    // settlement-tx miner fee. Returning it needs a change output, which
+    // would link the settlement back to us — the one thing this swap buys.
+    let mut surplus = outputs
+        .iter()
+        .sum::<u64>()
+        .checked_sub(receiver_amount.to_sat())
+        .ok_or_else(|| {
+            TakerError::General("Settlement outputs cannot cover the receiver amount".into())
+        })?;
+    while surplus > 0 {
+        let Some((_, output)) = outputs
+            .iter_mut()
+            .enumerate()
+            .max_by_key(|(_, value)| **value)
+        else {
+            return Err(TakerError::General("No settlement outputs".into()));
+        };
+        let reducible = output.saturating_sub(MIN_PAYMENT_OUTPUT_SATS);
+        if reducible == 0 {
+            return Err(TakerError::General(
+                "Cannot remove the surplus without breaching dust".into(),
+            ));
+        }
+        let cut = reducible.min(surplus);
+        *output -= cut;
+        surplus -= cut;
+    }
+    Ok(outputs)
+}
+
+/// Dust-floor decision, free of `Taker` so a unit test can drive it; the
+/// caller supplies the quote and split count from the swap state.
+fn check_payment_dust_floor(
+    payment: Option<&PaymentQuote>,
+    tx_count: u32,
+) -> Result<(), TakerError> {
+    let Some(payment) = payment else {
+        return Ok(());
+    };
+    let count = u64::from(tx_count);
+    if payment.amount.to_sat() < MIN_PAYMENT_OUTPUT_SATS * count {
+        return Err(TakerError::General(format!(
+            "Payment amount {} is below the {} sat minimum for {} settlement outputs",
+            payment.amount,
+            MIN_PAYMENT_OUTPUT_SATS * count,
+            count
+        )));
+    }
+    Ok(())
+}
+
 impl Taker {
-    /// Validate the receiver address network and per-output dust floor.
-    /// Returns the checked address, or `None` for regular swaps. Runs at the
-    /// top of `prepare_swap`, before any swap state exists; the checked
-    /// address then feeds [`Self::payment_prepare_route`].
+    /// Validate the receiver address network. Returns the checked address, or
+    /// `None` for regular swaps. Runs at the top of `prepare_swap`, before any
+    /// swap state exists; the checked address then feeds
+    /// [`Self::payment_prepare_route`].
     pub(crate) fn payment_validate_params(
         &self,
         params: &SwapParams,
@@ -158,24 +243,15 @@ impl Taker {
             ))
         })?;
 
-        // The receiver amount is split across `tx_count` settlement outputs;
-        // each must clear the dust floor.
-        let tx_count = params.tx_count as u64;
-        if tx_count == 0 {
-            return Err(TakerError::General(
-                "A payment swap needs at least one transaction split".into(),
-            ));
-        }
-        if params.send_amount.to_sat() < MIN_PAYMENT_OUTPUT_SATS * tx_count {
-            return Err(TakerError::General(format!(
-                "Payment amount {} is below the {} sat minimum for {} settlement outputs",
-                params.send_amount,
-                MIN_PAYMENT_OUTPUT_SATS * tx_count,
-                tx_count
-            )));
-        }
-
         Ok(Some(address))
+    }
+
+    /// Dust floor on the receiver amount, sized on the declared `tx_count`:
+    /// the settlement outputs number the last hop's acked split count, which
+    /// is unknown until that ack arrives, so the ceiling is what must fit.
+    pub(crate) fn payment_check_dust_floor(&self) -> Result<(), TakerError> {
+        let swap = self.swap_state()?;
+        check_payment_dust_floor(swap.payment.as_ref(), swap.params.tx_count)
     }
 
     /// Solve the payment route after maker selection and before negotiation:
@@ -183,11 +259,12 @@ impl Taker {
     /// rewrite `params.send_amount` from the receiver's exact amount to the
     /// solved gross route amount. `address` is the validated receiver.
     pub(crate) fn payment_prepare_route(&mut self, address: Address) -> Result<(), TakerError> {
-        let (receiver_amount, tx_count, protocol, maker_count) = {
+        let (receiver_amount, tx_count, max_input_budget, protocol, maker_count) = {
             let swap = self.swap_state()?;
             (
                 swap.params.send_amount,
                 swap.params.tx_count as u64,
+                swap.params.max_input_budget,
                 swap.params.protocol,
                 swap.makers.len(),
             )
@@ -220,9 +297,19 @@ impl Taker {
             self.swap_state_mut()?.makers[i].offer = Some(offer);
         }
 
-        let settlement_budget = payment_settlement_budget_sats(protocol) * tx_count;
+        let swap_feerate = self.swap_state()?.params.swap_feerate();
+        let settlement_budget = payment_settlement_budget_sats(protocol, swap_feerate)
+            .and_then(|per_coin| per_coin.checked_mul(tx_count))
+            .ok_or_else(|| TakerError::General("Settlement budget overflow".to_string()))?;
         let final_net = receiver_amount.to_sat() + settlement_budget;
-        let per_hop_mining_fee = estimate_funding_tx_fee_sats() * tx_count;
+        // Solve at the ceiling: full splits at the full input budget, so the
+        // receiver amount is covered no matter how makers actually build.
+        let per_hop_mining_fee =
+            funding_fee_policy_sats(max_input_budget as usize, max_input_budget, swap_feerate)
+                .zip(sweep_fee_policy_sats(protocol, swap_feerate))
+                .and_then(|(funding, sweep)| funding.checked_add(sweep))
+                .and_then(|per_leg| tx_count.checked_mul(per_leg))
+                .ok_or_else(|| TakerError::General("Mining fee overflow".to_string()))?;
         let gross = solve_route_gross_sats(&hops, per_hop_mining_fee, final_net)?;
 
         // Maker selection was sized on the receiver amount, since the gross is
@@ -269,8 +356,11 @@ impl Taker {
     /// Pin the receiver on every final incoming swapcoin, right after
     /// creation and before wallet persistence. No-op for regular swaps.
     ///
-    /// Each coin surrenders an equal share of the settlement budget; the hop
-    /// total was verified exact, so the outputs sum to the receiver amount.
+    /// Each coin retains an equal share of the ceiling-sized settlement
+    /// budget for its claim fee; any surplus from makers beating the ceiling
+    /// is shaved off the largest outputs (down to dust) and becomes
+    /// settlement-tx miner fee, so the outputs sum to the receiver amount
+    /// exactly.
     pub(crate) fn payment_stamp_targets(&mut self) -> Result<(), TakerError> {
         let Some(payment) = self.swap_state()?.payment.clone() else {
             return Ok(());
@@ -278,34 +368,16 @@ impl Taker {
         let script_pubkey: ScriptBuf = payment.address.script_pubkey();
 
         let swap = self.swap_state_mut()?;
-        let coin_count = swap.incoming_swapcoins.len() as u64;
-        if coin_count == 0 {
-            return Err(TakerError::General(
-                "Payment swap produced no incoming swapcoins to settle".into(),
-            ));
-        }
-        let budget = payment.settlement_budget.to_sat();
-        if budget % coin_count != 0 {
-            return Err(TakerError::General(format!(
-                "Settlement budget {budget} sats does not divide across {coin_count} swapcoins"
-            )));
-        }
-        let per_coin_budget = budget / coin_count;
+        let funding_amounts: Vec<Amount> = swap
+            .incoming_swapcoins
+            .iter()
+            .map(|swapcoin| swapcoin.funding_amount)
+            .collect();
+        let outputs =
+            settlement_outputs(&funding_amounts, payment.settlement_budget, payment.amount)?;
 
         let mut total = 0;
-        for swapcoin in &mut swap.incoming_swapcoins {
-            let output_sats = swapcoin
-                .funding_amount
-                .to_sat()
-                .checked_sub(per_coin_budget)
-                .filter(|v| *v >= MIN_PAYMENT_OUTPUT_SATS)
-                .ok_or_else(|| {
-                    TakerError::General(format!(
-                        "Incoming swapcoin funding {} cannot carry a settlement output above dust \
-                         after the {per_coin_budget} sat fee budget",
-                        swapcoin.funding_amount
-                    ))
-                })?;
+        for (swapcoin, output_sats) in swap.incoming_swapcoins.iter_mut().zip(outputs) {
             swapcoin.payment_target = Some(PaymentTarget {
                 script_pubkey: script_pubkey.clone(),
                 amount: Amount::from_sat(output_sats),
@@ -323,7 +395,7 @@ impl Taker {
 
         log::info!(
             "Pinned {} settlement outputs totaling exactly {} sats to receiver {}",
-            coin_count,
+            funding_amounts.len(),
             total,
             payment.address
         );
@@ -334,6 +406,74 @@ impl Taker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_outputs_split_the_budget_and_shave_the_surplus() {
+        let sat = Amount::from_sat;
+
+        // Equal shares, nothing to shave: each coin keeps its funding less
+        // its share of the budget, and the total is the receiver amount.
+        let outputs =
+            settlement_outputs(&[sat(50_000), sat(50_000)], sat(2_000), sat(98_000)).unwrap();
+        assert_eq!(outputs, vec![49_000, 49_000]);
+
+        // A surplus comes off the largest output first, never the smallest.
+        let outputs =
+            settlement_outputs(&[sat(80_000), sat(20_000)], sat(2_000), sat(90_000)).unwrap();
+        assert_eq!(outputs.iter().sum::<u64>(), 90_000);
+        assert_eq!(outputs, vec![71_000, 19_000]);
+
+        // Exact total: the shaving loop never runs.
+        let outputs = settlement_outputs(&[sat(10_000)], sat(1_000), sat(9_000)).unwrap();
+        assert_eq!(outputs, vec![9_000]);
+    }
+
+    #[test]
+    fn settlement_outputs_refuse_what_dust_cannot_absorb() {
+        let sat = Amount::from_sat;
+
+        // Outputs cannot cover the receiver amount.
+        let err = settlement_outputs(&[sat(10_000)], sat(1_000), sat(50_000)).unwrap_err();
+        assert!(format!("{err:?}").contains("cannot cover"), "{:?}", err);
+
+        // A coin too small to keep its budget share above dust.
+        let err =
+            settlement_outputs(&[sat(1_000), sat(1_000)], sat(1_000), sat(1_000)).unwrap_err();
+        assert!(format!("{err:?}").contains("above dust"), "{:?}", err);
+
+        // The surplus cannot be shaved without breaching dust: both outputs
+        // sit at the floor, so there is nothing left to cut.
+        let err = settlement_outputs(
+            &[sat(MIN_PAYMENT_OUTPUT_SATS), sat(MIN_PAYMENT_OUTPUT_SATS)],
+            sat(0),
+            sat(MIN_PAYMENT_OUTPUT_SATS),
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("breaching dust"), "{:?}", err);
+
+        // No coins at all.
+        let err = settlement_outputs(&[], sat(1_000), sat(1_000)).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("no incoming swapcoins"),
+            "{:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn swap_feerate_returns_the_configured_rate() {
+        // Below-floor rates are rejected in `prepare_swap`; the accessor
+        // returns what was configured rather than repairing it.
+        let params = SwapParams::new(
+            crate::protocol::common_messages::ProtocolVersion::Taproot,
+            Amount::from_sat(100_000),
+            2,
+        )
+        .with_feerate(0);
+        assert_eq!(params.swap_feerate(), 0.0);
+        let params = params.with_feerate(3);
+        assert_eq!(params.swap_feerate(), 3.0);
+    }
 
     fn terms(base_fee: u64, amount_pct: f64, time_pct: f64, locktime: u32) -> HopFeeTerms {
         HopFeeTerms {
@@ -404,5 +544,30 @@ mod tests {
         // the net can never reach the target however large the gross.
         let hop = terms(0, 60.0, 0.5, 100);
         assert!(hop_gross_for_net(&hop, 0, 500_000).is_err());
+    }
+
+    #[test]
+    fn dust_floor_scales_with_the_declared_tx_count() {
+        // The integration test cannot reach this floor (maker min_size beats
+        // 546 sats per output), so drive the decision directly: at tx_count
+        // 10 the receiver amount must cover 10 dust outputs, i.e. 5_460 sats.
+        let address = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+            .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+            .unwrap()
+            .assume_checked();
+        let quote = |sats: u64| PaymentQuote {
+            address: address.clone(),
+            amount: Amount::from_sat(sats),
+            settlement_budget: Amount::ZERO,
+            taker_funding_fee_estimate: Amount::ZERO,
+        };
+
+        assert!(check_payment_dust_floor(None, 10).is_ok());
+        assert!(matches!(
+            check_payment_dust_floor(Some(&quote(5_459)), 10),
+            Err(TakerError::General(message)) if message.contains("5460 sat minimum for 10")
+        ));
+        assert!(check_payment_dust_floor(Some(&quote(5_460)), 10).is_ok());
+        assert!(check_payment_dust_floor(Some(&quote(10_000)), 10).is_ok());
     }
 }

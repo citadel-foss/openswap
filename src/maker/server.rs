@@ -5,7 +5,7 @@ use std::{
     net::{Ipv4Addr, TcpListener, TcpStream},
     sync::{
         atomic::Ordering::{self, Relaxed},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
     thread::{self, sleep},
     time::{Duration, Instant},
@@ -16,8 +16,10 @@ use crate::maker::rpc::server::MakerRpc;
 use crate::{
     lock_debug,
     maker::nostr::broadcast_bond_on_nostr,
-    protocol::common_messages::{MakerToTakerMessage, TakerToMakerMessage},
-    utill::{HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE},
+    protocol::common_messages::{MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage},
+    utill::{
+        HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, RECOVERY_FEE_RATE, UNBROADCAST_DISCARD_GRACE,
+    },
     wallet::{Blockchain, RecoveryReport, Wallet},
 };
 
@@ -57,17 +59,6 @@ struct LimiterState {
     last_refill: Instant,
 }
 
-impl LimiterState {
-    fn new() -> Self {
-        Self {
-            active: 0,
-            pending: 0,
-            tokens: CONNECTION_BURST,
-            last_refill: Instant::now(),
-        }
-    }
-}
-
 struct ConnectionLimiter {
     state: Mutex<LimiterState>,
 }
@@ -75,15 +66,25 @@ struct ConnectionLimiter {
 impl ConnectionLimiter {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(LimiterState::new()),
+            state: Mutex::new(LimiterState {
+                active: 0,
+                pending: 0,
+                tokens: CONNECTION_BURST,
+                last_refill: Instant::now(),
+            }),
         })
     }
 
-    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
-        let mut state = self
-            .state
+    /// A poisoned limiter lock carries no invariant worth aborting for: the
+    /// counts are rebuilt from live permits either way.
+    fn lock(&self) -> MutexGuard<'_, LimiterState> {
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let mut state = self.lock();
         let now = Instant::now();
         state.tokens = (state.tokens
             + now.duration_since(state.last_refill).as_secs_f64() * CONNECTIONS_PER_SECOND)
@@ -119,23 +120,14 @@ struct ConnectionPermit {
 impl ConnectionPermit {
     fn mark_established(&mut self) {
         if std::mem::replace(&mut self.pending, false) {
-            let mut state = self
-                .limiter
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.pending -= 1;
+            self.limiter.lock().pending -= 1;
         }
     }
 }
 
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
-        let mut state = self
-            .limiter
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.limiter.lock();
         if self.pending {
             state.pending -= 1;
         }
@@ -208,14 +200,23 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         maker.watch_service.stop_watcher_for_test();
     }
     let listener = if maker.watch_service.is_alive() {
-        let listener = TcpListener::bind(("127.0.0.1", maker.config.network_port)).map_err(|e| {
-            log::warn!(
-                "Failed to bind network port {}: {}. Fidelity bond funds may be locked to this port.",
-                maker.config.network_port,
-                e
-            );
-            MakerError::IO(e)
-        })?;
+        // Tests reserve the port at allocation and hand the socket over, so a
+        // parallel test cannot take it between allocation and start.
+        #[cfg(feature = "integration-test")]
+        let reserved = maker.reserved_network_listener.lock().unwrap().take();
+        #[cfg(not(feature = "integration-test"))]
+        let reserved: Option<TcpListener> = None;
+        let listener = match reserved {
+            Some(listener) => listener,
+            None => TcpListener::bind(("127.0.0.1", maker.config.network_port)).map_err(|e| {
+                log::warn!(
+                    "Failed to bind network port {}: {}. Fidelity bond funds may be locked to this port.",
+                    maker.config.network_port,
+                    e
+                );
+                MakerError::IO(e)
+            })?,
+        };
         listener.set_nonblocking(true).map_err(MakerError::IO)?;
         Some(listener)
     } else {
@@ -547,7 +548,9 @@ fn handle_connection(
                 // A read timeout is only a wakeup: keepalives arrive on separate
                 // connections and refresh the shared swap activity. Break only
                 // when the swap has gone quiet everywhere, not just this socket.
-                if is_read_timeout(&e) && !swap_is_quiet(&maker, &state) {
+                if matches!(&e, MakerError::IO(io) if matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
+                    && !swap_is_quiet(&maker, &state)
+                {
                     continue;
                 }
                 log::debug!(
@@ -681,21 +684,11 @@ fn handle_connection(
                 }
             } else {
                 // The swap is settled; its contract watches are no longer needed.
-                for incoming in &state.incoming_swapcoins {
-                    let txid = incoming.contract_tx.compute_txid();
-                    for (vout, txout) in incoming.contract_tx.output.iter().enumerate() {
-                        maker.unwatch_outpoint(
-                            bitcoin::OutPoint {
-                                txid,
-                                vout: vout as u32,
-                            },
-                            txout.script_pubkey.clone(),
-                        );
-                    }
-                }
-                for outgoing in &state.outgoing_swapcoins {
-                    let txid = outgoing.contract_tx.compute_txid();
-                    for (vout, txout) in outgoing.contract_tx.output.iter().enumerate() {
+                let incoming = state.incoming_swapcoins.iter().map(|s| &s.contract_tx);
+                let outgoing = state.outgoing_swapcoins.iter().map(|s| &s.contract_tx);
+                for contract_tx in incoming.chain(outgoing) {
+                    let txid = contract_tx.compute_txid();
+                    for (vout, txout) in contract_tx.output.iter().enumerate() {
                         maker.unwatch_outpoint(
                             bitcoin::OutPoint {
                                 txid,
@@ -720,10 +713,6 @@ fn handle_connection(
 }
 
 /// True when the error is the socket read timeout firing, not a real IO failure.
-fn is_read_timeout(e: &MakerError) -> bool {
-    matches!(e, MakerError::IO(io) if matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
-}
-
 /// A swap is quiet when neither this connection nor any keepalive connection
 /// has shown activity within the idle timeout.
 fn swap_is_quiet(maker: &Arc<MakerServer>, state: &ConnectionState) -> bool {
@@ -764,7 +753,7 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                 swap_amount_sat: idle.swap_amount_sat,
                 incoming_count: idle.incoming_swapcoins.len(),
                 outgoing_count: idle.outgoing_swapcoins.len(),
-                funding_broadcast: idle.funding_broadcast,
+                funding_broadcast_txids: idle.funding_broadcast_txids.clone(),
                 recovery: MakerRecoveryState::default(),
                 created_at: now,
                 updated_at: now,
@@ -845,7 +834,7 @@ fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result
         // Redeem any expired bonds
         if let Err(e) = lock_debug!(maker.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .redeem_expired_fidelity_bonds(AddressType::P2TR)
+            .redeem_expired_fidelity_bonds(RECOVERY_FEE_RATE, AddressType::P2TR)
         {
             log::warn!(
                 "[{}] Failed to redeem expired fidelity bonds: {:?}",
@@ -1042,7 +1031,9 @@ fn recover_from_swap(
     incoming_swapcoins: Vec<crate::wallet::swapcoin::IncomingSwapCoin>,
     outgoing_swapcoins: Vec<crate::wallet::swapcoin::OutgoingSwapCoin>,
 ) -> Result<(), MakerError> {
-    use super::swap_tracker::{MakerRecoveryPhase, MakerSwapPhase};
+    use super::swap_tracker::{
+        now_secs, MakerRecoveryPhase, MakerRecoveryState, MakerSwapPhase, MakerSwapRecord,
+    };
 
     // For Taproot, get_timelock() returns an absolute CLTV height.
     // For Legacy, it returns a relative CSV offset — but Legacy recovery
@@ -1090,44 +1081,43 @@ fn recover_from_swap(
     };
     let mut timelock_recovery_txids = Vec::new();
 
-    // Check if funding was ever broadcast. Only an explicit tracker record with
-    // funding_broadcast=false is safe to discard; missing tracker state can
-    // happen after a reboot and must not delete persisted recovery material.
+    // A restart reaches here with no record: the drain that would create one
+    // never ran. Create it aged from the reservation, so the unbroadcast grace
+    // runs from the event, not from the restart.
     {
-        let funding_broadcast = lock_debug!(maker.swap_tracker.lock())
+        let record_missing = lock_debug!(maker.swap_tracker.lock())
             .map_err(|_| MakerError::MutexPossion)?
             .get_record(&swap_id)
-            .map(|r| r.funding_broadcast);
-
-        if funding_broadcast == Some(false) {
-            log::info!(
-                "[{}] Funding was never broadcast for swap {} — nothing to recover. Discarding swapcoins.",
-                maker.config.network_port,
-                swap_id
-            );
-
+            .is_none();
+        if record_missing {
+            let created_at = lock_debug!(maker.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                .reservation_created_at(&swap_id)
+                .unwrap_or_else(now_secs);
+            let now = now_secs();
+            let protocol = outgoing_swapcoins
+                .first()
+                .map(|sc| sc.protocol)
+                .or_else(|| incoming_swapcoins.first().map(|sc| sc.protocol))
+                .unwrap_or(ProtocolVersion::Taproot);
+            let record = MakerSwapRecord {
+                swap_id: swap_id.clone(),
+                protocol,
+                phase: MakerSwapPhase::TakerDropped,
+                swap_amount_sat: 0,
+                incoming_count: incoming_swapcoins.len(),
+                outgoing_count: outgoing_swapcoins.len(),
+                funding_broadcast_txids: Vec::new(),
+                recovery: MakerRecoveryState::default(),
+                created_at,
+                updated_at: now,
+            };
+            if let Err(e) = lock_debug!(maker.swap_tracker.lock())
+                .map_err(|_| MakerError::MutexPossion)?
+                .save_record(&record)
             {
-                let mut wallet = lock_debug!(maker.wallet.write())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                for outgoing in &outgoing_swapcoins {
-                    let key = outgoing.contract_tx.compute_txid().to_string();
-                    wallet.remove_outgoing_swapcoin(&key);
-                }
-                for incoming in &incoming_swapcoins {
-                    let key = incoming.contract_tx.compute_txid().to_string();
-                    wallet.remove_incoming_swapcoin(&key);
-                }
-                wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                log::error!("Failed to save swap tracker record: {:?}", e);
             }
-
-            update_tracker(&maker, &swap_id, |r| {
-                r.phase = MakerSwapPhase::Recovered;
-                r.recovery.phase = MakerRecoveryPhase::CleanedUp;
-            });
-
-            #[cfg(feature = "integration-test")]
-            maker.shutdown.store(true, Relaxed);
-            return Ok(());
         }
     }
 
@@ -1138,7 +1128,138 @@ fn recover_from_swap(
     });
 
     let mut watchtower_down_logged = false;
+    let mut discard_deferred_logged = false;
     while !maker.is_shutdown() {
+        // True while the discard decision is still waiting on the grace. The
+        // swap is not finished until that is settled, whatever the contracts say.
+        let discard_pending;
+        // Discard only when every funding tx of the batch is positively unknown to
+        // the backend: an empty broadcast record can follow a crash before the
+        // first send was logged, and a failed query is not proof of absence.
+        {
+            // A send that never reached the record, or a backend that has not seen
+            // it yet, both read as "no broadcast". Funding already in flight is
+            // committed money, so age the record before believing that. Age is
+            // measured from creation: recovery progress refreshes `updated_at`,
+            // which would hold the grace open forever.
+            //
+            // Legacy never reaches this discard: its outgoing swapcoins are
+            // persisted only with the contract-sig response, which carries the
+            // funding txs fully signed — so the peer may hold and broadcast
+            // them even when we never did. Only Taproot, which broadcasts
+            // before responding, can prove never-exposed here.
+            let legacy_exposed = outgoing_swapcoins
+                .first()
+                .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy);
+            let unrecorded_for = lock_debug!(maker.swap_tracker.lock())
+                .map_err(|_| MakerError::MutexPossion)?
+                .get_record(&swap_id)
+                .filter(|r| r.funding_broadcast_txids.is_empty())
+                .map(|r| now_secs().saturating_sub(r.created_at));
+            let never_recorded = !legacy_exposed
+                && unrecorded_for.is_some_and(|age| age >= UNBROADCAST_DISCARD_GRACE.as_secs());
+            discard_pending = !legacy_exposed && unrecorded_for.is_some() && !never_recorded;
+            if let Some(age) = unrecorded_for.filter(|_| discard_pending) {
+                if !discard_deferred_logged {
+                    discard_deferred_logged = true;
+                    log::info!(
+                        "[{}] Swap {} shows no funding broadcast after {}s; keeping it until {}s",
+                        maker.config.network_port,
+                        swap_id,
+                        age,
+                        UNBROADCAST_DISCARD_GRACE.as_secs()
+                    );
+                }
+            }
+
+            if never_recorded {
+                // The maker's own sends: Legacy's funding txs (each outgoing
+                // contract spends one) or Taproot's contract txs. `None` when a
+                // Legacy contract tx has no input, so it proves nothing.
+                let batch_txids: Option<Vec<_>> = outgoing_swapcoins
+                    .iter()
+                    .map(|outgoing| match outgoing.protocol {
+                        ProtocolVersion::Legacy => outgoing
+                            .contract_tx
+                            .input
+                            .first()
+                            .map(|input| input.previous_output.txid),
+                        ProtocolVersion::Taproot => Some(outgoing.contract_tx.compute_txid()),
+                    })
+                    .collect();
+
+                let wallet = lock_debug!(maker.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                let mut all_unknown = batch_txids.is_some();
+                if let Some(txids) = &batch_txids {
+                    for txid in txids {
+                        // Nothing re-spawns this thread, so a failed query must not
+                        // end recovery. Keep the records and let the monitoring
+                        // loop below retry every heartbeat.
+                        match wallet.blockchain.is_tx_unknown(txid) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                all_unknown = false;
+                                break;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "[{}] Could not check funding tx {} for swap {}: {:?}; keeping swapcoins",
+                                    maker.config.network_port,
+                                    txid,
+                                    swap_id,
+                                    e
+                                );
+                                all_unknown = false;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    log::error!(
+                        "[{}] Malformed outgoing swapcoin for swap {}: contract tx has no inputs; keeping swapcoins for recovery",
+                        maker.config.network_port,
+                        swap_id
+                    );
+                }
+                drop(wallet);
+
+                if all_unknown {
+                    log::info!(
+                        "[{}] Funding was never broadcast for swap {} — nothing to recover. Discarding swapcoins.",
+                        maker.config.network_port,
+                        swap_id
+                    );
+
+                    {
+                        let mut wallet = lock_debug!(maker.wallet.write())
+                            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                        for outgoing in &outgoing_swapcoins {
+                            let key = outgoing.contract_tx.compute_txid().to_string();
+                            wallet.remove_outgoing_swapcoin(&key);
+                        }
+                        for incoming in &incoming_swapcoins {
+                            let key = incoming.contract_tx.compute_txid().to_string();
+                            wallet.remove_incoming_swapcoin(&key);
+                        }
+                        // The swap is settled as never funded: its input
+                        // reservation goes with it, not at the 4h TTL.
+                        wallet.release_swap_locks(&swap_id, None);
+                        wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                    }
+
+                    update_tracker(&maker, &swap_id, |r| {
+                        r.phase = MakerSwapPhase::Recovered;
+                        r.recovery.phase = MakerRecoveryPhase::CleanedUp;
+                    });
+
+                    #[cfg(feature = "integration-test")]
+                    maker.shutdown.store(true, Relaxed);
+                    return Ok(());
+                }
+            }
+        }
+
         // --- Hashlock path: check if preimages are available ---
         if let Err(e) = check_for_preimage(&maker, &outgoing_swapcoins, &incoming_swapcoins) {
             log::warn!(
@@ -1220,7 +1341,6 @@ fn recover_from_swap(
             let swept = Wallet::sweep_incoming_swapcoins(
                 &maker.wallet,
                 chain,
-                crate::utill::MIN_FEE_RATE,
                 &maker.shutdown,
                 Some(&contract_txids),
             )
@@ -1299,11 +1419,19 @@ fn recover_from_swap(
 
             let chain = chain.as_ref().expect("connection created for this branch");
 
+            let legacy_funding_shared = outgoing_swapcoins
+                .first()
+                .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy);
             let recovered = Wallet::recover_timelocked_swapcoins(
                 &maker.wallet,
                 chain,
-                crate::utill::MIN_FEE_RATE,
+                RECOVERY_FEE_RATE,
                 &maker.shutdown,
+                Some(&swap_id),
+                // Legacy funding rides the contract-sig response, so the peer
+                // may hold it even when we never broadcast. The pass is scoped
+                // to one swap, so every coin gets the same answer.
+                &|_| legacy_funding_shared,
             )
             .map_err(MakerError::Wallet)?;
 
@@ -1332,7 +1460,9 @@ fn recover_from_swap(
                     );
                     false
                 });
-                if resolved {
+                // Nothing on-chain also describes a swap that never funded, so
+                // do not call it cleaned up while the discard is still pending.
+                if resolved && !discard_pending {
                     update_tracker(&maker, &swap_id, |r| {
                         r.phase = MakerSwapPhase::Recovered;
                         r.recovery.phase = MakerRecoveryPhase::CleanedUp;

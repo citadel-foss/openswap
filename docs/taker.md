@@ -377,7 +377,11 @@ Options:
   -a, --amount <AMOUNT>
           Sets the swap amount in sats [default: 20000]
       --tx-count <TX_COUNT>
-          [default: 1]
+          Maximum funding splits per hop; makers may forward fewer [default: 2]
+      --max-input-budget <MAX_INPUT_BUDGET>
+          Maximum inputs per funding tx whose fee you cover; extra inputs are the maker's cost [default: 2]
+      --feerate <FEERATE>
+          Swap feerate in sats/vB; values below the 1 sat/vB relay floor are rejected [default: 1]
       --protocol <PROTOCOL>
           Protocol version to use: "legacy" or "taproot" [default: legacy]
       --maker-address <MAKER_ADDRESSES>
@@ -391,6 +395,8 @@ Options:
   -h, --help
           Print help
 ```
+
+The `--tx-count`, `--max-input-budget`, and `--feerate` parameters are explained in [the fee policy](./fee-policy.md).
 
 By default, the command opens an interactive UTXO picker so you can choose which coins fund the swap; pass `--auto-select` to let the wallet pick them automatically.
 
@@ -409,7 +415,7 @@ Sending:   20000 sats
          Fees: base=500 sats, amt=0.0025%, time=0.000100%
          Locktime: 24 blocks, Estimated fee: 530 sats
 
-Total estimated fee: 1080 sats
+Maximum total cost (ceiling): 1080 sats
 Estimated receive:   18920 sats
 ==================================
 
@@ -418,7 +424,9 @@ Proceed with this swap? [y/N]
 
 The swap ID is randomly generated and independent of the swap's cryptographic material, so it cannot be used to locate the swap's contracts on-chain. It is a local handle for referring to the swap, for example with `verify-deniability`.
 
-Confirm with `y` (or pass `-y`/`--yes` upfront) to execute the swap. With `--payment-address <addr>` (PaySwap), the summary instead shows the receiver, the exact amount the receiver gets, and the total openswap cost.
+Confirm with `y` (or pass `-y`/`--yes` upfront) to execute the swap.
+
+With `--payment-address <addr>` (PaySwap), the summary changes. **Maximum total cost (ceiling)** still bounds what you pay. Your estimated receive then reads 0. The money settles to the receiver instead of returning to you. A payment section lists the receiver, the exact amount the receiver gets, and **Route miner fees (est.)**. Those miner fees already sit inside the ceiling. They are not an extra charge.
 
 The process typically takes several minutes to complete. You can monitor the swap progress by watching the debug log in a new terminal:
 

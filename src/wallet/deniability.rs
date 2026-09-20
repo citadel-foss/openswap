@@ -21,7 +21,7 @@ use crate::{
         contract2::create_taproot_script,
         musig_interface::get_aggregated_pubkey_compat,
     },
-    utill::{now_unix_secs, redeemscript_to_scriptpubkey},
+    utill::{now_secs, redeemscript_to_scriptpubkey},
 };
 
 use super::{
@@ -213,7 +213,7 @@ impl DeniabilityProof {
                     protocol: ProtocolVersion::Taproot,
                     outgoing_swapcoin,
                     proof: DeniabilityProofData::Taproot(data),
-                    created_at: now_unix_secs(),
+                    created_at: now_secs(),
                 })
             }
             ProtocolVersion::Legacy => {
@@ -246,7 +246,7 @@ impl DeniabilityProof {
                     protocol: ProtocolVersion::Legacy,
                     outgoing_swapcoin,
                     proof: DeniabilityProofData::Legacy(data),
-                    created_at: now_unix_secs(),
+                    created_at: now_secs(),
                 })
             }
         }

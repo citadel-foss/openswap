@@ -23,7 +23,7 @@ use bitcoin::{
 
 pub(crate) use bitcoin::hashes::hash160::Hash as Hash160;
 
-use crate::utill::{calculate_fee_sats, redeemscript_to_scriptpubkey};
+use crate::utill::{fee_at_rate_sats, redeemscript_to_scriptpubkey};
 
 use super::{
     error::ProtocolError,
@@ -396,8 +396,28 @@ pub(crate) fn create_senders_contract_tx(
     input: OutPoint,
     input_value: Amount,
     contract_redeemscript: &ScriptBuf,
+    fee_rate: f64,
 ) -> Result<Transaction, ProtocolError> {
-    let fee_amount = calculate_fee_sats(CONTRACT_TX_VSIZE);
+    // The taker is charged at this negotiated rate, so the tx is built at it.
+    // A rate that cannot be priced is an error, never a reason to fall back.
+    let fee_amount = fee_at_rate_sats(CONTRACT_TX_VSIZE, fee_rate).ok_or(
+        ProtocolError::General("Contract tx fee rate cannot be priced"),
+    )?;
+    // `input_value` is peer-derived; a dust funding output would panic the
+    // handler thread, so fail the swap instead.
+    let contract_value = input_value
+        .checked_sub(Amount::from_sat(fee_amount))
+        .ok_or(ProtocolError::General(
+            "Funding output below contract tx fee",
+        ))?;
+    let script_pubkey = redeemscript_to_scriptpubkey(contract_redeemscript)?;
+    // A dust contract output never relays: the recovery broadcast fails and
+    // the locked funding sits unclaimed. Refuse the swap instead.
+    if contract_value < script_pubkey.minimal_non_dust() {
+        return Err(ProtocolError::General(
+            "Contract output below the dust threshold",
+        ));
+    }
 
     Ok(Transaction {
         input: vec![TxIn {
@@ -407,8 +427,8 @@ pub(crate) fn create_senders_contract_tx(
             script_sig: ScriptBuf::new(),
         }],
         output: vec![TxOut {
-            script_pubkey: redeemscript_to_scriptpubkey(contract_redeemscript)?,
-            value: input_value - Amount::from_sat(fee_amount),
+            script_pubkey,
+            value: contract_value,
         }],
         lock_time: LockTime::ZERO,
         version: Version::TWO,
@@ -420,10 +440,11 @@ pub(crate) fn create_receivers_contract_tx(
     input: OutPoint,
     input_value: Amount,
     contract_redeemscript: &ScriptBuf,
+    fee_rate: f64,
 ) -> Result<Transaction, ProtocolError> {
     // exactly the same thing as senders contract for now, until collateral
     // inputs are implemented
-    create_senders_contract_tx(input, input_value, contract_redeemscript)
+    create_senders_contract_tx(input, input_value, contract_redeemscript, fee_rate)
 }
 
 /// Check if a contract output is valid.
@@ -542,7 +563,10 @@ pub(crate) fn sum_claimed_amounts(
 
 #[cfg(test)]
 mod test {
-    use crate::protocol::legacy_messages::NextHopInfo;
+    use crate::{
+        protocol::legacy_messages::NextHopInfo,
+        utill::{fee_at_rate_sats, MIN_RELAY_FEE_RATE},
+    };
 
     use super::*;
     use bitcoin::{
@@ -770,15 +794,21 @@ mod test {
         )
         .unwrap();
 
-        // Create a contract transaction spending the above utxo
-        let contract_tx =
-            create_receivers_contract_tx(spending_utxo, Amount::from_sat(30000), &contract_script)
-                .unwrap();
+        // Create a contract transaction spending the above utxo. The golden
+        // hex was regenerated at the 1 sat/vB relay floor (fee 150 sats);
+        // the old 2 sat/vB floor paid 300.
+        let contract_tx = create_receivers_contract_tx(
+            spending_utxo,
+            Amount::from_sat(30000),
+            &contract_script,
+            MIN_RELAY_FEE_RATE,
+        )
+        .unwrap();
 
         // Check creation matches expectation
         let expected_tx_hex = String::from(
             "020000000156944c5d3f98413ef45cf54545538103cc9f298e057\
-            5820ad3591376e2e0f65d2a00000000000000000104740000000000002200200ed322603ee06987031788\
+            5820ad3591376e2e0f65d2a0000000000000000019a740000000000002200200ed322603ee06987031788\
             2801ce84362bf3eff64df77389f6d14375c121706f00000000",
         );
         let expected_tx: Transaction =
@@ -868,6 +898,68 @@ mod test {
     }
 
     #[test]
+    fn test_contract_tx_fee_at_non_floor_rate() {
+        let contract_script = ScriptBuf::from(
+            Vec::from_hex(
+                "827ca91414cdf8fe0b7b2db2bd976f27fb6f3cd5f9228633876321038cc778b555c3fe2b01d1b550a07\
+            d26e38c026c4c4e1dee2a41f0431283230ee0012000672102b6b9ab72d42fb625a24598a792fa5346aa\
+            64d728b446f7560f4ce1c29378b22c00012868b2757b88ac"
+            ).unwrap()
+        );
+        let spending_utxo = OutPoint::from_str(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:42",
+        )
+        .unwrap();
+
+        // The floor rate would hide a broken rate parameterization, so pin 3
+        // sat/vB: fee = CONTRACT_TX_VSIZE x 3, output = input - fee.
+        let feerate = 3.0;
+        let input_value = Amount::from_sat(30000);
+        let expected_fee = CONTRACT_TX_VSIZE * feerate as u64;
+
+        for contract_tx in [
+            create_senders_contract_tx(spending_utxo, input_value, &contract_script, feerate)
+                .unwrap(),
+            create_receivers_contract_tx(spending_utxo, input_value, &contract_script, feerate)
+                .unwrap(),
+        ] {
+            assert_eq!(contract_tx.input[0].previous_output, spending_utxo);
+            let fee = input_value.to_sat() - contract_tx.output[0].value.to_sat();
+            assert_eq!(fee, expected_fee);
+            assert_eq!(
+                contract_tx.output[0].value,
+                input_value - Amount::from_sat(expected_fee)
+            );
+        }
+    }
+
+    #[test]
+    fn contract_tx_rejects_funding_below_the_fee() {
+        let contract_script = ScriptBuf::from(
+            Vec::from_hex(
+                "827ca91414cdf8fe0b7b2db2bd976f27fb6f3cd5f9228633876321038cc778b555c3fe2b01d1b550a07\
+            d26e38c026c4c4e1dee2a41f0431283230ee0012000672102b6b9ab72d42fb625a24598a792fa5346aa\
+            64d728b446f7560f4ce1c29378b22c00012868b2757b88ac"
+            ).unwrap()
+        );
+        let spending_utxo = OutPoint::from_str(
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456:42",
+        )
+        .unwrap();
+
+        // A funding output worth less than the fee must fail the swap, not
+        // panic the handler thread on the checked_sub. The sender entry point
+        // is covered by `sender_contract_rejects_dust_outputs`.
+        let below_fee = Amount::from_sat(CONTRACT_TX_VSIZE);
+        let error = create_receivers_contract_tx(spending_utxo, below_fee, &contract_script, 3.0)
+            .expect_err("a funding output below the fee must fail");
+        let ProtocolError::General(message) = error else {
+            panic!("expected a general protocol error, got {:?}", error);
+        };
+        assert_eq!(message, "Funding output below contract tx fee");
+    }
+
+    #[test]
     fn test_contract_sig_validation() {
         // First create a funding transaction
         let secp = Secp256k1::new();
@@ -915,6 +1007,7 @@ mod test {
             funding_outpoint,
             funding_tx.output[0].value,
             &contract_script,
+            MIN_RELAY_FEE_RATE,
         )
         .unwrap();
 
@@ -1105,13 +1198,13 @@ mod test {
     #[test]
     fn calculate_swap_fee_normal() {
         // Test with typical values
-        let base_fee_sat = calculate_fee_sats(150);
+        let base_fee_sat = fee_at_rate_sats(150, MIN_RELAY_FEE_RATE).unwrap();
         let amt_rel_fee_pct = 2.5;
         let time_rel_fee_pct = 0.1;
         let swap_amount = 100_000;
         let refund_locktime = 20;
 
-        let expected_fee = 4800;
+        let expected_fee = 4650;
 
         let calculated_fee = calculate_swap_fee(
             swap_amount,
@@ -1132,7 +1225,7 @@ mod test {
         // Test with only the absolute fee being non-zero
         assert_eq!(
             calculate_swap_fee(swap_amount, refund_locktime, base_fee_sat, 0.0, 0.0),
-            300
+            150
         );
 
         // Test with only the relative fees being non-zero
@@ -1301,7 +1394,6 @@ mod test {
                 next_hashlock_nonce: SecretKey::new(&mut thread_rng()),
             }],
             refund_locktime: u16::default(),
-            contract_feerate: f64::default(),
             id: "random".to_string(),
         };
 
@@ -1332,7 +1424,6 @@ mod test {
                 next_hashlock_nonce: SecretKey::new(&mut thread_rng()),
             }],
             refund_locktime: u16::default(),
-            contract_feerate: f64::default(),
             id: "random".to_string(),
         };
 
@@ -1377,6 +1468,51 @@ mod test {
         assert_eq!(
             sum_claimed_amounts(std::iter::repeat_n(Amount::MAX_MONEY, 10_000)),
             Err(Amount::MAX_MONEY)
+        );
+    }
+
+    #[test]
+    fn sender_contract_rejects_dust_outputs() {
+        let secp = Secp256k1::new();
+        let pubkey = |byte: u8| {
+            PrivateKey::from_slice(&[byte; 32], bitcoin::NetworkKind::Test)
+                .unwrap()
+                .public_key(&secp)
+        };
+        let redeemscript = create_contract_redeemscript(
+            &pubkey(1),
+            &pubkey(2),
+            &Hash160::from_slice(&[0u8; 20]).unwrap(),
+            &50,
+        );
+        let input = OutPoint::null();
+        let fee = fee_at_rate_sats(CONTRACT_TX_VSIZE, MIN_RELAY_FEE_RATE).unwrap();
+
+        // An input below the fee fails at the fee check.
+        let err = create_senders_contract_tx(input, Amount::from_sat(fee - 1), &redeemscript, 1.0)
+            .expect_err("an input below the fee must fail");
+        assert!(
+            format!("{err:?}").contains("below contract tx fee"),
+            "{:?}",
+            err
+        );
+
+        // Zero or dust after the fee never relays: fails at the dust check.
+        for input_value in [fee, fee + 100] {
+            let err = create_senders_contract_tx(
+                input,
+                Amount::from_sat(input_value),
+                &redeemscript,
+                1.0,
+            )
+            .expect_err("a zero or dust contract output must fail");
+            assert!(format!("{err:?}").contains("dust"), "{:?}", err);
+        }
+
+        // Above the dust threshold it builds.
+        assert!(
+            create_senders_contract_tx(input, Amount::from_sat(fee + 500), &redeemscript, 1.0)
+                .is_ok()
         );
     }
 }

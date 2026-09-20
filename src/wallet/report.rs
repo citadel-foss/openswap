@@ -20,7 +20,7 @@ use std::{
 
 use crate::{
     atomic_file::{read_json, write_json_atomically, FileLock},
-    utill::now_unix_secs,
+    utill::now_secs,
 };
 
 use super::{
@@ -462,7 +462,7 @@ impl MakerReport {
         outgoing: Option<&OutgoingSwapCoin>,
     ) -> Self {
         let swap_duration_seconds = start_time.elapsed().as_secs_f64();
-        let end = now_unix_secs();
+        let end = now_secs();
         Self {
             swap_id,
             status: SwapStatus::Success,
@@ -586,7 +586,7 @@ impl RecoveryReport {
             recovery_type,
             recovery_txids,
             network,
-            timestamp: now_unix_secs(),
+            timestamp: now_secs(),
         };
         report.print();
         if let Err(e) = report.save_for_wallet(data_dir, None) {
@@ -617,7 +617,7 @@ impl RecoveryReport {
             recovery_type,
             recovery_txids,
             network,
-            timestamp: now_unix_secs(),
+            timestamp: now_secs(),
         };
         report.print();
         if let Err(e) = report.save_for_wallet(data_dir, None) {

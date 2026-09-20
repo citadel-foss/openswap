@@ -19,7 +19,6 @@ use openswap::{
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
     utill::NO_SHUTDOWN,
-    wallet::AddressType,
 };
 
 use super::test_framework::*;
@@ -55,22 +54,10 @@ fn test_taproot_malice_maker_broadcast_contract() {
     let taker = takers.get_mut(0).unwrap();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each
-    let taker_original_balance = fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
@@ -89,14 +76,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
     wait_for_makers_setup(&makers, 120);
 
     // Sync wallets after setup
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&NO_SHUTDOWN)
-            .unwrap();
-    }
+    sync_maker_wallets(&makers);
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting taproot maker malice test...");
@@ -208,7 +188,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
 
     // Verify maker balances -- makers should have recovered their outgoing funds via timelock
     for (i, maker_balances) in maker_balances_all.iter().enumerate() {
-        let expected_regular = [14998926u64, 14998926][i];
+        let expected_regular = [14999463u64, 14999463][i];
         assert_eq!(
             maker_balances.regular.to_sat(),
             expected_regular,
@@ -239,7 +219,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
         );
         assert_eq!(
             maker_diff.to_sat(),
-            588,
+            294,
             "Maker {} spendable balance change mismatch",
             i
         );
@@ -248,7 +228,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
     // Verify taker balance
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14999412,
+        14999706,
         "Taker regular balance mismatch"
     );
     assert_eq!(
@@ -266,7 +246,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
     // The taker recovered its own funding, so it only pays the recovery fees.
     assert_eq!(
         balance_diff.to_sat(),
-        588,
+        294,
         "Taker spendable balance change mismatch"
     );
 

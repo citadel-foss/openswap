@@ -4,9 +4,15 @@
 //! A malicious maker could send invalid signatures, wrong scripts, or
 //! mismatched hash values — these checks catch all of those.
 
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet},
+    thread::sleep,
+    time::Duration,
+};
+
 use bitcoin::{
     hashes::{hash160::Hash as Hash160, Hash},
-    Amount, PublicKey, ScriptBuf, Transaction,
+    Amount, PublicKey, ScriptBuf, Transaction, Txid,
 };
 
 use crate::{
@@ -19,12 +25,126 @@ use crate::{
         },
         legacy_messages::SenderContractTxInfo,
     },
-    utill::{get_taker_dir, redeemscript_to_scriptpubkey},
+    utill::{fee_at_rate_sats, get_taker_dir, redeemscript_to_scriptpubkey},
+    wallet::Blockchain,
 };
 
 use super::{api::Taker, error::TakerError};
 
+/// Prevout lookups before the funding-fee check gives up. A backend blip must
+/// not abort a swap the taker has already funded.
+const MAX_PREVOUT_LOOKUP_ATTEMPTS: u32 = 3;
+
+/// Delay between prevout lookup attempts.
+const PREVOUT_LOOKUP_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 impl Taker {
+    /// Record a proven maker violation in the offerbook. A persistence
+    /// failure is only logged: it must not mask the verification error
+    /// that proves the violation.
+    pub(crate) fn note_proven_violation(&self, maker_idx: usize) {
+        let Ok(swap) = self.swap_state() else {
+            return;
+        };
+        let Some(maker) = swap.makers.get(maker_idx) else {
+            return;
+        };
+        if let Err(e) = self.offerbook.record_proven_violation(&maker.address) {
+            log::warn!("Failed to record maker {maker_idx} violation: {e:?}");
+        }
+    }
+
+    /// Require every maker funding tx to pay the agreed feerate, priced from
+    /// its prevouts and the transaction's own vsize. Backend failure retries
+    /// then aborts; a shortfall is recorded as a proven violation.
+    pub(crate) fn verify_maker_funding_feerate(
+        &self,
+        funding_txs: &[Transaction],
+        maker_idx: usize,
+    ) -> Result<(), TakerError> {
+        let feerate = self.swap_state()?.params.swap_feerate();
+        let chain = self.read_wallet()?.blockchain.new_connection()?;
+        let mut prev_txs: HashMap<Txid, Transaction> = HashMap::new();
+        for (i, tx) in funding_txs.iter().enumerate() {
+            let mut input_sum = Amount::ZERO;
+            for input in &tx.input {
+                let prev_outpoint = input.previous_output;
+                if let Entry::Vacant(e) = prev_txs.entry(prev_outpoint.txid) {
+                    // Fail closed: an unverifiable prevout must never skip the
+                    // fee check, but a transient backend error is not the
+                    // maker's fault, so retry before giving up.
+                    let mut fetched = None;
+                    for attempt in 1..=MAX_PREVOUT_LOOKUP_ATTEMPTS {
+                        match chain.get_raw_transaction(&prev_outpoint.txid, None) {
+                            Ok(prev_tx) => {
+                                fetched = Some(prev_tx);
+                                break;
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "Maker {maker_idx} funding tx {i} prevout {} lookup {attempt}/{MAX_PREVOUT_LOOKUP_ATTEMPTS} failed: {err:?}",
+                                    prev_outpoint.txid
+                                );
+                                if attempt < MAX_PREVOUT_LOOKUP_ATTEMPTS {
+                                    sleep(PREVOUT_LOOKUP_RETRY_DELAY);
+                                }
+                            }
+                        }
+                    }
+                    let prev_tx = fetched.ok_or_else(|| {
+                        TakerError::General(format!(
+                            "Maker {maker_idx} funding tx {i} prevout {} is unavailable; \
+                             cannot verify its funding fee",
+                            prev_outpoint.txid
+                        ))
+                    })?;
+                    e.insert(prev_tx);
+                }
+                let prevout = prev_txs[&prev_outpoint.txid]
+                    .output
+                    .get(prev_outpoint.vout as usize)
+                    .ok_or_else(|| {
+                        TakerError::General(format!(
+                            "Maker {maker_idx} funding tx {i} spends a nonexistent prevout"
+                        ))
+                    })?;
+                input_sum = input_sum.checked_add(prevout.value).ok_or_else(|| {
+                    TakerError::General(format!("Maker {maker_idx} funding tx {i} input overflow"))
+                })?;
+            }
+            let output_sum = tx
+                .output
+                .iter()
+                .try_fold(Amount::ZERO, |acc, out| acc.checked_add(out.value))
+                .ok_or_else(|| {
+                    TakerError::General(format!("Maker {maker_idx} funding tx {i} output overflow"))
+                })?;
+            let fee = input_sum.checked_sub(output_sum).ok_or_else(|| {
+                TakerError::General(format!(
+                    "Maker {maker_idx} funding tx {i} outputs exceed its inputs"
+                ))
+            })?;
+            // Price the real transaction: a witness-size estimate can be
+            // exceeded by a larger valid witness, quietly dropping the
+            // effective feerate below what was negotiated.
+            let vsize = tx.vsize() as u64;
+            let expected = fee_at_rate_sats(vsize, feerate)
+                .ok_or_else(|| TakerError::General("funding fee overflow".to_string()))?;
+            // One-sided bound: overpaying costs only the maker. A dropped
+            // dust change output lands in the fee, so honest makers sit at or
+            // above the bound, never below it.
+            if fee.to_sat() < expected {
+                self.note_proven_violation(maker_idx);
+                return Err(TakerError::General(format!(
+                    "Maker {maker_idx} funding tx {i} pays {} sats, below the {expected} sats \
+                     the agreed feerate requires",
+                    fee.to_sat()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Verify sender contract signatures received from the first maker.
     ///
     /// Each signature must be valid against the corresponding outgoing swapcoin's
@@ -180,19 +300,58 @@ impl Taker {
     pub(crate) fn verify_maker_sender_contracts(
         &self,
         senders_info: &[SenderContractTxInfo],
-        maker_idx: usize,
         next_multisig_pubkeys: &[PublicKey],
         next_hashlock_pubkeys: &[PublicKey],
         refund_locktime: u16,
         expected_amount: Option<Amount>,
+        maker_idx: usize,
     ) -> Result<(), TakerError> {
-        let expected_count = self.swap_state()?.params.tx_count as usize;
+        // The maker reported its frozen plan shape in the Ack; it must
+        // deliver exactly that many sender contracts — no more, no fewer.
+        let expected_count = self.swap_state()?.makers[maker_idx].funding_splits.len();
         if senders_info.len() != expected_count {
+            self.note_proven_violation(maker_idx);
             return Err(TakerError::General(format!(
-                "Wrong number of maker sender contracts: expected {}, got {}",
-                expected_count,
-                senders_info.len()
+                "Maker {} sent {} sender contracts, but its reported plan has {} splits",
+                maker_idx,
+                senders_info.len(),
+                expected_count
             )));
+        }
+
+        // Each delivered funding tx must use the input count its split was
+        // declared with: the next hop's amount was priced from that shape, so
+        // a quiet change aborts the swap a hop later.
+        for (index, (info, declared)) in senders_info
+            .iter()
+            .zip(self.swap_state()?.makers[maker_idx].funding_splits.iter())
+            .enumerate()
+        {
+            if info.funding_tx.input.len() as u32 != *declared {
+                self.note_proven_violation(maker_idx);
+                return Err(TakerError::General(format!(
+                    "Maker {} funded split {} with {} inputs, but its reported plan declared {}",
+                    maker_idx,
+                    index,
+                    info.funding_tx.input.len(),
+                    declared
+                )));
+            }
+        }
+
+        // One funded output must never back two claims: duplicates would let a
+        // single output satisfy the total-amount check more than once.
+        let mut seen_outpoints = HashSet::with_capacity(senders_info.len());
+        for info in senders_info {
+            if let Some(input) = info.contract_tx.input.first() {
+                if !seen_outpoints.insert(input.previous_output) {
+                    self.note_proven_violation(maker_idx);
+                    return Err(TakerError::General(format!(
+                        "Maker {} sent a duplicate sender contract for funding outpoint {}",
+                        maker_idx, input.previous_output
+                    )));
+                }
+            }
         }
 
         let expected_hashvalue = Hash160::hash(&self.swap_state()?.preimage);
@@ -264,6 +423,7 @@ impl Taker {
                 )));
             }
             if funding_output.value != info.funding_amount {
+                self.note_proven_violation(maker_idx);
                 return Err(TakerError::General(format!(
                     "Sender contract {} funding output value {} does not match advertised amount {}",
                     i, funding_output.value, info.funding_amount
@@ -353,9 +513,15 @@ impl Taker {
             }
         }
 
-        // The maker deducts a fee we can compute exactly from its advertised
-        // schedule, so the total must match, not just clear a minimum.
-        if let Some(expected) = expected_amount {
+        // The deduction must equal the policy price of the actual funding
+        // txs: the swap fee and sweep price are already in `expected_amount`,
+        // so the funding fee is priced per real input count, capped at the
+        // negotiated budget. Exact equality, not a minimum.
+        if let Some(forwardable) = expected_amount {
+            let expected = self.expected_hop_total(
+                forwardable,
+                senders_info.iter().map(|i| i.funding_tx.input.len()),
+            )?;
             let total_funding = sum_claimed_amounts(senders_info.iter().map(|i| i.funding_amount))
                 .map_err(|amount| {
                     TakerError::General(format!(
@@ -364,13 +530,19 @@ impl Taker {
                     ))
                 })?;
             if total_funding != expected {
+                self.note_proven_violation(maker_idx);
                 return Err(TakerError::General(format!(
-                    "Maker sender contracts total funding {} does not match expected {} \
-                     (based on maker's advertised fee schedule)",
-                    total_funding, expected
+                    "Maker {maker_idx} sender contracts total funding {total_funding} does not \
+                     match the negotiated hop total {expected}"
                 )));
             }
         }
+
+        let maker_funding_txs: Vec<Transaction> = senders_info
+            .iter()
+            .map(|info| info.funding_tx.clone())
+            .collect();
+        self.verify_maker_funding_feerate(&maker_funding_txs, maker_idx)?;
 
         log::info!(
             "Verified {} maker sender contracts (structure, hashvalue, locktime, pubkeys, amounts)",

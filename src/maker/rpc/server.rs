@@ -23,7 +23,10 @@ use crate::{
         error::MakerError,
         rpc::messages::RpcMsgResp,
     },
-    utill::{parse_checked_address, read_message, send_message, HEART_BEAT_INTERVAL, UTXO},
+    utill::{
+        is_unusable_fee_rate, parse_checked_address, read_message, send_message,
+        HEART_BEAT_INTERVAL, UTXO,
+    },
     wallet::{infer_address_type, AddressType, Destination, Wallet},
 };
 use std::{path::Path, sync::RwLock};
@@ -68,6 +71,10 @@ pub trait MakerRpc {
     fn data_dir(&self) -> &Path;
     fn config(&self) -> &MakerServerConfig;
     fn shutdown(&self) -> &ShutdownSignal;
+    #[cfg(feature = "integration-test")]
+    fn take_reserved_rpc_listener(&self) -> Option<TcpListener> {
+        None
+    }
     #[cfg(not(feature = "integration-test"))]
     fn get_tor_hostname(&self) -> Result<String, TorError>;
 }
@@ -144,37 +151,45 @@ fn handle_request<M: MakerRpc>(
             feerate,
         } => {
             let amount = Amount::from_sat(amount);
+            // Below the relay floor the tx would not propagate; an invalid
+            // rate is the caller's error, not something to repair.
+            if is_unusable_fee_rate(feerate) {
+                RpcMsgResp::ServerError(
+                    "SendToAddress feerate must be finite and at least the 1 sats/vB relay floor"
+                        .to_string(),
+                )
+            } else {
+                let destination_address = parse_checked_address(&address, maker.config().network)
+                    .map_err(MakerError::from)?;
 
-            let destination_address = parse_checked_address(&address, maker.config().network)
-                .map_err(MakerError::from)?;
+                let address_type = infer_address_type(&destination_address.script_pubkey());
+                let outputs = vec![(destination_address, amount)];
+                let destination = Destination::Multi {
+                    outputs,
+                    op_return_data: None,
+                    change_address_type: AddressType::P2TR,
+                };
 
-            let address_type = infer_address_type(&destination_address.script_pubkey());
-            let outputs = vec![(destination_address, amount)];
-            let destination = Destination::Multi {
-                outputs,
-                op_return_data: None,
-                change_address_type: AddressType::P2TR,
-            };
+                let coins_to_send = lock_debug!(maker.wallet().read())?.coin_select(
+                    amount,
+                    feerate,
+                    address_type,
+                    None,
+                    None,
+                )?;
+                let tx = lock_debug!(maker.wallet().write())?.spend_from_wallet(
+                    feerate,
+                    destination,
+                    &coins_to_send,
+                )?;
 
-            let coins_to_send = lock_debug!(maker.wallet().read())?.coin_select(
-                amount,
-                feerate,
-                address_type,
-                None,
-                None,
-            )?;
-            let tx = lock_debug!(maker.wallet().write())?.spend_from_wallet(
-                feerate,
-                destination,
-                &coins_to_send,
-            )?;
+                let txid = lock_debug!(maker.wallet().read())?.send_tx(&tx)?;
 
-            let txid = lock_debug!(maker.wallet().read())?.send_tx(&tx)?;
+                log::info!("Sync at:----handle_request----");
+                lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;
 
-            log::info!("Sync at:----handle_request----");
-            lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;
-
-            RpcMsgResp::SendToAddressResp(txid.to_string())
+                RpcMsgResp::SendToAddressResp(txid.to_string())
+            }
         }
         RpcMsgReq::GetDataDir => RpcMsgResp::GetDataDirResp(maker.data_dir().to_path_buf()),
         RpcMsgReq::GetTorAddress => {
@@ -240,7 +255,16 @@ fn handle_request<M: MakerRpc>(
 
 pub(crate) fn start_rpc_server<M: MakerRpc>(maker: Arc<M>) -> Result<(), MakerError> {
     let rpc_port = maker.config().rpc_port;
-    let listener = TcpListener::bind(("127.0.0.1", rpc_port))?;
+    // A reserved socket means the framework already holds this port; binding
+    // again would fail against our own reservation.
+    #[cfg(feature = "integration-test")]
+    let reserved = maker.take_reserved_rpc_listener();
+    #[cfg(not(feature = "integration-test"))]
+    let reserved: Option<TcpListener> = None;
+    let listener = match reserved {
+        Some(listener) => listener,
+        None => TcpListener::bind(("127.0.0.1", rpc_port))?,
+    };
     let rpc_cookie = write_rpc_cookie(maker.data_dir())?;
     let rpc_socket = format!("127.0.0.1:{rpc_port}");
     let listener = Arc::new(listener);
@@ -294,6 +318,91 @@ pub(crate) fn start_rpc_server<M: MakerRpc>(maker: Arc<M>) -> Result<(), MakerEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utill::MIN_RELAY_FEE_RATE;
+
+    /// A maker double for the fee-rate guard tests; the guard fires before
+    /// any wallet access, so `wallet()` is never reached.
+    struct GuardDouble {
+        config: MakerServerConfig,
+        data_dir: std::path::PathBuf,
+        shutdown: ShutdownSignal,
+    }
+
+    impl MakerRpc for GuardDouble {
+        fn wallet(&self) -> &RwLock<Wallet> {
+            unreachable!("the fee-rate guard fires before any wallet access")
+        }
+        fn data_dir(&self) -> &Path {
+            &self.data_dir
+        }
+        fn config(&self) -> &MakerServerConfig {
+            &self.config
+        }
+        fn shutdown(&self) -> &ShutdownSignal {
+            &self.shutdown
+        }
+        #[cfg(not(feature = "integration-test"))]
+        fn get_tor_hostname(&self) -> Result<String, TorError> {
+            unreachable!("no request in these tests asks for the hostname")
+        }
+    }
+
+    fn rpc_send_to_address(address: &str, feerate: f64) -> Result<RpcMsgResp, MakerError> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let cookie = write_rpc_cookie(dir.path()).unwrap();
+        let double = Arc::new(GuardDouble {
+            config: MakerServerConfig::default(),
+            data_dir: dir.path().to_path_buf(),
+            shutdown: ShutdownSignal::new(),
+        });
+
+        send_message(
+            &mut client,
+            &AuthenticatedRpcRequest {
+                token: cookie.clone(),
+                request: RpcMsgReq::SendToAddress {
+                    address: address.to_string(),
+                    amount: 50_000,
+                    feerate,
+                },
+            },
+        )
+        .unwrap();
+        handle_request(&double, &mut server, &cookie)?;
+        Ok(serde_cbor::from_slice(&read_message(&mut client).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn send_to_address_rejects_unusable_rates_over_rpc() {
+        for rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.5] {
+            let RpcMsgResp::ServerError(e) = rpc_send_to_address("bcrt1qinvalid", rate).unwrap()
+            else {
+                panic!("rate {} must be refused with a server error", rate);
+            };
+            assert!(
+                e.contains("relay floor"),
+                "rate {} must trip the floor guard: {}",
+                rate,
+                e
+            );
+        }
+    }
+
+    #[test]
+    fn send_to_address_clears_the_relay_floor_over_rpc() {
+        // The invalid address fails AFTER the rate check, so the propagated
+        // error proves the floor rate cleared the guard instead of tripping it.
+        let e = rpc_send_to_address("bcrt1qinvalid", MIN_RELAY_FEE_RATE).unwrap_err();
+        assert!(
+            !format!("{e:?}").contains("relay floor"),
+            "the floor rate must clear the rate check: {:?}",
+            e
+        );
+    }
 
     #[test]
     fn rpc_cookie_is_random_and_authenticated() {

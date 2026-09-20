@@ -2,12 +2,14 @@
 //!
 //! Verifies Taproot contract data received from makers during the swap flow.
 
+use std::collections::HashSet;
+
 use bitcoin::{
     hashes::{sha256, Hash},
     opcodes::all::{OP_CHECKSIG, OP_CLTV, OP_DROP, OP_EQUALVERIFY, OP_SHA256},
     script::Instruction,
     secp256k1::{Secp256k1, XOnlyPublicKey},
-    PublicKey,
+    OutPoint, PublicKey,
 };
 
 use crate::{
@@ -55,13 +57,51 @@ impl Taker {
         expected_locktime: u32,
         expected_amount: Option<bitcoin::Amount>,
     ) -> Result<(), TakerError> {
-        // Must have at least one contract tx
-        if contract.contract_txs.is_empty() {
+        // The maker reported its frozen plan shape in the Ack; it must
+        // deliver exactly that many contract txs — no more, no fewer.
+        let expected_count = self.swap_state()?.makers[maker_idx].funding_splits.len();
+        if contract.contract_txs.len() != expected_count {
+            self.note_proven_violation(maker_idx);
             return Err(TakerError::General(format!(
-                "Maker {} sent empty Taproot contract data (no contract txs)",
-                maker_idx
+                "Maker {} sent {} Taproot contract txs, but its reported plan has {} splits",
+                maker_idx,
+                contract.contract_txs.len(),
+                expected_count
             )));
         }
+        // Each delivered contract tx must use the input count its split was
+        // declared with: the next hop's amount was priced from that shape, so
+        // a quiet change aborts the swap a hop later.
+        for (index, (tx, declared)) in contract
+            .contract_txs
+            .iter()
+            .zip(self.swap_state()?.makers[maker_idx].funding_splits.iter())
+            .enumerate()
+        {
+            if tx.input.len() as u32 != *declared {
+                self.note_proven_violation(maker_idx);
+                return Err(TakerError::General(format!(
+                    "Maker {} funded split {} with {} inputs, but its reported plan declared {}",
+                    maker_idx,
+                    index,
+                    tx.input.len(),
+                    declared
+                )));
+            }
+        }
+        // One funded output must never back two claims: duplicates would let a
+        // single output satisfy the total-amount check more than once.
+        let mut seen_outpoints = HashSet::with_capacity(contract.contract_txs.len());
+        for tx in &contract.contract_txs {
+            if !seen_outpoints.insert(OutPoint::new(tx.compute_txid(), 0)) {
+                self.note_proven_violation(maker_idx);
+                return Err(TakerError::General(format!(
+                    "Maker {} sent a duplicate Taproot contract outpoint",
+                    maker_idx
+                )));
+            }
+        }
+
         // QA: Maker-controlled Taproot metadata must stay 1:1 with the actual
         // contract txs, otherwise later amount checks can read the wrong claim.
         if contract.contract_txs.len() != contract.amounts.len() {
@@ -352,6 +392,7 @@ impl Taker {
             if tx.output[0].value != contract.amounts[i] {
                 // QA: Prevent underfunded incoming swapcoins where the maker
                 // claims a larger amount than the confirmed contract output.
+                self.note_proven_violation(maker_idx);
                 return Err(TakerError::General(format!(
                     "Maker {} Taproot claimed amount {} for contract tx {} does not match output value {}",
                     maker_idx, contract.amounts[i], i, tx.output[0].value
@@ -359,9 +400,15 @@ impl Taker {
             }
         }
 
-        // The maker deducts a fee we can compute exactly from its advertised
-        // schedule, so the total must match, not just clear a minimum.
-        if let Some(expected) = expected_amount {
+        // The deduction must equal the policy price of the actual contract
+        // txs: the swap fee and sweep price are already in `expected_amount`,
+        // so the funding fee is priced per real input count, capped at the
+        // negotiated budget. Exact equality, not a minimum.
+        if let Some(forwardable) = expected_amount {
+            let expected = self.expected_hop_total(
+                forwardable,
+                contract.contract_txs.iter().map(|tx| tx.input.len()),
+            )?;
             let total_amount =
                 sum_claimed_amounts(contract.amounts.iter().copied()).map_err(|amount| {
                     TakerError::General(format!(
@@ -370,13 +417,16 @@ impl Taker {
                     ))
                 })?;
             if total_amount != expected {
+                self.note_proven_violation(maker_idx);
                 return Err(TakerError::General(format!(
-                    "Maker {} Taproot contract total amount {} does not match expected {} \
-                     (based on maker's advertised fee schedule)",
-                    maker_idx, total_amount, expected
+                    "Maker {maker_idx} Taproot contract total amount {total_amount} does not \
+                     match the negotiated hop total {expected}"
                 )));
             }
         }
+
+        // Taproot's contract txs are the maker's funding txs.
+        self.verify_maker_funding_feerate(&contract.contract_txs, maker_idx)?;
 
         log::info!(
             "Verified Taproot contract data from maker {}: {} contract txs (hash, timelock, structure, amounts)",

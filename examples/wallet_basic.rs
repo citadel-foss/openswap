@@ -22,7 +22,7 @@ use bitcoind::{
     BitcoinD,
 };
 use openswap::{
-    utill::MIN_FEE_RATE,
+    utill::MIN_RELAY_FEE_RATE,
     wallet::{AddressType, AnyBlockchain, CoreRPC, CoreRpcConfig, Destination, Wallet},
 };
 
@@ -212,7 +212,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if balances.spendable >= select_amount {
             println!("\nCoin Selection Demo:");
             let selected_utxos = wallet
-                .coin_select(select_amount, MIN_FEE_RATE, AddressType::P2TR, None, None)
+                .coin_select(
+                    select_amount,
+                    MIN_RELAY_FEE_RATE,
+                    AddressType::P2TR,
+                    None,
+                    None,
+                )
                 .unwrap();
 
             let total_selected: u64 = selected_utxos
@@ -247,7 +253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .spend_coins(
                     &selected_utxos,
                     Destination::Sweep(destination_address.clone()),
-                    MIN_FEE_RATE,
+                    MIN_RELAY_FEE_RATE,
                 )
                 .unwrap();
 

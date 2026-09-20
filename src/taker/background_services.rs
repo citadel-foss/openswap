@@ -18,12 +18,14 @@ use bitcoin::{OutPoint, ScriptBuf, Txid};
 use crate::{
     lock_debug,
     taker::error::TakerError,
-    utill::HEART_BEAT_INTERVAL,
+    utill::{HEART_BEAT_INTERVAL, RECOVERY_FEE_RATE},
     wallet::{AnyBlockchain, Blockchain, RecoveryReport, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
 
-use super::swap_tracker::{ContractOutcome, ContractResolution, RecoveryPhase, SwapTracker};
+use super::swap_tracker::{
+    funding_shared, ContractOutcome, ContractResolution, RecoveryPhase, SwapTracker,
+};
 
 /// Interval between recovery retry attempts.
 #[cfg(not(feature = "integration-test"))]
@@ -46,11 +48,13 @@ impl RecoveryLoop {
     /// Spawn the background recovery thread.
     ///
     /// The `swap_tracker` is used to update per-contract resolution outcomes
-    /// as contracts are resolved in the background.
+    /// as contracts are resolved in the background. `swap_scope` restricts the
+    /// timelock pass to one swap's coins — the sharing state is per swap.
     pub(crate) fn start(
         wallet: Arc<RwLock<Wallet>>,
         swap_tracker: Arc<Mutex<SwapTracker>>,
         data_dir: PathBuf,
+        swap_scope: Option<String>,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let complete = Arc::new(AtomicBool::new(false));
@@ -85,7 +89,6 @@ impl RecoveryLoop {
                     let incoming_result = match Wallet::sweep_incoming_swapcoins(
                         &wallet,
                         &chain,
-                        2.0,
                         &shutdown_clone,
                         None,
                     ) {
@@ -108,8 +111,10 @@ impl RecoveryLoop {
                     let outgoing_result = match Wallet::recover_timelocked_swapcoins(
                         &wallet,
                         &chain,
-                        2.0,
+                        RECOVERY_FEE_RATE,
                         &shutdown_clone,
+                        swap_scope.as_deref(),
+                        &|coin_swap| funding_shared(&swap_tracker, coin_swap),
                     ) {
                         Ok(ref recovered) if !recovered.is_empty() => {
                             log::info!(

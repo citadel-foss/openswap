@@ -9,7 +9,7 @@ use openswap::{
     maker::{start_server, MakerBehavior, MakerError, MakerServer, MakerServerConfig},
     protocol::common_messages::ProtocolVersion,
     taker::{error::TakerError, SwapParams, TakerBehavior},
-    wallet::{AddressType, WalletError},
+    wallet::WalletError,
 };
 
 use super::test_framework::*;
@@ -37,22 +37,10 @@ fn fidelity_limit_violation() {
 
     info!("Funding taker and maker");
     // Fund the taker with 3 UTXOs of 0.05 BTC each (Taproot)
-    fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_taker_default(taker, bitcoind, 3);
 
     // Fund the Maker with 4 UTXOs of 0.05 BTC each (Taproot)
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    fund_makers_default(&makers, bitcoind);
 
     // Start the Maker Server thread
     info!("Initiating Maker server...");
