@@ -1362,7 +1362,14 @@ impl Taker {
             let parsed: Vec<MakerAddress> = addrs
                 .iter()
                 .filter_map(|s| match MakerAddress::try_from(s.clone()) {
-                    Ok(addr) => Some(addr),
+                    Ok(addr) => {
+                        if self.offerbook.is_banned(&addr).unwrap_or(false) {
+                            log::warn!("Preferred maker '{}' is banned; skipping", s);
+                            None
+                        } else {
+                            Some(addr)
+                        }
+                    }
                     Err(e) => {
                         log::warn!("Invalid maker address '{}': {:?}", s, e);
                         None
@@ -1634,7 +1641,17 @@ impl Taker {
                         || quoted.time_relative_fee_pct.to_bits()
                             != offer.time_relative_fee_pct.to_bits()
                     {
-                        let _ = self.ban_maker(&maker_address);
+                        if let Err(ban_err) = self.ban_maker(&maker_address) {
+                            log::warn!(
+                                "Failed to persist ban for maker {}: {:?}",
+                                maker_address,
+                                ban_err
+                            );
+                            return Err(TakerError::General(format!(
+                                "Maker {} repriced its offer between the payment quote and negotiation (ban persistence failed: {:?})",
+                                maker_idx, ban_err
+                            )));
+                        }
                         return Err(TakerError::General(format!(
                             "Maker {} repriced its offer between the payment quote and negotiation",
                             maker_idx
@@ -1644,7 +1661,17 @@ impl Taker {
                 self.swap_state_mut()?.makers[maker_idx].offer = Some(*offer);
             }
             other => {
-                let _ = self.ban_maker(&maker_address);
+                if let Err(ban_err) = self.ban_maker(&maker_address) {
+                    log::warn!(
+                        "Failed to persist ban for maker {}: {:?}",
+                        maker_address,
+                        ban_err
+                    );
+                    return Err(TakerError::General(format!(
+                        "Expected Offer from maker {}, got {:?} (ban persistence failed: {:?})",
+                        maker_idx, other, ban_err
+                    )));
+                }
                 return Err(TakerError::General(format!(
                     "Expected Offer from maker {}, got {:?}",
                     maker_idx, other

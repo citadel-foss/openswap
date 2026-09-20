@@ -319,16 +319,11 @@ impl OfferBookHandle {
         Ok(())
     }
 
-    /// Check if a maker is banned (state is Bad).
+    /// Check if a maker is banned (state is Bad or registered in banned_makers).
     pub fn is_banned(&self, address: &MakerAddress) -> Result<bool, TakerError> {
         let offerbook = lock_debug!(self.inner.read())
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
-        Ok(offerbook
-            .makers
-            .iter()
-            .find(|m| &m.address == address)
-            .map(|m| m.state == MakerState::Bad)
-            .unwrap_or(false))
+        Ok(offerbook.is_banned(address))
     }
 
     /// All current good makers
@@ -1136,16 +1131,21 @@ pub struct OfferBook {
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     suppressed_makers: HashMap<MakerAddress, SuppressedMaker>,
+
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(super) banned_makers: HashMap<MakerAddress, Option<OutPoint>>,
 }
 
 impl OfferBook {
     fn retain_valid_addresses(&mut self) -> usize {
-        let before = self.makers.len() + self.suppressed_makers.len();
+        let before = self.makers.len() + self.suppressed_makers.len() + self.banned_makers.len();
         self.makers
             .retain(|maker| is_valid_maker_address(&maker.address.0));
         self.suppressed_makers
             .retain(|address, _| is_valid_maker_address(&address.0));
-        before - (self.makers.len() + self.suppressed_makers.len())
+        self.banned_makers
+            .retain(|address, _| is_valid_maker_address(&address.0));
+        before - (self.makers.len() + self.suppressed_makers.len() + self.banned_makers.len())
     }
 
     /// Adds a maker learned through discovery. An active candidate rejects a new
@@ -1158,6 +1158,18 @@ impl OfferBook {
         fidelity_expiry_height: Option<u32>,
         now_ts: u64,
     ) -> bool {
+        if let Some(banned_outpoint) = self.banned_makers.get(&address) {
+            match (banned_outpoint, fidelity_outpoint) {
+                (Some(old_bond), Some(new_bond)) if *old_bond != new_bond => {
+                    log::info!("Banned maker {address} rotated fidelity bond from {old_bond} to {new_bond}; clearing ban");
+                    self.banned_makers.remove(&address);
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+
         if let Some(existing) = self.makers.iter_mut().find(|m| m.address == address) {
             let mut changed = false;
             if let Some(outpoint) = fidelity_outpoint {
@@ -1332,7 +1344,21 @@ impl OfferBook {
         let before_suppressed = self.suppressed_makers.len();
         self.suppressed_makers
             .retain(|_, maker| maker.fidelity_outpoint != Some(outpoint));
-        self.makers.len() != before || self.suppressed_makers.len() != before_suppressed
+        let before_banned = self.banned_makers.len();
+        self.banned_makers.retain(|_, bond| *bond != Some(outpoint));
+        self.makers.len() != before
+            || self.suppressed_makers.len() != before_suppressed
+            || self.banned_makers.len() != before_banned
+    }
+
+    pub(crate) fn is_banned(&self, address: &MakerAddress) -> bool {
+        self.banned_makers.contains_key(address)
+            || self
+                .makers
+                .iter()
+                .find(|m| &m.address == address)
+                .map(|m| m.state == MakerState::Bad)
+                .unwrap_or(false)
     }
 
     pub(crate) fn mark_success(
@@ -1342,7 +1368,15 @@ impl OfferBook {
         protocol: MakerProtocol,
         now_ts: u64,
     ) {
+        if self.banned_makers.contains_key(address) {
+            log::warn!("Ignored mark_success for banned maker: {address}");
+            return;
+        }
         if let Some(m) = self.makers.iter_mut().find(|m| &m.address == address) {
+            if m.state == MakerState::Bad {
+                log::warn!("Ignored mark_success for bad maker: {address}");
+                return;
+            }
             m.mark_success(offer, protocol, now_ts);
         }
     }
@@ -1389,7 +1423,9 @@ impl OfferBook {
     ) -> Vec<MakerAddress> {
         self.makers
             .iter()
-            .filter(|m| !matches!(m.state, MakerState::Bad))
+            .filter(|m| {
+                !matches!(m.state, MakerState::Bad) && !self.banned_makers.contains_key(&m.address)
+            })
             .filter(|m| match m.fidelity_outpoint {
                 None => true,
                 Some(outpoint) => live_candidates.get(&m.address) == Some(&Some(outpoint)),
@@ -1409,7 +1445,7 @@ impl OfferBook {
     }
 
     fn mark_bad(&mut self, address: &MakerAddress) {
-        if let Some(m) = self.makers.iter_mut().find(|m| &m.address == address) {
+        let outpoint = if let Some(m) = self.makers.iter_mut().find(|m| &m.address == address) {
             #[cfg(debug_assertions)]
             if m.state != MakerState::Bad {
                 log::debug!(
@@ -1421,7 +1457,11 @@ impl OfferBook {
             m.state = MakerState::Bad;
             m.offer = None;
             m.backend_retry_pending = false;
-        }
+            m.fidelity_outpoint
+        } else {
+            None
+        };
+        self.banned_makers.insert(address.clone(), outpoint);
     }
 
     /// Gets all active (good) offers for a given protocol.
@@ -1430,7 +1470,7 @@ impl OfferBook {
         let mut result: Vec<_> = self
             .makers
             .iter()
-            .filter(|m| m.state == MakerState::Good)
+            .filter(|m| m.state == MakerState::Good && !self.banned_makers.contains_key(&m.address))
             .filter(|m| {
                 m.protocol
                     .as_ref()
@@ -1446,7 +1486,9 @@ impl OfferBook {
     fn good_makers(&self) -> Vec<OfferAndAddress> {
         self.makers
             .iter()
-            .filter(|m| !matches!(m.state, MakerState::Bad))
+            .filter(|m| {
+                !matches!(m.state, MakerState::Bad) && !self.banned_makers.contains_key(&m.address)
+            })
             .filter_map(|m| m.as_offer_and_address())
             .collect()
     }
@@ -1462,7 +1504,7 @@ impl OfferBook {
         let mut result: Vec<_> = self
             .makers
             .iter()
-            .filter(|m| m.state == MakerState::Bad)
+            .filter(|m| m.state == MakerState::Bad || self.banned_makers.contains_key(&m.address))
             .filter(|m| {
                 m.protocol
                     .as_ref()
@@ -1533,6 +1575,14 @@ impl MakerAddress {
                     return OfferFetchResult::ProtocolViolation(TakerError::Wallet(
                         WalletError::Protocol(e),
                     ));
+                }
+                Err(TakerError::Deserialize(e)) => {
+                    log::warn!(
+                        "Malformed payload deserializing offer from {}: {:?}",
+                        self,
+                        e
+                    );
+                    return OfferFetchResult::ProtocolViolation(TakerError::Deserialize(e));
                 }
                 Err(e) if attempt < FIRST_CONNECT_ATTEMPTS => {
                     log::debug!(
@@ -1892,6 +1942,7 @@ mod tests {
                 (valid_suppression.clone(), suppression.clone()),
                 (invalid_address, suppression),
             ]),
+            ..Default::default()
         };
         let mut sanitized = book.clone();
         assert_eq!(sanitized.retain_valid_addresses(), 2);
@@ -2428,5 +2479,69 @@ mod tests {
 
         let reopened = OfferBookHandle::load_or_create(dir.path()).unwrap();
         assert!(reopened.is_banned(&address).unwrap());
+    }
+
+    #[test]
+    fn ban_maker_without_existing_candidate_persists_and_blocks_discovery() {
+        let dir = bitcoind::tempfile::TempDir::new().unwrap();
+        let handle = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let address = addr("absent-maker");
+
+        assert!(!handle.is_banned(&address).unwrap());
+        handle.ban_maker(&address).unwrap();
+        assert!(handle.is_banned(&address).unwrap());
+
+        let outpoint = Some(OutPoint::new(Txid::from_slice(&[5; 32]).unwrap(), 0));
+        {
+            let mut book = handle.inner.write().unwrap();
+            let changed = book.upsert_discovered(address.clone(), outpoint, Some(100), 1000);
+            assert!(!changed);
+            assert!(book.is_banned(&address));
+        }
+
+        let reopened = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        assert!(reopened.is_banned(&address).unwrap());
+    }
+
+    #[test]
+    fn mark_success_cannot_rehabilitate_banned_maker() {
+        let address = addr("banned-success-maker");
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), None, None, 1000);
+        book.mark_bad(&address);
+
+        assert!(book.is_banned(&address));
+        book.mark_success(
+            &address,
+            dummy_offer(&address.to_string()),
+            MakerProtocol::Taproot,
+            1050,
+        );
+
+        assert!(book.is_banned(&address));
+        assert!(book.active_makers(&MakerProtocol::Taproot).is_empty());
+        assert!(book.good_makers().is_empty());
+    }
+
+    #[test]
+    fn stale_pruning_preserves_banned_makers() {
+        let address = addr("stale-banned-maker");
+        let now_ts = 1000;
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), None, None, now_ts);
+        book.mark_bad(&address);
+        assert!(book.is_banned(&address));
+
+        // Stale prune after 3 days
+        let future_ts = now_ts + 3 * 24 * 60 * 60;
+        assert_eq!(book.prune_stale_makers(future_ts), 1);
+        assert!(book.makers.is_empty());
+
+        // The ban in banned_makers is preserved
+        assert!(book.is_banned(&address));
+
+        // Discovery with the same bond cannot resurrect
+        assert!(!book.upsert_discovered(address.clone(), None, None, future_ts + 60));
+        assert!(book.is_banned(&address));
     }
 }
