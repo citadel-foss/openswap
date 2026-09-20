@@ -139,8 +139,6 @@ fn solve_route_gross_sats(
     Ok(required)
 }
 
-/// Dust-floor decision, free of `Taker` so a unit test can drive it; the
-/// method above supplies the quote and split count from the swap state.
 /// Settlement output values for `funding_amounts`: each keeps an equal share
 /// of `settlement_budget` for its claim fee, and the surplus over
 /// `receiver_amount` is shaved off the largest outputs, never below dust.
@@ -204,6 +202,8 @@ fn settlement_outputs(
     Ok(outputs)
 }
 
+/// Dust-floor decision, free of `Taker` so a unit test can drive it; the
+/// caller supplies the quote and split count from the swap state.
 fn check_payment_dust_floor(
     payment: Option<&PaymentQuote>,
     tx_count: u32,
