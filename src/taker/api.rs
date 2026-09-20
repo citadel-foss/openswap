@@ -37,6 +37,7 @@ use crate::{
             SwapPrivkey, TakerHello, TakerToMakerMessage,
         },
         contract::calculate_pubkey_from_nonce,
+        error::ProtocolError,
     },
     utill::{
         estimate_funding_tx_fee_sats, generate_maker_keys, get_taker_dir, read_message,
@@ -46,7 +47,7 @@ use crate::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig,
         MakerFeeInfo as ReportMakerFeeInfo, RecoveryOutcome, ReportUtxo, SwapStatus, TakerReport,
-        Wallet,
+        Wallet, WalletError,
     },
     watch_tower::{
         registry_storage::FileRegistry,
@@ -1359,23 +1360,21 @@ impl Taker {
 
         // If preferred makers are specified, use them directly.
         let (selected_makers, spares) = if let Some(addrs) = preferred {
-            let parsed: Vec<MakerAddress> = addrs
-                .iter()
-                .filter_map(|s| match MakerAddress::try_from(s.clone()) {
+            let mut parsed = Vec::new();
+            for s in addrs {
+                match MakerAddress::try_from(s.clone()) {
                     Ok(addr) => {
-                        if self.offerbook.is_banned(&addr).unwrap_or(false) {
+                        if self.offerbook.is_banned(&addr)? {
                             log::warn!("Preferred maker '{}' is banned; skipping", s);
-                            None
                         } else {
-                            Some(addr)
+                            parsed.push(addr);
                         }
                     }
                     Err(e) => {
                         log::warn!("Invalid maker address '{}': {:?}", s, e);
-                        None
                     }
-                })
-                .collect();
+                }
+            }
 
             if parsed.len() < maker_count {
                 return Err(TakerError::General(format!(
@@ -1610,14 +1609,45 @@ impl Taker {
 
         let mut stream = self.net_connect(&maker_address)?;
 
-        let negotiated_protocol = self.net_handshake(&mut stream)?;
+        let negotiated_protocol = match self.net_handshake(&mut stream) {
+            Ok(proto) => proto,
+            Err(TakerError::Wallet(WalletError::Protocol(e))) => {
+                if let Err(ban_err) = self.ban_maker(&maker_address) {
+                    log::warn!(
+                        "Failed to persist ban for maker {}: {:?}",
+                        maker_address,
+                        ban_err
+                    );
+                }
+                return Err(TakerError::General(format!(
+                    "Maker {} protocol violation during handshake: {:?}",
+                    maker_idx, e
+                )));
+            }
+            Err(e) => return Err(e),
+        };
         log::info!("Handshake complete, protocol: {:?}", negotiated_protocol);
 
         // Fetch the maker's offer before proposing swap details.
         // This gives us the fee schedule for amount verification later.
         send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
         let offer_bytes = read_message(&mut stream)?;
-        let offer_msg: MakerToTakerMessage = serde_cbor::from_slice(&offer_bytes)?;
+        let offer_msg: MakerToTakerMessage = match serde_cbor::from_slice(&offer_bytes) {
+            Ok(msg) => msg,
+            Err(e) => {
+                if let Err(ban_err) = self.ban_maker(&maker_address) {
+                    log::warn!(
+                        "Failed to persist ban for maker {}: {:?}",
+                        maker_address,
+                        ban_err
+                    );
+                }
+                return Err(TakerError::General(format!(
+                    "Maker {} sent malformed Offer CBOR: {:?}",
+                    maker_idx, e
+                )));
+            }
+        };
         match offer_msg {
             MakerToTakerMessage::Offer(offer) => {
                 log::info!(
@@ -1627,7 +1657,16 @@ impl Taker {
                     offer.amount_relative_fee_pct,
                     offer.time_relative_fee_pct
                 );
-                Self::validate_offer(&offer, maker_idx, send_amount)?;
+                if let Err(val_err) = Self::validate_offer(&offer, maker_idx, send_amount) {
+                    if let Err(ban_err) = self.ban_maker(&maker_address) {
+                        log::warn!(
+                            "Failed to persist ban for maker {}: {:?}",
+                            maker_address,
+                            ban_err
+                        );
+                    }
+                    return Err(val_err);
+                }
                 // A repricing since the payment quote would silently move the
                 // receiver's amount; abort while nothing is funded. Bitwise
                 // float comparison is intentional: any change is a repricing.
@@ -1711,7 +1750,22 @@ impl Taker {
         )?;
 
         let msg_bytes = read_message(&mut stream)?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+        let msg: MakerToTakerMessage = match serde_cbor::from_slice(&msg_bytes) {
+            Ok(msg) => msg,
+            Err(e) => {
+                if let Err(ban_err) = self.ban_maker(&maker_address) {
+                    log::warn!(
+                        "Failed to persist ban for maker {}: {:?}",
+                        maker_address,
+                        ban_err
+                    );
+                }
+                return Err(TakerError::General(format!(
+                    "Maker {} sent malformed AckSwapDetails CBOR: {:?}",
+                    maker_idx, e
+                )));
+            }
+        };
 
         match msg {
             MakerToTakerMessage::AckSwapDetails(ack) => {
@@ -1765,16 +1819,32 @@ impl Taker {
 
                     Ok(())
                 } else {
+                    if let Err(ban_err) = self.ban_maker(&maker_address) {
+                        log::warn!(
+                            "Failed to persist ban for maker {}: {:?}",
+                            maker_address,
+                            ban_err
+                        );
+                    }
                     Err(TakerError::General(format!(
                         "Maker {} rejected swap",
                         maker_idx
                     )))
                 }
             }
-            _ => Err(TakerError::General(format!(
-                "Unexpected message from maker {}: expected AckSwapDetails",
-                maker_idx
-            ))),
+            other => {
+                if let Err(ban_err) = self.ban_maker(&maker_address) {
+                    log::warn!(
+                        "Failed to persist ban for maker {}: {:?}",
+                        maker_address,
+                        ban_err
+                    );
+                }
+                Err(TakerError::General(format!(
+                    "Unexpected message from maker {}: expected AckSwapDetails, got {:?}",
+                    maker_idx, other
+                )))
+            }
         }
     }
 
@@ -2093,7 +2163,11 @@ impl Taker {
         send_message(stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
 
         let msg_bytes = read_message(stream)?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes).map_err(|_e| {
+            TakerError::Wallet(WalletError::Protocol(ProtocolError::General(
+                "Malformed MakerHello CBOR payload",
+            )))
+        })?;
 
         match msg {
             MakerToTakerMessage::MakerHello(maker_hello) => {
@@ -2107,9 +2181,12 @@ impl Taker {
                     )))
                 }
             }
-            _ => Err(TakerError::General(
-                "Expected MakerHello response".to_string(),
-            )),
+            other => Err(TakerError::Wallet(WalletError::Protocol(
+                ProtocolError::WrongMessage {
+                    expected: "MakerHello".to_string(),
+                    received: format!("{other:?}"),
+                },
+            ))),
         }
     }
 

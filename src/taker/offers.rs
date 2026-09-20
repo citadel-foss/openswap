@@ -1344,11 +1344,7 @@ impl OfferBook {
         let before_suppressed = self.suppressed_makers.len();
         self.suppressed_makers
             .retain(|_, maker| maker.fidelity_outpoint != Some(outpoint));
-        let before_banned = self.banned_makers.len();
-        self.banned_makers.retain(|_, bond| *bond != Some(outpoint));
-        self.makers.len() != before
-            || self.suppressed_makers.len() != before_suppressed
-            || self.banned_makers.len() != before_banned
+        self.makers.len() != before || self.suppressed_makers.len() != before_suppressed
     }
 
     pub(crate) fn is_banned(&self, address: &MakerAddress) -> bool {
@@ -1368,12 +1364,21 @@ impl OfferBook {
         protocol: MakerProtocol,
         now_ts: u64,
     ) {
-        if self.banned_makers.contains_key(address) {
-            log::warn!("Ignored mark_success for banned maker: {address}");
-            return;
+        let offered_bond = offer.fidelity.bond.outpoint;
+        if let Some(banned_bond) = self.banned_makers.get(address) {
+            match banned_bond {
+                Some(old_bond) if *old_bond != offered_bond => {
+                    log::info!("Maker {address} successfully verified rotated bond {offered_bond}; clearing ban");
+                    self.banned_makers.remove(address);
+                }
+                _ => {
+                    log::warn!("Ignored mark_success for banned maker {address}");
+                    return;
+                }
+            }
         }
         if let Some(m) = self.makers.iter_mut().find(|m| &m.address == address) {
-            if m.state == MakerState::Bad {
+            if m.state == MakerState::Bad && self.banned_makers.contains_key(address) {
                 log::warn!("Ignored mark_success for bad maker: {address}");
                 return;
             }
@@ -1424,7 +1429,14 @@ impl OfferBook {
         self.makers
             .iter()
             .filter(|m| {
-                !matches!(m.state, MakerState::Bad) && !self.banned_makers.contains_key(&m.address)
+                if let Some(banned_bond) = self.banned_makers.get(&m.address) {
+                    match (banned_bond, m.fidelity_outpoint) {
+                        (Some(old_bond), Some(new_bond)) => *old_bond != new_bond,
+                        _ => false,
+                    }
+                } else {
+                    !matches!(m.state, MakerState::Bad)
+                }
             })
             .filter(|m| match m.fidelity_outpoint {
                 None => true,
