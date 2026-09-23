@@ -485,6 +485,7 @@ impl Taker {
                             &next_tp,
                             nonce,
                         )
+                        .inspect_err(|_| self.note_proven_violation(i))
                         .map_err(|e| {
                             TakerError::General(format!(
                                 "Maker {} Taproot hashlock pubkey verification failed: {:?}",
@@ -504,6 +505,7 @@ impl Taker {
                         let Some(Ok(bitcoin::script::Instruction::PushBytes(pk_bytes))) =
                             hl_instructions.next()
                         else {
+                            self.note_proven_violation(i);
                             return Err(TakerError::General(format!(
                                 "Last maker {} Taproot hashlock script carries no pubkey",
                                 i
@@ -514,12 +516,14 @@ impl Taker {
                             pk_bytes.as_bytes(),
                         )
                         .map_err(|_| {
+                            self.note_proven_violation(i);
                             TakerError::General(format!(
                                 "Last maker {} Taproot hashlock has invalid pubkey",
                                 i
                             ))
                         })?;
                         if script_xonly != expected_xonly {
+                            self.note_proven_violation(i);
                             return Err(TakerError::General(format!(
                                 "Last maker {} Taproot hashlock pubkey doesn't match taker's key",
                                 i

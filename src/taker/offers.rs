@@ -803,10 +803,13 @@ impl OfferSyncService {
             // snapshot completes, absence from it does not invalidate a saved offer.
             if self.initial_sync_complete.load(Ordering::SeqCst) {
                 let before = book.makers.len();
+                // Only a manual delete lifts a ban, so an expired or spent bond
+                // must not take the ban with it.
                 book.makers.retain(|maker| {
-                    maker.fidelity_outpoint.is_none_or(|outpoint| {
-                        registry_candidates.contains(&(maker.address.clone(), outpoint))
-                    })
+                    matches!(maker.state, MakerState::Banned(_))
+                        || maker.fidelity_outpoint.is_none_or(|outpoint| {
+                            registry_candidates.contains(&(maker.address.clone(), outpoint))
+                        })
                 });
                 changed |= book.makers.len() != before;
             }
@@ -818,6 +821,7 @@ impl OfferSyncService {
                     Some(outpoint) => {
                         if book.makers.iter().any(|maker| {
                             &maker.address == address
+                                && !matches!(maker.state, MakerState::Banned(_))
                                 && maker
                                     .fidelity_outpoint
                                     .is_some_and(|existing| existing != outpoint)
@@ -845,7 +849,9 @@ impl OfferSyncService {
                 };
                 if suppress {
                     let before = book.makers.len();
-                    book.makers.retain(|maker| &maker.address != address);
+                    book.makers.retain(|maker| {
+                        &maker.address != address || matches!(maker.state, MakerState::Banned(_))
+                    });
                     changed |= book.makers.len() != before;
                 }
             }
@@ -1216,6 +1222,7 @@ fn classify_bond_failure(error: WalletError) -> OfferCheckError {
             WrongScriptType
                 | BondDoesNotExist
                 | InvalidCertHash
+                | InvalidCertSignature
                 | InvalidBondLocktime
                 | BondPubkeyMismatch
                 | BondAmountMismatch { .. }
@@ -1264,9 +1271,16 @@ fn verify_fidelity_with_backend(
 
     let txid = proof.bond.outpoint.txid;
     let vout = proof.bond.outpoint.vout;
+    // A bond the backend has definitely never seen is not an outage: treating it
+    // as one would retry a fake bond forever and shield it from pruning.
     let transaction = blockchain
         .get_raw_transaction(&txid, None)
-        .map_err(backend_down)?;
+        .map_err(|e| match blockchain.is_tx_unknown(&txid) {
+            Ok(true) => {
+                OfferCheckError::Lifecycle(UnavailableReason::BondUnverified, TakerError::Wallet(e))
+            }
+            _ => backend_down(e),
+        })?;
     let current_height = blockchain.get_block_count().map_err(backend_down)?;
     let confirmation_height = blockchain
         .tx_block_height(&txid)
@@ -1508,7 +1522,7 @@ impl OfferBook {
     }
 
     /// Drops suppression records once their fidelity bond can no longer be a
-    /// discovery source. Records without known expiry remain until retried.
+    /// discovery source. Bans and records without known expiry remain.
     fn prune_expired_suppressions(&mut self, current_height: u32) -> usize {
         if current_height == 0 {
             return 0;
@@ -1516,9 +1530,10 @@ impl OfferBook {
 
         let before = self.suppressed_makers.len();
         self.suppressed_makers.retain(|_, suppressed| {
-            suppressed
-                .fidelity_expiry_height
-                .is_none_or(|expiry| expiry > current_height)
+            matches!(suppressed.state, Some(MakerState::Banned(_)))
+                || suppressed
+                    .fidelity_expiry_height
+                    .is_none_or(|expiry| expiry > current_height)
         });
         before - self.suppressed_makers.len()
     }
@@ -1551,11 +1566,15 @@ impl OfferBook {
 
     fn remove_fidelity_outpoint(&mut self, outpoint: OutPoint) -> bool {
         let before = self.makers.len();
-        self.makers
-            .retain(|maker| maker.fidelity_outpoint != Some(outpoint));
+        self.makers.retain(|maker| {
+            matches!(maker.state, MakerState::Banned(_))
+                || maker.fidelity_outpoint != Some(outpoint)
+        });
         let before_suppressed = self.suppressed_makers.len();
-        self.suppressed_makers
-            .retain(|_, maker| maker.fidelity_outpoint != Some(outpoint));
+        self.suppressed_makers.retain(|_, maker| {
+            matches!(maker.state, Some(MakerState::Banned(_)))
+                || maker.fidelity_outpoint != Some(outpoint)
+        });
         self.makers.len() != before || self.suppressed_makers.len() != before_suppressed
     }
 
@@ -2261,7 +2280,7 @@ mod tests {
             .unwrap()
             .as_secs();
 
-        let book = OfferBook {
+        let mut book = OfferBook {
             makers: vec![MakerOfferCandidate {
                 address,
                 fidelity_outpoint: Some(outpoint),
@@ -2277,6 +2296,17 @@ mod tests {
             }],
             ..Default::default()
         };
+        // A ban whose bond has left the registry must outlive the cleanup.
+        let banned = addr("6113");
+        let banned_outpoint = OutPoint::new(Txid::from_slice(&[15; 32]).unwrap(), 0);
+        book.insert_candidate(
+            banned.clone(),
+            Some(banned_outpoint),
+            Some(1_000),
+            now,
+            None,
+        );
+        book.ban(&banned, BanReason::ProvenViolation, now);
         book.write_to_disk(&path).unwrap();
 
         let handle = OfferBookHandle {
@@ -2301,8 +2331,8 @@ mod tests {
         );
 
         service.run_once().unwrap();
-        assert_eq!(handle.snapshot().unwrap().makers.len(), 1);
-        assert_eq!(OfferBook::read_from_disk(&path).unwrap().makers.len(), 1);
+        assert_eq!(handle.snapshot().unwrap().makers.len(), 2);
+        assert_eq!(OfferBook::read_from_disk(&path).unwrap().makers.len(), 2);
 
         #[cfg(not(feature = "integration-test"))]
         let registry_address = MakerAddress::try_from(
@@ -2323,8 +2353,14 @@ mod tests {
 
         initial_sync_complete.store(true, Ordering::SeqCst);
         service.run_once().unwrap();
-        assert!(handle.snapshot().unwrap().makers.is_empty());
-        assert!(OfferBook::read_from_disk(&path).unwrap().makers.is_empty());
+        for book in [
+            handle.snapshot().unwrap(),
+            OfferBook::read_from_disk(&path).unwrap(),
+        ] {
+            assert_eq!(book.makers.len(), 1);
+            assert_eq!(book.makers[0].address, banned);
+            assert!(matches!(book.makers[0].state, MakerState::Banned(_)));
+        }
     }
 
     #[test]
@@ -2620,6 +2656,11 @@ mod tests {
         ));
 
         // A certificate signed over the wrong thing is proof, and proof is final.
+        let unsigned = classify_bond_failure(FidelityError::InvalidCertSignature.into());
+        assert!(matches!(
+            unsigned,
+            OfferCheckError::Proven(BanReason::InvalidFidelityProof, _)
+        ));
         let forged = classify_bond_failure(FidelityError::InvalidCertHash.into());
         book.record_offer_failure(&address, &forged, now_ts);
         assert!(matches!(
@@ -2744,6 +2785,37 @@ mod tests {
         assert!(handle.is_banned(&parked).unwrap());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_manual_delete_lifts_a_ban() {
+        let dir = tempdir().unwrap();
+        let handle = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let address = addr("rebonded");
+        let old_outpoint = OutPoint::new(Txid::from_slice(&[13; 32]).unwrap(), 0);
+        let new_outpoint = Some(OutPoint::new(Txid::from_slice(&[14; 32]).unwrap(), 0));
+
+        {
+            let mut book = lock_debug!(handle.inner.write()).unwrap();
+            book.insert_candidate(address.clone(), Some(old_outpoint), Some(500), 0, None);
+            book.ban(&address, BanReason::ProvenViolation, 1);
+
+            // The bond is spent and a new one posted: the ban holds.
+            assert!(!book.remove_fidelity_outpoint(old_outpoint));
+            assert!(!book.upsert_discovered(address.clone(), new_outpoint, Some(600), 2));
+        }
+        assert!(handle.is_banned(&address).unwrap());
+
+        assert!(handle.remove(&address).unwrap());
+        let mut book = lock_debug!(handle.inner.write()).unwrap();
+        assert!(book.upsert_discovered(address, new_outpoint, Some(600), 3));
+        assert!(matches!(
+            book.makers[0].state,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::AwaitingOffer,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2932,6 +3004,17 @@ mod tests {
         assert_eq!(book.prune_expired_suppressions(499), 0);
         assert_eq!(book.prune_expired_suppressions(500), 1);
         assert!(!book.suppressed_makers.contains_key(&address));
+
+        // A migrated ban sits here too, and only a manual delete lifts it.
+        book.insert_candidate(address.clone(), outpoint, Some(500), now_ts - ttl, None);
+        assert_eq!(book.prune_stale_makers(now_ts), 1);
+        book.suppressed_makers.get_mut(&address).unwrap().state =
+            Some(MakerState::Banned(BanRecord {
+                reason: BanReason::LegacyProvenViolation,
+                recorded_at_ts: 1,
+            }));
+        assert_eq!(book.prune_expired_suppressions(500), 0);
+        assert!(book.suppressed_makers.contains_key(&address));
     }
 
     #[test]

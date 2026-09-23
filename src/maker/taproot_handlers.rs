@@ -278,6 +278,18 @@ fn process_taproot_contract<M: Maker>(
         data.next_hop_point
     };
     let next_hop_xonly = bitcoin::key::XOnlyPublicKey::from(next_hop_hashlock_pubkey.inner);
+    #[cfg(feature = "integration-test")]
+    let next_hop_xonly = if maker.behavior() == MakerBehavior::WrongHashlockKey {
+        log::warn!(
+            "[{}] Test behavior: building the hashlock for the wrong key",
+            maker.network_port()
+        );
+        let wrong_key =
+            bitcoin::secp256k1::SecretKey::from_slice(&[7u8; 32]).expect("valid test key");
+        wrong_key.x_only_public_key(&secp).0
+    } else {
+        next_hop_xonly
+    };
     let hashlock_script = create_hashlock_script(&hash, &next_hop_xonly);
 
     // Derive keys, scripts and addresses for exactly the splits in the frozen
@@ -733,6 +745,17 @@ fn process_taproot_handover<M: Maker>(
         maker.network_port(),
         handover.id
     );
+
+    #[cfg(feature = "integration-test")]
+    if maker.behavior() == MakerBehavior::SendWrongHandoverKey {
+        log::warn!(
+            "[{}] Test behavior: handing over the wrong private key",
+            maker.network_port()
+        );
+        let wrong_key =
+            bitcoin::secp256k1::SecretKey::from_slice(&[7u8; 32]).expect("valid test key");
+        privkeys.iter_mut().for_each(|p| p.key = wrong_key);
+    }
 
     let response = PrivateKeyHandover {
         id: handover.id,

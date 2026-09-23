@@ -825,13 +825,15 @@ impl MakerServer {
                 // The bond tx may never confirm (e.g. evicted again at a low
                 // feerate). Losing it must not take the maker down: log it,
                 // skip it, and let the next restart retry.
-                Err(WalletError::TxConfirmationTimeout(msg)) => {
+                Err(
+                    e @ (WalletError::TxConfirmationTimeout(_) | WalletError::TxNeverBroadcast(_)),
+                ) => {
                     log::error!(
                         "[{}] Pending fidelity bond {} did not confirm ({}); \
                          skipping it and continuing startup.",
                         self.config.network_port,
                         txid,
-                        msg
+                        e
                     );
                     continue;
                 }

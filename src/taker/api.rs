@@ -2674,10 +2674,11 @@ impl Taker {
             // maker from sending a garbage key that would make funds unspendable.
             if i == num_makers - 1 {
                 let secp = bitcoin::secp256k1::Secp256k1::new();
-                let incoming = &mut self.swap_state_mut()?.incoming_swapcoins;
+                let incoming = &self.swap_state()?.incoming_swapcoins;
                 // `zip` stops at the shorter side, so a short reply would leave
                 // later swapcoins without the key that makes them spendable.
                 if received_privkeys.len() != incoming.len() {
+                    self.note_proven_violation(i);
                     return Err(TakerError::General(format!(
                         "Last maker {} sent {} private keys for {} incoming swapcoins",
                         i,
@@ -2686,9 +2687,7 @@ impl Taker {
                     )));
                 }
 
-                for (incoming, received_privkey) in
-                    incoming.iter_mut().zip(received_privkeys.iter())
-                {
+                for (incoming, received_privkey) in incoming.iter().zip(received_privkeys.iter()) {
                     let derived_pubkey = PublicKey {
                         compressed: true,
                         inner: bitcoin::secp256k1::PublicKey::from_secret_key(
@@ -2704,12 +2703,20 @@ impl Taker {
                         )));
                     };
                     if derived_pubkey != expected_pubkey {
+                        self.note_proven_violation(i);
                         return Err(TakerError::General(format!(
                             "Last maker {} sent incorrect private key: derived pubkey {} \
                              does not match expected {}",
                             i, derived_pubkey, expected_pubkey
                         )));
                     }
+                }
+                for (incoming, received_privkey) in self
+                    .swap_state_mut()?
+                    .incoming_swapcoins
+                    .iter_mut()
+                    .zip(received_privkeys.iter())
+                {
                     incoming.set_other_privkey(*received_privkey);
                 }
                 log::info!(

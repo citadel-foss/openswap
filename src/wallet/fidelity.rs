@@ -56,6 +56,8 @@ pub enum FidelityError {
     BondAlreadyRedeemed,
     BondLocktimeExpired,
     InvalidCertHash,
+    /// The certificate is not signed by the bond key.
+    InvalidCertSignature,
     General(String),
     InvalidBondLocktime,
     BondUncomfirmed,
@@ -85,6 +87,9 @@ impl std::fmt::Display for FidelityError {
             }
             FidelityError::BondLocktimeExpired => write!(f, "Fidelity bond locktime has expired"),
             FidelityError::InvalidCertHash => write!(f, "Invalid fidelity certificate hash"),
+            FidelityError::InvalidCertSignature => {
+                write!(f, "Fidelity certificate is not signed by the bond key")
+            }
             FidelityError::InvalidBondLocktime => {
                 write!(f, "Fidelity bond locktime is outside the acceptable range")
             }
@@ -195,7 +200,7 @@ pub(crate) fn verify_fidelity_checks(
     let derived_script_pubkey = redeemscript_to_scriptpubkey(&fidelity_redeem_script)?;
     let tx_out = tx
         .tx_out(proof.bond.outpoint.vout as usize)
-        .map_err(|_| WalletError::General("Outputs index error".to_string()))?;
+        .map_err(|_| FidelityError::BondDoesNotExist)?;
 
     if tx_out.script_pubkey != derived_script_pubkey {
         return Err(WalletError::Fidelity(FidelityError::BondDoesNotExist));
@@ -213,7 +218,8 @@ pub(crate) fn verify_fidelity_checks(
 
     // Verify ECDSA signature
     let cert_message = Message::from_digest_slice(proof.cert_hash.as_byte_array())?;
-    secp.verify_ecdsa(&cert_message, &proof.cert_sig, &proof.bond.pubkey.inner)?;
+    secp.verify_ecdsa(&cert_message, &proof.cert_sig, &proof.bond.pubkey.inner)
+        .map_err(|_| FidelityError::InvalidCertSignature)?;
 
     Ok(())
 }
@@ -829,6 +835,44 @@ mod test {
             &chain_code,
         )
         .expect("a stale advertised height must not fail the proof");
+    }
+
+    #[test]
+    fn a_forged_proof_is_named_as_forgery() {
+        let addr = "test.onion:6103";
+        let conf_height = 1_000u32;
+        let (proof, tx, tweakable_point, chain_code) = valid_proof(addr, conf_height);
+        let verify = |proof: &FidelityProof| {
+            verify_fidelity_checks(
+                proof,
+                addr,
+                tx.clone(),
+                u64::from(conf_height) + 1,
+                conf_height,
+                &tweakable_point,
+                &chain_code,
+            )
+        };
+
+        // A signed outpoint naming an output the transaction does not have.
+        let mut missing_output = proof.clone();
+        missing_output.bond.outpoint.vout = 1;
+        missing_output.cert_hash = missing_output
+            .bond
+            .generate_cert_hash(addr, &tweakable_point);
+        assert!(matches!(
+            verify(&missing_output),
+            Err(WalletError::Fidelity(FidelityError::BondDoesNotExist))
+        ));
+
+        let secp = Secp256k1::new();
+        let msg = Message::from_digest_slice(proof.cert_hash.as_byte_array()).unwrap();
+        let mut wrong_signer = proof;
+        wrong_signer.cert_sig = secp.sign_ecdsa(&msg, &SecretKey::from_slice(&[9u8; 32]).unwrap());
+        assert!(matches!(
+            verify(&wrong_signer),
+            Err(WalletError::Fidelity(FidelityError::InvalidCertSignature))
+        ));
     }
 
     #[test]

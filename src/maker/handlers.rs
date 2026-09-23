@@ -68,6 +68,12 @@ pub enum MakerBehavior {
     /// Sign the sender contracts with a key nobody agreed to, so the signatures
     /// are well formed and still wrong.
     SignSenderContractsWithWrongKey,
+    /// Build the outgoing Taproot hashlock for a key the next hop never agreed
+    /// to, keeping the contract otherwise consistent.
+    WrongHashlockKey,
+    /// Take the Taproot handover keys owed to us, then hand back a key that
+    /// does not match the contract.
+    SendWrongHandoverKey,
     /// Close connection when receiving ReqContractSigsForSender (abort2 scenarios).
     CloseAtReqContractSigsForSender,
     /// Close connection when receiving ProofOfFunding (abort2 scenario).
