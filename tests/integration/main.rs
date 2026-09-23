@@ -51,6 +51,8 @@ mod legacy_reboot_recovery;
 #[cfg(feature = "lightning")]
 mod lightning_e2e;
 #[cfg(feature = "lightning")]
+mod lightning_routed;
+#[cfg(feature = "lightning")]
 mod lightning_swap_in;
 #[cfg(feature = "lightning")]
 mod lightning_swap_out;

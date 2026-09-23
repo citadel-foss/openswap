@@ -92,6 +92,10 @@ pub struct MockLightningBackend {
     node_index: usize,
     node_id: PublicKey,
     node_sk: SecretKey,
+    /// CLTV bound passed to the most recent [`LightningBackend::pay_invoice`]
+    /// call. The mock does no routing, but swaps must bound their routes, so
+    /// tests assert on it.
+    last_pay_cltv_bound: Mutex<Option<u32>>,
 }
 
 impl Default for MockLightningBackend {
@@ -110,7 +114,14 @@ impl MockLightningBackend {
             node_index,
             node_id: PublicKey::from_secret_key(&secp, &sk),
             node_sk: sk,
+            last_pay_cltv_bound: Mutex::new(None),
         }
+    }
+
+    /// The `max_total_cltv_expiry_delta` of the last `pay_invoice` call on
+    /// this node, or `None` if it never paid (or paid unbounded).
+    pub fn last_pay_cltv_bound(&self) -> Option<u32> {
+        *self.last_pay_cltv_bound.lock().unwrap()
     }
 
     /// Builds a real, signed BOLT11 invoice string so code under test can
@@ -386,7 +397,11 @@ impl LightningBackend for MockLightningBackend {
         &self,
         invoice: &str,
         amount_msat: Option<u64>,
+        max_total_cltv_expiry_delta: Option<u32>,
     ) -> Result<PaymentId, LightningError> {
+        // No routing to constrain in-memory; recorded so tests can assert
+        // that swap code bounds its routes.
+        *self.last_pay_cltv_bound.lock()? = max_total_cltv_expiry_delta;
         let mut ledger = self.ledger.lock()?;
         let (payment_hash, entry) = ledger
             .invoices
@@ -635,7 +650,9 @@ mod tests {
         let invoice = owner
             .create_hold_invoice(payment_hash, InvoiceParams::default())
             .unwrap();
-        payer.pay_invoice(&invoice.invoice, Some(50_000)).unwrap();
+        payer
+            .pay_invoice(&invoice.invoice, Some(50_000), Some(200))
+            .unwrap();
 
         // The held payment parks at the owner; the payer sees nothing yet.
         assert!(payer.poll_event().unwrap().is_none());
@@ -669,7 +686,9 @@ mod tests {
         let invoice = owner
             .create_hold_invoice(payment_hash, InvoiceParams::default())
             .unwrap();
-        payer.pay_invoice(&invoice.invoice, Some(1_000)).unwrap();
+        payer
+            .pay_invoice(&invoice.invoice, Some(1_000), Some(200))
+            .unwrap();
         let _ = owner.poll_event().unwrap();
 
         owner.fail_held_payment(payment_hash).unwrap();
@@ -729,7 +748,7 @@ mod tests {
             })
             .unwrap();
 
-        let payment_id = mock.pay_invoice(&invoice.invoice, None).unwrap();
+        let payment_id = mock.pay_invoice(&invoice.invoice, None, Some(200)).unwrap();
         assert_eq!(payment_id.0, invoice.payment_hash.to_string());
 
         match mock.poll_event().unwrap() {
@@ -754,7 +773,7 @@ mod tests {
 
         // Unknown invoice strings are rejected.
         assert!(matches!(
-            mock.pay_invoice("lnbcrt-unknown", None),
+            mock.pay_invoice("lnbcrt-unknown", None, None),
             Err(LightningError::InvalidInvoice(_))
         ));
     }

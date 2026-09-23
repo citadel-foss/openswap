@@ -51,12 +51,19 @@ use openswap::{
 
 const BITCOIN_VERSION: &str = "28.1";
 
-/// Lightning backends to inject into the makers created by the next
-/// [`TestFramework::init`] call (popped one per maker, in reverse order).
-/// Lets a lightning test hand each in-process maker a mock Lightning node.
+/// Lightning backends for the makers of the test currently initializing,
+/// indexed the same way as `makers_config_map`. Guarded by
+/// [`LN_INJECT_LOCK`] so concurrently running lightning tests cannot read
+/// each other's entries; set it through
+/// [`TestFramework::init_with_lightning`] rather than directly.
 #[cfg(feature = "lightning")]
-pub static LN_MAKER_INJECT: Mutex<Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>> =
+static LN_MAKER_INJECT: Mutex<Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>> =
     Mutex::new(Vec::new());
+
+/// Held for the whole of one lightning test's framework init, which is the
+/// window in which [`LN_MAKER_INJECT`] is meaningful.
+#[cfg(feature = "lightning")]
+static LN_INJECT_LOCK: Mutex<()> = Mutex::new(());
 
 fn download_bitcoind_tarball(download_url: &str, retries: usize) -> Vec<u8> {
     for attempt in 1..=retries {
@@ -1121,7 +1128,12 @@ impl TestFramework {
                     *server.reserved_network_listener.lock().unwrap() = Some(network_listener);
                     *server.reserved_rpc_listener.lock().unwrap() = Some(rpc_listener);
                     #[cfg(feature = "lightning")]
-                    if let Some(backend) = LN_MAKER_INJECT.lock().unwrap().pop() {
+                    if let Some(backend) = LN_MAKER_INJECT
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(i)
+                        .cloned()
+                    {
                         server.set_lightning_backend(backend);
                     }
                     Arc::new(server)
@@ -1168,6 +1180,27 @@ impl TestFramework {
         });
         log::info!("✅ Test Framework initialization complete");
         (framework, takers, makers, generate_blocks_handle)
+    }
+
+    /// [`TestFramework::init`] with a Lightning backend handed to each maker,
+    /// `maker_lightning[i]` going to the maker at index `i`. Serialized
+    /// against other lightning tests for the duration of init.
+    #[allow(clippy::type_complexity)]
+    #[cfg(feature = "lightning")]
+    pub fn init_with_lightning<B: TestBackend>(
+        makers_config_map: Vec<(u16, Option<u16>)>,
+        taker_behavior: Vec<TakerBehavior>,
+        maker_behaviors: Vec<MakerBehavior>,
+        maker_lightning: Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>,
+    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
+        let _guard = LN_INJECT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        *LN_MAKER_INJECT.lock().unwrap_or_else(|p| p.into_inner()) = maker_lightning;
+        let framework = Self::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
+        LN_MAKER_INJECT
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        framework
     }
 
     /// Rebuild taker `i`'s init config, so a test can drop the taker and re-init

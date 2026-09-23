@@ -223,6 +223,30 @@ enum Commands {
         min_confirmations: u32,
     },
 
+    /// Swap on-chain BTC for on-chain BTC through two makers, with Lightning
+    /// as the middle hop. Needs no Lightning node of your own: maker 1 takes
+    /// the on-chain funds and forwards over Lightning to maker 2, which pays
+    /// you back on-chain.
+    #[cfg(feature = "lightning")]
+    LnSwapRouted {
+        /// On-chain amount in sats to receive back. Both makers' fees are
+        /// funded on top of this.
+        #[clap(long, short = 'a')]
+        amount: u64,
+        /// First maker address; picked from the offerbook when omitted.
+        #[clap(long = "first-maker")]
+        first_maker: Option<String>,
+        /// Second maker address; picked from the offerbook when omitted.
+        #[clap(long = "second-maker")]
+        second_maker: Option<String>,
+        /// Second hop's refund locktime in blocks (the first hop gets more).
+        #[clap(long)]
+        locktime: Option<u16>,
+        /// Confirmations required on each HTLC funding output.
+        #[clap(long, default_value = "1")]
+        min_confirmations: u32,
+    },
+
     /// Swap Lightning balance for on-chain BTC via a maker (reverse submarine swap).
     #[cfg(feature = "lightning")]
     LnSwapOut {
@@ -794,6 +818,35 @@ fn main() -> Result<(), TakerError> {
                 report.maker,
                 report.fee.to_sat(),
                 report.funding_outpoint
+            );
+        }
+        #[cfg(feature = "lightning")]
+        Commands::LnSwapRouted {
+            amount,
+            first_maker,
+            second_maker,
+            locktime,
+            min_confirmations,
+        } => {
+            let report = taker.lightning_swap_routed(
+                openswap::taker::lightning_swap::LnRoutedSwapParams {
+                    amount: Amount::from_sat(*amount),
+                    first_maker: first_maker.clone(),
+                    second_maker: second_maker.clone(),
+                    locktime: *locktime,
+                    min_confirmations: *min_confirmations,
+                },
+            )?;
+            println!(
+                "routed swap complete: sent {} sats via {}, received {} sats via {} \
+                 (fees {} + {} sats, claim {})",
+                report.sent.to_sat(),
+                report.first_maker,
+                report.received.to_sat(),
+                report.second_maker,
+                report.first_fee.to_sat(),
+                report.second_fee.to_sat(),
+                report.claim_txid
             );
         }
         #[cfg(feature = "lightning")]

@@ -43,16 +43,12 @@ fn lightning_submarine_swaps_e2e() {
     // Drain the channel event so later polls only see swap events.
     let _ = maker_ln.poll_event().unwrap();
 
-    LN_MAKER_INJECT
-        .lock()
-        .unwrap()
-        .push(maker_ln.clone() as Arc<dyn LightningBackend>);
-
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
+        TestFramework::init_with_lightning::<BitcoindBackend>(
             vec![(7102, None)],
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
+            vec![maker_ln.clone() as Arc<dyn LightningBackend>],
         );
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
