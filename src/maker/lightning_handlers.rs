@@ -268,6 +268,14 @@ pub fn handle_lightning_message<M: Maker>(
         )));
     };
 
+    // Bind the connection to this swap, as the other protocol families do on
+    // SwapDetails. Beyond bookkeeping, this is what promotes the connection
+    // out of the server's "pending" bucket: an unpromoted connection is
+    // dropped after PENDING_CONNECTION_TIMEOUT, which is far shorter than the
+    // gaps between Lightning steps (funding confirmations, held payments).
+    state.check_swap_id(&swap_id)?;
+    state.swap_id = Some(swap_id.clone());
+
     match message {
         LightningTakerMessage::SwapInRequest(req) => handle_swap_in_request(maker, &ctx, req),
         LightningTakerMessage::SwapInFunded(funded) => handle_swap_in_funded(maker, &ctx, funded),
@@ -439,8 +447,15 @@ fn handle_swap_in_funded<M: Maker>(
 
     // The on-chain money is locked to our hashlock; paying the invoice is
     // now safe. The settlement event hands us the preimage.
+    //
+    // Bound the route's CLTV budget: we only learn the preimage when the
+    // payment settles, and a settlement after our own refund window closes
+    // would let the taker reclaim the HTLC we already paid for. `accept`
+    // checked locktime >= invoice cltv + margin, so this bound always leaves
+    // room for the invoice's own final delta.
+    let cltv_bound = (swap.locktime as u32).saturating_sub(CLTV_SAFETY_MARGIN as u32);
     ctx.ln
-        .pay_invoice(&swap.invoice, None)
+        .pay_invoice(&swap.invoice, None, Some(cltv_bound))
         .map_err(|e| MakerError::General(format!("pay_invoice: {e:?}").leak()))?;
     log::info!(
         "[{}] Swap-in {}: invoice paid, awaiting settlement",

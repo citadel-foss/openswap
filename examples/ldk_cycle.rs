@@ -181,7 +181,7 @@ fn main() {
         })
         .expect("create_invoice");
     let payment_id = node1
-        .pay_invoice(&invoice.invoice, None)
+        .pay_invoice(&invoice.invoice, None, Some(200))
         .expect("pay_invoice");
     println!("pay_invoice: payment_id={payment_id}");
 
@@ -230,7 +230,9 @@ fn main() {
             },
         )
         .expect("create_hold_invoice");
-    let hold_payment_id = node1.pay_invoice(&hold.invoice, None).expect("pay hold");
+    let hold_payment_id = node1
+        .pay_invoice(&hold.invoice, None, Some(200))
+        .expect("pay hold");
     println!("pay hold invoice: payment_id={hold_payment_id}");
 
     wait_event("node2", &node2, Duration::from_secs(30), |e| {

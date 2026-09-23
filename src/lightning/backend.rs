@@ -62,10 +62,18 @@ pub trait LightningBackend: Send + Sync {
     ///
     /// `amount_msat` must be set when paying a variable-amount invoice and
     /// left `None` otherwise.
+    ///
+    /// `max_total_cltv_expiry_delta` caps the total CLTV budget of the route,
+    /// bounding how long the payment can stay in flight before it either
+    /// settles or fails back. Swaps MUST set it: the payer learns the
+    /// preimage only when the payment settles, so an unbounded route can
+    /// reveal it after the payer's own on-chain refund window has closed.
+    /// `None` leaves the backend default (1008 blocks for LDK).
     fn pay_invoice(
         &self,
         invoice: &str,
         amount_msat: Option<u64>,
+        max_total_cltv_expiry_delta: Option<u32>,
     ) -> Result<PaymentId, LightningError>;
 
     /// Creates a hold invoice for an externally supplied `payment_hash`.

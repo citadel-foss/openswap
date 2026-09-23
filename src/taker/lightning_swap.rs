@@ -5,6 +5,12 @@
 //! maker is chosen explicitly or from the offerbook (first good maker whose
 //! offer advertises Lightning terms covering the amount).
 //!
+//! A third flow, [`Taker::lightning_swap_routed`], chains the two through
+//! *two* makers: the taker pays on-chain to maker 1, maker 1 forwards over
+//! Lightning to maker 2, and maker 2 pays the taker back on-chain. The taker
+//! needs no Lightning node of its own for that one — Lightning is purely the
+//! makers' settlement rail.
+//!
 //! Crash safety: an [`LnPendingSwap`] record is written to the (encrypted)
 //! wallet store before any value is committed, and removed when the swap
 //! resolves. [`Taker::recover_lightning_swaps`] spends whatever those
@@ -57,6 +63,16 @@ const DEFAULT_LOCKTIME_HEADROOM: u16 = 48;
 /// Default swap-out refund locktime (maker's branch) in blocks.
 const DEFAULT_SWAP_OUT_LOCKTIME: u16 = 144;
 
+/// Extra blocks the first hop's refund gets over the second hop's in a
+/// routed swap. The hop we fund must stay locked until after the hop we
+/// claim from has resolved, or we could be refunded on one leg while still
+/// exposed on the other.
+const ROUTED_HOP_TIMELOCK_MARGIN: u16 = 48;
+
+/// How long to listen for an early rejection from the first maker before
+/// assuming it accepted and is working on the payment.
+const EARLY_REJECT_WINDOW: Duration = Duration::from_secs(5);
+
 /// Parameters of a Lightning submarine swap.
 #[derive(Debug, Clone)]
 pub struct LnSwapParams {
@@ -86,6 +102,48 @@ pub struct LnSwapReport {
     pub funding_outpoint: OutPoint,
     /// The taker's on-chain claim (swap-out only).
     pub claim_txid: Option<Txid>,
+}
+
+/// Parameters of a routed (two-maker) Lightning swap.
+#[derive(Debug, Clone)]
+pub struct LnRoutedSwapParams {
+    /// On-chain amount the taker receives back from the second maker. The
+    /// taker funds this plus both makers' fees.
+    pub amount: Amount,
+    /// First maker: receives the taker's on-chain funds and forwards over
+    /// Lightning. `None` picks one from the offerbook.
+    pub first_maker: Option<String>,
+    /// Second maker: receives Lightning and funds the taker's on-chain
+    /// payout. `None` picks one from the offerbook.
+    pub second_maker: Option<String>,
+    /// Refund locktime of the second hop, in blocks. The first hop gets
+    /// `ROUTED_HOP_TIMELOCK_MARGIN` more.
+    pub locktime: Option<u16>,
+    /// Confirmations required on each HTLC funding output.
+    pub min_confirmations: u32,
+}
+
+/// Outcome of a completed routed swap.
+#[derive(Debug, Clone)]
+pub struct LnRoutedSwapReport {
+    /// Swap identifier (hex payment hash), shared by both hops.
+    pub swap_id: String,
+    /// Maker that took the on-chain funds and paid over Lightning.
+    pub first_maker: String,
+    /// Maker that received Lightning and paid out on-chain.
+    pub second_maker: String,
+    /// Total on-chain amount the taker committed (amount + both fees).
+    pub sent: Amount,
+    /// On-chain amount the taker received back.
+    pub received: Amount,
+    /// Fee charged by the first maker.
+    pub first_fee: Amount,
+    /// Fee charged by the second maker.
+    pub second_fee: Amount,
+    /// Outpoint the taker funded for the first hop.
+    pub funding_outpoint: OutPoint,
+    /// The taker's claim of the second hop's HTLC.
+    pub claim_txid: Txid,
 }
 
 /// Builds the taker's Lightning backend from config, mirroring the maker's
@@ -156,6 +214,41 @@ impl LnMakerConn {
             &TakerToMakerMessage::Lightning(Box::new(msg)),
         )
         .map_err(|e| general(format!("send to maker failed: {e:?}")))
+    }
+
+    /// Listens briefly for an early rejection. A maker that refuses replies
+    /// at once, while one that accepted stays silent until its side of the
+    /// swap resolves, so silence here means "working on it".
+    ///
+    /// The caller must not read this connection again afterwards: a read
+    /// that times out mid-frame would leave the stream unaligned.
+    fn check_no_early_reject(&mut self, window: Duration) -> Result<(), TakerError> {
+        let previous = self.socket.read_timeout().ok().flatten();
+        if self.socket.set_read_timeout(Some(window)).is_err() {
+            return Ok(());
+        }
+        let early = read_message(&mut self.socket);
+        let _ = self.socket.set_read_timeout(previous);
+        match early {
+            Ok(bytes) => match serde_cbor::from_slice::<MakerToTakerMessage>(&bytes) {
+                Ok(MakerToTakerMessage::Lightning(ln)) => match *ln {
+                    LightningMakerMessage::Reject(reject) => {
+                        Err(general(format!("maker rejected swap: {}", reject.reason)))
+                    }
+                    other => Err(general(format!("unexpected early reply: {other}"))),
+                },
+                Ok(MakerToTakerMessage::Unsupported(unsupported)) => Err(general(format!(
+                    "maker does not support {}: {}",
+                    unsupported.what, unsupported.reason
+                ))),
+                Ok(other) => Err(general(format!("unexpected early reply: {other:?}"))),
+                Err(e) => Err(general(format!("bad maker message: {e:?}"))),
+            },
+            Err(e) => {
+                log::debug!("no early reply from maker (expected): {e:?}");
+                Ok(())
+            }
+        }
     }
 
     /// Reads the next Lightning-family reply, surfacing `Reject` and
@@ -592,7 +685,11 @@ impl Taker {
 
         // Pay the hold invoice: the payment parks at the maker (it cannot
         // settle without our preimage) and prompts it to fund the HTLC.
-        ln.pay_invoice(&accept.invoice, None)
+        // Keep the payment's worst-case resolution inside the on-chain
+        // window we are about to claim within, so a swap cannot straddle the
+        // HTLC's timelock.
+        let cltv_bound = (locktime as u32).saturating_sub(CLTV_SAFETY_MARGIN as u32);
+        ln.pay_invoice(&accept.invoice, None, Some(cltv_bound))
             .map_err(|e| general(format!("pay invoice: {e:?}")))?;
         conn.send(LightningTakerMessage::SwapOutPaid(LnSwapOutPaid {
             swap_id: swap_id.clone(),
@@ -684,6 +781,263 @@ impl Taker {
             fee: accept.fee,
             funding_outpoint: funded.outpoint,
             claim_txid: Some(claim_txid),
+        })
+    }
+
+    /// Routed swap: on-chain to maker 1, Lightning from maker 1 to maker 2,
+    /// on-chain back to the taker. Needs no Lightning node on this side.
+    ///
+    /// The taker collects maker 2's hold invoice first and hands it to maker
+    /// 1, so the single Lightning payment of the swap runs between the two
+    /// makers. One preimage governs all three legs: the taker's claim of
+    /// maker 2's HTLC publishes it on-chain, which lets maker 2 settle the
+    /// held payment, which in turn releases it to maker 1 for its own claim.
+    pub fn lightning_swap_routed(
+        &mut self,
+        params: LnRoutedSwapParams,
+    ) -> Result<LnRoutedSwapReport, TakerError> {
+        let mut preimage_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut preimage_bytes);
+        let preimage = Preimage(preimage_bytes);
+        let payment_hash = preimage.payment_hash();
+        let swap_id = payment_hash.to_string();
+        // Distinct keys: both hops share the payment hash, but each needs its
+        // own recovery record (different branch, key and outpoint).
+        let in_key = format!("{swap_id}-in");
+        let out_key = format!("{swap_id}-out");
+        // Hop 1 is ours to refund; hop 2 is ours to claim.
+        let (timelock_pubkey, timelock_privkey) = generate_keypair();
+        let (hashlock_pubkey, hashlock_privkey) = generate_keypair();
+        let out_locktime = params.locktime.unwrap_or(DEFAULT_SWAP_OUT_LOCKTIME);
+
+        // ---- Hop 2 first: maker 1 cannot pay an invoice that does not exist ----
+        let address2 =
+            self.select_lightning_maker(params.second_maker.clone(), false, params.amount)?;
+        let mut conn2 = self.connect_ln_maker(&address2, false, params.amount)?;
+        let expected_fee2 = advertised_fee(&conn2.ln_offer, params.amount);
+
+        conn2.send(LightningTakerMessage::SwapOutRequest(LnSwapOutRequest {
+            swap_id: swap_id.clone(),
+            payment_hash,
+            amount: params.amount,
+            locktime: out_locktime,
+            min_confirmations: params.min_confirmations,
+            taker_hashlock_pubkey: hashlock_pubkey,
+        }))?;
+        let accept2 = match conn2.read_ln()? {
+            LightningMakerMessage::SwapOutAccept(accept) => accept,
+            other => return Err(general(format!("expected SwapOutAccept, got {other}"))),
+        };
+        if accept2.swap_id != swap_id
+            || accept2.locktime != out_locktime
+            || accept2.min_confirmations != params.min_confirmations
+        {
+            return Err(general("second maker echoed different terms"));
+        }
+        if accept2.fee > expected_fee2 {
+            return Err(general(format!(
+                "second maker fee {} exceeds advertised {}",
+                accept2.fee, expected_fee2
+            )));
+        }
+
+        // What maker 1 must forward over Lightning: our payout plus maker 2's
+        // fee. Verified against the invoice we are about to hand over, since
+        // maker 1 will check the same thing and reject a mismatch.
+        let middle_amount = params.amount + accept2.fee;
+        let cltv_delta = verify_invoice(
+            &accept2.invoice,
+            &payment_hash,
+            middle_amount.to_sat() * 1000,
+        )
+        .map_err(|e| general(format!("second maker's invoice failed verification: {e}")))?
+        .min_final_cltv_expiry_delta as u16;
+
+        // The hop we fund must outlive the hop we claim from, and must also
+        // clear the Lightning claim window maker 1 is exposed to.
+        let in_locktime = out_locktime.saturating_add(ROUTED_HOP_TIMELOCK_MARGIN);
+        if in_locktime < cltv_delta.saturating_add(CLTV_SAFETY_MARGIN) {
+            return Err(general(format!(
+                "first hop locktime {in_locktime} too short for invoice cltv delta {cltv_delta}"
+            )));
+        }
+
+        // ---- Hop 1: hand maker 2's invoice to maker 1 ----
+        let address1 =
+            self.select_lightning_maker(params.first_maker.clone(), true, middle_amount)?;
+        if address1 == address2 {
+            return Err(general(
+                "routed swap needs two distinct makers; one maker would see both ends",
+            ));
+        }
+        let mut conn1 = self.connect_ln_maker(&address1, true, middle_amount)?;
+        let expected_fee1 = advertised_fee(&conn1.ln_offer, middle_amount);
+
+        conn1.send(LightningTakerMessage::SwapInRequest(LnSwapInRequest {
+            swap_id: swap_id.clone(),
+            invoice: accept2.invoice.clone(),
+            payment_hash,
+            amount: middle_amount,
+            locktime: in_locktime,
+            min_confirmations: params.min_confirmations,
+            taker_timelock_pubkey: timelock_pubkey,
+        }))?;
+        let accept1 = match conn1.read_ln()? {
+            LightningMakerMessage::SwapInAccept(accept) => accept,
+            other => return Err(general(format!("expected SwapInAccept, got {other}"))),
+        };
+        if accept1.swap_id != swap_id
+            || accept1.locktime != in_locktime
+            || accept1.min_confirmations != params.min_confirmations
+        {
+            return Err(general("first maker echoed different terms"));
+        }
+        if accept1.fee > expected_fee1 {
+            return Err(general(format!(
+                "first maker fee {} exceeds advertised {}",
+                accept1.fee, expected_fee1
+            )));
+        }
+
+        let htlc1 = SwapHtlc::new(
+            &accept1.maker_hashlock_pubkey,
+            &timelock_pubkey,
+            &payment_hash,
+            in_locktime,
+        );
+        let htlc2 = SwapHtlc::new(
+            &hashlock_pubkey,
+            &accept2.maker_timelock_pubkey,
+            &payment_hash,
+            out_locktime,
+        );
+
+        // Recovery records before any value moves. Hop 2 has no outpoint yet;
+        // it is filled in once maker 2 funds.
+        self.save_pending_swap(
+            &in_key,
+            LnPendingSwap {
+                is_swap_in: true,
+                preimage: Some(preimage.0),
+                redeemscript: htlc1.redeemscript().clone(),
+                locktime: in_locktime,
+                privkey: timelock_privkey,
+                outpoint: None,
+                value: None,
+            },
+        )?;
+        self.save_pending_swap(
+            &out_key,
+            LnPendingSwap {
+                is_swap_in: false,
+                preimage: Some(preimage.0),
+                redeemscript: htlc2.redeemscript().clone(),
+                locktime: out_locktime,
+                privkey: hashlock_privkey,
+                outpoint: None,
+                value: None,
+            },
+        )?;
+
+        let sent = middle_amount + accept1.fee;
+        let (outpoint1, value1) =
+            self.fund_htlc_output(&htlc1, sent, params.min_confirmations, &in_key)?;
+        conn1.send(LightningTakerMessage::SwapInFunded(LnHtlcFunded {
+            swap_id: swap_id.clone(),
+            outpoint: outpoint1,
+            value: value1,
+        }))?;
+        // Maker 1 goes quiet here until it learns the preimage — which cannot
+        // happen until we claim hop 2 — so only a rejection would arrive now.
+        // Nothing is read from this connection afterwards; maker 1 sweeps on
+        // its own once the preimage reaches it over Lightning.
+        conn1.check_no_early_reject(EARLY_REJECT_WINDOW)?;
+        log::info!("routed swap {swap_id}: hop 1 funded at {outpoint1}");
+
+        // ---- Maker 1 pays maker 2; maker 2 then funds our payout ----
+        conn2.send(LightningTakerMessage::SwapOutPaid(LnSwapOutPaid {
+            swap_id: swap_id.clone(),
+        }))?;
+        let funded2 = match conn2.read_ln()? {
+            LightningMakerMessage::SwapOutFunded(funded) => funded,
+            other => return Err(general(format!("expected SwapOutFunded, got {other}"))),
+        };
+        if funded2.swap_id != swap_id {
+            return Err(general("funding announced for a different swap"));
+        }
+        self.read_wallet()?.wait_for_tx_confirmation(
+            &[funded2.outpoint.txid],
+            params.min_confirmations,
+            None,
+            None,
+        )?;
+        let funding_tx = {
+            use crate::wallet::blockchain::Blockchain;
+            self.read_wallet()?
+                .blockchain
+                .get_raw_transaction(&funded2.outpoint.txid, None)?
+        };
+        let output2 = funding_tx
+            .output
+            .get(funded2.outpoint.vout as usize)
+            .ok_or_else(|| general("funding vout out of range"))?
+            .clone();
+        if funded2.value != output2.value {
+            return Err(general("announced funding value mismatch"));
+        }
+        htlc2
+            .validate_funding_output(&output2, params.amount)
+            .map_err(|e| general(format!("bad funding output: {e}")))?;
+        {
+            let mut wallet = self.write_wallet()?;
+            if let Some(record) = wallet.store.ln_pending_swaps.get_mut(&out_key) {
+                record.outpoint = Some(funded2.outpoint);
+                record.value = Some(output2.value);
+            }
+            wallet.save_to_disk()?;
+        }
+
+        // ---- Claim hop 2: publishes the preimage that unlocks hop 1 ----
+        let destination = self
+            .write_wallet()?
+            .get_next_external_address(AddressType::P2WPKH)?
+            .script_pubkey();
+        let claim_tx = htlc2
+            .create_hashlock_spend(
+                funded2.outpoint,
+                output2.value,
+                &hashlock_privkey,
+                &preimage,
+                destination,
+            )
+            .map_err(|e| general(format!("claim build: {e}")))?;
+        let claim_txid = self.read_wallet()?.send_tx(&claim_tx)?;
+        log::info!("routed swap {swap_id}: hop 2 claimed in {claim_txid}");
+
+        let _ = conn2.send(LightningTakerMessage::SwapOutClaimed(LnSwapOutClaimed {
+            swap_id: swap_id.clone(),
+            claim_txid,
+        }));
+        match conn2.read_ln() {
+            Ok(LightningMakerMessage::SwapOutComplete(_)) => {}
+            Ok(other) => log::warn!("unexpected closing message: {other}"),
+            Err(e) => log::debug!("no completion message from second maker: {e:?}"),
+        }
+
+        self.remove_pending_swap(&out_key)?;
+        self.remove_pending_swap(&in_key)?;
+        let _ = self.write_wallet()?.sync_and_save(&Default::default());
+
+        Ok(LnRoutedSwapReport {
+            swap_id,
+            first_maker: conn1.address.clone(),
+            second_maker: conn2.address.clone(),
+            sent,
+            received: params.amount,
+            first_fee: accept1.fee,
+            second_fee: accept2.fee,
+            funding_outpoint: outpoint1,
+            claim_txid,
         })
     }
 

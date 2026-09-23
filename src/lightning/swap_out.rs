@@ -205,7 +205,9 @@ impl SwapOutTaker {
             .invoice
             .as_ref()
             .ok_or(SwapError::NotReady("pay_invoice before on_accept"))?;
-        Ok(self.ln.pay_invoice(invoice, None)?)
+        Ok(self
+            .ln
+            .pay_invoice(invoice, None, Some(self.params.locktime as u32))?)
     }
 
     /// Verifies the maker's funding: the output pays the recreated HTLC

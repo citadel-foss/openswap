@@ -48,6 +48,14 @@ use super::{
 /// Delay between reconnection attempts of the event subscription stream.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
+/// LDK's default maximum number of MPP paths, restated because supplying
+/// route parameters overrides every field rather than merging with defaults.
+const DEFAULT_MAX_PATH_COUNT: u32 = 10;
+
+/// LDK's default maximum share of a channel's capacity used per path, as a
+/// power of 1/2. Restated for the same reason as [`DEFAULT_MAX_PATH_COUNT`].
+const DEFAULT_MAX_CHANNEL_SATURATION_POW_HALF: u32 = 2;
+
 /// A [`LightningBackend`] talking to an LDK Server instance over gRPC.
 ///
 /// The TLS certificate of the server is pinned (self-signed certificates are
@@ -292,11 +300,22 @@ impl LightningBackend for LdkServerBackend {
         &self,
         invoice: &str,
         amount_msat: Option<u64>,
+        max_total_cltv_expiry_delta: Option<u32>,
     ) -> Result<PaymentId, LightningError> {
+        // The server forwards route parameters verbatim, so supplying the
+        // struct at all means supplying every field: the other three are set
+        // to LDK's own documented defaults.
+        let route_parameters =
+            max_total_cltv_expiry_delta.map(|delta| proto_types::RouteParametersConfig {
+                max_total_routing_fee_msat: None,
+                max_total_cltv_expiry_delta: delta,
+                max_path_count: DEFAULT_MAX_PATH_COUNT,
+                max_channel_saturation_power_of_half: DEFAULT_MAX_CHANNEL_SATURATION_POW_HALF,
+            });
         let request = proto_api::Bolt11SendRequest {
             invoice: invoice.to_string(),
             amount_msat,
-            route_parameters: None,
+            route_parameters,
         };
         let response = self.call(self.client.bolt11_send(request))?;
         Ok(PaymentId(response.payment_id))

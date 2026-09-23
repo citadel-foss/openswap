@@ -578,7 +578,12 @@ impl SwapInMaker {
             .request
             .as_ref()
             .ok_or(SwapError::NotReady("pay_invoice before accept"))?;
-        Ok(self.ln.pay_invoice(&request.invoice, None)?)
+        // Bound the route so the settlement that reveals the preimage
+        // cannot land after our on-chain claim window closes.
+        let cltv_bound = request.params.locktime as u32;
+        Ok(self
+            .ln
+            .pay_invoice(&request.invoice, None, Some(cltv_bound))?)
     }
 
     /// Polls the backend for the `PaymentSuccessful` settlement event and
