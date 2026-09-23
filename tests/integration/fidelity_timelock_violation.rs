@@ -1,6 +1,6 @@
 //! This test demonstrates the scenario when the Maker violates the accepted fidelity_timelock limit.
 //! Discovery drops the bond announcement outright, so the swap fails with
-//! `NotEnoughMakersInOfferBook`, and a direct poll of that maker bans it.
+//! `NotEnoughMakersInOfferBook`, and a direct poll of that maker sidelines it.
 //! Later we restart the Maker with faulty config that is setting the fidelity_timelock to an
 //! unacceptable block count, the Maker thus results an error saying "Invalid fidelity timelock".
 
@@ -8,7 +8,10 @@ use bitcoin::Amount;
 use openswap::{
     maker::{start_server, MakerBehavior, MakerError, MakerServer, MakerServerConfig},
     protocol::common_messages::ProtocolVersion,
-    taker::{error::TakerError, BanReason, BanRecord, MakerState, SwapParams, TakerBehavior},
+    taker::{
+        error::TakerError, MakerState, SwapParams, TakerBehavior, UnavailableReason,
+        UnavailableState,
+    },
     wallet::WalletError,
 };
 
@@ -93,20 +96,20 @@ fn fidelity_limit_violation() {
         "discovery must not admit a maker whose bond timelock is out of range"
     );
 
-    // A bond outside the accepted timelock range is proven, not a timeout, so
-    // the maker must be banned rather than left to retry.
+    // The range is measured from our own confirmation height, which an honest
+    // bond can miss by confirming late, so it sidelines rather than bans.
     let standing = taker
         .poll_maker(address)
         .expect("the poll must be recorded");
     assert!(
         matches!(
             standing.state,
-            MakerState::Banned(BanRecord {
-                reason: BanReason::InvalidFidelityProof,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::BondUnverified,
                 ..
             })
         ),
-        "an out-of-range bond timelock must ban the maker, got {:?}",
+        "an out-of-range bond timelock must sideline the maker, got {:?}",
         standing.state
     );
 

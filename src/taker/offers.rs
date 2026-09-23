@@ -270,7 +270,7 @@ pub enum UnavailableReason {
     BondExpired,
     /// The bond output vanished from a chain that still calls it locked.
     BondReorged,
-    /// The bond check failed in a way we did not anticipate, so it blames no one.
+    /// The bond check failed without proving anything against the maker.
     BondUnverified,
     /// The offer cannot price any amount. A maker whose liquidity has fallen
     /// below its own minimum publishes exactly this, and recovers by funding.
@@ -535,11 +535,14 @@ impl OfferBookHandle {
                 }
                 Err(e) => {
                     // Starting empty forgives every recorded ban, so keep the
-                    // unreadable file rather than deleting the only evidence.
-                    let kept = path.with_extension("corrupt");
-                    if let Err(rename_error) = std::fs::rename(&path, &kept) {
+                    // unreadable file, under a name no earlier one holds.
+                    let kept = (0u64..)
+                        .map(|n| path.with_extension(format!("corrupt.{n}")))
+                        .find(|kept| !kept.exists())
+                        .expect("an unused name exists");
+                    std::fs::rename(&path, &kept).inspect_err(|rename_error| {
                         log::error!("Could not set aside the corrupt offerbook: {rename_error:?}");
-                    }
+                    })?;
                     log::error!(
                         "Offerbook corrupted at {path:?}, kept at {kept:?}. Starting empty; every recorded ban is lost. Error: {e:?}"
                     );
@@ -1223,7 +1226,6 @@ fn classify_bond_failure(error: WalletError) -> OfferCheckError {
                 | BondDoesNotExist
                 | InvalidCertHash
                 | InvalidCertSignature
-                | InvalidBondLocktime
                 | BondPubkeyMismatch
                 | BondAmountMismatch { .. }
         )
@@ -2224,6 +2226,20 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupt_offerbook_is_kept_and_never_overwritten() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("offerbook.json");
+
+        for (n, garbage) in ["not json", "still not json"].iter().enumerate() {
+            std::fs::write(&path, garbage).unwrap();
+            OfferBookHandle::load_or_create(dir.path()).unwrap();
+            let kept = path.with_extension(format!("corrupt.{n}"));
+            assert_eq!(std::fs::read_to_string(kept).unwrap(), *garbage);
+        }
+        assert!(OfferBook::read_from_disk(&path).unwrap().makers.is_empty());
+    }
+
+    #[test]
     fn offerbook_load_removes_invalid_persisted_addresses() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("offerbook.json");
@@ -2642,6 +2658,14 @@ mod tests {
                 reason: UnavailableReason::BondExpired,
                 ..
             })
+        ));
+
+        // Our own confirmation height sets the locktime range, so an honest
+        // bond that confirmed late falls outside it: no proof, no ban.
+        let out_of_range = classify_bond_failure(FidelityError::InvalidBondLocktime.into());
+        assert!(matches!(
+            out_of_range,
+            OfferCheckError::Lifecycle(UnavailableReason::BondUnverified, _)
         ));
 
         // An error nobody anticipated proves nothing either.
