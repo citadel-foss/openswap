@@ -379,6 +379,9 @@ pub(crate) fn read_pubkeys_from_multisig_redeemscript(
     redeemscript: &Script,
 ) -> Result<(PublicKey, PublicKey), ProtocolError> {
     let ms_rs_bytes = redeemscript.to_bytes();
+    if ms_rs_bytes.len() < PUBKEY2_OFFSET + PUBKEY_LENGTH {
+        return Err(ProtocolError::General("Multisig redeemscript too short"));
+    }
     let pubkey1 =
         PublicKey::from_slice(&ms_rs_bytes[PUBKEY1_OFFSET..PUBKEY1_OFFSET + PUBKEY_LENGTH])?;
     let pubkey2 =
@@ -1513,6 +1516,43 @@ mod test {
         assert!(
             create_senders_contract_tx(input, Amount::from_sat(fee + 500), &redeemscript, 1.0)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn short_multisig_redeemscript_is_rejected() {
+        // The maker reads these pubkeys straight out of a peer's
+        // `ProofOfFunding` (maker/legacy_handlers.rs:248), before
+        // `check_reedemscript_is_multisig` runs in `verify_proof_of_funding`.
+        let pub1 = PublicKey::from_str(
+            "032e58afe51f9ed8ad3cc7897f634d881fdbe49a81564629ded8156bebd2ffd1af",
+        )
+        .unwrap();
+        let pub2 = PublicKey::from_str(
+            "039b6347398505f5ec93826dc61c19f47c66c0283ee9be980e29ce325a0f4679ef",
+        )
+        .unwrap();
+        let multisig = create_multisig_redeemscript(&pub1, &pub2);
+
+        // Truncations of a real script: 0 and 2 run off the first pubkey,
+        // 35, 36 and 68 clear that read and run off the second.
+        for len in [0usize, 2, 35, 36, 68] {
+            let short = ScriptBuf::from(multisig.to_bytes()[..len].to_vec());
+            let err = read_pubkeys_from_multisig_redeemscript(&short).unwrap_err();
+            let message = match err {
+                ProtocolError::General(msg) => msg,
+                _ => "Incorrect path",
+            };
+            assert_eq!(message, "Multisig redeemscript too short", "at {len} bytes");
+        }
+
+        // 69 bytes is the shortest script holding both pubkeys, so the guard
+        // has to admit it, and the full script still reads back.
+        let both_keys = ScriptBuf::from(multisig.to_bytes()[..69].to_vec());
+        assert!(read_pubkeys_from_multisig_redeemscript(&both_keys).is_ok());
+        assert_eq!(
+            read_pubkeys_from_multisig_redeemscript(&multisig).unwrap(),
+            (pub1, pub2)
         );
     }
 }
