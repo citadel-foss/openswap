@@ -94,6 +94,18 @@ pub trait LightningBackend: Send + Sync {
     /// Fails a held payment back to the payer.
     fn fail_held_payment(&self, payment_hash: sha256::Hash) -> Result<(), LightningError>;
 
+    /// Looks up a settled payment's preimage by payment hash.
+    ///
+    /// [`poll_event`](Self::poll_event) is at-most-once, so a node that
+    /// restarted — or was merely disconnected — can miss the settlement that
+    /// carried the preimage. This is the resynchronization path for that:
+    /// it answers from the backend's own payment store rather than the event
+    /// stream. Returns `Ok(None)` when the payment is unknown or unsettled.
+    fn settled_preimage(
+        &self,
+        payment_hash: sha256::Hash,
+    ) -> Result<Option<Preimage>, LightningError>;
+
     /// Returns the next pending backend event, or `Ok(None)` if no event is
     /// currently queued. Never blocks.
     ///

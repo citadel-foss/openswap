@@ -36,4 +36,4 @@ pub use report::{
     TakerReport,
 };
 pub use spend::Destination;
-pub use storage::{AddressType, LnPendingSwap};
+pub use storage::{AddressType, LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap};

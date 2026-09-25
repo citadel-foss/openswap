@@ -554,6 +554,18 @@ impl LightningBackend for MockLightningBackend {
         Ok(())
     }
 
+    fn settled_preimage(
+        &self,
+        payment_hash: sha256::Hash,
+    ) -> Result<Option<Preimage>, LightningError> {
+        let ledger = self.ledger.lock()?;
+        Ok(ledger
+            .invoices
+            .get(&payment_hash)
+            .filter(|invoice| invoice.status == InvoiceStatus::Settled)
+            .and_then(|invoice| invoice.preimage))
+    }
+
     fn poll_event(&self) -> Result<Option<LnEvent>, LightningError> {
         Ok(self.ledger.lock()?.queues[self.node_index].pop_front())
     }
