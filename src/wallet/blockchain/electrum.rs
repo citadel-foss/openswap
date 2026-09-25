@@ -287,6 +287,23 @@ impl std::fmt::Debug for Electrum {
 }
 
 impl Electrum {
+    pub(crate) fn transaction_get_validating(
+        &self,
+        txid: &Txid,
+    ) -> Result<Transaction, WalletError> {
+        let tx = self.call(|c| c.transaction_get(txid))?;
+        if tx.compute_txid() != *txid {
+            return Err(WalletError::Electrum(electrum_client::Error::Protocol(
+                serde_json::Value::String(format!(
+                    "Server returned transaction {} for requested {}",
+                    tx.compute_txid(),
+                    txid
+                )),
+            )));
+        }
+        Ok(tx)
+    }
+
     pub(crate) fn spending_transaction(
         &self,
         outpoint: &OutPoint,
@@ -294,7 +311,7 @@ impl Electrum {
         expected_txid: Option<&Txid>,
     ) -> Result<Option<Transaction>, WalletError> {
         if let Some(txid) = expected_txid {
-            let tx = match self.call(|c| c.transaction_get(txid)) {
+            let tx = match self.transaction_get_validating(txid) {
                 Ok(tx) => tx,
                 Err(WalletError::Electrum(ref e)) if is_unknown_txid(e) => return Ok(None),
                 Err(e) => return Err(e),
@@ -306,7 +323,7 @@ impl Electrum {
                 .then_some(tx));
         }
         for entry in self.call(|c| c.script_get_history(script))? {
-            let tx = self.call(|c| c.transaction_get(&entry.tx_hash))?;
+            let tx = self.transaction_get_validating(&entry.tx_hash)?;
             if tx.input.iter().any(|i| i.previous_output == *outpoint) {
                 return Ok(Some(tx));
             }
@@ -791,7 +808,7 @@ impl Blockchain for Electrum {
         // A txid the server does not know cannot be mined; that is the
         // routine answer for a contract nobody broadcast. Any other Protocol
         // error is a server problem and must surface, not read as "not mined".
-        let tx = match self.call(|c| c.transaction_get(txid)) {
+        let tx = match self.transaction_get_validating(txid) {
             Ok(tx) => tx,
             Err(WalletError::Electrum(ref e)) if is_unknown_txid(e) => return Ok(None),
             Err(e) => return Err(e),
@@ -812,7 +829,7 @@ impl Blockchain for Electrum {
             if entry.tx_hash == outpoint.txid || entry.height <= 0 {
                 continue;
             }
-            let tx = self.call(|c| c.transaction_get(&entry.tx_hash))?;
+            let tx = self.get_raw_transaction(&entry.tx_hash, None)?;
             if tx.input.iter().any(|i| i.previous_output == *outpoint) {
                 return Ok(true);
             }
@@ -831,7 +848,7 @@ impl Blockchain for Electrum {
         txid: &Txid,
         _block_hash: Option<&BlockHash>,
     ) -> Result<Transaction, WalletError> {
-        self.call(|c| c.transaction_get(txid))
+        self.transaction_get_validating(txid)
     }
 
     fn get_raw_transaction_info(
@@ -843,7 +860,7 @@ impl Blockchain for Electrum {
         // info, but plenty of servers refuse it. Fetch the plain tx every server
         // serves and derive the rest from its mined height.
         // Only the few fields the wallet actually reads are populated.
-        let tx = self.call(|c| c.transaction_get(txid))?;
+        let tx = self.transaction_get_validating(txid)?;
         let hex = serialize(&tx).to_lower_hex_string();
         let height = self.mined_height(&tx)?;
         let confirmations = self.confirmations_at(height)?;
@@ -924,7 +941,7 @@ impl Blockchain for Electrum {
     }
 
     fn is_tx_unknown(&self, txid: &Txid) -> Result<bool, WalletError> {
-        match self.call(|c| c.transaction_get(txid)) {
+        match self.transaction_get_validating(txid) {
             Ok(_) => Ok(false),
             Err(WalletError::Electrum(ref e)) if is_unknown_txid(e) => Ok(true),
             Err(e) => Err(e),
@@ -944,7 +961,7 @@ impl Blockchain for Electrum {
         // The server answering "no such transaction" is a real absence, like Core.
         // Any other failure must surface: `Ok(None)` reads as "spent", the
         // fail-dangerous answer for those callers.
-        let tx = match self.call(|c| c.transaction_get(txid)) {
+        let tx = match self.transaction_get_validating(txid) {
             Ok(tx) => tx,
             Err(WalletError::Electrum(ref e)) if is_unknown_txid(e) => return Ok(None),
             Err(e) => return Err(e),
@@ -1121,7 +1138,7 @@ impl Blockchain for Electrum {
         let mut headers: HashMap<u64, Header> = HashMap::new();
         let mut out = Vec::new();
         for (txid, height) in page {
-            let tx = self.call(|c| c.transaction_get(&txid))?;
+            let tx = self.transaction_get_validating(&txid)?;
 
             // Value our own inputs: that is what separates a spend from a
             // receive, and the input total gives the fee.
@@ -1130,7 +1147,7 @@ impl Blockchain for Electrum {
             let is_coinbase = tx.is_coinbase();
             if !is_coinbase {
                 for input in &tx.input {
-                    let prev = self.call(|c| c.transaction_get(&input.previous_output.txid))?;
+                    let prev = self.transaction_get_validating(&input.previous_output.txid)?;
                     let prev_out = prev
                         .output
                         .get(input.previous_output.vout as usize)
@@ -1281,7 +1298,7 @@ impl Blockchain for Electrum {
             if !sub.seen.insert(h.tx_hash) {
                 continue;
             }
-            match self.call(|c| c.transaction_get(&h.tx_hash)) {
+            match self.transaction_get_validating(&h.tx_hash) {
                 Ok(tx) => {
                     state.fetch_attempts.remove(&h.tx_hash);
                     state.pending.push_back(WatchEvent::TxSeen {
@@ -1428,7 +1445,7 @@ impl Blockchain for Electrum {
             };
             for h in hist {
                 if seen.insert(h.tx_hash) {
-                    match self.call(|c| c.transaction_get(&h.tx_hash)) {
+                    match self.transaction_get_validating(&h.tx_hash) {
                         Ok(tx) => {
                             state.fetch_attempts.remove(&h.tx_hash);
                             state.pending.push_back(WatchEvent::TxSeen {
