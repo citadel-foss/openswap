@@ -49,7 +49,7 @@ fn lightning_submarine_swaps_e2e() {
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init_with_lightning::<BitcoindBackend>(
-            vec![(7102, None)],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
             vec![maker_ln.clone() as Arc<dyn LightningBackend>],
