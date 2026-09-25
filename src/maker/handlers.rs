@@ -546,6 +546,37 @@ pub trait Maker: Send + Sync {
         Ok(())
     }
 
+    /// Waits for a Lightning HTLC funding transaction to reach
+    /// `required_confirms`.
+    ///
+    /// Separate from [`wait_for_txs_on_chain`](Self::wait_for_txs_on_chain),
+    /// whose keep-alive hook aborts the wait for any swap missing from
+    /// `ongoing_swaps` — which every Lightning swap is, being tracked in its
+    /// own map.
+    #[cfg(feature = "lightning")]
+    fn wait_for_htlc_confirmation(
+        &self,
+        _txid: &bitcoin::Txid,
+        _required_confirms: u32,
+    ) -> Result<(), MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Funds `address` with exactly `amount` for a Lightning HTLC, returning
+    /// the transaction and the output's index.
+    ///
+    /// Separate from the coinswap funding path, which executes a plan frozen
+    /// at admission: a Lightning HTLC is one exact output with no hop to
+    /// reimburse, and its swap never enters `ongoing_swaps`.
+    #[cfg(feature = "lightning")]
+    fn fund_htlc(
+        &self,
+        _amount: Amount,
+        _address: bitcoin::Address,
+    ) -> Result<(Transaction, u32), MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
     /// A fresh wallet receive address (Lightning HTLC sweeps/refunds land here).
     #[cfg(feature = "lightning")]
     fn get_receive_address(&self) -> Result<bitcoin::Address, MakerError> {

@@ -73,7 +73,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for() {
 
     let (test_framework, takers, makers, block_generation_handle) =
         TestFramework::init_with_lightning::<BitcoindBackend>(
-            vec![(7502, None)],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
             vec![ln.clone() as Arc<dyn LightningBackend>],

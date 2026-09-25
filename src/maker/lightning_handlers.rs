@@ -501,7 +501,7 @@ fn handle_swap_in_funded<M: Maker>(
 
     // Wait for the announced funding to confirm, then verify it against the
     // HTLC we derived ourselves — script and exact value.
-    maker.wait_for_tx_on_chain(&funded.outpoint.txid, swap.min_confirmations)?;
+    maker.wait_for_htlc_confirmation(&funded.outpoint.txid, swap.min_confirmations)?;
     let funding_tx = maker.get_raw_transaction(&funded.outpoint.txid)?;
     let output = funding_tx
         .output
@@ -745,7 +745,7 @@ fn handle_swap_out_paid<M: Maker>(
         .htlc
         .address(maker.network())
         .map_err(|e| MakerError::General(format!("htlc address: {e}").leak()))?;
-    let (funding_tx, vout) = maker.create_funding_transaction(swap.amount, address, None)?;
+    let (funding_tx, vout) = maker.fund_htlc(swap.amount, address)?;
     let txid = maker.broadcast_transaction(&funding_tx)?;
     let outpoint = OutPoint { txid, vout };
     let value = funding_tx

@@ -32,7 +32,7 @@ fn setup_bitcoind(test_name: &str) -> (BitcoinD, PathBuf) {
     }
     let port_zmq = 28332 + rand::random::<u16>() % 20000;
     let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
-    let bitcoind = init_bitcoind(&temp_dir, zmq_addr);
+    let bitcoind = init_bitcoind(&temp_dir, zmq_addr).expect("bitcoind starts");
     (bitcoind, temp_dir)
 }
 

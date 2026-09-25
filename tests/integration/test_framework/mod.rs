@@ -1188,14 +1188,14 @@ impl TestFramework {
     #[allow(clippy::type_complexity)]
     #[cfg(feature = "lightning")]
     pub fn init_with_lightning<B: TestBackend>(
-        makers_config_map: Vec<(u16, Option<u16>)>,
+        maker_count: usize,
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
         maker_lightning: Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
         let _guard = LN_INJECT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         *LN_MAKER_INJECT.lock().unwrap_or_else(|p| p.into_inner()) = maker_lightning;
-        let framework = Self::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
+        let framework = Self::init::<B>(maker_count, taker_behavior, maker_behaviors);
         LN_MAKER_INJECT
             .lock()
             .unwrap_or_else(|p| p.into_inner())

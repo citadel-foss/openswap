@@ -46,7 +46,7 @@ use bitcoin::{
 
 use crate::{
     protocol::{contract::create_contract_redeemscript, error::ProtocolError, Hash160},
-    utill::{calculate_fee_sats, generate_keypair, redeemscript_to_scriptpubkey},
+    utill::{fee_at_rate_sats, generate_keypair, redeemscript_to_scriptpubkey},
 };
 
 use super::{
@@ -58,6 +58,10 @@ use super::{
 /// Virtual size (vB) assumed for HTLC spend transactions when computing the
 /// fixed fee. POC simplification: no feerate estimation.
 const SPEND_TX_VSIZE: u64 = 150;
+
+/// Feerate (sat/vB) HTLC spends are built at. Fixed for the same reason as
+/// [`SPEND_TX_VSIZE`]; a production path would estimate it.
+const SPEND_FEE_RATE: f64 = 2.0;
 
 /// Errors produced by the swap-in protocol.
 #[derive(Debug)]
@@ -318,7 +322,7 @@ impl SwapHtlc {
     }
 
     /// Builds the unsigned single-input single-output spend skeleton with a
-    /// fixed fee of `calculate_fee_sats(150)`.
+    /// fixed fee derived from [`SPEND_TX_VSIZE`] and [`SPEND_FEE_RATE`].
     fn build_spend(
         &self,
         outpoint: OutPoint,
@@ -326,7 +330,10 @@ impl SwapHtlc {
         sequence: Sequence,
         destination: ScriptBuf,
     ) -> Result<Transaction, SwapError> {
-        let fee = Amount::from_sat(calculate_fee_sats(SPEND_TX_VSIZE));
+        let fee = Amount::from_sat(
+            fee_at_rate_sats(SPEND_TX_VSIZE, SPEND_FEE_RATE)
+                .ok_or_else(|| SwapError::Validation("spend fee overflow".to_string()))?,
+        );
         let output_value = input_value.checked_sub(fee).ok_or_else(|| {
             SwapError::Validation(format!("fee {fee} exceeds input value {input_value}"))
         })?;

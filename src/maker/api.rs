@@ -2972,6 +2972,58 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn wait_for_htlc_confirmation(
+        &self,
+        txid: &bitcoin::Txid,
+        required_confirms: u32,
+    ) -> Result<(), MakerError> {
+        // Its own connection, so the wait does not pin the wallet lock.
+        let chain = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .new_connection()
+            .map_err(MakerError::Wallet)?;
+        crate::wallet::wait_for_tx_confirmation(
+            &chain,
+            &[*txid],
+            required_confirms.max(crate::utill::MIN_REQUIRED_CONFIRM),
+            crate::utill::TX_BROADCAST_TIMEOUT,
+            Some(&self.shutdown),
+            None,
+        )
+        .map_err(MakerError::Wallet)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "lightning")]
+    fn fund_htlc(
+        &self,
+        amount: Amount,
+        address: bitcoin::Address,
+    ) -> Result<(Transaction, u32), MakerError> {
+        let mut wallet = lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // One split, one destination, no taker-reimbursed input budget.
+        let plan = wallet
+            .plan_funding(amount, 1, MIN_RELAY_FEE_RATE, u32::MAX, None, None, None)
+            .map_err(MakerError::Wallet)?;
+        let result = wallet
+            .execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE)
+            .map_err(MakerError::Wallet)?;
+        let tx = result
+            .funding_txes
+            .into_iter()
+            .next()
+            .ok_or(MakerError::General("No funding tx created"))?;
+        let vout = result
+            .payment_output_positions
+            .first()
+            .copied()
+            .unwrap_or(0);
+        Ok((tx, vout))
+    }
+
+    #[cfg(feature = "lightning")]
     fn get_receive_address(&self) -> Result<bitcoin::Address, MakerError> {
         let mut wallet = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;

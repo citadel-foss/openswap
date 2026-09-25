@@ -71,7 +71,7 @@ fn lightning_maker_restart_recovers_funded_swap() {
 
     let (test_framework, takers, makers, block_generation_handle) =
         TestFramework::init_with_lightning::<BitcoindBackend>(
-            vec![(7402, None)],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
             vec![ln.clone() as Arc<dyn LightningBackend>],

@@ -41,7 +41,7 @@ use crate::{
             LnSwapInRequest, LnSwapOutClaimed, LnSwapOutPaid, LnSwapOutRequest,
         },
     },
-    utill::{generate_keypair, read_message, send_message, MIN_FEE_RATE},
+    utill::{generate_keypair, read_message, send_message, MIN_RELAY_FEE_RATE},
     wallet::{AddressType, LnPendingSwap},
 };
 
@@ -434,7 +434,11 @@ impl Taker {
 
         let (tx, vout) = {
             let mut wallet = self.write_wallet()?;
-            let result = wallet.create_funding_txes(value, &[address], MIN_FEE_RATE, None, None)?;
+            // One split, one destination: an HTLC output is a single exact
+            // payment, with no hop to reimburse and nothing to randomize.
+            let plan =
+                wallet.plan_funding(value, 1, MIN_RELAY_FEE_RATE, u32::MAX, None, None, None)?;
+            let result = wallet.execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE)?;
             let tx = result
                 .funding_txes
                 .into_iter()

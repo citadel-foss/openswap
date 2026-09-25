@@ -55,7 +55,7 @@ fn lightning_routed_swap_e2e() {
     // maker[0] pays over Lightning (ln1), maker[1] receives (ln2).
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init_with_lightning::<BitcoindBackend>(
-            vec![(7302, None), (7303, None)],
+            2,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal, MakerBehavior::Normal],
             vec![
