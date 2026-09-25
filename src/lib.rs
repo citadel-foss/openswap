@@ -6,7 +6,6 @@ pub extern crate bitcoind;
 pub(crate) mod atomic_file;
 pub mod blocklist;
 pub mod error;
-pub mod fee_estimation;
 pub mod maker;
 pub mod protocol;
 pub mod security;

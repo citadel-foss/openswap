@@ -19,7 +19,7 @@ use crate::{
     maker::nostr::broadcast_bond_on_nostr,
     protocol::common_messages::{MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage},
     utill::{
-        HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, RECOVERY_FEE_RATE, UNBROADCAST_DISCARD_GRACE,
+        HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE, UNBROADCAST_DISCARD_GRACE,
     },
     wallet::{Blockchain, RecoveryReport, Wallet},
 };
@@ -845,7 +845,7 @@ fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result
         // Redeem any expired bonds
         if let Err(e) = lock_debug!(maker.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .redeem_expired_fidelity_bonds(RECOVERY_FEE_RATE, AddressType::P2TR)
+            .redeem_expired_fidelity_bonds(MIN_RELAY_FEE_RATE, AddressType::P2TR)
         {
             log::warn!(
                 "[{}] Failed to redeem expired fidelity bonds: {:?}",
@@ -1494,7 +1494,6 @@ fn recover_from_swap(
             let recovered = Wallet::recover_timelocked_swapcoins(
                 &maker.wallet,
                 chain,
-                RECOVERY_FEE_RATE,
                 &maker.shutdown,
                 Some(&swap_scope),
                 // Legacy funding rides the contract-sig response, so the peer

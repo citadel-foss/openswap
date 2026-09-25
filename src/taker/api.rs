@@ -788,7 +788,6 @@ impl Taker {
             match Wallet::recover_timelocked_swapcoins(
                 &self.wallet,
                 chain,
-                MIN_RELAY_FEE_RATE,
                 &crate::utill::NO_SHUTDOWN,
                 Some(&swap_ids),
                 &|coin_swap| funding_shared(&self.swap_tracker, coin_swap),

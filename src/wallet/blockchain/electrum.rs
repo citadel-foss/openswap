@@ -1077,6 +1077,15 @@ impl Blockchain for Electrum {
             .collect())
     }
 
+    fn estimate_feerate(&self, conf_target: u16) -> Result<f64, WalletError> {
+        // BTC/kvB. Servers that forward to Core answer -1 when it has no estimate.
+        let per_kvb = self.call(|c| c.estimate_fee(conf_target as usize))?;
+        if per_kvb <= 0.0 {
+            return Err(WalletError::General(format!("no estimate: {per_kvb}")));
+        }
+        Ok(per_kvb * 100_000.0)
+    }
+
     fn list_transactions(
         &self,
         _label: Option<&str>,
@@ -1490,6 +1499,7 @@ mod tests {
     use electrum_client::Error;
 
     use super::*;
+    use crate::{utill::MIN_RELAY_FEE_RATE, wallet::AnyBlockchain};
 
     fn cfg(url: &str, socks5: Option<&str>) -> ElectrumConfig {
         ElectrumConfig {
@@ -1619,6 +1629,112 @@ mod tests {
             !overlapped,
             "two requests reached the shared electrum socket concurrently"
         );
+    }
+
+    #[test]
+    fn estimate_feerate_converts_btc_per_kvb_and_rejects_no_estimate() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock electrum");
+        let addr = listener.local_addr().unwrap();
+        let header_hex =
+            serialize_hex(&bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header);
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept electrum client");
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            // Opening handshake: fail server.features, answer genesis and tip.
+            let features = read_request(&mut reader);
+            serde_json::to_writer(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": features["id"],
+                    "error": { "code": -32601, "message": "method not found" }
+                }),
+            )
+            .unwrap();
+            writer.write_all(b"\n").unwrap();
+            writer.flush().unwrap();
+            let genesis = read_request(&mut reader);
+            write_result(&mut writer, &genesis, json!(header_hex));
+            let headers = read_request(&mut reader);
+            write_result(
+                &mut writer,
+                &headers,
+                json!({ "height": 0, "hex": header_hex }),
+            );
+
+            // A real estimate, then the -1 servers send when Core has none.
+            for (target, answer) in [(2, json!(0.0002)), (144, json!(-1))] {
+                let request = read_request(&mut reader);
+                assert_eq!(request["method"], "blockchain.estimatefee");
+                assert_eq!(request["params"], json!([target]));
+                write_result(&mut writer, &request, answer);
+            }
+        });
+
+        let backend = Electrum::new(&cfg(&format!("tcp://{addr}"), None)).unwrap();
+        assert_eq!(backend.estimate_feerate(2).unwrap(), 20.0);
+        assert!(backend.estimate_feerate(144).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recovery_feerates_stop_at_a_dead_link() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock electrum");
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let header_hex =
+            serialize_hex(&bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header);
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Serves the handshake on every connection and drops it at the first fee
+        // request, so each reconnect the backend makes is one more connection.
+        let server = thread::spawn({
+            let done = done.clone();
+            move || {
+                let mut connections = 0;
+                while !done.load(Ordering::Relaxed) {
+                    let Ok((stream, _)) = listener.accept() else {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    };
+                    connections += 1;
+                    stream.set_nonblocking(false).unwrap();
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        line.clear();
+                        let reply = match request["method"].as_str().unwrap() {
+                            "blockchain.estimatefee" => break,
+                            "blockchain.block.header" => json!({ "result": header_hex }),
+                            "blockchain.headers.subscribe" => {
+                                json!({ "result": { "height": 0, "hex": header_hex } })
+                            }
+                            _ => json!({ "error": { "code": -32601, "message": "not found" } }),
+                        };
+                        let mut reply = reply.as_object().unwrap().clone();
+                        reply.insert("jsonrpc".into(), json!("2.0"));
+                        reply.insert("id".into(), request["id"].clone());
+                        serde_json::to_writer(&mut writer, &reply).unwrap();
+                        writer.write_all(b"\n").unwrap();
+                        writer.flush().unwrap();
+                    }
+                }
+                connections
+            }
+        });
+
+        let mut config = cfg(&format!("tcp://{addr}"), None);
+        config.max_retries = 1;
+        let chain = AnyBlockchain::Electrum(Electrum::new(&config).unwrap());
+        assert_eq!(chain.recovery_feerates(), vec![MIN_RELAY_FEE_RATE]);
+        done.store(true, Ordering::Relaxed);
+        // The first target's one reconnect, then no more targets asked.
+        assert_eq!(server.join().unwrap(), 2);
     }
 
     #[test]

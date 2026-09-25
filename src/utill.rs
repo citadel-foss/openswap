@@ -116,10 +116,21 @@ pub fn is_unusable_fee_rate(rate: f64) -> bool {
     !rate.is_finite() || rate < MIN_RELAY_FEE_RATE
 }
 
-/// Fee rate for our own recovery transactions, shared by both roles.
-/// TODO: read the fee market at recovery time — a live node cannot be
-/// reconfigured mid-swap, and a startup value is stale by then.
-pub const RECOVERY_FEE_RATE: f64 = MIN_RELAY_FEE_RATE;
+/// Largest fee from `rates` whose spend of `value` still leaves `spk` a relayable
+/// output. Estimates need not fall with longer targets, so order does not matter.
+pub(crate) fn capped_fee(
+    rates: &[f64],
+    vsize: u64,
+    value: Amount,
+    spk: &ScriptBuf,
+) -> Option<Amount> {
+    let max_fee = value.checked_sub(spk.minimal_non_dust())?;
+    rates
+        .iter()
+        .filter_map(|&rate| fee_at_rate_sats(vsize, rate).map(Amount::from_sat))
+        .filter(|&fee| fee <= max_fee)
+        .max()
+}
 
 /// Current time as seconds since UNIX epoch.
 pub(crate) fn now_secs() -> u64 {
@@ -1286,6 +1297,24 @@ mod tests {
     use crate::protocol::common_messages::{MakerHello, MakerToTakerMessage, ProtocolVersion};
 
     use super::*;
+
+    #[test]
+    fn capped_fee_steps_down_until_the_output_relays() {
+        // P2TR relays from 330 sats, so a 1000-sat spend of 100 vB affords 670.
+        let spk = ScriptBuf::new_witness_program(
+            &WitnessProgram::new(WitnessVersion::V1, &[2; 32]).unwrap(),
+        );
+        let fee = |rates: &[f64], value| capped_fee(rates, 100, Amount::from_sat(value), &spk);
+        assert_eq!(fee(&[5.0, 1.0], 1000), Some(Amount::from_sat(500)));
+        assert_eq!(
+            fee(&[50.0, 9.0, 6.7, 1.0], 1000),
+            Some(Amount::from_sat(670))
+        );
+        assert_eq!(fee(&[6.71, 1.0], 1000), Some(Amount::from_sat(100)));
+        assert_eq!(fee(&[2.0, 5.0, 1.0], 1000), Some(Amount::from_sat(500)));
+        assert_eq!(fee(&[6.71], 1000), None);
+        assert_eq!(fee(&[1.0], 300), None);
+    }
 
     #[test]
     fn fee_at_rate_sats_rounds_fractional_rates_up() {

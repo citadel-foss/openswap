@@ -30,16 +30,20 @@ use bitcoin::{
     Transaction, Txid,
 };
 use bitcoind::bitcoincore_rpc::json::{
-    EstimateMode, EstimateSmartFeeResult, GetAddressInfoResult, GetBlockchainInfoResult,
-    GetRawTransactionResult, GetTxOutResult, ListTransactionResult, ListUnspentResultEntry,
-    ScanningDetails,
+    GetAddressInfoResult, GetBlockchainInfoResult, GetRawTransactionResult, GetTxOutResult,
+    ListTransactionResult, ListUnspentResultEntry, ScanningDetails,
 };
 use serde_json::Value;
 
 use super::error::WalletError;
+use crate::utill::MIN_RELAY_FEE_RATE;
+
+/// Confirmation targets for recovery feerates. Core and every
+/// Electrum server we checked accept each one.
+const RECOVERY_CONF_TARGETS: [u16; 4] = [2, 12, 25, 144];
 
 /// Error for a [`Blockchain`] method the active backend does not support
-/// (e.g. SPV proofs or `estimatesmartfee` on Electrum).
+/// (e.g. `block_at_height` on Electrum).
 fn unsupported(method: &str) -> WalletError {
     WalletError::General(format!("{method} is not supported by this backend"))
 }
@@ -254,6 +258,9 @@ pub trait Blockchain: Send + Sync + 'static {
         descriptor: &str,
         range: Option<[u32; 2]>,
     ) -> Result<Vec<Address<NetworkUnchecked>>, WalletError>;
+    /// Feerate in sat/vB to confirm within `conf_target` blocks. An `Err` when
+    /// the backend has no estimate carries its own reason.
+    fn estimate_feerate(&self, conf_target: u16) -> Result<f64, WalletError>;
     /// Recent wallet transactions, newest window first, ordered oldest-first
     /// like Core. Used by the FFI history view, so every backend must answer it.
     fn list_transactions(
@@ -263,15 +270,6 @@ pub trait Blockchain: Send + Sync + 'static {
         skip: Option<usize>,
         include_watchonly: Option<bool>,
     ) -> Result<Vec<ListTransactionResult>, WalletError>;
-    /// `estimatesmartfee` for `conf_target` blocks. Defaults to an error on
-    /// Electrum (callers fall back to the mempool.space/esplora estimators).
-    fn estimate_smart_fee(
-        &self,
-        _conf_target: u16,
-        _estimate_mode: Option<EstimateMode>,
-    ) -> Result<EstimateSmartFeeResult, WalletError> {
-        Err(unsupported("estimate_smart_fee"))
-    }
     // ---- Core-only sync helpers ----------------------------------------
     // These are invoked by `Wallet::sync` only on the Bitcoin Core path
     // (after an early return for Electrum), so the Electrum stubs are never hit.
@@ -420,6 +418,27 @@ impl AnyBlockchain {
             AnyBlockchain::Electrum(b) => b.spending_transaction(outpoint, script, expected_txid),
         }
     }
+
+    /// Recovery feerates in sat/vB, always including the relay floor. A failed
+    /// estimate drops only its rate; a dead Electrum link stops the rest.
+    pub(crate) fn recovery_feerates(&self) -> Vec<f64> {
+        let mut rates = Vec::new();
+        for target in RECOVERY_CONF_TARGETS {
+            match self.estimate_feerate(target) {
+                Ok(rate) => rates.push(rate.max(MIN_RELAY_FEE_RATE)),
+                Err(e) => {
+                    log::error!(
+                        "Fee estimation for {target} blocks failed, skipping that rate: {e:?}"
+                    );
+                    if matches!(e, WalletError::ElectrumUnreachable { .. }) {
+                        break;
+                    }
+                }
+            }
+        }
+        rates.push(MIN_RELAY_FEE_RATE);
+        rates
+    }
 }
 
 /// Dispatch each [`Blockchain`] method to the active backend variant.
@@ -539,6 +558,12 @@ impl Blockchain for AnyBlockchain {
             AnyBlockchain::Electrum(b) => b.derive_addresses(descriptor, range),
         }
     }
+    fn estimate_feerate(&self, conf_target: u16) -> Result<f64, WalletError> {
+        match self {
+            AnyBlockchain::CoreRPC(b) => b.estimate_feerate(conf_target),
+            AnyBlockchain::Electrum(b) => b.estimate_feerate(conf_target),
+        }
+    }
     fn list_transactions(
         &self,
         label: Option<&str>,
@@ -551,16 +576,6 @@ impl Blockchain for AnyBlockchain {
             AnyBlockchain::Electrum(b) => {
                 b.list_transactions(label, count, skip, include_watchonly)
             }
-        }
-    }
-    fn estimate_smart_fee(
-        &self,
-        conf_target: u16,
-        estimate_mode: Option<EstimateMode>,
-    ) -> Result<EstimateSmartFeeResult, WalletError> {
-        match self {
-            AnyBlockchain::CoreRPC(b) => b.estimate_smart_fee(conf_target, estimate_mode),
-            AnyBlockchain::Electrum(b) => b.estimate_smart_fee(conf_target, estimate_mode),
         }
     }
     fn prepare_backend_wallet(&self, wallet_name: &str) -> Result<(), WalletError> {

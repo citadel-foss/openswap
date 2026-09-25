@@ -13,9 +13,8 @@ use bitcoin::{
 };
 use bitcoind::bitcoincore_rpc::{
     json::{
-        EstimateMode, EstimateSmartFeeResult, GetAddressInfoResult, GetBlockchainInfoResult,
-        GetRawTransactionResult, GetTxOutResult, ListTransactionResult, ListUnspentResultEntry,
-        ScanningDetails,
+        GetAddressInfoResult, GetBlockchainInfoResult, GetRawTransactionResult, GetTxOutResult,
+        ListTransactionResult, ListUnspentResultEntry, ScanningDetails,
     },
     jsonrpc, Auth, Client, Error as CoreRpcError, RpcApi,
 };
@@ -449,12 +448,12 @@ impl Blockchain for CoreRPC {
             .list_transactions(label, count, skip, include_watchonly)?)
     }
 
-    fn estimate_smart_fee(
-        &self,
-        conf_target: u16,
-        estimate_mode: Option<EstimateMode>,
-    ) -> Result<EstimateSmartFeeResult, WalletError> {
-        Ok(self.rpc.estimate_smart_fee(conf_target, estimate_mode)?)
+    fn estimate_feerate(&self, conf_target: u16) -> Result<f64, WalletError> {
+        let res = self.rpc.estimate_smart_fee(conf_target, None)?;
+        let per_kvb = res.fee_rate.ok_or_else(|| {
+            WalletError::General(format!("no estimate: {:?}", res.errors.unwrap_or_default()))
+        })?;
+        Ok(per_kvb.to_sat() as f64 / 1000.0)
     }
 
     /// Load the watch-only wallet on the node, creating it if absent. Ported
@@ -551,4 +550,75 @@ fn list_wallet_dir(client: &Client) -> Result<Vec<String>, WalletError> {
     }
     let result: CallResult = client.call("listwalletdir", &[])?;
     Ok(result.wallets.into_iter().map(|n| n.name).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    use super::*;
+
+    #[test]
+    fn estimate_feerate_forwards_target_and_converts() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock core");
+        let addr = listener.local_addr().unwrap();
+
+        // Answers one estimate, then Core's "no estimate" shape, on any connection.
+        let server = thread::spawn(move || {
+            let mut replies = vec![
+                (2, json!({ "feerate": 0.0002, "blocks": 2 })),
+                (
+                    144,
+                    json!({ "errors": ["Insufficient data or no feerate found"], "blocks": 0 }),
+                ),
+            ]
+            .into_iter();
+            while replies.len() > 0 {
+                let (stream, _) = listener.accept().expect("accept core client");
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while replies.len() > 0 && reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    let mut body_len = 0;
+                    while line.trim() != "" {
+                        if let Some(n) = line.to_lowercase().strip_prefix("content-length:") {
+                            body_len = n.trim().parse().unwrap();
+                        }
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                    }
+                    line.clear();
+                    let mut body = vec![0; body_len];
+                    reader.read_exact(&mut body).unwrap();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let (target, result) = replies.next().unwrap();
+                    assert_eq!(request["method"], "estimatesmartfee");
+                    assert_eq!(request["params"], json!([target]));
+                    let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result, "error": null })
+                        .to_string();
+                    write!(
+                        writer,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .unwrap();
+                    writer.flush().unwrap();
+                }
+            }
+        });
+
+        let core = CoreRPC::new(&CoreRpcConfig {
+            url: addr.to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(core.estimate_feerate(2).unwrap(), 20.0);
+        let err = format!("{:?}", core.estimate_feerate(144).unwrap_err());
+        assert!(err.contains("Insufficient data"), "{}", err);
+        server.join().unwrap();
+    }
 }

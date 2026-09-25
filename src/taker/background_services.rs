@@ -19,7 +19,7 @@ use bitcoin::{OutPoint, ScriptBuf, Txid};
 use crate::{
     lock_debug,
     taker::error::TakerError,
-    utill::{HEART_BEAT_INTERVAL, RECOVERY_FEE_RATE},
+    utill::HEART_BEAT_INTERVAL,
     wallet::{AnyBlockchain, Blockchain, RecoveryReport, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
@@ -125,7 +125,6 @@ impl RecoveryLoop {
                     let outgoing_result = match Wallet::recover_timelocked_swapcoins(
                         &wallet,
                         &chain,
-                        RECOVERY_FEE_RATE,
                         &shutdown_clone,
                         Some(&swap_ids),
                         &|coin_swap| funding_shared(&swap_tracker, coin_swap),

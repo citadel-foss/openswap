@@ -10,7 +10,8 @@
 //! 5. Everyone falls back to timelock recovery.
 //! 6. After blocks mature, verify: taker recovered funds (minus fees), no contract balance.
 
-use bitcoin::Amount;
+use bitcoin::{Amount, Sequence, Txid};
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
@@ -21,7 +22,7 @@ use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    thread,
+    fs, thread,
     time::{Duration, Instant},
 };
 
@@ -142,6 +143,27 @@ fn test_taproot_timelock_recovery() {
         thread::sleep(Duration::from_secs(5));
     }
     info!("Background recovery loop completed.");
+
+    // An underpriced recovery must stay replaceable, so it has to signal RBF.
+    let taker_log = fs::read_to_string(test_framework.taker_log_path()).unwrap();
+    let recovery_txids: Vec<Txid> = taker_log
+        .lines()
+        .filter_map(|line| {
+            let rest = line.split_once("Timelock recovery tx ")?.1;
+            rest.split_once(' ')?.0.parse().ok()
+        })
+        .collect();
+    assert!(
+        !recovery_txids.is_empty(),
+        "no timelock recovery in the taker log"
+    );
+    for txid in recovery_txids {
+        let tx = bitcoind.client.get_raw_transaction(&txid, None).unwrap();
+        assert!(tx
+            .input
+            .iter()
+            .all(|i| i.sequence == Sequence::ENABLE_RBF_NO_LOCKTIME));
+    }
 
     // Mine a block to confirm recovery txs, then sync wallet
     generate_blocks(bitcoind, 1);
