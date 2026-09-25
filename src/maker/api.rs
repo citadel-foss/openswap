@@ -1604,31 +1604,36 @@ impl MakerServer {
     #[cfg(feature = "lightning")]
     fn lightning_offer(&self) -> Option<crate::protocol::lightning_messages::LightningOffer> {
         let ln = self.lightning.as_ref()?;
-        // Live liquidity bounds what we can honestly offer: swap-ins pay out
-        // over Lightning, swap-outs pay out on-chain from the wallet.
-        let balances = match ln.balances() {
-            Ok(balances) => balances,
+        // Each direction draws on a different resource, so they are sized
+        // separately from live channel state rather than from one balance.
+        let channels = match ln.list_channels() {
+            Ok(channels) => channels,
             Err(e) => {
-                log::warn!("lightning balances unavailable, omitting LN offer: {e:?}");
+                log::warn!("lightning channels unavailable, omitting LN offer: {e:?}");
                 return None;
             }
         };
-        let ln_capacity = balances.total_lightning.to_sat();
-        let max_size = ln_capacity.min(
-            lock_debug!(self.wallet.read())
-                .map(|w| w.store.offer_maxsize)
-                .unwrap_or(u64::MAX),
+        // A wallet we cannot read means no on-chain capacity we can promise,
+        // which disables swap-outs rather than advertising an unbounded one.
+        let wallet_max = lock_debug!(self.wallet.read())
+            .map(|w| w.store.offer_maxsize)
+            .unwrap_or(0);
+        let capacity = super::lightning_handlers::directional_limits(
+            &channels,
+            wallet_max,
+            self.config.min_swap_amount,
         );
-        if max_size < self.config.min_swap_amount {
+        if !capacity.swap_in && !capacity.swap_out {
             return None;
         }
         Some(crate::protocol::lightning_messages::LightningOffer {
-            swap_in: true,
-            swap_out: true,
+            swap_in: capacity.swap_in,
+            swap_out: capacity.swap_out,
             base_fee: self.config.base_fee,
             amount_relative_fee_pct: self.config.amount_relative_fee_pct,
             min_size: self.config.min_swap_amount,
-            max_size,
+            max_swap_in: capacity.max_swap_in,
+            max_swap_out: capacity.max_swap_out,
         })
     }
 }

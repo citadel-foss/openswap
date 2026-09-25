@@ -53,6 +53,8 @@ mod lightning_e2e;
 #[cfg(feature = "lightning")]
 mod lightning_maker_restart;
 #[cfg(feature = "lightning")]
+mod lightning_offer_limits;
+#[cfg(feature = "lightning")]
 mod lightning_routed;
 #[cfg(feature = "lightning")]
 mod lightning_swap_in;

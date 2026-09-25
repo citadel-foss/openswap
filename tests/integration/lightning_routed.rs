@@ -31,7 +31,10 @@ fn with_ready_channel(node: &Arc<MockLightningBackend>, peer: &Arc<MockLightning
             node_pubkey: peer.node_info().unwrap().node_id,
             address: "127.0.0.1:9735".to_string(),
             channel_amount: Amount::from_sat(1_000_000),
-            push_to_counterparty_msat: None,
+            // Push half to the peer so the channel has inbound capacity too:
+            // swap-outs are bounded by inbound, and a freshly opened channel
+            // has none.
+            push_to_counterparty_msat: Some(500_000_000),
             announce_channel: false,
         })
         .unwrap();

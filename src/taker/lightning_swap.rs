@@ -303,9 +303,8 @@ impl Taker {
             .iter()
             .find(|m| {
                 m.offer.lightning.is_some_and(|ln| {
-                    (if swap_in { ln.swap_in } else { ln.swap_out })
-                        && amount.to_sat() >= ln.min_size
-                        && amount.to_sat() <= ln.max_size
+                    let (served, max_size) = ln.direction_limits(swap_in);
+                    served && amount.to_sat() >= ln.min_size && amount.to_sat() <= max_size
                 })
             })
             .map(|m| m.address.to_string())
@@ -344,18 +343,17 @@ impl Taker {
         let ln_offer = offer
             .lightning
             .ok_or_else(|| general("maker does not offer Lightning swaps"))?;
-        let supported = if swap_in {
-            ln_offer.swap_in
-        } else {
-            ln_offer.swap_out
-        };
-        if !supported {
+        let (served, max_size) = ln_offer.direction_limits(swap_in);
+        if !served {
             return Err(general("maker does not offer this swap direction"));
         }
-        if amount.to_sat() < ln_offer.min_size || amount.to_sat() > ln_offer.max_size {
+        if amount.to_sat() < ln_offer.min_size || amount.to_sat() > max_size {
             return Err(general(format!(
-                "amount {} outside maker's range [{}, {}]",
-                amount, ln_offer.min_size, ln_offer.max_size
+                "amount {} outside maker's {} range [{}, {}]",
+                amount,
+                if swap_in { "swap-in" } else { "swap-out" },
+                ln_offer.min_size,
+                max_size
             )));
         }
         Ok(LnMakerConn {

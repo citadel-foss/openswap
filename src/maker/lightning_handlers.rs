@@ -29,7 +29,7 @@ use std::{
 use bitcoin::{hashes::sha256, secp256k1::SecretKey, Amount, OutPoint};
 
 use crate::{
-    lightning::{swap::SwapHtlc, LightningBackend, LnEvent, Preimage},
+    lightning::{swap::SwapHtlc, ChannelInfo, LightningBackend, LnEvent, Preimage},
     protocol::{
         common_messages::MakerToTakerMessage,
         lightning_messages::{
@@ -240,6 +240,50 @@ fn event_payment_hash(event: &LnEvent) -> Option<sha256::Hash> {
     }
 }
 
+/// What the maker can honestly offer in each direction right now.
+pub(super) struct LnCapacity {
+    /// Whether swap-ins are servable at all.
+    pub swap_in: bool,
+    /// Largest servable swap-in.
+    pub max_swap_in: u64,
+    /// Whether swap-outs are servable at all.
+    pub swap_out: bool,
+    /// Largest servable swap-out.
+    pub max_swap_out: u64,
+}
+
+/// Derives the two directional limits from live channel state.
+///
+/// The directions draw on opposite sides of the same channels, which is why
+/// one number cannot describe both: a swap-in has the maker paying over
+/// Lightning, so it is bounded by *outbound* capacity, while a swap-out has
+/// the maker receiving over Lightning and paying from the on-chain wallet,
+/// so it is bounded by *inbound* capacity and by `wallet_max`. Channels that
+/// are not usable contribute nothing either way.
+pub(super) fn directional_limits(
+    channels: &[ChannelInfo],
+    wallet_max: u64,
+    min_size: u64,
+) -> LnCapacity {
+    let (outbound_msat, inbound_msat) = channels.iter().filter(|channel| channel.is_usable).fold(
+        (0u64, 0u64),
+        |(outbound, inbound), channel| {
+            (
+                outbound.saturating_add(channel.outbound_capacity_msat),
+                inbound.saturating_add(channel.inbound_capacity_msat),
+            )
+        },
+    );
+    let max_swap_in = outbound_msat / 1000;
+    let max_swap_out = (inbound_msat / 1000).min(wallet_max);
+    LnCapacity {
+        swap_in: max_swap_in >= min_size,
+        max_swap_in,
+        swap_out: max_swap_out >= min_size,
+        max_swap_out,
+    }
+}
+
 /// Everything the Lightning handlers need from the maker; bails with a
 /// graceful reject when the maker has no backend configured.
 struct LnContext {
@@ -320,6 +364,7 @@ pub fn handle_lightning_message<M: Maker>(
 /// Terms validation shared by both directions. Returns the maker fee.
 fn validate_terms<M: Maker>(
     maker: &Arc<M>,
+    direction: LnDirection,
     amount: Amount,
     locktime: u16,
 ) -> Result<Amount, String> {
@@ -327,10 +372,18 @@ fn validate_terms<M: Maker>(
     let Some(offer) = config.lightning else {
         return Err("lightning swaps not offered".to_string());
     };
-    if amount.to_sat() < offer.min_size || amount.to_sat() > offer.max_size {
+    // Re-read against live capacity rather than whatever the taker saw when
+    // it fetched the offer, and against this direction's limit specifically.
+    let swap_in = direction == LnDirection::SwapIn;
+    let (served, max_size) = offer.direction_limits(swap_in);
+    let label = if swap_in { "swap-in" } else { "swap-out" };
+    if !served {
+        return Err(format!("maker is not currently serving {label} swaps"));
+    }
+    if amount.to_sat() < offer.min_size || amount.to_sat() > max_size {
         return Err(format!(
-            "amount {} outside offered range [{}, {}]",
-            amount, offer.min_size, offer.max_size
+            "amount {} outside the {label} range [{}, {}]",
+            amount, offer.min_size, max_size
         ));
     }
     if locktime < super::handlers::MIN_CONTRACT_REACTION_TIME {
@@ -362,7 +415,7 @@ fn handle_swap_in_request<M: Maker>(
     ctx: &LnContext,
     req: LnSwapInRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
-    let fee = match validate_terms(maker, req.amount, req.locktime) {
+    let fee = match validate_terms(maker, LnDirection::SwapIn, req.amount, req.locktime) {
         Ok(fee) => fee,
         Err(reason) => return Ok(reject(&req.swap_id, reason)),
     };
@@ -579,7 +632,7 @@ fn handle_swap_out_request<M: Maker>(
     ctx: &LnContext,
     req: LnSwapOutRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
-    let fee = match validate_terms(maker, req.amount, req.locktime) {
+    let fee = match validate_terms(maker, LnDirection::SwapOut, req.amount, req.locktime) {
         Ok(fee) => fee,
         Err(reason) => return Ok(reject(&req.swap_id, reason)),
     };
@@ -997,6 +1050,80 @@ mod tests {
             .create_timelock_spend(outpoint, value, &restored.privkey, ScriptBuf::new())
             .unwrap();
         assert_eq!(original, after_restart);
+    }
+
+    fn channel(outbound_sat: u64, inbound_sat: u64, is_usable: bool) -> ChannelInfo {
+        let (pubkey, _) = generate_keypair();
+        ChannelInfo {
+            channel_id: "aa".repeat(32),
+            user_channel_id: crate::lightning::ChannelId("chan".to_string()),
+            counterparty: pubkey.inner,
+            value: Amount::from_sat(outbound_sat + inbound_sat),
+            outbound_capacity_msat: outbound_sat * 1000,
+            inbound_capacity_msat: inbound_sat * 1000,
+            is_outbound: true,
+            confirmations: Some(6),
+            state: crate::lightning::ChannelState::Ready,
+            is_usable,
+        }
+    }
+
+    /// The two directions are bounded by *opposite* sides of the channels.
+    /// Sizing both from one number (as a single `max_size` did) advertises
+    /// swap-out capacity the maker does not have.
+    #[test]
+    fn directions_are_bounded_by_opposite_channel_sides() {
+        // Freshly opened channel: all outbound, no inbound.
+        let limits = directional_limits(&[channel(500_000, 0, true)], u64::MAX, 10_000);
+        assert!(limits.swap_in);
+        assert_eq!(limits.max_swap_in, 500_000);
+        assert!(!limits.swap_out, "no inbound capacity means no swap-outs");
+        assert_eq!(limits.max_swap_out, 0);
+
+        // Fully drained the other way: inbound only.
+        let limits = directional_limits(&[channel(0, 500_000, true)], u64::MAX, 10_000);
+        assert!(!limits.swap_in);
+        assert_eq!(limits.max_swap_in, 0);
+        assert!(limits.swap_out);
+        assert_eq!(limits.max_swap_out, 500_000);
+    }
+
+    /// A swap-out is paid from the on-chain wallet, so the wallet caps it —
+    /// while a swap-in, which pays over Lightning, is untouched by that.
+    #[test]
+    fn wallet_caps_only_the_swap_out_direction() {
+        let limits = directional_limits(&[channel(500_000, 500_000, true)], 80_000, 10_000);
+        assert_eq!(limits.max_swap_in, 500_000);
+        assert_eq!(limits.max_swap_out, 80_000);
+
+        // An unreadable wallet is reported as no on-chain capacity, which
+        // must disable swap-outs rather than advertise an unbacked one.
+        let limits = directional_limits(&[channel(500_000, 500_000, true)], 0, 10_000);
+        assert!(limits.swap_in);
+        assert!(!limits.swap_out);
+    }
+
+    /// Capacity sums over usable channels only, and a direction switches off
+    /// once it cannot cover the minimum swap.
+    #[test]
+    fn unusable_channels_and_dust_capacity_disable_a_direction() {
+        let channels = [
+            channel(300_000, 100_000, true),
+            channel(999_999, 999_999, false),
+            channel(200_000, 4_000, true),
+        ];
+        let limits = directional_limits(&channels, u64::MAX, 10_000);
+        assert_eq!(
+            limits.max_swap_in, 500_000,
+            "unusable channels contribute nothing"
+        );
+        assert_eq!(limits.max_swap_out, 104_000);
+        assert!(limits.swap_in && limits.swap_out);
+
+        // Below min_size the direction is withdrawn, not advertised small.
+        let limits = directional_limits(&[channel(300_000, 9_999, true)], u64::MAX, 10_000);
+        assert!(limits.swap_in);
+        assert!(!limits.swap_out);
     }
 
     /// A swap accepted but never funded has no outpoint yet; the record must
