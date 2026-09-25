@@ -357,6 +357,24 @@ impl LightningBackend for LdkServerBackend {
         Ok(())
     }
 
+    fn settled_preimage(
+        &self,
+        payment_hash: sha256::Hash,
+    ) -> Result<Option<Preimage>, LightningError> {
+        // ldk-node identifies a BOLT11 payment by its payment hash, so the
+        // hex hash doubles as the payment id.
+        let request = proto_api::GetPaymentDetailsRequest {
+            payment_id: payment_hash.to_string(),
+        };
+        match self.call(self.client.get_payment_details(request)) {
+            Ok(response) => Ok(extract_payment_fields(response.payment.as_ref()).preimage),
+            // A payment the node has never heard of is a valid answer here,
+            // not a failure: the caller is asking whether one exists.
+            Err(LightningError::Api { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn poll_event(&self) -> Result<Option<LnEvent>, LightningError> {
         match self.event_rx.try_recv() {
             Ok(event) => Ok(Some(event)),

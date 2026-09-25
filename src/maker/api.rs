@@ -740,6 +740,38 @@ impl MakerServer {
         // is gone and the server will start in recovery-only mode.
         let mut watches = wallet.incoming_contract_outpoints(None);
         watches.extend(wallet.outgoing_contract_outpoints(None));
+
+        // Lightning swaps that were in flight when this maker last stopped.
+        // Their HTLCs are re-watched alongside the coinswap contracts, and
+        // the restored states let the watchdog finish or refund them.
+        #[cfg(feature = "lightning")]
+        let restored_ln_swaps: HashMap<String, super::lightning_handlers::LnMakerSwap> = {
+            let restored: HashMap<_, _> = wallet
+                .store
+                .ln_maker_swaps
+                .clone()
+                .into_iter()
+                .map(|(swap_id, record)| {
+                    (
+                        swap_id,
+                        super::lightning_handlers::LnMakerSwap::from_record(record),
+                    )
+                })
+                .collect();
+            for swap in restored.values() {
+                if let (Some((outpoint, _)), Ok(spk)) = (swap.funding, swap.htlc.script_pubkey()) {
+                    watches.push((outpoint, spk));
+                }
+            }
+            if !restored.is_empty() {
+                log::info!(
+                    "[{}] Restored {} in-flight Lightning swap(s) from the wallet",
+                    config.network_port,
+                    restored.len()
+                );
+            }
+            restored
+        };
         if let Err(e) = watch_service.rebuild_watches(watches) {
             log::error!("could not initialize watches on startup: {e}; recovery-only mode");
         }
@@ -763,6 +795,22 @@ impl MakerServer {
         let ln_router = lightning
             .as_ref()
             .map(|ln| super::lightning_handlers::LnEventRouter::new(std::sync::Arc::clone(ln)));
+        #[cfg(feature = "lightning")]
+        match &ln_router {
+            // Re-open a mailbox per restored swap, or their settlement events
+            // would be dropped as belonging to an unknown payment.
+            Some(router) => {
+                for swap in restored_ln_swaps.values() {
+                    router.subscribe(swap.payment_hash);
+                }
+            }
+            None if !restored_ln_swaps.is_empty() => log::error!(
+                "{} Lightning swap(s) are in flight but no Lightning backend is configured; \
+                 their HTLCs cannot be resolved until one is",
+                restored_ln_swaps.len()
+            ),
+            None => {}
+        }
 
         Ok(MakerServer {
             config: config.clone(),
@@ -781,7 +829,7 @@ impl MakerServer {
             #[cfg(feature = "lightning")]
             ln_router,
             #[cfg(feature = "lightning")]
-            ln_swaps: Mutex::new(HashMap::new()),
+            ln_swaps: Mutex::new(restored_ln_swaps),
             #[cfg(feature = "integration-test")]
             behavior: MakerBehavior::default(),
             #[cfg(feature = "integration-test")]
@@ -1531,9 +1579,15 @@ impl MakerServer {
         &mut self,
         backend: std::sync::Arc<dyn crate::lightning::LightningBackend>,
     ) {
-        self.ln_router = Some(super::lightning_handlers::LnEventRouter::new(
-            std::sync::Arc::clone(&backend),
-        ));
+        let router = super::lightning_handlers::LnEventRouter::new(std::sync::Arc::clone(&backend));
+        // Mirror init: swaps restored before the backend existed still need
+        // their mailboxes, or their settlement events would be dropped.
+        if let Ok(swaps) = self.ln_swaps.lock() {
+            for swap in swaps.values() {
+                router.subscribe(swap.payment_hash);
+            }
+        }
+        self.ln_router = Some(router);
         self.lightning = Some(backend);
     }
 
@@ -2867,6 +2921,19 @@ impl MakerTrait for MakerServer {
         swap_id: &str,
         swap: super::lightning_handlers::LnMakerSwap,
     ) -> Result<(), MakerError> {
+        // Persist before the in-memory insert, and before the caller commits
+        // anything of value. Every store precedes an irreversible step —
+        // paying an invoice, funding an HTLC — so a crash in between must
+        // still leave a record that can reach the money.
+        {
+            let mut wallet = lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            wallet
+                .store
+                .ln_maker_swaps
+                .insert(swap_id.to_string(), swap.to_record());
+            wallet.save_to_disk().map_err(MakerError::Wallet)?;
+        }
         lock_debug!(self.ln_swaps.lock())
             .map_err(|_| MakerError::MutexPossion)?
             .insert(swap_id.to_string(), swap);
@@ -2889,6 +2956,13 @@ impl MakerTrait for MakerServer {
         lock_debug!(self.ln_swaps.lock())
             .map_err(|_| MakerError::MutexPossion)?
             .remove(swap_id);
+        // Dropped from disk only after the swap is resolved; an interrupted
+        // removal just leaves a record the next startup re-resolves.
+        let mut wallet = lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        if wallet.store.ln_maker_swaps.remove(swap_id).is_some() {
+            wallet.save_to_disk().map_err(MakerError::Wallet)?;
+        }
         Ok(())
     }
 

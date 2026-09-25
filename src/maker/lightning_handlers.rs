@@ -39,6 +39,7 @@ use crate::{
         },
     },
     utill::generate_keypair,
+    wallet::LnMakerSwapRecord,
 };
 
 use super::{
@@ -63,28 +64,10 @@ const SWAP_OUT_PAYMENT_DEADLINE: Duration = Duration::from_secs(3600);
 /// so inline waits and the watchdog never race for the same event.
 const WATCHDOG_MIN_IDLE: Duration = Duration::from_secs(300);
 
-/// Direction of a Lightning swap, from the taker's perspective.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LnDirection {
-    /// Taker pays on-chain, receives Lightning.
-    SwapIn,
-    /// Taker pays Lightning, receives on-chain.
-    SwapOut,
-}
-
-/// Progress of a maker-side Lightning swap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LnMakerPhase {
-    /// Swap-in accepted; awaiting the taker's HTLC funding announcement.
-    InAccepted,
-    /// Swap-in invoice paid; awaiting the settlement that reveals the
-    /// preimage (then sweep on-chain).
-    InPaid,
-    /// Swap-out accepted (hold invoice created); awaiting payment.
-    OutAccepted,
-    /// Swap-out HTLC funded on-chain; awaiting the taker's claim.
-    OutFunded,
-}
+/// Direction of a swap and how far it has progressed. Defined alongside the
+/// wallet's persisted record so the live state and the on-disk state cannot
+/// drift apart.
+pub use crate::wallet::{LnMakerDirection as LnDirection, LnMakerPhase};
 
 /// Maker-side state of one Lightning swap.
 #[derive(Debug, Clone)]
@@ -120,6 +103,51 @@ pub struct LnMakerSwap {
 impl LnMakerSwap {
     fn touch(&mut self) {
         self.updated_at = Instant::now();
+    }
+
+    /// The persistable form of this swap. Drops only `updated_at`, which is
+    /// a watchdog pacing hint rather than swap state.
+    pub(super) fn to_record(&self) -> LnMakerSwapRecord {
+        let (funding_outpoint, funding_value) = match self.funding {
+            Some((outpoint, value)) => (Some(outpoint), Some(value)),
+            None => (None, None),
+        };
+        LnMakerSwapRecord {
+            direction: self.direction,
+            phase: self.phase,
+            payment_hash: self.payment_hash,
+            amount: self.amount,
+            fee: self.fee,
+            locktime: self.locktime,
+            min_confirmations: self.min_confirmations,
+            redeemscript: self.htlc.redeemscript().clone(),
+            privkey: self.privkey,
+            invoice: self.invoice.clone(),
+            funding_outpoint,
+            funding_value,
+            funding_height: self.funding_height,
+        }
+    }
+
+    /// Rebuilds a swap from its persisted record after a restart. The
+    /// watchdog treats it as freshly touched, giving any reconnecting peer a
+    /// grace period before it resolves the swap unilaterally.
+    pub(super) fn from_record(record: LnMakerSwapRecord) -> Self {
+        Self {
+            direction: record.direction,
+            phase: record.phase,
+            payment_hash: record.payment_hash,
+            amount: record.amount,
+            fee: record.fee,
+            locktime: record.locktime,
+            min_confirmations: record.min_confirmations,
+            htlc: SwapHtlc::from_redeemscript(record.redeemscript, record.locktime),
+            privkey: record.privkey,
+            invoice: record.invoice,
+            funding: record.funding_outpoint.zip(record.funding_value),
+            funding_height: record.funding_height,
+            updated_at: Instant::now(),
+        }
     }
 }
 
@@ -824,7 +852,21 @@ fn watchdog_finish_swap_in(
             }
         }
     }
-    Ok(())
+    // No settlement event waiting. It may simply not have happened yet — or
+    // it may have been delivered while this maker was down, since event
+    // delivery is at-most-once. Ask the node directly, which is the only way
+    // a restarted swap-in maker can still reach the preimage it needs.
+    let preimage = ctx
+        .ln
+        .settled_preimage(swap.payment_hash)
+        .map_err(|e| MakerError::General(format!("preimage lookup: {e:?}").leak()))?;
+    match preimage {
+        Some(preimage) if preimage.payment_hash() == swap.payment_hash => {
+            log::info!("Swap-in {swap_id}: recovered preimage from the node's payment store");
+            sweep_swap_in(maker, ctx, swap_id, swap, &preimage)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn watchdog_resolve_swap_out(
@@ -893,5 +935,81 @@ fn watchdog_resolve_swap_out(
         Err(e) => Err(MakerError::General(
             format!("watch request failed: {e:?}").leak(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::ScriptBuf;
+
+    fn sample_swap(direction: LnDirection, phase: LnMakerPhase) -> LnMakerSwap {
+        let preimage = Preimage([0x33; 32]);
+        let (branch_pubkey, branch_privkey) = generate_keypair();
+        let (other_pubkey, _) = generate_keypair();
+        LnMakerSwap {
+            direction,
+            phase,
+            payment_hash: preimage.payment_hash(),
+            amount: Amount::from_sat(40_000),
+            fee: Amount::from_sat(501),
+            locktime: 60,
+            min_confirmations: 1,
+            htlc: SwapHtlc::new(&branch_pubkey, &other_pubkey, &preimage.payment_hash(), 60),
+            privkey: branch_privkey,
+            invoice: "lnbcrt-test".to_string(),
+            funding: Some((OutPoint::default(), Amount::from_sat(40_000))),
+            funding_height: Some(812_345),
+            updated_at: Instant::now(),
+        }
+    }
+
+    /// A restarted maker rebuilds its state from the encrypted wallet store,
+    /// so the record must survive a real CBOR round-trip and still produce a
+    /// byte-identical spend — that spend is the only way back to the money.
+    #[test]
+    fn persisted_record_survives_serialization_and_still_spends() {
+        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let bytes = serde_cbor::to_vec(&swap.to_record()).unwrap();
+        let restored = LnMakerSwap::from_record(serde_cbor::from_slice(&bytes).unwrap());
+
+        assert_eq!(restored.direction, swap.direction);
+        assert_eq!(restored.phase, swap.phase);
+        assert_eq!(restored.payment_hash, swap.payment_hash);
+        assert_eq!(restored.amount, swap.amount);
+        assert_eq!(restored.fee, swap.fee);
+        assert_eq!(restored.locktime, swap.locktime);
+        assert_eq!(restored.min_confirmations, swap.min_confirmations);
+        assert_eq!(restored.htlc, swap.htlc);
+        assert_eq!(restored.privkey, swap.privkey);
+        assert_eq!(restored.invoice, swap.invoice);
+        assert_eq!(restored.funding, swap.funding);
+        assert_eq!(restored.funding_height, swap.funding_height);
+
+        // The point of persisting at all: the refund still signs identically.
+        let (outpoint, value) = swap.funding.unwrap();
+        let original = swap
+            .htlc
+            .create_timelock_spend(outpoint, value, &swap.privkey, ScriptBuf::new())
+            .unwrap();
+        let after_restart = restored
+            .htlc
+            .create_timelock_spend(outpoint, value, &restored.privkey, ScriptBuf::new())
+            .unwrap();
+        assert_eq!(original, after_restart);
+    }
+
+    /// A swap accepted but never funded has no outpoint yet; the record must
+    /// round-trip that absence rather than inventing one.
+    #[test]
+    fn unfunded_record_round_trips_without_funding() {
+        let mut swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InAccepted);
+        swap.funding = None;
+        swap.funding_height = None;
+        let bytes = serde_cbor::to_vec(&swap.to_record()).unwrap();
+        let restored = LnMakerSwap::from_record(serde_cbor::from_slice(&bytes).unwrap());
+        assert!(restored.funding.is_none());
+        assert!(restored.funding_height.is_none());
+        assert_eq!(restored.htlc, swap.htlc);
     }
 }
