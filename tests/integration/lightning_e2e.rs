@@ -26,8 +26,9 @@ fn lightning_submarine_swaps_e2e() {
     log::warn!("Running Test: Lightning submarine swaps end-to-end");
 
     // Two mock Lightning nodes over one shared ledger: node 0 = maker's,
-    // node 1 = taker's. The maker needs outbound liquidity to pay swap-in
-    // invoices, so give it a funded, ready channel towards the taker.
+    // node 1 = taker's. The maker serves both directions, so its channel
+    // needs outbound capacity (to pay swap-in invoices) and inbound capacity
+    // (to receive swap-out payments) — different sides of the same channel.
     let (maker_ln, taker_ln) = MockLightningBackend::new_pair();
     maker_ln.set_onchain_balance(Amount::from_btc(0.02).unwrap());
     let channel = maker_ln
@@ -35,7 +36,10 @@ fn lightning_submarine_swaps_e2e() {
             node_pubkey: taker_ln.node_info().unwrap().node_id,
             address: "127.0.0.1:9736".to_string(),
             channel_amount: Amount::from_sat(1_000_000),
-            push_to_counterparty_msat: None,
+            // Push half to the peer so the channel has inbound capacity too:
+            // swap-outs are bounded by inbound, and a freshly opened channel
+            // has none.
+            push_to_counterparty_msat: Some(500_000_000),
             announce_channel: false,
         })
         .unwrap();

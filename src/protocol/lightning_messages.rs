@@ -28,10 +28,28 @@ pub struct LightningOffer {
     pub base_fee: u64,
     /// Percentage fee relative to the swap amount.
     pub amount_relative_fee_pct: f64,
-    /// Minimum swap amount in satoshis.
+    /// Minimum swap amount in satoshis, for either direction.
     pub min_size: u64,
-    /// Maximum swap amount in satoshis.
-    pub max_size: u64,
+    /// Largest swap-in in satoshis. The maker pays this over Lightning, so
+    /// it is bounded by its outbound channel capacity.
+    pub max_swap_in: u64,
+    /// Largest swap-out in satoshis. The maker receives this over Lightning
+    /// and pays it out on-chain, so it is bounded by its inbound channel
+    /// capacity *and* its on-chain wallet — a different resource entirely
+    /// from the swap-in limit.
+    pub max_swap_out: u64,
+}
+
+impl LightningOffer {
+    /// The advertised limits for one direction: whether it is served at all,
+    /// and the largest amount it will take.
+    pub fn direction_limits(&self, swap_in: bool) -> (bool, u64) {
+        if swap_in {
+            (self.swap_in, self.max_swap_in)
+        } else {
+            (self.swap_out, self.max_swap_out)
+        }
+    }
 }
 
 /// Taker -> Maker: propose a swap-in (on-chain BTC -> Lightning).
@@ -306,7 +324,8 @@ mod tests {
                 base_fee: 100,
                 amount_relative_fee_pct: 0.1,
                 min_size: 10_000,
-                max_size: 1_000_000,
+                max_swap_in: 1_000_000,
+                max_swap_out: 0,
             }),
         })
         .unwrap();
