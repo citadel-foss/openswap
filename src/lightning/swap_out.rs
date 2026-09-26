@@ -205,9 +205,11 @@ impl SwapOutTaker {
             .invoice
             .as_ref()
             .ok_or(SwapError::NotReady("pay_invoice before on_accept"))?;
-        Ok(self
-            .ln
-            .pay_invoice(invoice, None, Some(self.params.locktime as u32))?)
+        // Leave the maker room to settle after the preimage appears
+        // on-chain, rather than letting the route run to the refund itself.
+        let cltv_bound =
+            (self.params.locktime as u32).saturating_sub(super::swap::ROUTE_CLTV_MARGIN);
+        Ok(self.ln.pay_invoice(invoice, None, Some(cltv_bound))?)
     }
 
     /// Verifies the maker's funding: the output pays the recreated HTLC

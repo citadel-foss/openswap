@@ -435,7 +435,15 @@ impl LightningBackend for MockLightningBackend {
             )));
         }
         let amount_msat = match (entry.amount_msat, amount_msat) {
-            (Some(fixed), _) => fixed,
+            // The trait requires `amount_msat` to be None for a fixed-amount
+            // invoice; accepting one anyway would let broken caller code
+            // pass mock-backed tests and fail against a real node.
+            (Some(_), Some(_)) => {
+                return Err(LightningError::InvalidInvoice(
+                    "amount must not be supplied for a fixed-amount invoice".to_string(),
+                ))
+            }
+            (Some(fixed), None) => fixed,
             (None, Some(amount)) => amount,
             (None, None) => {
                 return Err(LightningError::InvalidInvoice(

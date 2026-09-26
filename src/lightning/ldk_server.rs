@@ -48,6 +48,16 @@ use super::{
 /// Delay between reconnection attempts of the event subscription stream.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
+/// Events buffered between the subscription task and [`poll_event`]. The
+/// sidecar sets the production rate, so this is bounded: an unbounded queue
+/// lets a faulty or hostile sidecar grow it until the process dies. Delivery
+/// is already documented as at-most-once, and consumers resynchronize with
+/// the query methods, so dropping past the bound is survivable where
+/// exhausting memory is not.
+///
+/// [`poll_event`]: LightningBackend::poll_event
+const EVENT_QUEUE_CAPACITY: usize = 4096;
+
 /// LDK's default maximum number of MPP paths, restated because supplying
 /// route parameters overrides every field rather than merging with defaults.
 const DEFAULT_MAX_PATH_COUNT: u32 = 10;
@@ -104,7 +114,7 @@ impl LdkServerBackend {
             .build()
             .map_err(|e| LightningError::Runtime(e.to_string()))?;
 
-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::bounded(EVENT_QUEUE_CAPACITY);
         let shutdown = Arc::new(AtomicBool::new(false));
         runtime.spawn(event_loop(client.clone(), event_tx, Arc::clone(&shutdown)));
 
@@ -159,9 +169,19 @@ async fn event_loop(client: LdkServerClient, tx: Sender<LnEvent>, shutdown: Arc<
                     }
                     match stream.next_message().await {
                         Some(Ok(envelope)) => {
-                            if tx.send(convert_event(envelope)).is_err() {
+                            // Never block the sole worker on a full queue:
+                            // that would stall the whole runtime, including
+                            // the unary calls swaps depend on.
+                            match tx.try_send(convert_event(envelope)) {
+                                Ok(()) => {}
+                                Err(crossbeam_channel::TrySendError::Full(dropped)) => {
+                                    log::warn!(
+                                        "lightning: event queue full, dropped {dropped:?}; \
+                                         swap state must be resynchronized by query"
+                                    );
+                                }
                                 // Receiver dropped: backend is gone.
-                                return;
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => return,
                             }
                         }
                         Some(Err(e)) => {
@@ -460,10 +480,27 @@ fn extract_payment_fields(payment: Option<&proto_types::Payment>) -> PaymentFiel
         ),
         _ => (None, None),
     };
+    // A malformed hash or preimage is dropped rather than guessed at, but it
+    // means the backend sent something it should not have — log it instead
+    // of letting it look like an ordinary absent field.
+    let payment_hash = hash_hex.and_then(|h| match parse_payment_hash(h) {
+        Ok(hash) => Some(hash),
+        Err(e) => {
+            log::warn!("lightning: backend sent an unparseable payment hash: {e}");
+            None
+        }
+    });
+    let preimage = preimage_hex.and_then(|p| match parse_preimage(p) {
+        Ok(preimage) => Some(preimage),
+        Err(e) => {
+            log::warn!("lightning: backend sent an unparseable preimage: {e}");
+            None
+        }
+    });
     PaymentFields {
         payment_id: PaymentId(payment.id.clone()),
-        payment_hash: hash_hex.and_then(|h| parse_payment_hash(h).ok()),
-        preimage: preimage_hex.and_then(|p| parse_preimage(p).ok()),
+        payment_hash,
+        preimage,
         amount_msat: payment.amount_msat,
         fee_paid_msat: payment.fee_paid_msat,
     }

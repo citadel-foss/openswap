@@ -73,6 +73,13 @@ const ROUTED_HOP_TIMELOCK_MARGIN: u16 = 48;
 /// assuming it accepted and is working on the payment.
 const EARLY_REJECT_WINDOW: Duration = Duration::from_secs(5);
 
+/// Hard ceiling on a maker's fee, as a percentage of the swap amount.
+///
+/// `advertised_fee` alone is no protection: its inputs come from the
+/// maker's own offer, so the maker sets both the ceiling and the charge.
+/// This is the bound the taker applies regardless of what was advertised.
+const MAX_FEE_PERCENT: u64 = 5;
+
 /// Parameters of a Lightning submarine swap.
 #[derive(Debug, Clone)]
 pub struct LnSwapParams {
@@ -192,10 +199,45 @@ pub(crate) fn init_lightning_backend(
 
 /// The maker's advertised fee for this amount; the accepted fee must not
 /// exceed it. Must mirror the maker's own formula.
+///
+/// The percentage is peer-supplied, so the arithmetic is done in a way that
+/// cannot produce a negative, NaN, or wrapped result: a nonsensical offer
+/// yields a fee the caller will reject rather than a panic.
 fn advertised_fee(offer: &LightningOffer, amount: Amount) -> Amount {
-    let fee =
-        offer.base_fee as f64 + amount.to_sat() as f64 * offer.amount_relative_fee_pct / 100.0;
-    Amount::from_sat(fee.ceil() as u64)
+    let pct = if offer.amount_relative_fee_pct.is_finite() {
+        offer.amount_relative_fee_pct.max(0.0)
+    } else {
+        f64::INFINITY
+    };
+    let relative = amount.to_sat() as f64 * pct / 100.0;
+    let total = offer.base_fee as f64 + relative;
+    if !total.is_finite() || total < 0.0 || total > u64::MAX as f64 {
+        return Amount::MAX_MONEY;
+    }
+    Amount::from_sat(total.ceil() as u64)
+}
+
+/// The most this taker will pay a maker for a swap of `amount`, whatever
+/// the offer says.
+fn max_acceptable_fee(amount: Amount) -> Amount {
+    Amount::from_sat(amount.to_sat().saturating_mul(MAX_FEE_PERCENT) / 100)
+}
+
+/// Rejects a quoted fee that exceeds either the maker's own advertised
+/// terms or this taker's hard ceiling.
+fn check_fee(quoted: Amount, advertised: Amount, amount: Amount) -> Result<(), TakerError> {
+    if quoted > advertised {
+        return Err(general(format!(
+            "maker fee {quoted} exceeds its advertised {advertised}"
+        )));
+    }
+    let ceiling = max_acceptable_fee(amount);
+    if quoted > ceiling {
+        return Err(general(format!(
+            "maker fee {quoted} exceeds {MAX_FEE_PERCENT}% of the swap amount ({ceiling})"
+        )));
+    }
+    Ok(())
 }
 
 fn general(msg: impl Into<String>) -> TakerError {
@@ -555,12 +597,7 @@ impl Taker {
         {
             return Err(general("maker echoed different terms"));
         }
-        if accept.fee > expected_fee {
-            return Err(general(format!(
-                "maker fee {} exceeds advertised {}",
-                accept.fee, expected_fee
-            )));
-        }
+        check_fee(accept.fee, expected_fee, params.amount)?;
 
         let htlc = SwapHtlc::new(
             &accept.maker_hashlock_pubkey,
@@ -657,12 +694,7 @@ impl Taker {
         {
             return Err(general("maker echoed different terms"));
         }
-        if accept.fee > expected_fee {
-            return Err(general(format!(
-                "maker fee {} exceeds advertised {}",
-                accept.fee, expected_fee
-            )));
-        }
+        check_fee(accept.fee, expected_fee, params.amount)?;
         // Never pay an invoice we did not verify: it must commit to OUR
         // payment hash and the agreed amount, or the maker could settle
         // instantly without funding anything.
@@ -843,12 +875,7 @@ impl Taker {
         {
             return Err(general("second maker echoed different terms"));
         }
-        if accept2.fee > expected_fee2 {
-            return Err(general(format!(
-                "second maker fee {} exceeds advertised {}",
-                accept2.fee, expected_fee2
-            )));
-        }
+        check_fee(accept2.fee, expected_fee2, params.amount)?;
 
         // What maker 1 must forward over Lightning: our payout plus maker 2's
         // fee. Verified against the invoice we are about to hand over, since
@@ -901,12 +928,7 @@ impl Taker {
         {
             return Err(general("first maker echoed different terms"));
         }
-        if accept1.fee > expected_fee1 {
-            return Err(general(format!(
-                "first maker fee {} exceeds advertised {}",
-                accept1.fee, expected_fee1
-            )));
-        }
+        check_fee(accept1.fee, expected_fee1, middle_amount)?;
 
         let htlc1 = SwapHtlc::new(
             &accept1.maker_hashlock_pubkey,

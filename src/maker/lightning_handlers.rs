@@ -617,10 +617,10 @@ fn handle_swap_in_funded<M: Maker>(
         ));
     }
 
-    let htlc_spk = swap
-        .htlc
-        .script_pubkey()
-        .map_err(|e| MakerError::General(format!("htlc spk: {e}").leak()))?;
+    let htlc_spk = swap.htlc.script_pubkey().map_err(|e| {
+        log::warn!("lightning: htlc script build failed: {e}");
+        MakerError::General("htlc script build failed")
+    })?;
     maker.register_watch_outpoint(funded.outpoint, htlc_spk.clone())?;
 
     swap.funding = Some((funded.outpoint, output.value));
@@ -640,7 +640,10 @@ fn handle_swap_in_funded<M: Maker>(
     let cltv_bound = remaining.saturating_sub(CLTV_SAFETY_MARGIN as u32);
     ctx.ln
         .pay_invoice(&swap.invoice, None, Some(cltv_bound))
-        .map_err(|e| MakerError::General(format!("pay_invoice: {e:?}").leak()))?;
+        .map_err(|e| {
+            log::warn!("lightning: pay_invoice failed: {e:?}");
+            MakerError::General("pay_invoice failed")
+        })?;
     log::info!(
         "[{}] Swap-in {}: invoice paid, awaiting settlement",
         maker.network_port(),
@@ -678,9 +681,8 @@ fn wait_for_preimage<M: Maker>(
                     return Ok(preimage);
                 }
                 LnEvent::PaymentFailed { payment_id, .. } => {
-                    return Err(MakerError::General(
-                        format!("lightning payment {payment_id} failed").leak(),
-                    ));
+                    log::warn!("lightning payment {payment_id} failed");
+                    return Err(MakerError::General("lightning payment failed"));
                 }
                 other => log::debug!("ignoring event while waiting for settlement: {other:?}"),
             }
@@ -709,7 +711,10 @@ fn sweep_swap_in<M: Maker>(
     let claim_tx = swap
         .htlc
         .create_hashlock_spend(outpoint, value, &swap.privkey, preimage, destination)
-        .map_err(|e| MakerError::General(format!("claim build: {e}").leak()))?;
+        .map_err(|e| {
+            log::warn!("lightning: claim build failed: {e}");
+            MakerError::General("claim build failed")
+        })?;
     let claim_txid = maker.broadcast_transaction(&claim_tx)?;
     log::info!(
         "[{}] Swap-in {} settled; on-chain sweep broadcast: {}",
@@ -885,10 +890,10 @@ fn handle_swap_out_paid<M: Maker>(
 
     // Fund the HTLC from the wallet with exactly `amount` (the fee is
     // collected on the Lightning side).
-    let address = swap
-        .htlc
-        .address(maker.network())
-        .map_err(|e| MakerError::General(format!("htlc address: {e}").leak()))?;
+    let address = swap.htlc.address(maker.network()).map_err(|e| {
+        log::warn!("lightning: htlc address build failed: {e}");
+        MakerError::General("htlc address build failed")
+    })?;
     let (funding_tx, vout) = maker.fund_htlc(swap_id, swap.amount, address)?;
     let output = funding_tx
         .output
@@ -909,10 +914,10 @@ fn handle_swap_out_paid<M: Maker>(
     swap.touch();
     store_swap(maker, swap_id, swap.clone())?;
 
-    let htlc_spk = swap
-        .htlc
-        .script_pubkey()
-        .map_err(|e| MakerError::General(format!("htlc spk: {e}").leak()))?;
+    let htlc_spk = swap.htlc.script_pubkey().map_err(|e| {
+        log::warn!("lightning: htlc script build failed: {e}");
+        MakerError::General("htlc script build failed")
+    })?;
     maker.register_watch_outpoint(outpoint, htlc_spk)?;
     maker.broadcast_transaction(&funding_tx)?;
     let _ = maker.sync_and_save_wallet();
@@ -969,9 +974,10 @@ fn settle_swap_out_from_spend<M: Maker>(
     if preimage.payment_hash() != swap.payment_hash {
         return Err(MakerError::General("revealed preimage does not match"));
     }
-    ctx.ln
-        .claim_held_payment(&preimage)
-        .map_err(|e| MakerError::General(format!("claim held payment: {e:?}").leak()))?;
+    ctx.ln.claim_held_payment(&preimage).map_err(|e| {
+        log::warn!("lightning: claim_held_payment failed: {e:?}");
+        MakerError::General("claim held payment failed")
+    })?;
     log::info!(
         "[{}] Swap-out {} settled from on-chain preimage",
         maker.network_port(),
@@ -1135,7 +1141,10 @@ fn watchdog_resolve_swap_out(
             let refund_tx = swap
                 .htlc
                 .create_timelock_spend(outpoint, value, &swap.privkey, destination)
-                .map_err(|e| MakerError::General(format!("refund build: {e}").leak()))?;
+                .map_err(|e| {
+                    log::warn!("lightning: refund build failed: {e}");
+                    MakerError::General("refund build failed")
+                })?;
             match maker.broadcast_transaction(&refund_tx) {
                 Ok(txid) => {
                     log::info!("Swap-out {swap_id} refunded via timelock: {txid}");

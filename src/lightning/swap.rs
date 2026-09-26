@@ -63,6 +63,12 @@ const SPEND_TX_VSIZE: u64 = 150;
 /// [`SPEND_TX_VSIZE`]; a production path would estimate it.
 const SPEND_FEE_RATE: f64 = 2.0;
 
+/// Blocks kept between the latest a Lightning payment may resolve and the
+/// moment the counterparty's refund matures. The payer only learns the
+/// preimage on settlement, so a route allowed to run to the very edge of
+/// the refund window leaves no time to spend against it.
+pub const ROUTE_CLTV_MARGIN: u32 = 12;
+
 /// Errors produced by the swap-in protocol.
 #[derive(Debug)]
 pub enum SwapError {
@@ -585,9 +591,12 @@ impl SwapInMaker {
             .request
             .as_ref()
             .ok_or(SwapError::NotReady("pay_invoice before accept"))?;
-        // Bound the route so the settlement that reveals the preimage
-        // cannot land after our on-chain claim window closes.
-        let cltv_bound = request.params.locktime as u32;
+        // Bound the route so the settlement that reveals the preimage lands
+        // with time to spare before our on-chain claim window closes. The
+        // integrated maker additionally subtracts blocks already elapsed
+        // since funding confirmed; this POC pays immediately after funding,
+        // so the margin alone is the difference.
+        let cltv_bound = (request.params.locktime as u32).saturating_sub(ROUTE_CLTV_MARGIN);
         Ok(self
             .ln
             .pay_invoice(&request.invoice, None, Some(cltv_bound))?)
