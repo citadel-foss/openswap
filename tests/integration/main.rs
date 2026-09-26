@@ -23,6 +23,7 @@ mod fidelity_timelock_violation;
 mod maker_cli;
 mod malice1;
 mod malice2;
+mod malice3;
 mod mixed_protocol_concurrent_swaps;
 mod multi_confirm_swap;
 mod multi_taker;

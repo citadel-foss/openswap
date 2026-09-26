@@ -24,6 +24,11 @@ pub enum MakerSwapPhase {
     #[default]
     Active,
     TakerDropped,
+    /// The counterparty broadcast the incoming contract tx before the swap
+    /// finished, spending the funding outpoint we watch for it. Distinct
+    /// from `TakerDropped`: the connection did not drop, the taker forced
+    /// the contract on-chain while still talking to us.
+    Breached,
     Recovering,
     Recovered,
     Completed,
@@ -34,6 +39,7 @@ impl fmt::Display for MakerSwapPhase {
         match self {
             MakerSwapPhase::Active => write!(f, "Active"),
             MakerSwapPhase::TakerDropped => write!(f, "TakerDropped"),
+            MakerSwapPhase::Breached => write!(f, "Breached"),
             MakerSwapPhase::Recovering => write!(f, "Recovering"),
             MakerSwapPhase::Recovered => write!(f, "Recovered"),
             MakerSwapPhase::Completed => write!(f, "Completed"),

@@ -370,6 +370,19 @@ fn process_proof_of_funding<M: Maker>(
                 txout.script_pubkey.clone(),
             )?;
         }
+
+        // Also watch the funding outpoint itself. The output watch above only
+        // fires once the contract's own output is later spent (hashlock claim
+        // or refund); it never fires on the contract broadcast itself. A spend
+        // of the funding outpoint by this exact contract txid is the taker
+        // forcing the contract on-chain early — see `legacy_swap_breached`.
+        if let (Some(funding_input), Some(multisig_redeemscript)) = (
+            incoming.contract_tx.input.first(),
+            incoming.multisig_redeemscript.as_ref(),
+        ) {
+            let funding_spk = redeemscript_to_scriptpubkey(multisig_redeemscript)?;
+            maker.register_watch_outpoint(funding_input.previous_output, funding_spk)?;
+        }
     }
 
     log::info!(
@@ -562,6 +575,21 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     state.expect_phase(&[SwapPhase::AwaitingSignaturesOrPreimage])?;
     state.check_swap_id(&resp.id)?;
+
+    // The taker may have already forced the incoming contract on-chain while
+    // this response was in flight. Broadcasting our own outgoing funding on
+    // top of that would commit funds we cannot get back through the normal
+    // swap path — abort into recovery instead.
+    if maker.legacy_swap_breached(&resp.id)? {
+        log::error!(
+            "[{}] Aborting swap {} before funding broadcast: incoming funding was breached",
+            maker.network_port(),
+            resp.id
+        );
+        return Err(MakerError::General(
+            "Legacy swap breached before funding broadcast",
+        ));
+    }
 
     #[cfg(feature = "integration-test")]
     {
@@ -816,6 +844,20 @@ fn process_req_contract_sigs_for_recvr<M: Maker>(
     state.expect_phase(&[SwapPhase::AwaitingPrivateKeyHandover])?;
     state.check_swap_id(&req.id)?;
 
+    // Signing here commits our outgoing side further; a breach means the
+    // taker already forced the incoming contract on-chain, so stop and let
+    // recovery run instead of continuing to cooperate.
+    if maker.legacy_swap_breached(&req.id)? {
+        log::error!(
+            "[{}] Aborting swap {} before signing receiver contracts: incoming funding was breached",
+            maker.network_port(),
+            req.id
+        );
+        return Err(MakerError::General(
+            "Legacy swap breached before receiver contract signing",
+        ));
+    }
+
     #[cfg(feature = "integration-test")]
     {
         use super::handlers::MakerBehavior;
@@ -927,6 +969,20 @@ fn process_legacy_handover<M: Maker>(
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     state.expect_phase(&[SwapPhase::AwaitingPrivateKeyHandover])?;
     state.check_swap_id(&handover.id)?;
+
+    // The actual loss scenario: handing over our outgoing privkey after the
+    // incoming contract is already on-chain lets the breach be turned into a
+    // theft immediately, with no recourse. Refuse and let recovery run.
+    if maker.legacy_swap_breached(&handover.id)? {
+        log::error!(
+            "[{}] Aborting swap {} before private key handover: incoming funding was breached",
+            maker.network_port(),
+            handover.id
+        );
+        return Err(MakerError::General(
+            "Legacy swap breached before private key handover",
+        ));
+    }
 
     #[cfg(feature = "integration-test")]
     {

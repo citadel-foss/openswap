@@ -1222,6 +1222,153 @@ impl MakerServer {
         Ok(idle)
     }
 
+    /// True if any funding outpoint in `incoming` has been spent by its own
+    /// contract txid. Sentinels are polled through the watch service's own
+    /// cache (armed by `process_proof_of_funding`), so this never makes a
+    /// fresh backend call — the watcher thread has to have already ingested
+    /// the spend for this to see it. Used only by `drain_breached_swaps`'s
+    /// background loop, which gets another try next heartbeat regardless; a
+    /// watcher error is returned to the caller rather than read as "not
+    /// breached", so a failing watcher does not look identical to "clean".
+    ///
+    /// The synchronous gates in `legacy_swap_breached` must not use this: a
+    /// broadcast the watcher has not caught up to yet would read as no
+    /// breach right before we hand over a private key. They use
+    /// `legacy_incoming_funding_breached_fresh` instead.
+    fn legacy_incoming_funding_breached(
+        &self,
+        incoming: &[IncomingSwapCoin],
+    ) -> Result<bool, MakerError> {
+        for sc in incoming {
+            let Some(funding_input) = sc.contract_tx.input.first() else {
+                continue;
+            };
+            let expected_txid = sc.contract_tx.compute_txid();
+            match self
+                .watch_service
+                .watch_request(funding_input.previous_output)
+            {
+                Ok(crate::watch_tower::watcher::WatcherEvent::UtxoSpent {
+                    spending_tx: Some(tx),
+                    ..
+                }) if tx.compute_txid() == expected_txid => return Ok(true),
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(MakerError::General(
+                        format!(
+                            "breach watch query for {} failed: {e}",
+                            funding_input.previous_output
+                        )
+                        .leak(),
+                    ));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Fresh, un-cached counterpart to `legacy_incoming_funding_breached` for
+    /// the synchronous gates. Queries the backend directly for each funding
+    /// outpoint instead of the watcher's own registry, so a broadcast that
+    /// just landed — before the watcher thread has processed it — still
+    /// shows up here. A backend error is returned rather than read as "not
+    /// breached": the caller must fail closed, not release a private key on
+    /// an inconclusive check.
+    fn legacy_incoming_funding_breached_fresh(
+        &self,
+        incoming: &[IncomingSwapCoin],
+    ) -> Result<bool, MakerError> {
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        for sc in incoming {
+            let Some(funding_input) = sc.contract_tx.input.first() else {
+                continue;
+            };
+            let Some(multisig_redeemscript) = sc.multisig_redeemscript.as_ref() else {
+                continue;
+            };
+            let funding_spk = crate::utill::redeemscript_to_scriptpubkey(multisig_redeemscript)?;
+            let expected_txid = sc.contract_tx.compute_txid();
+            match wallet.blockchain.spending_transaction(
+                &funding_input.previous_output,
+                funding_spk.as_script(),
+                Some(&expected_txid),
+            ) {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) => {}
+                Err(e) => return Err(MakerError::Wallet(e)),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Removes and returns swap data for any Legacy swap whose incoming
+    /// funding outpoint has been spent by its own expected contract txid —
+    /// the counterparty forcing the contract on-chain before the swap
+    /// finished. Runs independently of the idle timeout, so `check_for_idle_states`
+    /// starts recovery within one heartbeat instead of waiting out
+    /// `IDLE_CONNECTION_TIMEOUT`.
+    pub fn drain_breached_swaps(&self) -> Result<Vec<IdleSwapData>, MakerError> {
+        // Snapshot candidates before any watcher round trip: the watcher lives
+        // behind its own channel, and holding `ongoing_swaps` across that call
+        // would stall every handler touching an unrelated swap.
+        let candidates: Vec<(String, Vec<IncomingSwapCoin>)> = {
+            let swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            swaps
+                .iter()
+                .filter(|(_, state)| {
+                    state.phase != SwapPhase::Completed && !state.incoming_swapcoins.is_empty()
+                })
+                .map(|(id, state)| (id.clone(), state.incoming_swapcoins.clone()))
+                .collect()
+        };
+
+        let mut breached_ids = Vec::new();
+        for (id, incoming) in &candidates {
+            match self.legacy_incoming_funding_breached(incoming) {
+                Ok(true) => {
+                    log::error!(
+                        "[{}] Swap {} breached: incoming funding outpoint spent by its own contract tx before the swap finished. Recovering now.",
+                        self.config.network_port,
+                        id
+                    );
+                    breached_ids.push(id.clone());
+                }
+                Ok(false) => {}
+                // A watcher hiccup on one swap must not stall the drain for
+                // every other swap; this candidate just gets another try on
+                // the next heartbeat.
+                Err(e) => log::error!(
+                    "[{}] breach scan for swap {} failed, will retry next heartbeat: {e:?}",
+                    self.config.network_port,
+                    id
+                ),
+            }
+        }
+
+        if breached_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut swaps =
+            lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        let mut breached = Vec::with_capacity(breached_ids.len());
+        for id in breached_ids {
+            if let Some(state) = swaps.remove(&id) {
+                breached.push(IdleSwapData {
+                    swap_id: id,
+                    protocol: state.negotiated.protocol,
+                    swap_amount_sat: state.negotiated.swap_amount.to_sat(),
+                    incoming_swapcoins: state.incoming_swapcoins,
+                    outgoing_swapcoins: state.outgoing_swapcoins,
+                    funding_broadcast_txids: state.funding_broadcast_txids,
+                });
+            }
+        }
+        Ok(breached)
+    }
+
     /// Remove a completed swap's entry from `ongoing_swaps`.
     pub fn remove_swap_state(&self, swap_id: &str) -> Result<(), MakerError> {
         lock_debug!(self.ongoing_swaps.lock())
@@ -1865,6 +2012,23 @@ impl MakerTrait for MakerServer {
         if let Err(e) = self.watch_service.unwatch(outpoint, script_pubkey) {
             log::error!("unwatch for {outpoint} failed (watcher gone): {e}");
         }
+    }
+
+    fn legacy_swap_breached(&self, swap_id: &str) -> Result<bool, MakerError> {
+        let incoming = {
+            let swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            match swaps.get(swap_id) {
+                Some(state) => state.incoming_swapcoins.clone(),
+                // Reachable if `drain_breached_swaps` already pulled this
+                // swap out from under a concurrent handler: it raced us
+                // because it found a breach, so an absent entry here must
+                // not read as "clean" — that would hand over the private
+                // key for a swap already flagged and headed to recovery.
+                None => return Err(MakerError::General("No tracked swap state")),
+            }
+        };
+        self.legacy_incoming_funding_breached_fresh(&incoming)
     }
 
     fn sync_and_save_wallet(&self) -> Result<(), MakerError> {
