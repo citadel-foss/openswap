@@ -48,6 +48,18 @@ mod watchtower_liveness;
 mod concurrent_takers;
 mod legacy_hashlock_recovery;
 mod legacy_reboot_recovery;
+#[cfg(feature = "lightning")]
+mod lightning_e2e;
+#[cfg(feature = "lightning")]
+mod lightning_maker_restart;
+#[cfg(feature = "lightning")]
+mod lightning_offer_limits;
+#[cfg(feature = "lightning")]
+mod lightning_routed;
+#[cfg(feature = "lightning")]
+mod lightning_swap_in;
+#[cfg(feature = "lightning")]
+mod lightning_swap_out;
 mod offerbook_restart;
 mod offerbook_sync_race;
 mod rejection;

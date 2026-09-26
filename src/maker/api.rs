@@ -223,6 +223,14 @@ pub struct MakerServerConfig {
     pub password: Option<String>,
     /// Nostr relay URLs for fidelity bond broadcasting.
     pub nostr_relays: Vec<String>,
+    /// LDK Server gRPC address (`host:port`, no scheme) for the Lightning
+    /// backend. Lightning swaps are offered only when this is set (and the
+    /// binary is built with the `lightning` feature).
+    pub ldk_server_url: Option<String>,
+    /// Path to the LDK Server API key file (raw bytes, hex-encoded on load).
+    pub ldk_api_key_path: Option<String>,
+    /// Path to the LDK Server TLS certificate.
+    pub ldk_tls_cert_path: Option<String>,
 }
 
 impl Default for MakerServerConfig {
@@ -251,6 +259,9 @@ impl Default for MakerServerConfig {
             tor_auth_password: String::new(),
             password: None,
             nostr_relays: NOSTR_RELAYS.iter().map(|s| s.to_string()).collect(),
+            ldk_server_url: None,
+            ldk_api_key_path: None,
+            ldk_tls_cert_path: None,
         }
     }
 }
@@ -360,6 +371,9 @@ impl MakerServerConfig {
                 config_map.get("tor_auth_password"),
                 default_config.tor_auth_password,
             ),
+            ldk_server_url: config_map.get("ldk_server_url").cloned(),
+            ldk_api_key_path: config_map.get("ldk_api_key_path").cloned(),
+            ldk_tls_cert_path: config_map.get("ldk_tls_cert_path").cloned(),
             // Runtime fields — not read from config file
             data_dir: default_config.data_dir,
             network: default_config.network,
@@ -431,6 +445,25 @@ check_blocklist = {}
             self.required_confirms,
             self.check_blocklist,
         );
+
+        // Optional Lightning backend keys: only present when configured, so
+        // the round-trip rewrite makerd performs on startup preserves them.
+        let mut toml_data = toml_data;
+        if let Some(url) = &self.ldk_server_url {
+            toml_data.push_str(&format!(
+                "# LDK Server gRPC address (host:port, no scheme) for Lightning swaps\nldk_server_url = {url}\n"
+            ));
+        }
+        if let Some(path) = &self.ldk_api_key_path {
+            toml_data.push_str(&format!(
+                "# Path to the LDK Server API key file\nldk_api_key_path = {path}\n"
+            ));
+        }
+        if let Some(path) = &self.ldk_tls_cert_path {
+            toml_data.push_str(&format!(
+                "# Path to the LDK Server TLS certificate\nldk_tls_cert_path = {path}\n"
+            ));
+        }
 
         std::fs::create_dir_all(path.parent().ok_or_else(|| {
             std::io::Error::new(
@@ -613,6 +646,16 @@ pub struct MakerServer {
     pub swap_tracker: Mutex<MakerSwapTracker>,
     /// Nostr relay URLs for fidelity bond broadcasting.
     pub nostr_relays: Vec<String>,
+    /// Lightning backend, present when configured. All Lightning swap
+    /// handling is disabled when this is `None`.
+    #[cfg(feature = "lightning")]
+    pub lightning: Option<std::sync::Arc<dyn crate::lightning::LightningBackend>>,
+    /// Router distributing Lightning node events to per-swap mailboxes.
+    #[cfg(feature = "lightning")]
+    pub ln_router: Option<std::sync::Arc<super::lightning_handlers::LnEventRouter>>,
+    /// Active Lightning swaps by swap_id (hex payment hash).
+    #[cfg(feature = "lightning")]
+    pub ln_swaps: Mutex<HashMap<String, super::lightning_handlers::LnMakerSwap>>,
     /// Test-only behavior override.
     #[cfg(feature = "integration-test")]
     pub behavior: MakerBehavior,
@@ -697,6 +740,38 @@ impl MakerServer {
         // is gone and the server will start in recovery-only mode.
         let mut watches = wallet.incoming_contract_outpoints(None);
         watches.extend(wallet.outgoing_contract_outpoints(None));
+
+        // Lightning swaps that were in flight when this maker last stopped.
+        // Their HTLCs are re-watched alongside the coinswap contracts, and
+        // the restored states let the watchdog finish or refund them.
+        #[cfg(feature = "lightning")]
+        let restored_ln_swaps: HashMap<String, super::lightning_handlers::LnMakerSwap> = {
+            let restored: HashMap<_, _> = wallet
+                .store
+                .ln_maker_swaps
+                .clone()
+                .into_iter()
+                .map(|(swap_id, record)| {
+                    (
+                        swap_id,
+                        super::lightning_handlers::LnMakerSwap::from_record(record),
+                    )
+                })
+                .collect();
+            for swap in restored.values() {
+                if let (Some((outpoint, _)), Ok(spk)) = (swap.funding, swap.htlc.script_pubkey()) {
+                    watches.push((outpoint, spk));
+                }
+            }
+            if !restored.is_empty() {
+                log::info!(
+                    "[{}] Restored {} in-flight Lightning swap(s) from the wallet",
+                    config.network_port,
+                    restored.len()
+                );
+            }
+            restored
+        };
         if let Err(e) = watch_service.rebuild_watches(watches) {
             log::error!("could not initialize watches on startup: {e}; recovery-only mode");
         }
@@ -713,6 +788,30 @@ impl MakerServer {
         }
 
         let nostr_relays = config.nostr_relays.clone();
+
+        #[cfg(feature = "lightning")]
+        let lightning = Self::init_lightning_backend(&config);
+        #[cfg(feature = "lightning")]
+        let ln_router = lightning
+            .as_ref()
+            .map(|ln| super::lightning_handlers::LnEventRouter::new(std::sync::Arc::clone(ln)));
+        #[cfg(feature = "lightning")]
+        match &ln_router {
+            // Re-open a mailbox per restored swap, or their settlement events
+            // would be dropped as belonging to an unknown payment.
+            Some(router) => {
+                for swap in restored_ln_swaps.values() {
+                    router.subscribe(swap.payment_hash);
+                }
+            }
+            None if !restored_ln_swaps.is_empty() => log::error!(
+                "{} Lightning swap(s) are in flight but no Lightning backend is configured; \
+                 their HTLCs cannot be resolved until one is",
+                restored_ln_swaps.len()
+            ),
+            None => {}
+        }
+
         Ok(MakerServer {
             config: config.clone(),
             wallet: Arc::new(RwLock::new(wallet)),
@@ -725,6 +824,12 @@ impl MakerServer {
             data_dir,
             swap_tracker: Mutex::new(swap_tracker),
             nostr_relays,
+            #[cfg(feature = "lightning")]
+            lightning,
+            #[cfg(feature = "lightning")]
+            ln_router,
+            #[cfg(feature = "lightning")]
+            ln_swaps: Mutex::new(restored_ln_swaps),
             #[cfg(feature = "integration-test")]
             behavior: MakerBehavior::default(),
             #[cfg(feature = "integration-test")]
@@ -732,6 +837,48 @@ impl MakerServer {
             #[cfg(feature = "integration-test")]
             reserved_rpc_listener: Mutex::new(None),
         })
+    }
+
+    /// Builds the Lightning backend from config, if configured. A configured
+    /// but unreachable/broken backend is reported and disables Lightning
+    /// swaps instead of failing maker startup: on-chain swaps must not be
+    /// held hostage by the LN sidecar.
+    #[cfg(feature = "lightning")]
+    fn init_lightning_backend(
+        config: &MakerServerConfig,
+    ) -> Option<std::sync::Arc<dyn crate::lightning::LightningBackend>> {
+        use bitcoin::hashes::hex::DisplayHex;
+        let url = config.ldk_server_url.as_ref()?;
+        let api_key_path = match &config.ldk_api_key_path {
+            Some(path) => path,
+            None => {
+                log::error!("ldk_server_url set but ldk_api_key_path missing; Lightning disabled");
+                return None;
+            }
+        };
+        let api_key = match std::fs::read(api_key_path) {
+            Ok(bytes) => bytes.to_lower_hex_string(),
+            Err(e) => {
+                log::error!("cannot read LDK api key {api_key_path}: {e}; Lightning disabled");
+                return None;
+            }
+        };
+        let ln_config = crate::lightning::LightningConfig {
+            base_url: url.clone(),
+            api_key,
+            tls_cert_path: config.ldk_tls_cert_path.as_ref().map(PathBuf::from),
+            timeout_secs: crate::lightning::DEFAULT_TIMEOUT_SECS,
+        };
+        match crate::lightning::LdkServerBackend::new(&ln_config) {
+            Ok(backend) => {
+                log::info!("Lightning backend connected: {url}");
+                Some(std::sync::Arc::new(backend))
+            }
+            Err(e) => {
+                log::error!("Lightning backend init failed: {e:?}; Lightning disabled");
+                None
+            }
+        }
     }
 
     /// Check if shutdown has been requested.
@@ -1425,6 +1572,70 @@ impl MakerServer {
         }
         Ok((funding_txes, payment_output_positions, total_miner_fee))
     }
+    /// Injects a Lightning backend (tests only): lets integration tests run
+    /// the full swap stack against a mock Lightning node.
+    #[cfg(all(feature = "integration-test", feature = "lightning"))]
+    pub fn set_lightning_backend(
+        &mut self,
+        backend: std::sync::Arc<dyn crate::lightning::LightningBackend>,
+    ) {
+        let router = super::lightning_handlers::LnEventRouter::new(std::sync::Arc::clone(&backend));
+        // Mirror init: swaps restored before the backend existed still need
+        // their mailboxes, or their settlement events would be dropped.
+        if let Ok(swaps) = self.ln_swaps.lock() {
+            for swap in swaps.values() {
+                router.subscribe(swap.payment_hash);
+            }
+        }
+        self.ln_router = Some(router);
+        self.lightning = Some(backend);
+    }
+
+    /// Lightning swap terms for the offer, derived from the coinswap fee
+    /// schedule and the node's live liquidity. `None` when no backend is
+    /// configured (or the build has no lightning support), which keeps the
+    /// field out of the offer entirely.
+    #[cfg(not(feature = "lightning"))]
+    fn lightning_offer(&self) -> Option<crate::protocol::lightning_messages::LightningOffer> {
+        None
+    }
+
+    /// See the non-lightning variant.
+    #[cfg(feature = "lightning")]
+    fn lightning_offer(&self) -> Option<crate::protocol::lightning_messages::LightningOffer> {
+        let ln = self.lightning.as_ref()?;
+        // Each direction draws on a different resource, so they are sized
+        // separately from live channel state rather than from one balance.
+        let channels = match ln.list_channels() {
+            Ok(channels) => channels,
+            Err(e) => {
+                log::warn!("lightning channels unavailable, omitting LN offer: {e:?}");
+                return None;
+            }
+        };
+        // A wallet we cannot read means no on-chain capacity we can promise,
+        // which disables swap-outs rather than advertising an unbounded one.
+        let wallet_max = lock_debug!(self.wallet.read())
+            .map(|w| w.store.offer_maxsize)
+            .unwrap_or(0);
+        let capacity = super::lightning_handlers::directional_limits(
+            &channels,
+            wallet_max,
+            self.config.min_swap_amount,
+        );
+        if !capacity.swap_in && !capacity.swap_out {
+            return None;
+        }
+        Some(crate::protocol::lightning_messages::LightningOffer {
+            swap_in: capacity.swap_in,
+            swap_out: capacity.swap_out,
+            base_fee: self.config.base_fee,
+            amount_relative_fee_pct: self.config.amount_relative_fee_pct,
+            min_size: self.config.min_swap_amount,
+            max_swap_in: capacity.max_swap_in,
+            max_swap_out: capacity.max_swap_out,
+        })
+    }
 }
 
 /// True when a swap other than `except_swap_id` already holds one of `txids`,
@@ -1483,6 +1694,7 @@ impl MakerTrait for MakerServer {
                 .unwrap_or(u64::MAX),
             required_confirms: self.config.required_confirms,
             supported_protocols: self.config.supported_protocols.clone(),
+            lightning: self.lightning_offer(),
         }
     }
 
@@ -2696,6 +2908,133 @@ impl MakerTrait for MakerServer {
     #[cfg(feature = "integration-test")]
     fn behavior(&self) -> MakerBehavior {
         self.behavior
+    }
+
+    #[cfg(feature = "lightning")]
+    fn lightning(&self) -> Option<std::sync::Arc<dyn crate::lightning::LightningBackend>> {
+        self.lightning.clone()
+    }
+
+    #[cfg(feature = "lightning")]
+    fn ln_router(&self) -> Option<std::sync::Arc<super::lightning_handlers::LnEventRouter>> {
+        self.ln_router.clone()
+    }
+
+    #[cfg(feature = "lightning")]
+    fn store_ln_swap(
+        &self,
+        swap_id: &str,
+        swap: super::lightning_handlers::LnMakerSwap,
+    ) -> Result<(), MakerError> {
+        // Persist before the in-memory insert, and before the caller commits
+        // anything of value. Every store precedes an irreversible step —
+        // paying an invoice, funding an HTLC — so a crash in between must
+        // still leave a record that can reach the money.
+        {
+            let mut wallet = lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            wallet
+                .store
+                .ln_maker_swaps
+                .insert(swap_id.to_string(), swap.to_record());
+            wallet.save_to_disk().map_err(MakerError::Wallet)?;
+        }
+        lock_debug!(self.ln_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .insert(swap_id.to_string(), swap);
+        Ok(())
+    }
+
+    #[cfg(feature = "lightning")]
+    fn get_ln_swap(
+        &self,
+        swap_id: &str,
+    ) -> Result<Option<super::lightning_handlers::LnMakerSwap>, MakerError> {
+        Ok(lock_debug!(self.ln_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .get(swap_id)
+            .cloned())
+    }
+
+    #[cfg(feature = "lightning")]
+    fn remove_ln_swap(&self, swap_id: &str) -> Result<(), MakerError> {
+        lock_debug!(self.ln_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .remove(swap_id);
+        // Dropped from disk only after the swap is resolved; an interrupted
+        // removal just leaves a record the next startup re-resolves.
+        let mut wallet = lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        if wallet.store.ln_maker_swaps.remove(swap_id).is_some() {
+            wallet.save_to_disk().map_err(MakerError::Wallet)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "lightning")]
+    fn wait_for_htlc_confirmation(
+        &self,
+        txid: &bitcoin::Txid,
+        required_confirms: u32,
+    ) -> Result<(), MakerError> {
+        // Its own connection, so the wait does not pin the wallet lock.
+        let chain = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .new_connection()
+            .map_err(MakerError::Wallet)?;
+        crate::wallet::wait_for_tx_confirmation(
+            &chain,
+            &[*txid],
+            required_confirms.max(crate::utill::MIN_REQUIRED_CONFIRM),
+            crate::utill::TX_BROADCAST_TIMEOUT,
+            Some(&self.shutdown),
+            None,
+        )
+        .map_err(MakerError::Wallet)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "lightning")]
+    fn fund_htlc(
+        &self,
+        amount: Amount,
+        address: bitcoin::Address,
+    ) -> Result<(Transaction, u32), MakerError> {
+        let mut wallet = lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // One split, one destination, no taker-reimbursed input budget.
+        let plan = wallet
+            .plan_funding(amount, 1, MIN_RELAY_FEE_RATE, u32::MAX, None, None, None)
+            .map_err(MakerError::Wallet)?;
+        let result = wallet
+            .execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE)
+            .map_err(MakerError::Wallet)?;
+        let tx = result
+            .funding_txes
+            .into_iter()
+            .next()
+            .ok_or(MakerError::General("No funding tx created"))?;
+        let vout = result
+            .payment_output_positions
+            .first()
+            .copied()
+            .unwrap_or(0);
+        Ok((tx, vout))
+    }
+
+    #[cfg(feature = "lightning")]
+    fn get_receive_address(&self) -> Result<bitcoin::Address, MakerError> {
+        let mut wallet = lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        wallet
+            .get_next_external_address(crate::wallet::AddressType::P2WPKH)
+            .map_err(MakerError::Wallet)
+    }
+
+    #[cfg(feature = "lightning")]
+    fn shutdown_requested(&self) -> bool {
+        self.is_shutdown()
     }
 }
 

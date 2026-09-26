@@ -178,6 +178,12 @@ pub struct TakerInitConfig {
     pub connection_type: ConnectionType,
     /// Nostr relay URLs for maker discovery.
     pub nostr_relays: Vec<String>,
+    /// LDK Server gRPC address (`host:port`, no scheme) for Lightning swaps.
+    pub ldk_server_url: Option<String>,
+    /// Path to the LDK Server API key file.
+    pub ldk_api_key_path: Option<String>,
+    /// Path to the LDK Server TLS certificate.
+    pub ldk_tls_cert_path: Option<String>,
 }
 
 impl Default for TakerInitConfig {
@@ -193,6 +199,9 @@ impl Default for TakerInitConfig {
             password: None,
             connection_type: ConnectionType::Tor,
             nostr_relays: NOSTR_RELAYS.iter().map(|s| s.to_string()).collect(),
+            ldk_server_url: None,
+            ldk_api_key_path: None,
+            ldk_tls_cert_path: None,
         }
     }
 }
@@ -530,6 +539,9 @@ pub struct Taker {
     recovery_loop: Option<RecoveryLoop>,
     /// Breach detector for legacy swaps (monitors funding outpoints for adversarial contract broadcasts).
     pub(crate) breach_detector: Option<BreachDetector>,
+    /// Lightning backend for submarine swaps, when configured.
+    #[cfg(feature = "lightning")]
+    pub(crate) lightning: Option<Arc<dyn crate::lightning::LightningBackend>>,
     /// Test behavior.
     #[cfg(feature = "integration-test")]
     pub behavior: TakerBehavior,
@@ -722,9 +734,15 @@ impl Taker {
             swap_tracker,
             recovery_loop: None,
             breach_detector: None,
+            #[cfg(feature = "lightning")]
+            lightning: None,
             #[cfg(feature = "integration-test")]
             behavior: TakerBehavior::Normal,
         };
+        #[cfg(feature = "lightning")]
+        {
+            taker.lightning = super::lightning_swap::init_lightning_backend(&taker.config);
+        }
 
         taker.init_recover_wallet();
         Ok(taker)
