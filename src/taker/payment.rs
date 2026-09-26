@@ -548,9 +548,10 @@ mod tests {
 
     #[test]
     fn dust_floor_scales_with_the_declared_tx_count() {
-        // The integration test cannot reach this floor (maker min_size beats
-        // 546 sats per output), so drive the decision directly: at tx_count
-        // 10 the receiver amount must cover 10 dust outputs, i.e. 5_460 sats.
+        // test_payswap_dust_floor_rejects_before_funding covers the refusal
+        // end-to-end; this pins the tx_count scaling without a bitcoind run.
+        // At tx_count 10 the receiver amount must cover 10 dust outputs,
+        // i.e. 5_460 sats.
         let address = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
             .parse::<Address<bitcoin::address::NetworkUnchecked>>()
             .unwrap()

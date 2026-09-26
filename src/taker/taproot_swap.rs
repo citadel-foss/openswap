@@ -10,7 +10,7 @@ use bitcoin::{
 
 use crate::{
     protocol::{
-        common_messages::{MakerToTakerMessage, TakerToMakerMessage},
+        common_messages::{MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage},
         contract2::{
             check_taproot_hashlock_has_pubkey, create_hashlock_script, create_timelock_script,
         },
@@ -29,6 +29,8 @@ use super::{
     swap_tracker::SwapPhase,
 };
 
+#[cfg(feature = "integration-test")]
+use super::api::TakerBehavior;
 #[cfg(feature = "integration-test")]
 use crate::protocol::common_messages::GetOffer;
 
@@ -70,6 +72,7 @@ impl Taker {
         manually_selected_outpoints: Option<Vec<OutPoint>>,
         reference_height: Option<u32>,
         feerate: f64,
+        #[cfg(feature = "integration-test")] behavior: TakerBehavior,
     ) -> Result<Vec<OutgoingSwapCoin>, TakerError> {
         let secp = Secp256k1::new();
         let mut swapcoins = Vec::new();
@@ -161,6 +164,9 @@ impl Taker {
             &taproot_addresses,
             feerate,
             manually_selected_outpoints,
+            ProtocolVersion::Taproot,
+            #[cfg(feature = "integration-test")]
+            behavior,
         )?;
 
         for (

@@ -24,7 +24,7 @@ use crate::{
         legacy_messages::{FundingTxInfo, LegacyTakerMessage},
     },
     utill::{redeemscript_to_scriptpubkey, sweep_fee_policy_sats},
-    wallet::swapcoin::IncomingSwapCoin,
+    wallet::{min_contract_value_sats, swapcoin::IncomingSwapCoin},
 };
 
 /// Handle a Legacy protocol message.
@@ -234,7 +234,10 @@ fn process_proof_of_funding<M: Maker>(
     }
 
     // Checked before the confirmation wait so a bad proof costs us no time.
-    // Amounts are peer-supplied, so sum them without panicking.
+    // Amounts are peer-supplied, so sum them without panicking. A contract
+    // below the floor can never be swept, so it is worth nothing to us.
+    let contract_floor = min_contract_value_sats(ProtocolVersion::Legacy, state.swap_feerate)
+        .ok_or(MakerError::General("Contract floor cannot be priced"))?;
     let mut declared_incoming = bitcoin::Amount::ZERO;
     for funding_info in &pof.confirmed_funding_txes {
         let funding_output_index = find_funding_output_index(funding_info)?;
@@ -243,6 +246,11 @@ fn process_proof_of_funding<M: Maker>(
             .output
             .get(funding_output_index as usize)
             .ok_or(MakerError::General("Funding output not found"))?;
+        if funding_output.value.to_sat() < contract_floor {
+            return Err(MakerError::General(
+                "Legacy funding output below the contract floor",
+            ));
+        }
         declared_incoming = declared_incoming
             .checked_add(funding_output.value)
             .ok_or(MakerError::General("Funding output amounts overflow"))?;

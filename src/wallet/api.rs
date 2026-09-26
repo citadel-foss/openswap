@@ -28,7 +28,7 @@ use bitcoin::{
     secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey},
     sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType},
     Address, Amount, Network, OutPoint, PublicKey, Script, ScriptBuf, Transaction, TxOut, Txid,
-    Weight,
+    Weight, WitnessProgram, WitnessVersion,
 };
 use bitcoind::bitcoincore_rpc::bitcoincore_rpc_json::{ListUnspentResultEntry, ScanningDetails};
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,7 @@ use zeroize::Zeroize;
 
 use crate::{
     lock_debug,
-    protocol::contract::create_multisig_redeemscript,
+    protocol::{contract::create_multisig_redeemscript, ProtocolVersion},
     utill::{
         capped_fee, compute_checksum, fee_at_rate_sats, generate_keypair,
         get_hd_path_from_descriptor, now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL,
@@ -314,6 +314,14 @@ pub(crate) fn payment_settlement_budget_sats(
             fee_at_rate_sats(TAPROOT_SCRIPTPATH_VSIZE, feerate)
         }
     }
+}
+
+/// Smallest contract worth creating: it pays the costliest spend path at `feerate`
+/// and still leaves a P2TR output, the wallet's highest-dust script, above dust.
+pub fn min_contract_value_sats(protocol: ProtocolVersion, feerate: f64) -> Option<u64> {
+    let p2tr =
+        ScriptBuf::new_witness_program(&WitnessProgram::new(WitnessVersion::V1, &[0; 32]).ok()?);
+    payment_settlement_budget_sats(protocol, feerate)?.checked_add(p2tr.minimal_non_dust().to_sat())
 }
 
 /// Returns the estimated vsize (virtual bytes) for cooperative keypath, preimage (hashlock),
