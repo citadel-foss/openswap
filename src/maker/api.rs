@@ -32,6 +32,7 @@ use crate::{
     },
     wallet::{
         funding::{net_policy_fees, SplitPlan},
+        min_contract_value_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FidelityError,
         RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK,
@@ -51,14 +52,12 @@ use super::{
     error::MakerError,
     handlers::{
         past_refund_deadline, ConnectionState, Maker as MakerTrait, MakerConfig, SwapPhase,
-        MAX_CONCURRENT_SWAPS,
+        MAX_CONCURRENT_SWAPS, MIN_CONTRACT_REACTION_TIME,
     },
     rpc::server::MakerRpc,
     swap_tracker::MakerSwapTracker,
 };
 
-/// Minimum swap amount in satoshis.
-pub const MIN_SWAP_AMOUNT: u64 = 10_000;
 // Covers all production response timeouts and finalization retry delays.
 const COMPLETED_HANDOVER_TTL: Duration = Duration::from_secs(65 * 60);
 
@@ -77,6 +76,46 @@ fn unfunded_swap_lifetime() -> Duration {
     {
         UNFUNDED_SWAP_LIFETIME
     }
+}
+
+/// What a hop must keep after its own fee: the incoming sweeps plus one
+/// single-input outgoing contract. No swap of this shape passes with less.
+fn swap_cost_floor(
+    protocol: ProtocolVersion,
+    feerate: f64,
+    incoming_count: u32,
+    max_input_budget: u32,
+) -> Option<u64> {
+    sweep_fee_policy_sats(protocol, feerate)?
+        .checked_mul(incoming_count as u64)?
+        .checked_add(min_contract_value_sats(protocol, feerate)?)?
+        .checked_add(funding_fee_policy_sats(1, max_input_budget, feerate)?)
+}
+
+/// The advertised minimum rounds up to a multiple of this, so takers see a
+/// round number that still passes.
+const MIN_SWAP_STEP_SATS: u64 = 500;
+
+/// Smallest swap every supported protocol accepts: one coin in, one coin out,
+/// at the relay floor and the shortest lock, rounded up to `MIN_SWAP_STEP_SATS`.
+fn min_swap_amount(config: &MakerServerConfig) -> u64 {
+    let rel = (config.amount_relative_fee_pct
+        + f64::from(MIN_CONTRACT_REACTION_TIME) * config.time_relative_fee_pct)
+        / 100.0;
+    config
+        .supported_protocols
+        .iter()
+        .filter_map(|p| swap_cost_floor(*p, MIN_RELAY_FEE_RATE, 1, 1))
+        .max()
+        .filter(|_| rel < 1.0)
+        .map(|cost| {
+            // Solves `amount - fee(amount) >= cost` for `amount`.
+            let exact = (config.base_fee.saturating_add(cost) as f64 / (1.0 - rel)).ceil() as u64;
+            exact
+                .div_ceil(MIN_SWAP_STEP_SATS)
+                .saturating_mul(MIN_SWAP_STEP_SATS)
+        })
+        .unwrap_or(u64::MAX)
 }
 
 /// The terms fixed by the taker's `SwapDetails` at negotiation, including the
@@ -203,8 +242,6 @@ pub struct MakerServerConfig {
     pub amount_relative_fee_pct: f64,
     /// Time-relative fee percentage.
     pub time_relative_fee_pct: f64,
-    /// Minimum swap amount in satoshis.
-    pub min_swap_amount: u64,
     /// Required confirmations for funding transactions.
     pub required_confirms: u32,
     /// Whether funding inputs should be checked against the address blocklist.
@@ -246,7 +283,6 @@ impl Default for MakerServerConfig {
             base_fee: 500,
             amount_relative_fee_pct: 0.0025,
             time_relative_fee_pct: 0.0001,
-            min_swap_amount: 10_000,
             required_confirms: 1,
             check_blocklist: false,
             supported_protocols: vec![ProtocolVersion::Legacy, ProtocolVersion::Taproot],
@@ -303,22 +339,6 @@ impl MakerServerConfig {
             return Err(WalletError::Fidelity(FidelityError::InvalidBondLocktime));
         }
 
-        let min_swap_amount = parse_field(
-            config_map.get("min_swap_amount"),
-            default_config.min_swap_amount,
-        );
-        if min_swap_amount < MIN_SWAP_AMOUNT {
-            log::error!(
-                "Configured min_swap_amount {} is below protocol minimum {} sats",
-                min_swap_amount,
-                MIN_SWAP_AMOUNT
-            );
-            return Err(WalletError::InsufficientFund {
-                available: min_swap_amount,
-                required: MIN_SWAP_AMOUNT,
-            });
-        }
-
         let fidelity_feerate = parse_field(
             config_map.get("fidelity_feerate"),
             default_config.fidelity_feerate,
@@ -351,7 +371,6 @@ impl MakerServerConfig {
                 config_map.get("time_relative_fee_pct"),
                 default_config.time_relative_fee_pct,
             ),
-            min_swap_amount,
             required_confirms: parse_field(
                 config_map.get("required_confirms"),
                 default_config.required_confirms,
@@ -406,8 +425,6 @@ socks_port = {}
 control_port = {}
 # Authentication password for Tor interface
 tor_auth_password = {}
-# Minimum amount in satoshis that can be swapped
-min_swap_amount = {}
 # Fidelity Bond amount in satoshis
 fidelity_amount = {}
 # Fidelity Bond timelock in blocks (must be between {} and {})
@@ -430,7 +447,6 @@ check_blocklist = {}
             self.socks_port,
             self.control_port,
             self.tor_auth_password,
-            self.min_swap_amount,
             self.fidelity_amount,
             MIN_FIDELITY_TIMELOCK,
             MAX_FIDELITY_TIMELOCK,
@@ -1119,7 +1135,7 @@ impl MakerServer {
                 .store
                 .offer_maxsize;
 
-            let min_required = self.config.min_swap_amount;
+            let min_required = min_swap_amount(&self.config);
 
             if offer_max_size < min_required {
                 log::warn!(
@@ -1325,12 +1341,23 @@ impl MakerServer {
         let sweep_fee = sweep_fee_policy_sats(state.protocol, state.swap_feerate)
             .and_then(|per_contract| per_contract.checked_mul(state.incoming_count as u64))
             .ok_or(MakerError::General("Sweep fee arithmetic overflow"))?;
+        let min_kept = swap_cost_floor(
+            state.protocol,
+            state.swap_feerate,
+            state.incoming_count,
+            state.max_input_budget,
+        )
+        .ok_or(MakerError::General("Swap floor cannot be priced"))?;
+        // `min_kept` already covers the sweeps, so the subtraction cannot underflow.
         let forwardable = state
             .swap_amount
             .to_sat()
             .checked_sub(state.service_fee_sats)
-            .and_then(|rest| rest.checked_sub(sweep_fee))
-            .ok_or(MakerError::General("Swap fees exceed the declared amount"))?;
+            .filter(|kept| *kept >= min_kept)
+            .ok_or(MakerError::General(
+                "Swap amount below the minimum for its shape",
+            ))?
+            - sweep_fee;
         let wallet = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
         let mut plan = wallet
@@ -1342,6 +1369,7 @@ impl MakerServer {
                 Some(state.service_fee_sats),
                 None,
                 None,
+                state.protocol,
             )
             .map_err(|e| {
                 log::warn!(
@@ -1368,7 +1396,13 @@ impl MakerServer {
             })?;
         // Forwarding nets the taker-reimbursed fee out of each split; a split
         // the netting pushes below the floor is a refusal, not a smaller swap.
-        net_policy_fees(&mut plan, state.max_input_budget, state.swap_feerate).map_err(|e| {
+        net_policy_fees(
+            &mut plan,
+            state.max_input_budget,
+            state.swap_feerate,
+            state.protocol,
+        )
+        .map_err(|e| {
             log::warn!(
                 "[{}] Rejecting swap at admission: policy netting failed: {:?}",
                 self.config.network_port,
@@ -1525,7 +1559,7 @@ impl MakerTrait for MakerServer {
             base_fee: self.config.base_fee,
             amount_relative_fee_pct: self.config.amount_relative_fee_pct,
             time_relative_fee_pct: self.config.time_relative_fee_pct,
-            min_swap_amount: self.config.min_swap_amount,
+            min_swap_amount: min_swap_amount(&self.config),
             max_swap_amount: lock_debug!(self.wallet.read())
                 .map(|w| w.store.offer_maxsize)
                 .unwrap_or(u64::MAX),
@@ -1535,7 +1569,7 @@ impl MakerTrait for MakerServer {
     }
 
     fn validate_swap_parameters(&self, details: &SwapDetails) -> Result<u16, MakerError> {
-        use super::handlers::{offset_meets_reaction_time, MIN_CONTRACT_REACTION_TIME};
+        use super::handlers::offset_meets_reaction_time;
 
         let config = self.get_config();
 
@@ -1570,8 +1604,14 @@ impl MakerTrait for MakerServer {
 
         // Check amount is within bounds
         let amount_sat = details.amount.to_sat();
-        if amount_sat < config.min_swap_amount {
-            return Err(MakerError::General("Swap amount below minimum"));
+        // Every incoming contract must be worth recovering at the swap feerate.
+        let contract_floor =
+            min_contract_value_sats(details.protocol_version, details.feerate as f64)
+                .ok_or(MakerError::General("Contract floor cannot be priced"))?;
+        if amount_sat < contract_floor.saturating_mul(details.incoming_count as u64) {
+            return Err(MakerError::General(
+                "Swap amount below the incoming contract floor",
+            ));
         }
         if amount_sat > config.max_swap_amount {
             return Err(MakerError::General("Swap amount above maximum"));
@@ -2796,8 +2836,14 @@ impl MakerRpc for MakerServer {
 
 #[cfg(test)]
 mod tests {
-    use super::{MakerServerConfig, ShutdownSignal, ThreadPool};
-    use crate::utill::MIN_RELAY_FEE_RATE;
+    use super::{
+        min_swap_amount, swap_cost_floor, MakerServerConfig, ShutdownSignal, ThreadPool,
+        MIN_CONTRACT_REACTION_TIME, MIN_SWAP_STEP_SATS,
+    };
+    use crate::{
+        protocol::{contract::calculate_swap_fee, ProtocolVersion},
+        utill::MIN_RELAY_FEE_RATE,
+    };
     use std::{
         sync::{atomic::Ordering, mpsc, Arc, TryLockError},
         thread,
@@ -2834,6 +2880,37 @@ mod tests {
         assert_eq!(resolve("inf"), MIN_RELAY_FEE_RATE);
         assert_eq!(resolve("0.5"), MIN_RELAY_FEE_RATE);
         assert_eq!(resolve("3.0"), 3.0);
+    }
+
+    #[test]
+    fn advertised_min_swap_is_the_smallest_passing_round_amount() {
+        assert_eq!(min_swap_amount(&MakerServerConfig::default()), 1_500);
+        // Legacy costs more than taproot, so it sets the advertised minimum.
+        let cost = swap_cost_floor(ProtocolVersion::Legacy, MIN_RELAY_FEE_RATE, 1, 1).unwrap();
+        for (base_fee, amount_pct, time_pct) in
+            [(500, 0.0025, 0.0001), (0, 0.0, 0.0), (900, 1.5, 0.01)]
+        {
+            let config = MakerServerConfig {
+                base_fee,
+                amount_relative_fee_pct: amount_pct,
+                time_relative_fee_pct: time_pct,
+                ..Default::default()
+            };
+            let kept = |amount| {
+                amount
+                    - calculate_swap_fee(
+                        amount,
+                        MIN_CONTRACT_REACTION_TIME,
+                        base_fee,
+                        amount_pct,
+                        time_pct,
+                    )
+            };
+            let min = min_swap_amount(&config);
+            assert_eq!(min % MIN_SWAP_STEP_SATS, 0);
+            assert!(kept(min) >= cost, "{:?}", config);
+            assert!(kept(min - MIN_SWAP_STEP_SATS) < cost, "{:?}", config);
+        }
     }
 
     /// Keeps wallet inspection usable without clearing the terminal server latch.

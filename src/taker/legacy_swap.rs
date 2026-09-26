@@ -10,7 +10,7 @@ use bitcoin::{
 
 use crate::{
     protocol::{
-        common_messages::{MakerToTakerMessage, TakerToMakerMessage},
+        common_messages::{MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage},
         contract::{
             create_contract_redeemscript, create_multisig_redeemscript, create_senders_contract_tx,
             read_pubkeys_from_multisig_redeemscript, sign_contract_tx,
@@ -34,6 +34,9 @@ use super::{
     error::{breach_or_wallet_error, TakerError},
 };
 
+#[cfg(feature = "integration-test")]
+use super::api::TakerBehavior;
+
 /// Delay to allow the Maker to broadcast its funding transactions before we poll.
 const MAKER_BROADCAST_DELAY: Duration = Duration::from_secs(2);
 
@@ -51,6 +54,7 @@ impl Taker {
         network: Network,
         manually_selected_outpoints: Option<Vec<OutPoint>>,
         feerate: f64,
+        #[cfg(feature = "integration-test")] behavior: TakerBehavior,
     ) -> Result<Vec<OutgoingSwapCoin>, TakerError> {
         let secp = Secp256k1::new();
         let mut swapcoins = Vec::new();
@@ -93,6 +97,9 @@ impl Taker {
             &openswap_addresses,
             feerate,
             manually_selected_outpoints,
+            ProtocolVersion::Legacy,
+            #[cfg(feature = "integration-test")]
+            behavior,
         )?;
 
         for (

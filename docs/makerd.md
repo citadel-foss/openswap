@@ -30,8 +30,6 @@ socks_port = 9050
 control_port = 9051
 # Authentication password for Tor interface
 tor_auth_password = ""
-# Minimum amount in satoshis that can be swapped
-min_swap_amount = 10000
 # Fidelity Bond amount in satoshis
 fidelity_amount = 10000
 # Fidelity Bond timelock in blocks (must be between 12960 and 25920)
@@ -52,7 +50,6 @@ required_confirms = 1
 - `socks_port`: The Tor Socks Port.  Check the [tor doc](tor.md) for more details.
 - `control_port`: The Tor Control Port. Check the [tor doc](tor.md) for more details.
 - `tor_auth_password`: Optional password for Tor control authentication; empty by default.
-- `min_swap_amount`: Minimum swap amount (in satoshis). Values below the protocol minimum of 10,000 sats are rejected at startup.
 - `fidelity_amount`: Amount (in satoshis) locked as a fidelity bond to deter Sybil attacks. Defaults to 10,000 sats.
 - `fidelity_timelock`: Lock duration in block heights for the fidelity bond. Defaults to 15,000 blocks; must be within the accepted range of 12,960–25,920 blocks.
 - `fidelity_feerate`: Fee rate (in sats/vB) for the fidelity bond transaction. Defaults to 1.0, the relay minimum; lower values are clamped to it.
@@ -61,6 +58,19 @@ required_confirms = 1
 - `time_relative_fee_pct`: A percentage fee based on the swap duration.
 - `required_confirms`: Number of confirmations required for funding transactions (default: 1).
 - The per-hop parameters the taker negotiates (`tx_count`, `max_input_budget`, `feerate`) — and what the maker is reimbursed on top of its service fees — are covered in [the fee policy](./fee-policy.md).
+
+There is no minimum swap setting. Your node works out the smallest swap it accepts for each request. The swap must pay your fee and the mining fees. Every coin you receive or send must also stay above dust after you pay to spend it. Dust is an amount too small for the network to forward. At 1 sat/vB, one taproot coin needs at least 485 sats: 330 sats of dust plus 155 sats to spend it.
+
+Your node advertises the smallest swap it would accept. It works this out each time a taker asks for its price list. It assumes one coin in, one coin out, 1 sat/vB, and the shortest lock your node allows. It prices the costlier of the two swap types, legacy, so the number holds for both. It then rounds up to the next 500 sats. With the default fees, that is 1,500 sats:
+
+1. Sweeping the incoming coin costs 150 sats.
+2. The outgoing coin must hold at least 630 sats.
+3. Funding the outgoing coin costs 165 sats.
+4. Your base fee adds 500 sats, for 1,445.
+5. Your percentage fees round that up to 1,446.
+6. Rounding up to the next 500 gives 1,500.
+
+A swap with more coins or a higher fee rate needs more.
 
 > **Note:**  
 > On the first run, if the default `network_port` or `rpc_port` is already in use, `makerd` automatically discovers a free port and persists it to `config.toml`.
@@ -321,7 +331,7 @@ INFO openswap::maker::server - [6102] Server setup complete! Listening on port 6
 The server will display information about swap liquidity and continue listening for requests:
 
 ```bash
-INFO openswap::maker::api - Swap Liquidity: 5001672 sats | Min: 10000 sats | Listening for requests.
+INFO openswap::maker::api - Swap Liquidity: 5001672 sats | Min: 1500 sats | Listening for requests.
 INFO openswap::maker::server - [6102] Bitcoin Network: regtest
 INFO openswap::maker::server - [6102] Spendable Wallet Balance: 0.05001672 BTC
 ```

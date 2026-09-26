@@ -73,6 +73,8 @@ use crate::protocol::taproot_messages::TaprootContractData;
 use crate::utill::check_tor_status;
 #[cfg(not(feature = "integration-test"))]
 use crate::utill::socks5_connect;
+#[cfg(feature = "integration-test")]
+use crate::wallet::min_contract_value_sats;
 
 /// Connection type for the taker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1703,6 +1705,7 @@ impl Taker {
                 None,
                 swap.params.manually_selected_outpoints.clone(),
                 None,
+                swap.params.protocol,
             )?
         };
         let planned_hop0_count = planned_hop0.len() as u32;
@@ -2432,6 +2435,8 @@ impl Taker {
                 network,
                 manually_selected_outpoints,
                 swap_feerate,
+                #[cfg(feature = "integration-test")]
+                self.behavior,
             )?,
             ProtocolVersion::Taproot => {
                 let hashlock_pubkey = taproot_hashlock_pubkey
@@ -2448,6 +2453,8 @@ impl Taker {
                     manually_selected_outpoints,
                     reference_height,
                     swap_feerate,
+                    #[cfg(feature = "integration-test")]
+                    self.behavior,
                 )?
             }
         };
@@ -3578,6 +3585,8 @@ pub(crate) fn fund_all_or_nothing(
     destinations: &[bitcoin::Address],
     feerate: f64,
     manually_selected_outpoints: Option<Vec<OutPoint>>,
+    protocol: ProtocolVersion,
+    #[cfg(feature = "integration-test")] behavior: TakerBehavior,
 ) -> Result<CreateFundingTxesResult, TakerError> {
     let plan = wallet.plan_funding(
         send_amount,
@@ -3587,6 +3596,7 @@ pub(crate) fn fund_all_or_nothing(
         None,
         manually_selected_outpoints,
         None,
+        protocol,
     )?;
     if plan.len() != destinations.len() {
         return Err(TakerError::General(format!(
@@ -3595,6 +3605,20 @@ pub(crate) fn fund_all_or_nothing(
             destinations.len()
         )));
     }
+    // QA: even splits keep the count and the total exact, so only the maker's
+    // per-contract floor can refuse the one split skewed a sat below it.
+    #[cfg(feature = "integration-test")]
+    let plan = {
+        let mut plan = plan;
+        if behavior == TakerBehavior::SkewSplitBelowFloor && plan.len() > 1 {
+            let floor = min_contract_value_sats(protocol, feerate)
+                .expect("test: the swap feerate always prices the floor");
+            let skimmed = plan[0].value.to_sat() - (floor - 1);
+            plan[0].value = Amount::from_sat(floor - 1);
+            plan[1].value += Amount::from_sat(skimmed);
+        }
+        plan
+    };
     Ok(wallet.execute_funding_plan(&plan, destinations, feerate)?)
 }
 
@@ -3755,4 +3779,7 @@ pub enum TakerBehavior {
     /// idle timeout. The route heartbeat must keep that last maker live after
     /// the earlier makers have completed.
     StallBeforeLastHandover,
+    /// Skew one funding split a sat below the contract floor while keeping the
+    /// count and total exact (maker per-contract floor rejection tests).
+    SkewSplitBelowFloor,
 }

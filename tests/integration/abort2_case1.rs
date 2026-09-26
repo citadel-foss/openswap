@@ -235,22 +235,18 @@ fn heterogeneous_substitution_aborts_without_cascade() {
         Some(MakerFeeOverride {
             base_fee: 500,
             amount_relative_fee_pct: 0.0025,
-            ..Default::default()
         }),
         Some(MakerFeeOverride {
             base_fee: 800,
             amount_relative_fee_pct: 0.005,
-            ..Default::default()
         }),
         Some(MakerFeeOverride {
             base_fee: 1200,
             amount_relative_fee_pct: 0.0075,
-            ..Default::default()
         }),
         Some(MakerFeeOverride {
             base_fee: 950,
             amount_relative_fee_pct: 0.004,
-            ..Default::default()
         }),
     ];
     let maker_behaviors = vec![
@@ -427,17 +423,14 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing() {
         Some(MakerFeeOverride {
             base_fee: 500,
             amount_relative_fee_pct: 0.0025,
-            ..Default::default()
         }),
         Some(MakerFeeOverride {
             base_fee: 100,
             amount_relative_fee_pct: 0.0005,
-            ..Default::default()
         }),
         Some(MakerFeeOverride {
             base_fee: 20000,
             amount_relative_fee_pct: 0.05,
-            ..Default::default()
         }),
     ];
     let maker_behaviors = vec![
@@ -577,17 +570,14 @@ fn last_hop_equal_priced_spare_completes() {
         Some(MakerFeeOverride {
             base_fee: 500,
             amount_relative_fee_pct: 0.0025,
-            ..Default::default()
         }),
         Some(MakerFeeOverride {
             base_fee: 100,
             amount_relative_fee_pct: 0.0005,
-            ..Default::default()
         }),
         Some(MakerFeeOverride {
             base_fee: 100,
             amount_relative_fee_pct: 0.0005,
-            ..Default::default()
         }),
     ];
     let maker_behaviors = vec![

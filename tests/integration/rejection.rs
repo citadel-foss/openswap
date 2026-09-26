@@ -31,7 +31,7 @@ use openswap::{
         UnavailableState,
     },
     utill::{MAX_TX_COUNT, MIN_RELAY_FEE_RATE, NO_SHUTDOWN, TX_BROADCAST_TIMEOUT},
-    wallet::{AddressType, Destination},
+    wallet::{min_contract_value_sats, AddressType, Destination},
 };
 
 use super::test_framework::*;
@@ -81,8 +81,8 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     generate_blocks(bitcoind, 1);
 
-    // The maker advertises min = its `min_swap_amount`, max = its spendable
-    // liquidity, so derive both bounds instead of hardcoding them.
+    // The maker advertises min = the smallest swap it accepts, and max = its
+    // spendable liquidity. One sat under one relay-floor contract is below both.
     let maker_offer_max = makers[0]
         .wallet
         .read()
@@ -90,7 +90,9 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
         .get_balances()
         .unwrap()
         .regular;
-    let below_min = Amount::from_sat(5_000);
+    let contract_floor =
+        min_contract_value_sats(ProtocolVersion::Taproot, MIN_RELAY_FEE_RATE).unwrap();
+    let below_min = Amount::from_sat(contract_floor - 1);
     let above_max = maker_offer_max + Amount::from_sat(100_000);
     info!(
         "Maker offer max: {}, testing below_min={} and above_max={}",
@@ -132,7 +134,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     );
     info!("Above-maximum request rejected by the offerbook filter");
 
-    // ---- 3. Below minimum, past the filter, caught at negotiation ----
+    // ---- 3. Below minimum, past the filter: our own planner refuses the contract ----
     let err = taker
         .prepare_swap(
             SwapParams::new(ProtocolVersion::Taproot, below_min, 2)
@@ -140,17 +142,18 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
                 .with_required_confirms(1)
                 .with_preferred_makers(preferred.clone()),
         )
-        .expect_err("negotiation must refuse an amount under the maker's minimum");
+        .expect_err("the taker must refuse to fund a contract under the floor");
     let msg = format!("{:?}", err);
     assert!(
         msg.contains(&format!(
-            "Send amount ({} sats) is below maker 0 min_size",
-            below_min.to_sat()
+            "Amount {} sats is below the {} sat contract floor",
+            below_min.to_sat(),
+            contract_floor
         )),
-        "Expected the negotiation min_size guard, got: {}",
+        "Expected the contract floor refusal, got: {}",
         msg
     );
-    info!("Negotiation refused below-minimum request: {}", msg);
+    info!("Taker refused below-minimum request: {}", msg);
 
     // ---- 4. Above maximum, past the filter, caught at negotiation ----
     let err = taker
@@ -236,7 +239,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     test_framework.assert_log("closing early after maker selection", &log_path);
     // The forged amounts got past both taker-side layers, so the refusal must
     // come from the maker's own guard, logged as a handler error on drop.
-    test_framework.assert_log("Swap amount below minimum", &log_path);
+    test_framework.assert_log("Swap amount below the incoming contract floor", &log_path);
     test_framework.assert_log("Swap amount above maximum", &log_path);
     // The mutated resend dies on the whole-agreement compare: one value, so
     // no single field — feerate included — can drift between connections.
@@ -587,6 +590,28 @@ fn maker_rejects_underdelivered_taproot_amount() {
     run_taproot_declaration_guard(
         TakerBehavior::ForgeBounds(Amount::from_sat(600_000)),
         "does not match negotiated swap amount",
+    );
+}
+
+/// The taker funds 2 incoming contracts but skews one a sat below the
+/// contract floor, keeping the total exact. The equality and count checks
+/// pass, so only the maker's per-contract floor can refuse.
+#[test]
+fn maker_rejects_taproot_contract_below_floor() {
+    run_taproot_declaration_guard(
+        TakerBehavior::SkewSplitBelowFloor,
+        "Taproot contract below the contract floor",
+    );
+}
+
+/// Same skew on Legacy: one funding output sits below the floor while the
+/// declared sum stays exact, so the per-output floor is what refuses.
+#[test]
+fn maker_rejects_legacy_funding_output_below_floor() {
+    run_legacy_proof_guard(
+        TakerBehavior::SkewSplitBelowFloor,
+        2,
+        "Legacy funding output below the contract floor",
     );
 }
 
@@ -1380,7 +1405,19 @@ fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
             .with_required_confirms(1)
             .with_preferred_makers(preferred.clone())
     };
+    // The taker funds this hop with 2 contracts, so the shape needs 2 floors in.
+    let two_floors =
+        2 * min_contract_value_sats(ProtocolVersion::Taproot, MIN_RELAY_FEE_RATE).unwrap();
     let cases: Vec<(TakerBehavior, &str)> = vec![
+        (
+            TakerBehavior::ForgeBounds(Amount::from_sat(two_floors - 1)),
+            "Swap amount below the incoming contract floor",
+        ),
+        // Enough to cover the incoming contracts, but not our fee, the sweeps and one outgoing contract.
+        (
+            TakerBehavior::ForgeBounds(Amount::from_sat(two_floors)),
+            "Swap amount below the minimum for its shape",
+        ),
         (
             TakerBehavior::ForgeFeerate(0),
             "Swap feerate below the relay floor",

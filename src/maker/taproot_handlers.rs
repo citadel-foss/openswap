@@ -27,7 +27,10 @@ use crate::{
     },
     taker::api::REFUND_LOCKTIME_STEP,
     utill::sweep_fee_policy_sats,
-    wallet::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+    wallet::{
+        min_contract_value_sats,
+        swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+    },
 };
 #[cfg(feature = "integration-test")]
 use bitcoind::bitcoincore_rpc::{
@@ -140,6 +143,19 @@ fn process_taproot_contract<M: Maker>(
         );
         return Err(MakerError::General(
             "Taproot contract count does not match the declared incoming count",
+        ));
+    }
+
+    // A contract below the floor can never be swept, so it is worth nothing to us.
+    let contract_floor = min_contract_value_sats(ProtocolVersion::Taproot, state.swap_feerate)
+        .ok_or(MakerError::General("Contract floor cannot be priced"))?;
+    if data
+        .amounts
+        .iter()
+        .any(|amount| amount.to_sat() < contract_floor)
+    {
+        return Err(MakerError::General(
+            "Taproot contract below the contract floor",
         ));
     }
 

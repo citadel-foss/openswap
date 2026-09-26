@@ -379,12 +379,7 @@ fn test_payswap_dust_floor_rejects_before_funding() {
     // the refusal error would replace the dust error and this test fails.
     let maker_behaviors = vec![MakerBehavior::RefuseSwapDetails];
 
-    // The default 10_000 sat min_size would refuse the quote before the dust
-    // floor is reached, so this maker advertises a lower one.
-    let fee_overrides = vec![Some(MakerFeeOverride {
-        min_swap_amount: 1_000,
-        ..Default::default()
-    })];
+    let fee_overrides = vec![None];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init_with_fee_overrides::<BitcoindBackend>(
