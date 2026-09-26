@@ -6,7 +6,7 @@ use bitcoin::{
     secp256k1::{Keypair, Scalar, SecretKey, XOnlyPublicKey},
     sighash::SighashCache,
     taproot::Signature as TaprootSignature,
-    Address, Amount, PublicKey, ScriptBuf, Transaction, Txid, Witness,
+    Address, Amount, OutPoint, PublicKey, ScriptBuf, Transaction, Txid, Witness,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::TryInto;
@@ -1238,6 +1238,45 @@ impl OutgoingSwapCoin {
         }
         Ok(tx)
     }
+
+    /// True when `spending_tx` spends this coin's contract output through our
+    /// timelock branch, i.e. it is one of our own timelock recoveries.
+    ///
+    /// Only our timelock key can satisfy that branch and the output commits to
+    /// its scripts, so the witness shape alone is exact. Paying our recovery
+    /// address is not: the peer learns it from our mempool tx and can add an
+    /// output paying it to its own hashlock claim.
+    pub(crate) fn is_own_timelock_spend(&self, spending_tx: &Transaction) -> bool {
+        let contract_outpoint = OutPoint::new(
+            self.contract_tx.compute_txid(),
+            self.get_contract_output_vout(),
+        );
+        let Some(input) = spending_tx
+            .input
+            .iter()
+            .find(|input| input.previous_output == contract_outpoint)
+        else {
+            return false;
+        };
+        let witness = &input.witness;
+        match self.protocol {
+            // Script path [sig] [timelock_script] [control_block]. A key-path
+            // spend reveals no leaf; the hashlock leaf reveals the other script.
+            ProtocolVersion::Taproot => self.timelock_script.as_ref().is_some_and(|script| {
+                witness.taproot_leaf_script().is_some_and(|leaf| {
+                    leaf.version == bitcoin::taproot::LeafVersion::TapScript
+                        && leaf.script == script.as_script()
+                })
+            }),
+            // [sig] [<empty>] [redeemscript]: the empty element selects the
+            // timelock branch, where the hashlock branch needs the preimage.
+            ProtocolVersion::Legacy => self.contract_redeemscript.as_ref().is_some_and(|script| {
+                witness.len() == 3
+                    && witness.nth(1).is_some_and(<[u8]>::is_empty)
+                    && witness.last() == Some(script.as_bytes())
+            }),
+        }
+    }
 }
 
 /// Watch-only view of a swap between two other parties.
@@ -1309,5 +1348,175 @@ impl WatchOnlySwapCoin {
             timelock_script: Some(timelock_script),
             funding_amount,
         }
+    }
+}
+
+#[cfg(test)]
+mod timelock_spend_tests {
+    use super::*;
+    use crate::protocol::{
+        contract::{create_contract_redeemscript, Hash160},
+        contract2::{create_hashlock_script, create_timelock_script},
+    };
+    use bitcoin::{
+        locktime::absolute::LockTime,
+        secp256k1::Secp256k1,
+        taproot::{LeafVersion, TaprootBuilder},
+        transaction::Version,
+        TxIn, TxOut,
+    };
+
+    const CONTRACT_VALUE: Amount = Amount::from_sat(50_000);
+
+    fn key(byte: u8) -> SecretKey {
+        SecretKey::from_slice(&[byte; 32]).unwrap()
+    }
+
+    fn pubkey(byte: u8) -> PublicKey {
+        PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(
+            &Secp256k1::new(),
+            &key(byte),
+        ))
+    }
+
+    fn xonly(byte: u8) -> XOnlyPublicKey {
+        Keypair::from_secret_key(&Secp256k1::new(), &key(byte))
+            .x_only_public_key()
+            .0
+    }
+
+    fn tx(previous_output: OutPoint, witness: Witness, script_pubkey: ScriptBuf) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output,
+                witness,
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: CONTRACT_VALUE,
+                script_pubkey,
+            }],
+        }
+    }
+
+    /// An unsigned spend of `coin`'s contract output carrying `witness`.
+    fn spend(coin: &OutgoingSwapCoin, witness: Witness) -> Transaction {
+        let outpoint = OutPoint::new(
+            coin.contract_tx.compute_txid(),
+            coin.get_contract_output_vout(),
+        );
+        tx(outpoint, witness, ScriptBuf::new())
+    }
+
+    fn legacy_coin() -> OutgoingSwapCoin {
+        let redeemscript =
+            create_contract_redeemscript(&pubkey(2), &pubkey(3), &Hash160::all_zeros(), &20);
+        let contract_tx = tx(OutPoint::null(), Witness::new(), redeemscript.to_p2wsh());
+        OutgoingSwapCoin::new_legacy(
+            key(1),
+            pubkey(4),
+            contract_tx,
+            redeemscript,
+            key(3),
+            CONTRACT_VALUE,
+            1,
+        )
+    }
+
+    fn taproot_coin() -> OutgoingSwapCoin {
+        let hashlock_script = create_hashlock_script(&[7; 32], &xonly(2));
+        let timelock_script =
+            create_timelock_script(LockTime::from_height(500).unwrap(), &xonly(3));
+        let contract_tx = tx(
+            OutPoint::null(),
+            Witness::new(),
+            ScriptBuf::new_p2tr(&Secp256k1::new(), xonly(5), None),
+        );
+        let mut coin = OutgoingSwapCoin::new_taproot(
+            key(3),
+            hashlock_script,
+            timelock_script,
+            contract_tx,
+            CONTRACT_VALUE,
+            1,
+        );
+        coin.internal_key = Some(xonly(5));
+        coin.tap_tweak = Some(Scalar::ZERO);
+        coin
+    }
+
+    /// The control block a real script-path spend of `leaf` would carry.
+    fn control_block(coin: &OutgoingSwapCoin, leaf: &ScriptBuf) -> Vec<u8> {
+        TaprootBuilder::new()
+            .add_leaf(1, coin.hashlock_script.clone().unwrap())
+            .unwrap()
+            .add_leaf(1, coin.timelock_script.clone().unwrap())
+            .unwrap()
+            .finalize(&Secp256k1::new(), coin.internal_key.unwrap())
+            .unwrap()
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .unwrap()
+            .serialize()
+    }
+
+    #[test]
+    fn taproot_timelock_recovery_is_ours() {
+        let coin = taproot_coin();
+        let recovery = coin
+            .sign_timelock_recovery(spend(&coin, Witness::new()))
+            .unwrap();
+        assert!(coin.is_own_timelock_spend(&recovery));
+    }
+
+    #[test]
+    fn taproot_hashlock_claim_is_not_ours() {
+        let coin = taproot_coin();
+        let hashlock_script = coin.hashlock_script.clone().unwrap();
+        let witness = Witness::from_slice(&[
+            vec![1; 64],
+            vec![7; 32],
+            hashlock_script.to_bytes(),
+            control_block(&coin, &hashlock_script),
+        ]);
+        assert!(!coin.is_own_timelock_spend(&spend(&coin, witness)));
+    }
+
+    #[test]
+    fn taproot_key_path_spend_is_not_ours() {
+        let coin = taproot_coin();
+        let witness = Witness::from_slice(&[vec![1; 64]]);
+        assert!(!coin.is_own_timelock_spend(&spend(&coin, witness)));
+    }
+
+    #[test]
+    fn legacy_timelock_recovery_is_ours() {
+        let coin = legacy_coin();
+        let recovery = coin
+            .sign_timelock_recovery(spend(&coin, Witness::new()))
+            .unwrap();
+        assert!(coin.is_own_timelock_spend(&recovery));
+    }
+
+    #[test]
+    fn legacy_hashlock_claim_is_not_ours() {
+        let coin = legacy_coin();
+        let witness = Witness::from_slice(&[
+            vec![1; 71],
+            vec![7; 32],
+            coin.contract_redeemscript.clone().unwrap().to_bytes(),
+        ]);
+        assert!(!coin.is_own_timelock_spend(&spend(&coin, witness)));
+    }
+
+    #[test]
+    fn timelock_witness_on_another_outpoint_is_not_ours() {
+        let coin = legacy_coin();
+        let mut recovery = coin
+            .sign_timelock_recovery(spend(&coin, Witness::new()))
+            .unwrap();
+        recovery.input[0].previous_output = OutPoint::null();
+        assert!(!coin.is_own_timelock_spend(&recovery));
     }
 }

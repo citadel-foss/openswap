@@ -374,6 +374,8 @@ enum ContractChainState {
     OnChain,
     /// The output is gone for good; the swapcoin can be dropped.
     Discarded,
+    /// Our own timelock recovery already confirmed; record it as resolved.
+    RecoveredByTimelock(Txid),
     /// Nothing decided this pass; the next recovery run retries.
     NotYet,
 }
@@ -955,6 +957,31 @@ impl Wallet {
             let outpoint = OutPoint::new(contract_txid, contract_vout);
             let script = &swapcoin.contract_tx.output[contract_vout as usize].script_pubkey;
             if chain.is_confirmed_spend(&outpoint, script)? {
+                // The spend may be our own timelock recovery whose bookkeeping
+                // was lost to a crash or a failed confirmation wait.
+                if let Some(recovery) = chain
+                    .spending_transaction(&outpoint, script, None)?
+                    .filter(|tx| swapcoin.is_own_timelock_spend(tx))
+                {
+                    let recovery_txid = recovery.compute_txid();
+                    // Electrum returns the first history entry spending the
+                    // outpoint, which can be a replaced recovery. Record only the
+                    // one that confirmed; otherwise decide on the next pass.
+                    if chain.tx_block_height(&recovery_txid)?.is_none() {
+                        log::info!(
+                            "Our timelock recovery {} for {} is not the confirmed spend — retrying next cycle",
+                            recovery_txid,
+                            swap_id
+                        );
+                        return Ok(ContractChainState::NotYet);
+                    }
+                    log::info!(
+                        "Contract output for {} already spent by our confirmed timelock recovery {} — recording as resolved",
+                        swap_id,
+                        recovery_txid
+                    );
+                    return Ok(ContractChainState::RecoveredByTimelock(recovery_txid));
+                }
                 log::info!(
                     "Contract output for {} spent by a confirmed tx — discarding swapcoin",
                     swap_id
@@ -1142,6 +1169,7 @@ impl Wallet {
         }
 
         let mut discarded = Vec::new();
+        let mut already_recovered = Vec::new();
 
         for (swap_id, swapcoin, timelock) in to_recover {
             let contract_txid = swapcoin.contract_tx.compute_txid();
@@ -1155,6 +1183,11 @@ impl Wallet {
                 ContractChainState::OnChain => {}
                 ContractChainState::Discarded => {
                     discarded.push(swap_id.clone());
+                    continue;
+                }
+                ContractChainState::RecoveredByTimelock(recovery_txid) => {
+                    outcome.resolved.push((contract_txid, recovery_txid));
+                    already_recovered.push(swap_id.clone());
                     continue;
                 }
                 ContractChainState::NotYet => continue,
@@ -1285,6 +1318,9 @@ impl Wallet {
                 outcome.discarded.push(sc.contract_tx.compute_txid());
             }
             w.store.outgoing_swapcoins.remove(id);
+        }
+        for id in &already_recovered {
+            w.remove_outgoing_swapcoin(id);
         }
 
         if !outcome.is_empty() || !discarded.is_empty() {
