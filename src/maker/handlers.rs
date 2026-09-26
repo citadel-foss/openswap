@@ -463,6 +463,12 @@ pub trait Maker: Send + Sync {
     /// return false: their refresh is bounded by the unfunded lifetime instead.
     fn claimed_funding_unseen(&self, swap_id: &str) -> Result<bool, MakerError>;
 
+    /// The spending txid when the watchtower saw a Legacy incoming funding
+    /// outpoint of this swap spent, i.e. the previous hop broadcast its
+    /// pre-signed contract. A failed query is an error, never "not breached".
+    /// Taproot and unknown swaps: `None`.
+    fn incoming_contract_breached(&self, swap_id: &str) -> Result<Option<Txid>, MakerError>;
+
     /// Wait until every peer tx in `txids` is confirmed to `required_confirms` depth.
     /// One deadline covers the whole batch, so a long transaction list cannot multiply
     /// the wait. Shutdown breaks it, and each poll refreshes the swap's stored
@@ -707,6 +713,11 @@ pub fn handle_message<M: Maker>(
                     maker.network_port(),
                     id
                 );
+                return Ok(None);
+            }
+            // A keepalive must not hold off recovery once the taker has broadcast
+            // its contract: the swap cannot finish cooperatively any more.
+            if maker.incoming_contract_breached(id)?.is_some() {
                 return Ok(None);
             }
             // Once the swap has named its funding, a keepalive counts only while
@@ -1032,6 +1043,14 @@ fn handle_legacy_dispatch<M: Maker>(
 
     restore_state_if_needed(maker, state, &swap_id)?;
     ensure_negotiated_protocol(state, ProtocolVersion::Legacy)?;
+
+    // That handler checks itself, after saving the signed swapcoins recovery needs.
+    if !matches!(
+        legacy_msg,
+        LegacyTakerMessage::RespContractSigsForRecvrAndSender(_)
+    ) {
+        super::legacy_handlers::refuse_if_breached(maker.as_ref(), &swap_id)?;
+    }
 
     super::legacy_handlers::handle_legacy_message(maker, state, legacy_msg)
 }

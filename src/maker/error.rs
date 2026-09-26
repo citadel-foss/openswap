@@ -2,7 +2,7 @@
 
 use std::sync::{MutexGuard, PoisonError, RwLockReadGuard, RwLockWriteGuard};
 
-use bitcoin::{secp256k1, Amount};
+use bitcoin::{secp256k1, Amount, Txid};
 
 use crate::{
     blocklist::BlocklistError, error::NetError, protocol::error::ProtocolError, utill::TorError,
@@ -43,6 +43,14 @@ pub enum MakerError {
     TooManySwaps,
     /// Represents a resent SwapDetails whose admission parameters differ from the stored swap.
     SwapParamMismatch,
+    /// The previous hop broadcast its Legacy contract mid-swap, spending our incoming funding.
+    ContractBroadcast {
+        /// The swap whose incoming funding was spent.
+        swap_id: String,
+        /// The transaction that spent it; `None` when the backend reports the
+        /// spend but not the spender.
+        spending_txid: Option<Txid>,
+    },
     /// Represents a mutex poisoning error.
     MutexPossion,
     /// Represents an error related to secp256k1 operations.

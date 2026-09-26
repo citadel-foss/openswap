@@ -2340,6 +2340,56 @@ impl MakerTrait for MakerServer {
         Ok(true)
     }
 
+    fn incoming_contract_breached(&self, swap_id: &str) -> Result<Option<Txid>, MakerError> {
+        use crate::watch_tower::{watcher::WatcherEvent, watcher_error::WatcherError};
+
+        let funding_outpoints: Vec<OutPoint> = {
+            let swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            let Some(state) = swaps.get(swap_id) else {
+                return Ok(None);
+            };
+            if state.negotiated.protocol != ProtocolVersion::Legacy {
+                return Ok(None);
+            }
+            state
+                .incoming_swapcoins
+                .iter()
+                .filter_map(super::legacy_handlers::funding_watch)
+                .map(|(outpoint, _)| outpoint)
+                .collect()
+        };
+
+        for funding_outpoint in funding_outpoints {
+            let spender = match self.watch_service.watch_request(funding_outpoint) {
+                // A watched outpoint with no recorded spend replies `spending_tx: None`.
+                Ok(WatcherEvent::UtxoSpent { spending_tx, .. }) => {
+                    spending_tx.map(|tx| tx.compute_txid())
+                }
+                // `NoOutpoint` means the watch armed at ProofOfFunding is gone; the
+                // service already turns a watcher `Error` reply into `Err`.
+                other => {
+                    return Err(MakerError::Watcher(WatcherError::General(format!(
+                        "breach query for funding {funding_outpoint} of swap {swap_id} failed: {other:?}"
+                    ))));
+                }
+            };
+            // Before the handover only the previous hop's pre-signed contract can
+            // spend the 2-of-2, so any spend ends the swap.
+            if let Some(spender) = spender {
+                log::warn!(
+                    "[{}] Incoming funding {} of swap {} spent by {}: incoming contract broadcast",
+                    self.config.network_port,
+                    funding_outpoint,
+                    swap_id,
+                    spender
+                );
+                return Ok(Some(spender));
+            }
+        }
+        Ok(None)
+    }
+
     fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }

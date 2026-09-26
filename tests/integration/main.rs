@@ -47,6 +47,7 @@ mod wallet_backup;
 mod watchtower_liveness;
 
 mod concurrent_takers;
+mod legacy_contract_breach;
 mod legacy_hashlock_recovery;
 mod legacy_reboot_recovery;
 mod offerbook_restart;

@@ -357,8 +357,9 @@ fn process_proof_of_funding<M: Maker>(
         hashvalue
     );
 
-    // Register incoming contract outputs with watchtower so we detect
-    // if the taker broadcasts the maker's incoming contract tx.
+    // Watch the incoming contract outputs for a hashlock or timelock spend, and
+    // the funding outpoint behind each one: the taker holds its contract fully
+    // signed, and only a watch on the funding sees that contract broadcast.
     for incoming in &state.incoming_swapcoins {
         let txid = incoming.contract_tx.compute_txid();
         for (vout, txout) in incoming.contract_tx.output.iter().enumerate() {
@@ -370,6 +371,10 @@ fn process_proof_of_funding<M: Maker>(
                 txout.script_pubkey.clone(),
             )?;
         }
+        let (outpoint, spk) = funding_watch(incoming).ok_or(MakerError::General(
+            "Incoming swapcoin has no funding watch",
+        ))?;
+        maker.register_watch_outpoint(outpoint, spk)?;
     }
 
     log::info!(
@@ -691,6 +696,9 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
         maker.save_outgoing_swapcoin(outgoing)?;
     }
 
+    refuse_if_breached(maker.as_ref(), &resp.id)?;
+    refuse_if_funding_spent(maker.as_ref(), state, &resp.id)?;
+
     log::info!(
         "[{}] SECURITY: Broadcasting {} funding txs after receiving signatures",
         maker.network_port(),
@@ -958,6 +966,8 @@ fn process_legacy_handover<M: Maker>(
         maker.network_port(),
     )?;
 
+    refuse_if_funding_spent(maker.as_ref(), state, &handover.id)?;
+
     // Extract outgoing privkeys for response
     let mut privkeys = Vec::new();
     for outgoing in &state.outgoing_swapcoins {
@@ -1024,6 +1034,43 @@ fn process_legacy_handover<M: Maker>(
     Ok(Some(MakerToTakerMessage::LegacyPrivateKeyHandover(
         response,
     )))
+}
+
+/// The incoming funding outpoint and its 2-of-2 scriptPubKey. Its spend by the
+/// taker's pre-signed contract is the Legacy breach signal.
+pub(super) fn funding_watch(incoming: &IncomingSwapCoin) -> Option<(bitcoin::OutPoint, ScriptBuf)> {
+    let outpoint = incoming.contract_tx.input.first()?.previous_output;
+    let spk = redeemscript_to_scriptpubkey(incoming.multisig_redeemscript.as_ref()?).ok()?;
+    Some((outpoint, spk))
+}
+
+/// Error out once the previous hop has broadcast its contract.
+pub(super) fn refuse_if_breached(maker: &impl Maker, swap_id: &str) -> Result<(), MakerError> {
+    match maker.incoming_contract_breached(swap_id)? {
+        Some(spending_txid) => Err(MakerError::ContractBroadcast {
+            swap_id: swap_id.to_string(),
+            spending_txid: Some(spending_txid),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Ask the backend directly before we give up funds: the watchtower misses a
+/// spend whose ZMQ notification was dropped.
+fn refuse_if_funding_spent(
+    maker: &impl Maker,
+    state: &ConnectionState,
+    swap_id: &str,
+) -> Result<(), MakerError> {
+    for (outpoint, _) in state.incoming_swapcoins.iter().filter_map(funding_watch) {
+        if !maker.contract_output_unspent(&outpoint)? {
+            return Err(MakerError::ContractBroadcast {
+                swap_id: swap_id.to_string(),
+                spending_txid: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Find the index of the funding output in the funding transaction.

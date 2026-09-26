@@ -234,12 +234,7 @@ impl<R: Role> Watcher<R> {
 
                 // Drain pending events too: one per pass would leave the
                 // notification buffer lagging a busy mempool by a heartbeat each.
-                while !self.shutdown.load(Ordering::Relaxed) {
-                    let Some(event) = self.blockchain.poll_event() else {
-                        break;
-                    };
-                    self.handle_event(event);
-                }
+                self.drain_events();
                 // Failed backend work retries on every pass, not just idle ticks;
                 // with empty queues this is a no-op.
                 self.retry_pending_work();
@@ -323,6 +318,9 @@ impl<R: Role> Watcher<R> {
             }
             WatcherCommand::WatchRequest { outpoint, reply } => {
                 log::info!("Intercepted watch request: {outpoint}");
+                // Events queue while the loop waits for a command. Answer from the
+                // backend's current view, or a spend it already relayed reads as unspent.
+                self.drain_events();
                 let watches = match self.registry.list_watches() {
                     Ok(watches) => watches,
                     Err(e) => {
@@ -445,6 +443,15 @@ impl<R: Role> Watcher<R> {
             process_block::<R>(block, Some(height), &mut self.registry)?;
         }
         Ok(())
+    }
+
+    fn drain_events(&mut self) {
+        while !self.shutdown.load(Ordering::Relaxed) {
+            let Some(event) = self.blockchain.poll_event() else {
+                break;
+            };
+            self.handle_event(event);
+        }
     }
 
     /// Retry failed script subscriptions and Core block discovery. Successful

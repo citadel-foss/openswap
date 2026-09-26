@@ -642,6 +642,17 @@ impl Taker {
                 .legacy_exchange_mut()?
                 .prev_maker_sigs_obtained = true;
 
+            #[cfg(feature = "integration-test")]
+            if is_first_peer
+                && self.behavior == super::api::TakerBehavior::BroadcastContractBeforeMakerFunding
+            {
+                log::warn!("Test behavior: broadcasting our contract before maker 0 funds");
+                self.broadcast_own_contract(true)?;
+                // The maker's watcher records spends once per loop pass; sending the
+                // signatures within that pass would race its funding check.
+                std::thread::sleep(crate::utill::HEART_BEAT_INTERVAL * 2);
+            }
+
             log::info!(
                 "Sending RespContractSigsForRecvrAndSender to maker {}",
                 maker_idx
@@ -1012,9 +1023,18 @@ impl Taker {
     /// no longer exists.
     #[cfg(feature = "integration-test")]
     fn spend_funding_outpoint_before_proof(&self) -> Result<(), TakerError> {
-        use crate::wallet::Blockchain;
-
         log::warn!("Test behavior: spending the funding outpoint before ProofOfFunding");
+        let include_mempool =
+            self.behavior == super::api::TakerBehavior::ReplaySpentFundingOutpointMempool;
+        self.broadcast_own_contract(include_mempool)
+    }
+
+    /// Test-only: broadcast our first outgoing contract tx, spending the funding the
+    /// first maker is receiving, and wait until the backend sees the spend (mined,
+    /// or in the mempool when `include_mempool`).
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn broadcast_own_contract(&self, include_mempool: bool) -> Result<(), TakerError> {
+        use crate::wallet::Blockchain;
 
         let swapcoin = self
             .swap_state()?
@@ -1036,8 +1056,6 @@ impl Taker {
         // Mempool variant: wait only until the backend can see the spend at all.
         // electrs indexes the mempool a moment after the broadcast, and the maker
         // reads the same server, so the wait is what makes the case reachable.
-        let include_mempool =
-            self.behavior == super::api::TakerBehavior::ReplaySpentFundingOutpointMempool;
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         while wallet
             .blockchain

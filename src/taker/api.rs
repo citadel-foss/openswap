@@ -1428,6 +1428,15 @@ impl Taker {
         }
 
         #[cfg(feature = "integration-test")]
+        if self.behavior == TakerBehavior::BroadcastContractBeforeHandover {
+            log::warn!("Test behavior: broadcasting our contract, then handing over keys");
+            self.broadcast_own_contract(true)?;
+            // The maker's watcher records spends once per loop pass; handing over
+            // within that pass is the post-handover race, not this breach.
+            std::thread::sleep(crate::utill::HEART_BEAT_INTERVAL * 2);
+        }
+
+        #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::DropAfterFundsBroadcast {
             log::warn!("Test behavior: dropping after contract exchange");
             let err = TakerError::General("Test: dropped after contract exchange".to_string());
@@ -3678,6 +3687,12 @@ pub enum TakerBehavior {
     DropAfterFundsBroadcast,
     /// Broadcast contract transactions after full setup, then close (malice scenario).
     BroadcastContractAfterFullSetup,
+    /// Legacy: broadcast our signed contract after maker 0's contract data, before
+    /// sending it the signatures that make it fund (legacy_contract_breach).
+    BroadcastContractBeforeMakerFunding,
+    /// Legacy: broadcast our signed contract after full setup, then still attempt
+    /// the key handover (legacy_contract_breach).
+    BroadcastContractBeforeHandover,
     /// Close connection after receiving AckSwapDetails (taproot taker abort).
     CloseAtAckResponse,
     /// Close connection when sending sender's contract data (taproot taker abort).

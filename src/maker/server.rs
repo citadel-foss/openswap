@@ -734,6 +734,13 @@ fn handle_connection(
                         );
                     }
                 }
+                for (outpoint, spk) in state
+                    .incoming_swapcoins
+                    .iter()
+                    .filter_map(super::legacy_handlers::funding_watch)
+                {
+                    maker.unwatch_outpoint(outpoint, spk);
+                }
             }
 
             break;
