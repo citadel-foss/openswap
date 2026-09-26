@@ -54,7 +54,7 @@ use super::{
         MAX_CONCURRENT_SWAPS,
     },
     rpc::server::MakerRpc,
-    swap_tracker::MakerSwapTracker,
+    swap_tracker::{now_secs, MakerRecoveryPhase, MakerSwapPhase, MakerSwapTracker},
 };
 
 /// Minimum swap amount in satoshis.
@@ -1986,6 +1986,54 @@ impl MakerTrait for MakerServer {
             .map_err(MakerError::Wallet)?;
 
         Ok(sweep_outcome)
+    }
+
+    fn finalize_successful_swap(
+        &self,
+        swap_id: &str,
+        expected_outgoing: usize,
+    ) -> Result<(), MakerError> {
+        let outgoing_keys = {
+            let wallet = lock_debug!(self.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            let outgoing_keys = wallet.outgoing_keys_for_swap(swap_id);
+            if outgoing_keys.len() != expected_outgoing {
+                return Err(MakerError::General(
+                    "persisted outgoing swapcoin count does not match completed swap",
+                ));
+            }
+            outgoing_keys
+        };
+
+        {
+            let mut tracker =
+                lock_debug!(self.swap_tracker.lock()).map_err(|_| MakerError::MutexPossion)?;
+            if let Some(record) = tracker.get_record_mut(swap_id) {
+                record.phase = MakerSwapPhase::Completed;
+                record.recovery.phase = MakerRecoveryPhase::CleanedUp;
+                record.updated_at = now_secs();
+                let completed = record.clone();
+                tracker.save_record(&completed)?;
+            }
+        }
+
+        {
+            let mut wallet = lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            for key in &outgoing_keys {
+                wallet.remove_outgoing_swapcoin(key);
+            }
+            wallet.release_swap_locks(swap_id, None);
+            wallet.save_to_disk().map_err(MakerError::Wallet)?;
+        }
+
+        log::info!(
+            "[{}] Finalized successful swap {} and removed {} outgoing swapcoin(s)",
+            self.config.network_port,
+            swap_id,
+            outgoing_keys.len()
+        );
+        Ok(())
     }
 
     fn store_connection_state(

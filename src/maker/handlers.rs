@@ -95,6 +95,11 @@ pub enum MakerBehavior {
     CloseAtPrivateKeyHandover,
     /// Process a handover but drop its first response.
     DropHandoverResponse,
+    /// Close after sending the successful handover response, before sweeping
+    /// incoming swapcoins.
+    CloseAfterHandoverResponse,
+    /// Close after sweeping incoming swapcoins, before finalizing the swap.
+    CloseBeforeSwapFinalization,
     /// Close connection at contract sigs exchange (taproot recovery test).
     CloseAtContractSigsExchange,
     /// Sweep the incoming swapcoins, then close before handing the private key
@@ -425,6 +430,16 @@ pub trait Maker: Send + Sync {
         &self,
         incoming_swapcoins: &[IncomingSwapCoin],
     ) -> Result<RecoveryOutcome, MakerError>;
+
+    /// Persist the terminal maker state after every incoming contract has been
+    /// swept. This must complete before a success report is emitted: otherwise
+    /// a restart can mistake the already-delivered outgoing coins for an
+    /// abandoned swap and launch recovery for them.
+    fn finalize_successful_swap(
+        &self,
+        swap_id: &str,
+        expected_outgoing: usize,
+    ) -> Result<(), MakerError>;
 
     /// Store connection state for persistence across connections.
     /// `admission` is set only when storing from a fresh SwapDetails message.

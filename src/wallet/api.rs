@@ -2011,7 +2011,7 @@ impl Wallet {
     }
 
     /// Finds unfinished swapcoins.
-    /// Incoming unfinished: `other_privkey` is None.
+    /// Incoming swapcoins remain unfinished until they are swept and removed.
     /// Outgoing unfinished: `hash_preimage` is None.
     pub(crate) fn find_unfinished_swapcoins(
         &self,
@@ -2019,13 +2019,8 @@ impl Wallet {
         Vec<super::swapcoin::IncomingSwapCoin>,
         Vec<super::swapcoin::OutgoingSwapCoin>,
     ) {
-        let unfinished_incomings: Vec<_> = self
-            .store
-            .incoming_swapcoins
-            .values()
-            .filter(|ic| ic.other_privkey.is_none())
-            .cloned()
-            .collect();
+        let unfinished_incomings: Vec<_> =
+            self.store.incoming_swapcoins.values().cloned().collect();
         let unfinished_outgoings: Vec<_> = self
             .store
             .outgoing_swapcoins

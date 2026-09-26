@@ -31,6 +31,7 @@ mod payswap;
 mod reboot_recovery;
 mod skip_funding_recovery;
 mod standard_swap;
+mod successful_swap_restart;
 mod taproot_hashlock_recovery;
 mod taproot_maker_abort1;
 mod taproot_maker_abort2;
