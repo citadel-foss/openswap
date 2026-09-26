@@ -74,7 +74,6 @@ services:
         socks_port = $${TOR_SOCKS_PORT:-9050}
         control_port = $${TOR_CONTROL_PORT:-9051}
         tor_auth_password = "$${TOR_AUTH_PASSWORD}"
-        min_swap_amount = $${MIN_SWAP_AMOUNT:-10000}
         fidelity_amount = $${FIDELITY_AMOUNT:-50000}
         fidelity_timelock = $${FIDELITY_TIMELOCK:-13104}
         connection_type = "TOR"
@@ -100,7 +99,6 @@ services:
       - TOR_SOCKS_PORT=${TOR_SOCKS_PORT:-9050}
       - TOR_CONTROL_PORT=${TOR_CONTROL_PORT:-9051}
       - TOR_AUTH_PASSWORD=${TOR_AUTH_PASSWORD}
-      - MIN_SWAP_AMOUNT=${MIN_SWAP_AMOUNT:-10000}
       - FIDELITY_AMOUNT=${FIDELITY_AMOUNT:-50000}
       - FIDELITY_TIMELOCK=${FIDELITY_TIMELOCK:-13104}
       - BASE_FEE=${BASE_FEE:-500}

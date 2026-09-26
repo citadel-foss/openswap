@@ -703,6 +703,34 @@ fn one_utxo_taker_completes_degraded_swap() {
     test_framework.finish(takers, block_generation_handle);
 }
 
+/// The maker forwards 1,075 sats. Two splits net to 372 each, under the 485
+/// taproot floor, but one split nets to 910, so admission must re-plan with one.
+#[test]
+fn maker_degrades_split_count_when_netting_breaks_the_floor() {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(1_800), 1)
+        .with_tx_count(2)
+        .with_required_confirms(1);
+    taker
+        .prepare_swap(params)
+        .expect("admission must fall back to one split");
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
 /// A confirmed funding txid proves nothing about its outputs. Here the taker claims
 /// its own funding output through the contract path first, then still names that
 /// outpoint in ProofOfFunding. The maker must refuse before funding the next hop.

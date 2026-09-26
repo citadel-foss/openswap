@@ -25,7 +25,7 @@ use crate::{
     protocol::common_messages::{
         FidelityProof, MakerToTakerMessage, PrivateKeyHandover, ProtocolVersion, SwapDetails,
     },
-    taker::api::REFUND_LOCKTIME_STEP,
+    taker::api::{REFUND_LOCKTIME_BASE, REFUND_LOCKTIME_STEP},
     utill::{
         funding_fee_policy_sats, get_maker_dir, parse_field, parse_toml, sweep_fee_policy_sats,
         MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
@@ -97,10 +97,10 @@ fn swap_cost_floor(
 const MIN_SWAP_STEP_SATS: u64 = 500;
 
 /// Smallest swap every supported protocol accepts: one coin in, one coin out,
-/// at the relay floor and the shortest lock, rounded up to `MIN_SWAP_STEP_SATS`.
+/// at the relay floor and a one-maker lock, rounded up to `MIN_SWAP_STEP_SATS`.
 fn min_swap_amount(config: &MakerServerConfig) -> u64 {
     let rel = (config.amount_relative_fee_pct
-        + f64::from(MIN_CONTRACT_REACTION_TIME) * config.time_relative_fee_pct)
+        + f64::from(REFUND_LOCKTIME_BASE) * config.time_relative_fee_pct)
         / 100.0;
     config
         .supported_protocols
@@ -1123,6 +1123,14 @@ impl MakerServer {
             .get_next_external_address(AddressType::P2TR)
             .map_err(MakerError::Wallet)?;
 
+        // Fee settings no amount can pay would otherwise wait here forever.
+        let min_required = min_swap_amount(&self.config);
+        if min_required == u64::MAX {
+            return Err(MakerError::General(
+                "Fee settings leave no swap amount that pays",
+            ));
+        }
+
         while !self.shutdown.load(Ordering::Relaxed) {
             log::info!("Sync at:----check_swap_liquidity----");
             lock_debug!(self.wallet.write())
@@ -1134,8 +1142,6 @@ impl MakerServer {
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?
                 .store
                 .offer_maxsize;
-
-            let min_required = min_swap_amount(&self.config);
 
             if offer_max_size < min_required {
                 log::warn!(
@@ -1360,61 +1366,68 @@ impl MakerServer {
             - sweep_fee;
         let wallet = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-        let mut plan = wallet
-            .plan_funding(
-                Amount::from_sat(forwardable),
-                state.tx_count,
-                state.swap_feerate,
+        // Netting can push a split under the floor where fewer, larger splits
+        // would pass, so retry one split fewer, re-planning from scratch.
+        let mut max_splits = state.tx_count;
+        loop {
+            let mut plan = wallet
+                .plan_funding(
+                    Amount::from_sat(forwardable),
+                    max_splits,
+                    state.swap_feerate,
+                    state.max_input_budget,
+                    Some(state.service_fee_sats),
+                    None,
+                    None,
+                    state.protocol,
+                )
+                .map_err(|e| {
+                    log::warn!(
+                        "[{}] Rejecting swap at admission: cannot fund {} sats forwardable: {:?}",
+                        self.config.network_port,
+                        forwardable,
+                        e
+                    );
+                    match e {
+                        WalletError::InsufficientFund {
+                            available,
+                            required,
+                        } => MakerError::InsufficientLiquidity {
+                            available: Amount::from_sat(available),
+                            reserved: Amount::ZERO,
+                            requested: Amount::from_sat(required),
+                        },
+                        _ => MakerError::InsufficientLiquidity {
+                            available: Amount::ZERO,
+                            reserved: Amount::ZERO,
+                            requested: state.swap_amount,
+                        },
+                    }
+                })?;
+            // Forwarding nets the taker-reimbursed fee out of each split; one
+            // split the netting still pushes below the floor is a refusal.
+            match net_policy_fees(
+                &mut plan,
                 state.max_input_budget,
-                Some(state.service_fee_sats),
-                None,
-                None,
+                state.swap_feerate,
                 state.protocol,
-            )
-            .map_err(|e| {
-                log::warn!(
-                    "[{}] Rejecting swap at admission: cannot fund {} sats forwardable: {:?}",
-                    self.config.network_port,
-                    forwardable,
-                    e
-                );
-                match e {
-                    WalletError::InsufficientFund {
-                        available,
-                        required,
-                    } => MakerError::InsufficientLiquidity {
-                        available: Amount::from_sat(available),
-                        reserved: Amount::ZERO,
-                        requested: Amount::from_sat(required),
-                    },
-                    _ => MakerError::InsufficientLiquidity {
+            ) {
+                Ok(()) => return Ok(plan),
+                Err(_) if plan.len() > 1 => max_splits = plan.len() as u32 - 1,
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Rejecting swap at admission: policy netting failed: {:?}",
+                        self.config.network_port,
+                        e
+                    );
+                    return Err(MakerError::InsufficientLiquidity {
                         available: Amount::ZERO,
                         reserved: Amount::ZERO,
                         requested: state.swap_amount,
-                    },
+                    });
                 }
-            })?;
-        // Forwarding nets the taker-reimbursed fee out of each split; a split
-        // the netting pushes below the floor is a refusal, not a smaller swap.
-        net_policy_fees(
-            &mut plan,
-            state.max_input_budget,
-            state.swap_feerate,
-            state.protocol,
-        )
-        .map_err(|e| {
-            log::warn!(
-                "[{}] Rejecting swap at admission: policy netting failed: {:?}",
-                self.config.network_port,
-                e
-            );
-            MakerError::InsufficientLiquidity {
-                available: Amount::ZERO,
-                reserved: Amount::ZERO,
-                requested: state.swap_amount,
             }
-        })?;
-        Ok(plan)
+        }
     }
 
     /// The funding plan frozen at admission. `amount` must equal the plan's
@@ -2838,7 +2851,7 @@ impl MakerRpc for MakerServer {
 mod tests {
     use super::{
         min_swap_amount, swap_cost_floor, MakerServerConfig, ShutdownSignal, ThreadPool,
-        MIN_CONTRACT_REACTION_TIME, MIN_SWAP_STEP_SATS,
+        MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
@@ -2887,9 +2900,12 @@ mod tests {
         assert_eq!(min_swap_amount(&MakerServerConfig::default()), 1_500);
         // Legacy costs more than taproot, so it sets the advertised minimum.
         let cost = swap_cost_floor(ProtocolVersion::Legacy, MIN_RELAY_FEE_RATE, 1, 1).unwrap();
-        for (base_fee, amount_pct, time_pct) in
-            [(500, 0.0025, 0.0001), (0, 0.0, 0.0), (900, 1.5, 0.01)]
-        {
+        for (base_fee, amount_pct, time_pct) in [
+            (500, 0.0025, 0.0001),
+            (0, 0.0, 0.0),
+            (900, 1.5, 0.01),
+            (500, 0.0025, 0.3),
+        ] {
             let config = MakerServerConfig {
                 base_fee,
                 amount_relative_fee_pct: amount_pct,
@@ -2900,7 +2916,7 @@ mod tests {
                 amount
                     - calculate_swap_fee(
                         amount,
-                        MIN_CONTRACT_REACTION_TIME,
+                        REFUND_LOCKTIME_BASE,
                         base_fee,
                         amount_pct,
                         time_pct,
@@ -2910,6 +2926,14 @@ mod tests {
             assert_eq!(min % MIN_SWAP_STEP_SATS, 0);
             assert!(kept(min) >= cost, "{:?}", config);
             assert!(kept(min - MIN_SWAP_STEP_SATS) < cost, "{:?}", config);
+        }
+        // Fees no amount can pay leave no minimum; startup refuses these.
+        for amount_pct in [f64::NAN, 100.0] {
+            let config = MakerServerConfig {
+                amount_relative_fee_pct: amount_pct,
+                ..Default::default()
+            };
+            assert_eq!(min_swap_amount(&config), u64::MAX);
         }
     }
 

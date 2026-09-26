@@ -61,7 +61,7 @@ required_confirms = 1
 
 There is no minimum swap setting. Your node works out the smallest swap it accepts for each request. The swap must pay your fee and the mining fees. Every coin you receive or send must also stay above dust after you pay to spend it. Dust is an amount too small for the network to forward. At 1 sat/vB, one taproot coin needs at least 485 sats: 330 sats of dust plus 155 sats to spend it.
 
-Your node advertises the smallest swap it would accept. It works this out each time a taker asks for its price list. It assumes one coin in, one coin out, 1 sat/vB, and the shortest lock your node allows. It prices the costlier of the two swap types, legacy, so the number holds for both. It then rounds up to the next 500 sats. With the default fees, that is 1,500 sats:
+Your node advertises the smallest swap it would accept. It works this out each time a taker asks for its price list. It assumes one coin in, one coin out, 1 sat/vB, and the lock a one-maker swap uses. It prices the costlier of the two swap types, legacy, so the number holds for both. It then rounds up to the next 500 sats. With the default fees, that is 1,500 sats:
 
 1. Sweeping the incoming coin costs 150 sats.
 2. The outgoing coin must hold at least 630 sats.
@@ -70,7 +70,7 @@ Your node advertises the smallest swap it would accept. It works this out each t
 5. Your percentage fees round that up to 1,446.
 6. Rounding up to the next 500 gives 1,500.
 
-A swap with more coins or a higher fee rate needs more.
+A swap with more coins, more makers, or a higher fee rate needs more. If your fee settings leave no amount that pays, your node refuses to start.
 
 > **Note:**  
 > On the first run, if the default `network_port` or `rpc_port` is already in use, `makerd` automatically discovers a free port and persists it to `config.toml`.
