@@ -159,6 +159,97 @@ fn maker_serves_only_the_direction_it_has_capacity_for() {
         other => panic!("expected SwapInAccept, got {}", other),
     }
 
+    // ---- Hostile terms are refused ----
+    // A peer that asks for zero confirmations wants the maker to act on a
+    // funding it can still double-spend; one that asks for a huge number
+    // would pin the connection thread and burn the refund window.
+    for (confirmations, label) in [(0u32, "zero"), (u32::MAX, "absurd")] {
+        let preimage = Preimage([0x60 + confirmations as u8 % 8; 32]);
+        let reply = expect_ln(
+            handle_message(
+                &maker,
+                &mut ConnectionState::default(),
+                TakerToMakerMessage::TakerHello(TakerHello),
+            )
+            .and_then(|_| {
+                let mut state = ConnectionState::default();
+                handle_message(
+                    &maker,
+                    &mut state,
+                    TakerToMakerMessage::TakerHello(TakerHello),
+                )?;
+                handle_message(
+                    &maker,
+                    &mut state,
+                    ln_message(LightningTakerMessage::SwapInRequest(LnSwapInRequest {
+                        swap_id: preimage.payment_hash().to_string(),
+                        invoice: taker_node
+                            .create_hold_invoice(
+                                preimage.payment_hash(),
+                                InvoiceParams {
+                                    amount_msat: Some(amount.to_sat() * 1000),
+                                    description: "hostile".to_string(),
+                                    expiry_secs: 3600,
+                                },
+                            )
+                            .unwrap()
+                            .invoice,
+                        payment_hash: preimage.payment_hash(),
+                        amount,
+                        locktime: 60,
+                        min_confirmations: confirmations,
+                        taker_timelock_pubkey: test_pubkey(0x42),
+                    })),
+                )
+            })
+            .unwrap(),
+        );
+        match reply {
+            LightningMakerMessage::Reject(reject) => assert!(
+                reject.reason.contains("min_confirmations"),
+                "{label} confirmations should be refused by range, got: {}",
+                reject.reason
+            ),
+            other => panic!(
+                "expected a rejection for {} confirmations, got {}",
+                label, other
+            ),
+        }
+    }
+
+    // A second request reusing a live swap's id must not replace it: the
+    // stored record holds the only copy of that swap's branch key.
+    let mut state2 = ConnectionState::default();
+    handle_message(
+        &maker,
+        &mut state2,
+        TakerToMakerMessage::TakerHello(TakerHello),
+    )
+    .unwrap();
+    let reply = expect_ln(
+        handle_message(
+            &maker,
+            &mut state2,
+            ln_message(LightningTakerMessage::SwapOutRequest(LnSwapOutRequest {
+                swap_id: swap_id.clone(),
+                payment_hash,
+                amount,
+                locktime: 60,
+                min_confirmations: 1,
+                taker_hashlock_pubkey: test_pubkey(0x31),
+            })),
+        )
+        .unwrap(),
+    );
+    match reply {
+        LightningMakerMessage::Reject(reject) => assert!(
+            reject.reason.contains("already in progress"),
+            "a duplicate swap id should be refused, got: {}",
+            reject.reason
+        ),
+        other => panic!("expected a duplicate-id rejection, got {}", other),
+    }
+
     drop(takers);
     makers
         .iter()

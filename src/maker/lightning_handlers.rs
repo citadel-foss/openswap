@@ -64,6 +64,16 @@ const SWAP_OUT_PAYMENT_DEADLINE: Duration = Duration::from_secs(3600);
 /// so inline waits and the watchdog never race for the same event.
 const WATCHDOG_MIN_IDLE: Duration = Duration::from_secs(300);
 
+/// Most confirmations a peer may demand on an HTLC funding output. The wait
+/// pins a connection thread and burns the CSV window, so an unbounded value
+/// is a denial of service; this is already far past any honest setting.
+const MAX_MIN_CONFIRMATIONS: u32 = 12;
+
+/// Blocks of CSV window the maker insists are still unspent before it
+/// commits to a swap-in. Enough to notice the funding and get a sweep
+/// confirmed after the preimage arrives.
+const MIN_REMAINING_LOCKTIME: u32 = 24;
+
 /// Direction of a swap and how far it has progressed. Defined alongside the
 /// wallet's persisted record so the live state and the on-disk state cannot
 /// drift apart.
@@ -362,11 +372,23 @@ pub fn handle_lightning_message<M: Maker>(
 }
 
 /// Terms validation shared by both directions. Returns the maker fee.
+/// Refuses a swap id that already has state, so a second connection cannot
+/// overwrite an in-flight swap's record — which holds the only copy of the
+/// branch key needed to sweep or refund its HTLC.
+fn reject_if_swap_exists<M: Maker>(maker: &Arc<M>, swap_id: &str) -> Result<(), String> {
+    match maker.get_ln_swap(swap_id) {
+        Ok(Some(_)) => Err("a swap with this id is already in progress".to_string()),
+        Ok(None) => Ok(()),
+        Err(e) => Err(format!("cannot check for an existing swap: {e:?}")),
+    }
+}
+
 fn validate_terms<M: Maker>(
     maker: &Arc<M>,
     direction: LnDirection,
     amount: Amount,
     locktime: u16,
+    min_confirmations: u32,
 ) -> Result<Amount, String> {
     let config = maker.get_config();
     let Some(offer) = config.lightning else {
@@ -393,6 +415,26 @@ fn validate_terms<M: Maker>(
             super::handlers::MIN_CONTRACT_REACTION_TIME
         ));
     }
+    // The peer picks this, and both extremes hurt us: zero would have us act
+    // on an unconfirmed funding the peer can still double-spend, while a huge
+    // value pins a connection thread and eats the refund window while we wait.
+    let required = config
+        .required_confirms
+        .max(crate::utill::MIN_REQUIRED_CONFIRM);
+    if min_confirmations < required || min_confirmations > MAX_MIN_CONFIRMATIONS {
+        return Err(format!(
+            "min_confirmations {min_confirmations} outside the accepted range \
+             [{required}, {MAX_MIN_CONFIRMATIONS}]"
+        ));
+    }
+    // Every confirmation we wait for spends part of the CSV window we later
+    // need to sweep in, so the locktime has to cover both.
+    if (locktime as u32) < min_confirmations + MIN_REMAINING_LOCKTIME {
+        return Err(format!(
+            "locktime {locktime} leaves under {MIN_REMAINING_LOCKTIME} blocks \
+             after {min_confirmations} confirmation(s)"
+        ));
+    }
     let fee =
         offer.base_fee as f64 + amount.to_sat() as f64 * offer.amount_relative_fee_pct / 100.0;
     Ok(Amount::from_sat(fee.ceil() as u64))
@@ -415,7 +457,16 @@ fn handle_swap_in_request<M: Maker>(
     ctx: &LnContext,
     req: LnSwapInRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
-    let fee = match validate_terms(maker, LnDirection::SwapIn, req.amount, req.locktime) {
+    if let Err(reason) = reject_if_swap_exists(maker, &req.swap_id) {
+        return Ok(reject(&req.swap_id, reason));
+    }
+    let fee = match validate_terms(
+        maker,
+        LnDirection::SwapIn,
+        req.amount,
+        req.locktime,
+        req.min_confirmations,
+    ) {
         Ok(fee) => fee,
         Err(reason) => return Ok(reject(&req.swap_id, reason)),
     };
@@ -514,6 +565,24 @@ fn handle_swap_in_funded<M: Maker>(
     if let Err(e) = swap.htlc.validate_funding_output(output, expected) {
         return Ok(reject(&funded.swap_id, format!("bad funding output: {e}")));
     }
+    // Value and script are not enough. The taker chose this outpoint, so it
+    // may be one whose refund is already spendable — or already spent. Paying
+    // against either loses the Lightning amount outright.
+    let (unspent, age) = maker.htlc_unspent_and_age(&funded.outpoint)?;
+    if !unspent {
+        return Ok(reject(&funded.swap_id, "funding output is already spent"));
+    }
+    let remaining = (swap.locktime as u32).saturating_sub(age);
+    if remaining < MIN_REMAINING_LOCKTIME {
+        return Ok(reject(
+            &funded.swap_id,
+            format!(
+                "only {remaining} of {} locktime blocks remain after {age} elapsed",
+                swap.locktime
+            ),
+        ));
+    }
+
     let htlc_spk = swap
         .htlc
         .script_pubkey()
@@ -531,10 +600,10 @@ fn handle_swap_in_funded<M: Maker>(
     //
     // Bound the route's CLTV budget: we only learn the preimage when the
     // payment settles, and a settlement after our own refund window closes
-    // would let the taker reclaim the HTLC we already paid for. `accept`
-    // checked locktime >= invoice cltv + margin, so this bound always leaves
-    // room for the invoice's own final delta.
-    let cltv_bound = (swap.locktime as u32).saturating_sub(CLTV_SAFETY_MARGIN as u32);
+    // would let the taker reclaim the HTLC we already paid for. The budget is
+    // what is left of the window, not the whole locktime — blocks spent
+    // waiting for confirmations are already gone.
+    let cltv_bound = remaining.saturating_sub(CLTV_SAFETY_MARGIN as u32);
     ctx.ln
         .pay_invoice(&swap.invoice, None, Some(cltv_bound))
         .map_err(|e| MakerError::General(format!("pay_invoice: {e:?}").leak()))?;
@@ -632,7 +701,16 @@ fn handle_swap_out_request<M: Maker>(
     ctx: &LnContext,
     req: LnSwapOutRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
-    let fee = match validate_terms(maker, LnDirection::SwapOut, req.amount, req.locktime) {
+    if let Err(reason) = reject_if_swap_exists(maker, &req.swap_id) {
+        return Ok(reject(&req.swap_id, reason));
+    }
+    let fee = match validate_terms(
+        maker,
+        LnDirection::SwapOut,
+        req.amount,
+        req.locktime,
+        req.min_confirmations,
+    ) {
         Ok(fee) => fee,
         Err(reason) => return Ok(reject(&req.swap_id, reason)),
     };
@@ -746,24 +824,31 @@ fn handle_swap_out_paid<M: Maker>(
         .address(maker.network())
         .map_err(|e| MakerError::General(format!("htlc address: {e}").leak()))?;
     let (funding_tx, vout) = maker.fund_htlc(swap.amount, address)?;
-    let txid = maker.broadcast_transaction(&funding_tx)?;
-    let outpoint = OutPoint { txid, vout };
-    let value = funding_tx
+    let output = funding_tx
         .output
         .get(vout as usize)
-        .map(|o| o.value)
         .ok_or(MakerError::General("funding vout out of range"))?;
+    // The built transaction already fixes the outpoint, so record it before
+    // broadcasting. Crashing after a broadcast we had not persisted would
+    // leave the swap looking unfunded, and the watchdog would then drop the
+    // record holding the only copy of the refund key.
+    let outpoint = OutPoint {
+        txid: funding_tx.compute_txid(),
+        vout,
+    };
+    let value = output.value;
+    swap.funding = Some((outpoint, value));
+    swap.funding_height = maker.get_current_height().ok();
+    swap.phase = LnMakerPhase::OutFunded;
+    swap.touch();
+    store_swap(maker, swap_id, swap.clone())?;
+
     let htlc_spk = swap
         .htlc
         .script_pubkey()
         .map_err(|e| MakerError::General(format!("htlc spk: {e}").leak()))?;
     maker.register_watch_outpoint(outpoint, htlc_spk)?;
-
-    swap.funding = Some((outpoint, value));
-    swap.funding_height = maker.get_current_height().ok();
-    swap.phase = LnMakerPhase::OutFunded;
-    swap.touch();
-    store_swap(maker, swap_id, swap)?;
+    maker.broadcast_transaction(&funding_tx)?;
     let _ = maker.sync_and_save_wallet();
 
     log::info!(
@@ -985,9 +1070,13 @@ fn watchdog_resolve_swap_out(
                 }
             }
         }
-        Err(e) => Err(MakerError::General(
-            format!("watch request failed: {e:?}").leak(),
-        )),
+        Err(e) => {
+            // Logged rather than formatted into the error: MakerError::General
+            // holds a &'static str, and the watchdog reaches this on every
+            // tick for a persistently failing watch.
+            log::warn!("swap-out {swap_id}: watch request failed: {e:?}");
+            Err(MakerError::General("watch request failed"))
+        }
     }
 }
 

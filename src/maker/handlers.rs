@@ -572,6 +572,20 @@ pub trait Maker: Send + Sync {
         Ok(())
     }
 
+    /// Whether `outpoint` is still unspent (mempool included), and how many
+    /// blocks have passed since its transaction confirmed.
+    ///
+    /// A swap-in maker must know both before it pays: an already-spent
+    /// output, or one whose CSV window has largely elapsed, means the taker
+    /// can refund the HTLC the maker is about to pay for.
+    #[cfg(feature = "lightning")]
+    fn htlc_unspent_and_age(
+        &self,
+        _outpoint: &bitcoin::OutPoint,
+    ) -> Result<(bool, u32), MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
     /// Waits for a Lightning HTLC funding transaction to reach
     /// `required_confirms`.
     ///

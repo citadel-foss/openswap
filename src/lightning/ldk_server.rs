@@ -64,6 +64,7 @@ const DEFAULT_MAX_CHANNEL_SATURATION_POW_HALF: u32 = 2;
 pub struct LdkServerBackend {
     runtime: Runtime,
     client: LdkServerClient,
+    network: bitcoin::Network,
     timeout: Duration,
     event_rx: Receiver<LnEvent>,
     shutdown: Arc<AtomicBool>,
@@ -110,6 +111,7 @@ impl LdkServerBackend {
         Ok(Self {
             runtime,
             client,
+            network: config.network,
             timeout: Duration::from_secs(config.timeout_secs),
             event_rx,
             shutdown,
@@ -213,12 +215,18 @@ impl LightningBackend for LdkServerBackend {
             self.client
                 .onchain_receive(proto_api::OnchainReceiveRequest {}),
         )?;
-        // The sidecar is our own trusted node; network consistency between
-        // the node and the coinswap wallet is enforced by the caller.
-        Ok(response
+        // A misconfigured or compromised sidecar can hand back an address for
+        // another network, which would have us fund a script it never
+        // watches on our chain.
+        response
             .address
             .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
-            .assume_checked())
+            .require_network(self.network)
+            .map_err(|e| {
+                LightningError::InvalidResponse(format!(
+                    "backend returned an address for the wrong network: {e}"
+                ))
+            })
     }
 
     fn send_onchain(
@@ -368,9 +376,10 @@ impl LightningBackend for LdkServerBackend {
         };
         match self.call(self.client.get_payment_details(request)) {
             Ok(response) => Ok(extract_payment_fields(response.payment.as_ref()).preimage),
-            // A payment the node has never heard of is a valid answer here,
-            // not a failure: the caller is asking whether one exists.
-            Err(LightningError::Api { .. }) => Ok(None),
+            // Only an explicit "no such payment" is an answer. Every other
+            // failure must surface: recovery treating a transport error as
+            // "not settled" would silently give up on a sweep.
+            Err(LightningError::Api { ref code, .. }) if code.contains("NotFound") => Ok(None),
             Err(e) => Err(e),
         }
     }

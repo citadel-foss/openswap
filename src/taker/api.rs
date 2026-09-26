@@ -743,7 +743,11 @@ impl Taker {
         };
         #[cfg(feature = "lightning")]
         {
-            taker.lightning = super::lightning_swap::init_lightning_backend(&taker.config);
+            let network = taker
+                .read_wallet()
+                .map(|wallet| wallet.store.network)
+                .unwrap_or(bitcoin::Network::Bitcoin);
+            taker.lightning = super::lightning_swap::init_lightning_backend(&taker.config, network);
         }
 
         taker.init_recover_wallet();

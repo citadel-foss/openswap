@@ -86,7 +86,9 @@ fn lightning_maker_restart_recovers_funded_swap() {
     );
 
     let maker = makers[0].clone();
-    let locktime: u16 = 20;
+    // Must clear the maker's floor: enough window must remain after the
+    // confirmations it waits for.
+    let locktime: u16 = 30;
     let amount = Amount::from_sat(40_000);
 
     // The taker's secret and claim key; the maker never learns the preimage.

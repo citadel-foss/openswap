@@ -28,6 +28,9 @@ pub struct LightningConfig {
     pub tls_cert_path: Option<PathBuf>,
     /// Timeout in seconds applied to each unary backend call.
     pub timeout_secs: u64,
+    /// Network the sidecar is expected to be running on. Addresses it
+    /// returns are checked against this rather than trusted.
+    pub network: bitcoin::Network,
 }
 
 impl Default for LightningConfig {
@@ -37,6 +40,7 @@ impl Default for LightningConfig {
             api_key: String::new(),
             tls_cert_path: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            network: bitcoin::Network::Regtest,
         }
     }
 }
@@ -81,7 +85,9 @@ mod tests {
 
     #[test]
     fn default_cert_path_ends_with_tls_crt() {
-        let path = default_cert_path().expect("home dir should resolve in tests");
-        assert!(path.ends_with("tls.crt"));
+        // An environment with no home directory is valid, and returns None.
+        if let Some(path) = default_cert_path() {
+            assert!(path.ends_with("tls.crt"));
+        }
     }
 }

@@ -150,6 +150,7 @@ pub struct LnRoutedSwapReport {
 /// behavior: misconfiguration disables Lightning instead of failing init.
 pub(crate) fn init_lightning_backend(
     config: &TakerInitConfig,
+    network: bitcoin::Network,
 ) -> Option<Arc<dyn LightningBackend>> {
     use bitcoin::hashes::hex::DisplayHex;
     let url = config.ldk_server_url.as_ref()?;
@@ -175,6 +176,7 @@ pub(crate) fn init_lightning_backend(
             .as_ref()
             .map(std::path::PathBuf::from),
         timeout_secs: crate::lightning::DEFAULT_TIMEOUT_SECS,
+        network,
     };
     match crate::lightning::LdkServerBackend::new(&ln_config) {
         Ok(backend) => {
@@ -389,6 +391,12 @@ impl Taker {
                         return Ok(event);
                     }
                     log::debug!("ignoring lightning event: {event:?}");
+                    // Checked here too: a backend emitting a steady stream of
+                    // events for other payments would otherwise never reach
+                    // the deadline, and never sleep either.
+                    if Instant::now() > deadline {
+                        return Err(general(format!("timed out waiting for {what}")));
+                    }
                 }
                 None => {
                     if Instant::now() > deadline {
@@ -432,7 +440,12 @@ impl Taker {
             .map_err(|e| general(format!("htlc address: {e}")))?;
         let spk = address.script_pubkey();
 
-        let (tx, vout) = {
+        // Build and record the funding, then broadcast. The transaction fixes
+        // its own outpoint before it reaches the network, and a crash between
+        // a broadcast and its record would strand the HTLC: recovery treats a
+        // record without an outpoint as "nothing was committed" and discards
+        // the only copy of our branch key.
+        let (outpoint, actual_value) = {
             let mut wallet = self.write_wallet()?;
             // One split, one destination: an HTLC output is a single exact
             // payment, with no hop to reimburse and nothing to randomize.
@@ -444,34 +457,28 @@ impl Taker {
                 .into_iter()
                 .next()
                 .ok_or_else(|| general("no funding tx created"))?;
-            let vout = result
-                .payment_output_positions
-                .first()
-                .copied()
-                .unwrap_or(0);
-            wallet.send_tx(&tx)?;
-            (tx, vout)
-        };
-        let outpoint = OutPoint {
-            txid: tx.compute_txid(),
-            vout,
-        };
-        let actual_value = tx
-            .output
-            .get(vout as usize)
-            .map(|o| o.value)
-            .ok_or_else(|| general("funding vout out of range"))?;
-
-        // Update the recovery record with the now-committed outpoint before
-        // anything else can go wrong.
-        {
-            let mut wallet = self.write_wallet()?;
+            // Locate the HTLC by its script: a positional fallback could point
+            // at the change output, whose value we cannot spend with the
+            // HTLC's keys.
+            let vout = tx
+                .output
+                .iter()
+                .position(|output| output.script_pubkey == spk)
+                .ok_or_else(|| general("funding tx has no HTLC output"))?
+                as u32;
+            let outpoint = OutPoint {
+                txid: tx.compute_txid(),
+                vout,
+            };
+            let actual_value = tx.output[vout as usize].value;
             if let Some(record) = wallet.store.ln_pending_swaps.get_mut(swap_id) {
                 record.outpoint = Some(outpoint);
                 record.value = Some(actual_value);
             }
             wallet.save_to_disk()?;
-        }
+            wallet.send_tx(&tx)?;
+            (outpoint, actual_value)
+        };
         let _ = self.watch_service.register_watch_request(outpoint, spk);
 
         log::info!("HTLC funding broadcast: {outpoint}, waiting for {min_confirmations} conf");
@@ -1085,31 +1092,48 @@ impl Taker {
             }
             .map_err(|e| general(format!("recovery spend build: {e}")))?;
 
-            match self.read_wallet()?.send_tx(&spend) {
-                Ok(txid) => {
+            // A record is the only copy of the key that reaches this HTLC, so
+            // it is dropped on one condition alone: the outpoint has a
+            // *confirmed* spend. Neither a successful broadcast nor an
+            // ambiguous backend error qualifies — a mempool spend can still
+            // be evicted or reorged out, and deleting on one strands the
+            // HTLC for good.
+            let broadcast = self.read_wallet()?.send_tx(&spend);
+            match &broadcast {
+                Ok(txid) => log::info!("{swap_id}: recovery spend broadcast in {txid}"),
+                Err(e) => log::debug!("{swap_id}: recovery spend not accepted: {e:?}"),
+            }
+
+            let script = htlc
+                .script_pubkey()
+                .map_err(|e| general(format!("htlc spk: {e}")))?;
+            let settled = {
+                use crate::wallet::blockchain::Blockchain;
+                self.read_wallet()?
+                    .blockchain
+                    .is_confirmed_spend(&outpoint, &script)
+            };
+            match settled {
+                Ok(true) => {
                     self.remove_pending_swap(&swap_id)?;
-                    outcomes.push(format!("{swap_id}: recovered via {txid}"));
+                    outcomes.push(match broadcast {
+                        Ok(txid) => format!("{swap_id}: recovered via {txid}"),
+                        Err(_) => format!("{swap_id}: already resolved on-chain"),
+                    });
                 }
-                Err(e) => {
-                    let text = format!("{e:?}");
-                    if text.contains("non-BIP68-final") {
-                        outcomes.push(format!(
-                            "{swap_id}: refund not yet mature (locktime {}); retry later",
-                            record.locktime
-                        ));
-                    } else if text.contains("missingorspent")
-                        || text.contains("already")
-                        || text.contains("conflict")
-                    {
-                        // The outpoint is gone: counterparty claimed (they
-                        // held the preimage/our payment settled) or an
-                        // earlier recovery landed.
-                        self.remove_pending_swap(&swap_id)?;
-                        outcomes.push(format!("{swap_id}: already resolved on-chain"));
-                    } else {
-                        outcomes.push(format!("{swap_id}: broadcast failed: {text}"));
+                Ok(false) => outcomes.push(match broadcast {
+                    Ok(txid) => {
+                        format!("{swap_id}: recovery {txid} broadcast, awaiting confirmation")
                     }
-                }
+                    Err(e) if format!("{e:?}").contains("non-BIP68-final") => format!(
+                        "{swap_id}: refund not yet mature (locktime {}); retry later",
+                        record.locktime
+                    ),
+                    Err(e) => format!("{swap_id}: not yet recovered: {e:?}"),
+                }),
+                // The chain query itself failed, which says nothing about the
+                // outpoint. Keep the record and retry later.
+                Err(e) => outcomes.push(format!("{swap_id}: spend status unknown: {e:?}")),
             }
         }
         let _ = self.write_wallet()?.sync_and_save(&Default::default());

@@ -296,7 +296,7 @@ pub struct LnMakerSwapRecord {
 /// Persisted (encrypted with the rest of the store) before any value is
 /// committed, so a crashed taker can always claim (preimage present) or
 /// refund (timelock branch) the on-chain HTLC.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct LnPendingSwap {
     /// Whether this is a swap-in (`true`: we funded, refund branch is ours)
     /// or a swap-out (`false`: we claim via hashlock with the preimage).
@@ -313,6 +313,20 @@ pub struct LnPendingSwap {
     pub outpoint: Option<OutPoint>,
     /// The HTLC funding value, once known.
     pub value: Option<bitcoin::Amount>,
+}
+
+/// Redacted: the preimage is the secret the whole swap turns on, and
+/// `Wallet` formats its store.
+impl std::fmt::Debug for LnPendingSwap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LnPendingSwap")
+            .field("is_swap_in", &self.is_swap_in)
+            .field("preimage", &self.preimage.map(|_| "<redacted>"))
+            .field("locktime", &self.locktime)
+            .field("outpoint", &self.outpoint)
+            .field("value", &self.value)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WalletStore {

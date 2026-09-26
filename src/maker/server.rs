@@ -238,6 +238,13 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         .then(|| maker.get_tor_hostname())
         .transpose()?;
 
+    // Before the fidelity and liquidity waits, not after: both loop until the
+    // wallet has funds, and a maker whose coins are locked in a Lightning
+    // HTLC needs the watchdog to refund them before it can ever satisfy
+    // those waits. Recovery must not depend on being ready for new swaps.
+    #[cfg(feature = "lightning")]
+    spawn_lightning_threads(&maker)?;
+
     if let Some(maker_address) = maker_address.as_ref() {
         log::info!(
             "[{}] Setting up fidelity bond...",
@@ -248,9 +255,6 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
         maker.check_swap_liquidity()?;
     }
-
-    #[cfg(feature = "lightning")]
-    spawn_lightning_threads(&maker)?;
 
     // Check for unfinished swapcoins from a previous run and start recovery.
     {
@@ -481,8 +485,17 @@ fn spawn_lightning_threads(maker: &Arc<MakerServer>) -> Result<(), MakerError> {
                 super::lightning_handlers::ln_watchdog_tick(&watchdog_maker);
             }
             log::info!("Lightning swap watchdog stopped");
-        })
-        .map_err(MakerError::IO)?;
+        });
+    // The pump is already running and holds a MakerServer handle. If the
+    // watchdog cannot start, signal shutdown so the pump exits instead of
+    // spinning for the life of the process.
+    let watchdog = match watchdog {
+        Ok(handle) => handle,
+        Err(e) => {
+            maker.shutdown.store(true, Ordering::Relaxed);
+            return Err(MakerError::IO(e));
+        }
+    };
     maker.thread_pool.add_thread(watchdog)?;
     Ok(())
 }

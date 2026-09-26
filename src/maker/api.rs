@@ -697,6 +697,16 @@ pub struct MakerServer {
     /// Router distributing Lightning node events to per-swap mailboxes.
     #[cfg(feature = "lightning")]
     pub ln_router: Option<std::sync::Arc<super::lightning_handlers::LnEventRouter>>,
+    /// Last computed Lightning offer and when it was computed. Deriving one
+    /// costs a gRPC round-trip, and `get_config` runs on every coinswap
+    /// message, so the result is cached for [`LN_OFFER_TTL`].
+    #[cfg(feature = "lightning")]
+    ln_offer_cache: Mutex<
+        Option<(
+            Instant,
+            Option<crate::protocol::lightning_messages::LightningOffer>,
+        )>,
+    >,
     /// Active Lightning swaps by swap_id (hex payment hash).
     #[cfg(feature = "lightning")]
     pub ln_swaps: Mutex<HashMap<String, super::lightning_handlers::LnMakerSwap>>,
@@ -711,6 +721,10 @@ pub struct MakerServer {
     #[cfg(feature = "integration-test")]
     pub reserved_rpc_listener: Mutex<Option<TcpListener>>,
 }
+
+/// How long a derived Lightning offer is served before it is recomputed.
+#[cfg(feature = "lightning")]
+const LN_OFFER_TTL: Duration = Duration::from_secs(15);
 
 /// Idle swap data returned by [`MakerServer::drain_idle_swaps`].
 pub struct IdleSwapData {
@@ -874,6 +888,8 @@ impl MakerServer {
             #[cfg(feature = "lightning")]
             ln_router,
             #[cfg(feature = "lightning")]
+            ln_offer_cache: Mutex::new(None),
+            #[cfg(feature = "lightning")]
             ln_swaps: Mutex::new(restored_ln_swaps),
             #[cfg(feature = "integration-test")]
             behavior: MakerBehavior::default(),
@@ -946,6 +962,7 @@ impl MakerServer {
             api_key,
             tls_cert_path: config.ldk_tls_cert_path.as_ref().map(PathBuf::from),
             timeout_secs: crate::lightning::DEFAULT_TIMEOUT_SECS,
+            network: config.network,
         };
         match crate::lightning::LdkServerBackend::new(&ln_config) {
             Ok(backend) => {
@@ -1712,6 +1729,30 @@ impl MakerServer {
     /// See the non-lightning variant.
     #[cfg(feature = "lightning")]
     fn lightning_offer(&self) -> Option<crate::protocol::lightning_messages::LightningOffer> {
+        // Serve a recent answer if we have one: `get_config` is on the path
+        // of every coinswap message, and recomputing means a gRPC call to
+        // the sidecar each time. Capacity that goes stale within the window
+        // only costs a later rejection, never safety — the funding and
+        // payment steps fail closed on their own.
+        if let Ok(cache) = lock_debug!(self.ln_offer_cache.lock()) {
+            if let Some((computed_at, offer)) = cache.as_ref() {
+                if computed_at.elapsed() < LN_OFFER_TTL {
+                    return *offer;
+                }
+            }
+        }
+        let offer = self.compute_lightning_offer();
+        if let Ok(mut cache) = lock_debug!(self.ln_offer_cache.lock()) {
+            *cache = Some((Instant::now(), offer));
+        }
+        offer
+    }
+
+    /// Derives the Lightning offer from live node and wallet state.
+    #[cfg(feature = "lightning")]
+    fn compute_lightning_offer(
+        &self,
+    ) -> Option<crate::protocol::lightning_messages::LightningOffer> {
         let ln = self.lightning.as_ref()?;
         // Each direction draws on a different resource, so they are sized
         // separately from live channel state rather than from one balance.
@@ -3192,6 +3233,37 @@ impl MakerTrait for MakerServer {
             wallet.save_to_disk().map_err(MakerError::Wallet)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "lightning")]
+    fn htlc_unspent_and_age(
+        &self,
+        outpoint: &bitcoin::OutPoint,
+    ) -> Result<(bool, u32), MakerError> {
+        use crate::wallet::Blockchain;
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // Mempool included: a spend that is only in the mempool still means
+        // the taker is taking this output back.
+        let unspent = wallet
+            .blockchain
+            .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+            .map_err(MakerError::Wallet)?
+            .is_some();
+        let tip = wallet
+            .blockchain
+            .get_block_count()
+            .map_err(MakerError::Wallet)?;
+        let confirmed_at = wallet
+            .blockchain
+            .tx_block_height(&outpoint.txid)
+            .map_err(MakerError::Wallet)?;
+        // An unconfirmed funding has aged zero blocks; the confirmation wait
+        // is what decides whether that is acceptable.
+        let age = confirmed_at
+            .map(|height| tip.saturating_sub(height) as u32)
+            .unwrap_or(0);
+        Ok((unspent, age))
     }
 
     #[cfg(feature = "lightning")]

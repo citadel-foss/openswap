@@ -34,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_key,
         tls_cert_path: Some(data_dir.join("tls.crt")),
         timeout_secs: 10,
+        network: bitcoin::Network::Regtest,
     };
 
     println!("== connecting to {} ==", config.base_url);

@@ -49,6 +49,7 @@ fn connect(data_dir: &Path, grpc_addr: &str) -> LdkServerBackend {
         api_key,
         tls_cert_path: Some(data_dir.join("tls.crt")),
         timeout_secs: 10,
+        network: Network::Regtest,
     })
     .expect("backend connects")
 }
