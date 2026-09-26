@@ -75,7 +75,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 6. Hold invoice for an externally supplied hash (the Track 2/3 primitive)
-    let preimage = Preimage([0x42; 32]);
+    // Unique per run: a node rejects a payment hash it has already seen, so a
+    // fixed preimage would make this example work exactly once per data dir.
+    let preimage = {
+        let mut bytes = [0x42u8; 32];
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        bytes[..16].copy_from_slice(&nanos.to_le_bytes());
+        Preimage(bytes)
+    };
     let payment_hash = preimage.payment_hash();
     let hold = backend.create_hold_invoice(
         payment_hash,

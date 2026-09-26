@@ -190,17 +190,21 @@ fn main() {
         matches!(e, LnEvent::PaymentSuccessful { payment_hash, .. }
             if *payment_hash == Some(invoice.payment_hash))
     });
-    if let LnEvent::PaymentSuccessful {
-        preimage: Some(preimage),
-        ..
-    } = &success
-    {
-        assert_eq!(
-            preimage.payment_hash(),
-            invoice.payment_hash,
-            "released preimage must hash to the invoice payment hash"
-        );
-        println!("preimage verified: sha256(preimage) == payment_hash");
+    // Preimage release is the property this example exists to demonstrate, so
+    // a settlement without one is a failure rather than a skipped check.
+    match &success {
+        LnEvent::PaymentSuccessful {
+            preimage: Some(preimage),
+            ..
+        } => {
+            assert_eq!(
+                preimage.payment_hash(),
+                invoice.payment_hash,
+                "released preimage must hash to the invoice payment hash"
+            );
+            println!("preimage verified: sha256(preimage) == payment_hash");
+        }
+        other => panic!("settlement carried no preimage: {:?}", other),
     }
     wait_event("node2", &node2, Duration::from_secs(30), |e| {
         matches!(e, LnEvent::PaymentReceived { payment_hash, .. }
@@ -247,12 +251,14 @@ fn main() {
         matches!(e, LnEvent::PaymentSuccessful { payment_hash: h, .. }
             if *h == Some(payment_hash))
     });
-    if let LnEvent::PaymentSuccessful {
-        preimage: Some(p), ..
-    } = &hold_success
-    {
-        assert_eq!(*p, preimage, "payer must learn the exact preimage");
-        println!("payer learned preimage {} via settlement", p.to_hex());
+    match &hold_success {
+        LnEvent::PaymentSuccessful {
+            preimage: Some(p), ..
+        } => {
+            assert_eq!(*p, preimage, "payer must learn the exact preimage");
+            println!("payer learned preimage {} via settlement", p.to_hex());
+        }
+        other => panic!("hold settlement carried no preimage: {:?}", other),
     }
     wait_event("node2", &node2, Duration::from_secs(30), |e| {
         matches!(e, LnEvent::PaymentReceived { payment_hash: h, .. }

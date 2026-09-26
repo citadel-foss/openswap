@@ -74,6 +74,16 @@ const MAX_MIN_CONFIRMATIONS: u32 = 12;
 /// confirmed after the preimage arrives.
 const MIN_REMAINING_LOCKTIME: u32 = 24;
 
+/// Blocks past a taker's refund maturity before the maker gives up on a
+/// swap-in it never learned the preimage for. Generous: dropping too early
+/// would discard a sweep that could still land.
+const REFUND_GRACE_BLOCKS: u32 = 12;
+
+/// Blocks the swap-out maker keeps between the last moment the taker can
+/// claim on-chain and the deadline for settling the held Lightning payment.
+/// Covers spotting the preimage on-chain and getting the settlement through.
+const SETTLE_MARGIN: u32 = 6;
+
 /// Direction of a swap and how far it has progressed. Defined alongside the
 /// wallet's persisted record so the live state and the on-disk state cannot
 /// drift apart.
@@ -372,15 +382,37 @@ pub fn handle_lightning_message<M: Maker>(
 }
 
 /// Terms validation shared by both directions. Returns the maker fee.
+/// Most Lightning swaps the maker keeps in flight at once. Each one holds a
+/// hold invoice, a mailbox, and a persisted record, so an uncapped peer can
+/// exhaust node and disk resources for free.
+const MAX_CONCURRENT_LN_SWAPS: usize = 16;
+
+/// The wire format states that the swap id is the hex payment hash, but
+/// nothing on the wire enforces it. Checking keeps the two from disagreeing,
+/// which would route a swap's messages to state built under another key.
+fn swap_id_matches_hash(swap_id: &str, payment_hash: &sha256::Hash) -> Result<(), String> {
+    if swap_id == payment_hash.to_string() {
+        Ok(())
+    } else {
+        Err("swap id does not match the payment hash".to_string())
+    }
+}
+
 /// Refuses a swap id that already has state, so a second connection cannot
 /// overwrite an in-flight swap's record — which holds the only copy of the
 /// branch key needed to sweep or refund its HTLC.
 fn reject_if_swap_exists<M: Maker>(maker: &Arc<M>, swap_id: &str) -> Result<(), String> {
     match maker.get_ln_swap(swap_id) {
-        Ok(Some(_)) => Err("a swap with this id is already in progress".to_string()),
-        Ok(None) => Ok(()),
-        Err(e) => Err(format!("cannot check for an existing swap: {e:?}")),
+        Ok(Some(_)) => return Err("a swap with this id is already in progress".to_string()),
+        Ok(None) => {}
+        Err(e) => return Err(format!("cannot check for an existing swap: {e:?}")),
     }
+    if maker.ln_swap_count() >= MAX_CONCURRENT_LN_SWAPS {
+        return Err(format!(
+            "maker is already serving {MAX_CONCURRENT_LN_SWAPS} lightning swaps"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_terms<M: Maker>(
@@ -457,7 +489,9 @@ fn handle_swap_in_request<M: Maker>(
     ctx: &LnContext,
     req: LnSwapInRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
-    if let Err(reason) = reject_if_swap_exists(maker, &req.swap_id) {
+    if let Err(reason) = swap_id_matches_hash(&req.swap_id, &req.payment_hash)
+        .and_then(|()| reject_if_swap_exists(maker, &req.swap_id))
+    {
         return Ok(reject(&req.swap_id, reason));
     }
     let fee = match validate_terms(
@@ -701,7 +735,9 @@ fn handle_swap_out_request<M: Maker>(
     ctx: &LnContext,
     req: LnSwapOutRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
-    if let Err(reason) = reject_if_swap_exists(maker, &req.swap_id) {
+    if let Err(reason) = swap_id_matches_hash(&req.swap_id, &req.payment_hash)
+        .and_then(|()| reject_if_swap_exists(maker, &req.swap_id))
+    {
         return Ok(reject(&req.swap_id, reason));
     }
     let fee = match validate_terms(
@@ -804,17 +840,47 @@ fn handle_swap_out_paid<M: Maker>(
     let held = loop {
         if let Some(event) = ctx.router.take_event(&swap.payment_hash) {
             match event {
-                LnEvent::PaymentClaimable { .. } => break true,
+                LnEvent::PaymentClaimable { claim_deadline, .. } => break Some(claim_deadline),
                 other => log::debug!("ignoring event while waiting for held payment: {other:?}"),
             }
         } else if Instant::now() > deadline || maker.shutdown_requested() {
-            break false;
+            break None;
         } else {
             std::thread::sleep(Duration::from_millis(200));
         }
     };
-    if !held {
+    let Some(claim_deadline) = held else {
         return Ok(reject(swap_id, "held payment not observed"));
+    };
+
+    // The taker can claim on-chain right up to the moment our refund branch
+    // opens, and only then do we learn the preimage we need to settle the
+    // held payment. If that moment falls after the payment's own claim
+    // deadline, the payment fails back first and the taker takes both sides.
+    //
+    // Refusing here is the honest answer when the node's hold window is
+    // narrower than the on-chain window — which is the case for an unpatched
+    // ldk-node, whose window is only a few blocks wide.
+    let tip = maker.get_current_height()?;
+    let claim_window_ends = tip.saturating_add(swap.locktime as u32);
+    match claim_deadline {
+        Some(deadline) if deadline >= claim_window_ends.saturating_add(SETTLE_MARGIN) => {}
+        Some(deadline) => {
+            return Ok(reject(
+                swap_id,
+                format!(
+                    "lightning claim deadline {deadline} is before the on-chain claim \
+                     window closes at {claim_window_ends} (+{SETTLE_MARGIN} margin); \
+                     the node's hold window is too narrow for this locktime"
+                ),
+            ));
+        }
+        None => {
+            return Ok(reject(
+                swap_id,
+                "backend reported no claim deadline, so the hold window cannot be checked",
+            ));
+        }
     }
 
     // Fund the HTLC from the wallet with exactly `amount` (the fee is
@@ -823,7 +889,7 @@ fn handle_swap_out_paid<M: Maker>(
         .htlc
         .address(maker.network())
         .map_err(|e| MakerError::General(format!("htlc address: {e}").leak()))?;
-    let (funding_tx, vout) = maker.fund_htlc(swap.amount, address)?;
+    let (funding_tx, vout) = maker.fund_htlc(swap_id, swap.amount, address)?;
     let output = funding_tx
         .output
         .get(vout as usize)
@@ -994,17 +1060,35 @@ fn watchdog_finish_swap_in(
     // it may have been delivered while this maker was down, since event
     // delivery is at-most-once. Ask the node directly, which is the only way
     // a restarted swap-in maker can still reach the preimage it needs.
-    let preimage = ctx
-        .ln
-        .settled_preimage(swap.payment_hash)
-        .map_err(|e| MakerError::General(format!("preimage lookup: {e:?}").leak()))?;
-    match preimage {
-        Some(preimage) if preimage.payment_hash() == swap.payment_hash => {
+    let preimage = ctx.ln.settled_preimage(swap.payment_hash).map_err(|e| {
+        log::warn!("swap-in {swap_id}: preimage lookup failed: {e:?}");
+        MakerError::General("preimage lookup failed")
+    })?;
+    if let Some(preimage) = preimage {
+        if preimage.payment_hash() == swap.payment_hash {
             log::info!("Swap-in {swap_id}: recovered preimage from the node's payment store");
-            sweep_swap_in(maker, ctx, swap_id, swap, &preimage)
+            return sweep_swap_in(maker, ctx, swap_id, swap, &preimage);
         }
-        _ => Ok(()),
     }
+
+    // The payment never settled and the taker's refund window has closed, so
+    // the HTLC is theirs and there is nothing left for us to sweep. Without
+    // this an `InPaid` swap whose payment failed would be polled forever.
+    if let (Some(funded_at), Ok(tip)) = (swap.funding_height, maker.get_current_height()) {
+        let refundable_at = funded_at.saturating_add(swap.locktime as u32);
+        if tip > refundable_at.saturating_add(REFUND_GRACE_BLOCKS) {
+            log::info!(
+                "Swap-in {swap_id}: never settled and the taker's refund window has passed; \
+                 dropping the swap"
+            );
+            ctx.router.unsubscribe(&swap.payment_hash);
+            if let (Some((outpoint, _)), Ok(spk)) = (swap.funding, swap.htlc.script_pubkey()) {
+                maker.unwatch_outpoint(outpoint, spk);
+            }
+            return maker.remove_ln_swap(swap_id);
+        }
+    }
+    Ok(())
 }
 
 fn watchdog_resolve_swap_out(

@@ -51,6 +51,15 @@ use openswap::{
 
 const BITCOIN_VERSION: &str = "28.1";
 
+/// Whether an `init` took the injection lock itself, or is nested inside an
+/// `init_with_lightning` that already holds it.
+#[cfg(feature = "lightning")]
+enum InjectGuard<'a> {
+    /// Kept only so the lock lives until the guard drops; never read.
+    Held(#[allow(dead_code)] std::sync::MutexGuard<'a, ()>),
+    Reentrant,
+}
+
 /// Lightning backends for the makers of the test currently initializing,
 /// indexed the same way as `makers_config_map`. Guarded by
 /// [`LN_INJECT_LOCK`] so concurrently running lightning tests cannot read
@@ -61,7 +70,9 @@ static LN_MAKER_INJECT: Mutex<Vec<std::sync::Arc<dyn openswap::lightning::Lightn
     Mutex::new(Vec::new());
 
 /// Held for the whole of one lightning test's framework init, which is the
-/// window in which [`LN_MAKER_INJECT`] is meaningful.
+/// window in which [`LN_MAKER_INJECT`] is meaningful. Every `init` takes it,
+/// not just `init_with_lightning`: a plain init running concurrently would
+/// otherwise read — and consume — another test's injected backends.
 #[cfg(feature = "lightning")]
 static LN_INJECT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -931,6 +942,13 @@ impl TestFramework {
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
+        // Serialized against lightning inits, which is the only window in
+        // which the shared injection slot holds anything.
+        #[cfg(feature = "lightning")]
+        let _inject_guard = LN_INJECT_LOCK
+            .try_lock()
+            .map(InjectGuard::Held)
+            .unwrap_or(InjectGuard::Reentrant);
         let makers_config_map = vec![(0, None); maker_count];
         let fee_overrides = vec![None; maker_count];
         Self::init_with_settings::<B>(

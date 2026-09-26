@@ -3226,10 +3226,14 @@ impl MakerTrait for MakerServer {
             .map_err(|_| MakerError::MutexPossion)?
             .remove(swap_id);
         // Dropped from disk only after the swap is resolved; an interrupted
-        // removal just leaves a record the next startup re-resolves.
+        // removal just leaves a record the next startup re-resolves. Any
+        // inputs this swap reserved for its funding are freed here too, on
+        // every resolution path.
         let mut wallet = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-        if wallet.store.ln_maker_swaps.remove(swap_id).is_some() {
+        let removed = wallet.store.ln_maker_swaps.remove(swap_id).is_some();
+        let released = wallet.release_swap_locks(swap_id, None);
+        if removed || released {
             wallet.save_to_disk().map_err(MakerError::Wallet)?;
         }
         Ok(())
@@ -3293,6 +3297,7 @@ impl MakerTrait for MakerServer {
     #[cfg(feature = "lightning")]
     fn fund_htlc(
         &self,
+        swap_id: &str,
         amount: Amount,
         address: bitcoin::Address,
     ) -> Result<(Transaction, u32), MakerError> {
@@ -3302,9 +3307,26 @@ impl MakerTrait for MakerServer {
         let plan = wallet
             .plan_funding(amount, 1, MIN_RELAY_FEE_RATE, u32::MAX, None, None, None)
             .map_err(MakerError::Wallet)?;
-        let result = wallet
-            .execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE)
-            .map_err(MakerError::Wallet)?;
+        // Claim the selected inputs under this swap before executing, so a
+        // concurrent coinswap admission plans around them instead of
+        // selecting the same coins.
+        let selected: Vec<_> = plan
+            .iter()
+            .flat_map(|split| split.utxos.iter().copied())
+            .collect();
+        wallet.reserve_swap_locks(swap_id, &selected);
+        let result = wallet.execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE);
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                // Nothing was broadcast, so hand the coins back rather than
+                // leaving them reserved for a swap that never funded.
+                if wallet.release_swap_locks(swap_id, None) {
+                    let _ = wallet.save_to_disk();
+                }
+                return Err(MakerError::Wallet(e));
+            }
+        };
         let tx = result
             .funding_txes
             .into_iter()
@@ -3316,6 +3338,13 @@ impl MakerTrait for MakerServer {
             .copied()
             .unwrap_or(0);
         Ok((tx, vout))
+    }
+
+    #[cfg(feature = "lightning")]
+    fn ln_swap_count(&self) -> usize {
+        lock_debug!(self.ln_swaps.lock())
+            .map(|swaps| swaps.len())
+            .unwrap_or(0)
     }
 
     #[cfg(feature = "lightning")]
@@ -3544,5 +3573,70 @@ mod tests {
             .unwrap()
             .unwrap();
         joiner.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod lightning_config_tests {
+    use super::MakerServerConfig;
+    use std::io::Write as _;
+
+    /// The Lightning settings must survive a load, and must survive the
+    /// rewrite `makerd` performs on every start. A field missing from
+    /// `write_to_file` would be silently dropped on the next launch, leaving
+    /// a configured maker with Lightning disabled and no error.
+    #[test]
+    fn lightning_settings_round_trip_through_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let timelock = if cfg!(feature = "integration-test") {
+            950
+        } else {
+            15_000
+        };
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(
+            file,
+            "fidelity_timelock = {timelock}\n\
+             ldk_server_url = 127.0.0.1:3536\n\
+             ldk_api_key_path = /tmp/ldk/api_key\n\
+             ldk_tls_cert_path = /tmp/ldk/tls.crt\n"
+        )
+        .unwrap();
+        drop(file);
+
+        let loaded = MakerServerConfig::new(Some(&path)).unwrap();
+        assert_eq!(loaded.ldk_server_url.as_deref(), Some("127.0.0.1:3536"));
+        assert_eq!(loaded.ldk_api_key_path.as_deref(), Some("/tmp/ldk/api_key"));
+        assert_eq!(
+            loaded.ldk_tls_cert_path.as_deref(),
+            Some("/tmp/ldk/tls.crt")
+        );
+
+        // Rewrite and reload: this is what a restart does.
+        let rewritten = dir.path().join("rewritten.toml");
+        loaded.write_to_file(&rewritten).unwrap();
+        let reloaded = MakerServerConfig::new(Some(&rewritten)).unwrap();
+        assert_eq!(reloaded.ldk_server_url, loaded.ldk_server_url);
+        assert_eq!(reloaded.ldk_api_key_path, loaded.ldk_api_key_path);
+        assert_eq!(reloaded.ldk_tls_cert_path, loaded.ldk_tls_cert_path);
+    }
+
+    /// A config without the Lightning keys leaves them unset rather than
+    /// inventing defaults that would point at a nonexistent sidecar.
+    #[test]
+    fn lightning_settings_absent_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let timelock = if cfg!(feature = "integration-test") {
+            950
+        } else {
+            15_000
+        };
+        std::fs::write(&path, format!("fidelity_timelock = {timelock}\n")).unwrap();
+        let loaded = MakerServerConfig::new(Some(&path)).unwrap();
+        assert!(loaded.ldk_server_url.is_none());
+        assert!(loaded.ldk_api_key_path.is_none());
+        assert!(loaded.ldk_tls_cert_path.is_none());
     }
 }

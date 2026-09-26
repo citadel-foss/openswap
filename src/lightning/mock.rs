@@ -96,6 +96,12 @@ pub struct MockLightningBackend {
     /// call. The mock does no routing, but swaps must bound their routes, so
     /// tests assert on it.
     last_pay_cltv_bound: Mutex<Option<u32>>,
+    /// Block height reported as the deadline for claiming a held payment.
+    ///
+    /// Defaults to a height far past any test's chain tip, modelling a node
+    /// whose hold window is generous. Stock ldk-node's is only a few blocks
+    /// wide; [`MockLightningBackend::set_claim_deadline`] reproduces that.
+    claim_deadline: Mutex<Option<u32>>,
 }
 
 impl Default for MockLightningBackend {
@@ -115,7 +121,14 @@ impl MockLightningBackend {
             node_id: PublicKey::from_secret_key(&secp, &sk),
             node_sk: sk,
             last_pay_cltv_bound: Mutex::new(None),
+            claim_deadline: Mutex::new(Some(1_000_000)),
         }
+    }
+
+    /// Sets the claim deadline reported with held payments. `None` models a
+    /// backend that does not report one at all.
+    pub fn set_claim_deadline(&self, deadline: Option<u32>) {
+        *self.claim_deadline.lock().unwrap() = deadline;
     }
 
     /// The `max_total_cltv_expiry_delta` of the last `pay_invoice` call on
@@ -211,7 +224,7 @@ impl MockLightningBackend {
                 payment_id: PaymentId(payment_hash.to_string()),
                 payment_hash: Some(payment_hash),
                 amount_msat: Some(amount_msat),
-                claim_deadline: None,
+                claim_deadline: *self.claim_deadline.lock().unwrap(),
             },
         );
     }
@@ -307,23 +320,30 @@ impl LightningBackend for MockLightningBackend {
     }
 
     fn open_channel(&self, req: OpenChannelRequest) -> Result<ChannelId, LightningError> {
-        {
-            let local = self.local.lock()?;
-            if req.channel_amount > local.onchain_balance {
-                return Err(LightningError::InsufficientFunds);
-            }
-        }
+        let capacity_msat = req
+            .channel_amount
+            .to_sat()
+            .checked_mul(1000)
+            .ok_or_else(|| LightningError::General("channel amount overflows msat".to_string()))?;
+        let push_msat = req.push_to_counterparty_msat.unwrap_or(0);
+        let outbound_msat = capacity_msat.checked_sub(push_msat).ok_or_else(|| {
+            LightningError::General("push exceeds the channel amount".to_string())
+        })?;
         let id = self.next_id();
+        // Balance check and deduction under one lock, so two concurrent
+        // opens cannot both pass the check and overdraw.
         let mut local = self.local.lock()?;
+        if req.channel_amount > local.onchain_balance {
+            return Err(LightningError::InsufficientFunds);
+        }
         local.onchain_balance -= req.channel_amount;
         let channel_id = ChannelId(format!("mock-chan-{id}"));
-        let push_msat = req.push_to_counterparty_msat.unwrap_or(0);
         local.channels.push(ChannelInfo {
             channel_id: format!("{id:064x}"),
             user_channel_id: channel_id.clone(),
             counterparty: req.node_pubkey,
             value: req.channel_amount,
-            outbound_capacity_msat: req.channel_amount.to_sat() * 1000 - push_msat,
+            outbound_capacity_msat: outbound_msat,
             inbound_capacity_msat: push_msat,
             is_outbound: true,
             confirmations: Some(0),
@@ -435,7 +455,7 @@ impl LightningBackend for MockLightningBackend {
                     payment_id: PaymentId(payment_hash.to_string()),
                     payment_hash: Some(payment_hash),
                     amount_msat: Some(amount_msat),
-                    claim_deadline: None,
+                    claim_deadline: *self.claim_deadline.lock()?,
                 },
             );
         } else {

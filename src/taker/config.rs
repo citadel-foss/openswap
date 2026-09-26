@@ -237,4 +237,49 @@ mod tests {
         remove_temp_config(&config_path);
         assert_eq!(config, TakerConfig::default());
     }
+
+    /// The taker's Lightning settings must load and survive the rewrite, for
+    /// the same reason as the maker's: a dropped field silently disables
+    /// Lightning on the next start.
+    #[test]
+    fn lightning_settings_round_trip_through_the_config_file() {
+        let contents = r#"
+            control_port = 9051
+            socks_port = 9050
+            ldk_server_url = 127.0.0.1:3537
+            ldk_api_key_path = /tmp/ldk2/api_key
+            ldk_tls_cert_path = /tmp/ldk2/tls.crt
+        "#;
+        let path = create_temp_config(contents, "taker_ln_config.toml");
+        let loaded = TakerConfig::new(Some(&path)).unwrap();
+        assert_eq!(loaded.ldk_server_url.as_deref(), Some("127.0.0.1:3537"));
+        assert_eq!(
+            loaded.ldk_api_key_path.as_deref(),
+            Some("/tmp/ldk2/api_key")
+        );
+        assert_eq!(
+            loaded.ldk_tls_cert_path.as_deref(),
+            Some("/tmp/ldk2/tls.crt")
+        );
+
+        let rewritten = PathBuf::from("taker_ln_config_rewritten.toml");
+        loaded.write_to_file(&rewritten).unwrap();
+        let reloaded = TakerConfig::new(Some(&rewritten)).unwrap();
+        assert_eq!(reloaded, loaded);
+
+        remove_temp_config(&path);
+        remove_temp_config(&rewritten);
+    }
+
+    /// Absent keys stay absent rather than defaulting to a sidecar that is
+    /// not there.
+    #[test]
+    fn lightning_settings_absent_by_default() {
+        let path = create_temp_config("control_port = 9051\n", "taker_no_ln_config.toml");
+        let loaded = TakerConfig::new(Some(&path)).unwrap();
+        assert!(loaded.ldk_server_url.is_none());
+        assert!(loaded.ldk_api_key_path.is_none());
+        assert!(loaded.ldk_tls_cert_path.is_none());
+        remove_temp_config(&path);
+    }
 }

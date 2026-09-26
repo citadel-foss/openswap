@@ -572,6 +572,12 @@ pub trait Maker: Send + Sync {
         Ok(())
     }
 
+    /// How many Lightning swaps are currently in flight.
+    #[cfg(feature = "lightning")]
+    fn ln_swap_count(&self) -> usize {
+        0
+    }
+
     /// Whether `outpoint` is still unspent (mempool included), and how many
     /// blocks have passed since its transaction confirmed.
     ///
@@ -611,6 +617,7 @@ pub trait Maker: Send + Sync {
     #[cfg(feature = "lightning")]
     fn fund_htlc(
         &self,
+        _swap_id: &str,
         _amount: Amount,
         _address: bitcoin::Address,
     ) -> Result<(Transaction, u32), MakerError> {
