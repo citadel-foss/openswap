@@ -2726,6 +2726,10 @@ mod tests {
                 ..offer.clone()
             },
             Offer {
+                name: String::new(),
+                ..offer.clone()
+            },
+            Offer {
                 name: "\x1b[2J".to_string(),
                 ..offer.clone()
             },

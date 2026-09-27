@@ -304,7 +304,7 @@ impl Default for MakerServerConfig {
             tor_auth_password: String::new(),
             password: None,
             nostr_relays: NOSTR_RELAYS.iter().map(|s| s.to_string()).collect(),
-            name: String::new(),
+            name: "default-maker".to_string(),
         }
     }
 }
@@ -451,7 +451,7 @@ time_relative_fee_pct = {}
 required_confirms = {}
 # Check funding inputs against the address blocklist
 check_blocklist = {}
-# Public name shown to takers (at most {} bytes)
+# Public name shown to takers (required, at most {} characters, no control characters)
 name = \"{}\"
 ",
             self.network_port,
@@ -2960,7 +2960,11 @@ mod tests {
         assert_eq!(resolve("3.0"), 3.0);
 
         let path = dir.path().join("config.toml");
-        for (name, accepted) in [("x".repeat(32), true), ("x".repeat(33), false)] {
+        for (name, accepted) in [
+            ("é".repeat(32), true),
+            ("x".repeat(33), false),
+            (String::new(), false),
+        ] {
             std::fs::write(
                 &path,
                 format!("fidelity_timelock = {timelock}\nname = \"{name}\"\n"),

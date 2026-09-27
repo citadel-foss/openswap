@@ -341,11 +341,7 @@ fn display_offer(
     Expiry         : {expiry}
     "#,
         header = header.trim_end(),
-        name = if offer.name.is_empty() {
-            "(none)"
-        } else {
-            &offer.name
-        },
+        name = offer.name,
         base_fee = offer.base_fee,
         amount_fee = offer.amount_relative_fee_pct,
         time_fee = offer.time_relative_fee_pct,

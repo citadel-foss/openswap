@@ -108,15 +108,16 @@ impl Offer {
     }
 }
 
-/// Longest maker name, in bytes, that takers accept.
+/// Longest maker name, in characters, that takers accept.
 pub(crate) const MAX_MAKER_NAME_LEN: usize = 32;
 
-/// Takers store the name in the offerbook and print it to the terminal,
-/// so it must stay short and free of escape codes.
+/// Every maker must be named. Takers store the name and print it to the
+/// terminal, so it must stay short and free of escape codes.
 pub(crate) fn check_maker_name(name: &str) -> Result<(), String> {
-    if name.len() > MAX_MAKER_NAME_LEN || name.chars().any(char::is_control) {
+    let len = name.chars().count();
+    if len == 0 || len > MAX_MAKER_NAME_LEN || name.chars().any(char::is_control) {
         return Err(format!(
-            "invalid maker name {name:?}: at most {MAX_MAKER_NAME_LEN} bytes, no control characters"
+            "invalid maker name {name:?}: 1 to {MAX_MAKER_NAME_LEN} characters, no control characters"
         ));
     }
     Ok(())
