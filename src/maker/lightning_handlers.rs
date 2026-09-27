@@ -124,6 +124,8 @@ pub struct LnMakerSwap {
     pub preimage: Option<Preimage>,
     /// Txid of the refund we broadcast, once we have.
     pub refund_txid: Option<bitcoin::Txid>,
+    /// Where this swap pays out, fixed on first use.
+    pub payout_script: Option<bitcoin::ScriptBuf>,
     /// The confirmed/broadcast HTLC funding output, once known.
     pub funding: Option<(OutPoint, Amount)>,
     /// Block height when the funding was first seen (refund timing).
@@ -157,6 +159,7 @@ impl LnMakerSwap {
             invoice: self.invoice.clone(),
             preimage: self.preimage.map(|p| p.0),
             refund_txid: self.refund_txid,
+            payout_script: self.payout_script.clone(),
             funding_outpoint,
             funding_value,
             funding_height: self.funding_height,
@@ -180,6 +183,7 @@ impl LnMakerSwap {
             invoice: record.invoice,
             preimage: record.preimage.map(Preimage),
             refund_txid: record.refund_txid,
+            payout_script: record.payout_script,
             funding: record.funding_outpoint.zip(record.funding_value),
             funding_height: record.funding_height,
             updated_at: Instant::now(),
@@ -414,6 +418,27 @@ fn swap_id_matches_hash(swap_id: &str, payment_hash: &sha256::Hash) -> Result<()
     }
 }
 
+/// The script this swap pays out to, chosen once and then reused.
+///
+/// Deriving a fresh address per attempt would make each rebuild a
+/// different transaction — conflicting with whatever is already in the
+/// mempool — and would walk the wallet past its address gap limit while a
+/// slow spend confirms.
+fn payout_script<M: Maker>(
+    maker: &Arc<M>,
+    swap_id: &str,
+    swap: &LnMakerSwap,
+) -> Result<bitcoin::ScriptBuf, MakerError> {
+    if let Some(script) = &swap.payout_script {
+        return Ok(script.clone());
+    }
+    let script = maker.get_receive_address()?.script_pubkey();
+    let mut updated = swap.clone();
+    updated.payout_script = Some(script.clone());
+    maker.store_ln_swap(swap_id, updated)?;
+    Ok(script)
+}
+
 /// Refuses a swap id that already has state, so a second connection cannot
 /// overwrite an in-flight swap's record — which holds the only copy of the
 /// branch key needed to sweep or refund its HTLC.
@@ -567,6 +592,7 @@ fn handle_swap_in_request<M: Maker>(
             invoice: req.invoice.clone(),
             preimage: None,
             refund_txid: None,
+            payout_script: None,
             funding: None,
             funding_height: None,
             updated_at: Instant::now(),
@@ -724,7 +750,7 @@ fn sweep_swap_in<M: Maker>(
     let (outpoint, value) = swap
         .funding
         .ok_or(MakerError::General("swap-in sweep without funding"))?;
-    let destination = maker.get_receive_address()?.script_pubkey();
+    let destination = payout_script(maker, swap_id, swap)?;
     let claim_tx = swap
         .htlc
         .create_hashlock_spend(outpoint, value, &swap.privkey, preimage, destination)
@@ -779,7 +805,7 @@ fn watchdog_finish_sweep<M: Maker>(
     let Some(preimage) = swap.preimage else {
         return Err(MakerError::General("swept swap without a preimage"));
     };
-    let destination = maker.get_receive_address()?.script_pubkey();
+    let destination = payout_script(maker, swap_id, swap)?;
     let claim_tx = swap
         .htlc
         .create_hashlock_spend(outpoint, value, &swap.privkey, &preimage, destination)
@@ -857,6 +883,7 @@ fn handle_swap_out_request<M: Maker>(
             invoice: invoice.invoice.clone(),
             preimage: None,
             refund_txid: None,
+            payout_script: None,
             funding: None,
             funding_height: None,
             updated_at: Instant::now(),
@@ -1002,7 +1029,23 @@ fn handle_swap_out_paid<M: Maker>(
         .register_watch_outpoint(outpoint, htlc_spk)
         .and_then(|()| maker.broadcast_transaction(&funding_tx).map(|_| ()));
     if let Err(e) = committed {
-        log::warn!("swap-out {swap_id}: funding not committed, rolling back: {e:?}");
+        // An error is not proof the transaction never reached the network:
+        // a timeout or an "already known" reply can follow a successful
+        // relay. Rolling back then would drop `funding`, and the watchdog
+        // would later delete the only copy of the refund key while the HTLC
+        // was live. Only unwind when the backend positively does not know
+        // the transaction.
+        // A failed query is itself ambiguous, so it counts as "might be out
+        // there" and keeps the swap funded.
+        let known = maker.is_transaction_known(&outpoint.txid).unwrap_or(true);
+        if known {
+            log::warn!(
+                "swap-out {swap_id}: funding broadcast failed but the transaction is known; \
+                 keeping the swap funded: {e:?}"
+            );
+            return Err(e);
+        }
+        log::warn!("swap-out {swap_id}: funding never reached the network, rolling back: {e:?}");
         let mut reverted = swap.clone();
         reverted.funding = None;
         reverted.funding_height = None;
@@ -1257,6 +1300,19 @@ fn watchdog_resolve_swap_out(
         Ok(WatcherEvent::UtxoSpent {
             spending_tx: None, ..
         }) => Ok(()), // spent but tx unknown yet; retry next tick
+        Ok(WatcherEvent::NoOutpoint) => {
+            // Not "unspent" — the watcher has no entry for this outpoint at
+            // all, which happens when a startup rescan failed. Treating it
+            // as unspent would hide a taker claim forever. Re-arm and read
+            // the real state next tick.
+            let spk = swap.htlc.script_pubkey().map_err(|e| {
+                log::warn!("lightning: htlc script build failed: {e}");
+                MakerError::General("htlc script build failed")
+            })?;
+            log::warn!("Swap-out {swap_id}: HTLC was not being watched; re-arming");
+            maker.register_watch_outpoint(outpoint, spk)?;
+            Ok(())
+        }
         Ok(_) => {
             // Unspent: refund once the CSV window has passed. An early
             // attempt fails non-BIP68-final harmlessly and is retried.
@@ -1268,7 +1324,7 @@ fn watchdog_resolve_swap_out(
             if !refundable {
                 return Ok(());
             }
-            let destination = maker.get_receive_address()?.script_pubkey();
+            let destination = payout_script(maker, swap_id, swap)?;
             let refund_tx = swap
                 .htlc
                 .create_timelock_spend(outpoint, value, &swap.privkey, destination)
@@ -1328,6 +1384,7 @@ mod tests {
             invoice: "lnbcrt-test".to_string(),
             preimage: Some(preimage),
             refund_txid: None,
+            payout_script: None,
             funding: Some((OutPoint::default(), Amount::from_sat(40_000))),
             funding_height: Some(812_345),
             updated_at: Instant::now(),

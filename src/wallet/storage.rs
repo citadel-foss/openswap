@@ -296,6 +296,12 @@ pub struct LnMakerSwapRecord {
     /// transaction confirmed was the refund ours.
     #[serde(default)]
     pub refund_txid: Option<bitcoin::Txid>,
+    /// Where this swap's sweep or refund pays out. Fixed on first use so a
+    /// rebuild produces the same transaction instead of one that conflicts
+    /// with what is already in the mempool — and so retrying does not
+    /// consume a fresh address every tick.
+    #[serde(default)]
+    pub payout_script: Option<ScriptBuf>,
     /// The HTLC funding outpoint, once known.
     pub funding_outpoint: Option<OutPoint>,
     /// The HTLC funding value, once known.

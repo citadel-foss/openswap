@@ -70,6 +70,50 @@ fn default_data_dir() -> Option<PathBuf> {
     }
 }
 
+/// Builds a backend from an operator's three config values, or `None` when
+/// Lightning is not configured or cannot be reached.
+///
+/// Both roles take this path, so a misconfiguration behaves the same for
+/// each: it disables Lightning and says why, rather than failing startup.
+/// On-chain swaps must not be held hostage by the sidecar.
+pub fn backend_from_settings(
+    server_url: Option<&String>,
+    api_key_path: Option<&String>,
+    tls_cert_path: Option<&String>,
+    network: bitcoin::Network,
+) -> Option<std::sync::Arc<dyn super::LightningBackend>> {
+    use bitcoin::hashes::hex::DisplayHex;
+    let url = server_url?;
+    let Some(api_key_path) = api_key_path else {
+        log::error!("ldk_server_url set but ldk_api_key_path missing; Lightning disabled");
+        return None;
+    };
+    let api_key = match std::fs::read(api_key_path) {
+        Ok(bytes) => bytes.to_lower_hex_string(),
+        Err(e) => {
+            log::error!("cannot read LDK api key {api_key_path}: {e}; Lightning disabled");
+            return None;
+        }
+    };
+    let config = LightningConfig {
+        base_url: url.clone(),
+        api_key,
+        tls_cert_path: tls_cert_path.map(PathBuf::from),
+        timeout_secs: DEFAULT_TIMEOUT_SECS,
+        network,
+    };
+    match super::LdkServerBackend::new(&config) {
+        Ok(backend) => {
+            log::info!("Lightning backend connected: {url}");
+            Some(std::sync::Arc::new(backend))
+        }
+        Err(e) => {
+            log::error!("Lightning backend init failed: {e:?}; Lightning disabled");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

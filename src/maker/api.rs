@@ -726,6 +726,12 @@ pub struct MakerServer {
 #[cfg(feature = "lightning")]
 const LN_OFFER_TTL: Duration = Duration::from_secs(15);
 
+/// Confirmation target for a Lightning HTLC funding, in blocks. Comfortably
+/// inside the budget the swap-out hold-window check assumes, so the promise
+/// that check makes is one the funding can keep.
+#[cfg(feature = "lightning")]
+const FUNDING_CONF_TARGET: u16 = 6;
+
 /// Idle swap data returned by [`MakerServer::drain_idle_swaps`].
 pub struct IdleSwapData {
     /// Unique swap identifier.
@@ -933,47 +939,18 @@ impl MakerServer {
         Ok(())
     }
 
-    /// Builds the Lightning backend from config, if configured. A configured
-    /// but unreachable/broken backend is reported and disables Lightning
-    /// swaps instead of failing maker startup: on-chain swaps must not be
-    /// held hostage by the LN sidecar.
+    /// Builds the Lightning backend from config, if configured. Shared with
+    /// the taker so a fix to one reaches both.
     #[cfg(feature = "lightning")]
     fn init_lightning_backend(
         config: &MakerServerConfig,
     ) -> Option<std::sync::Arc<dyn crate::lightning::LightningBackend>> {
-        use bitcoin::hashes::hex::DisplayHex;
-        let url = config.ldk_server_url.as_ref()?;
-        let api_key_path = match &config.ldk_api_key_path {
-            Some(path) => path,
-            None => {
-                log::error!("ldk_server_url set but ldk_api_key_path missing; Lightning disabled");
-                return None;
-            }
-        };
-        let api_key = match std::fs::read(api_key_path) {
-            Ok(bytes) => bytes.to_lower_hex_string(),
-            Err(e) => {
-                log::error!("cannot read LDK api key {api_key_path}: {e}; Lightning disabled");
-                return None;
-            }
-        };
-        let ln_config = crate::lightning::LightningConfig {
-            base_url: url.clone(),
-            api_key,
-            tls_cert_path: config.ldk_tls_cert_path.as_ref().map(PathBuf::from),
-            timeout_secs: crate::lightning::DEFAULT_TIMEOUT_SECS,
-            network: config.network,
-        };
-        match crate::lightning::LdkServerBackend::new(&ln_config) {
-            Ok(backend) => {
-                log::info!("Lightning backend connected: {url}");
-                Some(std::sync::Arc::new(backend))
-            }
-            Err(e) => {
-                log::error!("Lightning backend init failed: {e:?}; Lightning disabled");
-                None
-            }
-        }
+        crate::lightning::backend_from_settings(
+            config.ldk_server_url.as_ref(),
+            config.ldk_api_key_path.as_ref(),
+            config.ldk_tls_cert_path.as_ref(),
+            config.network,
+        )
     }
 
     /// Check if shutdown has been requested.
@@ -3332,12 +3309,29 @@ impl MakerTrait for MakerServer {
     ) -> Result<(Transaction, u32), MakerError> {
         let mut wallet = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // The swap-out hold-window check promises the funding confirms
+        // inside a fixed budget, so price it to actually do that. The relay
+        // floor cannot keep that promise on a busy chain, and a funding that
+        // confirms late moves the CSV refund past the Lightning deadline.
+        let feerate = {
+            use crate::wallet::Blockchain;
+            match wallet.blockchain.estimate_feerate(FUNDING_CONF_TARGET) {
+                Ok(rate) if rate.is_finite() => rate.max(MIN_RELAY_FEE_RATE),
+                other => {
+                    log::warn!(
+                        "lightning: no feerate estimate for {FUNDING_CONF_TARGET} blocks \
+                         ({other:?}); funding at the relay floor"
+                    );
+                    MIN_RELAY_FEE_RATE
+                }
+            }
+        };
         // One split, one destination, no taker-reimbursed input budget.
         let plan = wallet
             .plan_funding(
                 amount,
                 1,
-                MIN_RELAY_FEE_RATE,
+                feerate,
                 u32::MAX,
                 None,
                 None,

@@ -31,8 +31,7 @@ use bitcoin::{
 
 use crate::{
     lightning::{
-        invoice::verify_invoice, swap::SwapHtlc, InvoiceParams, LightningBackend, LightningConfig,
-        LnEvent, Preimage,
+        invoice::verify_invoice, swap::SwapHtlc, InvoiceParams, LightningBackend, LnEvent, Preimage,
     },
     protocol::{
         common_messages::{GetOffer, MakerToTakerMessage, Offer, TakerHello, TakerToMakerMessage},
@@ -153,48 +152,18 @@ pub struct LnRoutedSwapReport {
     pub claim_txid: Txid,
 }
 
-/// Builds the taker's Lightning backend from config, mirroring the maker's
-/// behavior: misconfiguration disables Lightning instead of failing init.
+/// Builds the taker's Lightning backend from config. Shared with the maker
+/// so a fix to one reaches both.
 pub(crate) fn init_lightning_backend(
     config: &TakerInitConfig,
     network: bitcoin::Network,
 ) -> Option<Arc<dyn LightningBackend>> {
-    use bitcoin::hashes::hex::DisplayHex;
-    let url = config.ldk_server_url.as_ref()?;
-    let api_key_path = match &config.ldk_api_key_path {
-        Some(path) => path,
-        None => {
-            log::error!("ldk_server_url set but ldk_api_key_path missing; Lightning disabled");
-            return None;
-        }
-    };
-    let api_key = match std::fs::read(api_key_path) {
-        Ok(bytes) => bytes.to_lower_hex_string(),
-        Err(e) => {
-            log::error!("cannot read LDK api key {api_key_path}: {e}; Lightning disabled");
-            return None;
-        }
-    };
-    let ln_config = LightningConfig {
-        base_url: url.clone(),
-        api_key,
-        tls_cert_path: config
-            .ldk_tls_cert_path
-            .as_ref()
-            .map(std::path::PathBuf::from),
-        timeout_secs: crate::lightning::DEFAULT_TIMEOUT_SECS,
+    crate::lightning::backend_from_settings(
+        config.ldk_server_url.as_ref(),
+        config.ldk_api_key_path.as_ref(),
+        config.ldk_tls_cert_path.as_ref(),
         network,
-    };
-    match crate::lightning::LdkServerBackend::new(&ln_config) {
-        Ok(backend) => {
-            log::info!("Lightning backend connected: {url}");
-            Some(Arc::new(backend))
-        }
-        Err(e) => {
-            log::error!("Lightning backend init failed: {e:?}; Lightning disabled");
-            None
-        }
-    }
+    )
 }
 
 /// The maker's advertised fee for this amount; the accepted fee must not

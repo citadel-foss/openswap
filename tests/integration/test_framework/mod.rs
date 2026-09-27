@@ -1169,8 +1169,7 @@ impl TestFramework {
     }
 
     /// [`TestFramework::init`] with a Lightning backend handed to each maker,
-    /// `maker_lightning[i]` going to the maker at index `i`. Serialized
-    /// against other lightning tests for the duration of init.
+    /// `maker_lightning[i]` going to the maker at index `i`.
     #[allow(clippy::type_complexity)]
     #[cfg(feature = "lightning")]
     pub fn init_with_lightning<B: TestBackend>(

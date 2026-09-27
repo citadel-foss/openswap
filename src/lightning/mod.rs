@@ -27,7 +27,8 @@ mod types;
 
 pub use backend::LightningBackend;
 pub use config::{
-    default_cert_path, LightningConfig, DEFAULT_LDK_SERVER_URL, DEFAULT_TIMEOUT_SECS,
+    backend_from_settings, default_cert_path, LightningConfig, DEFAULT_LDK_SERVER_URL,
+    DEFAULT_TIMEOUT_SECS,
 };
 pub use error::LightningError;
 pub use ldk_server::LdkServerBackend;
