@@ -122,6 +122,8 @@ pub struct LnMakerSwap {
     pub invoice: String,
     /// The swap preimage, once learned. Lets a sweep be rebuilt.
     pub preimage: Option<Preimage>,
+    /// Txid of the refund we broadcast, once we have.
+    pub refund_txid: Option<bitcoin::Txid>,
     /// The confirmed/broadcast HTLC funding output, once known.
     pub funding: Option<(OutPoint, Amount)>,
     /// Block height when the funding was first seen (refund timing).
@@ -154,6 +156,7 @@ impl LnMakerSwap {
             privkey: self.privkey,
             invoice: self.invoice.clone(),
             preimage: self.preimage.map(|p| p.0),
+            refund_txid: self.refund_txid,
             funding_outpoint,
             funding_value,
             funding_height: self.funding_height,
@@ -176,6 +179,7 @@ impl LnMakerSwap {
             privkey: record.privkey,
             invoice: record.invoice,
             preimage: record.preimage.map(Preimage),
+            refund_txid: record.refund_txid,
             funding: record.funding_outpoint.zip(record.funding_value),
             funding_height: record.funding_height,
             updated_at: Instant::now(),
@@ -562,6 +566,7 @@ fn handle_swap_in_request<M: Maker>(
             privkey: hashlock_privkey,
             invoice: req.invoice.clone(),
             preimage: None,
+            refund_txid: None,
             funding: None,
             funding_height: None,
             updated_at: Instant::now(),
@@ -851,6 +856,7 @@ fn handle_swap_out_request<M: Maker>(
             privkey: timelock_privkey,
             invoice: invoice.invoice.clone(),
             preimage: None,
+            refund_txid: None,
             funding: None,
             funding_height: None,
             updated_at: Instant::now(),
@@ -1256,7 +1262,15 @@ fn watchdog_resolve_swap_out(
             // swap and fails the held payment on a later tick.
             match maker.broadcast_transaction(&refund_tx) {
                 Ok(txid) => {
-                    log::info!("Swap-out {swap_id} refund broadcast: {txid} (held until confirmed)")
+                    log::info!(
+                        "Swap-out {swap_id} refund broadcast: {txid} (held until confirmed)"
+                    );
+                    // Remembered so a later confirmed spend can be attributed
+                    // to us rather than assumed to be ours.
+                    let mut updated = swap.clone();
+                    updated.refund_txid = Some(txid);
+                    updated.touch();
+                    maker.store_ln_swap(swap_id, updated)?;
                 }
                 Err(e) => log::debug!("swap-out {swap_id} refund not yet broadcastable: {e:?}"),
             }
@@ -1293,6 +1307,7 @@ mod tests {
             privkey: branch_privkey,
             invoice: "lnbcrt-test".to_string(),
             preimage: Some(preimage),
+            refund_txid: None,
             funding: Some((OutPoint::default(), Amount::from_sat(40_000))),
             funding_height: Some(812_345),
             updated_at: Instant::now(),

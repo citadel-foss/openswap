@@ -3240,6 +3240,22 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn is_tx_confirmed(&self, txid: &bitcoin::Txid) -> Result<bool, MakerError> {
+        use crate::wallet::Blockchain;
+        let info = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .get_raw_transaction_info(txid, None);
+        match info {
+            Ok(info) => Ok(info.confirmations.unwrap_or(0) >= 1),
+            // Unknown to the backend means not confirmed, which is the
+            // answer the caller needs; a transport failure is not.
+            Err(e) if format!("{e:?}").contains("-5") => Ok(false),
+            Err(e) => Err(MakerError::Wallet(e)),
+        }
+    }
+
+    #[cfg(feature = "lightning")]
     fn is_htlc_spend_confirmed(
         &self,
         outpoint: &bitcoin::OutPoint,

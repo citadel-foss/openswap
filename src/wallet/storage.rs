@@ -291,6 +291,11 @@ pub struct LnMakerSwapRecord {
     /// can be rebuilt after a restart or an evicted broadcast.
     #[serde(default)]
     pub preimage: Option<[u8; 32]>,
+    /// Txid of the refund this maker broadcast, once it has. Lets a
+    /// confirmed spend of the HTLC be attributed: only if *this*
+    /// transaction confirmed was the refund ours.
+    #[serde(default)]
+    pub refund_txid: Option<bitcoin::Txid>,
     /// The HTLC funding outpoint, once known.
     pub funding_outpoint: Option<OutPoint>,
     /// The HTLC funding value, once known.

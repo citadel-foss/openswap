@@ -804,9 +804,7 @@ fn main() -> Result<(), TakerError> {
                 }
                 // "Nothing to recover" is not a failure of this command when
                 // the Lightning side still has work; every other error is.
-                Err(TakerError::General(msg))
-                    if msg.contains("No persisted swapcoins found for recovery") =>
-                {
+                Err(TakerError::NothingToRecover) => {
                     println!("No unfinished coinswaps to recover");
                     Ok(())
                 }

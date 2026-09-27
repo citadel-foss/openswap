@@ -36,6 +36,10 @@ pub enum TakerError {
     TorError(TorError),
     /// Error relating to Bitcoin Address Parsing.
     AddressParseError(ParseError),
+    /// Nothing was found to recover: no persisted swapcoin carries a swap
+    /// id. Typed rather than a message, so callers that legitimately treat
+    /// it as "no work here" cannot be broken by rewording.
+    NothingToRecover,
     /// General error with a custom message
     General(String),
     /// Watcher Service Error

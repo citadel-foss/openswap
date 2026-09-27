@@ -578,6 +578,15 @@ pub trait Maker: Send + Sync {
         0
     }
 
+    /// Whether this specific transaction is confirmed.
+    ///
+    /// Distinguishing *which* transaction spent an HTLC needs this: knowing
+    /// the outpoint has some confirmed spend does not say whose it was.
+    #[cfg(feature = "lightning")]
+    fn is_tx_confirmed(&self, _txid: &bitcoin::Txid) -> Result<bool, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
     /// Whether `outpoint` has a *confirmed* spend. A mempool-only spend
     /// reports false: it can still be evicted or reorged away, and dropping
     /// a swap's record on one would discard the only key that reaches the

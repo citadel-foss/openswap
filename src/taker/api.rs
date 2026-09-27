@@ -3397,9 +3397,7 @@ impl Taker {
                 .first()
                 .and_then(|sc| sc.swap_id.clone())
                 .or_else(|| incoming.first().and_then(|sc| sc.swap_id.clone()))
-                .ok_or_else(|| {
-                    TakerError::General("No persisted swapcoins found for recovery".to_string())
-                })?
+                .ok_or(TakerError::NothingToRecover)?
         };
 
         lock_debug!(self.swap_tracker.lock())
