@@ -70,7 +70,7 @@ Your node advertises a minimum swap size that is sure to pass. It works this out
 5. Your percentage fees round that up to 1,446.
 6. Rounding up to the next 500 gives 1,500.
 
-A swap with more coins, more makers, or a higher fee rate needs more. If your percentage fees are negative or add up to 100% or more, your node refuses to start.
+A swap with more coins, more makers, or a higher fee rate needs more. If your percentage fees add up to 100% or more, your node refuses to start.
 
 > **Note:**  
 > On the first run, if the default `network_port` or `rpc_port` is already in use, `makerd` automatically discovers a free port and persists it to `config.toml`.
