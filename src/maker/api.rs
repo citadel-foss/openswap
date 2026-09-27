@@ -3240,6 +3240,20 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn is_htlc_spend_confirmed(
+        &self,
+        outpoint: &bitcoin::OutPoint,
+        script: &bitcoin::ScriptBuf,
+    ) -> Result<bool, MakerError> {
+        use crate::wallet::Blockchain;
+        lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .is_confirmed_spend(outpoint, script)
+            .map_err(MakerError::Wallet)
+    }
+
+    #[cfg(feature = "lightning")]
     fn htlc_unspent_and_age(
         &self,
         outpoint: &bitcoin::OutPoint,

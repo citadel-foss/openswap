@@ -248,6 +248,10 @@ pub enum LnMakerPhase {
     /// Swap-in invoice paid; awaiting the settlement that reveals the
     /// preimage, then an on-chain sweep.
     InPaid,
+    /// Swap-in sweep broadcast, awaiting confirmation. The record is kept
+    /// until then so the sweep can be rebuilt and rebroadcast: a spend that
+    /// is only in the mempool can still be evicted or reorged away.
+    InSwept,
     /// Swap-out accepted (hold invoice created); awaiting payment.
     OutAccepted,
     /// Swap-out HTLC funded on-chain; awaiting the taker's claim.
@@ -283,6 +287,10 @@ pub struct LnMakerSwapRecord {
     pub privkey: bitcoin::secp256k1::SecretKey,
     /// The invoice: the taker's hold invoice (swap-in) or ours (swap-out).
     pub invoice: String,
+    /// The swap preimage, once the maker has learned it. Kept so a sweep
+    /// can be rebuilt after a restart or an evicted broadcast.
+    #[serde(default)]
+    pub preimage: Option<[u8; 32]>,
     /// The HTLC funding outpoint, once known.
     pub funding_outpoint: Option<OutPoint>,
     /// The HTLC funding value, once known.

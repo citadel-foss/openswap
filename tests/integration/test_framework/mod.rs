@@ -51,31 +51,6 @@ use openswap::{
 
 const BITCOIN_VERSION: &str = "28.1";
 
-/// Whether an `init` took the injection lock itself, or is nested inside an
-/// `init_with_lightning` that already holds it.
-#[cfg(feature = "lightning")]
-enum InjectGuard<'a> {
-    /// Kept only so the lock lives until the guard drops; never read.
-    Held(#[allow(dead_code)] std::sync::MutexGuard<'a, ()>),
-    Reentrant,
-}
-
-/// Lightning backends for the makers of the test currently initializing,
-/// indexed the same way as `makers_config_map`. Guarded by
-/// [`LN_INJECT_LOCK`] so concurrently running lightning tests cannot read
-/// each other's entries; set it through
-/// [`TestFramework::init_with_lightning`] rather than directly.
-#[cfg(feature = "lightning")]
-static LN_MAKER_INJECT: Mutex<Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>> =
-    Mutex::new(Vec::new());
-
-/// Held for the whole of one lightning test's framework init, which is the
-/// window in which [`LN_MAKER_INJECT`] is meaningful. Every `init` takes it,
-/// not just `init_with_lightning`: a plain init running concurrently would
-/// otherwise read — and consume — another test's injected backends.
-#[cfg(feature = "lightning")]
-static LN_INJECT_LOCK: Mutex<()> = Mutex::new(());
-
 fn download_bitcoind_tarball(download_url: &str, retries: usize) -> Vec<u8> {
     for attempt in 1..=retries {
         let response = minreq::get(download_url).send();
@@ -942,13 +917,6 @@ impl TestFramework {
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        // Serialized against lightning inits, which is the only window in
-        // which the shared injection slot holds anything.
-        #[cfg(feature = "lightning")]
-        let _inject_guard = LN_INJECT_LOCK
-            .try_lock()
-            .map(InjectGuard::Held)
-            .unwrap_or(InjectGuard::Reentrant);
         let makers_config_map = vec![(0, None); maker_count];
         let fee_overrides = vec![None; maker_count];
         Self::init_with_settings::<B>(
@@ -957,6 +925,8 @@ impl TestFramework {
             taker_behavior,
             maker_behaviors,
             false,
+            #[cfg(feature = "lightning")]
+            Vec::new(),
         )
     }
 
@@ -975,6 +945,8 @@ impl TestFramework {
             taker_behavior,
             maker_behaviors,
             true,
+            #[cfg(feature = "lightning")]
+            Vec::new(),
         )
     }
 
@@ -994,6 +966,8 @@ impl TestFramework {
             taker_behavior,
             maker_behaviors,
             false,
+            #[cfg(feature = "lightning")]
+            Vec::new(),
         )
     }
 
@@ -1004,6 +978,9 @@ impl TestFramework {
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
         check_blocklist: bool,
+        #[cfg(feature = "lightning")] maker_lightning: Vec<
+            std::sync::Arc<dyn openswap::lightning::LightningBackend>,
+        >,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
         assert_eq!(
             fee_overrides.len(),
@@ -1142,12 +1119,7 @@ impl TestFramework {
                     *server.reserved_network_listener.lock().unwrap() = Some(network_listener);
                     *server.reserved_rpc_listener.lock().unwrap() = Some(rpc_listener);
                     #[cfg(feature = "lightning")]
-                    if let Some(backend) = LN_MAKER_INJECT
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .get(i)
-                        .cloned()
-                    {
+                    if let Some(backend) = maker_lightning.get(i).cloned() {
                         server.set_lightning_backend(backend);
                     }
                     Arc::new(server)
@@ -1207,14 +1179,14 @@ impl TestFramework {
         maker_behaviors: Vec<MakerBehavior>,
         maker_lightning: Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        let _guard = LN_INJECT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        *LN_MAKER_INJECT.lock().unwrap_or_else(|p| p.into_inner()) = maker_lightning;
-        let framework = Self::init::<B>(maker_count, taker_behavior, maker_behaviors);
-        LN_MAKER_INJECT
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
-        framework
+        Self::init_with_settings::<B>(
+            vec![(0, None); maker_count],
+            vec![None; maker_count],
+            taker_behavior,
+            maker_behaviors,
+            false,
+            maker_lightning,
+        )
     }
 
     /// Rebuild taker `i`'s init config, so a test can drop the taker and re-init

@@ -596,7 +596,15 @@ impl SwapInMaker {
         // integrated maker additionally subtracts blocks already elapsed
         // since funding confirmed; this POC pays immediately after funding,
         // so the margin alone is the difference.
-        let cltv_bound = (request.params.locktime as u32).saturating_sub(ROUTE_CLTV_MARGIN);
+        let cltv_bound = (request.params.locktime as u32)
+            .checked_sub(ROUTE_CLTV_MARGIN)
+            .filter(|bound| *bound > 0)
+            .ok_or_else(|| {
+                SwapError::Validation(format!(
+                    "locktime {} leaves no route budget above the {ROUTE_CLTV_MARGIN}-block margin",
+                    request.params.locktime
+                ))
+            })?;
         Ok(self
             .ln
             .pay_invoice(&request.invoice, None, Some(cltv_bound))?)

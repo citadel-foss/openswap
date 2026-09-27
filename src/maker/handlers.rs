@@ -578,6 +578,19 @@ pub trait Maker: Send + Sync {
         0
     }
 
+    /// Whether `outpoint` has a *confirmed* spend. A mempool-only spend
+    /// reports false: it can still be evicted or reorged away, and dropping
+    /// a swap's record on one would discard the only key that reaches the
+    /// HTLC.
+    #[cfg(feature = "lightning")]
+    fn is_htlc_spend_confirmed(
+        &self,
+        _outpoint: &bitcoin::OutPoint,
+        _script: &bitcoin::ScriptBuf,
+    ) -> Result<bool, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
     /// Whether `outpoint` is still unspent (mempool included), and how many
     /// blocks have passed since its transaction confirmed.
     ///

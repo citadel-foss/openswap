@@ -84,6 +84,14 @@ const REFUND_GRACE_BLOCKS: u32 = 12;
 /// Covers spotting the preimage on-chain and getting the settlement through.
 const SETTLE_MARGIN: u32 = 6;
 
+/// Blocks allowed for the maker's own HTLC funding to confirm.
+///
+/// The refund branch is CSV, so it opens `locktime` blocks after the funding
+/// *confirms*, not after we build it. Measuring the on-chain window from the
+/// current tip would understate it by however long confirmation takes, and
+/// the taker's claim stays valid for that whole time.
+const FUNDING_CONF_BUDGET: u32 = 24;
+
 /// Direction of a swap and how far it has progressed. Defined alongside the
 /// wallet's persisted record so the live state and the on-disk state cannot
 /// drift apart.
@@ -112,6 +120,8 @@ pub struct LnMakerSwap {
     pub privkey: SecretKey,
     /// The invoice: the taker's hold invoice (swap-in) or ours (swap-out).
     pub invoice: String,
+    /// The swap preimage, once learned. Lets a sweep be rebuilt.
+    pub preimage: Option<Preimage>,
     /// The confirmed/broadcast HTLC funding output, once known.
     pub funding: Option<(OutPoint, Amount)>,
     /// Block height when the funding was first seen (refund timing).
@@ -143,6 +153,7 @@ impl LnMakerSwap {
             redeemscript: self.htlc.redeemscript().clone(),
             privkey: self.privkey,
             invoice: self.invoice.clone(),
+            preimage: self.preimage.map(|p| p.0),
             funding_outpoint,
             funding_value,
             funding_height: self.funding_height,
@@ -164,6 +175,7 @@ impl LnMakerSwap {
             htlc: SwapHtlc::from_redeemscript(record.redeemscript, record.locktime),
             privkey: record.privkey,
             invoice: record.invoice,
+            preimage: record.preimage.map(Preimage),
             funding: record.funding_outpoint.zip(record.funding_value),
             funding_height: record.funding_height,
             updated_at: Instant::now(),
@@ -549,6 +561,7 @@ fn handle_swap_in_request<M: Maker>(
             htlc,
             privkey: hashlock_privkey,
             invoice: req.invoice.clone(),
+            preimage: None,
             funding: None,
             funding_height: None,
             updated_at: Instant::now(),
@@ -651,7 +664,7 @@ fn handle_swap_in_funded<M: Maker>(
     );
 
     let preimage = wait_for_preimage(maker, ctx, &swap.payment_hash)?;
-    sweep_swap_in(maker, ctx, &funded.swap_id, &swap, &preimage)?;
+    sweep_swap_in(maker, &funded.swap_id, &swap, &preimage)?;
     Ok(Some(MakerToTakerMessage::Lightning(Box::new(
         LightningMakerMessage::SwapInComplete(LnSwapInComplete {
             swap_id: funded.swap_id,
@@ -699,7 +712,6 @@ fn wait_for_preimage<M: Maker>(
 /// Sweeps a settled swap-in's HTLC to the wallet and forgets the swap.
 fn sweep_swap_in<M: Maker>(
     maker: &Arc<M>,
-    ctx: &LnContext,
     swap_id: &str,
     swap: &LnMakerSwap,
     preimage: &Preimage,
@@ -715,19 +727,65 @@ fn sweep_swap_in<M: Maker>(
             log::warn!("lightning: claim build failed: {e}");
             MakerError::General("claim build failed")
         })?;
+    // Record the preimage and the swept phase before broadcasting: the
+    // record is what lets the watchdog rebuild this sweep if the broadcast
+    // is evicted, and it must not be dropped until the sweep confirms.
+    let mut swept = swap.clone();
+    swept.preimage = Some(*preimage);
+    swept.phase = LnMakerPhase::InSwept;
+    swept.touch();
+    store_swap(maker, swap_id, swept)?;
+
     let claim_txid = maker.broadcast_transaction(&claim_tx)?;
     log::info!(
-        "[{}] Swap-in {} settled; on-chain sweep broadcast: {}",
+        "[{}] Swap-in {} settled; on-chain sweep broadcast: {} (held until confirmed)",
         maker.network_port(),
         swap_id,
         claim_txid
     );
-    if let Ok(spk) = swap.htlc.script_pubkey() {
-        maker.unwatch_outpoint(outpoint, spk);
-    }
-    ctx.router.unsubscribe(&swap.payment_hash);
-    maker.remove_ln_swap(swap_id)?;
     let _ = maker.sync_and_save_wallet();
+    Ok(())
+}
+
+/// Finishes a swept swap-in once its sweep confirms, rebroadcasting while it
+/// has not. Removing on the broadcast alone would discard the branch key
+/// while the spend could still be evicted or reorged away.
+fn watchdog_finish_sweep<M: Maker>(
+    maker: &Arc<M>,
+    ctx: &LnContext,
+    swap_id: &str,
+    swap: &LnMakerSwap,
+) -> Result<(), MakerError> {
+    let (outpoint, value) = swap
+        .funding
+        .ok_or(MakerError::General("swept swap without funding"))?;
+    let spk = swap.htlc.script_pubkey().map_err(|e| {
+        log::warn!("lightning: htlc script build failed: {e}");
+        MakerError::General("htlc script build failed")
+    })?;
+    if maker.is_htlc_spend_confirmed(&outpoint, &spk)? {
+        log::info!("Swap-in {swap_id}: sweep confirmed; closing the swap");
+        maker.unwatch_outpoint(outpoint, spk);
+        ctx.router.unsubscribe(&swap.payment_hash);
+        return maker.remove_ln_swap(swap_id);
+    }
+    // Still unconfirmed: rebuild and rebroadcast. A duplicate is harmless,
+    // and this is what recovers from an eviction.
+    let Some(preimage) = swap.preimage else {
+        return Err(MakerError::General("swept swap without a preimage"));
+    };
+    let destination = maker.get_receive_address()?.script_pubkey();
+    let claim_tx = swap
+        .htlc
+        .create_hashlock_spend(outpoint, value, &swap.privkey, &preimage, destination)
+        .map_err(|e| {
+            log::warn!("lightning: claim rebuild failed: {e}");
+            MakerError::General("claim rebuild failed")
+        })?;
+    match maker.broadcast_transaction(&claim_tx) {
+        Ok(txid) => log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}"),
+        Err(e) => log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}"),
+    }
     Ok(())
 }
 
@@ -792,6 +850,7 @@ fn handle_swap_out_request<M: Maker>(
             htlc,
             privkey: timelock_privkey,
             invoice: invoice.invoice.clone(),
+            preimage: None,
             funding: None,
             funding_height: None,
             updated_at: Instant::now(),
@@ -867,7 +926,12 @@ fn handle_swap_out_paid<M: Maker>(
     // narrower than the on-chain window — which is the case for an unpatched
     // ldk-node, whose window is only a few blocks wide.
     let tip = maker.get_current_height()?;
-    let claim_window_ends = tip.saturating_add(swap.locktime as u32);
+    // Worst case: our funding takes the whole confirmation budget, so the
+    // CSV clock starts that late and the taker can claim until then plus
+    // the locktime.
+    let claim_window_ends = tip
+        .saturating_add(FUNDING_CONF_BUDGET)
+        .saturating_add(swap.locktime as u32);
     match claim_deadline {
         Some(deadline) if deadline >= claim_window_ends.saturating_add(SETTLE_MARGIN) => {}
         Some(deadline) => {
@@ -875,8 +939,10 @@ fn handle_swap_out_paid<M: Maker>(
                 swap_id,
                 format!(
                     "lightning claim deadline {deadline} is before the on-chain claim \
-                     window closes at {claim_window_ends} (+{SETTLE_MARGIN} margin); \
-                     the node's hold window is too narrow for this locktime"
+                     window closes at {claim_window_ends} (tip {tip} + {FUNDING_CONF_BUDGET} \
+                     confirmation budget + {} locktime + {SETTLE_MARGIN} margin); the node's \
+                     hold window is too narrow for this locktime",
+                    swap.locktime
                 ),
             ));
         }
@@ -894,11 +960,19 @@ fn handle_swap_out_paid<M: Maker>(
         log::warn!("lightning: htlc address build failed: {e}");
         MakerError::General("htlc address build failed")
     })?;
-    let (funding_tx, vout) = maker.fund_htlc(swap_id, swap.amount, address)?;
-    let output = funding_tx
+    let htlc_spk = swap.htlc.script_pubkey().map_err(|e| {
+        log::warn!("lightning: htlc script build failed: {e}");
+        MakerError::General("htlc script build failed")
+    })?;
+    let (funding_tx, _) = maker.fund_htlc(swap_id, swap.amount, address)?;
+    // By script, never by position: a positional fallback can land on the
+    // change output, which our HTLC keys cannot spend.
+    let vout = funding_tx
         .output
-        .get(vout as usize)
-        .ok_or(MakerError::General("funding vout out of range"))?;
+        .iter()
+        .position(|output| output.script_pubkey == htlc_spk)
+        .ok_or(MakerError::General("funding tx has no HTLC output"))? as u32;
+    let output = &funding_tx.output[vout as usize];
     // The built transaction already fixes the outpoint, so record it before
     // broadcasting. Crashing after a broadcast we had not persisted would
     // leave the swap looking unfunded, and the watchdog would then drop the
@@ -914,12 +988,23 @@ fn handle_swap_out_paid<M: Maker>(
     swap.touch();
     store_swap(maker, swap_id, swap.clone())?;
 
-    let htlc_spk = swap.htlc.script_pubkey().map_err(|e| {
-        log::warn!("lightning: htlc script build failed: {e}");
-        MakerError::General("htlc script build failed")
-    })?;
-    maker.register_watch_outpoint(outpoint, htlc_spk)?;
-    maker.broadcast_transaction(&funding_tx)?;
+    // If either of these fails the funding never reached the network, so the
+    // stored `OutFunded` would describe a transaction nobody can see: a
+    // retransmission would re-announce it and the watchdog would try to
+    // refund an output that does not exist. Put the swap back.
+    let committed = maker
+        .register_watch_outpoint(outpoint, htlc_spk)
+        .and_then(|()| maker.broadcast_transaction(&funding_tx).map(|_| ()));
+    if let Err(e) = committed {
+        log::warn!("swap-out {swap_id}: funding not committed, rolling back: {e:?}");
+        let mut reverted = swap.clone();
+        reverted.funding = None;
+        reverted.funding_height = None;
+        reverted.phase = LnMakerPhase::OutAccepted;
+        reverted.touch();
+        store_swap(maker, swap_id, reverted)?;
+        return Err(e);
+    }
     let _ = maker.sync_and_save_wallet();
 
     log::info!(
@@ -1020,6 +1105,10 @@ pub(crate) fn ln_watchdog_tick(maker: &Arc<MakerServer>) {
             (LnDirection::SwapIn, LnMakerPhase::InPaid) => {
                 watchdog_finish_swap_in(maker, &ctx, &swap_id, &swap)
             }
+            // Swept but not yet confirmed: confirm or rebroadcast.
+            (LnDirection::SwapIn, LnMakerPhase::InSwept) => {
+                watchdog_finish_sweep(maker, &ctx, &swap_id, &swap)
+            }
             // Accepted but never funded/paid: forget after the deadline.
             (_, LnMakerPhase::InAccepted) | (_, LnMakerPhase::OutAccepted) => {
                 if swap.updated_at.elapsed() > SWAP_OUT_PAYMENT_DEADLINE {
@@ -1058,7 +1147,7 @@ fn watchdog_finish_swap_in(
         } = event
         {
             if preimage.payment_hash() == swap.payment_hash {
-                return sweep_swap_in(maker, ctx, swap_id, swap, &preimage);
+                return sweep_swap_in(maker, swap_id, swap, &preimage);
             }
         }
     }
@@ -1073,7 +1162,7 @@ fn watchdog_finish_swap_in(
     if let Some(preimage) = preimage {
         if preimage.payment_hash() == swap.payment_hash {
             log::info!("Swap-in {swap_id}: recovered preimage from the node's payment store");
-            return sweep_swap_in(maker, ctx, swap_id, swap, &preimage);
+            return sweep_swap_in(maker, swap_id, swap, &preimage);
         }
     }
 
@@ -1113,15 +1202,31 @@ fn watchdog_resolve_swap_out(
             spending_tx: Some(spending_tx),
             ..
         }) => {
-            // Either the taker's claim (carries the preimage we need) or our
-            // own refund landing; both close the swap.
-            if swap.htlc.extract_preimage(&spending_tx).is_some() {
-                settle_swap_out_from_spend(maker, ctx, swap_id, swap, &spending_tx)
-            } else {
-                log::info!("Swap-out {swap_id} HTLC spent without preimage (refund); closing");
-                ctx.router.unsubscribe(&swap.payment_hash);
-                maker.remove_ln_swap(swap_id)
+            let spk = swap.htlc.script_pubkey().map_err(|e| {
+                log::warn!("lightning: htlc script build failed: {e}");
+                MakerError::General("htlc script build failed")
+            })?;
+            // Settling on a preimage we can see is safe even before the
+            // spend confirms — learning it early only helps us.
+            let reveals_preimage = swap.htlc.extract_preimage(&spending_tx).is_some();
+            if reveals_preimage {
+                settle_swap_out_from_spend(maker, ctx, swap_id, swap, &spending_tx)?;
+                // `settle_swap_out_from_spend` removes the record once the
+                // Lightning side is settled, which is the value we care
+                // about here; the on-chain side is the taker's.
+                return Ok(());
             }
+            // No preimage: this is our own refund. Close only once it is
+            // confirmed, since a mempool spend can still disappear.
+            if maker.is_htlc_spend_confirmed(&outpoint, &spk)? {
+                log::info!("Swap-out {swap_id}: refund confirmed; closing");
+                let _ = ctx.ln.fail_held_payment(swap.payment_hash);
+                maker.unwatch_outpoint(outpoint, spk);
+                ctx.router.unsubscribe(&swap.payment_hash);
+                maker.remove_ln_swap(swap_id)?;
+                let _ = maker.sync_and_save_wallet();
+            }
+            Ok(())
         }
         Ok(WatcherEvent::UtxoSpent {
             spending_tx: None, ..
@@ -1145,23 +1250,17 @@ fn watchdog_resolve_swap_out(
                     log::warn!("lightning: refund build failed: {e}");
                     MakerError::General("refund build failed")
                 })?;
+            // Broadcast but keep the record: the refund is only ours once it
+            // confirms, and until then this record holds the only key that
+            // can rebuild it. The confirmed-spend branch above closes the
+            // swap and fails the held payment on a later tick.
             match maker.broadcast_transaction(&refund_tx) {
                 Ok(txid) => {
-                    log::info!("Swap-out {swap_id} refunded via timelock: {txid}");
-                    let _ = ctx.ln.fail_held_payment(swap.payment_hash);
-                    if let Ok(spk) = swap.htlc.script_pubkey() {
-                        maker.unwatch_outpoint(outpoint, spk);
-                    }
-                    ctx.router.unsubscribe(&swap.payment_hash);
-                    maker.remove_ln_swap(swap_id)?;
-                    let _ = maker.sync_and_save_wallet();
-                    Ok(())
+                    log::info!("Swap-out {swap_id} refund broadcast: {txid} (held until confirmed)")
                 }
-                Err(e) => {
-                    log::debug!("swap-out {swap_id} refund not yet broadcastable: {e:?}");
-                    Ok(())
-                }
+                Err(e) => log::debug!("swap-out {swap_id} refund not yet broadcastable: {e:?}"),
             }
+            Ok(())
         }
         Err(e) => {
             // Logged rather than formatted into the error: MakerError::General
@@ -1193,6 +1292,7 @@ mod tests {
             htlc: SwapHtlc::new(&branch_pubkey, &other_pubkey, &preimage.payment_hash(), 60),
             privkey: branch_privkey,
             invoice: "lnbcrt-test".to_string(),
+            preimage: Some(preimage),
             funding: Some((OutPoint::default(), Amount::from_sat(40_000))),
             funding_height: Some(812_345),
             updated_at: Instant::now(),

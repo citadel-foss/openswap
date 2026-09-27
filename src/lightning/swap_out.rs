@@ -38,11 +38,10 @@
 //! mined on demand) but not production-safe without patching ldk-server to
 //! raise the invoice delta.
 //!
-//! A second POC gap: the taker cannot parse BOLT11, so it trusts the echoed
-//! [`SwapOutAccept::payment_hash`] instead of verifying that the invoice
-//! string itself commits to `H` and the agreed amount. Production needs a
-//! bolt11 decoder here — paying an invoice with a different hash would let
-//! the maker settle instantly without funding anything.
+//! [`SwapOutTaker::on_accept`] verifies the maker's invoice against the
+//! swap's own payment hash and amount before it is ever paid: an invoice
+//! committing to a different hash would let the maker settle instantly
+//! without funding anything.
 
 use std::sync::Arc;
 
@@ -171,9 +170,16 @@ impl SwapOutTaker {
 
     /// Validates the maker's acceptance and builds the on-chain HTLC.
     ///
-    /// POC: verifies the echoed payment hash and terms, but trusts that the
-    /// invoice string commits to them (no bolt11 parsing — see module docs).
+    /// The invoice itself is verified, not just the echoed fields: paying
+    /// one that commits to a different hash would let the maker settle
+    /// without funding anything.
     pub fn on_accept(&mut self, accept: &SwapOutAccept) -> Result<&SwapHtlc, SwapError> {
+        crate::lightning::invoice::verify_invoice(
+            &accept.invoice,
+            &self.payment_hash,
+            self.params.invoice_amount().to_sat() * 1000,
+        )
+        .map_err(SwapError::Validation)?;
         if accept.payment_hash != self.payment_hash {
             return Err(SwapError::Validation(format!(
                 "maker echoed wrong payment hash {}",
@@ -207,8 +213,16 @@ impl SwapOutTaker {
             .ok_or(SwapError::NotReady("pay_invoice before on_accept"))?;
         // Leave the maker room to settle after the preimage appears
         // on-chain, rather than letting the route run to the refund itself.
-        let cltv_bound =
-            (self.params.locktime as u32).saturating_sub(super::swap::ROUTE_CLTV_MARGIN);
+        let margin = super::swap::ROUTE_CLTV_MARGIN;
+        let cltv_bound = (self.params.locktime as u32)
+            .checked_sub(margin)
+            .filter(|bound| *bound > 0)
+            .ok_or_else(|| {
+                SwapError::Validation(format!(
+                    "locktime {} leaves no route budget above the {margin}-block margin",
+                    self.params.locktime
+                ))
+            })?;
         Ok(self.ln.pay_invoice(invoice, None, Some(cltv_bound))?)
     }
 
@@ -391,7 +405,9 @@ mod tests {
         SwapOutParams {
             amount: Amount::from_sat(50_000),
             maker_fee: Amount::from_sat(2_000),
-            locktime: 10,
+            // Above ROUTE_CLTV_MARGIN: a shorter window leaves no room for
+            // the payment to resolve before the refund matures.
+            locktime: 30,
             min_confirmations: 1,
         }
     }

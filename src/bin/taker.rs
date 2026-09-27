@@ -791,14 +791,27 @@ fn main() -> Result<(), TakerError> {
             }
         }
         Commands::Recover => {
-            // Coinswap recovery errors when there is nothing to recover, so
-            // run it for its effect and keep going: Lightning swaps are
-            // tracked separately and must not be skipped because no coinswap
-            // needed recovering.
-            let coinswap = taker.recover_active_swap();
-            if coinswap.is_ok() && !taker.wait_for_recovery() {
-                log::warn!("Recovery did not finish; re-run `taker recover`");
-            }
+            // Lightning swaps are tracked separately from coinswaps, so
+            // "no coinswap to recover" must not skip them — nor make the
+            // command fail when the Lightning side recovered fine. Any
+            // other coinswap error still propagates.
+            let coinswap = match taker.recover_active_swap() {
+                Ok(()) => {
+                    if !taker.wait_for_recovery() {
+                        log::warn!("Recovery did not finish; re-run `taker recover`");
+                    }
+                    Ok(())
+                }
+                // "Nothing to recover" is not a failure of this command when
+                // the Lightning side still has work; every other error is.
+                Err(TakerError::General(msg))
+                    if msg.contains("No persisted swapcoins found for recovery") =>
+                {
+                    println!("No unfinished coinswaps to recover");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
             #[cfg(feature = "lightning")]
             for outcome in taker.recover_lightning_swaps()? {
                 println!("{outcome}");
