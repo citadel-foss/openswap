@@ -23,7 +23,8 @@ use crate::{
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
     protocol::common_messages::{
-        FidelityProof, MakerToTakerMessage, PrivateKeyHandover, ProtocolVersion, SwapDetails,
+        check_maker_name, FidelityProof, MakerToTakerMessage, PrivateKeyHandover, ProtocolVersion,
+        SwapDetails, MAX_MAKER_NAME_LEN,
     },
     taker::api::{REFUND_LOCKTIME_BASE, REFUND_LOCKTIME_STEP},
     utill::{
@@ -274,6 +275,8 @@ pub struct MakerServerConfig {
     pub password: Option<String>,
     /// Nostr relay URLs for fidelity bond broadcasting.
     pub nostr_relays: Vec<String>,
+    /// Public name sent to takers in the offer.
+    pub name: String,
 }
 
 impl Default for MakerServerConfig {
@@ -301,6 +304,7 @@ impl Default for MakerServerConfig {
             tor_auth_password: String::new(),
             password: None,
             nostr_relays: NOSTR_RELAYS.iter().map(|s| s.to_string()).collect(),
+            name: String::new(),
         }
     }
 }
@@ -361,6 +365,9 @@ impl MakerServerConfig {
             MIN_RELAY_FEE_RATE
         };
 
+        let name = parse_field(config_map.get("name"), default_config.name);
+        check_maker_name(&name).map_err(WalletError::General)?;
+
         Ok(MakerServerConfig {
             network_port: parse_field(config_map.get("network_port"), default_config.network_port),
             rpc_port: parse_field(config_map.get("rpc_port"), default_config.rpc_port),
@@ -393,6 +400,7 @@ impl MakerServerConfig {
                 config_map.get("tor_auth_password"),
                 default_config.tor_auth_password,
             ),
+            name,
             // Runtime fields — not read from config file
             data_dir: default_config.data_dir,
             network: default_config.network,
@@ -443,6 +451,8 @@ time_relative_fee_pct = {}
 required_confirms = {}
 # Check funding inputs against the address blocklist
 check_blocklist = {}
+# Public name shown to takers (at most {} bytes)
+name = \"{}\"
 ",
             self.network_port,
             self.rpc_port,
@@ -460,6 +470,8 @@ check_blocklist = {}
             self.time_relative_fee_pct,
             self.required_confirms,
             self.check_blocklist,
+            MAX_MAKER_NAME_LEN,
+            self.name,
         );
 
         std::fs::create_dir_all(path.parent().ok_or_else(|| {
@@ -1580,6 +1592,7 @@ impl MakerTrait for MakerServer {
                 .unwrap_or(u64::MAX),
             required_confirms: self.config.required_confirms,
             supported_protocols: self.config.supported_protocols.clone(),
+            name: self.config.name.clone(),
         }
     }
 
@@ -2917,9 +2930,9 @@ mod tests {
 
     /// Non-finite or below-minimum fidelity feerates clamp to the relay
     /// minimum; a valid value is kept. A plain `<` comparison would let
-    /// `nan` through into the bond fee math.
+    /// `nan` through into the bond fee math. A name takers would refuse stops startup.
     #[test]
-    fn maker_config_clamps_invalid_fidelity_feerate() {
+    fn maker_config_checks_file_values() {
         // The accepted timelock range depends on the integration-test
         // feature, so write one that is valid for this build instead of
         // inheriting the 15,000-block default (invalid under the feature).
@@ -2945,6 +2958,16 @@ mod tests {
         assert_eq!(resolve("inf"), MIN_RELAY_FEE_RATE);
         assert_eq!(resolve("0.5"), MIN_RELAY_FEE_RATE);
         assert_eq!(resolve("3.0"), 3.0);
+
+        let path = dir.path().join("config.toml");
+        for (name, accepted) in [("x".repeat(32), true), ("x".repeat(33), false)] {
+            std::fs::write(
+                &path,
+                format!("fidelity_timelock = {timelock}\nname = \"{name}\"\n"),
+            )
+            .unwrap();
+            assert_eq!(MakerServerConfig::new(Some(&path)).is_ok(), accepted);
+        }
     }
 
     #[test]

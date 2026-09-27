@@ -647,6 +647,8 @@ pub struct MakerConfig {
     pub required_confirms: u32,
     /// Supported protocol versions.
     pub supported_protocols: Vec<ProtocolVersion>,
+    /// Public name sent in the offer.
+    pub name: String,
 }
 
 /// Message handler
@@ -800,6 +802,7 @@ fn handle_get_offer<M: Maker>(
         tweakable_point,
         fidelity,
         tweak_chain_code,
+        name: config.name,
     };
 
     #[cfg(feature = "integration-test")]

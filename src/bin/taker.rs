@@ -322,6 +322,7 @@ fn display_offer(
 
     Offer
     ─────
+    Name           : {name}
     Base Fee       : {base_fee}
     Amount Fee %   : {amount_fee:.4}
     Time Fee %     : {time_fee:.4}
@@ -340,6 +341,7 @@ fn display_offer(
     Expiry         : {expiry}
     "#,
         header = header.trim_end(),
+        name = offer.name,
         base_fee = offer.base_fee,
         amount_fee = offer.amount_relative_fee_pct,
         time_fee = offer.time_relative_fee_pct,

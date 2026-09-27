@@ -79,6 +79,9 @@ pub struct Offer {
     pub fidelity: FidelityProof,
     /// Chain code for deterministic derivation of swap addresses from the tweakable point.
     pub tweak_chain_code: ChainCode,
+    /// Public name the maker chose. A label only: any maker can claim any name.
+    #[serde(default)]
+    pub name: String,
 }
 
 impl Offer {
@@ -101,8 +104,22 @@ impl Offer {
             ));
         }
 
-        Ok(())
+        check_maker_name(&self.name)
     }
+}
+
+/// Longest maker name, in bytes, that takers accept.
+pub(crate) const MAX_MAKER_NAME_LEN: usize = 32;
+
+/// Takers store the name in the offerbook and print it to the terminal,
+/// so it must stay short and free of escape codes.
+pub(crate) fn check_maker_name(name: &str) -> Result<(), String> {
+    if name.len() > MAX_MAKER_NAME_LEN || name.chars().any(char::is_control) {
+        return Err(format!(
+            "invalid maker name {name:?}: at most {MAX_MAKER_NAME_LEN} bytes, no control characters"
+        ));
+    }
+    Ok(())
 }
 
 /// Swap details from Taker to Maker.

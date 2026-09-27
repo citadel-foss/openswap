@@ -116,6 +116,15 @@ fn test_offerbook_removal_survives_restart() {
         "manual removal must survive the restart, got {:?}",
         listed
     );
+    // The maker's name arrives in its offer and is saved with it.
+    let names: Vec<String> = restarted
+        .fetch_offers()
+        .expect("offerbook snapshot")
+        .all_makers()
+        .iter()
+        .filter_map(|m| m.offer.as_ref().map(|o| o.name.clone()))
+        .collect();
+    assert_eq!(names, [format!("maker{}", makers[1].config.network_port)]);
 
     // ---- 4b. A direct poll rediscovers the removed maker without a relay ----
     restarted

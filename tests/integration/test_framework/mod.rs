@@ -1074,6 +1074,7 @@ impl TestFramework {
                     let fee = fee_overrides.get(i).copied().flatten();
                     let config = MakerServerConfig {
                         data_dir: temp_dir.join(network_port.to_string()),
+                        name: maker_id.clone(),
                         wallet_name: maker_id,
                         network_port,
                         rpc_port: rpc_listener.local_addr().unwrap().port(),

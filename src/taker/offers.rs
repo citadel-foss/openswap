@@ -1928,6 +1928,7 @@ impl MakerAddress {
                 cert_sig: router_offer.fidelity.cert_sig,
             },
             tweak_chain_code: router_offer.tweak_chain_code,
+            name: router_offer.name,
         };
 
         log::info!(
@@ -2124,6 +2125,7 @@ mod tests {
                 cert_sig,
             },
             tweak_chain_code: bitcoin::bip32::ChainCode::from([0u8; 32]),
+            name: "maker".to_string(),
         }
     }
 
@@ -2717,6 +2719,14 @@ mod tests {
             },
             Offer {
                 min_size: offer.max_size + 1,
+                ..offer.clone()
+            },
+            Offer {
+                name: "x".repeat(33),
+                ..offer.clone()
+            },
+            Offer {
+                name: "\x1b[2J".to_string(),
                 ..offer.clone()
             },
         ] {
