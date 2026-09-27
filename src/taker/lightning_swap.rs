@@ -491,8 +491,18 @@ impl Taker {
             let mut wallet = self.write_wallet()?;
             // One split, one destination: an HTLC output is a single exact
             // payment, with no hop to reimburse and nothing to randomize.
-            let plan =
-                wallet.plan_funding(value, 1, MIN_RELAY_FEE_RATE, u32::MAX, None, None, None)?;
+            // A Lightning HTLC is a script-path P2WSH contract, priced like
+            // the Legacy protocol's rather than Taproot's.
+            let plan = wallet.plan_funding(
+                value,
+                1,
+                MIN_RELAY_FEE_RATE,
+                u32::MAX,
+                None,
+                None,
+                None,
+                crate::protocol::ProtocolVersion::Legacy,
+            )?;
             let result = wallet.execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE)?;
             let tx = result
                 .funding_txes

@@ -1222,16 +1222,36 @@ fn watchdog_resolve_swap_out(
                 // about here; the on-chain side is the taker's.
                 return Ok(());
             }
-            // No preimage: this is our own refund. Close only once it is
-            // confirmed, since a mempool spend can still disappear.
-            if maker.is_htlc_spend_confirmed(&outpoint, &spk)? {
-                log::info!("Swap-out {swap_id}: refund confirmed; closing");
-                let _ = ctx.ln.fail_held_payment(swap.payment_hash);
-                maker.unwatch_outpoint(outpoint, spk);
-                ctx.router.unsubscribe(&swap.payment_hash);
-                maker.remove_ln_swap(swap_id)?;
-                let _ = maker.sync_and_save_wallet();
+            // No preimage in the snapshot we were handed — but that snapshot
+            // can be stale. The watcher may report our mempool refund while
+            // the taker's claim is what actually confirms, and
+            // `is_htlc_spend_confirmed` only says the outpoint has *some*
+            // confirmed spend, not whose. Treating that as our refund would
+            // fail the hold invoice while the confirmed transaction carried
+            // the preimage, handing the taker both sides.
+            if !maker.is_htlc_spend_confirmed(&outpoint, &spk)? {
+                return Ok(());
             }
+            let ours_confirmed = match swap.refund_txid {
+                Some(txid) => maker.is_tx_confirmed(&txid)?,
+                None => false,
+            };
+            if !ours_confirmed {
+                // Someone else won the outpoint, which can only be the
+                // taker's claim. Keep the swap and retry until we hold the
+                // confirmed spender and can take its preimage.
+                log::warn!(
+                    "Swap-out {swap_id}: HTLC spent by a transaction that is not our refund; \
+                     retrying for the preimage"
+                );
+                return Ok(());
+            }
+            log::info!("Swap-out {swap_id}: our refund confirmed; closing");
+            let _ = ctx.ln.fail_held_payment(swap.payment_hash);
+            maker.unwatch_outpoint(outpoint, spk);
+            ctx.router.unsubscribe(&swap.payment_hash);
+            maker.remove_ln_swap(swap_id)?;
+            let _ = maker.sync_and_save_wallet();
             Ok(())
         }
         Ok(WatcherEvent::UtxoSpent {

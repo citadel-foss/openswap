@@ -1771,7 +1771,7 @@ impl MakerServer {
         let capacity = super::lightning_handlers::directional_limits(
             &channels,
             wallet_max,
-            self.config.min_swap_amount,
+            min_swap_amount(&self.config),
         );
         if !capacity.swap_in && !capacity.swap_out {
             return None;
@@ -1781,7 +1781,7 @@ impl MakerServer {
             swap_out: capacity.swap_out,
             base_fee: self.config.base_fee,
             amount_relative_fee_pct: self.config.amount_relative_fee_pct,
-            min_size: self.config.min_swap_amount,
+            min_size: min_swap_amount(&self.config),
             max_swap_in: capacity.max_swap_in,
             max_swap_out: capacity.max_swap_out,
         })
@@ -3242,17 +3242,16 @@ impl MakerTrait for MakerServer {
     #[cfg(feature = "lightning")]
     fn is_tx_confirmed(&self, txid: &bitcoin::Txid) -> Result<bool, MakerError> {
         use crate::wallet::Blockchain;
-        let info = lock_debug!(self.wallet.read())
+        // `tx_block_height` already distinguishes "not in a block" from a
+        // query failure, across both backends. Matching on an error string
+        // would not: Core reports an unknown transaction as -5 while
+        // Electrum reports it as a message under -32603.
+        let height = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
             .blockchain
-            .get_raw_transaction_info(txid, None);
-        match info {
-            Ok(info) => Ok(info.confirmations.unwrap_or(0) >= 1),
-            // Unknown to the backend means not confirmed, which is the
-            // answer the caller needs; a transport failure is not.
-            Err(e) if format!("{e:?}").contains("-5") => Ok(false),
-            Err(e) => Err(MakerError::Wallet(e)),
-        }
+            .tx_block_height(txid)
+            .map_err(MakerError::Wallet)?;
+        Ok(height.is_some())
     }
 
     #[cfg(feature = "lightning")]
@@ -3335,7 +3334,18 @@ impl MakerTrait for MakerServer {
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
         // One split, one destination, no taker-reimbursed input budget.
         let plan = wallet
-            .plan_funding(amount, 1, MIN_RELAY_FEE_RATE, u32::MAX, None, None, None)
+            .plan_funding(
+                amount,
+                1,
+                MIN_RELAY_FEE_RATE,
+                u32::MAX,
+                None,
+                None,
+                None,
+                // A Lightning HTLC is a script-path P2WSH contract, so it is
+                // priced like the Legacy protocol's, not Taproot's.
+                ProtocolVersion::Legacy,
+            )
             .map_err(MakerError::Wallet)?;
         // Claim the selected inputs under this swap before executing, so a
         // concurrent coinswap admission plans around them instead of
