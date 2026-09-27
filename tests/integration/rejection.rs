@@ -725,6 +725,8 @@ fn maker_degrades_split_count_when_netting_breaks_the_floor() {
     taker
         .prepare_swap(params)
         .expect("admission must fall back to one split");
+    // Two splits would reserve at least two inputs.
+    assert_eq!(makers[0].live_reserved_inputs().unwrap(), 1);
 
     shutdown_makers(&makers, maker_threads);
     test_framework.stop();

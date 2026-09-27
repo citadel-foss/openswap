@@ -107,7 +107,9 @@ fn min_swap_amount(config: &MakerServerConfig) -> u64 {
         .iter()
         .filter_map(|p| swap_cost_floor(*p, MIN_RELAY_FEE_RATE, 1, 1))
         .max()
-        .filter(|_| rel < 1.0)
+        // The closed form is exact only while the fee grows with the amount
+        // but stays under it; outside that no minimum can be priced.
+        .filter(|_| (0.0..1.0).contains(&rel))
         .map(|cost| {
             // Solves `amount - fee(amount) >= cost` for `amount`.
             let exact = (config.base_fee.saturating_add(cost) as f64 / (1.0 - rel)).ceil() as u64;
@@ -1127,7 +1129,7 @@ impl MakerServer {
         let min_required = min_swap_amount(&self.config);
         if min_required == u64::MAX {
             return Err(MakerError::General(
-                "Fee settings leave no swap amount that pays",
+                "Fee settings cannot price a minimum swap amount",
             ));
         }
 
@@ -2927,8 +2929,8 @@ mod tests {
             assert!(kept(min) >= cost, "{:?}", config);
             assert!(kept(min - MIN_SWAP_STEP_SATS) < cost, "{:?}", config);
         }
-        // Fees no amount can pay leave no minimum; startup refuses these.
-        for amount_pct in [f64::NAN, 100.0] {
+        // Fees the formula cannot price leave no minimum; startup refuses these.
+        for amount_pct in [f64::NAN, 100.0, -1000.0] {
             let config = MakerServerConfig {
                 amount_relative_fee_pct: amount_pct,
                 ..Default::default()
