@@ -3410,12 +3410,20 @@ impl Wallet {
             if let Err(e) = (|| -> Result<(), WalletError> {
                 let contract_txid = swapcoin.contract_tx.compute_txid();
                 if let Some(spend_tx) = &swapcoin.spending_tx {
-                    // A sweep we built before may already be out: hold the refund.
-                    claiming.extend(swapcoin.swap_id.clone());
+                    // A sweep we built before may already be out. If the backend
+                    // does not know it, the contract output checks below decide.
                     let txid = spend_tx.compute_txid();
-                    if !chain.is_tx_unknown(&txid)? {
-                        sweeps.push((swap_id.clone(), contract_txid, txid));
-                        return Ok(());
+                    match chain.is_tx_unknown(&txid) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            claiming.extend(swapcoin.swap_id.clone());
+                            sweeps.push((swap_id.clone(), contract_txid, txid));
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            claiming.extend(swapcoin.swap_id.clone());
+                            return Err(e);
+                        }
                     }
                 }
                 // Determine which UTXO to spend based on protocol and spending path.

@@ -21,7 +21,7 @@ use crate::{
     utill::{
         HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE, UNBROADCAST_DISCARD_GRACE,
     },
-    wallet::{Blockchain, RecoveryOutcome, RecoveryReport, Wallet},
+    wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, Wallet},
 };
 
 use super::{
@@ -1203,6 +1203,27 @@ fn recover_from_swap(
         outgoing_swapcoins.len()
     );
 
+    // The next hop claimed an outgoing contract: it has a confirmed spend other
+    // than our own timelock refund. That claim puts the preimage on chain.
+    let claimed_downstream = |chain: &AnyBlockchain| -> Result<bool, MakerError> {
+        for outgoing in &outgoing_swapcoins {
+            let outpoint = bitcoin::OutPoint::new(
+                outgoing.contract_tx.compute_txid(),
+                outgoing.get_contract_output_vout(),
+            );
+            let Some(output) = outgoing.contract_tx.output.get(outpoint.vout as usize) else {
+                continue;
+            };
+            if chain
+                .confirmed_spending_transaction(&outpoint, &output.script_pubkey)
+                .map_err(MakerError::Wallet)?
+                .is_some_and(|tx| !outgoing.is_own_timelock_spend(&tx))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
     let all_outgoing_confirmed_settled = || -> Result<bool, MakerError> {
         if outgoing_swapcoins.is_empty() {
             return Ok(false);
@@ -1603,7 +1624,27 @@ fn recover_from_swap(
             None
         };
 
-        if all_preimages_known && !incoming_swapcoins.is_empty() {
+        // A crash between the hashlock sweep and its cleanup leaves no incoming
+        // coin to show the preimage, but the next hop's claim on chain still does.
+        let settled_downstream = match chain.as_ref().filter(|_| incoming_swapcoins.is_empty()) {
+            Some(chain) => match claimed_downstream(chain) {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Could not check outgoing contract spends: {:?}; retrying recovery",
+                        maker.config.network_port,
+                        e
+                    );
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
+                    }
+                    continue;
+                }
+            },
+            None => false,
+        };
+
+        if all_preimages_known && (!incoming_swapcoins.is_empty() || settled_downstream) {
             log::info!(
                 "[{}] All preimages known, recovering via hashlock path",
                 maker.config.network_port
@@ -1763,34 +1804,14 @@ fn recover_from_swap(
             let incoming_unclaimable = incoming_swapcoins
                 .iter()
                 .all(|incoming| incoming.other_privkey.is_none());
-            // The next hop's hashlock claim also empties the wallet (as a discard),
-            // and can confirm before the watcher shows its preimage. That incoming
-            // is ours to claim, so any spend but our own refund keeps it.
-            let claimed_downstream = || {
-                outgoing_swapcoins.iter().any(|outgoing| {
-                    let outpoint = bitcoin::OutPoint::new(
-                        outgoing.contract_tx.compute_txid(),
-                        outgoing.get_contract_output_vout(),
-                    );
-                    outgoing
-                        .contract_tx
-                        .output
-                        .get(outpoint.vout as usize)
-                        .is_some_and(|output| {
-                            match chain
-                                .confirmed_spending_transaction(&outpoint, &output.script_pubkey)
-                            {
-                                Ok(spend) => {
-                                    spend.is_some_and(|tx| !outgoing.is_own_timelock_spend(&tx))
-                                }
-                                Err(_) => true,
-                            }
-                        })
-                })
-            };
-            // Nothing on-chain also describes a swap that never funded, so
-            // do not call it cleaned up while the discard is still pending.
-            if outgoing_done && incoming_unclaimable && !discard_pending && !claimed_downstream() {
+            // A next hop's hashlock claim also empties the wallet, maybe before the
+            // watcher shows its preimage, so any spend but our own refund keeps the
+            // incoming. A swap that never funded waits for its pending discard.
+            if outgoing_done
+                && incoming_unclaimable
+                && !discard_pending
+                && !claimed_downstream(chain).unwrap_or(true)
+            {
                 {
                     let mut wallet = lock_debug!(maker.wallet.write())
                         .map_err(|_| MakerError::General("Failed to lock wallet"))?;
