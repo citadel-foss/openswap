@@ -239,7 +239,8 @@ pub struct SwapParams {
     /// Swap feerate in sats/vB for every transaction in this swap. Defaults
     /// to the 1 sat/vB relay floor; lower values are rejected at prepare time.
     pub feerate: u64,
-    /// Required confirmations for funding transactions.
+    /// Required confirmations for funding transactions. At least 1:
+    /// `prepare_swap` rejects 0.
     pub required_confirms: u32,
     /// User-selected UTXOs (optional).
     pub manually_selected_outpoints: Option<Vec<OutPoint>>,
@@ -984,6 +985,14 @@ impl Taker {
                 "Swap feerate {} sats/vB is below the {} sats/vB relay floor",
                 params.feerate, MIN_RELAY_FEE_RATE as u64
             )));
+        }
+
+        // A 0-conf peer can replace its funding after we commit to the next
+        // step. Nothing downstream defends against that, so refuse it here.
+        if params.required_confirms == 0 {
+            return Err(TakerError::General(
+                "Required confirmations must be at least 1".to_string(),
+            ));
         }
 
         // Zero splits fund nothing; above the cap the per-split messages grow

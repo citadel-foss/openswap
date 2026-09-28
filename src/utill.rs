@@ -102,10 +102,6 @@ pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(120);
 pub(crate) const UNFUNDED_SWAP_LIFETIME: Duration =
     Duration::from_secs(2 * TX_CONFIRMATION_TIMEOUT.as_secs());
 
-/// Floor for funding-tx confirmations: applied when the configured
-/// `required_confirms` is absent or 0.
-pub const MIN_REQUIRED_CONFIRM: u32 = 1;
-
 /// Default fee rate in sats/vb for all transactions, and the absolute floor:
 /// Bitcoin Core's default `minrelaytxfee`. Lower rates stop relaying.
 pub const MIN_RELAY_FEE_RATE: f64 = 1.0;

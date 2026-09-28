@@ -365,7 +365,7 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     let (test_framework, takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             1,
-            vec![TakerBehavior::Normal],
+            vec![TakerBehavior::SkipFundingConfirmWait],
             vec![MakerBehavior::Normal],
         );
 
@@ -379,12 +379,10 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     generate_blocks(bitcoind, 1);
 
-    // required_confirms 0 skips the taker's own confirmation wait, so its
-    // contract data reaches the maker unconfirmed; the maker's own floor of 1
-    // confirmation is what parks it in the wait.
-    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
-        .with_tx_count(2)
-        .with_required_confirms(0);
+    // The taker skips its own confirmation wait, so its contract data reaches
+    // the maker unconfirmed and parks the maker in its wait.
+    let swap_params =
+        SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1).with_tx_count(2);
     let summary = taker.prepare_swap(swap_params).expect("prepare swap");
 
     let log_path = test_framework.taker_log_path();

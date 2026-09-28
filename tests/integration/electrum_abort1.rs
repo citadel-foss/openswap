@@ -337,11 +337,8 @@ fn electrum_sweeps_after_breach() {
     wait_for_makers_setup(&makers, 120);
     sync_maker_wallets(&makers);
 
-    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        // Zero confirms: the taker hits the closed connection at once instead
-        // of sitting in a confirmation wait while the contract mines.
-        .with_required_confirms(0);
+    let swap_params =
+        SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2).with_tx_count(3);
 
     generate_blocks(bitcoind, 1);
     let swap_start_height = chain_tip(bitcoind) + 1;
@@ -459,9 +456,8 @@ fn electrum_discards_only_on_confirmed_spend() {
     wait_for_makers_setup(&makers, 120);
     sync_maker_wallets(&makers);
 
-    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(0);
+    let swap_params =
+        SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2).with_tx_count(3);
 
     generate_blocks(bitcoind, 1);
 

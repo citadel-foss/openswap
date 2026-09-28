@@ -245,7 +245,7 @@ pub struct MakerServerConfig {
     pub amount_relative_fee_pct: f64,
     /// Time-relative fee percentage.
     pub time_relative_fee_pct: f64,
-    /// Required confirmations for funding transactions.
+    /// Required confirmations for funding transactions. At least 1: `init` rejects 0.
     pub required_confirms: u32,
     /// Whether funding inputs should be checked against the address blocklist.
     pub check_blocklist: bool,
@@ -697,6 +697,11 @@ impl MakerServer {
         // Configs built in code skip `MakerServerConfig::new`, so check here too.
         check_fee_pcts(config.amount_relative_fee_pct, config.time_relative_fee_pct)
             .map_err(|e| MakerError::Wallet(WalletError::General(e)))?;
+        // A 0-conf peer can replace its funding after we fund the next hop.
+        // Nothing downstream defends against that, so refuse the config.
+        if config.required_confirms == 0 {
+            return Err(MakerError::General("required_confirms must be at least 1"));
+        }
         std::fs::create_dir_all(&config.data_dir).map_err(MakerError::IO)?;
         // For the Core backend, bind the node-side wallet name to the on-disk
         // wallet name (no-op for Electrum, which has no server-side wallet).
@@ -1782,8 +1787,6 @@ impl MakerTrait for MakerServer {
         txids: &[bitcoin::Txid],
         required_confirms: u32,
     ) -> Result<(), MakerError> {
-        let required_confirms = required_confirms.max(crate::utill::MIN_REQUIRED_CONFIRM);
-
         log::info!(
             "[{}] Waiting for {} confirmation(s) on tx batch of {}",
             self.config.network_port,
@@ -2599,7 +2602,7 @@ impl MakerTrait for MakerServer {
                 check_reedemscript_is_multisig, read_contract_locktime,
                 read_hashvalue_from_contract,
             },
-            utill::{redeemscript_to_scriptpubkey, MIN_REQUIRED_CONFIRM},
+            utill::redeemscript_to_scriptpubkey,
         };
         use bitcoin::{hashes::Hash, OutPoint};
         use std::collections::HashSet;
@@ -2654,11 +2657,7 @@ impl MakerTrait for MakerServer {
         // Check the funding txs are confirmed to required depth, one wait for the
         // whole batch. Same confirm source as the taproot path: the operator's
         // config, not a hardcoded 1.
-        self.wait_for_txs_on_chain(
-            &message.id,
-            &funding_txids,
-            self.config.required_confirms.max(MIN_REQUIRED_CONFIRM),
-        )?;
+        self.wait_for_txs_on_chain(&message.id, &funding_txids, self.config.required_confirms)?;
 
         for funding_info in &message.confirmed_funding_txes {
             // Check that the new locktime is sufficiently short enough
@@ -3131,6 +3130,20 @@ mod tests {
             };
             assert_eq!(min_swap_amount(&config), u64::MAX);
         }
+    }
+
+    /// A 0-conf maker would fund the next hop on replaceable funding. The
+    /// config is refused before init touches disk or the backend.
+    #[test]
+    fn init_rejects_zero_required_confirms() {
+        let config = MakerServerConfig {
+            required_confirms: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            MakerServer::init(config),
+            Err(MakerError::General("required_confirms must be at least 1"))
+        ));
     }
 
     /// Keeps wallet inspection usable without clearing the terminal server latch.

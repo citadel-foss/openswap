@@ -803,7 +803,7 @@ fn maker_rejects_spent_funding_outpoint_mempool() {
 #[test]
 fn maker_errors_when_seen_funding_tx_is_evicted() {
     let maker_count = 2;
-    let taker_behaviors = vec![TakerBehavior::Normal];
+    let taker_behaviors = vec![TakerBehavior::SkipFundingConfirmWait];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
@@ -837,11 +837,10 @@ fn maker_errors_when_seen_funding_tx_is_evicted() {
             .unwrap()
     };
 
-    // Zero required confirms sends the contract data while the funding tx is
-    // still in the mempool, which is what puts the maker into its wait.
-    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
-        .with_tx_count(1)
-        .with_required_confirms(0);
+    // The taker skips its confirmation wait, so the contract data arrives while
+    // the funding tx is still in the mempool, which puts the maker into its wait.
+    let swap_params =
+        SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2).with_tx_count(1);
     let summary = taker
         .prepare_swap(swap_params)
         .expect("prepare_swap should succeed");
@@ -1373,6 +1372,10 @@ fn taker_rejects_out_of_bounds_params_at_prepare() {
                 "Max input budget 0 is outside the protocol bounds 1..={}",
                 MAX_TX_COUNT
             ),
+        ),
+        (
+            params().with_required_confirms(0),
+            "Required confirmations must be at least 1".to_string(),
         ),
         (
             params().with_feerate(0),
@@ -2033,7 +2036,6 @@ struct ReplayScenario {
     swap1_completes: bool,
     sync_after_swap1: bool,
     swapcoins_before: Option<(usize, &'static str)>,
-    swap2_confirms: u32,
     swap2_reject_msg: &'static str,
     needle: &'static str,
     needle_timeout_secs: u64,
@@ -2050,7 +2052,6 @@ const REPLAYED_TAPROOT_AFTER_COMPLETION: ReplayScenario = ReplayScenario {
     swap1_completes: true,
     sync_after_swap1: false,
     swapcoins_before: None,
-    swap2_confirms: 1,
     swap2_reject_msg: "the maker must reject replayed contract data",
     needle: "Taproot contract output already spent",
     needle_timeout_secs: 120,
@@ -2070,7 +2071,6 @@ const REPLAYED_LEGACY_POF_IN_FLIGHT: ReplayScenario = ReplayScenario {
     swap1_completes: false,
     sync_after_swap1: true,
     swapcoins_before: None,
-    swap2_confirms: 0,
     swap2_reject_msg: "the maker must reject the replayed proof of funding",
     needle: "Legacy contract txid already in use",
     needle_timeout_secs: 60,
@@ -2090,7 +2090,6 @@ const REPLAYED_TAPROOT_IN_FLIGHT: ReplayScenario = ReplayScenario {
     swap1_completes: false,
     sync_after_swap1: false,
     swapcoins_before: Some((1, "swap 1's incoming swapcoin must be live on the maker")),
-    swap2_confirms: 0,
     swap2_reject_msg: "the maker must reject the in-flight replayed contract data",
     needle: "Contract txid already in use",
     needle_timeout_secs: 60,
@@ -2121,10 +2120,8 @@ fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
 
     let preferred = vec![format!("127.0.0.1:{}", makers[0].config.network_port)];
-    let params = |confirms| {
-        let p = SwapParams::new(s.protocol, Amount::from_sat(500_000), 1)
-            .with_tx_count(1)
-            .with_required_confirms(confirms);
+    let params = || {
+        let p = SwapParams::new(s.protocol, Amount::from_sat(500_000), 1).with_tx_count(1);
         if s.pin_maker {
             p.with_preferred_makers(preferred.clone())
         } else {
@@ -2133,7 +2130,7 @@ fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     };
 
     let summary1 = taker
-        .prepare_swap(params(1))
+        .prepare_swap(params())
         .expect("prepare 1 must succeed");
     if s.swap1_completes {
         // Swap 1 completes normally; its contract data is cached for the replay.
@@ -2199,7 +2196,7 @@ fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
 
     let summary2 = taker
-        .prepare_swap(params(s.swap2_confirms))
+        .prepare_swap(params())
         .expect("prepare 2 must succeed");
     assert_ne!(summary1.swap_id, summary2.swap_id);
     let swap2 = taker.start_swap(&summary2.swap_id);
@@ -2397,7 +2394,6 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
     let params = |address: &str| {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
             .with_tx_count(1)
-            .with_required_confirms(0)
             .with_preferred_makers(vec![address.to_string()])
     };
 
@@ -2502,7 +2498,6 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
     let params = |address: &str| {
         SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
             .with_tx_count(1)
-            .with_required_confirms(0)
             .with_preferred_makers(vec![address.to_string()])
     };
 

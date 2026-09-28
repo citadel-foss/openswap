@@ -56,7 +56,7 @@ required_confirms = 1
 - `base_fee`: A fixed fee charged by the Maker for providing its services (in satoshis).
 - `amount_relative_fee_pct`: A percentage fee based on the swap amount.
 - `time_relative_fee_pct`: A percentage fee based on the swap duration.
-- `required_confirms`: Number of confirmations required for funding transactions (default: 1).
+- `required_confirms`: Number of confirmations required for funding transactions (default: 1). Must be at least 1: the maker refuses to start with 0.
 - The per-hop parameters the taker negotiates (`tx_count`, `max_input_budget`, `feerate`) — and what the maker is reimbursed on top of its service fees — are covered in [the fee policy](./fee-policy.md).
 
 There is no minimum swap setting. Your node works out the smallest swap it accepts for each request. The swap must pay your fee and the mining fees. Every coin you receive or send must also stay above dust after you pay to spend it. Dust is an amount too small for the network to forward. At 1 sat/vB, one taproot coin needs at least 485 sats: 330 sats of dust plus 155 sats to spend it.

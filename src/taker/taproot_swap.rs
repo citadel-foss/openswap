@@ -835,12 +835,14 @@ impl Taker {
         let required_confirms = self.swap_state()?.params.required_confirms;
 
         // Test hook: send contract data while the funding is mempool-only or
-        // withheld entirely, so keepalives meet the maker's evidence gate.
+        // withheld entirely, so the maker's defences meet unconfirmed funding.
         #[cfg(feature = "integration-test")]
         let skip_wait = matches!(
             self.behavior,
             super::api::TakerBehavior::SkipFundingConfirmWait
                 | super::api::TakerBehavior::WithholdFundingBroadcast
+                | super::api::TakerBehavior::ReplayTaprootContractData
+                | super::api::TakerBehavior::ReplayTaprootContractDataInFlight
         );
         #[cfg(not(feature = "integration-test"))]
         let skip_wait = false;
@@ -874,7 +876,7 @@ impl Taker {
         required_confirms: u32,
         arrival_timeout: Duration,
     ) -> Result<(), TakerError> {
-        if required_confirms == 0 || contract_txids.is_empty() {
+        if contract_txids.is_empty() {
             return Ok(());
         }
 
