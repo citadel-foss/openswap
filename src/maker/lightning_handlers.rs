@@ -124,6 +124,8 @@ pub struct LnMakerSwap {
     pub preimage: Option<Preimage>,
     /// Txid of the refund we broadcast, once we have.
     pub refund_txid: Option<bitcoin::Txid>,
+    /// Chain tip when the swap was accepted.
+    pub accepted_height: Option<u32>,
     /// Where this swap pays out, fixed on first use.
     pub payout_script: Option<bitcoin::ScriptBuf>,
     /// The confirmed/broadcast HTLC funding output, once known.
@@ -159,6 +161,7 @@ impl LnMakerSwap {
             invoice: self.invoice.clone(),
             preimage: self.preimage.map(|p| p.0),
             refund_txid: self.refund_txid,
+            accepted_height: self.accepted_height,
             payout_script: self.payout_script.clone(),
             funding_outpoint,
             funding_value,
@@ -183,6 +186,7 @@ impl LnMakerSwap {
             invoice: record.invoice,
             preimage: record.preimage.map(Preimage),
             refund_txid: record.refund_txid,
+            accepted_height: record.accepted_height,
             payout_script: record.payout_script,
             funding: record.funding_outpoint.zip(record.funding_value),
             funding_height: record.funding_height,
@@ -401,7 +405,6 @@ pub fn handle_lightning_message<M: Maker>(
     }
 }
 
-/// Terms validation shared by both directions. Returns the maker fee.
 /// Most Lightning swaps the maker keeps in flight at once. Each one holds a
 /// hold invoice, a mailbox, and a persisted record, so an uncapped peer can
 /// exhaust node and disk resources for free.
@@ -427,15 +430,17 @@ fn swap_id_matches_hash(swap_id: &str, payment_hash: &sha256::Hash) -> Result<()
 fn payout_script<M: Maker>(
     maker: &Arc<M>,
     swap_id: &str,
-    swap: &LnMakerSwap,
+    swap: &mut LnMakerSwap,
 ) -> Result<bitcoin::ScriptBuf, MakerError> {
     if let Some(script) = &swap.payout_script {
         return Ok(script.clone());
     }
     let script = maker.get_receive_address()?.script_pubkey();
-    let mut updated = swap.clone();
-    updated.payout_script = Some(script.clone());
-    maker.store_ln_swap(swap_id, updated)?;
+    // Written through the caller's own value, not just to storage: a later
+    // store of their copy would otherwise write the script back out as
+    // None, and every rebuild would take a fresh address again.
+    swap.payout_script = Some(script.clone());
+    maker.store_ln_swap(swap_id, swap.clone())?;
     Ok(script)
 }
 
@@ -456,6 +461,7 @@ fn reject_if_swap_exists<M: Maker>(maker: &Arc<M>, swap_id: &str) -> Result<(), 
     Ok(())
 }
 
+/// Terms validation shared by both directions. Returns the maker fee.
 fn validate_terms<M: Maker>(
     maker: &Arc<M>,
     direction: LnDirection,
@@ -592,6 +598,7 @@ fn handle_swap_in_request<M: Maker>(
             invoice: req.invoice.clone(),
             preimage: None,
             refund_txid: None,
+            accepted_height: maker.get_current_height().ok(),
             payout_script: None,
             funding: None,
             funding_height: None,
@@ -657,6 +664,26 @@ fn handle_swap_in_funded<M: Maker>(
             format!(
                 "only {remaining} of {} locktime blocks remain after {age} elapsed",
                 swap.locktime
+            ),
+        ));
+    }
+    // The route budget derived below is `remaining - margin`. If that falls
+    // under the invoice's own final delta no route can satisfy it, so the
+    // payment would fail and leave the swap idling until the watchdog drops
+    // it. Refuse now instead, while the taker can still refund promptly.
+    let invoice_delta = crate::lightning::invoice::verify_invoice(
+        &swap.invoice,
+        &swap.payment_hash,
+        swap.amount.to_sat() * 1000,
+    )
+    .map(|verified| verified.min_final_cltv_expiry_delta)
+    .unwrap_or(0) as u32;
+    if remaining < invoice_delta.saturating_add(CLTV_SAFETY_MARGIN as u32) {
+        return Ok(reject(
+            &funded.swap_id,
+            format!(
+                "{remaining} blocks left after {age} elapsed cannot cover the invoice's \
+                 {invoice_delta}-block final delta plus the {CLTV_SAFETY_MARGIN}-block margin"
             ),
         ));
     }
@@ -750,7 +777,8 @@ fn sweep_swap_in<M: Maker>(
     let (outpoint, value) = swap
         .funding
         .ok_or(MakerError::General("swap-in sweep without funding"))?;
-    let destination = payout_script(maker, swap_id, swap)?;
+    let mut swap = swap.clone();
+    let destination = payout_script(maker, swap_id, &mut swap)?;
     let claim_tx = swap
         .htlc
         .create_hashlock_spend(outpoint, value, &swap.privkey, preimage, destination)
@@ -805,7 +833,8 @@ fn watchdog_finish_sweep<M: Maker>(
     let Some(preimage) = swap.preimage else {
         return Err(MakerError::General("swept swap without a preimage"));
     };
-    let destination = payout_script(maker, swap_id, swap)?;
+    let mut swap = swap.clone();
+    let destination = payout_script(maker, swap_id, &mut swap)?;
     let claim_tx = swap
         .htlc
         .create_hashlock_spend(outpoint, value, &swap.privkey, &preimage, destination)
@@ -883,6 +912,7 @@ fn handle_swap_out_request<M: Maker>(
             invoice: invoice.invoice.clone(),
             preimage: None,
             refund_txid: None,
+            accepted_height: maker.get_current_height().ok(),
             payout_script: None,
             funding: None,
             funding_height: None,
@@ -1158,7 +1188,31 @@ pub(crate) fn ln_watchdog_tick(maker: &Arc<MakerServer>) {
             (LnDirection::SwapIn, LnMakerPhase::InSwept) => {
                 watchdog_finish_sweep(maker, &ctx, &swap_id, &swap)
             }
-            // Accepted but never funded/paid: forget after the deadline.
+            // A swap-in's taker cannot announce funding until it has the
+            // confirmations we ourselves demanded, which is block time, not
+            // wall-clock time. Expiring on a timer would fail swaps the
+            // taker did everything right on — and strand its HTLC until the
+            // CSV refund. Measure that one in blocks.
+            (LnDirection::SwapIn, LnMakerPhase::InAccepted) => {
+                let expired = match (swap.accepted_height, maker.get_current_height().ok()) {
+                    (Some(accepted), Some(tip)) => {
+                        tip > accepted
+                            .saturating_add(swap.min_confirmations)
+                            .saturating_add(FUNDING_CONF_BUDGET)
+                    }
+                    // Without heights to compare, fall back to the timer
+                    // rather than keeping the swap open forever.
+                    _ => swap.updated_at.elapsed() > SWAP_OUT_PAYMENT_DEADLINE,
+                };
+                if expired {
+                    log::info!("Lightning swap {swap_id} expired unfunded; forgetting");
+                    ctx.router.unsubscribe(&swap.payment_hash);
+                    let _ = maker.remove_ln_swap(&swap_id);
+                }
+                Ok(())
+            }
+            // A swap-out's taker only has to pay an invoice, so the timer is
+            // the right measure there.
             (_, LnMakerPhase::InAccepted) | (_, LnMakerPhase::OutAccepted) => {
                 if swap.updated_at.elapsed() > SWAP_OUT_PAYMENT_DEADLINE {
                     log::info!("Lightning swap {swap_id} expired unfunded; forgetting");
@@ -1324,7 +1378,8 @@ fn watchdog_resolve_swap_out(
             if !refundable {
                 return Ok(());
             }
-            let destination = payout_script(maker, swap_id, swap)?;
+            let mut swap = swap.clone();
+            let destination = payout_script(maker, swap_id, &mut swap)?;
             let refund_tx = swap
                 .htlc
                 .create_timelock_spend(outpoint, value, &swap.privkey, destination)
@@ -1384,6 +1439,7 @@ mod tests {
             invoice: "lnbcrt-test".to_string(),
             preimage: Some(preimage),
             refund_txid: None,
+            accepted_height: Some(812_000),
             payout_script: None,
             funding: Some((OutPoint::default(), Amount::from_sat(40_000))),
             funding_height: Some(812_345),

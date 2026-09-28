@@ -3349,7 +3349,7 @@ impl MakerTrait for MakerServer {
             .flat_map(|split| split.utxos.iter().copied())
             .collect();
         wallet.reserve_swap_locks(swap_id, &selected);
-        let result = wallet.execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE);
+        let result = wallet.execute_funding_plan(&plan, &[address], feerate);
         let result = match result {
             Ok(result) => result,
             Err(e) => {

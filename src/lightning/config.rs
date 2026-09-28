@@ -102,16 +102,22 @@ pub fn backend_from_settings(
         timeout_secs: DEFAULT_TIMEOUT_SECS,
         network,
     };
-    match super::LdkServerBackend::new(&config) {
-        Ok(backend) => {
-            log::info!("Lightning backend connected: {url}");
-            Some(std::sync::Arc::new(backend))
-        }
+    let backend = match super::LdkServerBackend::new(&config) {
+        Ok(backend) => backend,
         Err(e) => {
             log::error!("Lightning backend init failed: {e:?}; Lightning disabled");
-            None
+            return None;
         }
+    };
+    // Constructing the client only builds HTTP machinery; it never touches
+    // the sidecar. One real call decides whether this node is actually
+    // usable, so a maker does not advertise Lightning terms it cannot serve.
+    if let Err(e) = super::LightningBackend::node_info(&backend) {
+        log::error!("Lightning backend at {url} is unreachable: {e:?}; Lightning disabled");
+        return None;
     }
+    log::info!("Lightning backend connected: {url}");
+    Some(std::sync::Arc::new(backend))
 }
 
 #[cfg(test)]

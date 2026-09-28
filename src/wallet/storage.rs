@@ -296,6 +296,11 @@ pub struct LnMakerSwapRecord {
     /// transaction confirmed was the refund ours.
     #[serde(default)]
     pub refund_txid: Option<bitcoin::Txid>,
+    /// Chain tip when this swap was accepted. A swap-in's funding deadline
+    /// is measured in blocks from here, since the taker must wait for the
+    /// confirmations the maker demanded before it can announce.
+    #[serde(default)]
+    pub accepted_height: Option<u32>,
     /// Where this swap's sweep or refund pays out. Fixed on first use so a
     /// rebuild produces the same transaction instead of one that conflicts
     /// with what is already in the mempool — and so retrying does not
