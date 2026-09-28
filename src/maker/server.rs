@@ -21,7 +21,7 @@ use crate::{
     utill::{
         HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE, UNBROADCAST_DISCARD_GRACE,
     },
-    wallet::{Blockchain, RecoveryReport, Wallet},
+    wallet::{Blockchain, RecoveryOutcome, RecoveryReport, Wallet},
 };
 
 use super::{
@@ -1635,7 +1635,15 @@ fn recover_from_swap(
                 &maker.shutdown,
                 Some(&contract_txids),
             )
-            .map_err(MakerError::Wallet)?;
+            // Ending recovery here would leave the outgoing refund unclaimed.
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "[{}] Hashlock sweep failed: {:?}",
+                    maker.config.network_port,
+                    e
+                );
+                RecoveryOutcome::default()
+            });
 
             if !swept.is_empty() {
                 log::info!(

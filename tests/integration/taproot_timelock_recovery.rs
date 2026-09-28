@@ -98,6 +98,12 @@ fn test_taproot_timelock_recovery() {
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     taker.log_tracker_state();
+    let outgoing_coins = taker
+        .get_wallet()
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count();
+    assert!(outgoing_coins > 1, "the batch check needs several refunds");
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -164,6 +170,21 @@ fn test_taproot_timelock_recovery() {
             .iter()
             .all(|i| i.sequence == Sequence::ENABLE_RBF_NO_LOCKTIME));
     }
+
+    // Every refund goes out before one shared wait, so a single pass records
+    // them all. Waiting per coin would record one refund per pass.
+    let taker_wallet = format!(
+        "Wallet: {} |",
+        taker.get_wallet().read().unwrap().get_name()
+    );
+    let refunded = format!("| Refunded: {outgoing_coins} |");
+    assert!(
+        taker_log
+            .lines()
+            .any(|line| line.contains(&taker_wallet) && line.contains(&refunded)),
+        "the taker's {} refunds were not recorded in one pass",
+        outgoing_coins
+    );
 
     // Mine a block to confirm recovery txs, then sync wallet
     generate_blocks(bitcoind, 1);

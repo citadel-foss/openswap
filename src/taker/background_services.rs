@@ -81,7 +81,7 @@ impl RecoveryLoop {
                         return;
                     }
 
-                    // One connection per pass, shared by all three steps below:
+                    // One connection per pass, shared by both steps below:
                     // on Tor Electrum each fresh connection costs a circuit handshake.
                     let chain = match lock_debug!(wallet.read()) {
                         Ok(w) => match w.blockchain.new_connection() {
@@ -98,61 +98,33 @@ impl RecoveryLoop {
                         }
                     };
 
-                    // Try hashlock sweep (incoming). It takes the lock itself and drops
-                    // it across its waits, so a stuck tx cannot wedge the wallet.
-                    let incoming_result = match Wallet::sweep_incoming_swapcoins(
+                    // Sweeps and timelock refunds in one pass. It takes the lock itself
+                    // and drops it across its wait, so a stuck tx cannot wedge the wallet.
+                    match Wallet::recover_swapcoins(
                         &wallet,
                         &chain,
                         &shutdown_clone,
-                        Some(&incoming_contract_txids),
-                    ) {
-                        Ok(ref swept) if !swept.is_empty() => {
-                            log::info!(
-                                "Recovery loop: swept {} incoming swapcoins",
-                                swept.resolved.len()
-                            );
-                            Some(swept.clone())
-                        }
-                        Err(e) => {
-                            log::debug!("Recovery loop: incoming sweep: {:?}", e);
-                            None
-                        }
-                        _ => None,
-                    };
-
-                    // Try timelock recovery (outgoing). Same deal — it manages the
-                    // lock itself and never holds it across a confirmation wait.
-                    let outgoing_result = match Wallet::recover_timelocked_swapcoins(
-                        &wallet,
-                        &chain,
-                        &shutdown_clone,
-                        Some(&swap_ids),
+                        &incoming_contract_txids,
+                        &swap_ids,
                         &|coin_swap| funding_shared(&swap_tracker, coin_swap),
                     ) {
-                        Ok(ref recovered) if !recovered.is_empty() => {
+                        Ok((swept, recovered)) if !swept.is_empty() || !recovered.is_empty() => {
                             log::info!(
-                                "Recovery loop: recovered {} timelocked swapcoins",
+                                "Recovery loop: swept {} incoming swapcoins, recovered {} timelocked swapcoins",
+                                swept.resolved.len(),
                                 recovered.len()
                             );
-                            Some(recovered.clone())
+                            if let Ok(mut tracker) = lock_debug!(swap_tracker.lock()) {
+                                Self::update_tracker_outcomes(
+                                    &mut tracker,
+                                    &swap_ids,
+                                    &swept,
+                                    &recovered,
+                                );
+                            }
                         }
-                        Err(e) => {
-                            log::debug!("Recovery loop: timelock recovery: {:?}", e);
-                            None
-                        }
-                        _ => None,
-                    };
-
-                    // Update tracker outcomes from recovery results
-                    if incoming_result.is_some() || outgoing_result.is_some() {
-                        if let Ok(mut tracker) = lock_debug!(swap_tracker.lock()) {
-                            Self::update_tracker_outcomes(
-                                &mut tracker,
-                                &swap_ids,
-                                incoming_result.as_ref(),
-                                outgoing_result.as_ref(),
-                            );
-                        }
+                        Ok(_) => {}
+                        Err(e) => log::debug!("Recovery loop: recovery pass: {:?}", e),
                     }
 
                     // Snapshot the outpoints, then drop the guard: the checks below
@@ -294,8 +266,8 @@ impl RecoveryLoop {
     fn update_tracker_outcomes(
         tracker: &mut SwapTracker,
         recovery_scope: &HashSet<String>,
-        incoming: Option<&crate::wallet::RecoveryOutcome>,
-        outgoing: Option<&crate::wallet::RecoveryOutcome>,
+        swept: &crate::wallet::RecoveryOutcome,
+        recovered: &crate::wallet::RecoveryOutcome,
     ) {
         let swap_ids: Vec<String> = tracker
             .incomplete_swaps()
@@ -309,78 +281,74 @@ impl RecoveryLoop {
 
             let _ = tracker.update_and_save(&swap_id, |record| {
                 // Update incoming outcomes from sweep results
-                if let Some(swept) = incoming {
-                    for (contract_txid, spending_txid) in &swept.resolved {
-                        if record.incoming_contract_txids.contains(contract_txid) {
-                            // Find existing outcome or add new one
-                            if let Some(outcome) = record
-                                .recovery
-                                .incoming
-                                .iter_mut()
-                                .find(|o| o.contract_txid == *contract_txid)
-                            {
-                                if outcome.resolution == ContractResolution::Unresolved {
-                                    outcome.resolution = ContractResolution::Hashlock;
-                                    outcome.spending_txid = Some(*spending_txid);
-                                    changed = true;
-                                }
-                            } else {
-                                record.recovery.incoming.push(ContractOutcome {
-                                    contract_txid: *contract_txid,
-                                    resolution: ContractResolution::Hashlock,
-                                    spending_txid: Some(*spending_txid),
-                                });
+                for (contract_txid, spending_txid) in &swept.resolved {
+                    if record.incoming_contract_txids.contains(contract_txid) {
+                        // Find existing outcome or add new one
+                        if let Some(outcome) = record
+                            .recovery
+                            .incoming
+                            .iter_mut()
+                            .find(|o| o.contract_txid == *contract_txid)
+                        {
+                            if outcome.resolution == ContractResolution::Unresolved {
+                                outcome.resolution = ContractResolution::Hashlock;
+                                outcome.spending_txid = Some(*spending_txid);
                                 changed = true;
                             }
+                        } else {
+                            record.recovery.incoming.push(ContractOutcome {
+                                contract_txid: *contract_txid,
+                                resolution: ContractResolution::Hashlock,
+                                spending_txid: Some(*spending_txid),
+                            });
+                            changed = true;
                         }
                     }
                 }
 
                 // Update outgoing outcomes from timelock recovery results
-                if let Some(recovered) = outgoing {
-                    for (contract_txid, spending_txid) in &recovered.resolved {
-                        if record.outgoing_contract_txids.contains(contract_txid) {
-                            if let Some(outcome) = record
-                                .recovery
-                                .outgoing
-                                .iter_mut()
-                                .find(|o| o.contract_txid == *contract_txid)
-                            {
-                                if outcome.resolution == ContractResolution::Unresolved {
-                                    outcome.resolution = ContractResolution::Timelock;
-                                    outcome.spending_txid = Some(*spending_txid);
-                                    changed = true;
-                                }
-                            } else {
-                                record.recovery.outgoing.push(ContractOutcome {
-                                    contract_txid: *contract_txid,
-                                    resolution: ContractResolution::Timelock,
-                                    spending_txid: Some(*spending_txid),
-                                });
+                for (contract_txid, spending_txid) in &recovered.resolved {
+                    if record.outgoing_contract_txids.contains(contract_txid) {
+                        if let Some(outcome) = record
+                            .recovery
+                            .outgoing
+                            .iter_mut()
+                            .find(|o| o.contract_txid == *contract_txid)
+                        {
+                            if outcome.resolution == ContractResolution::Unresolved {
+                                outcome.resolution = ContractResolution::Timelock;
+                                outcome.spending_txid = Some(*spending_txid);
                                 changed = true;
                             }
+                        } else {
+                            record.recovery.outgoing.push(ContractOutcome {
+                                contract_txid: *contract_txid,
+                                resolution: ContractResolution::Timelock,
+                                spending_txid: Some(*spending_txid),
+                            });
+                            changed = true;
                         }
                     }
-                    for contract_txid in &recovered.discarded {
-                        if record.outgoing_contract_txids.contains(contract_txid) {
-                            if let Some(outcome) = record
-                                .recovery
-                                .outgoing
-                                .iter_mut()
-                                .find(|o| o.contract_txid == *contract_txid)
-                            {
-                                if outcome.resolution == ContractResolution::Unresolved {
-                                    outcome.resolution = ContractResolution::Discarded;
-                                    changed = true;
-                                }
-                            } else {
-                                record.recovery.outgoing.push(ContractOutcome {
-                                    contract_txid: *contract_txid,
-                                    resolution: ContractResolution::Discarded,
-                                    spending_txid: None,
-                                });
+                }
+                for contract_txid in &recovered.discarded {
+                    if record.outgoing_contract_txids.contains(contract_txid) {
+                        if let Some(outcome) = record
+                            .recovery
+                            .outgoing
+                            .iter_mut()
+                            .find(|o| o.contract_txid == *contract_txid)
+                        {
+                            if outcome.resolution == ContractResolution::Unresolved {
+                                outcome.resolution = ContractResolution::Discarded;
                                 changed = true;
                             }
+                        } else {
+                            record.recovery.outgoing.push(ContractOutcome {
+                                contract_txid: *contract_txid,
+                                resolution: ContractResolution::Discarded,
+                                spending_txid: None,
+                            });
+                            changed = true;
                         }
                     }
                 }

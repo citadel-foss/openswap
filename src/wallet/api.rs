@@ -376,6 +376,9 @@ pub struct RecoveryOutcome {
     pub discarded: Vec<Txid>,
 }
 
+/// A spend sent by a recovery pass: (swapcoin key, contract txid, spending txid).
+type SentSpend = (String, Txid, Txid);
+
 /// Chain state of one swapcoin's contract output on a recovery pass.
 #[derive(Debug, PartialEq, Eq)]
 enum ContractChainState {
@@ -1215,17 +1218,9 @@ impl Wallet {
 
     /// Attempt to recover timelocked outgoing swapcoins.
     ///
-    /// The caller supplies the backend connection: the confirmation waits run
+    /// The caller supplies the backend connection: the confirmation wait runs
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
     /// Without `swap_scope` every eligible outgoing swapcoin is considered.
-    ///
-    /// Each coin's feerate is read from our own backend just before its recovery
-    /// is built: the peer that abandoned the swap does not get to price it.
-    ///
-    /// `funding_shared_with_peer` answers per coin whether the peer may hold
-    /// its funding txs. Unshared funding can never land on-chain, so its
-    /// swapcoin is discardable; shared funding is kept until its inputs are
-    /// confirmed spent elsewhere.
     pub fn recover_timelocked_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
@@ -1233,9 +1228,34 @@ impl Wallet {
         swap_scope: Option<&HashSet<String>>,
         funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
     ) -> Result<RecoveryOutcome, WalletError> {
-        let mut outcome = RecoveryOutcome::default();
+        let (refunds, discarded) = Self::broadcast_timelock_recoveries(
+            wallet,
+            chain,
+            shutdown,
+            swap_scope,
+            funding_shared_with_peer,
+        )?;
+        Ok(Self::finish_recoveries(wallet, chain, shutdown, Vec::new(), refunds, discarded)?.1)
+    }
 
-        // Snapshot everything the recovery needs, then drop the guard before any wait.
+    /// Broadcasts every ready timelock refund without waiting on any of them.
+    /// Returns the refunds sent and the outgoing swapcoins to discard.
+    ///
+    /// Feerates come from our own backend: the peer that abandoned the swap
+    /// does not get to price our refund.
+    ///
+    /// `funding_shared_with_peer` answers per coin whether the peer may hold
+    /// its funding txs. Unshared funding can never land on-chain, so its
+    /// swapcoin is discardable; shared funding is kept until its inputs are
+    /// confirmed spent elsewhere.
+    fn broadcast_timelock_recoveries(
+        wallet: &std::sync::RwLock<Wallet>,
+        chain: &AnyBlockchain,
+        shutdown: &std::sync::atomic::AtomicBool,
+        swap_scope: Option<&HashSet<String>>,
+        funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
+    ) -> Result<(Vec<SentSpend>, Vec<String>), WalletError> {
+        // Snapshot everything the recovery needs, then drop the guard before any backend call.
         let candidates = {
             let mut w = lock_debug!(wallet.write())
                 .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
@@ -1259,7 +1279,7 @@ impl Wallet {
                 .collect();
 
             if candidates.is_empty() {
-                return Ok(outcome);
+                return Ok((Vec::new(), Vec::new()));
             }
 
             w.sync_and_save(shutdown)?;
@@ -1310,175 +1330,227 @@ impl Wallet {
         }
 
         let mut discarded = Vec::new();
-        let mut already_recovered = Vec::new();
+        let mut refunds = Vec::new();
+        let mut fee_rates = None;
 
         for (swap_id, swapcoin, timelock) in to_recover {
-            let contract_txid = swapcoin.contract_tx.compute_txid();
-            let contract_vout = swapcoin.get_contract_output_vout();
-            match Self::ensure_contract_on_chain(
-                chain,
-                &swap_id,
-                &swapcoin,
-                funding_shared_with_peer,
-            )? {
-                ContractChainState::OnChain => {}
-                ContractChainState::Discarded => {
-                    discarded.push(swap_id.clone());
-                    continue;
+            // One failing coin must not hold back the other coins' refunds.
+            if let Err(e) = (|| -> Result<(), WalletError> {
+                let contract_txid = swapcoin.contract_tx.compute_txid();
+                let contract_vout = swapcoin.get_contract_output_vout();
+                match Self::ensure_contract_on_chain(
+                    chain,
+                    &swap_id,
+                    &swapcoin,
+                    funding_shared_with_peer,
+                )? {
+                    ContractChainState::OnChain => {}
+                    ContractChainState::Discarded => {
+                        discarded.push(swap_id.clone());
+                        return Ok(());
+                    }
+                    // Already mined, so the shared wait returns at once and records it.
+                    ContractChainState::RecoveredByTimelock(recovery_txid) => {
+                        refunds.push((swap_id.clone(), contract_txid, recovery_txid));
+                        return Ok(());
+                    }
+                    ContractChainState::NotYet => return Ok(()),
                 }
-                ContractChainState::RecoveredByTimelock(recovery_txid) => {
-                    outcome.resolved.push((contract_txid, recovery_txid));
-                    already_recovered.push(swap_id.clone());
-                    continue;
-                }
-                ContractChainState::NotYet => continue,
-            }
 
-            // Verify the contract UTXO is confirmed and the timelock is satisfied.
-            //
-            // Legacy uses BIP68 CSV (relative): the recovery tx sets
-            // Sequence::from_height(timelock), requiring `timelock` confirmations.
-            //
-            // Taproot uses BIP65 CLTV (absolute): the recovery tx sets
-            // nLockTime to the absolute height. We just need the UTXO to be
-            // confirmed (at least 1 confirmation).
-            let required_confirmations =
-                if swapcoin.protocol == crate::protocol::ProtocolVersion::Taproot {
-                    1 // CLTV only needs the UTXO to exist; the height check is above
-                } else {
-                    timelock // CSV needs this many confirmations
-                };
-            match chain.get_tx_out(&contract_txid, contract_vout, Some(false)) {
-                Ok(Some(utxo_info)) if utxo_info.confirmations >= required_confirmations => {
-                    log::info!(
-                        "Contract tx {} has {} confirmations (need {}), proceeding with recovery",
-                        contract_txid,
-                        utxo_info.confirmations,
-                        required_confirmations
-                    );
+                // Verify the contract UTXO is confirmed and the timelock is satisfied.
+                //
+                // Legacy uses BIP68 CSV (relative): the recovery tx sets
+                // Sequence::from_height(timelock), requiring `timelock` confirmations.
+                //
+                // Taproot uses BIP65 CLTV (absolute): the recovery tx sets
+                // nLockTime to the absolute height. We just need the UTXO to be
+                // confirmed (at least 1 confirmation).
+                let required_confirmations =
+                    if swapcoin.protocol == crate::protocol::ProtocolVersion::Taproot {
+                        1 // CLTV only needs the UTXO to exist; the height check is above
+                    } else {
+                        timelock // CSV needs this many confirmations
+                    };
+                match chain.get_tx_out(&contract_txid, contract_vout, Some(false)) {
+                    Ok(Some(utxo_info)) if utxo_info.confirmations >= required_confirmations => {
+                        log::info!(
+                            "Contract tx {} has {} confirmations (need {}), proceeding with recovery",
+                            contract_txid,
+                            utxo_info.confirmations,
+                            required_confirmations
+                        );
+                    }
+                    Ok(Some(utxo_info)) => {
+                        log::info!(
+                            "Contract tx {} has {} confirmations, need {} — waiting",
+                            contract_txid,
+                            utxo_info.confirmations,
+                            required_confirmations
+                        );
+                        return Ok(());
+                    }
+                    Ok(None) => {
+                        log::info!(
+                            "Contract tx {} not yet confirmed, skipping recovery attempt",
+                            contract_txid
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
                 }
-                Ok(Some(utxo_info)) => {
-                    log::info!(
-                        "Contract tx {} has {} confirmations, need {} — waiting",
-                        contract_txid,
-                        utxo_info.confirmations,
-                        required_confirmations
-                    );
-                    continue;
-                }
-                Ok(None) => {
-                    log::info!(
-                        "Contract tx {} not yet confirmed, skipping recovery attempt",
-                        contract_txid
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
 
-            // A retry must pay the same destination. Persist it before
-            // broadcasting so a failed wait cannot burn another index.
-            let recovery_address = {
-                let mut w = lock_debug!(wallet.write())
-                    .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
-                let stored = w
-                    .store
-                    .outgoing_swapcoins
-                    .get(&swap_id)
-                    .and_then(|coin| coin.recovery_address.clone());
-                let (address, created) = recovery_address_or_else(stored, || {
-                    Ok(w.get_next_internal_addresses(1, AddressType::P2TR)?[0]
-                        .clone()
-                        .into_unchecked())
-                })?;
-                if created {
-                    w.store
+                // A retry must pay the same destination. Persist it before
+                // broadcasting so a failed wait cannot burn another index.
+                let recovery_address = {
+                    let mut w = lock_debug!(wallet.write())
+                        .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
+                    let stored = w
+                        .store
                         .outgoing_swapcoins
-                        .get_mut(&swap_id)
-                        .ok_or_else(|| {
-                            WalletError::General(format!(
-                                "outgoing swapcoin {} disappeared during recovery",
-                                swap_id
-                            ))
-                        })?
-                        .recovery_address = Some(address.clone());
-                    w.save_to_disk()?;
-                }
-                address.require_network(w.store.network).map_err(|e| {
-                    WalletError::General(format!("invalid recovery address network: {e}"))
-                })?
-            };
+                        .get(&swap_id)
+                        .and_then(|coin| coin.recovery_address.clone());
+                    let (address, created) = recovery_address_or_else(stored, || {
+                        Ok(w.get_next_internal_addresses(1, AddressType::P2TR)?[0]
+                            .clone()
+                            .into_unchecked())
+                    })?;
+                    if created {
+                        w.store
+                            .outgoing_swapcoins
+                            .get_mut(&swap_id)
+                            .ok_or_else(|| {
+                                WalletError::General(format!(
+                                    "outgoing swapcoin {} disappeared during recovery",
+                                    swap_id
+                                ))
+                            })?
+                            .recovery_address = Some(address.clone());
+                        w.save_to_disk()?;
+                    }
+                    address.require_network(w.store.network).map_err(|e| {
+                        WalletError::General(format!("invalid recovery address network: {e}"))
+                    })?
+                };
 
-            // Priced per coin: an earlier coin's confirmation wait can outlast any rate.
-            let fee_rates = chain.recovery_feerates();
-            match Self::create_timelock_recovery_tx(&swapcoin, &fee_rates, recovery_address) {
-                Ok(recovery_tx) => {
-                    match chain.send_raw_transaction(&recovery_tx) {
-                        Ok(txid) => {
-                            // Keep the swapcoin until the spend is mined. A failed wait
-                            // leaves it for the next pass to rebroadcast; dropping it
-                            // here would strand the funds if this tx never confirms.
-                            let conf_height = wait_for_tx_confirmation(
-                                chain,
-                                &[txid],
-                                1,
-                                TX_BROADCAST_TIMEOUT,
-                                Some(shutdown),
-                                None,
-                            )?;
-                            log::info!(
-                                "Timelock recovery tx {} confirmed at blockheight: {}",
-                                txid,
-                                conf_height
-                            );
-
-                            outcome.resolved.push((contract_txid, txid));
-
-                            // Re-acquire the guard only to record the recovery.
-                            let mut w = lock_debug!(wallet.write()).map_err(|_| {
-                                WalletError::General("wallet lock poisoned".to_string())
-                            })?;
-                            w.remove_outgoing_swapcoin(&swap_id);
-                        }
+                // Read once, at the first ready coin: no refund in this pass waits
+                // on another, so every one is built within seconds.
+                let fee_rates = fee_rates.get_or_insert_with(|| chain.recovery_feerates());
+                match Self::create_timelock_recovery_tx(&swapcoin, fee_rates, recovery_address) {
+                    Ok(recovery_tx) => match chain.send_raw_transaction(&recovery_tx) {
+                        Ok(txid) => refunds.push((swap_id.clone(), contract_txid, txid)),
                         Err(e) => {
                             log::warn!("Failed to broadcast recovery tx for {}: {:?}", swap_id, e);
                         }
+                    },
+                    Err(e) => {
+                        log::warn!("Failed to create recovery tx for {}: {:?}", swap_id, e);
                     }
                 }
-                Err(e) => {
-                    log::warn!("Failed to create recovery tx for {}: {:?}", swap_id, e);
-                }
+                Ok(())
+            })() {
+                log::warn!("Timelock recovery for {} failed: {:?}", swap_id, e);
             }
         }
+
+        Ok((refunds, discarded))
+    }
+
+    /// Waits once for every broadcast sweep and refund, then drops each coin
+    /// whose spend was mined. The next pass records any spend mined later.
+    /// Returns the (incoming, outgoing) outcomes.
+    fn finish_recoveries(
+        wallet: &std::sync::RwLock<Wallet>,
+        chain: &AnyBlockchain,
+        shutdown: &std::sync::atomic::AtomicBool,
+        sweeps: Vec<SentSpend>,
+        refunds: Vec<SentSpend>,
+        discarded: Vec<String>,
+    ) -> Result<(RecoveryOutcome, RecoveryOutcome), WalletError> {
+        let txids: Vec<Txid> = sweeps
+            .iter()
+            .chain(&refunds)
+            .map(|(_, _, txid)| *txid)
+            .collect();
+        let confirmed =
+            wait_for_tx_confirmation(chain, &txids, 1, TX_BROADCAST_TIMEOUT, Some(shutdown), None);
+        // A failed batch wait says nothing about each tx, so ask for each one
+        // before taking the guard. A sibling that did confirm is still recorded.
+        let mined = |(_, _, txid): &SentSpend| {
+            confirmed.is_ok() || matches!(chain.tx_block_height(txid), Ok(Some(_)))
+        };
+        let sweeps: Vec<_> = sweeps.into_iter().filter(mined).collect();
+        let refunds: Vec<_> = refunds.into_iter().filter(mined).collect();
 
         let mut w = lock_debug!(wallet.write())
             .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
 
+        let mut incoming = RecoveryOutcome::default();
+        for (swap_id, contract_txid, txid) in sweeps {
+            log::info!("Sweep transaction {} confirmed", txid);
+            w.remove_incoming_swapcoin(&swap_id);
+            incoming.resolved.push((contract_txid, txid));
+        }
+
+        let mut outgoing = RecoveryOutcome::default();
+        for (swap_id, contract_txid, txid) in refunds {
+            log::info!("Timelock recovery tx {} confirmed", txid);
+            w.remove_outgoing_swapcoin(&swap_id);
+            outgoing.resolved.push((contract_txid, txid));
+        }
         for id in &discarded {
             if let Some(sc) = w.store.outgoing_swapcoins.get(id) {
-                outcome.discarded.push(sc.contract_tx.compute_txid());
+                outgoing.discarded.push(sc.contract_tx.compute_txid());
             }
             w.store.outgoing_swapcoins.remove(id);
         }
-        for id in &already_recovered {
-            w.remove_outgoing_swapcoin(id);
-        }
 
-        if !outcome.is_empty() || !discarded.is_empty() {
+        if !incoming.is_empty() || !outgoing.is_empty() {
             w.save_to_disk()?;
-        }
-
-        if !outcome.is_empty() {
             #[cfg(debug_assertions)]
             log::debug!(
-                "[RECOVERY_STATE] Wallet: {} | Action: recover_timelocked | Resolved: {} | Discarded: {} | OutgoingRemaining: {}",
+                "[RECOVERY_STATE] Wallet: {} | Swept: {} | Refunded: {} | Discarded: {} | IncomingRemaining: {} | OutgoingRemaining: {}",
                 w.store.file_name,
-                outcome.resolved.len(),
-                outcome.discarded.len(),
+                incoming.resolved.len(),
+                outgoing.resolved.len(),
+                outgoing.discarded.len(),
+                w.store.incoming_swapcoins.len(),
                 w.store.outgoing_swapcoins.len()
             );
         }
-        Ok(outcome)
+
+        // Callers drop the outcome on `Err`, so a partial success must return
+        // `Ok`. Unresolved coins stay in the wallet for the next pass.
+        match confirmed {
+            Err(e) if incoming.is_empty() && outgoing.is_empty() => Err(e),
+            _ => Ok((incoming, outgoing)),
+        }
+    }
+
+    /// One recovery pass over both sides. Every ready sweep and timelock refund
+    /// is broadcast before a single wait, so a slow sweep cannot hold back a
+    /// refund while its race is open. Returns the (incoming, outgoing) outcomes.
+    pub fn recover_swapcoins(
+        wallet: &std::sync::RwLock<Wallet>,
+        chain: &AnyBlockchain,
+        shutdown: &std::sync::atomic::AtomicBool,
+        contract_txids: &HashSet<Txid>,
+        swap_ids: &HashSet<String>,
+        funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
+    ) -> Result<(RecoveryOutcome, RecoveryOutcome), WalletError> {
+        // A failed sweep step must still let the refunds go out.
+        let sweeps = Self::broadcast_incoming_sweeps(wallet, chain, shutdown, Some(contract_txids))
+            .unwrap_or_else(|e| {
+                log::warn!("Incoming sweep failed: {:?}", e);
+                Vec::new()
+            });
+        let (refunds, discarded) = Self::broadcast_timelock_recoveries(
+            wallet,
+            chain,
+            shutdown,
+            Some(swap_ids),
+            funding_shared_with_peer,
+        )?;
+        Self::finish_recoveries(wallet, chain, shutdown, sweeps, refunds, discarded)
     }
 
     /// Create a recovery transaction for a timelocked outgoing swapcoin.
@@ -3214,21 +3286,33 @@ impl Wallet {
     /// preimage cascade, the taker may end up with both the incoming sweep and
     /// its own timelock refund — the double cost lands on the faulty maker.
     ///
-    /// The caller supplies the backend connection: the confirmation waits run
+    /// The caller supplies the backend connection: the confirmation wait runs
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
     /// `contract_txids` scopes normal settlement to one swap; `None` is reserved
     /// for startup and background recovery across the whole wallet.
-    /// A PaySwap coin pays the receiver an exact amount, so its fee is whatever
-    /// the input leaves over; every other coin sweeps at its negotiated feerate.
     pub fn sweep_incoming_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
         shutdown: &std::sync::atomic::AtomicBool,
         contract_txids: Option<&HashSet<Txid>>,
     ) -> Result<RecoveryOutcome, WalletError> {
-        let mut outcome = RecoveryOutcome::default();
+        let sweeps = Self::broadcast_incoming_sweeps(wallet, chain, shutdown, contract_txids)?;
+        Ok(Self::finish_recoveries(wallet, chain, shutdown, sweeps, Vec::new(), Vec::new())?.0)
+    }
 
-        // Snapshot everything the sweep needs, then drop the guard before any wait.
+    /// Broadcasts every ready incoming sweep without waiting on any of them, and
+    /// returns the sweeps sent. A contract still in the mempool waits for a later pass.
+    /// A PaySwap coin pays the receiver an exact amount, so its fee is whatever
+    /// the input leaves over; every other coin sweeps at its negotiated feerate.
+    fn broadcast_incoming_sweeps(
+        wallet: &std::sync::RwLock<Wallet>,
+        chain: &AnyBlockchain,
+        shutdown: &std::sync::atomic::AtomicBool,
+        contract_txids: Option<&HashSet<Txid>>,
+    ) -> Result<Vec<SentSpend>, WalletError> {
+        let mut sweeps = Vec::new();
+
+        // Snapshot everything the sweep needs, then drop the guard before any backend call.
         let completed_swapcoins = {
             let mut w = lock_debug!(wallet.write())
                 .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
@@ -3248,7 +3332,7 @@ impl Wallet {
 
             if completed_swapcoins.is_empty() {
                 log::info!("No completed incoming swap coins to sweep");
-                return Ok(outcome);
+                return Ok(sweeps);
             }
 
             w.sync_and_save(shutdown)?;
@@ -3265,18 +3349,7 @@ impl Wallet {
             if let Some(spend_tx) = &swapcoin.spending_tx {
                 let txid = spend_tx.compute_txid();
                 if !chain.is_tx_unknown(&txid)? {
-                    wait_for_tx_confirmation(
-                        chain,
-                        &[txid],
-                        1,
-                        TX_BROADCAST_TIMEOUT,
-                        Some(shutdown),
-                        None,
-                    )?;
-                    outcome.resolved.push((contract_txid, txid));
-                    lock_debug!(wallet.write())
-                        .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?
-                        .remove_incoming_swapcoin(&swap_id);
+                    sweeps.push((swap_id, contract_txid, txid));
                     continue;
                 }
             }
@@ -3343,37 +3416,15 @@ impl Wallet {
                     matches!(chain.get_tx_out(&utxo_txid, utxo_vout, None), Ok(Some(_)));
 
                 if in_mempool {
-                    // The incoming contract tx is broadcast but unconfirmed.
-                    // Wait for it to confirm before sweeping.
+                    // Waiting here would hold back every other sweep and refund
+                    // in the pass. A later pass sweeps it once it confirms.
                     log::info!(
-                        "Incoming contract tx {}:{} is in mempool for {} — waiting for confirmation",
+                        "Incoming contract tx {}:{} is in mempool for {} — sweeping on a later pass",
                         utxo_txid,
                         utxo_vout,
                         swap_id
                     );
-                    match wait_for_tx_confirmation(
-                        chain,
-                        &[utxo_txid],
-                        1,
-                        TX_BROADCAST_TIMEOUT,
-                        Some(shutdown),
-                        None,
-                    ) {
-                        Ok(_) => {}
-                        Err(e @ WalletError::Interrupted(_)) => return Err(e),
-                        Err(e) => {
-                            // Bounded wait ran out — skip this coin; the recovery
-                            // loop retries the sweep on its next pass.
-                            log::warn!(
-                                "Giving up waiting on {}:{} for {}: {:?}",
-                                utxo_txid,
-                                utxo_vout,
-                                swap_id,
-                                e
-                            );
-                            continue;
-                        }
-                    }
+                    continue;
                 } else if swapcoin.other_privkey.is_none() && swapcoin.others_contract_sig.is_some()
                 {
                     log::info!(
@@ -3515,30 +3566,7 @@ impl Wallet {
                         w.save_to_disk()?;
                     }
                     match chain.send_raw_transaction(&spend_tx) {
-                        Ok(txid) => {
-                            let conf_height = wait_for_tx_confirmation(
-                                chain,
-                                &[txid],
-                                1,
-                                TX_BROADCAST_TIMEOUT,
-                                Some(shutdown),
-                                None,
-                            )?;
-                            log::info!(
-                                "Sweep transaction {} confirmed at blockheight: {}",
-                                txid,
-                                conf_height
-                            );
-
-                            outcome.resolved.push((contract_txid, txid));
-                            log::info!("Successfully swept incoming swap coin: {}", swap_id);
-
-                            // Re-acquire the guard only to drop the swept coin.
-                            let mut w = lock_debug!(wallet.write()).map_err(|_| {
-                                WalletError::General("wallet lock poisoned".to_string())
-                            })?;
-                            w.remove_incoming_swapcoin(&swap_id);
-                        }
+                        Ok(txid) => sweeps.push((swap_id, contract_txid, txid)),
                         Err(e) => {
                             log::warn!(
                                 "Failed to broadcast sweep tx for swapcoin {}: {:?}",
@@ -3562,17 +3590,7 @@ impl Wallet {
         let w = lock_debug!(wallet.write())
             .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
         w.save_to_disk()?;
-        if !outcome.is_empty() {
-            #[cfg(debug_assertions)]
-            log::debug!(
-                "[RECOVERY_STATE] Wallet: {} | Action: sweep_incoming | Resolved: {} | Discarded: {} | IncomingRemaining: {}",
-                w.store.file_name,
-                outcome.resolved.len(),
-                outcome.discarded.len(),
-                w.store.incoming_swapcoins.len()
-            );
-        }
-        Ok(outcome)
+        Ok(sweeps)
     }
 
     /// Runs the crate's shared bounded wait on this wallet's own backend connection.

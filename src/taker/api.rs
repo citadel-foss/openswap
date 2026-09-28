@@ -752,9 +752,8 @@ impl Taker {
             return;
         }
 
-        // One connection serves both startup recovery passes; the sweep and
-        // timelock recovery each take the lock themselves and drop it across
-        // their waits, so a stuck counterparty tx cannot wedge taker startup.
+        // Recovery takes the wallet lock itself and drops it across its wait,
+        // so a stuck counterparty tx cannot wedge taker startup.
         let chain = match self.read_wallet() {
             Ok(w) => match w.blockchain.new_connection() {
                 Ok(chain) => Some(chain),
@@ -770,38 +769,23 @@ impl Taker {
         };
 
         if let Some(chain) = &chain {
-            match Wallet::sweep_incoming_swapcoins(
+            match Wallet::recover_swapcoins(
                 &self.wallet,
                 chain,
                 &crate::utill::NO_SHUTDOWN,
-                Some(&incoming_contract_txids),
-            ) {
-                Ok(ref swept) if !swept.is_empty() => {
-                    log::info!(
-                        "Startup recovery: swept {} incoming swapcoins",
-                        swept.resolved.len()
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => log::warn!("Startup incoming sweep failed: {:?}", e),
-            }
-
-            // Wallet-driven recovery: recover timelocked. Also takes the lock itself.
-            match Wallet::recover_timelocked_swapcoins(
-                &self.wallet,
-                chain,
-                &crate::utill::NO_SHUTDOWN,
-                Some(&swap_ids),
+                &incoming_contract_txids,
+                &swap_ids,
                 &|coin_swap| funding_shared(&self.swap_tracker, coin_swap),
             ) {
-                Ok(ref recovered) if !recovered.is_empty() => {
+                Ok((swept, recovered)) if !swept.is_empty() || !recovered.is_empty() => {
                     log::info!(
-                        "Startup recovery: recovered {} timelocked outgoing swapcoins",
+                        "Startup recovery: swept {} incoming, recovered {} timelocked outgoing swapcoins",
+                        swept.resolved.len(),
                         recovered.len()
-                    );
+                    )
                 }
                 Ok(_) => {}
-                Err(e) => log::warn!("Startup timelock recovery failed: {:?}", e),
+                Err(e) => log::warn!("Startup recovery failed: {:?}", e),
             }
         }
 
