@@ -3465,15 +3465,25 @@ impl Wallet {
 
                 // Verify the UTXO actually exists on chain before attempting to spend.
                 // First check confirmed UTXOs, then fall back to mempool.
-                let utxo_confirmed = matches!(
-                    chain.get_tx_out(&utxo_txid, utxo_vout, Some(false)),
-                    Ok(Some(_))
-                );
+                // A failed lookup says nothing about the contract, so the coin
+                // holds its swap's refund until a later pass can tell.
+                let utxo_confirmed = match chain.get_tx_out(&utxo_txid, utxo_vout, Some(false)) {
+                    Ok(utxo) => utxo.is_some(),
+                    Err(e) => {
+                        claiming.extend(swapcoin.swap_id.clone());
+                        return Err(e);
+                    }
+                };
 
                 if !utxo_confirmed {
                     // UTXO not yet confirmed. Check if it's at least in the mempool.
-                    let in_mempool =
-                        matches!(chain.get_tx_out(&utxo_txid, utxo_vout, None), Ok(Some(_)));
+                    let in_mempool = match chain.get_tx_out(&utxo_txid, utxo_vout, None) {
+                        Ok(utxo) => utxo.is_some(),
+                        Err(e) => {
+                            claiming.extend(swapcoin.swap_id.clone());
+                            return Err(e);
+                        }
+                    };
 
                     if in_mempool {
                         // Waiting here would hold back every other sweep and refund
@@ -3502,6 +3512,8 @@ impl Wallet {
                                             txid,
                                             swap_id
                                         );
+                                        // Our contract is out, so we will sweep it: hold the refund.
+                                        claiming.extend(swapcoin.swap_id.clone());
                                     }
                                     Err(e) => {
                                         log::warn!(
@@ -3524,10 +3536,9 @@ impl Wallet {
                         }
 
                         // Re-check UTXO availability (including mempool) after broadcast
-                        let utxo_available = matches!(
-                            chain.get_tx_out(&utxo_txid, utxo_vout, Some(true)),
-                            Ok(Some(_))
-                        );
+                        let utxo_available = chain
+                            .get_tx_out(&utxo_txid, utxo_vout, Some(true))?
+                            .is_some();
                         if !utxo_available {
                             log::info!(
                                 "Contract output still not available for {} after broadcast — will retry later",

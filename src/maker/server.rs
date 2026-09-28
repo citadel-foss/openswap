@@ -1272,13 +1272,18 @@ fn recover_from_swap(
         }
         Ok(true)
     };
-    let mut timelock_recovery_txids = Vec::new();
-    // A restart resumes the list, so the report keeps sweeps from before it.
-    let mut incoming_swept_txids = lock_debug!(maker.swap_tracker.lock())
-        .map_err(|_| MakerError::MutexPossion)?
-        .get_record(&swap_id)
-        .map(|record| record.recovery.incoming_swept.clone())
-        .unwrap_or_default();
+    // A restart resumes both lists, so the reports keep txids from before it.
+    let (mut timelock_recovery_txids, mut incoming_swept_txids) =
+        lock_debug!(maker.swap_tracker.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .get_record(&swap_id)
+            .map(|record| {
+                (
+                    record.recovery.outgoing_recovered.clone(),
+                    record.recovery.incoming_swept.clone(),
+                )
+            })
+            .unwrap_or_default();
 
     // A restart reaches here with no record: the drain that would create one
     // never ran. Create it aged from the reservation, so the unbroadcast grace
