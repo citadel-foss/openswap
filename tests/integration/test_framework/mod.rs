@@ -248,19 +248,50 @@ pub(crate) fn send_to_address(
         .unwrap()
 }
 
-/// Spawns a throwaway regtest bitcoind under a unique temp directory.
+/// A throwaway regtest node that deletes its data directory when it drops.
+///
+/// Derefs to the [`BitcoinD`] so callers use it like the node itself.
+#[cfg(feature = "lightning")]
+pub(crate) struct LnRegtest {
+    node: Option<BitcoinD>,
+    dir: PathBuf,
+}
+
+#[cfg(feature = "lightning")]
+impl std::ops::Deref for LnRegtest {
+    type Target = BitcoinD;
+    fn deref(&self) -> &BitcoinD {
+        self.node.as_ref().expect("node lives until drop")
+    }
+}
+
+#[cfg(feature = "lightning")]
+impl Drop for LnRegtest {
+    fn drop(&mut self) {
+        // Stop the node first: its data directory cannot be removed from
+        // under a running process.
+        drop(self.node.take());
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Spawns a throwaway regtest bitcoind under a unique temp directory, which
+/// is removed when the returned guard drops.
 ///
 /// `suite` groups a test file's data directories; `test_name` names the run.
 #[cfg(feature = "lightning")]
-pub(crate) fn setup_bitcoind(suite: &str, test_name: &str) -> (BitcoinD, PathBuf) {
-    let temp_dir = env::temp_dir()
-        .join(format!("coinswap-{}", rand::random::<u64>()))
-        .join(suite)
-        .join(test_name);
+pub(crate) fn setup_bitcoind(suite: &str, test_name: &str) -> LnRegtest {
+    // The unique root, not the leaf, is what gets removed: deleting only the
+    // leaf would leave an empty shell behind on every run.
+    let root = env::temp_dir().join(format!("coinswap-{}", rand::random::<u64>()));
+    let dir = root.join(suite).join(test_name);
     let port_zmq = 28332 + rand::random::<u16>() % 20000;
     let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
-    let bitcoind = init_bitcoind(&temp_dir, zmq_addr).expect("bitcoind starts");
-    (bitcoind, temp_dir)
+    let node = init_bitcoind(&dir, zmq_addr).expect("bitcoind starts");
+    LnRegtest {
+        node: Some(node),
+        dir: root,
+    }
 }
 
 /// Fetches a transaction by txid, retrying briefly: the asynchronous txindex

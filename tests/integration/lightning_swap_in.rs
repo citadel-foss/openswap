@@ -36,7 +36,7 @@ fn test_params() -> SwapInParams {
 /// claim, preimage learning and maker on-chain sweep through the hashlock.
 #[test]
 fn swap_in_happy_path() {
-    let (bitcoind, _tmp) = setup_bitcoind("ln-swap-tests", "happy-path");
+    let bitcoind = setup_bitcoind("ln-swap-tests", "happy-path");
     // One shared mock backend plays both Lightning nodes (POC).
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
 
@@ -104,7 +104,7 @@ fn swap_in_happy_path() {
 /// funds through the timelock branch — but only after `locktime` blocks.
 #[test]
 fn swap_in_refund_path() {
-    let (bitcoind, _tmp) = setup_bitcoind("ln-swap-tests", "refund-path");
+    let bitcoind = setup_bitcoind("ln-swap-tests", "refund-path");
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
 
     let params = test_params();
@@ -147,7 +147,7 @@ fn swap_in_refund_path() {
 /// the backend and the on-chain hashlock spend is rejected by consensus.
 #[test]
 fn swap_in_wrong_preimage_fails_both_layers() {
-    let (bitcoind, _tmp) = setup_bitcoind("ln-swap-tests", "wrong-preimage");
+    let bitcoind = setup_bitcoind("ln-swap-tests", "wrong-preimage");
     let mock = MockLightningBackend::new();
 
     let preimage = Preimage([0x55; 32]);

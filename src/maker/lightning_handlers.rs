@@ -22,6 +22,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    convert::TryFrom,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -384,15 +385,9 @@ pub fn handle_lightning_message<M: Maker>(
         )));
     };
 
-    // Bind the connection to this swap, as the other protocol families do on
-    // SwapDetails. Beyond bookkeeping, this is what promotes the connection
-    // out of the server's "pending" bucket: an unpromoted connection is
-    // dropped after PENDING_CONNECTION_TIMEOUT, which is far shorter than the
-    // gaps between Lightning steps (funding confirmations, held payments).
     state.check_swap_id(&swap_id)?;
-    state.swap_id = Some(swap_id);
 
-    match message {
+    let response = match message {
         LightningTakerMessage::SwapInRequest(req) => handle_swap_in_request(maker, &ctx, req),
         LightningTakerMessage::SwapInFunded(funded) => handle_swap_in_funded(maker, &ctx, funded),
         LightningTakerMessage::SwapOutRequest(req) => handle_swap_out_request(maker, &ctx, req),
@@ -402,7 +397,28 @@ pub fn handle_lightning_message<M: Maker>(
         LightningTakerMessage::SwapOutClaimed(claimed) => {
             handle_swap_out_claimed(maker, &ctx, &claimed.swap_id, claimed.claim_txid)
         }
+    };
+
+    // Binding the connection to a swap is what promotes it out of the
+    // server's pending bucket, where it would be dropped after
+    // PENDING_CONNECTION_TIMEOUT, into a slot it can hold for
+    // IDLE_CONNECTION_TIMEOUT. Only a swap we took on earns that: otherwise
+    // any peer naming a swap id we never heard of could hold every inbound
+    // slot for a quarter of an hour at no cost. A rejected peer keeps the
+    // short pending deadline, which is the same budget an unidentified
+    // connection gets.
+    if !is_rejection(&response) {
+        state.swap_id = Some(swap_id);
     }
+    response
+}
+
+/// True when the handler declined the message, rather than advancing a swap.
+fn is_rejection(response: &Result<Option<MakerToTakerMessage>, MakerError>) -> bool {
+    matches!(
+        response,
+        Ok(Some(MakerToTakerMessage::Lightning(msg))) if matches!(**msg, LightningMakerMessage::Reject(_))
+    )
 }
 
 /// Most Lightning swaps the maker keeps in flight at once. Each one holds a
@@ -677,17 +693,8 @@ fn handle_swap_in_funded<M: Maker>(
         swap.amount.to_sat() * 1000,
     )
     .map(|verified| verified.min_final_cltv_expiry_delta)
-    // Saturating, not truncating: `as u32` would turn a 2^32 delta into 0
-    // and wave through a swap whose claim window we cannot cover. The
-    // locktime check at acceptance already bounds this to a u16, so the
-    // clamp is defence in depth rather than a live path.
-    .map_or(0u32, |delta| {
-        if delta > u32::MAX as u64 {
-            u32::MAX
-        } else {
-            delta as u32
-        }
-    });
+    // Saturate: a truncated delta could wrap to 0 and pass the check below.
+    .map_or(0u32, |delta| u32::try_from(delta).unwrap_or(u32::MAX));
     if remaining < invoice_delta.saturating_add(CLTV_SAFETY_MARGIN as u32) {
         return Ok(reject(
             &funded.swap_id,
@@ -1564,6 +1571,24 @@ mod tests {
         let limits = directional_limits(&[channel(300_000, 9_999, true)], u64::MAX, 10_000);
         assert!(limits.swap_in);
         assert!(!limits.swap_out);
+    }
+
+    /// Promotion moves a connection from the server's short pending deadline
+    /// into a slot it can hold for IDLE_CONNECTION_TIMEOUT. A peer naming a
+    /// swap we never accepted must not earn one.
+    #[test]
+    fn only_a_rejection_leaves_the_connection_unpromoted() {
+        assert!(is_rejection(&Ok(reject("deadbeef", "unknown swap"))));
+
+        // A real step has to promote, or the connection would be dropped
+        // mid-swap while waiting on confirmations.
+        let accepted = Ok(Some(MakerToTakerMessage::Lightning(Box::new(
+            LightningMakerMessage::SwapInComplete(LnSwapInComplete {
+                swap_id: "deadbeef".to_string(),
+            }),
+        ))));
+        assert!(!is_rejection(&accepted));
+        assert!(!is_rejection(&Err(MakerError::General("handler failed"))));
     }
 
     /// A swap accepted but never funded has no outpoint yet; the record must

@@ -34,7 +34,7 @@ fn test_params() -> SwapOutParams {
 /// the maker settles the held Lightning payment from the claim witness.
 #[test]
 fn swap_out_happy_path() {
-    let (bitcoind, _tmp) = setup_bitcoind("ln-swap-out-tests", "happy-path");
+    let bitcoind = setup_bitcoind("ln-swap-out-tests", "happy-path");
     // One shared mock backend plays both Lightning nodes (POC).
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
 
@@ -115,7 +115,7 @@ fn swap_out_happy_path() {
 /// real node).
 #[test]
 fn swap_out_refund_path() {
-    let (bitcoind, _tmp) = setup_bitcoind("ln-swap-out-tests", "refund-path");
+    let bitcoind = setup_bitcoind("ln-swap-out-tests", "refund-path");
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
 
     let params = test_params();
