@@ -921,6 +921,22 @@ impl Taker {
             taker_config.check_blocklist = check_blocklist;
         }
 
+        // Carried across the rewrite like every other setting above: the CLI
+        // rebuilds `TakerInitConfig` from this file on the next launch, so
+        // dropping these would silently disable the Lightning backend — and
+        // with it the automatic recovery of any swap still in flight.
+        if config.ldk_server_url.is_some() {
+            taker_config.ldk_server_url = config.ldk_server_url.clone();
+        }
+
+        if config.ldk_api_key_path.is_some() {
+            taker_config.ldk_api_key_path = config.ldk_api_key_path.clone();
+        }
+
+        if config.ldk_tls_cert_path.is_some() {
+            taker_config.ldk_tls_cert_path = config.ldk_tls_cert_path.clone();
+        }
+
         #[cfg(not(feature = "integration-test"))]
         if config.connection_type == ConnectionType::Tor {
             check_tor_status(
@@ -3817,4 +3833,47 @@ pub enum TakerBehavior {
     /// Skew one funding split a sat below the contract floor while keeping the
     /// count and total exact (maker per-contract floor rejection tests).
     SkewSplitBelowFloor,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CLI rebuilds `TakerInitConfig` from `config.toml` on every launch,
+    /// so anything `init_taker_config` fails to write is lost at the next
+    /// start. For the Lightning settings that would mean a taker restarting
+    /// without a backend, unable to recover a swap still in flight.
+    #[test]
+    fn init_taker_config_persists_lightning_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "taker-init-config-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config = TakerInitConfig {
+            connection_type: ConnectionType::Clearnet,
+            ldk_server_url: Some("127.0.0.1:3537".to_string()),
+            ldk_api_key_path: Some("/tmp/ldk2/api_key".to_string()),
+            ldk_tls_cert_path: Some("/tmp/ldk2/tls.crt".to_string()),
+            ..TakerInitConfig::default()
+        };
+
+        Taker::init_taker_config(&config, &dir).unwrap();
+
+        // Reloaded the way the CLI does on the next launch.
+        let reloaded = TakerConfig::new(Some(&dir.join("config.toml"))).unwrap();
+        assert_eq!(reloaded.ldk_server_url.as_deref(), Some("127.0.0.1:3537"));
+        assert_eq!(
+            reloaded.ldk_api_key_path.as_deref(),
+            Some("/tmp/ldk2/api_key")
+        );
+        assert_eq!(
+            reloaded.ldk_tls_cert_path.as_deref(),
+            Some("/tmp/ldk2/tls.crt")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
