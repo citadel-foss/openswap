@@ -10,13 +10,13 @@ use std::{
     convert::TryInto,
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use bitcoin::{secp256k1::SecretKey, Txid};
 use serde::{Deserialize, Serialize};
 
-use crate::{lock_debug, protocol::common_messages::ProtocolVersion};
+use crate::{lock_debug, protocol::common_messages::ProtocolVersion, wallet::Wallet};
 
 use super::error::TakerError;
 
@@ -427,20 +427,28 @@ pub(crate) fn funding_shared(tracker: &Arc<Mutex<SwapTracker>>, coin_swap: Optio
 }
 
 /// Whether this swap's incoming coin was already claimed, which makes its
-/// outgoing the first maker's to claim. A tracker that cannot answer says yes.
-pub(crate) fn incoming_claimed(tracker: &Arc<Mutex<SwapTracker>>, swap_id: &str) -> bool {
-    lock_debug!(tracker.lock())
-        .map(|tracker| {
-            tracker.get_record(swap_id).is_some_and(|record| {
-                record.recovery.incoming.iter().any(|outcome| {
-                    matches!(
-                        outcome.resolution,
-                        ContractResolution::Hashlock | ContractResolution::KeyPath
-                    )
-                })
-            })
-        })
-        .unwrap_or(true)
+/// outgoing the first maker's to claim. The wallet saves an incoming coin
+/// before the tracker lists it and drops it once swept, so a listed coin gone
+/// from the wallet was claimed, even if a crash kept the outcome off the
+/// tracker. A lock that cannot answer says yes.
+pub(crate) fn incoming_claimed(
+    tracker: &Arc<Mutex<SwapTracker>>,
+    wallet: &RwLock<Wallet>,
+    swap_id: &str,
+) -> bool {
+    let Ok(listed) = lock_debug!(tracker.lock()).map(|tracker| {
+        tracker
+            .get_record(swap_id)
+            .map(|record| record.incoming_contract_txids.clone())
+            .unwrap_or_default()
+    }) else {
+        return true;
+    };
+    lock_debug!(wallet.read()).map_or(true, |wallet| {
+        listed
+            .iter()
+            .any(|txid| wallet.find_incoming_swapcoin(&txid.to_string()).is_none())
+    })
 }
 
 pub struct SwapTracker {

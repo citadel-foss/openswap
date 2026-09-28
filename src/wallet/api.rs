@@ -1587,27 +1587,23 @@ impl Wallet {
         funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
         incoming_claimed: &dyn Fn(&str) -> bool,
     ) -> Result<(RecoveryOutcome, RecoveryOutcome), WalletError> {
-        // A failed sweep step must still let the refunds go out.
-        let sweeps = Self::broadcast_incoming_sweeps(wallet, chain, shutdown, Some(contract_txids))
-            .unwrap_or_else(|e| {
-                log::warn!("Incoming sweep failed: {:?}", e);
-                Vec::new()
-            });
-        let claiming: HashSet<String> = {
-            let w = lock_debug!(wallet.read())
-                .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
-            sweeps
-                .iter()
-                .filter_map(|(key, _, _)| w.store.incoming_swapcoins.get(key)?.swap_id.clone())
-                .collect()
-        };
+        // A failed sweep step must still let the refunds go out, but with no
+        // word on which coins are claimable, each refund must prove it dangles.
+        let (sweeps, claiming, sweep_failed) =
+            match Self::broadcast_incoming_sweeps(wallet, chain, shutdown, Some(contract_txids)) {
+                Ok((sweeps, claiming)) => (sweeps, claiming, false),
+                Err(e) => {
+                    log::warn!("Incoming sweep failed: {:?}", e);
+                    (Vec::new(), HashSet::new(), true)
+                }
+            };
         let (refunds, discarded) = Self::broadcast_timelock_recoveries(
             wallet,
             chain,
             shutdown,
             Some(swap_ids),
             funding_shared_with_peer,
-            &|swap_id| claiming.contains(swap_id) || incoming_claimed(swap_id),
+            &|swap_id| sweep_failed || claiming.contains(swap_id) || incoming_claimed(swap_id),
         )?;
         Self::finish_recoveries(wallet, chain, shutdown, sweeps, refunds, discarded)
     }
@@ -3354,12 +3350,14 @@ impl Wallet {
         shutdown: &std::sync::atomic::AtomicBool,
         contract_txids: Option<&HashSet<Txid>>,
     ) -> Result<RecoveryOutcome, WalletError> {
-        let sweeps = Self::broadcast_incoming_sweeps(wallet, chain, shutdown, contract_txids)?;
+        let (sweeps, _) = Self::broadcast_incoming_sweeps(wallet, chain, shutdown, contract_txids)?;
         Ok(Self::finish_recoveries(wallet, chain, shutdown, sweeps, Vec::new(), Vec::new())?.0)
     }
 
     /// Broadcasts every ready incoming sweep without waiting on any of them, and
     /// returns the sweeps sent. A contract still in the mempool waits for a later pass.
+    /// Also returns the swaps being claimed: those whose incoming contract is on
+    /// chain, whether or not their sweep went out in this pass.
     /// A PaySwap coin pays the receiver an exact amount, so its fee is whatever
     /// the input leaves over; every other coin sweeps at its negotiated feerate.
     fn broadcast_incoming_sweeps(
@@ -3367,8 +3365,9 @@ impl Wallet {
         chain: &AnyBlockchain,
         shutdown: &std::sync::atomic::AtomicBool,
         contract_txids: Option<&HashSet<Txid>>,
-    ) -> Result<Vec<SentSpend>, WalletError> {
+    ) -> Result<(Vec<SentSpend>, HashSet<String>), WalletError> {
         let mut sweeps = Vec::new();
+        let mut claiming = HashSet::new();
 
         // Snapshot everything the sweep needs, then drop the guard before any backend call.
         let completed_swapcoins = {
@@ -3390,7 +3389,7 @@ impl Wallet {
 
             if completed_swapcoins.is_empty() {
                 log::info!("No completed incoming swap coins to sweep");
-                return Ok(sweeps);
+                return Ok((sweeps, claiming));
             }
 
             w.sync_and_save(shutdown)?;
@@ -3409,6 +3408,7 @@ impl Wallet {
                 if let Some(spend_tx) = &swapcoin.spending_tx {
                     let txid = spend_tx.compute_txid();
                     if !chain.is_tx_unknown(&txid)? {
+                        claiming.extend(swapcoin.swap_id.clone());
                         sweeps.push((swap_id.clone(), contract_txid, txid));
                         return Ok(());
                     }
@@ -3478,6 +3478,7 @@ impl Wallet {
                     if in_mempool {
                         // Waiting here would hold back every other sweep and refund
                         // in the pass. A later pass sweeps it once it confirms.
+                        claiming.extend(swapcoin.swap_id.clone());
                         log::info!(
                             "Incoming contract tx {}:{} is in mempool for {} — sweeping on a later pass",
                             utxo_txid,
@@ -3542,6 +3543,10 @@ impl Wallet {
                         return Ok(());
                     }
                 }
+
+                // The contract is on chain, so this coin is ours to claim even if
+                // its sweep fails to go out below.
+                claiming.extend(swapcoin.swap_id.clone());
 
                 // A PaySwap coin settles to the receiver's own script — nothing is
                 // allocated or tracked in this wallet. Otherwise, allocate the
@@ -3654,10 +3659,16 @@ impl Wallet {
             }
         }
 
-        let w = lock_debug!(wallet.write())
-            .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
-        w.save_to_disk()?;
-        Ok(sweeps)
+        // The sweeps are already out: a failed save must not hide them from the wait.
+        match lock_debug!(wallet.write()) {
+            Ok(w) => {
+                if let Err(e) = w.save_to_disk() {
+                    log::warn!("Failed to persist incoming sweep state: {:?}", e);
+                }
+            }
+            Err(_) => log::warn!("Failed to persist incoming sweep state: wallet lock poisoned"),
+        }
+        Ok((sweeps, claiming))
     }
 
     /// Runs the crate's shared bounded wait on this wallet's own backend connection.

@@ -108,7 +108,7 @@ impl RecoveryLoop {
                         &incoming_contract_txids,
                         &swap_ids,
                         &|coin_swap| funding_shared(&swap_tracker, coin_swap),
-                        &|swap_id| incoming_claimed(&swap_tracker, swap_id),
+                        &|swap_id| incoming_claimed(&swap_tracker, &wallet, swap_id),
                     ) {
                         Ok((swept, recovered)) if !swept.is_empty() || !recovered.is_empty() => {
                             log::info!(

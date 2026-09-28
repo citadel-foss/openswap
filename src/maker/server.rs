@@ -1273,7 +1273,12 @@ fn recover_from_swap(
         Ok(true)
     };
     let mut timelock_recovery_txids = Vec::new();
-    let mut incoming_swept_txids = Vec::new();
+    // A restart resumes the list, so the report keeps sweeps from before it.
+    let mut incoming_swept_txids = lock_debug!(maker.swap_tracker.lock())
+        .map_err(|_| MakerError::MutexPossion)?
+        .get_record(&swap_id)
+        .map(|record| record.recovery.incoming_swept.clone())
+        .unwrap_or_default();
 
     // A restart reaches here with no record: the drain that would create one
     // never ran. Create it aged from the reservation, so the unbroadcast grace
@@ -1753,9 +1758,34 @@ fn recover_from_swap(
             let incoming_unclaimable = incoming_swapcoins
                 .iter()
                 .all(|incoming| incoming.other_privkey.is_none());
+            // The next hop's hashlock claim also empties the wallet (as a discard),
+            // and can confirm before the watcher shows its preimage. That incoming
+            // is ours to claim, so any spend but our own refund keeps it.
+            let claimed_downstream = || {
+                outgoing_swapcoins.iter().any(|outgoing| {
+                    let outpoint = bitcoin::OutPoint::new(
+                        outgoing.contract_tx.compute_txid(),
+                        outgoing.get_contract_output_vout(),
+                    );
+                    outgoing
+                        .contract_tx
+                        .output
+                        .get(outpoint.vout as usize)
+                        .is_some_and(|output| {
+                            match chain
+                                .confirmed_spending_transaction(&outpoint, &output.script_pubkey)
+                            {
+                                Ok(spend) => {
+                                    spend.is_some_and(|tx| !outgoing.is_own_timelock_spend(&tx))
+                                }
+                                Err(_) => true,
+                            }
+                        })
+                })
+            };
             // Nothing on-chain also describes a swap that never funded, so
             // do not call it cleaned up while the discard is still pending.
-            if outgoing_done && incoming_unclaimable && !discard_pending {
+            if outgoing_done && incoming_unclaimable && !discard_pending && !claimed_downstream() {
                 {
                     let mut wallet = lock_debug!(maker.wallet.write())
                         .map_err(|_| MakerError::General("Failed to lock wallet"))?;
