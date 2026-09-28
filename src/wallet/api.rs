@@ -1551,7 +1551,11 @@ impl Wallet {
         }
 
         if !incoming.is_empty() || !outgoing.is_empty() {
-            w.save_to_disk()?;
+            // The spends are mined and the coins are gone from memory: a failed
+            // save must not drop the outcome the caller records.
+            if let Err(e) = w.save_to_disk() {
+                log::warn!("Failed to persist recovery outcome: {:?}", e);
+            }
             #[cfg(debug_assertions)]
             log::debug!(
                 "[RECOVERY_STATE] Wallet: {} | Swept: {} | Refunded: {} | Discarded: {} | IncomingRemaining: {} | OutgoingRemaining: {}",
@@ -3406,9 +3410,10 @@ impl Wallet {
             if let Err(e) = (|| -> Result<(), WalletError> {
                 let contract_txid = swapcoin.contract_tx.compute_txid();
                 if let Some(spend_tx) = &swapcoin.spending_tx {
+                    // A sweep we built before may already be out: hold the refund.
+                    claiming.extend(swapcoin.swap_id.clone());
                     let txid = spend_tx.compute_txid();
                     if !chain.is_tx_unknown(&txid)? {
-                        claiming.extend(swapcoin.swap_id.clone());
                         sweeps.push((swap_id.clone(), contract_txid, txid));
                         return Ok(());
                     }
@@ -3515,13 +3520,14 @@ impl Wallet {
                                         // Our contract is out, so we will sweep it: hold the refund.
                                         claiming.extend(swapcoin.swap_id.clone());
                                     }
+                                    // An error does not prove a rejection: the
+                                    // re-check below tells whether it landed.
                                     Err(e) => {
                                         log::warn!(
                                             "Failed to broadcast incoming contract tx for {}: {:?}",
                                             swap_id,
                                             e
                                         );
-                                        return Ok(());
                                     }
                                 }
                             }
@@ -3536,9 +3542,14 @@ impl Wallet {
                         }
 
                         // Re-check UTXO availability (including mempool) after broadcast
-                        let utxo_available = chain
-                            .get_tx_out(&utxo_txid, utxo_vout, Some(true))?
-                            .is_some();
+                        let utxo_available =
+                            match chain.get_tx_out(&utxo_txid, utxo_vout, Some(true)) {
+                                Ok(utxo) => utxo.is_some(),
+                                Err(e) => {
+                                    claiming.extend(swapcoin.swap_id.clone());
+                                    return Err(e);
+                                }
+                            };
                         if !utxo_available {
                             log::info!(
                                 "Contract output still not available for {} after broadcast — will retry later",
