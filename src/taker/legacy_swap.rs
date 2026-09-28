@@ -928,6 +928,10 @@ impl Taker {
         required_confirms: u32,
         arrival_timeout: Duration,
     ) -> Result<u32, TakerError> {
+        #[cfg(feature = "integration-test")]
+        if self.behavior == super::api::TakerBehavior::SkipFundingConfirmWait {
+            return Ok(0);
+        }
         if funding_txids.is_empty() {
             return Ok(0);
         }

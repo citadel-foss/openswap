@@ -317,7 +317,8 @@ fn taker_abort_1_legacy_electrum() {
 #[test]
 fn electrum_sweeps_after_breach() {
     let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
+    // Skip the funding waits so recovery can meet the contracts unconfirmed.
+    let taker_behavior = vec![TakerBehavior::SkipFundingConfirmWait];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
         MakerBehavior::BroadcastContractAfterSetup,

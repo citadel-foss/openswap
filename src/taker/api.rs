@@ -3772,8 +3772,8 @@ pub enum TakerBehavior {
     /// connection and resend the same contract data (resume-after-partial-
     /// broadcast test). Only the maker's same-swap exemptions let this pass.
     ResumeAfterMakerDrop,
-    /// Broadcast the contract txs but skip the confirmation wait, so contract
-    /// data reaches the maker while the funding is only mempool-visible.
+    /// Broadcast the funding but skip the confirmation waits, so the swap moves
+    /// on while the funding and contracts are only mempool-visible.
     SkipFundingConfirmWait,
     /// Withhold the contract tx broadcast and skip the wait, so the maker
     /// claims funding txids no backend can see (evidence-gated keepalive).
