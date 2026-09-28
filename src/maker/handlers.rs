@@ -349,6 +349,13 @@ pub trait Maker: Send + Sync {
     /// Get maker configuration values.
     fn get_config(&self) -> MakerConfig;
 
+    /// Lightning submarine-swap terms, when a Lightning backend is
+    /// configured and reachable. Deliberately kept off [`MakerConfig`]:
+    /// `get_config` runs on every coinswap message, and deriving these
+    /// terms costs a round-trip to the Lightning sidecar. On-chain swaps
+    /// must not wait on a service they do not use.
+    fn lightning_offer(&self) -> Option<crate::protocol::lightning_messages::LightningOffer>;
+
     /// Validate swap parameters.
     fn validate_swap_parameters(&self, details: &SwapDetails) -> Result<u16, MakerError>;
 
@@ -788,9 +795,6 @@ pub struct MakerConfig {
     pub supported_protocols: Vec<ProtocolVersion>,
     /// Public name sent in the offer.
     pub name: String,
-    /// Lightning submarine-swap terms, when a Lightning backend is
-    /// configured and reachable.
-    pub lightning: Option<crate::protocol::lightning_messages::LightningOffer>,
 }
 
 /// Message handler
@@ -976,7 +980,9 @@ fn handle_get_offer<M: Maker>(
         fidelity,
         tweak_chain_code,
         name: config.name,
-        lightning: config.lightning,
+        // Fetched here rather than through `get_config`: this is one of the
+        // two places that actually needs it.
+        lightning: maker.lightning_offer(),
     };
 
     #[cfg(feature = "integration-test")]

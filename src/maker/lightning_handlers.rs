@@ -470,7 +470,7 @@ fn validate_terms<M: Maker>(
     min_confirmations: u32,
 ) -> Result<Amount, String> {
     let config = maker.get_config();
-    let Some(offer) = config.lightning else {
+    let Some(offer) = maker.lightning_offer() else {
         return Err("lightning swaps not offered".to_string());
     };
     // Re-read against live capacity rather than whatever the taker saw when

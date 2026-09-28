@@ -209,6 +209,23 @@ fn check_fee(quoted: Amount, advertised: Amount, amount: Amount) -> Result<(), T
     Ok(())
 }
 
+/// Satoshis as millisatoshis. A swap amount large enough to overflow the
+/// conversion is rejected rather than wrapped into a small one.
+fn msat(amount: Amount) -> Result<u64, TakerError> {
+    amount
+        .to_sat()
+        .checked_mul(1000)
+        .ok_or_else(|| general(format!("{amount} is too large to express in millisatoshis")))
+}
+
+/// `amount + fee`, rejected rather than panicking on overflow. The fee is
+/// bounded by `check_fee` first, so this only fires on an absurd amount.
+fn total_with_fee(amount: Amount, fee: Amount) -> Result<Amount, TakerError> {
+    amount
+        .checked_add(fee)
+        .ok_or_else(|| general(format!("{amount} plus a fee of {fee} overflows")))
+}
+
 fn general(msg: impl Into<String>) -> TakerError {
     TakerError::General(msg.into())
 }
@@ -532,7 +549,7 @@ impl Taker {
             .create_hold_invoice(
                 payment_hash,
                 InvoiceParams {
-                    amount_msat: Some(params.amount.to_sat() * 1000),
+                    amount_msat: Some(msat(params.amount)?),
                     description: format!("swap-in {swap_id}"),
                     expiry_secs: 3600,
                 },
@@ -541,13 +558,9 @@ impl Taker {
 
         // The refund locktime must clear our own invoice's CLTV window; the
         // maker enforces the same bound on its side.
-        let cltv_delta = verify_invoice(
-            &invoice.invoice,
-            &payment_hash,
-            params.amount.to_sat() * 1000,
-        )
-        .map_err(|e| general(format!("own invoice failed verification: {e}")))?
-        .min_final_cltv_expiry_delta as u16;
+        let cltv_delta = verify_invoice(&invoice.invoice, &payment_hash, msat(params.amount)?)
+            .map_err(|e| general(format!("own invoice failed verification: {e}")))?
+            .min_final_cltv_expiry_delta as u16;
         let locktime = params
             .locktime
             .unwrap_or(cltv_delta + DEFAULT_LOCKTIME_HEADROOM);
@@ -598,7 +611,7 @@ impl Taker {
                 value: None,
             },
         )?;
-        let funding_value = params.amount + accept.fee;
+        let funding_value = total_with_fee(params.amount, accept.fee)?;
         let (outpoint, actual_value) =
             self.fund_htlc_output(&htlc, funding_value, params.min_confirmations, &swap_id)?;
 
@@ -680,7 +693,7 @@ impl Taker {
         verify_invoice(
             &accept.invoice,
             &payment_hash,
-            (params.amount + accept.fee).to_sat() * 1000,
+            msat(total_with_fee(params.amount, accept.fee)?)?,
         )
         .map_err(|e| general(format!("maker invoice failed verification: {e}")))?;
 
@@ -859,14 +872,10 @@ impl Taker {
         // What maker 1 must forward over Lightning: our payout plus maker 2's
         // fee. Verified against the invoice we are about to hand over, since
         // maker 1 will check the same thing and reject a mismatch.
-        let middle_amount = params.amount + accept2.fee;
-        let cltv_delta = verify_invoice(
-            &accept2.invoice,
-            &payment_hash,
-            middle_amount.to_sat() * 1000,
-        )
-        .map_err(|e| general(format!("second maker's invoice failed verification: {e}")))?
-        .min_final_cltv_expiry_delta as u16;
+        let middle_amount = total_with_fee(params.amount, accept2.fee)?;
+        let cltv_delta = verify_invoice(&accept2.invoice, &payment_hash, msat(middle_amount)?)
+            .map_err(|e| general(format!("second maker's invoice failed verification: {e}")))?
+            .min_final_cltv_expiry_delta as u16;
 
         // The hop we fund must outlive the hop we claim from, and must also
         // clear the Lightning claim window maker 1 is exposed to.
@@ -949,7 +958,7 @@ impl Taker {
             },
         )?;
 
-        let sent = middle_amount + accept1.fee;
+        let sent = total_with_fee(middle_amount, accept1.fee)?;
         let (outpoint1, value1) =
             self.fund_htlc_output(&htlc1, sent, params.min_confirmations, &in_key)?;
         conn1.send(LightningTakerMessage::SwapInFunded(LnHtlcFunded {

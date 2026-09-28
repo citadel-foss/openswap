@@ -1822,8 +1822,11 @@ impl MakerTrait for MakerServer {
             required_confirms: self.config.required_confirms,
             supported_protocols: self.config.supported_protocols.clone(),
             name: self.config.name.clone(),
-            lightning: self.lightning_offer(),
         }
+    }
+
+    fn lightning_offer(&self) -> Option<crate::protocol::lightning_messages::LightningOffer> {
+        MakerServer::lightning_offer(self)
     }
 
     fn validate_swap_parameters(&self, details: &SwapDetails) -> Result<u16, MakerError> {
