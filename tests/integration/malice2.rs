@@ -47,7 +47,7 @@ enum Ending {
     MiddleMakerDies,
 }
 
-/// Stops maker `i` the way a crashed daemon stops.
+/// Stops maker `i`: an orderly shutdown, so the test covers an offline maker, not a crash.
 fn stop_maker(makers: &[Arc<MakerServer>], threads: &mut [Option<JoinHandle<()>>], i: usize) {
     makers[i].shutdown.store(true, Relaxed);
     if let Some(thread) = threads[i].take() {
