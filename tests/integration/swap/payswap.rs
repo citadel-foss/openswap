@@ -362,6 +362,77 @@ fn dust_floor_rejects_before_funding(world: &mut World) {
     info!("PaySwap dust-floor refusal test completed successfully!");
 }
 
+/// PaySwap must read the per-hop counts, not the scalar `tx_count`: with the
+/// scalar left at 1, a uniform `tx_counts` of 3 quotes three settlement
+/// outputs and a uniform 10 applies the ten-output dust floor. An uneven
+/// route has no single per-hop price, so it is refused before discovery.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3),
+        fund_makers_default(),
+        start_makers(120),
+    ],
+)]
+fn quotes_on_per_hop_counts(world: &mut World) {
+    let receiver_address = world
+        .bitcoind()
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .require_network(bitcoin::Network::Regtest)
+        .unwrap();
+    world.mine(1);
+
+    let payment = |sats: u64| {
+        SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(sats), 1)
+            .with_tx_count(1)
+            .with_required_confirms(1)
+            .with_payment_address(receiver_address.as_unchecked().clone())
+    };
+    let taker = world.taker_mut();
+
+    let uneven_err = taker
+        .prepare(payment(100_000).with_tx_counts(vec![1, 3]))
+        .expect_err("an uneven payment route must be refused");
+    assert!(
+        format!("{uneven_err:?}").contains("one transaction count for every hop"),
+        "unexpected refusal error: {:?}",
+        uneven_err
+    );
+
+    // Three settlement outputs, each budgeted at the 155 vB taproot
+    // script-path spend at 1 sat/vB. The scalar count would quote one.
+    let summary = taker
+        .prepare(payment(100_000).with_tx_counts(vec![3, 3]))
+        .expect("a uniform per-hop payment route must be quoted");
+    let quote = summary
+        .payment
+        .expect("a payment swap must carry its quote");
+    info!(
+        "Per-hop payment quote: settlement_budget={}",
+        quote.settlement_budget
+    );
+    assert_eq!(
+        quote.settlement_budget,
+        Amount::from_sat(3 * 155),
+        "the settlement budget must cover the per-hop count of outputs"
+    );
+
+    // 5459 sats clears the dust floor of one output (546) but not of ten
+    // (5460). Same feerate as the dust-floor test, so the route still prices.
+    let dust_err = taker
+        .prepare(payment(5459).with_tx_counts(vec![10, 10]).with_feerate(3))
+        .expect_err("the per-hop count must size the dust floor");
+    assert!(
+        format!("{dust_err:?}").contains("5460 sat minimum for 10 settlement outputs"),
+        "unexpected refusal error: {:?}",
+        dust_err
+    );
+}
+
 /// A PaySwap quote is bound to its selected makers. Negotiation failure must
 /// not substitute a spare, and a changed offer must abort before funding.
 #[world_test(

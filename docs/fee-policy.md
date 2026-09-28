@@ -21,6 +21,10 @@ Four numbers shape every swap:
   a maker may use for one hop. A funding transaction is the on-chain
   transaction that locks coins into a hop. The default is 2, the maximum is
   10. This is a ceiling, not a promise. A maker may deliver fewer.
+  On Taproot you can set a different ceiling for each hop (`tx_counts`,
+  `--tx-counts 1,3,1`). The first entry caps your own funding and each next
+  one caps a maker's forwarding. Legacy swaps and PaySwap need one count
+  for every hop.
 - **Incoming count** — how many contracts a hop actually receives. A
   contract is a coin locked so that only the swap can unlock it. You do not
   set this number. It comes out of the funding plan, and both sides check
