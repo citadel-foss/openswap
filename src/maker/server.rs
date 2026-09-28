@@ -1610,9 +1610,7 @@ fn recover_from_swap(
         // One connection per pass, shared by both recovery paths below: on Tor
         // Electrum each fresh connection costs a circuit handshake. Idle passes
         // that only poll the watchtower pay for none.
-        let chain = if (all_preimages_known && !incoming_swapcoins.is_empty())
-            || current_height >= timelock_expiry
-        {
+        let chain = if all_preimages_known || current_height >= timelock_expiry {
             Some(
                 lock_debug!(maker.wallet.read())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?

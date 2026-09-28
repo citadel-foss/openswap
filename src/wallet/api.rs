@@ -3414,6 +3414,26 @@ impl Wallet {
                     // does not know it, the contract output checks below decide.
                     let txid = spend_tx.compute_txid();
                     match chain.is_tx_unknown(&txid) {
+                        // Our hashlock sweep put the preimage out. Only the sender's
+                        // confirmed timelock refund proves that claim is over.
+                        Ok(true) if swapcoin.other_privkey.is_none() => {
+                            let outpoint =
+                                OutPoint::new(contract_txid, swapcoin.get_contract_output_vout());
+                            let refunded =
+                                match swapcoin.contract_tx.output.get(outpoint.vout as usize) {
+                                    Some(output) => chain
+                                        .confirmed_spending_transaction(
+                                            &outpoint,
+                                            &output.script_pubkey,
+                                        )
+                                        .inspect_err(|_| claiming.extend(swapcoin.swap_id.clone()))?
+                                        .is_some_and(|tx| swapcoin.is_timelock_spend(&tx)),
+                                    None => false,
+                                };
+                            if !refunded {
+                                claiming.extend(swapcoin.swap_id.clone());
+                            }
+                        }
                         Ok(true) => {}
                         Ok(false) => {
                             claiming.extend(swapcoin.swap_id.clone());

@@ -584,6 +584,21 @@ impl IncomingSwapCoin {
         }
     }
 
+    /// True when `spending_tx` is the sender's timelock refund of our contract:
+    /// a spend that leaves our claim with nothing to spend.
+    pub(crate) fn is_timelock_spend(&self, spending_tx: &Transaction) -> bool {
+        is_timelock_spend(
+            spending_tx,
+            OutPoint::new(
+                self.contract_tx.compute_txid(),
+                self.get_contract_output_vout(),
+            ),
+            self.protocol,
+            self.contract_redeemscript.as_deref(),
+            self.timelock_script.as_deref(),
+        )
+    }
+
     /// Get the vout of the contract output in the contract_tx.
     pub fn get_contract_output_vout(&self) -> u32 {
         if self.protocol == ProtocolVersion::Taproot && self.contract_tx.output.len() > 1 {
