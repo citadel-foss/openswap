@@ -6,7 +6,7 @@ use bitcoin::{
     secp256k1::{Keypair, Scalar, SecretKey, XOnlyPublicKey},
     sighash::SighashCache,
     taproot::Signature as TaprootSignature,
-    Address, Amount, OutPoint, PublicKey, ScriptBuf, Transaction, Txid, Witness,
+    Address, Amount, OutPoint, PublicKey, Script, ScriptBuf, Transaction, Txid, Witness,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::TryInto;
@@ -1001,36 +1001,11 @@ impl OutgoingSwapCoin {
 
     /// Extracts the timelock value from the script.
     pub fn get_timelock(&self) -> Option<u32> {
-        if self.protocol == ProtocolVersion::Taproot {
-            // Parse timelock from Taproot timelock script
-            let timelock_script = self.timelock_script.as_ref()?;
-            let script_bytes = timelock_script.as_bytes();
-
-            if script_bytes.len() < 6 {
-                return None;
-            }
-
-            // First byte is push opcode
-            let locktime_len = script_bytes[0] as usize;
-            if locktime_len == 0 || locktime_len > 5 || script_bytes.len() < locktime_len + 1 {
-                return None;
-            }
-
-            // Parse little-endian locktime
-            let mut locktime = 0u32;
-            for i in 0..locktime_len {
-                locktime |= (script_bytes[1 + i] as u32) << (i * 8);
-            }
-
-            Some(locktime)
-        } else {
-            // Legacy: parse from contract_redeemscript
-            // The timelock is at a specific position in the script
-            let redeemscript = self.contract_redeemscript.as_ref()?;
-            crate::protocol::contract::read_contract_locktime(redeemscript)
-                .ok()
-                .map(|t| t as u32)
-        }
+        contract_timelock(
+            self.protocol,
+            self.contract_redeemscript.as_deref(),
+            self.timelock_script.as_deref(),
+        )
     }
 
     /// Get the vout of the contract output in the contract_tx.
@@ -1247,35 +1222,88 @@ impl OutgoingSwapCoin {
     /// address is not: the peer learns it from our mempool tx and can add an
     /// output paying it to its own hashlock claim.
     pub(crate) fn is_own_timelock_spend(&self, spending_tx: &Transaction) -> bool {
-        let contract_outpoint = OutPoint::new(
-            self.contract_tx.compute_txid(),
-            self.get_contract_output_vout(),
-        );
-        let Some(input) = spending_tx
-            .input
-            .iter()
-            .find(|input| input.previous_output == contract_outpoint)
-        else {
-            return false;
-        };
-        let witness = &input.witness;
-        match self.protocol {
-            // Script path [sig] [timelock_script] [control_block]. A key-path
-            // spend reveals no leaf; the hashlock leaf reveals the other script.
-            ProtocolVersion::Taproot => self.timelock_script.as_ref().is_some_and(|script| {
-                witness.taproot_leaf_script().is_some_and(|leaf| {
-                    leaf.version == bitcoin::taproot::LeafVersion::TapScript
-                        && leaf.script == script.as_script()
-                })
-            }),
-            // [sig] [<empty>] [redeemscript]: the empty element selects the
-            // timelock branch, where the hashlock branch needs the preimage.
-            ProtocolVersion::Legacy => self.contract_redeemscript.as_ref().is_some_and(|script| {
-                witness.len() == 3
-                    && witness.nth(1).is_some_and(<[u8]>::is_empty)
-                    && witness.last() == Some(script.as_bytes())
-            }),
+        is_timelock_spend(
+            spending_tx,
+            OutPoint::new(
+                self.contract_tx.compute_txid(),
+                self.get_contract_output_vout(),
+            ),
+            self.protocol,
+            self.contract_redeemscript.as_deref(),
+            self.timelock_script.as_deref(),
+        )
+    }
+}
+
+/// The contract's timelock: Taproot's CLTV height or Legacy's CSV blocks.
+pub(crate) fn contract_timelock(
+    protocol: ProtocolVersion,
+    redeemscript: Option<&Script>,
+    timelock_script: Option<&Script>,
+) -> Option<u32> {
+    if protocol == ProtocolVersion::Taproot {
+        // Parse timelock from Taproot timelock script
+        let script_bytes = timelock_script?.as_bytes();
+
+        if script_bytes.len() < 6 {
+            return None;
         }
+
+        // First byte is push opcode
+        let locktime_len = script_bytes[0] as usize;
+        if locktime_len == 0 || locktime_len > 5 || script_bytes.len() < locktime_len + 1 {
+            return None;
+        }
+
+        // Parse little-endian locktime
+        let mut locktime = 0u32;
+        for i in 0..locktime_len {
+            locktime |= (script_bytes[1 + i] as u32) << (i * 8);
+        }
+
+        Some(locktime)
+    } else {
+        // Legacy: parse from contract_redeemscript
+        // The timelock is at a specific position in the script
+        crate::protocol::contract::read_contract_locktime(redeemscript?)
+            .ok()
+            .map(|t| t as u32)
+    }
+}
+
+/// True when `spending_tx` spends `contract_outpoint` through the contract's
+/// timelock branch. Only the sender's timelock key satisfies it and the output
+/// commits to its scripts, so the witness shape alone is exact.
+fn is_timelock_spend(
+    spending_tx: &Transaction,
+    contract_outpoint: OutPoint,
+    protocol: ProtocolVersion,
+    redeemscript: Option<&Script>,
+    timelock_script: Option<&Script>,
+) -> bool {
+    let Some(input) = spending_tx
+        .input
+        .iter()
+        .find(|input| input.previous_output == contract_outpoint)
+    else {
+        return false;
+    };
+    let witness = &input.witness;
+    match protocol {
+        // Script path [sig] [timelock_script] [control_block]. A key-path
+        // spend reveals no leaf; the hashlock leaf reveals the other script.
+        ProtocolVersion::Taproot => timelock_script.is_some_and(|script| {
+            witness.taproot_leaf_script().is_some_and(|leaf| {
+                leaf.version == bitcoin::taproot::LeafVersion::TapScript && leaf.script == script
+            })
+        }),
+        // [sig] [<empty>] [redeemscript]: the empty element selects the
+        // timelock branch, where the hashlock branch needs the preimage.
+        ProtocolVersion::Legacy => redeemscript.is_some_and(|script| {
+            witness.len() == 3
+                && witness.nth(1).is_some_and(<[u8]>::is_empty)
+                && witness.last() == Some(script.as_bytes())
+        }),
     }
 }
 
@@ -1303,6 +1331,29 @@ pub struct WatchOnlySwapCoin {
 }
 
 impl WatchOnlySwapCoin {
+    /// True when `spending_tx` is the sender's timelock refund of this contract:
+    /// a spend that reveals no preimage to the receiver.
+    pub(crate) fn is_timelock_spend(&self, spending_tx: &Transaction) -> bool {
+        is_timelock_spend(
+            spending_tx,
+            self.contract_outpoint(),
+            self.protocol,
+            Some(&self.contract_redeemscript),
+            self.timelock_script.as_deref(),
+        )
+    }
+
+    /// The contract output this coin watches: the one paying the funding amount.
+    pub(crate) fn contract_outpoint(&self) -> OutPoint {
+        let vout = self
+            .contract_tx
+            .output
+            .iter()
+            .position(|output| output.value == self.funding_amount)
+            .unwrap_or(0);
+        OutPoint::new(self.contract_tx.compute_txid(), vout as u32)
+    }
+
     /// Returns the contract transaction ID.
     #[allow(dead_code)]
     pub fn contract_txid(&self) -> Txid {

@@ -426,6 +426,23 @@ pub(crate) fn funding_shared(tracker: &Arc<Mutex<SwapTracker>>, coin_swap: Optio
     })
 }
 
+/// Whether this swap's incoming coin was already claimed, which makes its
+/// outgoing the first maker's to claim. A tracker that cannot answer says yes.
+pub(crate) fn incoming_claimed(tracker: &Arc<Mutex<SwapTracker>>, swap_id: &str) -> bool {
+    lock_debug!(tracker.lock())
+        .map(|tracker| {
+            tracker.get_record(swap_id).is_some_and(|record| {
+                record.recovery.incoming.iter().any(|outcome| {
+                    matches!(
+                        outcome.resolution,
+                        ContractResolution::Hashlock | ContractResolution::KeyPath
+                    )
+                })
+            })
+        })
+        .unwrap_or(true)
+}
+
 pub struct SwapTracker {
     path: PathBuf,
     data: SwapTrackerData,

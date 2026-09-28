@@ -490,6 +490,8 @@ $ taker recover
 
 This will attempt to recover all funds from failed swaps. In this case, since there are no unfinished transactions (both incoming and outgoing txids arrays are empty), the recovery process completes immediately with no funds to recover.
 
+A contract can stay locked on purpose. Once your node receives its coins from a swap, the contract you sent is owed to the first maker, the one you paid directly. Your node takes it back only after that maker takes back its own contract. At that point nobody else can ever claim yours.
+
 ### Backing Up the Wallet
 
 To back up the selected wallet (use `-w` to pick a non-default wallet), run:

@@ -12,8 +12,8 @@ use std::{
 
 pub(crate) use super::swap_tracker::SwapPhase;
 use super::swap_tracker::{
-    funding_shared, now_secs, ContractOutcome, ContractResolution, ExchangeProgress,
-    FinalizationProgress, LegacyExchangeProgress, MakerProgress, RecoveryState,
+    funding_shared, incoming_claimed, now_secs, ContractOutcome, ContractResolution,
+    ExchangeProgress, FinalizationProgress, LegacyExchangeProgress, MakerProgress, RecoveryState,
     SerializableSecretKey, SwapRecord, SwapTracker, TaprootExchangeProgress,
 };
 
@@ -777,6 +777,7 @@ impl Taker {
                 &incoming_contract_txids,
                 &swap_ids,
                 &|coin_swap| funding_shared(&self.swap_tracker, coin_swap),
+                &|swap_id| incoming_claimed(&self.swap_tracker, swap_id),
             ) {
                 Ok((swept, recovered)) if !swept.is_empty() || !recovered.is_empty() => {
                     log::info!(

@@ -1615,7 +1615,8 @@ fn recover_from_swap(
                 &maker.shutdown,
                 Some(&contract_txids),
             )
-            // Ending recovery here would leave the outgoing refund unclaimed.
+            // Retry next pass. With the preimage known the timelock refund is never
+            // an option: a hashlock claim and a refund must not both happen.
             .unwrap_or_else(|e| {
                 log::warn!(
                     "[{}] Hashlock sweep failed: {:?}",
@@ -1680,10 +1681,8 @@ fn recover_from_swap(
                 maker.shutdown.store(true, Relaxed);
                 return Ok(());
             }
-        }
-
-        // --- Timelock path: reclaim outgoing after timelock expires ---
-        if current_height >= timelock_expiry {
+        } else if current_height >= timelock_expiry {
+            // --- Timelock path: reclaim outgoing after timelock expires ---
             log::info!(
                 "[{}] Timelock expired at {} (expiry={}), recovering via timelock path",
                 maker.config.network_port,

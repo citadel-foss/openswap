@@ -688,8 +688,9 @@ impl Taker {
             // Store this maker's outgoing info for next hop
             prev_senders_info = Some(senders_contract_txs_info.clone());
 
-            // For non-first hops, the taker doesn't own these contracts — track as watch-only
-            if !is_first_peer {
+            // A maker's outgoing pays the next maker, except the last one's, which
+            // is our incoming. Track the maker-to-maker ones as watch-only.
+            if !is_last_peer {
                 let watchonly_coins: Vec<WatchOnlySwapCoin> = senders_contract_txs_info
                     .iter()
                     .map(|info| {
