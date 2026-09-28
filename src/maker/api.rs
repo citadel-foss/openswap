@@ -3309,6 +3309,7 @@ impl MakerTrait for MakerServer {
     ) -> Result<(Transaction, u32), MakerError> {
         let mut wallet = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let htlc_spk = address.script_pubkey();
         // The swap-out hold-window check promises the funding confirms
         // inside a fixed budget, so price it to actually do that. The relay
         // floor cannot keep that promise on a busy chain, and a funding that
@@ -3366,11 +3367,14 @@ impl MakerTrait for MakerServer {
             .into_iter()
             .next()
             .ok_or(MakerError::General("No funding tx created"))?;
-        let vout = result
-            .payment_output_positions
-            .first()
-            .copied()
-            .unwrap_or(0);
+        // Locate the HTLC by its script rather than by position: a
+        // positional fallback could point at the change output, which the
+        // HTLC's keys cannot spend, and the swap would be unrefundable.
+        let vout = tx
+            .output
+            .iter()
+            .position(|output| output.script_pubkey == htlc_spk)
+            .ok_or(MakerError::General("funding tx has no HTLC output"))? as u32;
         Ok((tx, vout))
     }
 
