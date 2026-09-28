@@ -1611,13 +1611,25 @@ fn recover_from_swap(
         // Electrum each fresh connection costs a circuit handshake. Idle passes
         // that only poll the watchtower pay for none.
         let chain = if all_preimages_known || current_height >= timelock_expiry {
-            Some(
-                lock_debug!(maker.wallet.read())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                    .blockchain
-                    .new_connection()
-                    .map_err(MakerError::Wallet)?,
-            )
+            // Nothing respawns this thread, so a failed connection retries.
+            match lock_debug!(maker.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                .blockchain
+                .new_connection()
+            {
+                Ok(chain) => Some(chain),
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Could not connect for recovery: {:?}; retrying recovery",
+                        maker.config.network_port,
+                        e
+                    );
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
+                    }
+                    continue;
+                }
+            }
         } else {
             None
         };
