@@ -563,7 +563,7 @@ fn handle_swap_in_request<M: Maker>(
         Ok(verified) => verified.min_final_cltv_expiry_delta,
         Err(reason) => return Ok(reject(&req.swap_id, reason)),
     };
-    if (req.locktime as u64) < cltv_delta + CLTV_SAFETY_MARGIN {
+    if (req.locktime as u64) < cltv_delta.saturating_add(CLTV_SAFETY_MARGIN) {
         return Ok(reject(
             &req.swap_id,
             format!(
@@ -677,7 +677,17 @@ fn handle_swap_in_funded<M: Maker>(
         swap.amount.to_sat() * 1000,
     )
     .map(|verified| verified.min_final_cltv_expiry_delta)
-    .unwrap_or(0) as u32;
+    // Saturating, not truncating: `as u32` would turn a 2^32 delta into 0
+    // and wave through a swap whose claim window we cannot cover. The
+    // locktime check at acceptance already bounds this to a u16, so the
+    // clamp is defence in depth rather than a live path.
+    .map_or(0u32, |delta| {
+        if delta > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            delta as u32
+        }
+    });
     if remaining < invoice_delta.saturating_add(CLTV_SAFETY_MARGIN as u32) {
         return Ok(reject(
             &funded.swap_id,

@@ -226,6 +226,19 @@ fn total_with_fee(amount: Amount, fee: Amount) -> Result<Amount, TakerError> {
         .ok_or_else(|| general(format!("{amount} plus a fee of {fee} overflows")))
 }
 
+/// An invoice's final CLTV delta as a locktime-sized value. The wire
+/// locktime is a `u16`, so a delta that does not fit cannot be covered by
+/// any locktime we could send. Reject it rather than truncate: `as u16`
+/// turns 65,536 into 0, which then passes every check below it.
+fn cltv_delta_blocks(delta: u64) -> Result<u16, TakerError> {
+    if delta > u16::MAX as u64 {
+        return Err(general(format!(
+            "invoice cltv delta {delta} exceeds the largest locktime this protocol can express"
+        )));
+    }
+    Ok(delta as u16)
+}
+
 fn general(msg: impl Into<String>) -> TakerError {
     TakerError::General(msg.into())
 }
@@ -558,13 +571,22 @@ impl Taker {
 
         // The refund locktime must clear our own invoice's CLTV window; the
         // maker enforces the same bound on its side.
-        let cltv_delta = verify_invoice(&invoice.invoice, &payment_hash, msat(params.amount)?)
-            .map_err(|e| general(format!("own invoice failed verification: {e}")))?
-            .min_final_cltv_expiry_delta as u16;
-        let locktime = params
-            .locktime
-            .unwrap_or(cltv_delta + DEFAULT_LOCKTIME_HEADROOM);
-        if locktime < cltv_delta + CLTV_SAFETY_MARGIN {
+        let cltv_delta = cltv_delta_blocks(
+            verify_invoice(&invoice.invoice, &payment_hash, msat(params.amount)?)
+                .map_err(|e| general(format!("own invoice failed verification: {e}")))?
+                .min_final_cltv_expiry_delta,
+        )?;
+        let locktime = match params.locktime {
+            Some(locktime) => locktime,
+            None => cltv_delta
+                .checked_add(DEFAULT_LOCKTIME_HEADROOM)
+                .ok_or_else(|| {
+                    general(format!(
+                        "invoice cltv delta {cltv_delta} leaves no room for a default locktime"
+                    ))
+                })?,
+        };
+        if locktime < cltv_delta.saturating_add(CLTV_SAFETY_MARGIN) {
             return Err(general(format!(
                 "locktime {locktime} too short for invoice cltv delta {cltv_delta}"
             )));
@@ -873,9 +895,11 @@ impl Taker {
         // fee. Verified against the invoice we are about to hand over, since
         // maker 1 will check the same thing and reject a mismatch.
         let middle_amount = total_with_fee(params.amount, accept2.fee)?;
-        let cltv_delta = verify_invoice(&accept2.invoice, &payment_hash, msat(middle_amount)?)
-            .map_err(|e| general(format!("second maker's invoice failed verification: {e}")))?
-            .min_final_cltv_expiry_delta as u16;
+        let cltv_delta = cltv_delta_blocks(
+            verify_invoice(&accept2.invoice, &payment_hash, msat(middle_amount)?)
+                .map_err(|e| general(format!("second maker's invoice failed verification: {e}")))?
+                .min_final_cltv_expiry_delta,
+        )?;
 
         // The hop we fund must outlive the hop we claim from, and must also
         // clear the Lightning claim window maker 1 is exposed to.
@@ -1148,5 +1172,35 @@ impl Taker {
         }
         let _ = self.write_wallet()?.sync_and_save(&Default::default());
         Ok(outcomes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The delta is a `u64` on the invoice but the wire locktime is a
+    /// `u16`. A truncating cast maps 65,536 to 0, which then satisfies
+    /// every locktime check and lets a counterparty hand us an invoice
+    /// whose real claim window outlives our on-chain refund.
+    #[test]
+    fn cltv_delta_above_u16_is_rejected_not_truncated() {
+        assert_eq!(cltv_delta_blocks(42).unwrap(), 42);
+        assert_eq!(cltv_delta_blocks(u16::MAX as u64).unwrap(), u16::MAX);
+        assert!(cltv_delta_blocks(u16::MAX as u64 + 1).is_err());
+        assert!(cltv_delta_blocks(u64::MAX).is_err());
+    }
+
+    /// `amount + fee` and the millisatoshi conversion both take an amount
+    /// that arrives unbounded from the CLI.
+    #[test]
+    fn oversized_amounts_are_rejected_not_wrapped() {
+        assert_eq!(msat(Amount::from_sat(1)).unwrap(), 1000);
+        assert!(msat(Amount::from_sat(u64::MAX)).is_err());
+        assert_eq!(
+            total_with_fee(Amount::from_sat(10), Amount::from_sat(5)).unwrap(),
+            Amount::from_sat(15)
+        );
+        assert!(total_with_fee(Amount::from_sat(u64::MAX), Amount::from_sat(1)).is_err());
     }
 }
