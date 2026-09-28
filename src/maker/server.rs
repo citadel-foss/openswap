@@ -1273,6 +1273,7 @@ fn recover_from_swap(
         Ok(true)
     };
     let mut timelock_recovery_txids = Vec::new();
+    let mut incoming_swept_txids = Vec::new();
 
     // A restart reaches here with no record: the drain that would create one
     // never ran. Create it aged from the reservation, so the unbroadcast grace
@@ -1555,7 +1556,8 @@ fn recover_from_swap(
             watchtower_down_logged = true;
         }
 
-        // Check if all incoming swapcoins now have preimages
+        // Check if all incoming swapcoins now have preimages. One already
+        // gone from the wallet was swept on an earlier pass.
         let all_preimages_known = {
             let wallet = lock_debug!(maker.wallet.read())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -1564,7 +1566,7 @@ fn recover_from_swap(
                 let key = incoming.contract_tx.compute_txid().to_string();
                 wallet
                     .find_incoming_swapcoin(&key)
-                    .is_some_and(|s| s.is_preimage_known())
+                    .is_none_or(|s| s.is_preimage_known())
             })
         };
 
@@ -1634,12 +1636,24 @@ fn recover_from_swap(
                 );
 
                 // Tracker: HashlockRecovered
-                let swept_txids: Vec<_> = swept.resolved.iter().map(|(_, txid)| *txid).collect();
+                incoming_swept_txids.extend(swept.resolved.iter().map(|(_, txid)| *txid));
                 update_tracker(&maker, &swap_id, |r| {
-                    r.recovery.incoming_swept = swept_txids;
+                    r.recovery.incoming_swept = incoming_swept_txids.clone();
                     r.recovery.phase = MakerRecoveryPhase::HashlockRecovered;
                 });
+            }
 
+            // A contract still in the mempool is swept on a later pass, so
+            // finish only once every incoming coin has left the wallet.
+            let fully_swept = {
+                let wallet = lock_debug!(maker.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                incoming_swapcoins.iter().all(|incoming| {
+                    let key = incoming.contract_tx.compute_txid().to_string();
+                    wallet.find_incoming_swapcoin(&key).is_none()
+                })
+            };
+            if fully_swept {
                 // Clean up outgoing swapcoins — their funding was spent by
                 // someone else (hashlock), so they are no longer recoverable
                 // via timelock. Remove them from the wallet store.
@@ -1664,10 +1678,9 @@ fn recover_from_swap(
                 let network = lock_debug!(maker.wallet.read())
                     .map(|w| w.store.network.to_string())
                     .unwrap_or_default();
-                let recovery_txids: Vec<String> = swept
-                    .resolved
+                let recovery_txids: Vec<String> = incoming_swept_txids
                     .iter()
-                    .map(|(_, spending_txid)| spending_txid.to_string())
+                    .map(|spending_txid| spending_txid.to_string())
                     .collect();
                 RecoveryReport::emit_maker(
                     &maker.data_dir,
