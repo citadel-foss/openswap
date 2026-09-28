@@ -736,8 +736,8 @@ impl Taker {
     /// Called on startup to recover funds from incomplete swaps.
     ///
     /// Sweeps incoming swapcoins (hashlock path), recovers timelocked outgoing
-    /// swapcoins, and spawns a background RecoveryLoop for any remaining
-    /// unresolved contracts.
+    /// swapcoins, and spawns the background RecoveryLoop that finishes each
+    /// failed swap.
     fn init_recover_wallet(&mut self) {
         log::info!("Checking wallet for unresolved swap contracts...");
 
@@ -783,47 +783,41 @@ impl Taker {
                         "Startup recovery: swept {} incoming, recovered {} timelocked outgoing swapcoins",
                         swept.resolved.len(),
                         recovered.len()
-                    )
+                    );
+                    // Reports need these outcomes, and later passes read the claims back.
+                    if let Ok(mut tracker) = lock_debug!(self.swap_tracker.lock()) {
+                        RecoveryLoop::update_tracker_outcomes(
+                            &mut tracker,
+                            &swap_ids,
+                            &swept,
+                            &recovered,
+                        );
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => log::warn!("Startup recovery failed: {:?}", e),
             }
         }
 
-        let has_remaining = match self.read_wallet() {
-            Ok(wallet) => {
-                !wallet
-                    .outgoing_contract_outpoints(Some(&swap_ids))
-                    .is_empty()
-                    || !wallet
-                        .incoming_contract_outpoints(Some(&swap_ids))
-                        .is_empty()
-            }
+        // Always start the loop: with nothing left, its first pass still marks
+        // the swaps cleaned up and writes their reports, so restarts stop retrying.
+        let data_dir = match self
+            .config
+            .data_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(get_taker_dir)
+        {
+            Ok(dir) => dir,
             Err(e) => {
-                log::warn!("Startup recovery: failed to lock wallet: {:?}", e);
-                false
+                log::warn!("Startup recovery: {e}; skipping recovery loop");
+                return;
             }
         };
-
-        if has_remaining {
-            let data_dir = match self
-                .config
-                .data_dir
-                .clone()
-                .map(Ok)
-                .unwrap_or_else(get_taker_dir)
-            {
-                Ok(dir) => dir,
-                Err(e) => {
-                    log::warn!("Startup recovery: {e}; skipping recovery loop");
-                    return;
-                }
-            };
-            match RecoveryLoop::start(self.wallet.clone(), self.swap_tracker.clone(), data_dir) {
-                Ok(rl) => self.recovery_loop = Some(rl),
-                // Without the loop, remaining contracts are never swept.
-                Err(e) => log::error!("Failed to spawn recovery loop: {e}"),
-            }
+        match RecoveryLoop::start(self.wallet.clone(), self.swap_tracker.clone(), data_dir) {
+            Ok(rl) => self.recovery_loop = Some(rl),
+            // Without the loop, remaining contracts are never swept.
+            Err(e) => log::error!("Failed to spawn recovery loop: {e}"),
         }
     }
 

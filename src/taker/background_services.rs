@@ -263,7 +263,7 @@ impl RecoveryLoop {
     }
 
     /// Match resolved contract txids against tracker records and update outcomes.
-    fn update_tracker_outcomes(
+    pub(crate) fn update_tracker_outcomes(
         tracker: &mut SwapTracker,
         recovery_scope: &HashSet<String>,
         swept: &crate::wallet::RecoveryOutcome,

@@ -13,12 +13,17 @@
 //!    timelocks to mature, so there is a wide window to die in.
 //! 3. A fresh `Taker` is built from the same data dir, with nothing in memory.
 //! 4. `recover_active_swap` must find the swap on disk and finish the job.
+//! 5. A crash before the tracker records the cleanup leaves nothing to recover;
+//!    the next startup must still finish the swap instead of retrying it forever.
 
 use bitcoin::Amount;
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, Taker, TakerBehavior},
+    taker::{
+        swap_tracker::{RecoveryPhase, SwapTracker},
+        SwapParams, Taker, TakerBehavior,
+    },
     utill::NO_SHUTDOWN,
 };
 
@@ -148,7 +153,7 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     info!("Restoring the pre-sweep state to simulate a crash before cleanup");
     drop(taker);
     std::fs::copy(wallet_snapshot, wallet_path).unwrap();
-    std::fs::copy(tracker_snapshot, tracker_path).unwrap();
+    std::fs::copy(&tracker_snapshot, &tracker_path).unwrap();
     thread::sleep(Duration::from_secs(5));
 
     let restarted = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
@@ -255,6 +260,24 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     assert!(
         !log_contents.contains("No persisted swapcoins found for recovery"),
         "restarted taker failed to read the swap back off disk"
+    );
+
+    // Crash again before the tracker saw the cleanup: the chain and wallet are
+    // settled, so startup has nothing to recover but must still finish the swap.
+    drop(restarted);
+    std::fs::copy(&tracker_snapshot, &tracker_path).unwrap();
+    let settled = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
+        .expect("settled taker should open the same wallet");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !settled.is_recovery_complete() {
+        assert!(Instant::now() < deadline, "settled swap was not finished");
+        thread::sleep(Duration::from_secs(1));
+    }
+    let tracker = SwapTracker::load_or_create(&taker_dir).unwrap();
+    assert_eq!(
+        tracker.get_record(&summary.swap_id).unwrap().recovery.phase,
+        RecoveryPhase::CleanedUp,
+        "startup left a settled swap for every restart to retry"
     );
 
     info!("Taker restart recovery test completed successfully!");
