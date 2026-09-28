@@ -175,6 +175,15 @@ enum Commands {
             value_parser = clap::value_parser!(u32).range(1..=MAX_TX_COUNT as i64)
         )]
         tx_count: u32,
+        /// Per-hop maximums (Taproot only), e.g. `1,3,1`: makers + 1 entries, the
+        /// first capping the taker's own funding and each next one a maker's
+        /// forwarding. Overrides `--tx-count`.
+        #[clap(
+            long = "tx-counts",
+            value_delimiter = ',',
+            value_parser = clap::value_parser!(u32).range(1..=MAX_TX_COUNT as i64)
+        )]
+        tx_counts: Option<Vec<u32>>,
         /// Maximum inputs per forwarding tx whose fee the taker covers.
         #[clap(
             long = "max-input-budget",
@@ -671,6 +680,7 @@ fn main() -> Result<(), TakerError> {
             makers,
             amount,
             tx_count,
+            tx_counts,
             max_input_budget,
             feerate,
             protocol,
@@ -706,6 +716,9 @@ fn main() -> Result<(), TakerError> {
             let mut swap_params =
                 SwapParams::new(protocol_version, Amount::from_sat(*amount), *makers);
             swap_params.tx_count = *tx_count;
+            if let Some(tx_counts) = tx_counts {
+                swap_params.tx_counts = tx_counts.clone();
+            }
             swap_params.max_input_budget = *max_input_budget;
             swap_params.feerate = *feerate;
             swap_params.manually_selected_outpoints = manually_selected_outpoints;
