@@ -390,7 +390,7 @@ pub fn handle_lightning_message<M: Maker>(
     // dropped after PENDING_CONNECTION_TIMEOUT, which is far shorter than the
     // gaps between Lightning steps (funding confirmations, held payments).
     state.check_swap_id(&swap_id)?;
-    state.swap_id = Some(swap_id.clone());
+    state.swap_id = Some(swap_id);
 
     match message {
         LightningTakerMessage::SwapInRequest(req) => handle_swap_in_request(maker, &ctx, req),
@@ -702,7 +702,7 @@ fn handle_swap_in_funded<M: Maker>(
         log::warn!("lightning: htlc script build failed: {e}");
         MakerError::General("htlc script build failed")
     })?;
-    maker.register_watch_outpoint(funded.outpoint, htlc_spk.clone())?;
+    maker.register_watch_outpoint(funded.outpoint, htlc_spk)?;
 
     swap.funding = Some((funded.outpoint, output.value));
     swap.funding_height = maker.get_current_height().ok();

@@ -248,6 +248,81 @@ pub(crate) fn send_to_address(
         .unwrap()
 }
 
+/// Spawns a throwaway regtest bitcoind under a unique temp directory.
+///
+/// `suite` groups a test file's data directories; `test_name` names the run.
+#[cfg(feature = "lightning")]
+pub(crate) fn setup_bitcoind(suite: &str, test_name: &str) -> (BitcoinD, PathBuf) {
+    let temp_dir = env::temp_dir()
+        .join(format!("coinswap-{}", rand::random::<u64>()))
+        .join(suite)
+        .join(test_name);
+    let port_zmq = 28332 + rand::random::<u16>() % 20000;
+    let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
+    let bitcoind = init_bitcoind(&temp_dir, zmq_addr).expect("bitcoind starts");
+    (bitcoind, temp_dir)
+}
+
+/// Fetches a transaction by txid, retrying briefly: the asynchronous txindex
+/// can lag behind a freshly mined block under parallel test load.
+#[cfg(feature = "lightning")]
+pub(crate) fn raw_tx_with_retry(bitcoind: &BitcoinD, txid: &Txid) -> bitcoin::Transaction {
+    for _ in 0..50 {
+        if let Ok(tx) = bitcoind.client.get_raw_transaction(txid, None) {
+            return tx;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("transaction {} not found after retries", txid);
+}
+
+/// Funds `spk` with `amount`, mines a block and returns the confirmed
+/// funding txid, outpoint and output.
+#[cfg(feature = "lightning")]
+pub(crate) fn fund_script(
+    bitcoind: &BitcoinD,
+    spk: &bitcoin::ScriptBuf,
+    amount: Amount,
+) -> (Txid, bitcoin::OutPoint, bitcoin::TxOut) {
+    let address = bitcoin::Address::from_script(spk, bitcoin::Network::Regtest).unwrap();
+    let txid = send_to_address(bitcoind, &address, amount);
+    generate_blocks(bitcoind, 1);
+    let funding_tx = raw_tx_with_retry(bitcoind, &txid);
+    let vout = funding_tx
+        .output
+        .iter()
+        .position(|o| &o.script_pubkey == spk)
+        .expect("funding output present");
+    let outpoint = bitcoin::OutPoint {
+        txid,
+        vout: vout as u32,
+    };
+    (txid, outpoint, funding_tx.output[vout].clone())
+}
+
+/// Confirmation count for `txid`, retrying while the txindex catches up.
+#[cfg(feature = "lightning")]
+pub(crate) fn confirmations(bitcoind: &BitcoinD, txid: &Txid) -> u32 {
+    for _ in 0..50 {
+        if let Ok(info) = bitcoind.client.get_raw_transaction_info(txid, None) {
+            return info.confirmations.unwrap_or(0);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    0
+}
+
+/// A fresh address from the node's own wallet, as a spend destination.
+#[cfg(feature = "lightning")]
+pub(crate) fn miner_spk(bitcoind: &BitcoinD) -> bitcoin::ScriptBuf {
+    bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked()
+        .script_pubkey()
+}
+
 /// Wait for all makers to complete setup, with a timeout.
 ///
 /// Panics if any maker's `is_setup_complete` flag doesn't become true within `timeout_secs`.

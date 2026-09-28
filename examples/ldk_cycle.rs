@@ -18,27 +18,15 @@ use std::{env, path::Path, time::Duration};
 use openswap::{
     bitcoind::bitcoincore_rpc::{Auth, Client, RpcApi},
     lightning::{
-        ChannelState, InvoiceParams, LdkServerBackend, LightningBackend, LightningConfig, LnEvent,
-        OpenChannelRequest, Preimage,
+        ChannelState, InvoiceParams, LightningBackend, LnEvent, OpenChannelRequest, Preimage,
     },
 };
 
-const POLL: Duration = Duration::from_millis(500);
+#[path = "ln_common/mod.rs"]
+mod ln_common;
+use ln_common::connect;
 
-fn connect(data_dir: &Path, grpc_addr: &str) -> LdkServerBackend {
-    use bitcoin::hashes::hex::DisplayHex;
-    let api_key = std::fs::read(data_dir.join("regtest/api_key"))
-        .expect("api_key file")
-        .to_lower_hex_string();
-    LdkServerBackend::new(&LightningConfig {
-        base_url: grpc_addr.to_string(),
-        api_key,
-        tls_cert_path: Some(data_dir.join("tls.crt")),
-        timeout_secs: 10,
-        network: bitcoin::Network::Regtest,
-    })
-    .expect("backend connects")
-}
+const POLL: Duration = Duration::from_millis(500);
 
 /// Drains events until one matches `pred` or `timeout` elapses. Non-matching
 /// events are printed and discarded.

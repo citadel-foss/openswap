@@ -22,41 +22,14 @@ use bitcoin::{Amount, Network, OutPoint};
 use openswap::{
     bitcoind::bitcoincore_rpc::{Auth, Client, RpcApi},
     lightning::{
-        ChannelState, HtlcFunded, LdkServerBackend, LightningBackend, LightningConfig,
-        OpenChannelRequest, SwapInMaker, SwapInParams, SwapInTaker,
+        ChannelState, HtlcFunded, LightningBackend, OpenChannelRequest, SwapInMaker, SwapInParams,
+        SwapInTaker,
     },
 };
 
-const POLL: Duration = Duration::from_millis(500);
-
-fn connect(data_dir: &Path, grpc_addr: &str) -> LdkServerBackend {
-    use bitcoin::hashes::hex::DisplayHex;
-    let api_key = std::fs::read(data_dir.join("regtest/api_key"))
-        .expect("api_key file")
-        .to_lower_hex_string();
-    LdkServerBackend::new(&LightningConfig {
-        base_url: grpc_addr.to_string(),
-        api_key,
-        tls_cert_path: Some(data_dir.join("tls.crt")),
-        timeout_secs: 10,
-        network: Network::Regtest,
-    })
-    .expect("backend connects")
-}
-
-/// Retries `step` until it reports completion or `timeout` elapses.
-fn wait_for(what: &str, timeout: Duration, mut step: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + timeout;
-    while !step() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for: {}",
-            what
-        );
-        std::thread::sleep(POLL);
-    }
-    println!("ok: {what}");
-}
+#[path = "ln_common/mod.rs"]
+mod ln_common;
+use ln_common::{connect, wait_for};
 
 fn main() {
     let args: Vec<String> = env::args().collect();

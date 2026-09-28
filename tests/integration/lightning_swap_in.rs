@@ -6,35 +6,22 @@
 //! and payment hash); the on-chain side runs against a real regtest bitcoind
 //! so HTLC spends are validated by actual consensus rules.
 
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
-use bip39::rand;
 use bitcoin::{
     secp256k1::{Secp256k1, SecretKey},
-    Amount, Network, OutPoint, PublicKey, ScriptBuf, Transaction, Txid,
+    Amount, PublicKey,
 };
-use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
+use bitcoind::bitcoincore_rpc::RpcApi;
 
 use openswap::lightning::{
     HtlcFunded, InvoiceParams, LightningBackend, LightningError, MockLightningBackend, Preimage,
     SwapHtlc, SwapInMaker, SwapInParams, SwapInTaker,
 };
 
-use super::test_framework::{generate_blocks, init_bitcoind, send_to_address};
-
-fn setup_bitcoind(test_name: &str) -> (BitcoinD, PathBuf) {
-    let temp_dir = std::env::temp_dir()
-        .join(format!("coinswap-{}", rand::random::<u64>()))
-        .join("ln-swap-tests")
-        .join(test_name);
-    if temp_dir.exists() {
-        std::fs::remove_dir_all(&temp_dir).unwrap();
-    }
-    let port_zmq = 28332 + rand::random::<u16>() % 20000;
-    let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
-    let bitcoind = init_bitcoind(&temp_dir, zmq_addr).expect("bitcoind starts");
-    (bitcoind, temp_dir)
-}
+use super::test_framework::{
+    confirmations, fund_script, generate_blocks, miner_spk, setup_bitcoind,
+};
 
 fn test_params() -> SwapInParams {
     SwapInParams {
@@ -45,65 +32,11 @@ fn test_params() -> SwapInParams {
     }
 }
 
-/// Funds `spk` with `amount`, mines a block and returns the confirmed
-/// funding outpoint and output.
-fn fund_htlc(
-    bitcoind: &BitcoinD,
-    spk: &ScriptBuf,
-    amount: Amount,
-) -> (Txid, OutPoint, bitcoin::TxOut) {
-    let address = bitcoin::Address::from_script(spk, Network::Regtest).unwrap();
-    let txid = send_to_address(bitcoind, &address, amount);
-    generate_blocks(bitcoind, 1);
-    let funding_tx = raw_tx_with_retry(bitcoind, &txid);
-    let vout = funding_tx
-        .output
-        .iter()
-        .position(|o| &o.script_pubkey == spk)
-        .expect("funding output present");
-    let outpoint = OutPoint {
-        txid,
-        vout: vout as u32,
-    };
-    (txid, outpoint, funding_tx.output[vout].clone())
-}
-
-/// Fetches a transaction by txid, retrying briefly: the asynchronous txindex
-/// can lag behind a freshly mined block under parallel test load.
-fn raw_tx_with_retry(bitcoind: &BitcoinD, txid: &Txid) -> Transaction {
-    for _ in 0..50 {
-        if let Ok(tx) = bitcoind.client.get_raw_transaction(txid, None) {
-            return tx;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    panic!("transaction {} not found after retries", txid);
-}
-
-fn confirmations(bitcoind: &BitcoinD, txid: &Txid) -> u32 {
-    for _ in 0..50 {
-        if let Ok(info) = bitcoind.client.get_raw_transaction_info(txid, None) {
-            return info.confirmations.unwrap_or(0);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    0
-}
-
-fn miner_spk(bitcoind: &BitcoinD) -> ScriptBuf {
-    bitcoind
-        .client
-        .get_new_address(None, None)
-        .unwrap()
-        .assume_checked()
-        .script_pubkey()
-}
-
 /// Full happy path: request/accept, on-chain funding, invoice payment, taker
 /// claim, preimage learning and maker on-chain sweep through the hashlock.
 #[test]
 fn swap_in_happy_path() {
-    let (bitcoind, _tmp) = setup_bitcoind("happy-path");
+    let (bitcoind, _tmp) = setup_bitcoind("ln-swap-tests", "happy-path");
     // One shared mock backend plays both Lightning nodes (POC).
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
 
@@ -124,7 +57,7 @@ fn swap_in_happy_path() {
 
     // 4-5. Taker funds the HTLC on-chain.
     let (funding_txid, outpoint, funding_output) =
-        fund_htlc(&bitcoind, &spk, params.funding_amount());
+        fund_script(&bitcoind, &spk, params.funding_amount());
     let funded = HtlcFunded {
         outpoint,
         value: funding_output.value,
@@ -171,7 +104,7 @@ fn swap_in_happy_path() {
 /// funds through the timelock branch — but only after `locktime` blocks.
 #[test]
 fn swap_in_refund_path() {
-    let (bitcoind, _tmp) = setup_bitcoind("refund-path");
+    let (bitcoind, _tmp) = setup_bitcoind("ln-swap-tests", "refund-path");
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
 
     let params = test_params();
@@ -182,7 +115,7 @@ fn swap_in_refund_path() {
     let accept = maker.accept(request).unwrap();
     let spk = taker.on_accept(&accept).unwrap().script_pubkey().unwrap();
 
-    let (_txid, outpoint, funding_output) = fund_htlc(&bitcoind, &spk, params.funding_amount());
+    let (_txid, outpoint, funding_output) = fund_script(&bitcoind, &spk, params.funding_amount());
 
     // Maker never pays the invoice; nothing is claimable.
     assert!(!taker.try_claim().unwrap());
@@ -214,7 +147,7 @@ fn swap_in_refund_path() {
 /// the backend and the on-chain hashlock spend is rejected by consensus.
 #[test]
 fn swap_in_wrong_preimage_fails_both_layers() {
-    let (bitcoind, _tmp) = setup_bitcoind("wrong-preimage");
+    let (bitcoind, _tmp) = setup_bitcoind("ln-swap-tests", "wrong-preimage");
     let mock = MockLightningBackend::new();
 
     let preimage = Preimage([0x55; 32]);
@@ -242,7 +175,7 @@ fn swap_in_wrong_preimage_fails_both_layers() {
     let htlc = SwapHtlc::new(&hashlock_pk, &timelock_pk, &payment_hash, 20);
     let spk = htlc.script_pubkey().unwrap();
 
-    let (_txid, outpoint, funding_output) = fund_htlc(&bitcoind, &spk, Amount::from_sat(55_000));
+    let (_txid, outpoint, funding_output) = fund_script(&bitcoind, &spk, Amount::from_sat(55_000));
 
     let bad_claim = htlc
         .create_hashlock_spend(
