@@ -62,6 +62,8 @@ The apps provide the full suite of OpenSwap operations at "near production" qual
 
 Check the [demo doc](./docs/demo.md) for quick setup guides.
 
+For swapping between on-chain BTC and the Lightning Network — including routed swaps that need no Lightning node of your own — see [lightning swaps](./docs/lightning.md).
+
 For how wallet keys and passphrases are protected — at-rest encryption, in-memory key sealing, and the exact threat model — see [wallet security](./docs/wallet-security.md).
 
 > [!NOTE]
