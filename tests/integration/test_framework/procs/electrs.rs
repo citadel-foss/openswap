@@ -34,21 +34,36 @@ pub(crate) fn init_electrsd(bitcoind: &BitcoinD, datadir: &std::path::Path) -> E
 #[allow(dead_code)]
 pub fn wait_for_electrs_tip(bitcoind: &BitcoinD, electrsd: &ElectrsD, cfg: &ElectrumConfig) {
     let expected = bitcoind.client.get_block_count().unwrap();
-    let probe = Electrum::new(cfg).unwrap();
+    // Connected lazily: while electrs is still indexing, connecting fails with
+    // "unavailable index", which is just another not-ready-yet state.
+    let mut probe = None;
+    let mut last_connect_err = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let _ = electrsd.trigger();
-        if probe
-            .get_block_count()
-            .map(|tip| tip >= expected)
-            .unwrap_or(false)
-        {
-            return;
+        if probe.is_none() {
+            match Electrum::new(cfg) {
+                Ok(connected) => probe = Some(connected),
+                Err(e) => last_connect_err = Some(e),
+            }
+        }
+        if let Some(probe) = &probe {
+            if probe
+                .get_block_count()
+                .map(|tip| tip >= expected)
+                .unwrap_or(false)
+            {
+                return;
+            }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "electrs did not reach tip {} within 60s",
-            expected
+            "electrs did not reach tip {} within 60s{}",
+            expected,
+            match (&probe, &last_connect_err) {
+                (None, Some(e)) => format!("; never connected, last error: {e:?}"),
+                _ => String::new(),
+            }
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
