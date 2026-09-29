@@ -593,7 +593,7 @@ impl SwapTracker {
         &mut self,
         wallet: &Wallet,
     ) -> Result<(HashSet<String>, HashSet<Txid>), TakerError> {
-        let mut listed = false;
+        let mut unlisted = Vec::new();
         for record in self.data.swaps.values_mut().filter(|record| {
             record.phase == SwapPhase::Failed && record.recovery.phase < RecoveryPhase::CleanedUp
         }) {
@@ -604,12 +604,22 @@ impl SwapTracker {
                     .map_err(|_| TakerError::General(format!("incoming key {txid} is no txid")))?;
                 if !record.incoming_contract_txids.contains(&txid) {
                     record.incoming_contract_txids.push(txid);
-                    listed = true;
+                    unlisted.push((record.swap_id.clone(), txid));
                 }
             }
         }
-        if listed {
-            self.flush()?;
+        // Undo on a failed save, so the next pass lists them again.
+        if !unlisted.is_empty() {
+            if let Err(e) = self.flush() {
+                for (swap_id, txid) in &unlisted {
+                    if let Some(record) = self.data.swaps.get_mut(swap_id) {
+                        record
+                            .incoming_contract_txids
+                            .retain(|listed| listed != txid);
+                    }
+                }
+                return Err(e);
+            }
         }
         Ok(self.recovery_scope())
     }

@@ -1237,18 +1237,14 @@ fn update_tracker(
     }
 }
 
-/// Close a swap whose coins have all left the wallet on disk: its tracker
-/// record, then its report. Startup reruns this for a record a crash left open.
+/// Close a swap whose coins have all left the wallet on disk: its report,
+/// then its tracker record. Startup reruns this for a record a crash left open.
 fn finish_swap(
     maker: &MakerServer,
     swap_id: &str,
     phase: MakerSwapPhase,
     report: Option<(&str, &[Txid])>,
 ) {
-    update_tracker(maker, swap_id, |r| {
-        r.phase = phase;
-        r.recovery.phase = MakerRecoveryPhase::CleanedUp;
-    });
     if let Some((recovery_type, txids)) = report {
         let network = lock_debug!(maker.wallet.read())
             .map(|w| w.store.network.to_string())
@@ -1261,6 +1257,10 @@ fn finish_swap(
             txids.iter().map(|txid| txid.to_string()).collect(),
         );
     }
+    update_tracker(maker, swap_id, |r| {
+        r.phase = phase;
+        r.recovery.phase = MakerRecoveryPhase::CleanedUp;
+    });
 }
 
 /// Recover maker funds after taker drops.
@@ -1830,6 +1830,14 @@ fn recover_from_swap(
                     .is_some_and(|output| {
                         chain
                             .confirmed_spending_transaction(&outpoint, &output.script_pubkey)
+                            .inspect_err(|e| {
+                                log::warn!(
+                                    "[{}] Could not check {} for a sender refund: {:?}",
+                                    maker.config.network_port,
+                                    outpoint,
+                                    e
+                                )
+                            })
                             .is_ok_and(|tx| tx.is_some_and(|tx| incoming.is_timelock_spend(&tx)))
                     })
             });

@@ -1469,16 +1469,19 @@ impl Wallet {
                                 ))
                             })?
                             .recovery_address = Some(address.clone());
-                        // This refund settles an unclaimed swap: a hashlock sweep of
-                        // its incoming after it would take both sides. Give up that
-                        // claim in the same save. A maker never refunds a known preimage.
-                        if let Some(id) = swapcoin.swap_id.as_ref().filter(|_| !claimed) {
-                            for coin in w.store.incoming_swapcoins.values_mut() {
-                                if coin.swap_id.as_ref() == Some(id) {
-                                    coin.hash_preimage = None;
-                                }
+                    }
+                    // This refund settles an unclaimed swap: a hashlock sweep of
+                    // its incoming after it would take both sides. Give up that
+                    // claim before it goes out. A maker never refunds a known preimage.
+                    let mut changed = created;
+                    if let Some(id) = swapcoin.swap_id.as_ref().filter(|_| !claimed) {
+                        for coin in w.store.incoming_swapcoins.values_mut() {
+                            if coin.swap_id.as_ref() == Some(id) {
+                                changed |= coin.hash_preimage.take().is_some();
                             }
                         }
+                    }
+                    if changed {
                         w.save_to_disk()?;
                     }
                     address.require_network(w.store.network).map_err(|e| {
