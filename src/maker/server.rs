@@ -32,7 +32,9 @@ use super::{
     handlers::{
         emit_maker_success_report, handle_message, ConnectionState, Maker, MAX_CONCURRENT_SWAPS,
     },
-    swap_tracker::{MakerRecoveryPhase, MakerSwapPhase},
+    swap_tracker::{
+        now_secs, MakerRecoveryPhase, MakerRecoveryState, MakerSwapPhase, MakerSwapRecord,
+    },
 };
 
 /// A live swap normally owns a route-heartbeat connection and one protocol
@@ -881,8 +883,6 @@ fn swap_is_quiet(maker: &Arc<MakerServer>, state: &ConnectionState) -> bool {
 
 /// Background thread that checks for idle swap states and spawns recovery.
 fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
-    use super::swap_tracker::{now_secs, MakerRecoveryState, MakerSwapRecord};
-
     loop {
         if maker.is_shutdown() {
             break;
@@ -1277,36 +1277,11 @@ fn recover_from_swap(
     incoming_swapcoins: Vec<crate::wallet::swapcoin::IncomingSwapCoin>,
     outgoing_swapcoins: Vec<crate::wallet::swapcoin::OutgoingSwapCoin>,
 ) -> Result<(), MakerError> {
-    use super::swap_tracker::{now_secs, MakerRecoveryState, MakerSwapRecord};
-
     // Timelock recovery may already have removed every outgoing coin before a
     // crash. Any claim-ready incoming coins still need an idempotent sweep, but
     // there is no outgoing timelock left to monitor.
     if outgoing_swapcoins.is_empty() {
-        if incoming_swapcoins
-            .iter()
-            .any(|incoming| incoming.other_privkey.is_some() || incoming.is_preimage_known())
-        {
-            maker.sweep_incoming_swapcoins(&incoming_swapcoins)?;
-            return Ok(());
-        }
-        // Only an outgoing spend can reveal their preimage, and none is left: a
-        // crash after the last refund, or a swap dropped before we funded.
-        {
-            let mut wallet = lock_debug!(maker.wallet.write())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-            for incoming in &incoming_swapcoins {
-                wallet.remove_incoming_swapcoin(&incoming.contract_tx.compute_txid().to_string());
-            }
-            wallet.save_to_disk().map_err(MakerError::Wallet)?;
-        }
-        let refunds = lock_debug!(maker.swap_tracker.lock())
-            .map_err(|_| MakerError::MutexPossion)?
-            .get_record(&swap_id)
-            .map(|record| record.recovery.outgoing_recovered.clone())
-            .unwrap_or_default();
-        let report = (!refunds.is_empty()).then_some(("timelock", &refunds[..]));
-        finish_swap(&maker, &swap_id, MakerSwapPhase::Recovered, report);
+        maker.sweep_incoming_swapcoins(&incoming_swapcoins)?;
         return Ok(());
     }
 
@@ -1859,9 +1834,8 @@ fn recover_from_swap(
                     })
             });
             if fully_swept {
-                // Clean up outgoing swapcoins — their funding was spent by
-                // someone else (hashlock), so they are no longer recoverable
-                // via timelock. Remove them from the wallet store.
+                // With the preimage known the outgoing coins are the next hop's
+                // to claim, never ours to refund, so drop them with the incoming.
                 {
                     let mut wallet = lock_debug!(maker.wallet.write())
                         .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -1877,12 +1851,10 @@ fn recover_from_swap(
                     }
                     wallet.save_to_disk().map_err(MakerError::Wallet)?;
                 }
-                finish_swap(
-                    &maker,
-                    &swap_id,
-                    MakerSwapPhase::Recovered,
-                    Some(("hashlock", &incoming_swept_txids)),
-                );
+                // An incoming the sender took back is a loss, not a recovery.
+                let report = (!incoming_swept_txids.is_empty())
+                    .then_some(("hashlock", &incoming_swept_txids[..]));
+                finish_swap(&maker, &swap_id, MakerSwapPhase::Recovered, report);
 
                 #[cfg(feature = "integration-test")]
                 maker.shutdown.store(true, Relaxed);

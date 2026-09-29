@@ -767,32 +767,37 @@ impl Taker {
             .ok()
             .zip(self.read_wallet().ok())
             .map(|(mut tracker, wallet)| tracker.recovery_scope_listing(&wallet));
-        let Some(Ok((swap_ids, incoming_contract_txids))) = scope else {
-            log::warn!("Startup recovery: could not read the recovery scope: {scope:?}");
-            return;
+        // The loop retries the scope every pass, so a failure here skips only
+        // this startup pass, never the loop itself.
+        let scope = match scope {
+            Some(Ok(scope)) => Some(scope),
+            other => {
+                log::warn!("Startup recovery: could not read the recovery scope: {other:?}");
+                None
+            }
         };
-        if swap_ids.is_empty() {
+        if scope
+            .as_ref()
+            .is_some_and(|(swap_ids, _)| swap_ids.is_empty())
+        {
             log::info!("startup recovery: Not needed, no failed swaps");
             return;
         }
 
         // Recovery takes the wallet lock itself and drops it across its wait,
         // so a stuck counterparty tx cannot wedge taker startup.
-        let chain = match self.read_wallet() {
-            Ok(w) => match w.blockchain.new_connection() {
+        let chain = match self.read_wallet().ok().filter(|_| scope.is_some()) {
+            Some(w) => match w.blockchain.new_connection() {
                 Ok(chain) => Some(chain),
                 Err(e) => {
                     log::warn!("Startup recovery: no backend connection: {:?}", e);
                     None
                 }
             },
-            Err(e) => {
-                log::warn!("Startup recovery: failed to lock wallet: {:?}", e);
-                None
-            }
+            None => None,
         };
 
-        if let Some(chain) = &chain {
+        if let (Some(chain), Some((swap_ids, incoming_contract_txids))) = (&chain, scope) {
             match Wallet::recover_swapcoins(
                 &self.wallet,
                 chain,

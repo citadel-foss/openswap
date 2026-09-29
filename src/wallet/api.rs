@@ -373,7 +373,7 @@ pub(crate) fn infer_address_type(script_pubkey: &Script) -> AddressType {
 pub struct RecoveryOutcome {
     /// (contract_txid, spending_txid) for contracts we successfully spent.
     pub resolved: Vec<(Txid, Txid)>,
-    /// Contract txids that were discarded (already spent or never broadcast).
+    /// Contract txids that were discarded (never broadcast, or their funding is gone).
     pub discarded: Vec<Txid>,
 }
 
