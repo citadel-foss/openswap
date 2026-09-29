@@ -1786,7 +1786,15 @@ fn recover_from_swap(
                 // to one swap, so every coin gets the same answer.
                 &|_| legacy_funding_shared,
             )
-            .map_err(MakerError::Wallet)?;
+            // Nothing respawns this thread: a failed wait retries on the next pass.
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "[{}] Timelock recovery pass failed: {:?}",
+                    maker.config.network_port,
+                    e
+                );
+                RecoveryOutcome::default()
+            });
 
             if !recovered.is_empty() {
                 log::info!(
