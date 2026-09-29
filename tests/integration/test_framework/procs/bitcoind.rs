@@ -2,7 +2,7 @@
 
 use std::{
     env,
-    fs::{create_dir_all, File},
+    fs::{self, create_dir_all, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
 };
@@ -24,9 +24,8 @@ fn download_bitcoind_tarball(download_url: &str, retries: usize) -> Vec<u8> {
             Ok(res) if res.status_code == 503 => {
                 // If the response is 503, log and prepare for retry
                 eprintln!(
-                    "Attempt {}: URL {} returned status code 503 (Service Unavailable)",
-                    attempt + 1,
-                    download_url
+                    "Attempt {}/{}: URL {} returned status code 503 (Service Unavailable)",
+                    attempt, retries, download_url
                 );
             }
             Ok(res) => {
@@ -37,7 +36,9 @@ fn download_bitcoind_tarball(download_url: &str, retries: usize) -> Vec<u8> {
                 );
             }
             Err(err) => {
-                eprintln!("Attempt {attempt}: Failed to fetch URL {download_url}: {err:?}");
+                eprintln!(
+                    "Attempt {attempt}/{retries}: Failed to fetch URL {download_url}: {err:?}"
+                );
             }
         }
 
@@ -70,23 +71,132 @@ fn read_tarball_from_file(path: &str) -> Vec<u8> {
 fn unpack_tarball(tarball_bytes: &[u8], destination: &Path) {
     let decoder = GzDecoder::new(tarball_bytes);
     let mut archive = Archive::new(decoder);
-    for mut entry in archive.entries().unwrap().flatten() {
+    let mut unpacked = false;
+    for entry in archive
+        .entries()
+        .unwrap_or_else(|e| panic!("cannot read bitcoind tarball: {:?}", e))
+    {
+        let mut entry =
+            entry.unwrap_or_else(|e| panic!("cannot read bitcoind tarball entry: {:?}", e));
         if let Ok(file) = entry.path() {
             if file.ends_with("bitcoind") {
-                entry.unpack_in(destination).unwrap();
+                // `false` means the entry's path escapes `destination` and was skipped.
+                unpacked |= entry
+                    .unpack_in(destination)
+                    .unwrap_or_else(|e| panic!("cannot unpack bitcoind from tarball: {:?}", e));
             }
         }
     }
+    assert!(unpacked, "bitcoind tarball has no bitcoind binary");
+    // tar stops reading at its end-of-archive marker, so drain the rest: only at EOF
+    // does GzDecoder check the CRC32/size trailer that catches a corrupted payload.
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
+        .unwrap_or_else(|e| panic!("bitcoind tarball failed its gzip integrity check: {:?}", e));
 }
 
-fn get_bitcoind_filename(os: &str, arch: &str) -> String {
+/// Release tarball for this platform, or `None` when there is no gzipped
+/// tarball to download for it.
+fn get_bitcoind_filename(os: &str, arch: &str) -> Option<String> {
     match (os, arch) {
-        ("macos", "aarch64") => format!("bitcoin-{BITCOIN_VERSION}-arm64-apple-darwin.tar.gz"),
-        ("macos", "x86_64") => format!("bitcoin-{BITCOIN_VERSION}-x86_64-apple-darwin.tar.gz"),
-        ("linux", "x86_64") => format!("bitcoin-{BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz"),
-        ("linux", "aarch64") => format!("bitcoin-{BITCOIN_VERSION}-aarch64-linux-gnu.tar.gz"),
-        _ => format!("bitcoin-{BITCOIN_VERSION}-x86_64-apple-darwin-unsigned.zip"),
+        ("macos", "aarch64") => Some(format!(
+            "bitcoin-{BITCOIN_VERSION}-arm64-apple-darwin.tar.gz"
+        )),
+        ("macos", "x86_64") => Some(format!(
+            "bitcoin-{BITCOIN_VERSION}-x86_64-apple-darwin.tar.gz"
+        )),
+        ("linux", "x86_64") => Some(format!("bitcoin-{BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz")),
+        ("linux", "aarch64") => Some(format!(
+            "bitcoin-{BITCOIN_VERSION}-aarch64-linux-gnu.tar.gz"
+        )),
+        _ => None,
     }
+}
+
+/// Install bitcoind into `bin/bitcoin-<V>`, unless another process got there first.
+///
+/// nextest runs each test in its own process, so several can find the install
+/// missing at once. They take turns on a lock file, and the installer unpacks
+/// into its own staging dir and renames the finished tree into place, so no
+/// process ever sees an install from this function half-written.
+fn install_bitcoind(bitcoin_bin_dir: &Path, os: &str, arch: &str) {
+    create_dir_all(bitcoin_bin_dir).unwrap();
+    let lock_path = bitcoin_bin_dir.join(".bitcoind-install.lock");
+    let lock_file = File::create(&lock_path)
+        .unwrap_or_else(|e| panic!("cannot create {}: {e}", lock_path.display()));
+    // Held until `lock_file` drops at the end of this function.
+    lock_file
+        .lock()
+        .unwrap_or_else(|e| panic!("cannot lock {}: {e}", lock_path.display()));
+
+    let bitcoin_home = bitcoin_bin_dir.join(format!("bitcoin-{BITCOIN_VERSION}"));
+    if bitcoin_home.join("bin").join("bitcoind").exists() {
+        return; // Installed by another process while this one waited.
+    }
+
+    let tarball_bytes = match env::var("BITCOIND_TARBALL_FILE") {
+        Ok(path) => read_tarball_from_file(&path),
+        Err(_) => {
+            let download_filename = get_bitcoind_filename(os, arch).unwrap_or_else(|| {
+                panic!(
+                    "no bitcoind {} tarball to download for {}/{}; \
+                     set BITCOIND_TARBALL_FILE to a bitcoin-{} .tar.gz for it",
+                    BITCOIN_VERSION, os, arch, BITCOIN_VERSION
+                )
+            });
+            let download_endpoint = env::var("BITCOIND_DOWNLOAD_ENDPOINT")
+                .unwrap_or_else(|_| "http://170.75.166.88/bitcoin-binaries".to_owned());
+            let url = format!("{download_endpoint}/{download_filename}");
+            download_bitcoind_tarball(&url, 5)
+        }
+    };
+
+    // Inside `bin/`, so the rename below stays on one filesystem.
+    // Holding the lock means no other install is running, so every staging dir here
+    // was left by an install that crashed or panicked; clear them all.
+    for entry in fs::read_dir(bitcoin_bin_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let stale = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".bitcoind-staging-"));
+        if stale {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+    let staging = bitcoin_bin_dir.join(format!(".bitcoind-staging-{}", std::process::id()));
+    create_dir_all(&staging).unwrap();
+    unpack_tarball(&tarball_bytes, &staging);
+
+    let staged_home = staging.join(format!("bitcoin-{BITCOIN_VERSION}"));
+    let staged_binary = staged_home.join("bin").join("bitcoind");
+    assert!(
+        staged_binary.exists(),
+        "bitcoind tarball has no bitcoin-{}/bin/bitcoind",
+        BITCOIN_VERSION
+    );
+
+    if os == "macos" {
+        std::process::Command::new("codesign")
+            .arg("--sign")
+            .arg("-")
+            .arg(&staged_binary)
+            .output()
+            .expect("Failed to sign bitcoind binary");
+    }
+
+    // A crashed install from before this lock can leave `bitcoin-<V>` without
+    // its binary, and the rename needs the target gone.
+    if bitcoin_home.exists() {
+        fs::remove_dir_all(&bitcoin_home).unwrap();
+    }
+    fs::rename(&staged_home, &bitcoin_home).unwrap_or_else(|e| {
+        panic!(
+            "cannot move {} to {}: {e}",
+            staged_home.display(),
+            bitcoin_home.display()
+        )
+    });
+    fs::remove_dir_all(&staging).unwrap();
 }
 
 /// Initiate the bitcoind backend. Fallible so the caller can retry on a fresh
@@ -119,37 +229,13 @@ pub(crate) fn init_bitcoind(
     let arch = env::consts::ARCH;
     let current_dir: PathBuf = std::env::current_dir().expect("failed to read current dir");
     let bitcoin_bin_dir = current_dir.join("bin");
-    let download_filename = get_bitcoind_filename(os, arch);
     let bitcoin_exe_home = bitcoin_bin_dir
         .join(format!("bitcoin-{BITCOIN_VERSION}"))
         .join("bin");
 
-    if !bitcoin_exe_home.exists() {
-        let tarball_bytes = match env::var("BITCOIND_TARBALL_FILE") {
-            Ok(path) => read_tarball_from_file(&path),
-            Err(_) => {
-                let download_endpoint = env::var("BITCOIND_DOWNLOAD_ENDPOINT")
-                    .unwrap_or_else(|_| "http://170.75.166.88/bitcoin-binaries".to_owned());
-                let url = format!("{download_endpoint}/{download_filename}");
-                download_bitcoind_tarball(&url, 5)
-            }
-        };
-
-        if let Some(parent) = bitcoin_exe_home.parent() {
-            create_dir_all(parent).unwrap();
-        }
-
-        unpack_tarball(&tarball_bytes, &bitcoin_bin_dir);
-
-        if os == "macos" {
-            let bitcoind_binary = bitcoin_exe_home.join("bitcoind");
-            std::process::Command::new("codesign")
-                .arg("--sign")
-                .arg("-")
-                .arg(&bitcoind_binary)
-                .output()
-                .expect("Failed to sign bitcoind binary");
-        }
+    // Unlocked fast path: the binary only ever appears complete, by rename.
+    if !bitcoin_exe_home.join("bitcoind").exists() {
+        install_bitcoind(&bitcoin_bin_dir, os, arch);
     }
 
     env::set_var("BITCOIND_EXE", bitcoin_exe_home.join("bitcoind"));
