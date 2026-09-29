@@ -3301,7 +3301,7 @@ impl MakerTrait for MakerServer {
         crate::wallet::wait_for_tx_confirmation(
             &chain,
             &[*txid],
-            required_confirms.max(crate::utill::MIN_REQUIRED_CONFIRM),
+            required_confirms,
             crate::utill::TX_BROADCAST_TIMEOUT,
             Some(&self.shutdown),
             None,

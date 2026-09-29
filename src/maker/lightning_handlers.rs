@@ -513,9 +513,7 @@ fn validate_terms<M: Maker>(
     // The peer picks this, and both extremes hurt us: zero would have us act
     // on an unconfirmed funding the peer can still double-spend, while a huge
     // value pins a connection thread and eats the refund window while we wait.
-    let required = config
-        .required_confirms
-        .max(crate::utill::MIN_REQUIRED_CONFIRM);
+    let required = config.required_confirms;
     if min_confirmations < required || min_confirmations > MAX_MIN_CONFIRMATIONS {
         return Err(format!(
             "min_confirmations {min_confirmations} outside the accepted range \
