@@ -33,7 +33,7 @@ use std::{
     net::TcpStream,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Once, OnceLock},
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -337,14 +337,16 @@ pub fn setup_maker_logger(filter: LevelFilter, data_dir: Option<PathBuf>) {
     });
 }
 
-/// Setup function that will only run once, even if called multiple times.
+/// Setup function that is safe to call multiple times.
 /// Takes log level to set the desired logging verbosity
+///
+/// [`setup_taker_logger`] and [`setup_maker_logger`] share one process-wide
+/// guard: whichever runs first in the process installs the logger, and every
+/// later call to either is a no-op.
 pub fn setup_logger(filter: LevelFilter, data_dir: Option<PathBuf>) {
-    Once::new().call_once(|| {
-        // env::set_var("RUST_LOG", "openswap=info");
-        setup_taker_logger(filter, true, data_dir.as_ref().map(|d| d.join("taker")));
-        setup_maker_logger(filter, data_dir.as_ref().map(|d| d.join("maker")));
-    });
+    // env::set_var("RUST_LOG", "openswap=info");
+    setup_taker_logger(filter, true, data_dir.as_ref().map(|d| d.join("taker")));
+    setup_maker_logger(filter, data_dir.as_ref().map(|d| d.join("maker")));
 }
 
 /// Logs the stable identity used to find a join without a matching completion.
