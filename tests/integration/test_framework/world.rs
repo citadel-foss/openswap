@@ -6,7 +6,10 @@ use std::{
     path::PathBuf,
     process::Child,
     sync::{
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{
+            AtomicBool,
+            Ordering::{Relaxed, SeqCst},
+        },
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -56,6 +59,8 @@ pub struct TestFramework {
     /// [`TestFramework::taker_init_config`] must screen as the original did.
     check_blocklist: bool,
     shutdown: AtomicBool,
+    /// Set by the first teardown, so `stop()` followed by `Drop` tears down once.
+    torn_down: AtomicBool,
     block_gen_paused: AtomicBool,
     nostr_relay: Mutex<Option<Child>>,
 }
@@ -334,6 +339,7 @@ impl TestFramework {
             zmq_addr,
             check_blocklist,
             shutdown: AtomicBool::new(false),
+            torn_down: AtomicBool::new(false),
             block_gen_paused: AtomicBool::new(false),
             nostr_relay: Mutex::new(Some(nostr_relay)),
         });
@@ -449,7 +455,19 @@ impl TestFramework {
     }
 
     /// Stop bitcoind, nostr relay, and clean up all test data.
+    ///
+    /// Calling it is optional: `Drop` runs the same teardown, and whichever
+    /// comes first does the work, so the teardown runs once either way.
     pub fn stop(&self) {
+        self.teardown();
+    }
+
+    /// The teardown shared by [`TestFramework::stop`] and `Drop`. Only the
+    /// first call does anything; later calls return immediately.
+    fn teardown(&self) {
+        if self.torn_down.swap(true, SeqCst) {
+            return;
+        }
         log::info!("🛑 Stopping Test Framework");
         self.shutdown.store(true, Relaxed);
         self.kill_relay();
@@ -478,12 +496,10 @@ impl TestFramework {
 
 impl Drop for TestFramework {
     fn drop(&mut self) {
-        self.shutdown.store(true, Relaxed);
-        self.kill_relay();
-        // Field order drops bitcoind first; take electrs down ahead of it.
-        drop(self.electrsd.lock().unwrap().take());
-        let _ = self.bitcoind.client.stop();
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        // Field order drops bitcoind first; teardown takes electrs down ahead of it.
+        self.teardown();
+        // Takers and makers dropped after stop() still flush their wallets and
+        // offerbooks into temp_dir, recreating it; sweep whatever they wrote.
         if self.temp_dir.exists() {
             let _ = fs::remove_dir_all(&self.temp_dir);
         }

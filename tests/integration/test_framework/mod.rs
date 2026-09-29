@@ -6,8 +6,8 @@
 //!
 //! Each framework keeps its data, including the bitcoind data directory, in its own
 //! `openswap-<random u64>` directory under [`std::env::temp_dir()`], logged at startup.
-//! [TestFramework::stop] and `Drop for TestFramework` both delete it, so the data is only there
-//! while the test runs. It survives only when teardown never runs, e.g. the process is killed.
+//! [TestFramework::stop] deletes it, as does `Drop for TestFramework` when `stop()` was never
+//! called, so the data is only there while the test runs. It survives only when teardown never runs, e.g. the process is killed.
 
 mod actors;
 mod backend;
