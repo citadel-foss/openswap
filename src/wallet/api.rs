@@ -1458,6 +1458,17 @@ impl Wallet {
                             .clone()
                             .into_unchecked())
                     })?;
+                    // Checked before any write: a refund that cannot go out must
+                    // not give up the claim below.
+                    let checked =
+                        address
+                            .clone()
+                            .require_network(w.store.network)
+                            .map_err(|e| {
+                                WalletError::General(format!(
+                                    "invalid recovery address network: {e}"
+                                ))
+                            })?;
                     if created {
                         w.store
                             .outgoing_swapcoins
@@ -1484,9 +1495,7 @@ impl Wallet {
                     if changed {
                         w.save_to_disk()?;
                     }
-                    address.require_network(w.store.network).map_err(|e| {
-                        WalletError::General(format!("invalid recovery address network: {e}"))
-                    })?
+                    checked
                 };
 
                 // Read once, at the first ready coin: no refund in this pass waits

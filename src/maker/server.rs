@@ -294,12 +294,11 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                 (!recovery.outgoing_recovered.is_empty())
                     .then_some(("timelock", &recovery.outgoing_recovered[..]))
             };
-            finish_swap(
-                &maker,
-                &swap_id,
-                phase.max(MakerSwapPhase::Recovered),
-                report,
-            );
+            let phase = match phase {
+                MakerSwapPhase::Completed => MakerSwapPhase::Completed,
+                _ => MakerSwapPhase::Recovered,
+            };
+            finish_swap(&maker, &swap_id, phase, report);
         }
     }
 
@@ -1832,8 +1831,8 @@ fn recover_from_swap(
                 });
             }
 
-            // A contract still in the mempool is swept on a later pass. One the
-            // sender took back by timelock never will be, so it is settled too.
+            // A contract still in the mempool is swept on a later pass. A contract
+            // the sender took back by timelock never will be, so it is settled too.
             let remaining: Vec<_> = {
                 let wallet = lock_debug!(maker.wallet.read())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?;
