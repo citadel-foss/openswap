@@ -1231,16 +1231,17 @@ fn check_for_preimage(
 /// Update the Maker swap tracker with the given closure.
 ///
 /// Locks the tracker, applies `f` to the record matching `swap_id`, then flushes.
+/// False when the change did not reach disk.
 fn update_tracker(
     maker: &MakerServer,
     swap_id: &str,
     f: impl FnOnce(&mut super::swap_tracker::MakerSwapRecord),
-) {
+) -> bool {
     let mut tracker = match lock_debug!(maker.swap_tracker.lock()) {
         Ok(tracker) => tracker,
         Err(_) => {
             log::error!("Swap tracker lock poisoned, skipping update for {swap_id}");
-            return;
+            return false;
         }
     };
     if let Some(record) = tracker.get_record_mut(swap_id) {
@@ -1249,8 +1250,10 @@ fn update_tracker(
         let cloned = record.clone();
         if let Err(e) = tracker.save_record(&cloned) {
             log::error!("Failed to flush swap tracker: {:?}", e);
+            return false;
         }
     }
+    true
 }
 
 /// Close a swap whose coins have all left the wallet on disk: its report,
@@ -1518,7 +1521,12 @@ fn recover_from_swap(
 
             // Record the outcome before the cleanup: startup finishes a cleanup
             // a crash cut short with the phase it finds here.
-            update_tracker(&maker, &swap_id, |r| r.phase = MakerSwapPhase::Completed);
+            if !update_tracker(&maker, &swap_id, |r| r.phase = MakerSwapPhase::Completed) {
+                if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                    break;
+                }
+                continue;
+            }
             {
                 let mut wallet = lock_debug!(maker.wallet.write())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?;
