@@ -1226,6 +1226,7 @@ impl Wallet {
             swap_scope,
             funding_shared_with_peer,
             &|_| false,
+            &|_| false,
         )?;
         Ok(Self::finish_recoveries(wallet, chain, shutdown, Vec::new(), refunds, discarded)?.1)
     }
@@ -1243,7 +1244,9 @@ impl Wallet {
     ///
     /// `claimed_by_hashlock` names swaps whose incoming coin we claimed. Their
     /// outgoing coins are the first maker's to claim with the preimage, so they
-    /// are refunded only once that can provably never happen.
+    /// are refunded only once that can provably never happen. `claim_proven`
+    /// is the part of those with real evidence of a claim; only such a swap
+    /// keeps its preimage when it is refunded.
     fn broadcast_timelock_recoveries(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
@@ -1251,6 +1254,7 @@ impl Wallet {
         swap_scope: Option<&HashSet<String>>,
         funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
         claimed_by_hashlock: &dyn Fn(&str) -> bool,
+        claim_proven: &dyn Fn(&str) -> bool,
     ) -> Result<(Vec<SentSpend>, Vec<String>), WalletError> {
         // Snapshot everything the recovery needs, then drop the guard before any backend call.
         let candidates = {
@@ -1400,6 +1404,7 @@ impl Wallet {
                 // outgoing: the first hops, all at the one locktime we gave it.
                 // Once each went back by timelock, our outgoing is left dangling.
                 let claimed = swapcoin.swap_id.as_deref().is_some_and(claimed_by_hashlock);
+                let proven = swapcoin.swap_id.as_deref().is_some_and(claim_proven);
                 if let Some(swap_id) = swapcoin.swap_id.as_deref().filter(|_| claimed) {
                     let hops = lock_debug!(wallet.read())
                         .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?
@@ -1484,8 +1489,15 @@ impl Wallet {
                     // This refund settles an unclaimed swap: a hashlock sweep of
                     // its incoming after it would take both sides. Give up that
                     // claim before it goes out. A maker never refunds a known preimage.
+                    // A sweep we already built proves a claim too.
+                    let unclaimed = swapcoin.swap_id.as_ref().filter(|id| {
+                        !proven
+                            && !w.store.incoming_swapcoins.values().any(|coin| {
+                                coin.swap_id.as_ref() == Some(*id) && coin.spending_tx.is_some()
+                            })
+                    });
                     let mut changed = created;
-                    if let Some(id) = swapcoin.swap_id.as_ref().filter(|_| !claimed) {
+                    if let Some(id) = unclaimed {
                         for coin in w.store.incoming_swapcoins.values_mut() {
                             if coin.swap_id.as_ref() == Some(id) {
                                 changed |= coin.hash_preimage.take().is_some();
@@ -1628,6 +1640,8 @@ impl Wallet {
             Some(swap_ids),
             funding_shared_with_peer,
             &|swap_id| sweep_failed || claiming.contains(swap_id) || incoming_claimed(swap_id),
+            // A failed sweep step holds every refund, but proves no claim.
+            &|swap_id| claiming.contains(swap_id) || incoming_claimed(swap_id),
         )?;
         Self::finish_recoveries(wallet, chain, shutdown, sweeps, refunds, discarded)
     }
