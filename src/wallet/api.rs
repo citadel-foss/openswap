@@ -991,7 +991,7 @@ impl Wallet {
         // The confirmed view has no such output: it was spent, or the
         // contract tx was never broadcast.
         if chain.tx_block_height(&contract_txid)?.is_some() {
-            // Discard only on a confirmed spend. On Electrum a mempool-spent
+            // Classify only a confirmed spend. On Electrum a mempool-spent
             // output looks identical here, and such a spend can be evicted;
             // the backend answers from the script's history instead.
             let outpoint = OutPoint::new(contract_txid, contract_vout);
@@ -1013,11 +1013,12 @@ impl Wallet {
                     );
                     return Ok(ContractChainState::RecoveredByTimelock(recovery_txid));
                 }
+                // The other side claimed it, and that spend may carry the preimage
+                // we still need. Keep the coin until the swap settles.
                 log::info!(
-                    "Contract output for {} spent by a confirmed tx — discarding swapcoin",
+                    "Contract output for {} claimed by a confirmed tx — keeping swapcoin",
                     swap_id
                 );
-                return Ok(ContractChainState::Discarded);
             }
             return Ok(ContractChainState::NotYet);
         }
@@ -1398,11 +1399,8 @@ impl Wallet {
                 // The first maker learns the preimage only from a spend of its own
                 // outgoing: the first hops, all at the one locktime we gave it.
                 // Once each went back by timelock, our outgoing is left dangling.
-                if let Some(swap_id) = swapcoin
-                    .swap_id
-                    .as_deref()
-                    .filter(|id| claimed_by_hashlock(id))
-                {
+                let claimed = swapcoin.swap_id.as_deref().is_some_and(claimed_by_hashlock);
+                if let Some(swap_id) = swapcoin.swap_id.as_deref().filter(|_| claimed) {
                     let hops = lock_debug!(wallet.read())
                         .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?
                         .store
@@ -1471,6 +1469,16 @@ impl Wallet {
                                 ))
                             })?
                             .recovery_address = Some(address.clone());
+                        // This refund settles an unclaimed swap: a hashlock sweep of
+                        // its incoming after it would take both sides. Give up that
+                        // claim in the same save. A maker never refunds a known preimage.
+                        if let Some(id) = swapcoin.swap_id.as_ref().filter(|_| !claimed) {
+                            for coin in w.store.incoming_swapcoins.values_mut() {
+                                if coin.swap_id.as_ref() == Some(id) {
+                                    coin.hash_preimage = None;
+                                }
+                            }
+                        }
                         w.save_to_disk()?;
                     }
                     address.require_network(w.store.network).map_err(|e| {
@@ -5153,6 +5161,22 @@ mod timelock_reconcile_tests {
             state,
             ContractChainState::RecoveredByTimelock(recovery.compute_txid())
         );
+    }
+
+    /// The next hop's claim of our contract can carry the preimage the maker
+    /// still needs for its incoming, so the coin stays until the swap settles.
+    #[test]
+    fn electrum_keeps_a_contract_the_other_side_claimed() {
+        let (coin, _) = legacy_coin_and_recovery();
+        let claim = tx(
+            OutPoint::new(coin.contract_tx.compute_txid(), 0),
+            49_000,
+            ScriptBuf::new_p2wpkh(&pubkey(6).wpubkey_hash().unwrap()),
+        );
+        let url = start_electrum_stub(coin.contract_tx.clone(), claim);
+        let state =
+            Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true).unwrap();
+        assert_eq!(state, ContractChainState::NotYet);
     }
 
     /// A Taproot outgoing swapcoin whose contract output commits to both

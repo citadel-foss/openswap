@@ -5,6 +5,7 @@
 //! recovery is impossible since the funding is never on-chain).
 
 use bitcoin::Amount;
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
@@ -690,4 +691,136 @@ fn withheld_legacy_funding_bans_only_its_own_maker() {
 #[test]
 fn withheld_taproot_funding_bans_only_its_own_maker_electrum() {
     run_withheld_funding_bans_its_maker::<ElectrumBackend>(ProtocolVersion::Taproot);
+}
+
+/// A refund settles the swap one way. The last maker publishes the taker's
+/// incoming contract only after the taker refunded its outgoing: sweeping it
+/// now would reveal the preimage and take both sides, so no sweep may follow.
+#[test]
+fn late_incoming_after_refund_is_never_swept() {
+    warn!("Running Test: Late Incoming After Refund Is Never Swept");
+
+    let maker_count = 2;
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![
+        MakerBehavior::Normal,
+        MakerBehavior::WithholdFundingSilently,
+    ];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || {
+                start_server(maker_clone).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+
+    generate_blocks(bitcoind, 1);
+
+    let summary = taker
+        .prepare_swap(swap_params)
+        .expect("Prepare should succeed");
+
+    // The last maker's withheld contracts are the taker's incoming side. Grab
+    // them mid-swap: its recovery drops them once the swap fails.
+    let withheld = {
+        let (maker, swap_id) = (makers[1].clone(), summary.swap_id.clone());
+        let deadline = Instant::now() + Duration::from_secs(300);
+        thread::spawn(move || loop {
+            let txs = maker.outgoing_contract_txs(&swap_id).unwrap();
+            if !txs.is_empty() || Instant::now() > deadline {
+                return txs;
+            }
+            thread::sleep(Duration::from_millis(200));
+        })
+    };
+    assert!(
+        taker.start_swap(&summary.swap_id).is_err(),
+        "Swap must fail when the last maker withholds its funding"
+    );
+    let withheld = withheld.join().unwrap();
+    assert!(
+        !withheld.is_empty(),
+        "the last maker never saved the contracts it withheld"
+    );
+
+    // The taker drops an outgoing coin once its timelock refund is mined.
+    let deadline = Instant::now() + Duration::from_secs(400);
+    while taker
+        .get_wallet()
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count()
+        != 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "taker did not refund its outgoing within 400s"
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
+
+    info!("Taker refunded; publishing the withheld incoming contracts");
+    for tx in &withheld {
+        bitcoind.client.send_raw_transaction(tx).unwrap();
+    }
+    generate_blocks(bitcoind, 1);
+
+    // Several recovery passes, each of which would sweep a claimable coin.
+    thread::sleep(Duration::from_secs(40));
+    for tx in &withheld {
+        let txid = tx.compute_txid();
+        for vout in 0..tx.output.len() as u32 {
+            assert!(
+                bitcoind
+                    .client
+                    .get_tx_out(&txid, vout, Some(false))
+                    .unwrap()
+                    .is_some(),
+                "the taker swept {}:{} after refunding its outgoing",
+                txid,
+                vout
+            );
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !taker.is_recovery_complete() {
+        assert!(
+            Instant::now() < deadline,
+            "recovery kept waiting on an incoming it gave up"
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
+    assert_eq!(
+        taker
+            .get_wallet()
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count(),
+        0,
+        "the given-up incoming coins must be cleaned up"
+    );
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
 }

@@ -13,9 +13,16 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior, MakerServer},
+    maker::{
+        start_server,
+        swap_tracker::{
+            MakerRecoveryPhase, MakerRecoveryState, MakerSwapPhase, MakerSwapRecord,
+            MakerSwapTracker,
+        },
+        MakerBehavior, MakerServer,
+    },
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, Taker, TakerBehavior},
+    taker::{swap_tracker::SwapTracker, SwapParams, Taker, TakerBehavior},
 };
 
 use super::test_framework::*;
@@ -25,7 +32,7 @@ use std::{
     net::TcpStream,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Test: maker reboot recovery preserves funded Taproot swapcoins. Maker2 funds
@@ -375,6 +382,15 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
         all[offset.min(all.len())..].to_string()
     };
 
+    // A crash can save the incoming coins before the tracker lists them. The
+    // restart must still find them from the wallet and claim them.
+    let taker_dir = test_framework.temp_dir.join("taker1");
+    let mut tracker = SwapTracker::load_or_create(&taker_dir).unwrap();
+    let mut record = tracker.get_record(&summary.swap_id).unwrap().clone();
+    record.incoming_contract_txids.clear();
+    tracker.save_record(&record).unwrap();
+    drop(tracker);
+
     // ---- The taker restarts first: its sweep is what puts the preimage on chain.
     let taker_offset = log_len();
     info!("Restarting the taker with an empty watcher...");
@@ -553,6 +569,170 @@ fn test_legacy_electrum_crash_after_contract_exchange() {
         ProtocolVersion::Legacy,
         TakerBehavior::CrashAfterContractExchange,
     );
+}
+
+/// Test: a maker learns the preimage only after its sender refunded it.
+///
+/// ```text
+/// t=0   funding on chain; the taker drops without recovering, Maker2 never
+///       runs its recovery, Maker1 recovers normally
+/// t~2m  Maker1 refunds its outgoing: Maker2's incoming is gone
+/// then  the taker restarts and claims by hashlock: the preimage is on chain
+/// then  Maker2 restarts and reads it, but its incoming can never be swept
+/// ```
+///
+/// Maker2 must still finish the swap instead of retrying the sweep forever. The
+/// same restart closes a record a crash left open with no coins behind it.
+#[test]
+fn test_taproot_maker_finishes_when_its_incoming_was_refunded() {
+    warn!("Running Test: Maker Finishes When Its Incoming Was Refunded");
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            2,
+            vec![TakerBehavior::CrashBeforeRecovery],
+            vec![MakerBehavior::Normal, MakerBehavior::CrashBeforeRecovery],
+        );
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+
+    let mut maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || {
+                start_server(maker_clone).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+
+    generate_blocks(bitcoind, 1);
+
+    let summary = taker
+        .prepare_swap(swap_params)
+        .expect("Prepare should succeed");
+    assert!(
+        taker.start_swap(&summary.swap_id).is_err(),
+        "Swap should fail because the taker crashes before finalization"
+    );
+
+    let mut taker_config = taker.config().clone();
+    taker_config.password = Some("integration-test".to_string());
+
+    info!("Waiting for Maker1 to refund Maker2's incoming...");
+    let deadline = Instant::now() + Duration::from_secs(400);
+    while makers[0]
+        .wallet
+        .read()
+        .unwrap()
+        .get_outgoing_swapcoins_count()
+        != 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "Maker1 did not refund its outgoing"
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
+
+    // The taker's claim is what first puts the preimage on chain.
+    drop(takers);
+    let restarted_taker = Taker::init(taker_config).expect("taker restart should succeed");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while restarted_taker
+        .get_wallet()
+        .read()
+        .unwrap()
+        .get_incoming_swapcoins_count()
+        != 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "restarted taker did not claim its incoming by hashlock"
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
+
+    let victim = makers[1].clone();
+    let mut victim_config = victim.config.clone();
+    victim_config.password = Some("integration-test".to_string());
+    victim.shutdown.store(true, Relaxed);
+    maker_threads.remove(1).join().unwrap();
+    drop(victim);
+
+    // A crash between a finish's wallet save and its tracker save: the record
+    // still says recovering, and the wallet holds nothing for it.
+    let mut tracker = MakerSwapTracker::load_or_create(&victim_config.data_dir).unwrap();
+    tracker
+        .save_record(&MakerSwapRecord {
+            swap_id: "crashed-finish".to_string(),
+            protocol: ProtocolVersion::Taproot,
+            phase: MakerSwapPhase::Recovering,
+            swap_amount_sat: 0,
+            incoming_count: 0,
+            outgoing_count: 0,
+            funding_broadcast_txids: Vec::new(),
+            recovery: MakerRecoveryState::default(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+    drop(tracker);
+
+    info!("Restarting Maker2 after the preimage reached the chain...");
+    let restarted = Arc::new(MakerServer::init(victim_config).expect("maker restart"));
+    let restarted_thread = {
+        let maker_clone = restarted.clone();
+        thread::spawn(move || {
+            start_server(maker_clone).unwrap();
+        })
+    };
+    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+
+    let phase = |swap_id: &str| {
+        restarted
+            .swap_tracker
+            .lock()
+            .unwrap()
+            .get_record(swap_id)
+            .map(|record| record.recovery.phase)
+    };
+    assert_eq!(
+        phase("crashed-finish"),
+        Some(MakerRecoveryPhase::CleanedUp),
+        "startup left a finished record open"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while phase(&summary.swap_id) != Some(MakerRecoveryPhase::CleanedUp) {
+        assert!(
+            Instant::now() < deadline,
+            "Maker2 kept retrying a sweep of an incoming its sender refunded"
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
+    let wallet = restarted.wallet.read().unwrap();
+    assert_eq!(wallet.get_incoming_swapcoins_count(), 0);
+    assert_eq!(wallet.get_outgoing_swapcoins_count(), 0);
+    drop(wallet);
+
+    restarted.shutdown.store(true, Relaxed);
+    restarted_thread.join().unwrap();
+    shutdown_makers(&makers[..1], maker_threads);
+    drop(restarted_taker);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
 }
 
 /// A maker that reserved inputs for a funding it never sent must still hold

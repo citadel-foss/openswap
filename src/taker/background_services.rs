@@ -68,13 +68,18 @@ impl RecoveryLoop {
             .spawn(move || {
                 log::info!("Recovery loop started");
                 while !shutdown_clone.load(Relaxed) {
-                    let (swap_ids, incoming_contract_txids) = match lock_debug!(swap_tracker.lock())
-                    {
-                        Ok(tracker) => tracker.recovery_scope(),
-                        Err(_) => {
-                            thread::park_timeout(RECOVERY_LOOP_INTERVAL);
-                            continue;
-                        }
+                    let scope = lock_debug!(swap_tracker.lock())
+                        .ok()
+                        .zip(lock_debug!(wallet.read()).ok())
+                        .and_then(|(mut tracker, w)| {
+                            tracker
+                                .recovery_scope_listing(&w)
+                                .inspect_err(|e| log::warn!("Recovery loop: scope: {:?}", e))
+                                .ok()
+                        });
+                    let Some((swap_ids, incoming_contract_txids)) = scope else {
+                        thread::park_timeout(RECOVERY_LOOP_INTERVAL);
+                        continue;
                     };
                     if swap_ids.is_empty() {
                         log::info!("Recovery loop: no failed swaps remain");
@@ -134,7 +139,17 @@ impl RecoveryLoop {
                     let outpoints = match lock_debug!(wallet.read()) {
                         Ok(w) => {
                             let mut outpoints = w.outgoing_contract_outpoints(Some(&swap_ids));
-                            outpoints.extend(w.incoming_contract_outpoints(Some(&swap_ids)));
+                            // A coin given up for a refund has no claim left to wait on.
+                            outpoints.extend(
+                                w.incoming_contract_outpoints(Some(&swap_ids))
+                                    .into_iter()
+                                    .filter(|(op, _)| {
+                                        w.find_incoming_swapcoin(&op.txid.to_string())
+                                            .is_some_and(|sc| {
+                                                sc.is_preimage_known() || sc.other_privkey.is_some()
+                                            })
+                                    }),
+                            );
                             Some(outpoints)
                         }
                         Err(_) => None,
@@ -164,6 +179,7 @@ impl RecoveryLoop {
                         );
                     } else {
                         log::info!("Recovery loop: all contracts resolved");
+                        let mut saved = false;
                         if let Ok(mut w) = lock_debug!(wallet.write()) {
                             for swap_id in &swap_ids {
                                 // A sweep normally removes its incoming entry
@@ -183,7 +199,16 @@ impl RecoveryLoop {
                                 }
                                 w.remove_watchonly_swapcoins(swap_id);
                             }
-                            let _ = w.save_to_disk();
+                            saved = w
+                                .save_to_disk()
+                                .inspect_err(|e| log::warn!("Recovery loop: cleanup save: {:?}", e))
+                                .is_ok();
+                        }
+                        // Finished only once the removal is on disk: a restart
+                        // skips a CleanedUp swap and would keep its stale coins.
+                        if !saved {
+                            thread::park_timeout(RECOVERY_LOOP_INTERVAL);
+                            continue;
                         }
 
                         if let Ok(mut tracker) = lock_debug!(swap_tracker.lock()) {

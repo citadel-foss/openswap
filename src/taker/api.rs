@@ -763,12 +763,13 @@ impl Taker {
     fn init_recover_wallet(&mut self) {
         log::info!("Checking wallet for unresolved swap contracts...");
 
-        let (swap_ids, incoming_contract_txids) = match lock_debug!(self.swap_tracker.lock()) {
-            Ok(tracker) => tracker.recovery_scope(),
-            Err(_) => {
-                log::warn!("Startup recovery: swap tracker lock poisoned");
-                return;
-            }
+        let scope = lock_debug!(self.swap_tracker.lock())
+            .ok()
+            .zip(self.read_wallet().ok())
+            .map(|(mut tracker, wallet)| tracker.recovery_scope_listing(&wallet));
+        let Some(Ok((swap_ids, incoming_contract_txids))) = scope else {
+            log::warn!("Startup recovery: could not read the recovery scope: {scope:?}");
+            return;
         };
         if swap_ids.is_empty() {
             log::info!("startup recovery: Not needed, no failed swaps");
