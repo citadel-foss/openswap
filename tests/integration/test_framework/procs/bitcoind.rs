@@ -168,14 +168,47 @@ pub(crate) fn init_bitcoind(
 }
 
 /// Generate Blocks in regtest node.
+///
+/// Panics if the chain never grows by `n`, so a node that cannot mine fails here
+/// instead of surfacing later as an unrelated timeout.
 pub(crate) fn generate_blocks(bitcoind: &BitcoinD, n: u64) {
-    let mining_address = match bitcoind.client.get_new_address(None, None) {
-        Ok(addr) => addr
-            .require_network(bitcoind::bitcoincore_rpc::bitcoin::Network::Regtest)
-            .unwrap(),
-        Err(_) => return,
+    let before = bitcoind.client.get_block_count();
+    let Err(e) = try_generate_blocks(bitcoind, n) else {
+        return;
     };
-    let _ = bitcoind.client.generate_to_address(n, &mining_address);
+    // An RPC error is not proof the blocks are missing: jsonrpc stops waiting after
+    // a 15 s read timeout (resending once first) while a loaded node keeps mining,
+    // and every such error prints as "Couldn't connect to host". Judge by height.
+    let Ok(before) = before else {
+        panic!("failed to generate {} blocks: {}", n, e);
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
+        if bitcoind
+            .client
+            .get_block_count()
+            .is_ok_and(|height| height >= before + n)
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("failed to generate {} blocks: {}", n, e);
+}
+
+/// [`generate_blocks`] that returns the RPC error instead of panicking, for
+/// callers that must survive the node going away.
+pub(in crate::test_framework) fn try_generate_blocks(
+    bitcoind: &BitcoinD,
+    n: u64,
+) -> Result<(), bitcoind::bitcoincore_rpc::Error> {
+    let mining_address = bitcoind
+        .client
+        .get_new_address(None, None)?
+        .require_network(bitcoind::bitcoincore_rpc::bitcoin::Network::Regtest)
+        .unwrap();
+    bitcoind.client.generate_to_address(n, &mining_address)?;
+    Ok(())
 }
 
 /// Send coins to a bitcoin address.

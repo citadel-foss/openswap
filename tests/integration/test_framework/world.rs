@@ -34,7 +34,7 @@ use super::{
     backend::TestBackend,
     ports::{free_ports, reserve_listeners},
     procs::{
-        bitcoind::{generate_blocks, init_bitcoind},
+        bitcoind::{init_bitcoind, try_generate_blocks},
         electrs::{init_electrsd, wait_for_electrs_tip},
         nostr::{spawn_nostr_relay, wait_for_relay_healthy},
     },
@@ -361,7 +361,13 @@ impl TestFramework {
                 return;
             }
             if !tf.block_gen_paused.load(Relaxed) {
-                generate_blocks(&tf.bitcoind, blocks_per_tick);
+                // Never panic here: teardown stops bitcoind while this thread
+                // may be mid-call, and some tests restart the node themselves.
+                if let Err(e) = try_generate_blocks(&tf.bitcoind, blocks_per_tick) {
+                    if !tf.shutdown.load(Relaxed) {
+                        log::warn!("⛏️ Background block generation failed: {e}");
+                    }
+                }
                 if let Some(elec) = tf.electrsd.lock().unwrap().as_ref() {
                     let _ = elec.trigger();
                 }
