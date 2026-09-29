@@ -15,6 +15,8 @@ pub(super) const BLOCK_TICK_INTERVAL: Duration = Duration::from_secs(3);
 /// outer-hop timelock (225 blocks) to mature, at backend `B`'s block cadence.
 pub(crate) fn timelock_recovery_wait<B: TestBackend>() -> Duration {
     let (per_tick, tick) = B::block_cadence();
-    // 10s idle timeout + 225 blocks + scheduling margin.
+    // 30s maker idle timeout (IDLE_CONNECTION_TIMEOUT in integration builds) + the
+    // 225-block outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) +
+    // scheduling margin.
     Duration::from_secs(175) + tick * (225u64.div_ceil(per_tick)) as u32
 }
