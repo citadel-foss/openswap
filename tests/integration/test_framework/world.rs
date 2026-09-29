@@ -106,7 +106,9 @@ impl TestFramework {
         }
     }
 
-    /// Initialize test framework over backend `B`. Complete segregation over the 2 backends.
+    /// Initialize test framework over backend `B`. `B` builds the wallet backend
+    /// config of every taker and maker (and so decides whether electrs is spawned),
+    /// and sets the background miner's cadence.
     ///
     /// This creates Taker and MakerServer instances that support
     /// both Legacy (ECDSA) and Taproot (MuSig2) protocols using message types.
@@ -416,7 +418,11 @@ impl TestFramework {
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .expect("Electrum backend needs a framework started with init_electrum")
+                    .expect(
+                        "Electrum backend needs electrsd, which init_with_settings spawns \
+                         only for an Electrum backend with at least one taker or maker, and \
+                         which is gone after teardown or once a test takes it",
+                    )
                     .electrum_url
             )
         };
@@ -512,7 +518,8 @@ impl Drop for TestFramework {
     }
 }
 
-/// Initializes a [`TestFramework`] given a [`CoreRpcConfig`].
+/// Builds a [`CoreRpcConfig`] for a [`TestFramework`]'s bitcoind: its RPC URL
+/// and cookie auth, with every other field left at its default.
 impl From<&TestFramework> for CoreRpcConfig {
     fn from(value: &TestFramework) -> Self {
         let url = value.bitcoind.rpc_url().split_at(7).1.to_string();
