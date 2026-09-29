@@ -267,10 +267,21 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         .map_err(|_| MakerError::MutexPossion)?
         .incomplete_swaps()
         .into_iter()
-        .filter(|record| record.phase == MakerSwapPhase::Recovering)
-        .map(|record| (record.swap_id.clone(), record.recovery.clone()))
+        .filter(|record| {
+            matches!(
+                record.phase,
+                MakerSwapPhase::Recovering | MakerSwapPhase::Completed
+            )
+        })
+        .map(|record| {
+            (
+                record.swap_id.clone(),
+                record.phase,
+                record.recovery.clone(),
+            )
+        })
         .collect();
-    for (swap_id, recovery) in recovering {
+    for (swap_id, phase, recovery) in recovering {
         let wallet = lock_debug!(maker.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
         let settled = wallet.incoming_keys_for_swap(&swap_id).is_empty()
@@ -283,7 +294,12 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                 (!recovery.outgoing_recovered.is_empty())
                     .then_some(("timelock", &recovery.outgoing_recovered[..]))
             };
-            finish_swap(&maker, &swap_id, MakerSwapPhase::Recovered, report);
+            finish_swap(
+                &maker,
+                &swap_id,
+                phase.max(MakerSwapPhase::Recovered),
+                report,
+            );
         }
     }
 
@@ -1500,6 +1516,9 @@ fn recover_from_swap(
                 }
             }
 
+            // Record the outcome before the cleanup: startup finishes a cleanup
+            // a crash cut short with the phase it finds here.
+            update_tracker(&maker, &swap_id, |r| r.phase = MakerSwapPhase::Completed);
             {
                 let mut wallet = lock_debug!(maker.wallet.write())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -1868,7 +1887,10 @@ fn recover_from_swap(
                 maker.shutdown.store(true, Relaxed);
                 return Ok(());
             }
-        } else if current_height >= timelock_expiry {
+        } else if current_height >= timelock_expiry && !incoming_swapcoins.is_empty() {
+            // Refund only while incoming coins are left. They are saved before
+            // outgoing ones, so a funded swap with none left had its incoming
+            // claimed before a restart, and a refund would take both sides.
             // --- Timelock path: reclaim outgoing after timelock expires ---
             log::info!(
                 "[{}] Timelock expired at {} (expiry={}), recovering via timelock path",
