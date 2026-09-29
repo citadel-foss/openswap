@@ -153,11 +153,34 @@ struct Setup {
 }
 
 fn setup(name: &str) -> Setup {
-    let root_dir = std::env::temp_dir().join(format!("openswap-transport-{}", std::process::id()));
+    // Unique per call: every test ends by deleting its root, so a root shared by
+    // pid would let the first test to finish delete the others' live datadirs
+    // when they run as threads of one process (cargo test).
+    let root_dir = std::env::temp_dir().join(format!(
+        "openswap-transport-{}-{}",
+        name,
+        bip39::rand::random::<u64>()
+    ));
     let temp_dir = root_dir.join(name);
     std::fs::create_dir_all(&temp_dir).unwrap();
 
-    let bitcoind = init_bitcoind(&temp_dir, "tcp://127.0.0.1:48332".to_string())
+    // A fixed ZMQ port collides between concurrent bitcoinds, and a freed OS pick
+    // can be taken before bitcoind binds it, so retry on a fresh one.
+    let bitcoind = (1..=3)
+        .find_map(|attempt| {
+            let zmq_port = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .expect("no free local port for ZMQ")
+                .port();
+            match init_bitcoind(&temp_dir, format!("tcp://127.0.0.1:{zmq_port}")) {
+                Ok(bitcoind) => Some(bitcoind),
+                Err(e) if attempt < 3 => {
+                    log::warn!("bitcoind failed to start on ZMQ port {zmq_port}, retrying: {e}");
+                    None
+                }
+                Err(e) => panic!("bitcoind failed to start: {}", e),
+            }
+        })
         .expect("bitcoind failed to start");
     let electrsd = init_electrsd(&bitcoind, &temp_dir);
     generate_blocks(&bitcoind, 101);
