@@ -59,76 +59,62 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::SkipFundingBroadcast];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    let taker_original_balance = world.fund_taker_default(3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
     // Use post-fidelity, pre-swap balances as the correct baseline
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
     log::info!("Starting Legacy timelock-only recovery test...");
 
     // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
+    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
-    test_framework.wait_for_electrs_tip();
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
 
     // Prepare should succeed; execution should fail because Maker2 closes the connection
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
         swap_result.is_err(),
         "Swap should fail due to Maker2 skipping funding broadcast"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
+    world.taker().inner().log_tracker_state();
 
     // Maker2 planned a funding it never sent, and handed it out unsigned, so
     // only it could broadcast. Its swapcoins must still be there: only the
     // grace may release them, never the failure itself.
-    let victim_held = makers[1]
+    let victim_held = world.makers()[1]
+        .inner()
         .wallet
         .read()
         .unwrap()
         .get_outgoing_swapcoins_count()
-        + makers[1]
+        + world.makers()[1]
+            .inner()
             .wallet
             .read()
             .unwrap()
@@ -140,13 +126,17 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
 
     if stop_watcher {
         assert!(
-            makers[0]
+            world.makers()[0]
+                .inner()
                 .has_unfinished_outgoing_swapcoin(&summary.swap_id)
                 .unwrap(),
             "Maker1 must have an outgoing swapcoin for the funded swap before watcher shutdown"
         );
-        makers[0].watch_service.stop_watcher_for_test();
-        assert!(!makers[0].watch_service.is_alive());
+        world.makers()[0]
+            .inner()
+            .watch_service
+            .stop_watcher_for_test();
+        assert!(!world.makers()[0].inner().watch_service.is_alive());
     }
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
@@ -157,15 +147,10 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
 
     // Recovery waits out the grace before dropping the never-broadcast
     // funding, then releases the swapcoins, exactly as for Taproot.
-    assert_grace_then_discard(&test_framework.taker_log_path(), &summary.swap_id);
-    makers[1]
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    assert_grace_then_discard(&world.taker_log_path(), &summary.swap_id);
+    world.makers()[1].sync();
     let victim_after = {
-        let wallet = makers[1].wallet.read().unwrap();
+        let wallet = world.makers()[1].inner().wallet.read().unwrap();
         wallet.get_outgoing_swapcoins_count() + wallet.get_incoming_swapcoins_count()
     };
     assert_eq!(
@@ -174,14 +159,9 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     );
 
     // Verify maker balances after recovery
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, maker) in world.makers().iter().enumerate() {
+        maker.sync();
+        let maker_balances = maker.balances();
         info!(
             "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
             i,
@@ -204,7 +184,7 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     // retries timelock recovery. Wait for it to finish.
     let recovery_timeout = Duration::from_secs(120);
     let recovery_start = Instant::now();
-    while !taker.is_recovery_complete() {
+    while !world.taker().inner().is_recovery_complete() {
         if recovery_start.elapsed() > recovery_timeout {
             panic!("Background recovery did not complete within timeout");
         }
@@ -213,17 +193,12 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet
-    generate_blocks(bitcoind, 1);
-    test_framework.wait_for_electrs_tip();
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
+    world.taker().sync();
 
     // Verify taker balance
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances = world.taker().balances();
 
     info!(
         "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
@@ -259,14 +234,9 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     );
 
     // Verify maker balances are close to pre-swap (post-fidelity) balances
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, maker) in world.makers().iter().enumerate() {
+        maker.sync();
+        let maker_balances = maker.balances();
         let original = maker_spendable_balance[i];
 
         let maker_diff = original
@@ -290,14 +260,13 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
         );
     }
 
-    taker.log_tracker_state();
+    world.taker().inner().log_tracker_state();
     info!("Legacy timelock-only recovery test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
     tracker_logger.stop();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 #[test]
@@ -346,75 +315,61 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
         MakerBehavior::SkipFundingBroadcastUnrecorded,
     ];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<B>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    let taker_original_balance = world.fund_taker_default(3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
     // Use post-fidelity, pre-swap balances as the correct baseline
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
     log::info!("Starting Taproot timelock-only recovery test...");
 
     // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
+    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
     // Swap params for openswap (Taproot)
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
-    test_framework.wait_for_electrs_tip();
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
 
     // Prepare should succeed; execution should fail because Maker2 closes the connection
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
         swap_result.is_err(),
         "Swap should fail due to Maker2 skipping funding broadcast"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
+    world.taker().inner().log_tracker_state();
 
     // Maker2 planned a funding it never sent. Its swapcoins must still be
     // there: only the grace may release them, never the failure itself.
-    let victim_held = makers[1]
+    let victim_held = world.makers()[1]
+        .inner()
         .wallet
         .read()
         .unwrap()
         .get_outgoing_swapcoins_count()
-        + makers[1]
+        + world.makers()[1]
+            .inner()
             .wallet
             .read()
             .unwrap()
@@ -433,15 +388,10 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     // Maker2 left its broadcast unrecorded, so recovery must wait out the
     // grace before dropping the swapcoins rather than trusting one backend
     // answer. Both lines must appear, in that order.
-    assert_grace_then_discard(&test_framework.taker_log_path(), &summary.swap_id);
-    makers[1]
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    assert_grace_then_discard(&world.taker_log_path(), &summary.swap_id);
+    world.makers()[1].sync();
     let victim_after = {
-        let wallet = makers[1].wallet.read().unwrap();
+        let wallet = world.makers()[1].inner().wallet.read().unwrap();
         wallet.get_outgoing_swapcoins_count() + wallet.get_incoming_swapcoins_count()
     };
     assert_eq!(
@@ -450,14 +400,9 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     );
 
     // Verify maker balances after recovery
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, maker) in world.makers().iter().enumerate() {
+        maker.sync();
+        let maker_balances = maker.balances();
         info!(
             "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
             i,
@@ -481,7 +426,7 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     // so this only waits for the loop to notice and broadcast.
     let recovery_timeout = Duration::from_secs(120);
     let recovery_start = Instant::now();
-    while !taker.is_recovery_complete() {
+    while !world.taker().inner().is_recovery_complete() {
         if recovery_start.elapsed() > recovery_timeout {
             panic!("Background recovery did not complete within timeout");
         }
@@ -490,17 +435,12 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet
-    generate_blocks(bitcoind, 1);
-    test_framework.wait_for_electrs_tip();
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
+    world.taker().sync();
 
     // Verify taker balance
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances = world.taker().balances();
 
     info!(
         "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
@@ -536,14 +476,9 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     );
 
     // Verify maker balances are close to pre-swap (post-fidelity) balances
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, maker) in world.makers().iter().enumerate() {
+        maker.sync();
+        let maker_balances = maker.balances();
         let original = maker_spendable_balance[i];
 
         let maker_diff = original
@@ -567,14 +502,13 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
         );
     }
 
-    taker.log_tracker_state();
+    world.taker().inner().log_tracker_state();
     info!("Taproot timelock-only recovery test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
     tracker_logger.stop();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 /// A maker that answers normally but never sends its funding is not a dropped
@@ -590,46 +524,36 @@ fn run_withheld_funding_bans_its_maker<B: TestBackend>(protocol: ProtocolVersion
         MakerBehavior::WithholdFundingSilently,
     ];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<B>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
-    test_framework.wait_for_electrs_tip();
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
         swap_result.is_err(),
         "Swap must fail when a maker withholds its funding"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
 
-    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standings = world.taker().inner().fetch_offers().unwrap().all_makers();
     let standing_of = |port: u16| {
         standings
             .iter()
@@ -639,7 +563,7 @@ fn run_withheld_funding_bans_its_maker<B: TestBackend>(protocol: ProtocolVersion
             .clone()
     };
 
-    let withholder = standing_of(makers[1].config.network_port);
+    let withholder = standing_of(world.makers()[1].inner().config.network_port);
     assert!(
         matches!(
             withholder,
@@ -652,7 +576,7 @@ fn run_withheld_funding_bans_its_maker<B: TestBackend>(protocol: ProtocolVersion
         withholder
     );
 
-    let honest = standing_of(makers[0].config.network_port);
+    let honest = standing_of(world.makers()[0].inner().config.network_port);
     assert!(
         !matches!(honest, MakerState::Banned(_)),
         "the honest maker must not be blamed, got {:?}",
@@ -661,9 +585,8 @@ fn run_withheld_funding_bans_its_maker<B: TestBackend>(protocol: ProtocolVersion
 
     info!("Withheld funding test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 #[test]

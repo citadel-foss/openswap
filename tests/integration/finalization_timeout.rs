@@ -7,14 +7,12 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
 };
 
 use super::test_framework::*;
-
-use std::thread;
 
 #[test]
 fn taproot_last_maker_survives_finalization_idle_window() {
@@ -26,41 +24,36 @@ fn taproot_last_maker_survives_finalization_idle_window() {
         MakerBehavior::DropHandoverResponse,
     ];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behaviors)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.first_mut().unwrap();
+    world.fund_taker_default(4);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 4);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.start_makers(120);
+    world.mine(1);
 
     let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 3)
         .with_tx_count(1)
         .with_required_confirms(1);
-    let summary = taker.prepare_swap(params).expect("prepare should succeed");
+    let summary = world
+        .taker_mut()
+        .prepare(params)
+        .expect("prepare should succeed");
 
-    taker
-        .start_swap(&summary.swap_id)
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("the route heartbeat must keep the last maker live through finalization");
 
-    generate_blocks(bitcoind, 1);
-    sync_maker_wallets(&makers);
+    world.mine(1);
+    world.sync_makers();
 
-    for (index, maker) in makers.iter().enumerate() {
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (index, maker) in world.makers().iter().enumerate() {
+        let balances = maker.balances();
         assert_eq!(
             balances.contract,
             Amount::ZERO,
@@ -68,7 +61,7 @@ fn taproot_last_maker_survives_finalization_idle_window() {
         );
     }
 
-    let log = std::fs::read_to_string(test_framework.taker_log_path()).unwrap();
+    let log = std::fs::read_to_string(world.taker_log_path()).unwrap();
     assert!(log.contains("Test behavior: stalling"));
     assert!(log.contains("Test behavior: dropping completed handover response"));
     assert!(
@@ -88,9 +81,8 @@ fn taproot_last_maker_survives_finalization_idle_window() {
         "each maker should process exactly one private-key handover"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 #[test]
@@ -103,41 +95,36 @@ fn legacy_last_maker_survives_finalization_idle_window() {
         MakerBehavior::DropHandoverResponse,
     ];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behaviors)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.first_mut().unwrap();
+    world.fund_taker_default(4);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 4);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = maker.clone();
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.start_makers(120);
+    world.mine(1);
 
     let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 3)
         .with_tx_count(1)
         .with_required_confirms(1);
-    let summary = taker.prepare_swap(params).expect("prepare should succeed");
+    let summary = world
+        .taker_mut()
+        .prepare(params)
+        .expect("prepare should succeed");
 
-    taker
-        .start_swap(&summary.swap_id)
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("the route heartbeat must keep the last Legacy maker live through finalization");
 
-    generate_blocks(bitcoind, 1);
-    sync_maker_wallets(&makers);
+    world.mine(1);
+    world.sync_makers();
 
-    for (index, maker) in makers.iter().enumerate() {
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (index, maker) in world.makers().iter().enumerate() {
+        let balances = maker.balances();
         assert_eq!(
             balances.contract,
             Amount::ZERO,
@@ -145,7 +132,7 @@ fn legacy_last_maker_survives_finalization_idle_window() {
         );
     }
 
-    let log = std::fs::read_to_string(test_framework.taker_log_path()).unwrap();
+    let log = std::fs::read_to_string(world.taker_log_path()).unwrap();
     assert!(log.contains("Test behavior: stalling"));
     assert!(log.contains("Test behavior: dropping completed handover response"));
     assert!(
@@ -159,7 +146,6 @@ fn legacy_last_maker_survives_finalization_idle_window() {
         "each Legacy maker should process exactly one private-key handover"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }

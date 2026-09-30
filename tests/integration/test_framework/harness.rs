@@ -52,6 +52,7 @@ pub struct WorldBuilder<B> {
     maker_behaviors: Vec<MakerBehavior>,
     taker_behaviors: Vec<TakerBehavior>,
     fee_overrides: Option<Vec<Option<MakerFeeOverride>>>,
+    check_blocklist: bool,
     backend: PhantomData<fn() -> B>,
 }
 
@@ -87,8 +88,16 @@ impl<B: TestBackend> WorldBuilder<B> {
         self
     }
 
+    /// Enables runtime blocklist screening on every taker and maker. Builds
+    /// through [`TestFramework::init_with_blocklist`] instead of `init`.
+    pub fn check_blocklist(mut self) -> Self {
+        self.check_blocklist = true;
+        self
+    }
+
     /// Runs [`TestFramework::init`] with the collected arguments, or
-    /// [`TestFramework::init_with_fee_overrides`] when fee overrides are set.
+    /// [`TestFramework::init_with_fee_overrides`] when fee overrides are set,
+    /// or [`TestFramework::init_with_blocklist`] when screening is enabled.
     #[must_use = "dropping the World tears the framework down at once"]
     pub fn build(self) -> World {
         // `init` ignores behaviors past the maker count; refuse instead of
@@ -99,20 +108,29 @@ impl<B: TestBackend> WorldBuilder<B> {
             self.maker_behaviors.len(),
             self.maker_count
         );
-        let (framework, takers, makers, block_generation) = match self.fee_overrides {
-            None => TestFramework::init::<B>(
-                self.maker_count,
-                self.taker_behaviors,
-                self.maker_behaviors,
-            ),
-            // `init_with_fee_overrides` reads only the length of the config map.
-            Some(fee_overrides) => TestFramework::init_with_fee_overrides::<B>(
-                vec![(0, None); self.maker_count],
-                fee_overrides,
-                self.taker_behaviors,
-                self.maker_behaviors,
-            ),
-        };
+        let (framework, takers, makers, block_generation) =
+            match (self.fee_overrides, self.check_blocklist) {
+                (None, false) => TestFramework::init::<B>(
+                    self.maker_count,
+                    self.taker_behaviors,
+                    self.maker_behaviors,
+                ),
+                // `init_with_fee_overrides` reads only the length of the config map.
+                (Some(fee_overrides), false) => TestFramework::init_with_fee_overrides::<B>(
+                    vec![(0, None); self.maker_count],
+                    fee_overrides,
+                    self.taker_behaviors,
+                    self.maker_behaviors,
+                ),
+                (None, true) => TestFramework::init_with_blocklist::<B>(
+                    self.maker_count,
+                    self.taker_behaviors,
+                    self.maker_behaviors,
+                ),
+                (Some(_), true) => {
+                    panic!("no TestFramework init takes both fee overrides and the blocklist")
+                }
+            };
         World {
             takers: takers
                 .into_iter()
@@ -152,6 +170,7 @@ impl World {
             maker_behaviors: Vec::new(),
             taker_behaviors: Vec::new(),
             fee_overrides: None,
+            check_blocklist: false,
             backend: PhantomData,
         }
     }
