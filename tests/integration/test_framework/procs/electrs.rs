@@ -21,7 +21,7 @@ pub(crate) fn init_electrsd(bitcoind: &BitcoinD, datadir: &std::path::Path) -> E
     // Surface electrs stderr only when explicitly requested via env var, to keep test output clean.
     conf.view_stderr = std::env::var("ELECTRS_LOG").is_ok();
     let electrsd = ElectrsD::with_conf(exe, bitcoind, &conf).expect("failed to spawn electrs");
-    log::info!("🔌 electrs spawned at {}", electrsd.electrum_url);
+    log::info!("electrs spawned at {}", electrsd.electrum_url);
     electrsd
 }
 

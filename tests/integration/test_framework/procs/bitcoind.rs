@@ -219,11 +219,8 @@ pub(crate) fn init_bitcoind(
     // electrum-only tests; harmless for tests that don't use electrs.
     conf.p2p = bitcoind::P2P::Yes;
     conf.staticdir = Some(datadir.join(".bitcoin"));
-    log::info!(
-        "🔗 bitcoind datadir: {:?}",
-        conf.staticdir.as_ref().unwrap()
-    );
-    log::info!("🔧 bitcoind configuration: {:?}", conf.args);
+    log::info!("bitcoind datadir: {:?}", conf.staticdir.as_ref().unwrap());
+    log::info!("bitcoind configuration: {:?}", conf.args);
 
     let os = env::consts::OS;
     let arch = env::consts::ARCH;
@@ -242,13 +239,13 @@ pub(crate) fn init_bitcoind(
 
     let exe_path = bitcoind::exe_path().unwrap();
 
-    log::info!("📁 Executable path: {exe_path:?}");
+    log::info!("Executable path: {exe_path:?}");
 
     let bitcoind = BitcoinD::with_conf(exe_path, &conf)?;
 
     // Generate initial 101 blocks
     generate_blocks(&bitcoind, 101);
-    log::info!("🚀 bitcoind initiated!!");
+    log::info!("bitcoind initiated!!");
 
     Ok(bitcoind)
 }

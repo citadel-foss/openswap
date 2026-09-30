@@ -155,7 +155,7 @@ fn heterogeneous_route_setup(
 /// shape check — never re-negotiate the downstream maker or exhaust the spares.
 #[test]
 fn heterogeneous_substitution_aborts_without_cascade() {
-    warn!("Running Test: Heterogeneous offers — spare shape mismatch aborts without cascade");
+    warn!("Running Test: Heterogeneous offers - spare shape mismatch aborts without cascade");
 
     // Route is [maker0, maker1]; spares are popped from the back, so maker3 is
     // tried first. maker0 drops at ReqContractSigsForSender: after both hops

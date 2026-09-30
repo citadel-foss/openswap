@@ -12,7 +12,7 @@ pub(crate) fn wait_for_log(log_path: &str, expected: &str, timeout: Duration) {
     loop {
         if let Ok(contents) = fs::read_to_string(log_path) {
             if contents.contains(expected) {
-                log::info!("✅ Found expected log message: '{expected}'");
+                log::info!("Found expected log message: '{expected}'");
                 return;
             }
         }
@@ -39,7 +39,7 @@ pub(crate) fn wait_for_new_log(log_path: &str, expected: &str, timeout: Duration
                 .get(offset as usize..)
                 .is_some_and(|new| new.contains(expected))
             {
-                log::info!("✅ Found expected log message: '{expected}'");
+                log::info!("Found expected log message: '{expected}'");
                 return;
             }
         }
