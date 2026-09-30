@@ -210,6 +210,11 @@ impl World {
         verify_maker_pre_swap_balances(&self.servers())
     }
 
+    /// [`sync_maker_wallets`] on every maker.
+    pub fn sync_makers(&self) {
+        sync_maker_wallets(&self.servers());
+    }
+
     /// Syncs each maker in turn and asserts its contract balance is zero: it
     /// recovered every contract it held.
     #[track_caller]
@@ -325,6 +330,11 @@ pub struct MakerHandle {
 }
 
 impl MakerHandle {
+    /// The maker server itself, for what the handle does not wrap.
+    pub fn inner(&self) -> &MakerServer {
+        &self.server
+    }
+
     /// Syncs the maker's wallet against the backend and saves it.
     #[track_caller]
     pub fn sync(&self) {
@@ -363,7 +373,6 @@ pub struct TakerHandle {
 
 impl TakerHandle {
     /// The taker itself, for what the handle does not wrap.
-    #[allow(dead_code)] // first used by the Electrum abort tests
     pub fn inner(&self) -> &Taker {
         &self.taker
     }

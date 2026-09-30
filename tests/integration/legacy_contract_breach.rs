@@ -1,11 +1,3 @@
-//! Legacy breach: the taker broadcasts its maker-signed contract mid-swap.
-//!
-//! The taker holds its contract tx fully signed from `ReqContractSigsForSender`.
-//! Broadcasting it spends the funding maker 0 is receiving, so maker 0 must stop
-//! committing funds the moment the watchtower sees that spend:
-//! 1. Before maker 0 funds: it never broadcasts its funding.
-//! 2. After full setup: it refuses the key handover and recovers on-chain.
-
 use bitcoin::Amount;
 use openswap::{
     maker::MakerBehavior,
@@ -23,45 +15,41 @@ use std::{thread, time::Duration};
 fn test_legacy_breach_before_maker_funding() {
     warn!("Running Test: Legacy breach before maker funding");
 
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::BroadcastContractBeforeMakerFunding];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
+        .takers([TakerBehavior::BroadcastContractBeforeMakerFunding])
+        .build();
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = spawn_makers(&makers);
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    verify_maker_pre_swap_balances(&makers);
-    let regular_before: Vec<Amount> = makers
+    world.start_makers(120);
+    world.verify_maker_pre_swap_balances();
+    let regular_before: Vec<Amount> = world
+        .makers()
         .iter()
-        .map(|m| m.wallet.read().unwrap().get_balances().unwrap().regular)
+        .map(|m| m.balances().regular)
         .collect();
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(swap_result.is_err(), "Swap must fail: maker 0 never funds");
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
 
     // The first maker reached its funding step and saved the signed swapcoins,
     // then refused because of the breach rather than for any other reason.
     assert!(
-        makers.iter().any(|m| m
+        world.makers().iter().any(|m| m
+            .inner()
             .has_unfinished_outgoing_swapcoin(&summary.swap_id)
             .unwrap()),
         "No maker saved the swap's outgoing swapcoins"
@@ -69,11 +57,11 @@ fn test_legacy_breach_before_maker_funding() {
 
     // Let any stray maker broadcast confirm before comparing balances.
     thread::sleep(Duration::from_secs(20));
-    sync_maker_wallets(&makers);
-    assert_breach_refused(&test_framework);
+    world.sync_makers();
+    assert_breach_refused(&world);
 
-    for (i, maker) in makers.iter().enumerate() {
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, maker) in world.makers().iter().enumerate() {
+        let balances = maker.balances();
         info!(
             "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
             i, balances.regular, balances.swap, balances.contract, balances.spendable
@@ -89,8 +77,8 @@ fn test_legacy_breach_before_maker_funding() {
         );
     }
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// Breach after full setup: maker 0 must refuse the key handover and recover.
@@ -98,34 +86,28 @@ fn test_legacy_breach_before_maker_funding() {
 fn test_legacy_breach_before_handover() {
     warn!("Running Test: Legacy breach before key handover");
 
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::BroadcastContractBeforeHandover];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
+        .takers([TakerBehavior::BroadcastContractBeforeHandover])
+        .build();
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = spawn_makers(&makers);
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    verify_maker_pre_swap_balances(&makers);
+    world.start_makers(120);
+    world.verify_maker_pre_swap_balances();
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
         swap_result.is_err(),
         "Swap must fail: maker 0 refuses the handover"
@@ -134,42 +116,36 @@ fn test_legacy_breach_before_handover() {
 
     info!("Waiting for makers to recover on-chain...");
     thread::sleep(timelock_recovery_wait::<BitcoindBackend>());
-    sync_maker_wallets(&makers);
-    assert_breach_refused(&test_framework);
+    world.sync_makers();
+    assert_breach_refused(&world);
 
-    for (i, maker) in makers.iter().enumerate() {
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    // Observed in a real run: each maker swept its incoming contract via the
+    // hashlock. A maker that had handed over its outgoing leg would be ~500k short.
+    let expected_regular = [14500865, 14502398];
+    let expected_swap = [499100, 497530];
+    for (i, maker) in world.makers().iter().enumerate() {
+        let balances = maker.balances();
         info!(
             "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
             i, balances.regular, balances.swap, balances.contract, balances.spendable
         );
-        // Observed in a real run: each maker swept its incoming contract via the
-        // hashlock. A maker that had handed over its outgoing leg would be ~500k short.
-        let expected_regular = [14500865u64, 14502398][i];
-        let expected_swap = [499100u64, 497530][i];
-        assert_eq!(
-            balances.regular.to_sat(),
-            expected_regular,
-            "Maker {i} regular balance"
-        );
-        assert_eq!(
-            balances.swap.to_sat(),
-            expected_swap,
-            "Maker {i} swap balance"
-        );
-        assert_eq!(
-            balances.contract,
-            Amount::ZERO,
-            "Maker {i} contract balance"
-        );
+        BalanceExpect {
+            regular: Some(Is::Sats(expected_regular[i])),
+            swap: Some(Is::Sats(expected_swap[i])),
+            contract: Some(Is::Amount(Amount::ZERO)),
+            fidelity: None,
+            spendable: None,
+            delta: None,
+        }
+        .assert(&format!("Maker {i}"), &balances);
     }
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// The maker refused because of the breach, not for any other reason.
-fn assert_breach_refused(test_framework: &TestFramework) {
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("ContractBroadcast", &log_path);
+fn assert_breach_refused(world: &World) {
+    let log_path = world.taker_log_path();
+    world.framework().assert_log("ContractBroadcast", &log_path);
 }
