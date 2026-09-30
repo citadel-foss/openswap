@@ -24,7 +24,7 @@ use std::{
 /// The app works as a regular Bitcoin wallet with the added capability to perform openswaps.
 /// It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an
 /// Electrum-protocol server (via `--electrum`). Both paths support the full swap flow
-/// and the `restore` subcommand. It currently only runs on the custom signet.
+/// and the `restore` subcommand. It runs on the custom signet; mainnet use is experimental.
 /// Suggested faucet for getting signet coins: <https://faucet.openswap.live/>
 ///
 /// For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>

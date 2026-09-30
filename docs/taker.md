@@ -15,7 +15,7 @@ The taker CLI is an application that allows you to perform openswaps as a taker.
 
 ### Start the Blockchain Backend (Pre-requisite)
 
-`Taker` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on a **custom signet** (check the [bitcoind doc](./bitcoind.md)). The examples below use Bitcoin Core.
+`Taker` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on the **custom signet**, with mainnet use experimental (check the [bitcoind doc](./bitcoind.md)). The examples below use Bitcoin Core.
 
 > **Important:**  
 > The marketplace runs on our **custom signet**, where we test. Mainnet use is experimental. Makers announce themselves separately on each network, so you only find makers on the network your node runs.
@@ -45,7 +45,7 @@ This will display a detailed guide about the app and its capabilities.
 ```bash
 A simple command line app to operate as openswap client.
 
-The app works as a regular Bitcoin wallet with the added capability to perform openswaps. It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an Electrum-protocol server (via `--electrum`). Both paths support the full swap flow and the `restore` subcommand. It currently only runs on the custom signet. Suggested faucet for getting signet coins: <https://faucet.openswap.live/>
+The app works as a regular Bitcoin wallet with the added capability to perform openswaps. It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an Electrum-protocol server (via `--electrum`). Both paths support the full swap flow and the `restore` subcommand. It runs on the custom signet; mainnet use is experimental. Suggested faucet for getting signet coins: <https://faucet.openswap.live/>
 
 For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 

@@ -10,7 +10,7 @@ use std::{path::PathBuf, sync::Arc};
 
 /// OpenSwap Maker Server
 ///
-/// The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet. It requires some starting balance — around 50,000 sats for Fidelity + Swap Liquidity.
+/// The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet (mainnet use is experimental). It requires some starting balance — around 50,000 sats for Fidelity + Swap Liquidity.
 /// A 0.001 BTC top-up covers this with margin. Suggested faucet: <https://faucet.openswap.live/>
 ///
 /// All server processes will start after the fidelity bond transaction is confirmed. This may take some time. Approx: 10 mins.

@@ -49,6 +49,8 @@ load_config() {
 }
 
 save_config() {
+    # Restrict the file before writing secrets into it.
+    touch "$CONFIG_FILE" && chmod 600 "$CONFIG_FILE"
     cat > "$CONFIG_FILE" << EOF
 # OpenSwap Docker Configuration
 BITCOIN_DATADIR="$BITCOIN_DATADIR"
@@ -70,7 +72,6 @@ BITCOIN_WALLET_NAME="$BITCOIN_WALLET_NAME"
 EOF
     # %q keeps the passphrase byte-exact when load_config sources the file.
     printf 'WALLET_PASSPHRASE=%q\n' "$WALLET_PASSPHRASE" >> "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
     print_success "Configuration saved to $CONFIG_FILE"
 }
 
@@ -256,7 +257,11 @@ select_bitcoin_wallet() {
 # The maker wallet is always encrypted, so makerd needs a passphrase to create or open it.
 prompt_wallet_passphrase() {
     while [ -z "$WALLET_PASSPHRASE" ]; do
-        IFS= read -r -s -p "Maker wallet passphrase: " WALLET_PASSPHRASE
+        if ! IFS= read -r -s -p "Maker wallet passphrase: " WALLET_PASSPHRASE; then
+            echo ""
+            print_error "No wallet passphrase given"
+            exit 1
+        fi
         echo ""
     done
 }
@@ -686,7 +691,7 @@ start_makerd() {
         echo -e ""
         echo -e "If the maker server starts successfully, you will see a log like below:"
         echo -e "  [<port>] Server setup complete! Listening on port <port>"
-        echo -e "  [6103] RPC socket binding successful at 127.0.0.1:6103"
+        echo -e "  [${MAKERD_RPC_PORT}] RPC socket binding successful at 127.0.0.1:${MAKERD_RPC_PORT}"
         echo -e ""
         echo -e "Press Ctrl+C to stop watching logs (this will keep the maker server running in the background)."
         echo -e "To restart makerd later, run: ./docker-setup restart"
@@ -714,7 +719,15 @@ run_command() {
     [ -t 0 ] && tty="-it"
     case "$cmd" in
         maker-cli) docker exec $tty openswap-makerd maker-cli "$@" ;;
-        bitcoin-cli) docker exec $tty openswap-bitcoind bitcoin-cli $BITCOIN_NETWORK_ARG "$@" ;;
+        bitcoin-cli)
+            if [[ "$USE_EXTERNAL_BITCOIND" == "true" ]]; then
+                docker run --rm $tty --network host "openswap/${BITCOIN_IMAGE_NAME}:latest" bitcoin-cli \
+                    -rpcconnect="${EXTERNAL_BITCOIND_HOST%:*}" -rpcport="${EXTERNAL_BITCOIND_HOST##*:}" \
+                    -rpcuser="$BITCOIN_RPC_USER" -rpcpassword="$BITCOIN_RPC_PASSWORD" "$@"
+            else
+                docker exec $tty openswap-bitcoind bitcoin-cli $BITCOIN_NETWORK_ARG "$@"
+            fi
+            ;;
         *) docker run --rm $tty --network host "openswap/${IMAGE_NAME}:latest" "$cmd" "$@" ;;
     esac
 }
@@ -734,7 +747,7 @@ show_help() {
     echo "  stop             Stop the OpenSwap stack"
     echo "  restart          Restart the OpenSwap stack"
     echo "  logs [service]   Show logs (optionally for specific service)"
-    echo "                   Services: bitcoind, tor, makerd-internal (makerd with your own Tor)"
+    echo "                   Services: bitcoind, tor, makerd-internal (bundled Tor), makerd (your own Tor)"
     echo "  status           Show status of running services"
     echo "  shell            Open shell in a new container"
     echo ""

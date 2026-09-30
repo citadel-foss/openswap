@@ -120,7 +120,7 @@ This section focuses on `Makerd`, walking you through the process of starting an
 
 ### 1. Start the Blockchain Backend (Pre-requisite)
 
-`Makerd` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on the **custom signet** (check the [bitcoind doc](./bitcoind.md)). The examples below use Bitcoin Core. To get started, start `bitcoind`:
+`Makerd` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on the **custom signet**, with mainnet use experimental (check the [bitcoind doc](./bitcoind.md)). The examples below use Bitcoin Core. To get started, start `bitcoind`:
 
 > **Important:**  
 > The marketplace runs on our **custom signet**, where we test. Mainnet use is experimental. Makers announce themselves separately on each network, so you only find makers on the network your node runs.
@@ -148,7 +148,7 @@ This will display information about the `makerd` binary and its options.
 ```bash
 OpenSwap Maker Server
 
-The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet. It requires some starting balance — around 50,000 sats for Fidelity + Swap Liquidity. A 0.001 BTC top-up covers this with margin. Suggested faucet: <https://faucet.openswap.live/>
+The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet (mainnet use is experimental). It requires some starting balance — around 50,000 sats for Fidelity + Swap Liquidity. A 0.001 BTC top-up covers this with margin. Suggested faucet: <https://faucet.openswap.live/>
 
 All server processes will start after the fidelity bond transaction is confirmed. This may take some time. Approx: 10 mins. Once the bond is confirmed, the server starts listening for incoming swap requests. As it performs swaps for clients, it keeps earning fees.
 
