@@ -35,9 +35,9 @@ use openswap::{
 
 use super::{
     actors::{
-        fund_makers, fund_makers_default, fund_taker_default, shutdown_makers, spawn_makers,
-        spawn_ready_makers_and_mine, sync_maker_wallets, verify_maker_pre_swap_balances,
-        wait_for_makers_setup,
+        fund_makers, fund_makers_default, fund_taker, fund_taker_default, shutdown_makers,
+        spawn_makers, spawn_ready_makers_and_mine, sync_maker_wallets,
+        verify_maker_pre_swap_balances, wait_for_makers_setup,
     },
     backend::TestBackend,
     procs::bitcoind::generate_blocks,
@@ -216,6 +216,22 @@ impl World {
         fund_taker_default(&self.taker().taker, self.bitcoind(), utxo_count)
     }
 
+    /// [`fund_taker`] on the first taker; returns its spendable balance.
+    pub fn fund_taker(
+        &self,
+        utxo_count: u32,
+        utxo_value: Amount,
+        address_type: AddressType,
+    ) -> Amount {
+        fund_taker(
+            &self.taker().taker,
+            self.bitcoind(),
+            utxo_count,
+            utxo_value,
+            address_type,
+        )
+    }
+
     /// [`fund_taker_default`] on `takers[index]`; returns its spendable balance.
     #[track_caller]
     pub fn fund_nth_taker_default(&self, index: usize, utxo_count: u32) -> Amount {
@@ -252,6 +268,15 @@ impl World {
         self.attach_threads(threads);
         wait_for_makers_setup(&servers, setup_timeout_secs);
         sync_maker_wallets(&servers);
+    }
+
+    /// [`spawn_makers`] then [`wait_for_makers_setup`]: [`World::start_makers`]
+    /// without its wallet sync.
+    pub fn start_makers_without_sync(&mut self, setup_timeout_secs: u64) {
+        let servers = self.servers();
+        let threads = spawn_makers(&servers);
+        self.attach_threads(threads);
+        wait_for_makers_setup(&servers, setup_timeout_secs);
     }
 
     /// [`spawn_ready_makers_and_mine`]: start every maker server, wait for

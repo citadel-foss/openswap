@@ -7,7 +7,6 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
     wallet::AddressType,
@@ -28,71 +27,39 @@ use std::{
 fn test_concurrent_legacy_and_taproot_swaps() {
     warn!("Running Test: Concurrent Legacy and Taproot swaps through the same makers");
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            2,
-            vec![TakerBehavior::Normal, TakerBehavior::Normal],
-            // Admission reserves nothing, so both plans form over the same pool.
-            vec![MakerBehavior::Normal, MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
+    // Admission reserves nothing, so both plans form over the same pool.
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .takers([TakerBehavior::Normal, TakerBehavior::Normal])
+        .build();
 
-    let taker_original_balances = takers
-        .iter()
-        .map(|taker| fund_taker_default(taker, bitcoind, 3))
+    let taker_original_balances = (0..world.takers().len())
+        .map(|i| world.fund_nth_taker_default(i, 3))
         .collect::<Vec<_>>();
     // Both admissions plan over the same pool, so the protocols' split sizes
     // keep the plans apart: legacy splits (~167k) fit the 200k coins, taproot
     // splits (~233k) need the 300k ones. The bond takes its exact UTXO and
     // leaves no change in the pool.
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(5_000_243),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        3,
-        Amount::from_sat(200_000),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        3,
-        Amount::from_sat(300_000),
-        AddressType::P2TR,
-    );
+    world.fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR);
+    world.fund_makers(3, Amount::from_sat(200_000), AddressType::P2TR);
+    world.fund_makers(3, Amount::from_sat(300_000), AddressType::P2TR);
 
-    let maker_threads = spawn_makers(&makers);
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
     // Not verify_maker_pre_swap_balances: that helper pins the 4-UTXO funding
     // shape, and this test needs more UTXOs for two concurrent frozen plans.
-    let maker_original_balances: Vec<Amount> = makers
+    let maker_original_balances: Vec<Amount> = world
+        .makers()
         .iter()
-        .map(|maker| {
-            maker
-                .wallet
-                .read()
-                .unwrap()
-                .get_balances()
-                .unwrap()
-                .spendable
-        })
+        .map(|maker| maker.balances().spendable)
         .collect();
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     let start = Arc::new(Barrier::new(2));
     let legacy_succeeded = AtomicBool::new(false);
     let taproot_succeeded = AtomicBool::new(false);
 
     thread::scope(|scope| {
-        let (legacy_takers, taproot_takers) = takers.split_at_mut(1);
+        let (legacy_takers, taproot_takers) = world.takers_mut().split_at_mut(1);
         let legacy_taker = &mut legacy_takers[0];
         let taproot_taker = &mut taproot_takers[0];
 
@@ -106,8 +73,8 @@ fn test_concurrent_legacy_and_taproot_swaps() {
                 .with_tx_count(3)
                 .with_required_confirms(1);
             let result = legacy_taker
-                .prepare_swap(params)
-                .and_then(|summary| legacy_taker.start_swap(&summary.swap_id));
+                .prepare(params)
+                .and_then(|summary| legacy_taker.start(&summary.swap_id));
 
             match result {
                 Ok(report) => {
@@ -128,8 +95,8 @@ fn test_concurrent_legacy_and_taproot_swaps() {
                 .with_tx_count(3)
                 .with_required_confirms(1);
             let result = taproot_taker
-                .prepare_swap(params)
-                .and_then(|summary| taproot_taker.start_swap(&summary.swap_id));
+                .prepare(params)
+                .and_then(|summary| taproot_taker.start(&summary.swap_id));
 
             match result {
                 Ok(report) => {
@@ -159,29 +126,21 @@ fn test_concurrent_legacy_and_taproot_swaps() {
 
     // Sync and log every party before any assert, so one stale golden value
     // does not hide the rest.
-    let taker_balances: Vec<_> = takers
+    let taker_balances: Vec<_> = world
+        .takers()
         .iter()
         .map(|taker| {
-            taker
-                .get_wallet()
-                .write()
-                .unwrap()
-                .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-                .unwrap();
-            taker.get_wallet().read().unwrap().get_balances().unwrap()
+            taker.sync();
+            taker.balances()
         })
         .collect();
-    generate_blocks(bitcoind, 1);
-    let maker_balances: Vec<_> = makers
+    world.mine(1);
+    let maker_balances: Vec<_> = world
+        .makers()
         .iter()
         .map(|maker| {
-            maker
-                .wallet
-                .write()
-                .unwrap()
-                .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-                .unwrap();
-            maker.wallet.read().unwrap().get_balances().unwrap()
+            maker.sync();
+            maker.balances()
         })
         .collect();
 
@@ -218,85 +177,44 @@ fn test_concurrent_legacy_and_taproot_swaps() {
 
     for (i, (balances, original_balance)) in taker_balances
         .iter()
-        .zip(taker_original_balances.iter())
+        .zip(taker_original_balances)
         .enumerate()
     {
-        assert_eq!(
-            balances.regular.to_sat(),
-            expected_taker_regular[i],
-            "Taker {} regular balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.swap.to_sat(),
-            expected_taker_swap[i],
-            "Taker {i} swap balance"
-        );
-        assert_eq!(
-            balances.contract,
-            Amount::ZERO,
-            "Taker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.fidelity,
-            Amount::ZERO,
-            "Taker {} fidelity balance mismatch",
-            i
-        );
-        assert_eq!(
-            original_balance
-                .checked_sub(balances.spendable)
-                .unwrap()
-                .to_sat(),
-            expected_taker_fees[i],
-            "Taker {i} spendable balance change"
-        );
+        BalanceExpect {
+            regular: Some(Is::Sats(expected_taker_regular[i])),
+            swap: Some(Is::Sats(expected_taker_swap[i])),
+            contract: Some(Is::Amount(Amount::ZERO)),
+            fidelity: Some(Is::Amount(Amount::ZERO)),
+            spendable: None,
+            delta: Some(Delta::Loss {
+                baseline: original_balance,
+                style: DiffStyle::CheckedUnwrap,
+                sats: expected_taker_fees[i],
+            }),
+        }
+        .assert(&format!("Taker {i}"), balances);
     }
 
     for (i, (balances, original_balance)) in maker_balances
         .iter()
-        .zip(maker_original_balances.iter())
+        .zip(maker_original_balances)
         .enumerate()
     {
-        assert_eq!(
-            balances.regular.to_sat(),
-            expected_maker_regular[i],
-            "Maker {i} regular balance"
-        );
-        assert_eq!(
-            balances.swap.to_sat(),
-            expected_maker_swap[i],
-            "Maker {i} swap balance"
-        );
-        assert_eq!(
-            balances.contract,
-            Amount::ZERO,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.fidelity,
-            Amount::from_btc(0.05).unwrap(),
-            "Maker {} fidelity balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances
-                .spendable
-                .checked_sub(*original_balance)
-                .unwrap()
-                .to_sat(),
-            expected_maker_earnings[i],
-            "Maker {i} earnings"
-        );
+        BalanceExpect {
+            regular: Some(Is::Sats(expected_maker_regular[i])),
+            swap: Some(Is::Sats(expected_maker_swap[i])),
+            contract: Some(Is::Amount(Amount::ZERO)),
+            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
+            spendable: None,
+            delta: Some(Delta::Gain {
+                baseline: original_balance,
+                style: DiffStyle::CheckedUnwrap,
+                sats: expected_maker_earnings[i],
+            }),
+        }
+        .assert(&format!("Maker {i}"), balances);
     }
 
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|handle| handle.join().unwrap());
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
