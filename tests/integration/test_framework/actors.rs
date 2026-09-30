@@ -95,7 +95,7 @@ pub fn fund_taker(
     utxo_value: Amount,
     address_type: AddressType,
 ) -> Amount {
-    log::info!("💰 Funding Taker...");
+    log::info!("Funding Taker...");
 
     let mut wallet = taker.get_wallet().write().unwrap();
     let prev_balances = wallet.get_balances().unwrap();
@@ -167,7 +167,7 @@ pub fn fund_makers(
     utxo_value: Amount,
     address_type: AddressType,
 ) -> Vec<Amount> {
-    log::info!("💰 Funding Makers...");
+    log::info!("Funding Makers...");
 
     let mut spendable_balances = Vec::new();
 

@@ -2231,7 +2231,7 @@ fn wait_for_log_after(
             {
                 // Never echo the needle: callers count occurrences in the log
                 // after this returns, and the echo would match itself.
-                log::info!("✅ wait_for_log_after satisfied");
+                log::info!("wait_for_log_after satisfied");
                 return;
             }
         }
