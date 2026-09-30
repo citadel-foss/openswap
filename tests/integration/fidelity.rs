@@ -105,26 +105,22 @@ fn test_fidelity_creation() {
     let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
-    let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
+    let world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .takers(taker_behavior)
+        .build();
 
     log::info!("Running Test: Fidelity Bond Creation and Redemption ");
 
-    let bitcoind = &test_framework.bitcoind;
-    let maker = makers.first().unwrap();
+    let bitcoind = world.bitcoind();
+    let maker = world.makers()[0].inner();
 
     // ----- Test -----
 
     log::info!("Providing insufficient funds to trigger funding request");
     // Provide insufficient funds to the Maker and start the server.
     // This will continuously log about insufficient funds and request BTC to create a fidelity bond.
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_btc(0.04).unwrap(),
-        AddressType::P2TR,
-    );
+    world.fund_makers(1, Amount::from_btc(0.04).unwrap(), AddressType::P2TR);
 
     let maker_clone = maker.clone();
 
@@ -133,9 +129,11 @@ fn test_fidelity_creation() {
 
     thread::sleep(Duration::from_secs(6));
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("Send at least 0.01001909 BTC to", &log_path);
-    test_framework.assert_log(
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("Send at least 0.01001909 BTC to", &log_path);
+    world.framework().assert_log(
         "(fidelity bond + fees + minimum swap liquidity) to be visible in the market",
         &log_path,
     );
@@ -143,13 +141,7 @@ fn test_fidelity_creation() {
     log::info!("Sending exactly the quoted amount");
     // Setup completes only after the bond is made and the leftover passes the
     // swap liquidity check, so this proves one deposit of the quote is enough.
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(1_001_909),
-        AddressType::P2TR,
-    );
+    world.fund_makers(1, Amount::from_sat(1_001_909), AddressType::P2TR);
     wait_for_makers_setup(std::slice::from_ref(maker), 120);
 
     // stop the Maker server
@@ -158,7 +150,9 @@ fn test_fidelity_creation() {
     let _ = maker_thread.join().unwrap();
 
     // Assert that successful fidelity bond creation is logged
-    test_framework.assert_log("Successfully created fidelity bond", &log_path);
+    world
+        .framework()
+        .assert_log("Successfully created fidelity bond", &log_path);
 
     log::info!("Verifying first fidelity bond creation");
     // Verify that the fidelity bond is created correctly.
@@ -237,7 +231,7 @@ fn test_fidelity_creation() {
     );
 
     log::info!("Creating second fidelity bond with higher amount");
-    fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
+    world.fund_makers(1, Amount::ONE_BTC, AddressType::P2TR);
     // Create another fidelity bond of 0.08 BTC and validate it.
     let second_maturity_height = {
         log::info!("Creating another fidelity bond using the `create_fidelity` API");
@@ -346,7 +340,7 @@ fn test_fidelity_creation() {
                 // and this branch runs at the boundary — mine one block past it.
                 generate_blocks(bitcoind, 1);
                 // Hold the mempool still so the probe below can find the tx.
-                test_framework.set_block_gen_paused(true);
+                world.framework().set_block_gen_paused(true);
                 // Through the wrapper at a distinct rate: proves the caller's
                 // feerate reaches the broadcast tx rather than a fixed fallback.
                 let bond_outpoint = wallet_write.get_fidelity_bonds()[1].outpoint();
@@ -392,7 +386,7 @@ fn test_fidelity_creation() {
         fee,
         vsize
     );
-    test_framework.set_block_gen_paused(false);
+    world.framework().set_block_gen_paused(false);
 
     thread::sleep(Duration::from_secs(10));
 
@@ -422,8 +416,7 @@ fn test_fidelity_creation() {
 
     thread::sleep(Duration::from_secs(10));
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 
     log::info!("Fidelity bond lifecycle test completed successfully");
 }
@@ -442,21 +435,17 @@ fn test_fidelity_spending() {
     let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
-    let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
+    let world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .takers(taker_behavior)
+        .build();
 
     log::info!("Running Test: Assert Fidelity Spending Behavior ");
 
-    let bitcoind = &test_framework.bitcoind;
-    let maker = makers.first().unwrap();
+    let bitcoind = world.bitcoind();
+    let maker = world.makers()[0].inner();
 
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_btc(2.0).unwrap(),
-        AddressType::P2TR,
-    );
+    world.fund_makers(1, Amount::from_btc(2.0).unwrap(), AddressType::P2TR);
 
     // Create fidelity bond
     let short_timelock_height =
@@ -740,8 +729,7 @@ fn test_fidelity_spending() {
     }
 
     log::info!("SUCCESS: All fidelity spending behavior requirements verified!");
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 // ---- Shared scaffolding for the maker-restart fidelity tests ----
@@ -839,21 +827,23 @@ fn test_unconfirmed_fidelity_bond_not_duplicated() {
     let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
-    let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
+    let world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .takers(taker_behavior)
+        .build();
 
     log::info!("Running Test: Unconfirmed Fidelity Bond Survives Maker Restart");
 
-    let bitcoind = &test_framework.bitcoind;
-    let maker = makers.first().unwrap();
-    let log_path = test_framework.taker_log_path();
+    let bitcoind = world.bitcoind();
+    let maker = world.makers()[0].inner();
+    let log_path = world.taker_log_path();
 
-    fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
+    world.fund_makers(1, Amount::ONE_BTC, AddressType::P2TR);
 
     // ----- Run 1: maker broadcasts a bond, then stops before it confirms -----
 
     // Pause the background miner so the bond tx cannot confirm while run 1 is up.
-    test_framework.set_block_gen_paused(true);
+    world.framework().set_block_gen_paused(true);
 
     let maker_clone = maker.clone();
     let maker_thread = thread::spawn(move || {
@@ -888,7 +878,7 @@ fn test_unconfirmed_fidelity_bond_not_duplicated() {
     // ----- Run 2: the restart must adopt the pending bond, not create a new one -----
 
     // Resume mining so the restarted maker can wait out the confirmation.
-    test_framework.set_block_gen_paused(false);
+    world.framework().set_block_gen_paused(false);
 
     let restarted = Arc::new(MakerServer::init(maker_restart_config(maker)).unwrap());
     let restarted_clone = restarted.clone();
@@ -929,8 +919,7 @@ fn test_unconfirmed_fidelity_bond_not_duplicated() {
         "restart must not create a second fidelity bond"
     );
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 
     log::info!("Unconfirmed fidelity bond restart test completed successfully");
 }
@@ -1022,21 +1011,22 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
     // ---- Setup ----
     let maker_count = 1;
 
-    let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, vec![], vec![]);
+    let world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .build();
 
     log::info!("Running Test: Evicted Fidelity Bond Rebroadcast On Restart");
 
-    let bitcoind = &test_framework.bitcoind;
-    let maker = makers.first().unwrap();
-    let log_path = test_framework.taker_log_path();
+    let bitcoind = world.bitcoind();
+    let maker = world.makers()[0].inner();
+    let log_path = world.taker_log_path();
 
-    fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
+    world.fund_makers(1, Amount::ONE_BTC, AddressType::P2TR);
 
     // ----- Run 1: maker broadcasts a bond, then stops before it confirms -----
 
     // Pause the background miner so the bond tx cannot confirm while run 1 is up.
-    test_framework.set_block_gen_paused(true);
+    world.framework().set_block_gen_paused(true);
 
     let maker_clone = maker.clone();
     let maker_thread = thread::spawn(move || {
@@ -1064,7 +1054,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
     };
 
     // Clean stop writes mempool.dat; the replacement node must not load it.
-    let _ = test_framework.bitcoind.client.stop();
+    let _ = world.framework().bitcoind.client.stop();
 
     // `-persistmempool=0` is the eviction: the mempool is not reloaded from
     // mempool.dat. `-walletbroadcast=0` stops the node wallet resurrecting
@@ -1073,7 +1063,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
     let raw_tx = format!("-zmqpubrawtx={zmq_addr}");
     let block_hash = format!("-zmqpubrawblock={zmq_addr}");
     let new_bitcoind = spawn_replacement_bitcoind(
-        test_framework.temp_dir.join(".bitcoin"),
+        world.temp_dir().join(".bitcoin"),
         &[
             "-persistmempool=0",
             "-walletbroadcast=0",
@@ -1153,8 +1143,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
     // Teardown: stop the replacement node first; the framework's original
     // node is already down (TestFramework::stop tolerates that).
     let _ = new_bitcoind.client.stop();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 
     log::info!("Evicted fidelity bond rebroadcast test completed successfully");
 }
@@ -1167,20 +1156,21 @@ fn test_unconfirmed_fidelity_bond_not_duplicated_electrum() {
     // ---- Setup ----
     let maker_count = 1;
 
-    let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<ElectrumBackend>(maker_count, vec![], vec![]);
+    let world = World::builder::<ElectrumBackend>()
+        .makers(maker_count)
+        .build();
 
     log::info!("Running Test: Unconfirmed Fidelity Bond Survives Maker Restart (Electrum)");
 
-    let bitcoind = &test_framework.bitcoind;
-    let maker = makers.first().unwrap();
-    let log_path = test_framework.taker_log_path();
+    let bitcoind = world.bitcoind();
+    let maker = world.makers()[0].inner();
+    let log_path = world.taker_log_path();
 
-    fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
+    world.fund_makers(1, Amount::ONE_BTC, AddressType::P2TR);
 
     // ----- Run 1: maker broadcasts a bond, then stops before it confirms -----
 
-    test_framework.set_block_gen_paused(true);
+    world.framework().set_block_gen_paused(true);
 
     let maker_clone = maker.clone();
     let maker_thread = thread::spawn(move || {
@@ -1200,7 +1190,7 @@ fn test_unconfirmed_fidelity_bond_not_duplicated_electrum() {
     // ----- Run 2: the restart must adopt the pending bond, not create a new one -----
 
     // Resume mining so the restarted maker can wait out the confirmation.
-    test_framework.set_block_gen_paused(false);
+    world.framework().set_block_gen_paused(false);
 
     // The Electrum backend is untouched: electrs keeps running throughout.
     let restarted = Arc::new(MakerServer::init(maker_restart_config(maker)).unwrap());
@@ -1236,8 +1226,7 @@ fn test_unconfirmed_fidelity_bond_not_duplicated_electrum() {
         "restart must not create a second fidelity bond"
     );
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 
     log::info!("Unconfirmed fidelity bond restart test (Electrum) completed successfully");
 }
@@ -1255,20 +1244,21 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum() {
     // ---- Setup ----
     let maker_count = 1;
 
-    let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<ElectrumBackend>(maker_count, vec![], vec![]);
+    let world = World::builder::<ElectrumBackend>()
+        .makers(maker_count)
+        .build();
 
     log::info!("Running Test: Evicted Fidelity Bond Rebroadcast On Restart (Electrum)");
 
-    let bitcoind = &test_framework.bitcoind;
-    let maker = makers.first().unwrap();
-    let log_path = test_framework.taker_log_path();
+    let bitcoind = world.bitcoind();
+    let maker = world.makers()[0].inner();
+    let log_path = world.taker_log_path();
 
-    fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
+    world.fund_makers(1, Amount::ONE_BTC, AddressType::P2TR);
 
     // ----- Run 1: maker broadcasts a bond, then stops before it confirms -----
 
-    test_framework.set_block_gen_paused(true);
+    world.framework().set_block_gen_paused(true);
 
     let maker_clone = maker.clone();
     let maker_thread = thread::spawn(move || {
@@ -1293,18 +1283,16 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum() {
     };
 
     // electrs polls bitcoind, so it goes down before the node does.
-    drop(test_framework.electrsd.lock().unwrap().take());
+    drop(world.framework().electrsd.lock().unwrap().take());
     // Clean stop writes mempool.dat; the replacement node must not load it.
-    let _ = test_framework.bitcoind.client.stop();
+    let _ = world.framework().bitcoind.client.stop();
 
     // `-persistmempool=0` is the eviction: the mempool is not reloaded from
     // mempool.dat. (No `-walletbroadcast=0` needed here: with the Electrum
     // backend no node-side wallet tracks the bond tx. No ZMQ args either:
     // electrs talks to the node over RPC/p2p only.)
-    let new_bitcoind = spawn_replacement_bitcoind(
-        test_framework.temp_dir.join(".bitcoin"),
-        &["-persistmempool=0"],
-    );
+    let new_bitcoind =
+        spawn_replacement_bitcoind(world.temp_dir().join(".bitcoin"), &["-persistmempool=0"]);
 
     assert!(
         new_bitcoind.client.get_mempool_entry(&bond_txid).is_err(),
@@ -1315,7 +1303,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum() {
     // Fresh electrs against the replacement node (same db dir: the indexed
     // chain survives, the mempool view is rebuilt empty).
     thread::sleep(Duration::from_secs(2));
-    let new_electrsd = init_electrsd(&new_bitcoind, &test_framework.temp_dir);
+    let new_electrsd = init_electrsd(&new_bitcoind, world.temp_dir());
     let new_electrum_cfg = ElectrumConfig {
         url: format!("tcp://{}", new_electrsd.electrum_url),
         ..electrum_cfg
@@ -1381,8 +1369,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum() {
     // replacement node; the framework's original node is already down.
     drop(new_electrsd);
     let _ = new_bitcoind.client.stop();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 
     log::info!("Evicted fidelity bond rebroadcast test (Electrum) completed successfully");
 }

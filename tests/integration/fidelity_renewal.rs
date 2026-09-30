@@ -18,29 +18,27 @@ fn test_fidelity_auto_renewal() {
     let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
-    let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
+    let world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .takers(taker_behavior)
+        .build();
 
     log::info!("Running Test: Fidelity Bond Auto-Renewal ");
 
-    let bitcoind = &test_framework.bitcoind;
-    let maker = makers.first().unwrap();
+    let bitcoind = world.bitcoind();
+    let maker = world.makers()[0].inner().clone();
 
     // Fund the Maker
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.20).unwrap(),
-        AddressType::P2TR,
-    );
+    world.fund_makers(4, Amount::from_btc(0.20).unwrap(), AddressType::P2TR);
 
-    // Start the Maker server
+    // Start the Maker server. The thread hands back start_server's result
+    // unchecked and the join at the end ignores it, so this maker is shut
+    // down here rather than by the world.
     let maker_clone = maker.clone();
     let maker_thread = thread::spawn(move || start_server(maker_clone));
 
     // Wait for setup to complete
-    wait_for_makers_setup(std::slice::from_ref(maker), 120);
+    wait_for_makers_setup(std::slice::from_ref(&maker), 120);
 
     // Verify initial bond was created and get its locktime
     let (initial_bond_index, bond_locktime) = {
@@ -162,13 +160,15 @@ fn test_fidelity_auto_renewal() {
         "Fidelity bond should have been automatically renewed"
     );
 
-    let log_file = test_framework.temp_dir.join("taker/debug.log");
+    let log_file = world.temp_dir().join("taker/debug.log");
     let log_path = log_file.to_str().unwrap();
-    test_framework.assert_log(
+    world.framework().assert_log(
         "Fidelity Bond at index: 0 expired | Redeeming it.",
         log_path,
     );
-    test_framework.assert_log("Successfully created fidelity bond", log_path);
+    world
+        .framework()
+        .assert_log("Successfully created fidelity bond", log_path);
 
     // ---- Regression check for issue #702 (fixed in #769, regressed in #758) ----
     // The nostr broadcast thread must pick up the renewed bond instead of
@@ -214,8 +214,7 @@ fn test_fidelity_auto_renewal() {
     // Shutdown
     maker.shutdown.store(true, Relaxed);
     let _ = maker_thread.join();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 
     log::info!("Fidelity bond auto-renewal test  completed successfully");
 }

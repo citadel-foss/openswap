@@ -1,18 +1,13 @@
 //! Stress and race-oriented tests for offerbook sync behavior (taker path).
 
+use super::test_framework::*;
 use bitcoin::Amount;
 use log::warn;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     taker::{MakerProtocol, MakerState, TakerBehavior},
     wallet::AddressType,
 };
-use std::{
-    sync::{atomic::Ordering::Relaxed, Arc},
-    thread,
-};
-
-use super::test_framework::*;
 
 const STAGED_MAKER_SETUP_TIMEOUT_SECS: u64 = 180;
 
@@ -42,24 +37,17 @@ fn test_repeated_manual_sync_is_bounded() {
         .map(|_| MakerBehavior::Normal)
         .collect();
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(expected_makers, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = &mut takers[0];
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(expected_makers)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
     // Fund all makers
-    fund_makers(
-        &makers,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    world.fund_makers(3, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
 
     // Spawn makers in stages: 2, 1, 3, 5
     let stage_plan = [2usize, 1usize, 3usize, 5usize];
-    let mut maker_threads = Vec::new();
     let mut spawned = 0usize;
     let syncs_per_stage = 5usize;
 
@@ -70,17 +58,16 @@ fn test_repeated_manual_sync_is_bounded() {
             spawned,
             stage_end
         );
-        for maker in &makers[spawned..stage_end] {
-            let maker_clone = Arc::clone(maker);
-            maker_threads.push(thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            }));
+        for index in spawned..stage_end {
+            world.spawn_maker(index);
         }
 
-        wait_for_makers_setup(&makers[..stage_end], STAGED_MAKER_SETUP_TIMEOUT_SECS);
+        world.wait_for_first_makers_setup(stage_end, STAGED_MAKER_SETUP_TIMEOUT_SECS);
 
         for _ in 0..syncs_per_stage {
-            taker
+            world
+                .taker()
+                .inner()
                 .sync_offerbook_and_wait()
                 .expect("manual sync call should complete");
         }
@@ -88,17 +75,13 @@ fn test_repeated_manual_sync_is_bounded() {
         spawned = stage_end;
     }
 
-    let good = good_maker_count(taker);
+    let good = good_maker_count(world.taker().inner());
     assert_eq!(
         good, expected_makers,
         "expected {expected_makers} good makers after staged syncs, got {good}"
     );
 
     // Shutdown
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads.into_iter().for_each(|t| t.join().unwrap());
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
