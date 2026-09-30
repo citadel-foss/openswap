@@ -207,6 +207,11 @@ impl TestFramework {
             .unwrap_or(log::LevelFilter::Debug);
         setup_logger(log_level, Some(temp_dir.clone()));
         log::info!("📁 temporary directory : {}", temp_dir.display());
+        // Names the test in its own log, so a kept data dir can be traced back.
+        log::info!(
+            "🧪 test: {}",
+            thread::current().name().unwrap_or("<unnamed>")
+        );
         let (bitcoind, zmq_addr) = (0..3)
             .find_map(|_| {
                 let zmq_addr = format!("tcp://127.0.0.1:{}", free_ports(1)[0]);
@@ -495,7 +500,18 @@ impl TestFramework {
         // original node itself.
         let _ = self.bitcoind.client.stop();
         std::thread::sleep(std::time::Duration::from_secs(3));
-        if self.temp_dir.exists() {
+        self.remove_temp_dir();
+    }
+
+    /// Deletes the temp dir, unless the test is failing: then its logs,
+    /// wallets and trackers stay behind for inspection (CI uploads them).
+    fn remove_temp_dir(&self) {
+        if thread::panicking() {
+            log::warn!(
+                "Keeping {} for inspection: the test failed",
+                self.temp_dir.display()
+            );
+        } else if self.temp_dir.exists() {
             let _ = fs::remove_dir_all(&self.temp_dir);
         }
     }
@@ -528,7 +544,8 @@ impl Drop for TestFramework {
         self.teardown();
         // Takers and makers dropped after stop() still flush their wallets and
         // offerbooks into temp_dir, recreating it; sweep whatever they wrote.
-        if self.temp_dir.exists() {
+        // A failing test's dir stays, as `teardown` already announced.
+        if !thread::panicking() && self.temp_dir.exists() {
             let _ = fs::remove_dir_all(&self.temp_dir);
         }
     }
