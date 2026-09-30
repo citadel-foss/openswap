@@ -845,6 +845,28 @@ impl Wallet {
         self.store.incoming_swapcoins.len()
     }
 
+    /// Contract outpoint, timelock and saved refund address of each outgoing
+    /// swapcoin, so an integration test can follow a refund on chain.
+    #[cfg(feature = "integration-test")]
+    pub fn outgoing_refund_targets(
+        &self,
+    ) -> Vec<(OutPoint, Option<u32>, Option<Address<NetworkUnchecked>>)> {
+        self.store
+            .outgoing_swapcoins
+            .values()
+            .map(|coin| {
+                (
+                    OutPoint::new(
+                        coin.contract_tx.compute_txid(),
+                        coin.get_contract_output_vout(),
+                    ),
+                    coin.get_timelock(),
+                    coin.recovery_address.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Gets the count of outgoing swap coins.
     pub fn get_outgoing_swapcoins_count(&self) -> usize {
         self.store.outgoing_swapcoins.len()
