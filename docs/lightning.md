@@ -149,11 +149,14 @@ no maker in the offerbook advertises suitable Lightning terms
 
 ## Maker setup
 
-A maker opts in with the same three keys, in `~/.openswap/maker/config.toml`:
+A maker opts in with the same keys, in `~/.openswap/maker/config.toml`.
+`ldk_server_url` and `ldk_api_key_path` are required. `ldk_tls_cert_path` is
+optional, as on the taker side:
 
 ```toml
 ldk_server_url = 127.0.0.1:3536
 ldk_api_key_path = /home/you/.ldk-server/regtest/api_key
+# Optional
 ldk_tls_cert_path = /home/you/.ldk-server/tls.crt
 ```
 

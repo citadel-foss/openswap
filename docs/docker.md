@@ -83,8 +83,10 @@ cd openswap
 # Check status
 ./docker-setup status
 
-# View maker logs (the service is `makerd` if you use your own Tor)
+# View maker logs with the bundled Tor
 ./docker-setup logs makerd-internal
+# View maker logs with your own Tor
+./docker-setup logs makerd
 ```
 
 ### Configuration Options
@@ -205,8 +207,10 @@ The setup script uses a standard `docker-compose.yml` with environment variables
 # Check status
 ./docker-setup status
 
-# View maker logs (the service is `makerd` if you use your own Tor)
+# View maker logs with the bundled Tor
 ./docker-setup logs makerd-internal
+# View maker logs with your own Tor
+./docker-setup logs makerd
 ```
 
 ## Data Persistence
@@ -222,11 +226,13 @@ All application data is stored in Docker volumes:
 ### Check logs
 
 ```bash
-# using setup script (the service is `makerd` if you use your own Tor)
+# using setup script, with the bundled Tor
 ./docker-setup logs makerd-internal
+# using setup script, with your own Tor
+./docker-setup logs makerd
 
 # or directly with docker-compose (requires env vars)
-docker compose logs -f makerd-internal
+docker compose logs -f makerd-internal   # or makerd with your own Tor
 ```
 
 ### Interactive debugging

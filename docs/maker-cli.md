@@ -227,8 +227,8 @@ $ ./maker-cli get-balances
 {
   "contract": 0,
   "fidelity": 10000,
-  "regular": 989000,
-  "spendable": 989000,
+  "regular": 989773,
+  "spendable": 989773,
   "swap": 0
 }
 ```
@@ -278,8 +278,8 @@ $ ./maker-cli get-balances
 {
   "contract": 0,
   "fidelity": 10000,
-  "regular": 989000,
-  "spendable": 989000,
+  "regular": 989773,
+  "spendable": 989773,
   "swap": 0
 }
 ```
@@ -301,8 +301,8 @@ $ ./maker-cli list-utxo
     "utxo_type": "fidelity-bond"
   },
   {
-    "addr": "tb1qu332pjytwdu0z73f5xzftkk06hpgdyvjvef9kn",
-    "amount": 989000,
+    "addr": "tb1p...",
+    "amount": 989773,
     "confirmations": 1,
     "utxo_type": "regular"
   }
@@ -318,11 +318,11 @@ This lists all UTXOs in the wallet, including fidelity bonds. We created a fundi
 
 - Initially, we funded the wallet with `0.01 BTC` (1,000,000 sats).
 - `10,000 sats` were locked in the fidelity bond.
-- `1,000 sats` were paid as the mining fee for the fidelity transaction. The fee depends on `fidelity_feerate`, which defaults to 1 sat/vB.
+- `227 sats` were paid as the mining fee for the fidelity transaction. The transaction is 227 vB, and `fidelity_feerate` defaults to 1 sat/vB.
 
 The remaining balance after these transactions is:
 
-**989,000 sats** = **1,000,000 sats** (total funding) - **10,000 sats** (for the fidelity bond) - **1,000 sats** (mining fees).
+**989,773 sats** = **1,000,000 sats** (total funding) - **10,000 sats** (for the fidelity bond) - **227 sats** (mining fees).
 
 We can verify this balance by running the `get-balances` command, which shows the total wallet balances of different categories:
 
@@ -331,8 +331,8 @@ $ ./maker-cli get-balances
 {
   "contract": 0,
   "fidelity": 10000,
-  "regular": 989000,
-  "spendable": 989000,
+  "regular": 989773,
+  "spendable": 989773,
   "swap": 0
 }
 ```
@@ -433,8 +433,8 @@ $ ./maker-cli get-balances
 {
   "contract": 0,
   "fidelity": 10000,
-  "regular": 978500,
-  "spendable": 978500,
+  "regular": 979489,
+  "spendable": 979489,
   "swap": 0
 }
 ```
@@ -453,8 +453,8 @@ $ ./maker-cli get-balances
 {
   "contract": 0,
   "fidelity": 10000,
-  "regular": 978500,
-  "spendable": 978500,
+  "regular": 979489,
+  "spendable": 979489,
   "swap": 0
 }
 ```
@@ -471,8 +471,8 @@ $ ./maker-cli get-balances
 {
   "contract": 0,
   "fidelity": 10000,
-  "regular": 978500,
-  "spendable": 978500,
+  "regular": 979489,
+  "spendable": 979489,
   "swap": 0
 }
 ```
@@ -492,8 +492,8 @@ $ ./maker-cli list-utxo
     "utxo_type": "fidelity-bond"
   },
   {
-    "addr": "tb1qu332pjytwdu0z73f5xzftkk06hpgdyvjvef9kn",
-    "amount": 978500,
+    "addr": "tb1p...",
+    "amount": 979489,
     "confirmations": 1,
     "utxo_type": "regular"
   }
@@ -503,13 +503,13 @@ $ ./maker-cli get-balances
 {
   "contract": 0,
   "fidelity": 10000,
-  "regular": 978500,
-  "spendable": 978500,
+  "regular": 979489,
+  "spendable": 979489,
   "swap": 0
 }
 ```
 
-After sending `10,000 sats` with a ~`500 sats` mining fee, the spendable balance dropped from `989,000` to `978,500` sats, and the change was consolidated back into the regular wallet UTXO.
+After sending `10,000 sats` with a `284 sats` mining fee (142 vB at 2 sats/vByte), the spendable balance dropped from `989,773` to `979,489` sats. The change went back into the regular wallet UTXO.
 
 ---
 

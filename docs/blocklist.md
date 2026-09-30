@@ -56,7 +56,7 @@ The taker always funds first, so this asymmetry follows from the protocol rather
 
 | Condition | Behaviour |
 |-----------|-----------|
-| More than 25 inputs | Refused without screening |
+| More than 25 inputs, list not empty | Refused without screening |
 | Previous output cannot be resolved | Refused |
 | List empty | Returns without querying the node |
 | Entry's address encodes a different network | Skipped, with address and reason recorded |

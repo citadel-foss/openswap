@@ -123,7 +123,7 @@ This section focuses on `Makerd`, walking you through the process of starting an
 `Makerd` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on the **custom signet** (check the [bitcoind doc](./bitcoind.md)). The examples below use Bitcoin Core. To get started, start `bitcoind`:
 
 > **Important:**  
-> All apps are designed to run on our **custom signet** for testing purposes. The marketplace is only live in custom signet. Running the maker in other networks will not work as there's no marketplace in that network.
+> The marketplace runs on our **custom signet**, where we test. Mainnet use is experimental. Makers announce themselves separately on each network, so you only find makers on the network your node runs.
 
 To start `bitcoind`:
 

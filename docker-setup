@@ -59,7 +59,6 @@ BITCOIN_RPC_USER="$BITCOIN_RPC_USER"
 BITCOIN_RPC_PASSWORD="$BITCOIN_RPC_PASSWORD"
 MAKERD_PORT="$MAKERD_PORT"
 MAKERD_RPC_PORT="$MAKERD_RPC_PORT"
-WALLET_PASSPHRASE="$WALLET_PASSPHRASE"
 TOR_SOCKS_PORT="$TOR_SOCKS_PORT"
 TOR_CONTROL_PORT="$TOR_CONTROL_PORT"
 TOR_AUTH_PASSWORD="$TOR_AUTH_PASSWORD"
@@ -69,6 +68,8 @@ EXTERNAL_BITCOIND_HOST="$EXTERNAL_BITCOIND_HOST"
 EXTERNAL_TOR_HOST="$EXTERNAL_TOR_HOST"
 BITCOIN_WALLET_NAME="$BITCOIN_WALLET_NAME"
 EOF
+    # %q keeps the passphrase byte-exact when load_config sources the file.
+    printf 'WALLET_PASSPHRASE=%q\n' "$WALLET_PASSPHRASE" >> "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
     print_success "Configuration saved to $CONFIG_FILE"
 }
@@ -255,7 +256,7 @@ select_bitcoin_wallet() {
 # The maker wallet is always encrypted, so makerd needs a passphrase to create or open it.
 prompt_wallet_passphrase() {
     while [ -z "$WALLET_PASSPHRASE" ]; do
-        read -s -p "Maker wallet passphrase: " WALLET_PASSPHRASE
+        IFS= read -r -s -p "Maker wallet passphrase: " WALLET_PASSPHRASE
         echo ""
     done
 }

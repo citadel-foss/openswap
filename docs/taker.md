@@ -18,7 +18,7 @@ The taker CLI is an application that allows you to perform openswaps as a taker.
 `Taker` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on a **custom signet** (check the [bitcoind doc](./bitcoind.md)). The examples below use Bitcoin Core.
 
 > **Important:**  
-> All apps are designed to run on our **custom signet** for testing purposes. The marketplace is only live in custom signet. Running the taker in other networks will not work as there's no marketplace in that network.
+> The marketplace runs on our **custom signet**, where we test. Mainnet use is experimental. Makers announce themselves separately on each network, so you only find makers on the network your node runs.
 
 To start `bitcoind`:
 
@@ -167,10 +167,10 @@ $ taker get-new-address
 **Output:**
 
 ```bash
-bcrt1p...
+tb1p...
 ```
 
-This returns a new taproot receiving address from the taker's wallet. The address starts with `bcrt1p` on regtest.
+This returns a new taproot receiving address from the taker's wallet. On the custom signet it starts with `tb1p`. On regtest it starts with `bcrt1p`, and the signet faucet cannot fund it.
 
 Now we can use the signet faucet to send some coins to this address. Use [this faucet](https://faucet.openswap.live/) to get some signet coins.
 
