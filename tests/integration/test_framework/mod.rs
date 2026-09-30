@@ -7,11 +7,18 @@
 //! Each framework keeps its data, including the bitcoind data directory, in its own
 //! `openswap-<random u64>` directory under [`std::env::temp_dir()`], logged at startup.
 //! [TestFramework::stop] deletes it, as does `Drop for TestFramework` when `stop()` was never
-//! called, so the data is only there while the test runs. It survives only when teardown never runs, e.g. the process is killed.
+//! called, so the data is only there while the test runs. It survives only when teardown never
+//! runs, e.g. the process is killed.
+//!
+//! [World] wraps the same `init` call and owns what it returns: [MakerHandle]s, [TakerHandle]s
+//! and a single teardown order that `Drop` also runs when a test panics. [BalanceExpect] states
+//! which balance fields a test asserts.
 
 mod actors;
 mod backend;
 mod chain;
+mod expect;
+mod harness;
 #[cfg(feature = "lightning")]
 mod lightning;
 mod logs;
@@ -28,6 +35,8 @@ pub use self::{
     actors::*,
     backend::*,
     chain::*,
+    expect::*,
+    harness::*,
     procs::{electrs::*, tor::*},
     reports::*,
     tracker::*,
