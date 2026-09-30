@@ -232,6 +232,10 @@ impl TestFramework {
                 }
             })
             .expect("nostr relay failed to start on three fresh ports");
+        // Until the framework below owns the relay, a panic while building the
+        // takers, makers or electrs would drop a bare `Child`, which leaves the
+        // process running; the guard kills it on that path instead.
+        let mut nostr_relay = RelayGuard(Some(nostr_relay));
         let nostr_relay_url = format!("ws://127.0.0.1:{nostr_port}");
         let mut electrsd: Option<ElectrsD> = None;
         let (takers, makers) = {
@@ -343,7 +347,7 @@ impl TestFramework {
             shutdown: AtomicBool::new(false),
             torn_down: AtomicBool::new(false),
             block_gen_paused: AtomicBool::new(false),
-            nostr_relay: Mutex::new(Some(nostr_relay)),
+            nostr_relay: Mutex::new(nostr_relay.0.take()),
         });
         let (blocks_per_tick, block_tick_interval) = B::block_cadence();
         log::info!(
@@ -503,6 +507,18 @@ impl TestFramework {
         drop(takers);
         self.stop();
         block_generation_handle.join().unwrap();
+    }
+}
+
+/// Owns the nostr relay during `init`, killing it if `init` unwinds before the
+/// framework takes it over.
+struct RelayGuard(Option<Child>);
+
+impl Drop for RelayGuard {
+    fn drop(&mut self) {
+        if let Some(mut relay) = self.0.take() {
+            let _ = relay.kill().and_then(|_| relay.wait());
+        }
     }
 }
 
