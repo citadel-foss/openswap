@@ -7,40 +7,29 @@ use openswap::{
     taker::{error::TakerError, SwapParams, TakerBehavior},
     wallet::AddressType,
 };
-use std::sync::atomic::Ordering::Relaxed;
 
 use super::test_framework::*;
 
 #[test]
 fn maker_rejects_new_swaps_after_watcher_exit() {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
 
-    let taker = &mut takers[0];
-    fund_taker_default(taker, bitcoind, 2);
-    fund_makers(
-        &makers,
-        bitcoind,
-        2,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    world.fund_taker_default(2);
+    world.fund_makers(2, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
 
-    let maker_threads = spawn_makers(&makers);
-    wait_for_makers_setup(&makers, 120);
+    world.start_makers_without_sync(120);
 
-    let maker = &makers[0];
+    let maker = world.makers()[0].inner();
     assert!(maker.watch_service.is_alive());
     maker.watch_service.stop_watcher_for_test();
     assert!(!maker.watch_service.is_alive());
 
     for protocol in [ProtocolVersion::Legacy, ProtocolVersion::Taproot] {
-        let result = taker.prepare_swap(
+        let result = world.taker_mut().prepare(
             SwapParams::new(protocol, Amount::from_sat(500_000), 1)
                 .with_tx_count(1)
                 .with_required_confirms(1),
@@ -55,52 +44,39 @@ fn maker_rejects_new_swaps_after_watcher_exit() {
         }
     }
 
-    drop(takers);
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|handle| handle.join().unwrap());
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 #[test]
 fn taker_refuses_swap_before_funding_after_watcher_exit() {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = &mut takers[0];
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
 
-    fund_taker_default(taker, bitcoind, 2);
-    fund_makers(
-        &makers,
-        bitcoind,
-        2,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    world.fund_taker_default(2);
+    world.fund_makers(2, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
 
-    let maker_threads = spawn_makers(&makers);
-    wait_for_makers_setup(&makers, 120);
+    world.start_makers_without_sync(120);
 
-    let summary = taker
-        .prepare_swap(
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
                 .with_tx_count(1)
                 .with_required_confirms(1),
         )
         .unwrap();
-    taker.behavior = TakerBehavior::StopWatcherBeforeSwap;
-    let error = taker.start_swap(&summary.swap_id).unwrap_err();
+    world
+        .taker_mut()
+        .set_behavior(TakerBehavior::StopWatcherBeforeSwap);
+    let error = world.taker_mut().start(&summary.swap_id).unwrap_err();
     assert!(format!("{error:?}").contains("watchtower is down"));
     assert_eq!(
-        taker
+        world
+            .taker()
+            .inner()
             .get_wallet()
             .read()
             .unwrap()
@@ -108,15 +84,7 @@ fn taker_refuses_swap_before_funding_after_watcher_exit() {
         0
     );
 
-    drop(takers);
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|handle| handle.join().unwrap());
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 #[test]

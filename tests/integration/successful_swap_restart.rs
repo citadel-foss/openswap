@@ -8,7 +8,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior, MakerServer},
+    maker::{MakerBehavior, MakerServer},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
 };
@@ -22,44 +22,34 @@ use std::{
 };
 
 fn run_successful_swap_restart(protocol: ProtocolVersion) {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            2,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal, MakerBehavior::Normal],
-        );
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .maker_behaviors(vec![MakerBehavior::Normal, MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    fund_taker_default(&takers[0], bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_nth_taker_default(0, 3);
+    world.fund_makers_default();
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = Arc::clone(maker);
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect();
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
-    generate_blocks(bitcoind, 1);
-    let summary = takers[0]
-        .prepare_swap(
+    world.mine(1);
+    let summary = world.takers_mut()[0]
+        .prepare(
             SwapParams::new(protocol, Amount::from_sat(500_000), 2)
                 .with_tx_count(2)
                 .with_required_confirms(1),
         )
         .expect("prepare successful swap");
-    takers[0]
-        .start_swap(&summary.swap_id)
+    world.takers_mut()[0]
+        .start(&summary.swap_id)
         .expect("swap must complete successfully");
 
     // The taker can return just before the maker handler finishes its durable
     // cleanup. Wait for that cleanup, not for an arbitrary sleep.
     let deadline = Instant::now() + Duration::from_secs(120);
-    while makers.iter().any(|maker| {
-        let wallet = maker.wallet.read().unwrap();
+    while world.makers().iter().any(|maker| {
+        let wallet = maker.inner().wallet.read().unwrap();
         wallet.get_incoming_swapcoins_count() != 0 || wallet.get_outgoing_swapcoins_count() != 0
     }) {
         assert!(
@@ -70,34 +60,29 @@ fn run_successful_swap_restart(protocol: ProtocolVersion) {
         thread::sleep(Duration::from_millis(250));
     }
 
-    let configs = makers
+    let configs = world
+        .makers()
         .iter()
         .map(|maker| {
-            let mut config = maker.config.clone();
+            let mut config = maker.inner().config.clone();
             // Initialization consumes the configured passphrase.
             config.password = Some("integration-test".to_string());
             config
         })
         .collect::<Vec<_>>();
-    drop(takers);
-    shutdown_makers(&makers, maker_threads);
-    drop(makers);
+    world.drop_takers();
+    world.shutdown_makers();
+    world.drop_makers();
 
-    let restarted = configs
-        .into_iter()
-        .map(|config| Arc::new(MakerServer::init(config).unwrap()))
-        .collect::<Vec<_>>();
-    let restarted_threads = restarted
-        .iter()
-        .map(|maker| {
-            let maker = Arc::clone(maker);
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect();
-    wait_for_makers_setup(&restarted, 120);
+    world.adopt_makers(
+        configs
+            .into_iter()
+            .map(|config| Arc::new(MakerServer::init(config).unwrap())),
+    );
+    world.start_makers_without_sync(120);
 
-    for maker in &restarted {
-        let wallet = maker.wallet.read().unwrap();
+    for maker in world.makers() {
+        let wallet = maker.inner().wallet.read().unwrap();
         assert_eq!(
             wallet.get_incoming_swapcoins_count(),
             0,
@@ -110,9 +95,8 @@ fn run_successful_swap_restart(protocol: ProtocolVersion) {
         );
     }
 
-    shutdown_makers(&restarted, restarted_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 fn run_interrupted_restart(
@@ -120,42 +104,32 @@ fn run_interrupted_restart(
     behavior: MakerBehavior,
     incoming_remains: bool,
 ) {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            2,
-            vec![TakerBehavior::Normal],
-            vec![behavior, behavior],
-        );
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .maker_behaviors(vec![behavior, behavior])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    fund_taker_default(&takers[0], bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_nth_taker_default(0, 3);
+    world.fund_makers_default();
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker = Arc::clone(maker);
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect();
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
-    generate_blocks(bitcoind, 1);
-    let summary = takers[0]
-        .prepare_swap(
+    world.mine(1);
+    let summary = world.takers_mut()[0]
+        .prepare(
             SwapParams::new(protocol, Amount::from_sat(500_000), 2)
                 .with_tx_count(2)
                 .with_required_confirms(1),
         )
         .expect("prepare interrupted swap");
-    takers[0]
-        .start_swap(&summary.swap_id)
+    world.takers_mut()[0]
+        .start(&summary.swap_id)
         .expect("handover must complete before maker interruption");
 
     let deadline = Instant::now() + Duration::from_secs(120);
-    while makers.iter().any(|maker| {
-        let wallet = maker.wallet.read().unwrap();
+    while world.makers().iter().any(|maker| {
+        let wallet = maker.inner().wallet.read().unwrap();
         wallet.get_outgoing_swapcoins_count() == 0
             || incoming_remains != (wallet.get_incoming_swapcoins_count() != 0)
     }) {
@@ -166,34 +140,29 @@ fn run_interrupted_restart(
         thread::sleep(Duration::from_millis(250));
     }
 
-    let configs = makers
+    let configs = world
+        .makers()
         .iter()
         .map(|maker| {
-            let mut config = maker.config.clone();
+            let mut config = maker.inner().config.clone();
             config.password = Some("integration-test".to_string());
             config
         })
         .collect::<Vec<_>>();
-    drop(takers);
-    shutdown_makers(&makers, maker_threads);
-    drop(makers);
+    world.drop_takers();
+    world.shutdown_makers();
+    world.drop_makers();
 
-    let restarted = configs
-        .into_iter()
-        .map(|config| Arc::new(MakerServer::init(config).unwrap()))
-        .collect::<Vec<_>>();
-    let restarted_threads = restarted
-        .iter()
-        .map(|maker| {
-            let maker = Arc::clone(maker);
-            thread::spawn(move || start_server(maker).unwrap())
-        })
-        .collect();
-    wait_for_makers_setup(&restarted, 120);
+    world.adopt_makers(
+        configs
+            .into_iter()
+            .map(|config| Arc::new(MakerServer::init(config).unwrap())),
+    );
+    world.start_makers_without_sync(120);
 
     let deadline = Instant::now() + Duration::from_secs(120);
-    while restarted.iter().any(|maker| {
-        let wallet = maker.wallet.read().unwrap();
+    while world.makers().iter().any(|maker| {
+        let wallet = maker.inner().wallet.read().unwrap();
         wallet.get_incoming_swapcoins_count() != 0 || wallet.get_outgoing_swapcoins_count() != 0
     }) {
         assert!(
@@ -203,9 +172,8 @@ fn run_interrupted_restart(
         thread::sleep(Duration::from_millis(250));
     }
 
-    shutdown_makers(&restarted, restarted_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 #[test]
