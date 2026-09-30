@@ -17,9 +17,10 @@
 //!
 //! An ephemeral onion service must upload its descriptor to the HSDir ring and
 //! the client must fetch it back, so these **cannot work offline**. They are
-//! `#[ignore]`d and additionally require `OPENSWAP_TOR_IT=1`; without that
-//! variable they skip, but with it set and Tor unreachable they deliberately
-//! panic — a misconfigured Tor must not pass silently. Run them with:
+//! `#[ignore]`d and additionally require `OPENSWAP_TOR_IT=1`, checked by the
+//! `tor_gate!()` that opens each row; without that variable they skip, but
+//! with it set and Tor unreachable they deliberately panic — a misconfigured
+//! Tor must not pass silently. Run them with:
 //!
 //! ```text
 //! OPENSWAP_TOR_IT=1 cargo test --features integration-test electrum_tor \
@@ -42,40 +43,34 @@ use openswap::protocol::common_messages::ProtocolVersion;
 use super::{
     electrum_abort1::{run_abort1, LEGACY_EXPECTED, TAPROOT_EXPECTED},
     malice2::run_malice2,
-    test_framework::{tor_it_enabled, TorElectrumBackend},
+    test_framework::TorElectrumBackend,
 };
 
 use log::warn;
 
-/// Taproot abort1 over Tor: the widest watchtower path in the suite.
-#[test]
-#[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
-fn tor_abort1_taproot() {
-    if !tor_it_enabled() {
-        return;
-    }
-    warn!("Running Test: abort1 (Taproot) over Tor Electrum");
-    run_abort1::<TorElectrumBackend>(ProtocolVersion::Taproot, &TAPROOT_EXPECTED);
-}
+swap_matrix! {
+    run_abort1 => {
+        /// Taproot abort1 over Tor: the widest watchtower path in the suite.
+        #[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
+        tor_abort1_taproot: {
+            tor_gate!();
+            warn!("Running Test: abort1 (Taproot) over Tor Electrum");
+        } <TorElectrumBackend>(ProtocolVersion::Taproot, &TAPROOT_EXPECTED),
 
-/// Legacy abort1 over Tor. Same cascade, different contract shape.
-#[test]
-#[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
-fn tor_abort1_legacy() {
-    if !tor_it_enabled() {
-        return;
+        /// Legacy abort1 over Tor. Same cascade, different contract shape.
+        #[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
+        tor_abort1_legacy: {
+            tor_gate!();
+            warn!("Running Test: abort1 (Legacy) over Tor Electrum");
+        } <TorElectrumBackend>(ProtocolVersion::Legacy, &LEGACY_EXPECTED),
     }
-    warn!("Running Test: abort1 (Legacy) over Tor Electrum");
-    run_abort1::<TorElectrumBackend>(ProtocolVersion::Legacy, &LEGACY_EXPECTED);
-}
 
-/// Malicious contract broadcast over Tor, exercising the taker's breach detector.
-#[test]
-#[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
-fn tor_malice2() {
-    if !tor_it_enabled() {
-        return;
+    run_malice2 => {
+        /// Malicious contract broadcast over Tor, exercising the taker's breach detector.
+        #[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
+        tor_malice2: {
+            tor_gate!();
+            warn!("Running Test: malice2 (maker broadcasts contract) over Tor Electrum");
+        } <TorElectrumBackend>(),
     }
-    warn!("Running Test: malice2 (maker broadcasts contract) over Tor Electrum");
-    run_malice2::<TorElectrumBackend>();
 }
