@@ -30,19 +30,19 @@ use openswap::{
     maker::{MakerBehavior, MakerServer},
     taker::{error::TakerError, SwapParams, SwapSummary, Taker, TakerBehavior},
     utill::NO_SHUTDOWN,
-    wallet::{Balances, TakerReport},
+    wallet::{AddressType, Balances, TakerReport},
 };
 
 use super::{
     actors::{
-        fund_makers_default, fund_taker_default, shutdown_makers, spawn_makers,
+        fund_makers, fund_makers_default, fund_taker_default, shutdown_makers, spawn_makers,
         spawn_ready_makers_and_mine, sync_maker_wallets, verify_maker_pre_swap_balances,
         wait_for_makers_setup,
     },
     backend::TestBackend,
     procs::bitcoind::generate_blocks,
     tracker::{spawn_tracker_logger, TrackerLoggerHandle},
-    world::TestFramework,
+    world::{MakerFeeOverride, TestFramework},
 };
 
 /// Collects what [`TestFramework::init`] takes. Nothing is defaulted on the
@@ -51,6 +51,7 @@ pub struct WorldBuilder<B> {
     maker_count: usize,
     maker_behaviors: Vec<MakerBehavior>,
     taker_behaviors: Vec<TakerBehavior>,
+    fee_overrides: Option<Vec<Option<MakerFeeOverride>>>,
     backend: PhantomData<fn() -> B>,
 }
 
@@ -75,7 +76,19 @@ impl<B: TestBackend> WorldBuilder<B> {
         self
     }
 
-    /// Runs [`TestFramework::init`] with the collected arguments.
+    /// Per-maker fee schedules, in maker order, one slot per maker; `None`
+    /// keeps the default schedule. Builds through
+    /// [`TestFramework::init_with_fee_overrides`] instead of `init`.
+    pub fn fee_overrides(
+        mut self,
+        overrides: impl IntoIterator<Item = Option<MakerFeeOverride>>,
+    ) -> Self {
+        self.fee_overrides = Some(overrides.into_iter().collect());
+        self
+    }
+
+    /// Runs [`TestFramework::init`] with the collected arguments, or
+    /// [`TestFramework::init_with_fee_overrides`] when fee overrides are set.
     #[must_use = "dropping the World tears the framework down at once"]
     pub fn build(self) -> World {
         // `init` ignores behaviors past the maker count; refuse instead of
@@ -86,8 +99,20 @@ impl<B: TestBackend> WorldBuilder<B> {
             self.maker_behaviors.len(),
             self.maker_count
         );
-        let (framework, takers, makers, block_generation) =
-            TestFramework::init::<B>(self.maker_count, self.taker_behaviors, self.maker_behaviors);
+        let (framework, takers, makers, block_generation) = match self.fee_overrides {
+            None => TestFramework::init::<B>(
+                self.maker_count,
+                self.taker_behaviors,
+                self.maker_behaviors,
+            ),
+            // `init_with_fee_overrides` reads only the length of the config map.
+            Some(fee_overrides) => TestFramework::init_with_fee_overrides::<B>(
+                vec![(0, None); self.maker_count],
+                fee_overrides,
+                self.taker_behaviors,
+                self.maker_behaviors,
+            ),
+        };
         World {
             takers: takers
                 .into_iter()
@@ -126,6 +151,7 @@ impl World {
             maker_count: 0,
             maker_behaviors: Vec::new(),
             taker_behaviors: Vec::new(),
+            fee_overrides: None,
             backend: PhantomData,
         }
     }
@@ -170,6 +196,16 @@ impl World {
         self.takers.remove(0)
     }
 
+    /// The takers, in taker order.
+    pub fn takers(&self) -> &[TakerHandle] {
+        &self.takers
+    }
+
+    /// The takers, in taker order, mutably.
+    pub fn takers_mut(&mut self) -> &mut [TakerHandle] {
+        &mut self.takers
+    }
+
     /// The makers, in maker order.
     pub fn makers(&self) -> &[MakerHandle] {
         &self.makers
@@ -180,9 +216,31 @@ impl World {
         fund_taker_default(&self.taker().taker, self.bitcoind(), utxo_count)
     }
 
+    /// [`fund_taker_default`] on `takers[index]`; returns its spendable balance.
+    #[track_caller]
+    pub fn fund_nth_taker_default(&self, index: usize, utxo_count: u32) -> Amount {
+        fund_taker_default(&self.takers[index].taker, self.bitcoind(), utxo_count)
+    }
+
     /// [`fund_makers_default`] on every maker.
     pub fn fund_makers_default(&self) -> Vec<Amount> {
         fund_makers_default(&self.servers(), self.bitcoind())
+    }
+
+    /// [`fund_makers`] on every maker.
+    pub fn fund_makers(
+        &self,
+        utxo_count: u32,
+        utxo_value: Amount,
+        address_type: AddressType,
+    ) -> Vec<Amount> {
+        fund_makers(
+            &self.servers(),
+            self.bitcoind(),
+            utxo_count,
+            utxo_value,
+            address_type,
+        )
     }
 
     /// Starts every maker server, waits up to `setup_timeout_secs` for their
