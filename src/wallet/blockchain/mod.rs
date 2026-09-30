@@ -476,12 +476,9 @@ impl AnyBlockchain {
         }
     }
 
-    /// Feerate in sat/vB that a replacement must add over the tx it replaces.
-    ///
-    /// Core reports its own `incrementalrelayfee`. Electrum has no such call,
-    /// and a failed read says nothing, so both assume the relay floor. The
-    /// floor also bounds a lower Core setting: the replacement still has to
-    /// relay through peers on the default.
+    /// Feerate in sat/vB a replacement must add: Core's `incrementalrelayfee`,
+    /// or the relay floor when the backend reports none. Never below the
+    /// floor, since the replacement must relay through default peers too.
     pub(crate) fn replacement_increment_rate(&self) -> f64 {
         let reported = match self {
             AnyBlockchain::CoreRPC(b) => b
