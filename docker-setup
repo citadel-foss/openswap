@@ -685,7 +685,7 @@ start_makerd() {
         echo -e "Ensure you have enough Swap Liquidity to participate in the market."
         echo -e ""
         echo -e "If the maker server starts successfully, you will see a log like below:"
-        echo -e "  [6102] Server setup complete! Listening on port 6102"
+        echo -e "  [<port>] Server setup complete! Listening on port <port>"
         echo -e "  [6103] RPC socket binding successful at 127.0.0.1:6103"
         echo -e ""
         echo -e "Press Ctrl+C to stop watching logs (this will keep the maker server running in the background)."
