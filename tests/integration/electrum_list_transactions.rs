@@ -21,14 +21,16 @@ const SEND_AMOUNT: Amount = Amount::from_sat(1_000_000);
 #[test]
 fn test_electrum_list_transactions() {
     info!("Running Test: Electrum wallet transaction history");
-    let (test_framework, mut takers, _makers, block_generation_handle) =
-        TestFramework::init::<ElectrumBackend>(0, vec![TakerBehavior::Normal], vec![]);
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let world = World::builder::<ElectrumBackend>()
+        .makers(0)
+        .takers(vec![TakerBehavior::Normal])
+        .build();
 
-    fund_taker(taker, bitcoind, UTXO_COUNT, UTXO_VALUE, AddressType::P2WPKH);
+    world.fund_taker(UTXO_COUNT, UTXO_VALUE, AddressType::P2WPKH);
 
-    let txs = taker
+    let txs = world
+        .taker()
+        .inner()
         .get_wallet()
         .read()
         .unwrap()
@@ -49,13 +51,16 @@ fn test_electrum_list_transactions() {
 
     // Spend to an address outside the wallet: the payment must show up as a
     // send, and the change coming back must not be counted as a receive.
-    let external = bitcoind
+    let external = world
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
         .require_network(bitcoin::Network::Regtest)
         .unwrap();
-    let spend_txid = taker
+    let spend_txid = world
+        .taker()
+        .inner()
         .get_wallet()
         .write()
         .unwrap()
@@ -66,16 +71,13 @@ fn test_electrum_list_transactions() {
             None,
         )
         .unwrap();
-    generate_blocks(bitcoind, 1);
-    test_framework.wait_for_electrs_tip();
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
+    world.taker().sync();
 
-    let txs = taker
+    let txs = world
+        .taker()
+        .inner()
         .get_wallet()
         .read()
         .unwrap()
@@ -120,7 +122,9 @@ fn test_electrum_list_transactions() {
     );
 
     // Paging: `skip` walks back from the newest entry.
-    let newest = taker
+    let newest = world
+        .taker()
+        .inner()
         .get_wallet()
         .read()
         .unwrap()
@@ -128,7 +132,9 @@ fn test_electrum_list_transactions() {
         .unwrap();
     assert_eq!(newest.len(), 1, "{newest:#?}");
     assert_eq!(newest[0].info.txid, spend_txid, "{newest:#?}");
-    let skipped = taker
+    let skipped = world
+        .taker()
+        .inner()
         .get_wallet()
         .read()
         .unwrap()
@@ -138,6 +144,5 @@ fn test_electrum_list_transactions() {
     assert_ne!(skipped[0].info.txid, spend_txid, "{skipped:#?}");
 
     info!("Electrum transaction history test completed successfully!");
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }

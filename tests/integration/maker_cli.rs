@@ -10,10 +10,10 @@
 
 use bitcoin::{Address, Amount};
 use openswap::{
-    maker::{start_server, AuthenticatedRpcRequest, MakerBehavior, RpcMsgReq, RpcMsgResp},
+    maker::{AuthenticatedRpcRequest, MakerBehavior, RpcMsgReq, RpcMsgResp},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    utill::{read_message, send_message, NO_SHUTDOWN},
+    utill::{read_message, send_message},
 };
 
 use super::test_framework::*;
@@ -59,58 +59,43 @@ fn test_maker_rpc_server() {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    let taker_original_balance = world.fund_taker_default(3);
+    world.fund_makers_default();
 
     info!("Starting Maker servers...");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
+    world.start_makers(120);
 
-    wait_for_makers_setup(&makers, 120);
-
-    sync_maker_wallets(&makers);
-
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
 
     // A completed swap gives the maker incoming swap coins and a swap id.
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
-    generate_blocks(bitcoind, 1);
-    let summary = taker
-        .prepare_swap(swap_params)
+    world.mine(1);
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
-    taker
-        .start_swap(&summary.swap_id)
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("OpenSwap should complete successfully");
     let swap_id = summary.swap_id.clone();
     info!("Swap {} completed, querying maker RPC", swap_id);
 
     // Same swap parameters as `taproot_swap`, so the same golden values apply.
     // Assert them before the RPC section, which moves funds via SendToAddress.
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&NO_SHUTDOWN)
-        .unwrap();
-    generate_blocks(bitcoind, 1);
-    sync_maker_wallets(&makers);
+    world.taker().sync();
+    world.mine(1);
+    world.sync_makers();
 
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances = world.taker().balances();
     info!(
         "Taker balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
         taker_balances.regular,
@@ -146,8 +131,13 @@ fn test_maker_rpc_server() {
     let expected_regular = [14500751u64, 14502170];
     let expected_swap = [499664u64, 498208];
     let expected_fee = [658u64, 621];
-    for (i, (maker, original)) in makers.iter().zip(&maker_spendable_balance).enumerate() {
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, (maker, original)) in world
+        .makers()
+        .iter()
+        .zip(&maker_spendable_balance)
+        .enumerate()
+    {
+        let balances = maker.balances();
         info!(
             "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
             i,
@@ -188,7 +178,7 @@ fn test_maker_rpc_server() {
         );
     }
 
-    let target = &makers[0];
+    let target = &world.makers()[0].inner();
     let rpc_port = target.config.rpc_port;
     let data_dir = target.config.data_dir.clone();
     let cookie = fs::read_to_string(data_dir.join("rpc_cookie"))
@@ -386,7 +376,7 @@ fn test_maker_rpc_server() {
         "Stop must answer Shutdown"
     );
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !makers[0].shutdown.load(Relaxed) {
+    while !world.makers()[0].inner().shutdown.load(Relaxed) {
         assert!(
             Instant::now() < deadline,
             "Stop did not shut the maker down within 60s"
@@ -395,10 +385,9 @@ fn test_maker_rpc_server() {
     }
     info!("Maker 0 shut down via RPC Stop");
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
     info!("Maker RPC server test completed successfully!");
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
