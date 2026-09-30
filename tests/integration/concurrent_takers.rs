@@ -8,7 +8,6 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
     wallet::AddressType,
@@ -52,65 +51,37 @@ fn concurrent_takers(
         protocol
     );
 
-    let taker_behavior = vec![TakerBehavior::Normal, TakerBehavior::Normal];
-
     // Initialize test framework with 2 takers and 2 makers
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
-
-    let bitcoind = &test_framework.bitcoind;
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .takers([TakerBehavior::Normal, TakerBehavior::Normal])
+        .build();
 
     // Fund each taker thrice with one 0.05 BTC UTXO (0.15 total), one per call so
     // each lands on a distinct address.
     let mut taker1_original_balance = Amount::ZERO;
     let mut taker2_original_balance = Amount::ZERO;
     for _ in 0..3 {
-        taker1_original_balance = fund_taker_default(&takers[0], bitcoind, 1);
-        taker2_original_balance = fund_taker_default(&takers[1], bitcoind, 1);
+        taker1_original_balance = world.fund_nth_taker_default(0, 1);
+        taker2_original_balance = world.fund_nth_taker_default(1, 1);
     }
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(5_500_000),
-        AddressType::P2TR,
-    );
+    world.fund_makers(1, Amount::from_sat(5_500_000), AddressType::P2TR);
     for _ in 0..3 {
-        fund_makers(
-            &makers,
-            bitcoind,
-            1,
-            Amount::from_sat(250_000),
-            AddressType::P2TR,
-        );
+        world.fund_makers(1, Amount::from_sat(250_000), AddressType::P2TR);
     }
 
-    // Start the maker server threads
+    // Start the makers, wait for their setup, then sync their wallets so the
+    // fidelity bonds are accounted for
     log::info!("Starting Maker servers...");
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup to ensure fidelity bonds are accounted for
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
     // Collect pre-swap spendable balances (skip standard assertions since we use limited liquidity)
-    let maker_spendable_balance: Vec<Amount> = makers
+    let maker_spendable_balance: Vec<Amount> = world
+        .makers()
         .iter()
         .enumerate()
         .map(|(i, maker)| {
-            let wallet = maker.wallet.read().unwrap();
-            let balances = wallet.get_balances().unwrap();
+            let balances = maker.balances();
             info!(
                 "Maker {} pre-swap: Regular: {}, Fidelity: {}, Spendable: {}",
                 i, balances.regular, balances.fidelity, balances.spendable
@@ -125,14 +96,14 @@ fn concurrent_takers(
         protocol
     );
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // Use atomics for thread-safe result tracking
     let result1 = AtomicU8::new(RESULT_PENDING);
     let result2 = AtomicU8::new(RESULT_PENDING);
 
     thread::scope(|s| {
-        let (taker1_slice, taker2_slice) = takers.split_at_mut(1);
+        let (taker1_slice, taker2_slice) = world.takers_mut().split_at_mut(1);
         let taker1 = &mut taker1_slice[0];
         let taker2 = &mut taker2_slice[0];
 
@@ -145,8 +116,8 @@ fn concurrent_takers(
                 .with_tx_count(3)
                 .with_required_confirms(1);
 
-            match taker1.prepare_swap(swap_params) {
-                Ok(summary) => match taker1.start_swap(&summary.swap_id) {
+            match taker1.prepare(swap_params) {
+                Ok(summary) => match taker1.start(&summary.swap_id) {
                     Ok(report) => {
                         info!("Taker 1 {:?} openswap completed successfully!", protocol);
                         info!("Taker 1 swap report: {:?}", report);
@@ -173,8 +144,8 @@ fn concurrent_takers(
                 .with_tx_count(3)
                 .with_required_confirms(1);
 
-            match taker2.prepare_swap(swap_params) {
-                Ok(summary) => match taker2.start_swap(&summary.swap_id) {
+            match taker2.prepare(swap_params) {
+                Ok(summary) => match taker2.start(&summary.swap_id) {
                     Ok(report) => {
                         info!("Taker 2 {:?} openswap completed successfully!", protocol);
                         info!("Taker 2 swap report: {:?}", report);
@@ -209,7 +180,9 @@ fn concurrent_takers(
     // With limited liquidity, we expect one to succeed and one to fail.
     // Both are admitted; the loser's maker runs out of coins at funding.
     assert_eq!(success_count, 1, "Exactly one taker should succeed");
-    test_framework.assert_log("InsufficientLiquidity", &test_framework.taker_log_path());
+    world
+        .framework()
+        .assert_log("InsufficientLiquidity", &world.taker_log_path());
     assert_eq!(
         completed_count, 2,
         "Both takers should have completed (success or failure)"
@@ -218,26 +191,20 @@ fn concurrent_takers(
     log::info!("All openswaps processed. Transactions complete.");
 
     // Sync all wallets
-    for taker in takers.iter() {
-        taker
-            .get_wallet()
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
+    for taker in world.takers() {
+        taker.sync();
     }
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    for maker in makers.iter() {
-        let mut wallet = maker.wallet.write().unwrap();
-        wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    for maker in world.makers() {
+        maker.sync();
     }
 
     // ---- Verify balances ----
     let results = [r1, r2];
-    for (i, taker) in takers.iter().enumerate() {
-        let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    for (i, taker) in world.takers().iter().enumerate() {
+        let taker_balances = taker.balances();
         let original = if i == 0 {
             taker1_original_balance
         } else {
@@ -267,9 +234,13 @@ fn concurrent_takers(
     }
 
     // Verify maker balances
-    for (i, (maker, original_spendable)) in makers.iter().zip(maker_spendable_balance).enumerate() {
-        let wallet = maker.wallet.read().unwrap();
-        let balances = wallet.get_balances().unwrap();
+    for (i, (maker, original_spendable)) in world
+        .makers()
+        .iter()
+        .zip(maker_spendable_balance)
+        .enumerate()
+    {
+        let balances = maker.balances();
 
         info!(
             "Maker {} final balances - Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
@@ -306,14 +277,11 @@ fn concurrent_takers(
         protocol
     );
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    // Drop takers before stopping the framework so their background services
-    // shut down while bitcoind is still running.
-    drop(takers);
-
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    // `finish` drops the takers before stopping the framework, so their
+    // background services shut down while bitcoind is still running.
+    world.finish();
 }
 
 /// Two takers race ONE maker whose liquidity funds exactly one swap, both
@@ -325,57 +293,31 @@ fn concurrent_takers(
 fn test_concurrent_funding_race() {
     warn!("Running Test: concurrent funding race - identical plans on one maker");
 
-    let taker_behavior = vec![TakerBehavior::Normal, TakerBehavior::Normal];
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(1, taker_behavior, vec![MakerBehavior::Normal]);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .takers([TakerBehavior::Normal, TakerBehavior::Normal])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-
-    for taker in takers.iter() {
-        fund_taker_default(taker, bitcoind, 1);
+    for i in 0..world.takers().len() {
+        world.fund_nth_taker_default(i, 1);
     }
     // The 0.05 BTC UTXO covers the fidelity bond; what remains plus the 250k
     // funds exactly one 500k swap, so a second admission can never fit.
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(5_500_000),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(250_000),
-        AddressType::P2TR,
-    );
+    world.fund_makers(1, Amount::from_sat(5_500_000), AddressType::P2TR);
+    world.fund_makers(1, Amount::from_sat(250_000), AddressType::P2TR);
 
     log::info!("Starting Maker server...");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    let maker_spendable = makers[0]
-        .wallet
-        .read()
-        .unwrap()
-        .get_balances()
-        .unwrap()
-        .spendable;
+    world.start_makers(120);
+    let maker_spendable = world.makers()[0].balances().spendable;
     info!("Maker spendable before the race: {}", maker_spendable);
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // 400k twice would not fit the ~750k pool; one always fits, even after
     // the winner's swap shrinks the maker's offer max below the race amount.
-    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let maker_address = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    );
     let swap_params = || {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(400_000), 1)
             .with_tx_count(3)
@@ -389,7 +331,7 @@ fn test_concurrent_funding_race() {
     let results = [AtomicU8::new(RESULT_PENDING), AtomicU8::new(RESULT_PENDING)];
 
     thread::scope(|s| {
-        for (i, taker) in takers.iter_mut().enumerate() {
+        for (i, taker) in world.takers_mut().iter_mut().enumerate() {
             let barrier = start.clone();
             let result = &results[i];
             let params = swap_params();
@@ -397,8 +339,8 @@ fn test_concurrent_funding_race() {
                 barrier.wait();
                 info!("Taker {} entering the admission race", i + 1);
                 let outcome = taker
-                    .prepare_swap(params)
-                    .and_then(|summary| taker.start_swap(&summary.swap_id));
+                    .prepare(params)
+                    .and_then(|summary| taker.start(&summary.swap_id));
                 match outcome {
                     Ok(report) => {
                         info!("Taker {} won the race: {:?}", i + 1, report);
@@ -428,39 +370,36 @@ fn test_concurrent_funding_race() {
 
     // Maker-side: the loser's planned coin was taken and no free coin could
     // replace it, proving both swaps raced on identical plans.
-    test_framework.assert_log("InsufficientLiquidity", &test_framework.taker_log_path());
+    world
+        .framework()
+        .assert_log("InsufficientLiquidity", &world.taker_log_path());
 
     // No reservation may leak from the lost funding race: the same maker
     // still serves the losing taker's later swap. The amount must fit the
     // post-race offer max: that tracks max(swap, regular), and the winner's
     // unswept incoming coin caps it just under the race amount.
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.sync_makers();
+    world.mine(1);
 
-    let loser_taker = takers.get_mut(loser).unwrap();
+    let loser_taker = &mut world.takers_mut()[loser];
     let retry_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(300_000), 1)
         .with_tx_count(3)
         .with_required_confirms(1)
         .with_preferred_makers(vec![maker_address.clone()]);
     let retry_summary = loser_taker
-        .prepare_swap(retry_params)
+        .prepare(retry_params)
         .expect("the losing taker's later swap must prepare");
     let retry_report = loser_taker
-        .start_swap(&retry_summary.swap_id)
+        .start(&retry_summary.swap_id)
         .expect("the maker must serve a later swap after the lost funding race");
     info!(
         "Losing taker's later swap completed: {:?}",
         retry_report.swap_id
     );
 
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for maker in world.makers() {
+        maker.sync();
+        let balances = maker.balances();
         info!(
             "Maker final balances - Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
             balances.regular, balances.swap, balances.contract, balances.spendable
@@ -473,7 +412,7 @@ fn test_concurrent_funding_race() {
         // The retry only proves the maker can serve again. A reservation that
         // leaked on inputs the retry never needed would still let it through.
         assert_eq!(
-            maker.reserved_inputs().unwrap(),
+            maker.inner().reserved_inputs().unwrap(),
             0,
             "the lost funding race must leave no reserved input behind"
         );
@@ -481,8 +420,8 @@ fn test_concurrent_funding_race() {
 
     info!("Concurrent funding race test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// Two takers are admitted on the same maker coins, which the deterministic
@@ -492,39 +431,25 @@ fn test_concurrent_funding_race() {
 fn test_concurrent_funding_conflict_replans() {
     warn!("Running Test: a funding conflict re-plans onto free coins");
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal, TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .takers([TakerBehavior::Normal, TakerBehavior::Normal])
+        .build();
 
-    for taker in takers.iter() {
-        fund_taker_default(taker, bitcoind, 1);
+    for i in 0..world.takers().len() {
+        world.fund_nth_taker_default(i, 1);
     }
     // The bond takes the 0.05 BTC coin. Two equal 500k coins remain: each
     // funds one swap alone, and a one-split plan picks the same one for both.
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(5_000_243),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        2,
-        Amount::from_sat(500_000),
-        AddressType::P2TR,
-    );
-    let maker_threads = spawn_makers(&makers);
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR);
+    world.fund_makers(2, Amount::from_sat(500_000), AddressType::P2TR);
+    world.start_makers(120);
+    world.mine(1);
 
-    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let maker_address = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    );
     let params = || {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(300_000), 1)
             .with_tx_count(1)
@@ -532,19 +457,21 @@ fn test_concurrent_funding_conflict_replans() {
             .with_preferred_makers(vec![maker_address.clone()])
     };
     // Admit both before either funds, so both plans name the same coin.
-    let summaries: Vec<_> = takers
+    let summaries: Vec<_> = world
+        .takers_mut()
         .iter_mut()
-        .map(|taker| {
-            taker
-                .prepare_swap(params())
-                .expect("admission must succeed")
-        })
+        .map(|taker| taker.prepare(params()).expect("admission must succeed"))
         .collect();
 
     let results = [AtomicU8::new(RESULT_PENDING), AtomicU8::new(RESULT_PENDING)];
     thread::scope(|s| {
-        for ((taker, summary), result) in takers.iter_mut().zip(&summaries).zip(&results) {
-            s.spawn(move || match taker.start_swap(&summary.swap_id) {
+        for ((taker, summary), result) in world
+            .takers_mut()
+            .iter_mut()
+            .zip(&summaries)
+            .zip(&results)
+        {
+            s.spawn(move || match taker.start(&summary.swap_id) {
                 Ok(_) => result.store(RESULT_SUCCESS, Relaxed),
                 Err(e) => {
                     warn!("Swap {} failed: {:?}", summary.swap_id, e);
@@ -558,16 +485,15 @@ fn test_concurrent_funding_conflict_replans() {
         results.iter().all(|r| r.load(Relaxed) == RESULT_SUCCESS),
         "both swaps must complete: the second maker re-plans onto its free coin"
     );
-    test_framework.assert_log(
-        "a planned coin went to another swap",
-        &test_framework.taker_log_path(),
-    );
+    world
+        .framework()
+        .assert_log("a planned coin went to another swap", &world.taker_log_path());
     assert_eq!(
-        makers[0].reserved_inputs().unwrap(),
+        world.makers()[0].inner().reserved_inputs().unwrap(),
         0,
         "both settled swaps must have released their coins"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }

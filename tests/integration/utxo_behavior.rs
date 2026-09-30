@@ -8,7 +8,7 @@ use bitcoin::{Amount, OutPoint};
 use bitcoind::bitcoincore_rpc::RpcApi;
 use log::{info, warn};
 use openswap::{
-    maker::start_server,
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
     utill::MIN_RELAY_FEE_RATE,
@@ -64,16 +64,15 @@ const TEST_CASES: &[(f64, &[f64], &str, &str)] = &[
 #[test]
 fn test_address_grouping_behavior() {
     // Initialize test environment with one maker (no swap needed, just wallet testing)
-    let maker_count = 1;
-    let taker_behavior = vec![TakerBehavior::Normal];
-
-    let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
+    let world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .takers([TakerBehavior::Normal])
+        .build();
 
     println!("=== Testing Smart Address Grouping Behavior ===");
 
-    let bitcoind = &test_framework.bitcoind;
-    let maker = makers.first().unwrap();
+    let bitcoind = world.bitcoind();
+    let maker = world.makers()[0].inner();
 
     println!("=== UTXO Setup ===");
 
@@ -180,54 +179,27 @@ fn test_address_grouping_behavior() {
     println!("All address grouping scenarios work correctly");
 
     // Clean shutdown
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 #[test]
 fn test_separated_utxo_coin_selection() {
     // Initialize test environment with TWO makers and one taker
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .takers([TakerBehavior::Normal])
+        .build();
 
     warn!("Running Test: Separated UTXO Coin Selection");
-    let bitcoind = &test_framework.bitcoind;
 
     // Fund the taker and Makers
-    let taker = &mut takers[0];
-    fund_taker(
-        taker,
-        bitcoind,
-        6,
-        Amount::from_btc(0.1).unwrap(),
-        AddressType::P2TR,
-    ); // 60M sats total
+    world.fund_taker(6, Amount::from_btc(0.1).unwrap(), AddressType::P2TR); // 60M sats total
 
-    fund_makers(
-        &makers,
-        bitcoind,
-        6,
-        Amount::from_btc(0.1).unwrap(),
-        AddressType::P2TR,
-    ); // 60M sats total
+    world.fund_makers(6, Amount::from_btc(0.1).unwrap(), AddressType::P2TR); // 60M sats total
 
-    // Start the Maker Servers
+    // Start the Maker Servers and wait for both makers setup completion
     info!("Starting Maker servers");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            std::thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for both makers setup completion
-    wait_for_makers_setup(&makers, 120);
+    world.start_makers_without_sync(120);
 
     // Perform openswap to create swap coins
     info!("Performing openswap to create swap coins");
@@ -235,23 +207,22 @@ fn test_separated_utxo_coin_selection() {
         .with_tx_count(1)
         .with_required_confirms(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare_swap should succeed");
-    taker
-        .start_swap(&summary.swap_id)
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("openswap should succeed");
 
     // Sync both maker wallets
-    for maker in &makers {
-        let mut wallet = maker.wallet.write().unwrap();
-        wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
-    }
+    world.sync_makers();
 
     println!("=== Testing Separated UTXO Coin Selection ===");
 
     // Test with the first maker
-    let maker = makers.first().unwrap();
+    let maker = world.makers()[0].inner();
 
     {
         let wallet = maker.wallet.read().unwrap();
@@ -342,16 +313,10 @@ fn test_separated_utxo_coin_selection() {
     println!("\n--- Test Case 3: Add Regular Funds and Retry ---");
 
     // Fund the Maker with enough to cover the target (30M SATS)
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(30000000),
-        AddressType::P2TR,
-    );
+    world.fund_makers(1, Amount::from_sat(30000000), AddressType::P2TR);
 
     // Generate blocks to confirm
-    generate_blocks(bitcoind, 3);
+    world.mine(3);
 
     // Sync wallet and retry
     {
@@ -384,66 +349,48 @@ fn test_separated_utxo_coin_selection() {
 
     println!("\n=== Test Completed Successfully ===");
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 #[test]
 fn test_manual_coinselection() {
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = &mut takers[0];
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .takers([TakerBehavior::Normal])
+        .build();
 
     let amounts: Vec<u64> = vec![
         90_283, 150_813, 212_842, 185_372, 478_324, 314_332, 136_414, 23_894, 10_000,
     ];
 
     for &amount in &amounts {
-        let addr = taker
+        let addr = world
+            .taker()
+            .inner()
             .get_wallet()
             .write()
             .unwrap()
             .get_next_external_address(AddressType::P2TR)
             .unwrap();
-        send_to_address(bitcoind, &addr, Amount::from_sat(amount));
-        generate_blocks(bitcoind, 1);
+        send_to_address(world.bitcoind(), &addr, Amount::from_sat(amount));
+        world.mine(1);
     }
 
     // Fund the makers with 3 utxos of 0.05 btc each
-    fund_makers(
-        &makers,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    world.fund_makers(3, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
+    world.start_makers_without_sync(120);
 
-    wait_for_makers_setup(&makers, 120);
+    world.taker().sync();
 
-    taker
+    let all_utxos = world
+        .taker()
+        .inner()
         .get_wallet()
-        .write()
+        .read()
         .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-
-    let all_utxos = taker.get_wallet().read().unwrap().list_all_utxo();
+        .list_all_utxo();
 
     // Manual selection caps the funding pool at the selected coins, so they
     // must cover the 0.01 BTC swap alone: the first seven sum to 1,568,380
@@ -477,32 +424,30 @@ fn test_manual_coinselection() {
         .with_required_confirms(1)
         .with_utxos(manually_selected_utxos.clone());
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare_swap should succeed");
-    taker
-        .start_swap(&summary.swap_id)
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("the swap must complete funded only by the selected coins");
 
     // After Swap is done, wait for maker threads to conclude.
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
     info!("All openswaps processed successfully. Transaction complete.");
 
     thread::sleep(Duration::from_secs(10));
 
     // Sync taker wallet to get the latest UTXO state after swap
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.taker().sync();
 
-    for maker in makers.iter() {
-        let mut wallet = maker.wallet.write().unwrap();
-        wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    for maker in world.makers() {
+        maker.sync();
     }
+
+    let taker = world.taker().inner();
 
     // Manual selection caps the funding pool at the selected coins; the plan
     // still picks the fewest of them that cover the spend. The cap is the
@@ -726,8 +671,7 @@ fn test_manual_coinselection() {
     }
 
     println!("All test cases completed successfully");
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 /// A maker with fragmented liquidity cannot fund the requested 3 splits within
@@ -747,57 +691,43 @@ fn test_taproot_swap_completes_with_degraded_splits() {
 }
 
 fn run_degraded_split_swap(protocol: ProtocolVersion) {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![openswap::maker::MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors([MakerBehavior::Normal])
+        .takers([TakerBehavior::Normal])
+        .build();
+    world.fund_taker_default(3);
     // Bond UTXO is exact (5,000,000 + 243 fee) so no change UTXO joins the
     // pool; liquidity is exactly one 400k UTXO plus six 20k UTXOs.
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(5_000_243),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(400_000),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        6,
-        Amount::from_sat(20_000),
-        AddressType::P2TR,
-    );
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
-    let swap_start_height = chain_tip(bitcoind) + 1;
+    world.fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR);
+    world.fund_makers(1, Amount::from_sat(400_000), AddressType::P2TR);
+    world.fund_makers(6, Amount::from_sat(20_000), AddressType::P2TR);
+    world.spawn_ready_makers_and_mine();
+    let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
         .with_tx_count(3)
         .with_required_confirms(1);
-    let summary = taker.prepare_swap(swap_params).expect("prepare swap");
-    taker
-        .start_swap(&summary.swap_id)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
+        .expect("prepare swap");
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("swap must complete with degraded splits");
 
-    let taker_balance = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balance = world.taker().balances();
     info!("Degraded-split taker balance: {:?}", taker_balance);
 
-    shutdown_makers(&makers, maker_threads);
-    let log_path = test_framework.taker_log_path();
+    world.shutdown_makers();
+    let log_path = world.taker_log_path();
+    let bitcoind = world.bitcoind();
     match protocol {
         ProtocolVersion::Legacy => {
-            test_framework.assert_log("3 receivers, 1 senders", &log_path);
+            world
+                .framework()
+                .assert_log("3 receivers, 1 senders", &log_path);
         }
         ProtocolVersion::Taproot => {
             // The "receivers, senders" line is Legacy-only, so the degradation
@@ -828,6 +758,5 @@ fn run_degraded_split_swap(protocol: ProtocolVersion) {
             );
         }
     }
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
