@@ -1,16 +1,6 @@
-//! Abort 1: TAKER Drops After Full Setup.
-//!
-//! The Taker drops the connection after broadcasting all the funding transactions.
-//! The Makers identify this and wait for a timeout (60s in test) for the Taker to come back.
-//! If the Taker doesn't return, the Makers broadcast the contract transactions and reclaim
-//! their funds via timelock.
-//!
-//! The Taker after coming live again will see unfinished openswaps in its wallet.
-//! It can reclaim funds via broadcasting contract transactions and claiming via timelock.
-
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
 };
@@ -18,52 +8,30 @@ use openswap::{
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use std::{thread, time::Duration};
 
 #[test]
 fn taker_abort_1_legacy_corerpc() {
     // ---- Setup ----
     warn!("Running Test: Taker Drops After Full Setup");
 
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::DropAfterFundsBroadcast];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
-
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
+        .takers([TakerBehavior::DropAfterFundsBroadcast])
+        .build();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    let taker_original_balance = world.fund_taker_default(3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
-    // Start the maker server threads
+    // Start the maker servers, wait for their setup, then sync their wallets
     log::info!("Initiating Maker servers");
+    world.start_makers(120);
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup
-    sync_maker_wallets(&makers);
-
-    verify_maker_pre_swap_balances(&makers);
+    world.verify_maker_pre_swap_balances();
 
     // Initiate OpenSwap
     info!("Initiating openswap protocol");
@@ -72,25 +40,23 @@ fn taker_abort_1_legacy_corerpc() {
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // Start periodic swap tracker logging
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
+    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
     // Prepare should succeed; execution should fail with DropAfterFundsBroadcast
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
         swap_result.is_err(),
         "Swap should fail due to DropAfterFundsBroadcast behavior"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
+    world.taker().log_tracker_state();
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -98,55 +64,18 @@ fn taker_abort_1_legacy_corerpc() {
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
 
-    // Verify maker balances after recovery
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
-        info!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i,
-            maker_balances.regular,
-            maker_balances.swap,
-            maker_balances.contract,
-            maker_balances.spendable,
-        );
-        assert_eq!(
-            maker_balances.contract,
-            Amount::ZERO,
-            "Maker {} should have no contract balance after recovery",
-            i
-        );
-    }
-
-    info!("Makers shut down. Waiting for background recovery loop to complete...");
+    world.assert_makers_contract_zero();
 
     // Wait for taker's background recovery loop to finish
-    let recovery_timeout = Duration::from_secs(120);
-    let recovery_start = Instant::now();
-    while !taker.is_recovery_complete() {
-        if recovery_start.elapsed() > recovery_timeout {
-            panic!("Background recovery did not complete within timeout");
-        }
-        thread::sleep(Duration::from_secs(5));
-    }
+    world.taker().await_recovery(Duration::from_secs(120));
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet
-    generate_blocks(bitcoind, 1);
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.taker().sync();
 
     // Verify taker balance
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances = world.taker().balances();
 
     info!(
         "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
@@ -156,99 +85,55 @@ fn taker_abort_1_legacy_corerpc() {
         taker_balances.spendable,
     );
 
-    assert_eq!(
-        taker_balances.regular.to_sat(),
-        14499538,
-        "Taker regular balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.swap.to_sat(),
-        495997,
-        "Taker swap balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.contract.to_sat(),
-        0,
-        "Taker contract balance mismatch"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-
-    let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
-        .unwrap();
-
-    info!(
-        "Taker balance diff: {} sats (original: {}, current: {})",
-        balance_diff.to_sat(),
-        taker_original_balance,
-        taker_balances.spendable,
-    );
-
-    assert_eq!(
-        balance_diff.to_sat(),
-        4465,
-        "Taker spendable balance change mismatch"
-    );
+    BalanceExpect {
+        regular: Some(Is::Sats(14499538)),
+        swap: Some(Is::Sats(495997)),
+        contract: Some(Is::Sats(0)),
+        fidelity: Some(Is::Amount(Amount::ZERO)),
+        spendable: None,
+        delta: Some(Delta::Loss {
+            baseline: taker_original_balance,
+            style: DiffStyle::CheckedUnwrap,
+            sats: 4465,
+        }),
+    }
+    .assert("Taker", &taker_balances);
 
     // Verify maker balances - makers should have recovered via timelock
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    let expected_regular = [14500865, 14502398];
+    let expected_swap = [499100, 497530];
+    let expected_spendable = [14999965, 14999928];
+    for (i, maker) in world.makers().iter().enumerate() {
+        maker.sync();
+        let balances = maker.balances();
 
         info!(
             "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
             i,
-            maker_balances.regular,
-            maker_balances.swap,
-            maker_balances.contract,
-            maker_balances.fidelity,
-            maker_balances.spendable,
+            balances.regular,
+            balances.swap,
+            balances.contract,
+            balances.fidelity,
+            balances.spendable,
         );
 
-        let expected_regular = [14500865u64, 14502398][i];
-        let expected_swap = [499100u64, 497530][i];
-        assert_eq!(
-            maker_balances.regular.to_sat(),
-            expected_regular,
-            "Maker {} regular balance mismatch",
-            i
-        );
-        assert_eq!(
-            maker_balances.swap.to_sat(),
-            expected_swap,
-            "Maker {} swap balance mismatch",
-            i
-        );
-        assert_eq!(
-            maker_balances.contract.to_sat(),
-            0,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
-
-        let expected_spendable = [14999965u64, 14999928][i];
-        assert_eq!(
-            maker_balances.spendable.to_sat(),
-            expected_spendable,
-            "Maker {} spendable balance mismatch",
-            i,
-        );
+        BalanceExpect {
+            regular: Some(Is::Sats(expected_regular[i])),
+            swap: Some(Is::Sats(expected_swap[i])),
+            contract: Some(Is::Sats(0)),
+            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
+            spendable: Some(Is::Sats(expected_spendable[i])),
+            delta: None,
+        }
+        .assert(&format!("Maker {i}"), &balances);
     }
 
-    taker.log_tracker_state();
+    world.taker().log_tracker_state();
     info!("Abort1 test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
-
+    world.shutdown_makers();
     tracker_logger.stop();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 /// A taker that never goes quiet must still not outlive the swap's locktime. Here the
@@ -262,52 +147,43 @@ fn taker_abort_1_legacy_corerpc() {
 fn maker_recovers_swap_past_refund_deadline() {
     warn!("Running Test: Maker recovers a swap that outlived its refund deadline");
 
-    let maker_count = 1;
-    let taker_behavior = vec![TakerBehavior::StallAfterProofOfFunding];
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors([MakerBehavior::Normal])
+        .takers([TakerBehavior::StallAfterProofOfFunding])
+        .build();
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            maker_count,
-            taker_behavior,
-            vec![MakerBehavior::Normal],
-        );
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = spawn_makers(&makers);
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.start_makers(120);
+    world.mine(1);
 
     // Legacy so the deadline is counted from the funding confirmation height the
     // maker records, which is the arm this test exists to prove.
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
         .with_tx_count(1)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Legacy prepare_swap should succeed");
     assert!(
-        taker.start_swap(&summary.swap_id).is_err(),
+        world.taker_mut().start(&summary.swap_id).is_err(),
         "The swap must fail once the maker gives up on it"
     );
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log(
+    let log_path = world.taker_log_path();
+    let framework = world.framework();
+    framework.assert_log(
         "Test behavior: stalling 180s so the maker's refund deadline passes",
         &log_path,
     );
     // The deadline, not a dropped connection, is what ended this swap. Keepalives were
     // still arriving every 5s, so the idle timeout could not have drained it.
-    test_framework.assert_log("reached its refund deadline; recovering now", &log_path);
-    test_framework.assert_log("Recovering from swap", &log_path);
+    framework.assert_log("reached its refund deadline; recovering now", &log_path);
+    framework.assert_log("Recovering from swap", &log_path);
 
-    shutdown_makers(&makers, maker_threads);
-
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
