@@ -465,11 +465,8 @@ fn test_concurrent_funding_conflict_replans() {
 
     let results = [AtomicU8::new(RESULT_PENDING), AtomicU8::new(RESULT_PENDING)];
     thread::scope(|s| {
-        for ((taker, summary), result) in world
-            .takers_mut()
-            .iter_mut()
-            .zip(&summaries)
-            .zip(&results)
+        for ((taker, summary), result) in
+            world.takers_mut().iter_mut().zip(&summaries).zip(&results)
         {
             s.spawn(move || match taker.start(&summary.swap_id) {
                 Ok(_) => result.store(RESULT_SUCCESS, Relaxed),
@@ -485,9 +482,10 @@ fn test_concurrent_funding_conflict_replans() {
         results.iter().all(|r| r.load(Relaxed) == RESULT_SUCCESS),
         "both swaps must complete: the second maker re-plans onto its free coin"
     );
-    world
-        .framework()
-        .assert_log("a planned coin went to another swap", &world.taker_log_path());
+    world.framework().assert_log(
+        "a planned coin went to another swap",
+        &world.taker_log_path(),
+    );
     assert_eq!(
         world.makers()[0].inner().reserved_inputs().unwrap(),
         0,
