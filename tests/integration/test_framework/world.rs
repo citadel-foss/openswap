@@ -98,7 +98,7 @@ impl TestFramework {
                     expected_message,
                     log_path
                 );
-                log::info!("✅ Found expected log message: '{expected_message}'");
+                log::info!("Found expected log message: '{expected_message}'");
             }
             Err(e) => {
                 panic!("Could not read log file at {}: {}", log_path, e);
@@ -206,12 +206,9 @@ impl TestFramework {
             .and_then(|level| level.parse().ok())
             .unwrap_or(log::LevelFilter::Debug);
         setup_logger(log_level, Some(temp_dir.clone()));
-        log::info!("📁 temporary directory : {}", temp_dir.display());
+        log::info!("temporary directory : {}", temp_dir.display());
         // Names the test in its own log, so a kept data dir can be traced back.
-        log::info!(
-            "🧪 test: {}",
-            thread::current().name().unwrap_or("<unnamed>")
-        );
+        log::info!("test: {}", thread::current().name().unwrap_or("<unnamed>"));
         let (bitcoind, zmq_addr) = (0..3)
             .find_map(|_| {
                 let zmq_addr = format!("tcp://127.0.0.1:{}", free_ports(1)[0]);
@@ -356,19 +353,19 @@ impl TestFramework {
         });
         let (blocks_per_tick, block_tick_interval) = B::block_cadence();
         log::info!(
-            "⛏️ Spawning block generation thread ({blocks_per_tick} blocks / {block_tick_interval:?})"
+            "Spawning block generation thread ({blocks_per_tick} blocks / {block_tick_interval:?})"
         );
         let tf_weak = Arc::downgrade(&framework);
         let generate_blocks_handle = thread::spawn(move || loop {
             thread::sleep(block_tick_interval);
 
             let Some(tf) = tf_weak.upgrade() else {
-                log::info!("🔚 Test framework dropped, ending block generation thread");
+                log::info!("Test framework dropped, ending block generation thread");
                 return;
             };
 
             if tf.shutdown.load(Relaxed) {
-                log::info!("🔚 Ending block generation thread");
+                log::info!("Ending block generation thread");
                 return;
             }
             if !tf.block_gen_paused.load(Relaxed) {
@@ -376,7 +373,7 @@ impl TestFramework {
                 // may be mid-call, and some tests restart the node themselves.
                 if let Err(e) = try_generate_blocks(&tf.bitcoind, blocks_per_tick) {
                     if !tf.shutdown.load(Relaxed) {
-                        log::warn!("⛏️ Background block generation failed: {e}");
+                        log::warn!("Background block generation failed: {e}");
                     }
                 }
                 if let Some(elec) = tf.electrsd.lock().unwrap().as_ref() {
@@ -384,7 +381,7 @@ impl TestFramework {
                 }
             }
         });
-        log::info!("✅ Test Framework initialization complete");
+        log::info!("Test Framework initialization complete");
         (framework, takers, makers, generate_blocks_handle)
     }
 
@@ -489,7 +486,7 @@ impl TestFramework {
         if self.torn_down.swap(true, SeqCst) {
             return;
         }
-        log::info!("🛑 Stopping Test Framework");
+        log::info!("Stopping Test Framework");
         self.shutdown.store(true, Relaxed);
         self.kill_relay();
         // electrs's datadir sits inside `temp_dir` and it polls bitcoind, so it
