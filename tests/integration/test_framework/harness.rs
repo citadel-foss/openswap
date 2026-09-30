@@ -344,6 +344,17 @@ impl World {
         shutdown_makers(&servers, threads);
     }
 
+    /// Drops every maker, releasing its server, for a test that restarts a
+    /// maker from its config. The makers must be shut down first.
+    #[track_caller]
+    pub fn drop_makers(&mut self) {
+        assert!(
+            self.makers.iter().all(|maker| maker.thread.is_none()),
+            "drop_makers on a running maker"
+        );
+        self.makers.clear();
+    }
+
     /// Tears the world down in the canonical order (see the module doc),
     /// propagating a maker or block-generation thread's panic.
     pub fn finish(mut self) {
@@ -458,6 +469,11 @@ impl TakerHandle {
     /// The taker itself, for what the handle does not wrap.
     pub fn inner(&self) -> &Taker {
         &self.taker
+    }
+
+    /// Sets the taker's test behavior for its next swap.
+    pub fn set_behavior(&mut self, behavior: TakerBehavior) {
+        self.taker.behavior = behavior;
     }
 
     /// [`Taker::log_tracker_state`].

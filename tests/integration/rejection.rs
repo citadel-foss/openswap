@@ -27,10 +27,10 @@ use openswap::{
     taker::{
         error::TakerError,
         swap_tracker::{ExchangeProgress, SwapTracker},
-        BanReason, BanRecord, MakerState, SwapParams, Taker, TakerBehavior, UnavailableReason,
+        BanReason, BanRecord, MakerState, SwapParams, TakerBehavior, UnavailableReason,
         UnavailableState,
     },
-    utill::{MAX_TX_COUNT, MIN_RELAY_FEE_RATE, NO_SHUTDOWN, TX_BROADCAST_TIMEOUT},
+    utill::{MAX_TX_COUNT, MIN_RELAY_FEE_RATE, TX_BROADCAST_TIMEOUT},
     wallet::{min_contract_value_sats, AddressType, Destination},
 };
 
@@ -40,7 +40,7 @@ use log::{info, warn};
 use std::{
     fs,
     sync::{atomic::Ordering::Relaxed, Arc},
-    thread::{self, JoinHandle},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -52,44 +52,26 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
     // 4 UTXOs, not the usual 3: the above-maximum cases need the taker to hold
     // more than the maker is willing to swap.
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 4);
-    fund_makers_default(&makers, bitcoind);
+    let taker_original_balance = world.fund_taker_default(4);
+    world.fund_makers_default();
 
     info!("Starting Maker servers...");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
+    world.start_makers(120);
 
-    wait_for_makers_setup(&makers, 120);
-
-    sync_maker_wallets(&makers);
-
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
-    generate_blocks(bitcoind, 1);
+    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
+    world.mine(1);
 
     // The maker advertises min = the smallest swap it accepts, and max = its
     // spendable liquidity. One sat under one relay-floor contract is below both.
-    let maker_offer_max = makers[0]
-        .wallet
-        .read()
-        .unwrap()
-        .get_balances()
-        .unwrap()
-        .regular;
+    let maker_offer_max = world.makers()[0].balances().regular;
     let contract_floor =
         min_contract_value_sats(ProtocolVersion::Taproot, MIN_RELAY_FEE_RATE).unwrap();
     let below_min = Amount::from_sat(contract_floor - 1);
@@ -99,14 +81,16 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
         maker_offer_max, below_min, above_max
     );
 
-    let preferred: Vec<String> = makers
+    let preferred: Vec<String> = world
+        .makers()
         .iter()
-        .map(|m| format!("127.0.0.1:{}", m.config.network_port))
+        .map(|m| format!("127.0.0.1:{}", m.inner().config.network_port))
         .collect();
 
     // ---- 1. Below minimum, taker-side offerbook filter ----
-    let err = taker
-        .prepare_swap(
+    let err = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, below_min, 2)
                 .with_tx_count(1)
                 .with_required_confirms(1),
@@ -120,8 +104,9 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     info!("Below-minimum request rejected by the offerbook filter");
 
     // ---- 2. Above maximum, taker-side offerbook filter ----
-    let err = taker
-        .prepare_swap(
+    let err = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, above_max, 2)
                 .with_tx_count(1)
                 .with_required_confirms(1),
@@ -135,8 +120,9 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     info!("Above-maximum request rejected by the offerbook filter");
 
     // ---- 3. Below minimum, past the filter: our own planner refuses the contract ----
-    let err = taker
-        .prepare_swap(
+    let err = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, below_min, 2)
                 .with_tx_count(1)
                 .with_required_confirms(1)
@@ -156,8 +142,9 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     info!("Taker refused below-minimum request: {}", msg);
 
     // ---- 4. Above maximum, past the filter, caught at negotiation ----
-    let err = taker
-        .prepare_swap(
+    let err = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, above_max, 2)
                 .with_tx_count(1)
                 .with_required_confirms(1)
@@ -176,23 +163,27 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     info!("Negotiation refused above-maximum request: {}", msg);
 
     // ---- 5. Taker aborts after maker selection, before negotiating ----
-    taker.behavior = TakerBehavior::CloseEarly;
-    let err = taker
-        .prepare_swap(
+    world.taker_mut().set_behavior(TakerBehavior::CloseEarly);
+    let err = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
                 .with_tx_count(1)
                 .with_required_confirms(1),
         )
         .expect_err("CloseEarly must abort prepare_swap");
     info!("Taker closed early after maker selection: {:?}", err);
-    taker.behavior = TakerBehavior::Normal;
+    world.taker_mut().set_behavior(TakerBehavior::Normal);
 
     // ---- 6. Forged below-minimum reaches the maker's own guard ----
     // The nominal 500_000 passes both taker-side layers; the hook rewrites
     // the amount only on the wire, so the maker guard is what must refuse.
-    taker.behavior = TakerBehavior::ForgeBounds(below_min);
-    let err = taker
-        .prepare_swap(
+    world
+        .taker_mut()
+        .set_behavior(TakerBehavior::ForgeBounds(below_min));
+    let err = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
                 .with_tx_count(1)
                 .with_required_confirms(1)
@@ -202,9 +193,12 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     info!("Maker guard refused forged below-minimum: {:?}", err);
 
     // ---- 7. Forged above-maximum reaches the maker's own guard ----
-    taker.behavior = TakerBehavior::ForgeBounds(above_max);
-    let err = taker
-        .prepare_swap(
+    world
+        .taker_mut()
+        .set_behavior(TakerBehavior::ForgeBounds(above_max));
+    let err = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
                 .with_tx_count(1)
                 .with_required_confirms(1)
@@ -216,9 +210,12 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     // ---- 8. Resent SwapDetails: identical refreshes, mutated is rejected ----
     // The hook resends the admitted details unchanged, then with +1 sat. The
     // error string it surfaces tells which arm the maker took for each.
-    taker.behavior = TakerBehavior::ResendMutatedDetails;
-    let err = taker
-        .prepare_swap(
+    world
+        .taker_mut()
+        .set_behavior(TakerBehavior::ResendMutatedDetails);
+    let err = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
                 .with_tx_count(1)
                 .with_required_confirms(1)
@@ -231,28 +228,31 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
         "Expected the mutated resend to be rejected after the identical one was accepted, got: {}",
         msg
     );
-    taker.behavior = TakerBehavior::Normal;
+    world.taker_mut().set_behavior(TakerBehavior::Normal);
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("closing early after maker selection", &log_path);
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("closing early after maker selection", &log_path);
     // The forged amounts got past both taker-side layers, so the refusal must
     // come from the maker's own guard, logged as a handler error on drop.
-    test_framework.assert_log("Swap amount below the incoming contract floor", &log_path);
-    test_framework.assert_log("Swap amount above maximum", &log_path);
+    world
+        .framework()
+        .assert_log("Swap amount below the incoming contract floor", &log_path);
+    world
+        .framework()
+        .assert_log("Swap amount above maximum", &log_path);
     // The mutated resend dies on the whole-agreement compare: one value, so
     // no single field — feerate included — can drift between connections.
-    test_framework.assert_log("parameters differ from stored swap", &log_path);
+    world
+        .framework()
+        .assert_log("parameters differ from stored swap", &log_path);
 
     // Nothing was funded, so nothing may have moved.
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&NO_SHUTDOWN)
-        .unwrap();
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    world.taker().sync();
+    let taker_balances = world.taker().balances();
     info!(
         "Taker balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
         taker_balances.regular,
@@ -287,14 +287,14 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
     );
     assert_eq!(taker_balances.fidelity, Amount::ZERO);
 
-    for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&NO_SHUTDOWN)
-            .unwrap();
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, (maker, original)) in world
+        .makers()
+        .iter()
+        .zip(maker_spendable_balance)
+        .enumerate()
+    {
+        maker.sync();
+        let balances = maker.balances();
         info!(
             "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
             i, balances.regular, balances.swap, balances.contract, balances.spendable,
@@ -334,8 +334,7 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
 
     info!("Maker SwapDetails rejection test completed successfully!");
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 #[test]
@@ -348,42 +347,28 @@ fn test_low_swap_liquidity() {
     let taker_behavior = vec![TakerBehavior::Normal];
 
     // Initialize test framework
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    let maker = &makers[0];
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .takers(taker_behavior)
+        .build();
 
     info!("Funding taker and maker");
     // Fund the taker with 3 UTXOs of 0.05 BTC each (Taproot)
-    fund_taker_default(taker, bitcoind, 3);
+    world.fund_taker_default(3);
 
     // Fund the Maker with 4 UTXOs of 0.05 BTC each (Taproot)
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
-    // Start the Maker Server thread
+    // Start the Maker Server thread and wait for it to complete setup
+    // (including fidelity bond creation)
     info!("Initiating Maker server...");
-    let maker_thread = {
-        let maker_clone = maker.clone();
-        std::thread::spawn(move || {
-            start_server(maker_clone).unwrap();
-        })
-    };
-
-    // Wait for maker to complete setup (including fidelity bond creation)
-    wait_for_makers_setup(std::slice::from_ref(maker), 120);
+    world.start_makers_without_sync(120);
 
     // Drain the Maker wallet after fidelity bond is created
-    drain_maker_liquidity_after_fidelity(maker, bitcoind);
+    drain_maker_liquidity_after_fidelity(world.makers()[0].inner(), world.bitcoind());
     // Mine a block to confirm the drain, then sync maker wallet
-    generate_blocks(bitcoind, 1);
-    maker
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.makers()[0].sync();
 
     info!("Maker should be halted due to low swap liquidity");
 
@@ -395,20 +380,26 @@ fn test_low_swap_liquidity() {
         .with_required_confirms(1);
 
     // Attempt the swap - it will fail because maker has no liquidity
-    let err = taker
-        .prepare_swap(swap_params.clone())
+    let err = world
+        .taker_mut()
+        .prepare(swap_params.clone())
         .expect_err("Swap should have failed due to insufficient maker liquidity");
     info!("OpenSwap failed as expected: {err:?}");
 
     info!("Adding sufficient funds to maker to perform a swap and avoid low swap liquidity");
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
     // The offerbook still holds the drained max_size=0 offer fetched moments
     // ago, and a sync round would skip re-polling it while it is within
     // OFFER_MAX_AGE_BEFORE_REFRESH, which is 10s for tests. Poll this maker directly so selection sees
     // the re-funded liquidity.
-    taker
-        .poll_maker(format!("127.0.0.1:{}", maker.config.network_port))
+    world
+        .taker()
+        .inner()
+        .poll_maker(format!(
+            "127.0.0.1:{}",
+            world.makers()[0].inner().config.network_port
+        ))
         .expect("re-poll of the re-funded maker should succeed");
 
     // Attempt the swap again, it should succeed
@@ -416,11 +407,12 @@ fn test_low_swap_liquidity() {
         .with_tx_count(2)
         .with_required_confirms(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare_swap should succeed after funding");
 
-    match taker.start_swap(&summary.swap_id) {
+    match world.taker_mut().start(&summary.swap_id) {
         Ok(_report) => {
             log::info!("OpenSwap completed successfully after re-funding!");
         }
@@ -430,15 +422,13 @@ fn test_low_swap_liquidity() {
         }
     }
 
-    maker.shutdown.store(true, Relaxed);
-    maker_thread.join().unwrap();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 
     info!("Low Swap liquidity test passed");
 }
 
-fn drain_maker_liquidity_after_fidelity(maker: &Arc<MakerServer>, bitcoind: &bitcoind::BitcoinD) {
+fn drain_maker_liquidity_after_fidelity(maker: &MakerServer, bitcoind: &bitcoind::BitcoinD) {
     let secp = Secp256k1::new();
     let keypair = bitcoin::key::Keypair::from_secret_key(&secp, &SecretKey::new(&mut OsRng));
     let (xonly, _) = keypair.x_only_public_key();
@@ -461,41 +451,44 @@ fn makers_reject_duplicate_funding_outpoints() {
     let taker_behaviors = vec![TakerBehavior::DuplicateFundingOutpoint];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behaviors)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    for taker in &mut takers {
-        fund_taker_default(taker, bitcoind, 3);
+    for i in 0..world.takers().len() {
+        world.fund_nth_taker_default(i, 3);
     }
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_makers(&makers);
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.start_makers(120);
+    world.mine(1);
 
     // The Taproot behavior repeats one contract transaction together with all
     // aligned per-contract vectors, so length and script checks still pass.
     let taproot_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
-    let taproot_summary = takers[0]
-        .prepare_swap(taproot_params)
+    let taproot_summary = world.takers_mut()[0]
+        .prepare(taproot_params)
         .expect("Taproot prepare_swap should succeed");
     assert!(
-        takers[0].start_swap(&taproot_summary.swap_id).is_err(),
+        world.takers_mut()[0]
+            .start(&taproot_summary.swap_id)
+            .is_err(),
         "Taproot maker must reject a duplicated contract outpoint"
     );
 
     // Assert both the taker side duplicate contract passing and the maker-side rejection.
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log(
+    let log_path = world.taker_log_path();
+    world.framework().assert_log(
         "Test behavior: duplicating Taproot contract outpoint",
         &log_path,
     );
-    test_framework.assert_log("Duplicate Taproot contract outpoint", &log_path);
+    world
+        .framework()
+        .assert_log("Duplicate Taproot contract outpoint", &log_path);
 
     let log_contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
@@ -503,46 +496,45 @@ fn makers_reject_duplicate_funding_outpoints() {
         "Taproot maker must reject before broadcasting outgoing funding"
     );
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    test_framework.finish(takers, block_generation_handle);
+    world.finish();
 }
 
 /// The maker guards a Legacy funding proof in order — entry count, declared
 /// sum, then duplication — so each malice keeps the earlier guards satisfied
 /// to reach its own. One maker is enough: the rejection is the point.
 fn run_legacy_proof_guard(behavior: TakerBehavior, tx_count: u32, expected: &str) {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(1, vec![behavior], vec![MakerBehavior::Normal]);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![behavior])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_makers(&makers);
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.start_makers(120);
+    world.mine(1);
 
     let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
         .with_tx_count(tx_count)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(params)
+    let summary = world
+        .taker_mut()
+        .prepare(params)
         .expect("prepare_swap should succeed");
     assert!(
-        taker.start_swap(&summary.swap_id).is_err(),
+        world.taker_mut().start(&summary.swap_id).is_err(),
         "maker must reject the crafted ProofOfFunding"
     );
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log(expected, &log_path);
+    let log_path = world.taker_log_path();
+    world.framework().assert_log(expected, &log_path);
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    test_framework.finish(takers, block_generation_handle);
+    world.finish();
 }
 
 #[test]
@@ -628,37 +620,36 @@ fn maker_rejects_wrong_taproot_incoming_count() {
 /// The taker funds honestly; the hook forges only the SwapDetails
 /// declaration, so the maker's own equality check is what refuses.
 fn run_taproot_declaration_guard(behavior: TakerBehavior, expected: &str) {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(1, vec![behavior], vec![MakerBehavior::Normal]);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![behavior])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_makers(&makers);
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.start_makers(120);
+    world.mine(1);
 
     let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
         .with_tx_count(3)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(params)
+    let summary = world
+        .taker_mut()
+        .prepare(params)
         .expect("prepare_swap should succeed");
     assert!(
-        taker.start_swap(&summary.swap_id).is_err(),
+        world.taker_mut().start(&summary.swap_id).is_err(),
         "maker must reject contract data that breaks the declaration"
     );
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log(expected, &log_path);
+    let log_path = world.taker_log_path();
+    world.framework().assert_log(expected, &log_path);
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    test_framework.finish(takers, block_generation_handle);
+    world.finish();
 }
 
 /// A taker holding a single UTXO cannot fund 2 splits, so negotiation plans
@@ -666,70 +657,67 @@ fn run_taproot_declaration_guard(behavior: TakerBehavior, expected: &str) {
 /// proves the declared count flowed through, and the swap still completes.
 #[test]
 fn one_utxo_taker_completes_degraded_swap() {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-        );
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
     // One UTXO, so the hop-0 plan must degrade below the requested tx_count.
-    fund_taker_default(taker, bitcoind, 1);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_taker_default(1);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_makers(&makers);
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.start_makers(120);
+    world.mine(1);
 
     let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
         .with_tx_count(2)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(params)
+    let summary = world
+        .taker_mut()
+        .prepare(params)
         .expect("prepare_swap should succeed");
-    taker
-        .start_swap(&summary.swap_id)
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("a degraded one-split swap must complete");
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("with 1 funding txs", &log_path);
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("with 1 funding txs", &log_path);
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    test_framework.finish(takers, block_generation_handle);
+    world.finish();
 }
 
 /// The maker forwards 1,075 sats. Two splits net to 372 each, under the 485
 /// taproot floor, but one split nets to 910, so admission must re-plan with one.
 #[test]
 fn maker_degrades_split_count_when_netting_breaks_the_floor() {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
 
     let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(1_800), 1)
         .with_tx_count(2)
         .with_required_confirms(1);
-    taker
-        .prepare_swap(params)
+    world
+        .taker_mut()
+        .prepare(params)
         .expect("admission must fall back to one split");
-    test_framework.assert_log("with 1 funding split(s)", &test_framework.taker_log_path());
+    world
+        .framework()
+        .assert_log("with 1 funding split(s)", &world.taker_log_path());
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A confirmed funding txid proves nothing about its outputs. Here the taker claims
@@ -740,36 +728,37 @@ fn run_rejects_spent_funding_outpoint<B: TestBackend>(behavior: TakerBehavior) {
     let taker_behaviors = vec![behavior];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(maker_count, taker_behaviors, maker_behaviors);
+    let mut world = World::builder::<B>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behaviors)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    fund_taker_default(&takers[0], bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_nth_taker_default(0, 3);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_makers(&makers);
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.start_makers(120);
+    world.mine(1);
 
     let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
-    let summary = takers[0]
-        .prepare_swap(params)
+    let summary = world.takers_mut()[0]
+        .prepare(params)
         .expect("Legacy prepare_swap should succeed");
     assert!(
-        takers[0].start_swap(&summary.swap_id).is_err(),
+        world.takers_mut()[0].start(&summary.swap_id).is_err(),
         "Legacy maker must reject an already spent funding outpoint"
     );
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log(
+    let log_path = world.taker_log_path();
+    world.framework().assert_log(
         "Test behavior: spending the funding outpoint before ProofOfFunding",
         &log_path,
     );
-    test_framework.assert_log("Funding output already spent", &log_path);
+    world
+        .framework()
+        .assert_log("Funding output already spent", &log_path);
 
     let log_contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
@@ -777,9 +766,9 @@ fn run_rejects_spent_funding_outpoint<B: TestBackend>(behavior: TakerBehavior) {
         "Maker must reject before broadcasting outgoing funding"
     );
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    test_framework.finish(takers, block_generation_handle);
+    world.finish();
 }
 
 #[test]
@@ -805,24 +794,22 @@ fn maker_errors_when_seen_funding_tx_is_evicted() {
     let taker_behaviors = vec![TakerBehavior::SkipFundingConfirmWait];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behaviors)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_makers(&makers);
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.start_makers(120);
+    world.mine(1);
 
     // Sign a double-spend of every taker UTXO up front, so it can replace the
     // funding tx (which signals RBF) the moment the maker reports seeing it.
     let conflict_tx = {
-        let mut wallet = taker.get_wallet().write().unwrap();
+        let mut wallet = world.taker().inner().get_wallet().write().unwrap();
         wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
         let coins = wallet.list_all_utxo_spend_info();
         let destination = wallet
@@ -840,22 +827,28 @@ fn maker_errors_when_seen_funding_tx_is_evicted() {
     // the funding tx is still in the mempool, which puts the maker into its wait.
     let swap_params =
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2).with_tx_count(1);
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare_swap should succeed");
 
-    let log_path = test_framework.taker_log_path();
+    let log_path = world.taker_log_path();
 
     // Mining is paused so the funding tx can never confirm; the maker stays in
     // its confirmation wait until the conflict evicts the tx from the mempool.
-    test_framework.set_block_gen_paused(true);
+    world.framework().set_block_gen_paused(true);
+    // The swap thread borrows the taker; the main thread keeps its own handle
+    // on the framework.
+    let framework = world.framework().clone();
+    let taker = world.taker_mut();
     let swap_result = thread::scope(|s| {
-        let swap_handle = s.spawn(|| taker.start_swap(&summary.swap_id));
+        let swap_handle = s.spawn(|| taker.start(&summary.swap_id));
 
         wait_for_new_log(&log_path, "seen in mempool", Duration::from_secs(120));
         // Sent through bitcoind, not the taker's wallet, whose lock the swap
         // thread holds for long stretches.
-        bitcoind
+        framework
+            .bitcoind
             .client
             .send_raw_transaction(serialize_hex(&conflict_tx))
             .expect("conflict tx should replace the funding tx in the mempool");
@@ -864,7 +857,7 @@ fn maker_errors_when_seen_funding_tx_is_evicted() {
         // not a fixed number: the poll backs off, so allow a second window for it
         // to notice.
         wait_for_log(&log_path, "did not reappear", TX_BROADCAST_TIMEOUT * 2);
-        test_framework.set_block_gen_paused(false);
+        framework.set_block_gen_paused(false);
         swap_handle.join().expect("taker thread panicked")
     });
     assert!(
@@ -872,9 +865,9 @@ fn maker_errors_when_seen_funding_tx_is_evicted() {
         "The swap must fail once the maker's funding wait errors out"
     );
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    test_framework.finish(takers, block_generation_handle);
+    world.finish();
 }
 
 #[test]
@@ -883,56 +876,44 @@ fn maker_rejects_proof_of_funding_with_missing_contract_cache() {
     let taker_behavior = vec![TakerBehavior::SkipSenderContractSigs];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.start_makers(120);
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || start_server(maker_clone).unwrap())
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-
-    let maker_spendable_before = makers[0]
-        .wallet
-        .read()
-        .unwrap()
-        .get_balances()
-        .unwrap()
-        .spendable;
+    let maker_spendable_before = world.makers()[0].balances().spendable;
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare_swap should succeed");
 
-    let result = taker.start_swap(&summary.swap_id);
+    let result = world.taker_mut().start(&summary.swap_id);
     assert!(
         result.is_err(),
         "maker must reject ProofOfFunding without a cached contract binding"
     );
 
     // Assert both the adversarial action and the maker's fail-closed reason.
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log(
+    let log_path = world.taker_log_path();
+    world.framework().assert_log(
         "Test behavior: skipping sender contract signature request before funding",
         &log_path,
     );
-    test_framework.assert_log("No cached sender contract for funding prevout", &log_path);
+    world
+        .framework()
+        .assert_log("No cached sender contract for funding prevout", &log_path);
 
     // Rejection must happen before the maker reaches the outgoing broadcast
     // boundary in process_resp_contract_sigs_for_recvr_and_sender.
@@ -942,27 +923,15 @@ fn maker_rejects_proof_of_funding_with_missing_contract_cache() {
         "maker must reject before broadcasting outgoing funding transactions"
     );
 
-    makers[0]
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-    let maker_spendable_after = makers[0]
-        .wallet
-        .read()
-        .unwrap()
-        .get_balances()
-        .unwrap()
-        .spendable;
+    world.makers()[0].sync();
+    let maker_spendable_after = world.makers()[0].balances().spendable;
     assert_eq!(
         maker_spendable_after, maker_spendable_before,
         "rejected proof must not spend maker liquidity"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 #[test]
@@ -972,48 +941,40 @@ fn test_taproot_maker_rejects_contract_amount_mismatch() {
     let taker_behavior = vec![TakerBehavior::InvalidTaprootContractAmount];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Taproot swap preparation should succeed before contract validation");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
         swap_result.is_err(),
         "Taproot swap should fail when taker lies about contract amount"
     );
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("does not match output value", &log_path);
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("does not match output value", &log_path);
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    test_framework.finish(takers, block_generation_handle);
+    world.finish();
 }
 
 #[test]
@@ -1027,38 +988,30 @@ fn test_legacy_taker_rejects_malformed_maker_funding_output() {
         MakerBehavior::Normal,
     ];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || start_server(maker_clone).unwrap())
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare_swap should succeed");
 
     // The taker must reject before signing/finalizing; otherwise it can later
     // report success while the incoming sweep is unspendable.
-    let result = taker.start_swap(&summary.swap_id);
+    let result = world.taker_mut().start(&summary.swap_id);
     assert!(
         result.is_err(),
         "taker must reject malformed maker sender contract data"
@@ -1071,51 +1024,48 @@ fn test_legacy_taker_rejects_malformed_maker_funding_output() {
         error
     );
 
-    let log_path = test_framework.taker_log_path();
+    let log_path = world.taker_log_path();
     // Pin the operator-visible rejection, not just the returned Rust error.
-    test_framework.assert_log(
+    world.framework().assert_log(
         "funding output does not pay to advertised multisig",
         &log_path,
     );
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 #[test]
 fn test_legacy_taker_rejects_fee_skimming_maker() {
     let maker_count = 1;
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            maker_count,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::FeeSkimming],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
-    let summary = taker
-        .prepare_swap(
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(vec![MakerBehavior::FeeSkimming])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
                 .with_tx_count(3)
                 .with_required_confirms(1),
         )
         .expect("prepare Legacy swap");
-    let error = taker
-        .start_swap(&summary.swap_id)
+    let error = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect_err("reject fee skim");
     assert!(
         format!("{error:?}").contains("does not match the negotiated hop total"),
         "unexpected error: {:?}",
         error
     );
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 #[test]
@@ -1129,47 +1079,41 @@ fn test_taproot_rejects_underfunded_maker_contract() {
     // make the taker accept an incoming swapcoin for more than the tx pays.
     let maker_behaviors = vec![MakerBehavior::UnderfundTaprootContract];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
     // Fund the taker and maker with P2TR coins so the swap runs through the
     // Taproot funding and contract-data exchange path.
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
     // Start the malicious maker server.
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || start_server(maker_clone).unwrap())
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
+    world.start_makers_without_sync(120);
 
     // Mine one block before preparing the swap so wallet state and offer data
     // are settled.
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // A 30k-sat swap keeps the maker's 10k-sat underfunded output valid enough
     // to broadcast while still making the amount mismatch obvious.
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(30_000), 1)
         .with_tx_count(3)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("failed to prepare Taproot openswap");
 
     // The taker must reject during maker contract verification, before storing
     // an incoming swapcoin from the underfunded contract data. The maker's
     // response amounts are read from its actual funding outputs, so the
     // underfunding is caught by the exact total-fee check.
-    let error = taker
-        .start_swap(&summary.swap_id)
+    let error = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect_err("taker must reject an underfunded maker contract");
     match error {
         TakerError::General(message) => {
@@ -1183,13 +1127,14 @@ fn test_taproot_rejects_underfunded_maker_contract() {
     }
 
     // Assert the rejection came from the exact-amount check.
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("does not match the negotiated hop total", &log_path);
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("does not match the negotiated hop total", &log_path);
 
     // ---- Cleanup ----
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 #[test]
@@ -1213,26 +1158,25 @@ fn taker_rejects_inflated_taproot_contract_amount() {
 
 fn test_taproot_rejection(behavior: MakerBehavior, expected_error: &str) {
     let maker_count = 1;
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            maker_count,
-            vec![TakerBehavior::Normal],
-            vec![behavior],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
-    let summary = taker
-        .prepare_swap(
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(vec![behavior])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(30_000), 1)
                 .with_tx_count(3)
                 .with_required_confirms(1),
         )
         .expect("prepare Taproot swap");
-    let error = taker
-        .start_swap(&summary.swap_id)
+    let error = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect_err("the maker's Taproot response must be rejected");
     assert!(
         format!("{error:?}").contains(expected_error),
@@ -1241,12 +1185,20 @@ fn test_taproot_rejection(behavior: MakerBehavior, expected_error: &str) {
     );
 
     // The lie is arithmetically proven, so the maker is banned outright.
-    let standing = taker
+    let standing = world
+        .taker()
+        .inner()
         .fetch_offers()
         .unwrap()
         .all_makers()
         .into_iter()
-        .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
+        .find(|m| {
+            m.address.to_string()
+                == format!(
+                    "127.0.0.1:{}",
+                    world.makers()[0].inner().config.network_port
+                )
+        })
         .expect("the maker must be in the offerbook");
     assert!(
         matches!(
@@ -1259,9 +1211,8 @@ fn test_taproot_rejection(behavior: MakerBehavior, expected_error: &str) {
         "a proven contract violation must ban the maker"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// Admission plans but reserves nothing: coins are claimed only at funding, so a
@@ -1273,35 +1224,26 @@ fn test_admission_reserves_no_liquidity() {
     let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal, TakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
-
-    let bitcoind = &test_framework.bitcoind;
-    let maker = &makers[0];
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .takers(taker_behavior)
+        .build();
 
     // Fund two takers with enough for a 1 BTC swap each.
-    fund_taker_default(&takers[0], bitcoind, 4);
-    fund_taker_default(&takers[1], bitcoind, 4);
+    world.fund_nth_taker_default(0, 4);
+    world.fund_nth_taker_default(1, 4);
 
     // Fund the maker with four 0.05 BTC UTXOs. After the fidelity bond, its
     // spendable liquidity is ~15M sats, so two 9M-sat swaps cannot both be
     // funded, while each request is still below the advertised max_size.
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
-    let maker_thread = {
-        let maker = maker.clone();
-        thread::spawn(move || start_server(maker).unwrap())
-    };
+    world.start_makers(120);
 
-    wait_for_makers_setup(std::slice::from_ref(maker), 120);
-    maker
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&NO_SHUTDOWN)
-        .unwrap();
-
-    let maker_addr = format!("127.0.0.1:{}", maker.config.network_port);
+    let maker_addr = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    );
 
     // Taker 0 admits a swap with the maker. prepare_swap only negotiates;
     // it does not fund, so the maker reserves nothing yet.
@@ -1309,8 +1251,8 @@ fn test_admission_reserves_no_liquidity() {
         .with_tx_count(1)
         .with_required_confirms(1)
         .with_preferred_makers(vec![maker_addr.clone()]);
-    takers[0]
-        .prepare_swap(first)
+    world.takers_mut()[0]
+        .prepare(first)
         .expect("first swap should be admitted");
 
     // Taker 1 asks for the same amount and is admitted too: nothing is locked
@@ -1319,19 +1261,17 @@ fn test_admission_reserves_no_liquidity() {
         .with_tx_count(1)
         .with_required_confirms(1)
         .with_preferred_makers(vec![maker_addr]);
-    takers[1]
-        .prepare_swap(second)
+    world.takers_mut()[1]
+        .prepare(second)
         .expect("second swap should be admitted on the same liquidity");
     assert_eq!(
-        maker.reserved_inputs().unwrap(),
+        world.makers()[0].inner().reserved_inputs().unwrap(),
         0,
         "admission must not reserve any input"
     );
 
-    maker.shutdown.store(true, Relaxed);
-    maker_thread.join().unwrap();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// Out-of-bounds swap parameters are refused by the taker's own prepare
@@ -1341,11 +1281,11 @@ fn test_admission_reserves_no_liquidity() {
 /// those with forged wire values.
 #[test]
 fn taker_rejects_out_of_bounds_params_at_prepare() {
-    let (test_framework, mut takers, _makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(0, vec![TakerBehavior::Normal], vec![]);
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(0)
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    let taker_original_balance = world.fund_taker_default(3);
 
     let params = || SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1);
     let cases: Vec<(SwapParams, String)> = vec![
@@ -1384,8 +1324,9 @@ fn taker_rejects_out_of_bounds_params_at_prepare() {
         ),
     ];
     for (params, expected) in cases {
-        let error = taker
-            .prepare_swap(params)
+        let error = world
+            .taker_mut()
+            .prepare(params)
             .expect_err("an out-of-bounds parameter must fail at prepare time");
         assert!(
             format!("{error:?}").contains(&expected),
@@ -1394,14 +1335,13 @@ fn taker_rejects_out_of_bounds_params_at_prepare() {
             error
         );
     }
-    let balance = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let balance = world.taker().balances();
     assert_eq!(
         balance.spendable, taker_original_balance,
         "prepare-time rejections must not spend anything"
     );
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 /// Honest parameters pass the taker's own guards; the behavior hook rewrites
@@ -1421,15 +1361,19 @@ fn maker_rejects_forged_swap_details_at_admission_electrum() {
 }
 
 fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(1, vec![TakerBehavior::Normal], vec![MakerBehavior::Normal]);
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    let mut world = World::builder::<B>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    let taker_original_balance = world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
 
-    let preferred = vec![format!("127.0.0.1:{}", makers[0].config.network_port)];
+    let preferred = vec![format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    )];
     let params = || {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
             .with_tx_count(2)
@@ -1478,37 +1422,33 @@ fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
             "Incoming count outside the protocol bounds",
         ),
     ];
-    let log_path = test_framework.taker_log_path();
+    let log_path = world.taker_log_path();
     for (behavior, expected) in &cases {
-        taker.behavior = *behavior;
+        world.taker_mut().set_behavior(*behavior);
         let offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
-        let error = taker
-            .prepare_swap(params())
+        let error = world
+            .taker_mut()
+            .prepare(params())
             .expect_err("the maker's admission guard must refuse the forged SwapDetails");
         // Each refusal must surface after its own forgery: two cases share a
         // message, so a whole-log check would let a missing guard pass.
         wait_for_log_after(&log_path, offset, expected, 1, Duration::from_secs(60));
         info!("forged {:?} refused at admission: {:?}", behavior, error);
     }
-    taker.behavior = TakerBehavior::Normal;
+    world.taker_mut().set_behavior(TakerBehavior::Normal);
 
     // Nothing was funded: the taker's balance is untouched.
-    let balance = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let balance = world.taker().balances();
     assert_eq!(
         balance.spendable, taker_original_balance,
         "admission rejections must not spend anything"
     );
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
     // The maker never reserved or spent anything either.
-    makers[0]
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&NO_SHUTDOWN)
-        .unwrap();
-    let maker_balances = makers[0].wallet.read().unwrap().get_balances().unwrap();
+    world.makers()[0].sync();
+    let maker_balances = world.makers()[0].balances();
     assert_eq!(
         maker_balances.spendable.to_sat(),
         14999757,
@@ -1517,8 +1457,7 @@ fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
     assert_eq!(maker_balances.swap, Amount::ZERO);
     assert_eq!(maker_balances.contract, Amount::ZERO);
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 /// A maker whose contract response is corrupt — overcounted, or repeating one
@@ -1528,23 +1467,26 @@ fn run_corrupt_contract_response(
     behavior: MakerBehavior,
     expected: &str,
 ) {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(1, vec![TakerBehavior::Normal], vec![behavior]);
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![behavior])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
 
-    let summary = taker
-        .prepare_swap(
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(protocol, Amount::from_sat(500_000), 1)
                 .with_tx_count(3)
                 .with_required_confirms(1),
         )
         .expect("prepare swap");
-    let error = taker
-        .start_swap(&summary.swap_id)
+    let error = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect_err("a corrupt contract response must be rejected");
     assert!(
         format!("{error:?}").contains(expected),
@@ -1554,12 +1496,20 @@ fn run_corrupt_contract_response(
 
     // The corruption is arithmetically proven, so the maker's standing steps
     // off Good in the offerbook.
-    let standing = taker
+    let standing = world
+        .taker()
+        .inner()
         .fetch_offers()
         .unwrap()
         .all_makers()
         .into_iter()
-        .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
+        .find(|m| {
+            m.address.to_string()
+                == format!(
+                    "127.0.0.1:{}",
+                    world.makers()[0].inner().config.network_port
+                )
+        })
         .expect("the maker must be in the offerbook");
     assert!(
         matches!(
@@ -1572,9 +1522,8 @@ fn run_corrupt_contract_response(
         "a proven contract violation must ban the maker"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 #[test]
@@ -1623,35 +1572,24 @@ fn taker_rejects_duplicated_legacy_contract_outpoint() {
 /// refuses the ask at negotiation.
 #[test]
 fn maker_without_fee_headroom_fails_before_any_broadcast() {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    let taker_original_balance = world.fund_taker_default(3);
     // Bond: exactly 5,000,000 + its 243 sat fee, leaving zero change.
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(5_000_243),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(499_000),
-        AddressType::P2TR,
-    );
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    world.fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR);
+    world.fund_makers(1, Amount::from_sat(499_000), AddressType::P2TR);
+    world.spawn_ready_makers_and_mine();
 
-    let maker_addr = format!("127.0.0.1:{}", makers[0].config.network_port);
-    let error = taker
-        .prepare_swap(
+    let maker_addr = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    );
+    let error = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
                 .with_required_confirms(1)
                 .with_preferred_makers(vec![maker_addr]),
@@ -1663,21 +1601,20 @@ fn maker_without_fee_headroom_fails_before_any_broadcast() {
         "unexpected error: {:?}",
         error
     );
-    let balance = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let balance = world.taker().balances();
     assert_eq!(
         balance.spendable, taker_original_balance,
         "a negotiation rejection must not spend anything"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    let log_path = test_framework.taker_log_path();
+    world.shutdown_makers();
+    let log_path = world.taker_log_path();
     let log_contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         !log_contents.contains("SECURITY: Broadcasting"),
         "an unfundable swap must never reach a funding broadcast"
     );
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 /// A fragmented maker wallet at a high negotiated feerate can only fund the
@@ -1686,40 +1623,26 @@ fn maker_without_fee_headroom_fails_before_any_broadcast() {
 /// maker refuses at admission — before either side locks anything.
 #[test]
 fn maker_rejects_over_budget_funding_plan() {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    let taker_original_balance = world.fund_taker_default(3);
     // The fidelity bond needs one large UTXO (5,000,000 sats + its 243 sat
     // fee, leaving no change); the swap liquidity is eight small ones, so
     // funding 500k sats can only pack six of them into a single split.
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(5_000_243),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        8,
-        Amount::from_sat(100_000),
-        AddressType::P2TR,
-    );
+    world.fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR);
+    world.fund_makers(8, Amount::from_sat(100_000), AddressType::P2TR);
 
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    world.spawn_ready_makers_and_mine();
 
     // The pool sum covers the amount, but the admission-time plan prices the
     // real input cost: six unreimbursed inputs at 100 sats/vB cost more than
     // the hop earns, so negotiation fails and nothing is locked.
-    let error = taker
-        .prepare_swap(
+    let error = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
                 .with_tx_count(2)
                 .with_max_input_budget(1)
@@ -1732,17 +1655,18 @@ fn maker_rejects_over_budget_funding_plan() {
         "unexpected error: {:?}",
         error
     );
-    let balance = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let balance = world.taker().balances();
     assert_eq!(
         balance.spendable, taker_original_balance,
         "an admission rejection must not spend anything"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("above the taker's input budget", &log_path);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("above the taker's input budget", &log_path);
+    world.finish();
 }
 
 /// Poll the maker's swap tracker until the swap's timelock recovery has
@@ -1784,40 +1708,42 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::FailSecondBroadcast];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(1, taker_behaviors, maker_behaviors);
+    let mut world = World::builder::<B>()
+        .makers(1)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behaviors)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_makers(&makers);
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
+    world.start_makers(120);
+    world.mine(1);
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
         .with_tx_count(2)
         .with_required_confirms(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare must succeed");
     let swap_id = summary.swap_id.clone();
-    let swap_result = taker.start_swap(&swap_id);
+    let swap_result = world.taker_mut().start(&swap_id);
     assert!(
         swap_result.is_err(),
         "the swap must fail when the maker's second broadcast fails"
     );
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("Test behavior: failing the second", &log_path);
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("Test behavior: failing the second", &log_path);
 
     // The 30s idle timeout starts recovery; the timelock path then needs the
     // maker's outgoing timelock (150 CSV blocks from the contract broadcast).
     let record = wait_for_maker_timelock_recovery(
-        &makers[0].data_dir,
+        &world.makers()[0].inner().data_dir,
         &swap_id,
         timelock_recovery_wait::<B>() + Duration::from_secs(120),
     );
@@ -1843,7 +1769,7 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
 
     // The unsent split's inputs must return to the pool without a restart.
     let deadline = Instant::now() + Duration::from_secs(180);
-    while makers[0].reserved_inputs().unwrap() != 0 {
+    while world.makers()[0].inner().reserved_inputs().unwrap() != 0 {
         assert!(
             Instant::now() < deadline,
             "recovery left the unsent split's inputs reserved"
@@ -1851,16 +1777,11 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
         thread::sleep(Duration::from_secs(2));
     }
 
-    generate_blocks(bitcoind, 1);
-    test_framework.wait_for_electrs_tip();
-    let maker = &makers[0];
-    maker
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&NO_SHUTDOWN)
-        .unwrap();
-    let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
+    let maker = &world.makers()[0];
+    maker.sync();
+    let balances = maker.balances();
     info!(
         "Maker balances after partial-broadcast recovery: regular={}, swap={}, contract={}, spendable={}",
         balances.regular, balances.swap, balances.contract, balances.spendable
@@ -1876,8 +1797,8 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
 
     // The recovery loop keeps polling until shutdown; the maker does not exit
     // on its own in this scenario.
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 #[test]
@@ -1905,32 +1826,34 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
     let taker_behaviors = vec![TakerBehavior::FailSecondFundingBroadcast];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(2, taker_behaviors, maker_behaviors);
+    let mut world = World::builder::<B>()
+        .makers(2)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behaviors)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    let taker_original_balance = world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    world.spawn_ready_makers_and_mine();
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
         .with_tx_count(2)
         .with_required_confirms(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare must succeed");
     let swap_id = summary.swap_id.clone();
-    let swap_result = taker.start_swap(&swap_id);
+    let swap_result = world.taker_mut().start(&swap_id);
     assert!(
         swap_result.is_err(),
         "the swap must fail at the taker's second funding broadcast"
     );
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log(
+    let log_path = world.taker_log_path();
+    world.framework().assert_log(
         "Test behavior: failing the second funding broadcast",
         &log_path,
     );
@@ -1947,7 +1870,7 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         "funding reinitialize destroys the on-chain split's swapcoins"
     );
 
-    let tracker = SwapTracker::load_or_create(&test_framework.temp_dir.join("taker1")).unwrap();
+    let tracker = SwapTracker::load_or_create(&world.temp_dir().join("taker1")).unwrap();
     let record = tracker
         .get_record(&swap_id)
         .expect("swap record must exist");
@@ -1968,7 +1891,9 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         "the broadcast milestone must be recorded before the loop, not after it"
     );
     assert_eq!(
-        taker
+        world
+            .taker()
+            .inner()
             .get_wallet()
             .read()
             .unwrap()
@@ -1979,7 +1904,7 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
 
     // Recovery reclaims the on-chain split once its timelock matures.
     let recovery_start = Instant::now();
-    while !taker.is_recovery_complete() {
+    while !world.taker().inner().is_recovery_complete() {
         assert!(
             recovery_start.elapsed() <= Duration::from_secs(360),
             "taker recovery did not complete in time"
@@ -1987,15 +1912,10 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         thread::sleep(Duration::from_secs(5));
     }
 
-    generate_blocks(bitcoind, 1);
-    test_framework.wait_for_electrs_tip();
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&NO_SHUTDOWN)
-        .unwrap();
-    let balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
+    world.taker().sync();
+    let balances = world.taker().balances();
     info!(
         "Taker balances after partial-broadcast recovery: original={}, regular={}, swap={}, contract={}, spendable={}",
         taker_original_balance,
@@ -2012,8 +1932,8 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         "taker spendable after recovering the partial batch"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 #[test]
@@ -2114,17 +2034,21 @@ const REPLAYED_TAPROOT_IN_FLIGHT: ReplayScenario = ReplayScenario {
 fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     warn!("Running Test: {}", s.name);
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(1, vec![s.behavior], vec![MakerBehavior::Normal]);
+    let mut world = World::builder::<B>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![s.behavior])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, s.taker_utxos);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_taker_default(s.taker_utxos);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    world.spawn_ready_makers_and_mine();
 
-    let preferred = vec![format!("127.0.0.1:{}", makers[0].config.network_port)];
+    let preferred = vec![format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    )];
     let params = || {
         let p = SwapParams::new(s.protocol, Amount::from_sat(500_000), 1).with_tx_count(1);
         if s.pin_maker {
@@ -2134,20 +2058,23 @@ fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
         }
     };
 
-    let summary1 = taker
-        .prepare_swap(params())
+    let summary1 = world
+        .taker_mut()
+        .prepare(params())
         .expect("prepare 1 must succeed");
     if s.swap1_completes {
         // Swap 1 completes normally; its contract data is cached for the replay.
-        taker
-            .start_swap(&summary1.swap_id)
+        world
+            .taker_mut()
+            .start(&summary1.swap_id)
             .expect("swap 1 must succeed");
 
         // Wait until the maker's sweep is confirmed and the swap-1 swapcoin
         // has left the store, so only the chain can answer the replay.
         let sweep_wait = Instant::now();
         loop {
-            let count = makers[0]
+            let count = world.makers()[0]
+                .inner()
                 .wallet
                 .read()
                 .unwrap()
@@ -2164,14 +2091,15 @@ fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     } else {
         // Swap 1 dies right after the maker processed its funding, so the
         // maker's claim on the incoming contracts is still live.
-        let swap1 = taker.start_swap(&summary1.swap_id);
+        let swap1 = world.taker_mut().start(&summary1.swap_id);
         assert!(
             swap1.is_err(),
             "the behavior hook must abort swap 1 with the maker's claim in flight"
         );
         if let Some((count, msg)) = s.swapcoins_before {
             assert_eq!(
-                makers[0]
+                world.makers()[0]
+                    .inner()
                     .wallet
                     .read()
                     .unwrap()
@@ -2184,27 +2112,23 @@ fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
         // With recovery suppressed nothing syncs the wallet between swaps;
         // swap 2's funding must not re-pick swap 1's spent UTXOs.
         if s.sync_after_swap1 {
-            taker
-                .get_wallet()
-                .write()
-                .unwrap()
-                .sync_and_save(&NO_SHUTDOWN)
-                .unwrap();
+            world.taker().sync();
         }
         // Hold the chain still so the replay lands inside the claim's window.
-        test_framework.set_block_gen_paused(true);
+        world.framework().set_block_gen_paused(true);
     }
 
     // Swap 2: fresh id, replayed funding. The maker must reject before
     // funding anything.
-    let log_path = test_framework.taker_log_path();
+    let log_path = world.taker_log_path();
     let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
 
-    let summary2 = taker
-        .prepare_swap(params())
+    let summary2 = world
+        .taker_mut()
+        .prepare(params())
         .expect("prepare 2 must succeed");
     assert_ne!(summary1.swap_id, summary2.swap_id);
-    let swap2 = taker.start_swap(&summary2.swap_id);
+    let swap2 = world.taker_mut().start(&summary2.swap_id);
     assert!(swap2.is_err(), "{}", s.swap2_reject_msg);
 
     wait_for_log(
@@ -2222,7 +2146,8 @@ fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     }
     if let Some((count, msg)) = s.swapcoins_after {
         assert_eq!(
-            makers[0]
+            world.makers()[0]
+                .inner()
                 .wallet
                 .read()
                 .unwrap()
@@ -2234,10 +2159,10 @@ fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     }
 
     if !s.swap1_completes {
-        test_framework.set_block_gen_paused(false);
+        world.framework().set_block_gen_paused(false);
     }
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A completed swap's Taproot contract data re-presented under a fresh swap id
@@ -2327,54 +2252,35 @@ fn wait_for_log_after(
 fn concurrent_replay_setup(
     behavior: TakerBehavior,
     taker_utxos: u32,
-) -> (
-    Arc<TestFramework>,
-    Taker,
-    Taker,
-    Vec<Arc<MakerServer>>,
-    JoinHandle<()>,
-    Vec<JoinHandle<()>>,
-    String,
-    String,
-    u64,
-) {
-    let (test_framework, takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![behavior, behavior],
-            vec![MakerBehavior::Normal],
-        );
+) -> (World, TakerHandle, TakerHandle, String, String, u64) {
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![behavior, behavior])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let mut taker_iter = takers.into_iter();
-    let taker1 = taker_iter.next().unwrap();
-    let taker2 = taker_iter.next().unwrap();
-    for taker in [&taker1, &taker2] {
-        fund_taker_default(taker, bitcoind, taker_utxos);
+    for i in 0..world.takers().len() {
+        world.fund_nth_taker_default(i, taker_utxos);
     }
-    fund_makers_default(&makers, bitcoind);
+    // Both takers run on their own threads, so they leave the world here.
+    let taker1 = world.take_taker();
+    let taker2 = world.take_taker();
+    world.fund_makers_default();
 
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    world.spawn_ready_makers_and_mine();
 
-    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
-    let log_path = test_framework.taker_log_path();
+    let maker_address = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    );
+    let log_path = world.taker_log_path();
 
     // Hold the swaps' funding unconfirmed: each maker handler blocks in the
     // confirmation wait.
-    test_framework.set_block_gen_paused(true);
+    world.framework().set_block_gen_paused(true);
     let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
 
-    (
-        test_framework,
-        taker1,
-        taker2,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        maker_address,
-        log_path,
-        log_offset,
-    )
+    (world, taker1, taker2, maker_address, log_path, log_offset)
 }
 
 /// The genuinely concurrent arm of the Taproot replay guard: swap 1's
@@ -2384,17 +2290,8 @@ fn concurrent_replay_setup(
 fn maker_rejects_concurrent_replayed_taproot_contract_data() {
     warn!("Running Test: maker rejects concurrent replayed Taproot contract data");
 
-    let (
-        test_framework,
-        mut taker1,
-        mut taker2,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        maker_address,
-        log_path,
-        log_offset,
-    ) = concurrent_replay_setup(TakerBehavior::ReplayTaprootContractData, 3);
+    let (mut world, mut taker1, mut taker2, maker_address, log_path, log_offset) =
+        concurrent_replay_setup(TakerBehavior::ReplayTaprootContractData, 3);
 
     let params = |address: &str| {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
@@ -2407,9 +2304,9 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
     let swap1_address = maker_address.clone();
     let swap1 = thread::spawn(move || {
         let summary = taker1
-            .prepare_swap(params(&swap1_address))
+            .prepare(params(&swap1_address))
             .expect("prepare 1 must succeed");
-        taker1.start_swap(&summary.swap_id)
+        taker1.start(&summary.swap_id)
     });
 
     // Barrier: the maker claimed swap 1's incoming txids and is inside the
@@ -2425,9 +2322,9 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
     // Swap 2 replays swap 1's contract data under a fresh id. The atomic
     // claim is the only guard that can refuse it this early.
     let summary2 = taker2
-        .prepare_swap(params(&maker_address))
+        .prepare(params(&maker_address))
         .expect("prepare 2 must succeed");
-    let swap2 = taker2.start_swap(&summary2.swap_id);
+    let swap2 = taker2.start(&summary2.swap_id);
     assert!(
         swap2.is_err(),
         "the maker must reject the concurrent replayed contract data"
@@ -2454,7 +2351,7 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
     );
 
     // Mining resumes: swap 1's handler wakes and funds exactly one hop.
-    test_framework.set_block_gen_paused(false);
+    world.framework().set_block_gen_paused(false);
     wait_for_log_after(
         &log_path,
         log_offset,
@@ -2475,10 +2372,9 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
 
     let _ = swap1.join().expect("swap 1 thread panicked");
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
     drop(taker2);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 /// The genuinely concurrent Legacy arm: swap 1's handler parks in the proof's
@@ -2488,17 +2384,8 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
 fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
     warn!("Running Test: maker rejects concurrent replayed Legacy proof of funding");
 
-    let (
-        test_framework,
-        taker1,
-        taker2,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        maker_address,
-        log_path,
-        log_offset,
-    ) = concurrent_replay_setup(TakerBehavior::ReplayLegacyProofOfFunding, 4);
+    let (mut world, taker1, taker2, maker_address, log_path, log_offset) =
+        concurrent_replay_setup(TakerBehavior::ReplayLegacyProofOfFunding, 4);
 
     let params = |address: &str| {
         SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
@@ -2506,12 +2393,12 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
             .with_preferred_makers(vec![address.to_string()])
     };
 
-    let run_swap = |mut taker: openswap::taker::Taker, address: String| {
+    let run_swap = |mut taker: TakerHandle, address: String| {
         thread::spawn(move || {
             let summary = taker
-                .prepare_swap(params(&address))
+                .prepare(params(&address))
                 .expect("prepare must succeed");
-            taker.start_swap(&summary.swap_id)
+            taker.start(&summary.swap_id)
         })
     };
     let swap1 = run_swap(taker1, maker_address.clone());
@@ -2537,7 +2424,7 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
         Duration::from_secs(120),
     );
 
-    test_framework.set_block_gen_paused(false);
+    world.framework().set_block_gen_paused(false);
 
     // Swap 1's wait observes the confirmation and funds exactly one hop.
     wait_for_log_after(
@@ -2565,9 +2452,8 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
         "neither swap may complete: the loser is rejected, the winner's counterpart is gone"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// After a partial broadcast, the taker re-admits the same swap; the maker
@@ -2577,23 +2463,24 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
 fn maker_reprocesses_own_contracts_after_partial_broadcast() {
     warn!("Running Test: maker reprocesses own contracts after partial broadcast");
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::ResumeAfterMakerDrop],
-            vec![MakerBehavior::FailSecondBroadcast],
-        );
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::FailSecondBroadcast])
+        .takers(vec![TakerBehavior::ResumeAfterMakerDrop])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    world.spawn_ready_makers_and_mine();
 
-    let preferred = vec![format!("127.0.0.1:{}", makers[0].config.network_port)];
-    let summary = taker
-        .prepare_swap(
+    let preferred = vec![format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    )];
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
                 .with_tx_count(2)
                 .with_required_confirms(1)
@@ -2601,14 +2488,16 @@ fn maker_reprocesses_own_contracts_after_partial_broadcast() {
         )
         .expect("prepare must succeed");
     let swap_id = summary.swap_id.clone();
-    let swap_result = taker.start_swap(&swap_id);
+    let swap_result = world.taker_mut().start(&swap_id);
     assert!(
         swap_result.is_err(),
         "the swap must fail: the resumed pass cannot re-fund the frozen plan"
     );
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("Test behavior: maker 0 dropped mid-exchange", &log_path);
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("Test behavior: maker 0 dropped mid-exchange", &log_path);
 
     let contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
@@ -2643,8 +2532,8 @@ fn maker_reprocesses_own_contracts_after_partial_broadcast() {
         "the swap must not complete"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A maker restarted mid-swap must refuse a SwapDetails whose id belongs
@@ -2656,23 +2545,24 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
 
     // CrashBeforeRecovery keeps the taker's negotiated state after the failed
     // swap, so the test can resend the same SwapDetails afterwards.
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::CrashBeforeRecovery],
-            vec![MakerBehavior::SkipFundingBroadcast],
-        );
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::SkipFundingBroadcast])
+        .takers(vec![TakerBehavior::CrashBeforeRecovery])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    world.spawn_ready_makers_and_mine();
 
-    let preferred = vec![format!("127.0.0.1:{}", makers[0].config.network_port)];
-    let summary = taker
-        .prepare_swap(
+    let preferred = vec![format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    )];
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
                 .with_tx_count(1)
                 .with_required_confirms(1)
@@ -2683,13 +2573,14 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
 
     // The maker persists both sides' swapcoins, then dies before funding: the
     // swap stays unfinished in its wallet.
-    let swap_result = taker.start_swap(&swap_id);
+    let swap_result = world.taker_mut().start(&swap_id);
     assert!(
         swap_result.is_err(),
         "the swap must fail when the maker skips its funding broadcast"
     );
     assert!(
-        makers[0]
+        world.makers()[0]
+            .inner()
             .wallet
             .read()
             .unwrap()
@@ -2700,14 +2591,14 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
 
     // Hold the timelocks still so the restarted maker's recovery cannot
     // resolve the swapcoins before the resend lands.
-    test_framework.set_block_gen_paused(true);
+    world.framework().set_block_gen_paused(true);
 
     // Restart the maker the way the reboot tests do: the first init consumed
     // the passphrase, so re-supply it.
-    let mut victim_config = makers[0].config.clone();
+    let mut victim_config = world.makers()[0].inner().config.clone();
     victim_config.password = Some("integration-test".to_string());
-    shutdown_makers(&makers, maker_threads);
-    drop(makers);
+    world.shutdown_makers();
+    world.drop_makers();
 
     let restarted = Arc::new(MakerServer::init(victim_config).unwrap());
     let restarted_thread = {
@@ -2718,7 +2609,9 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
 
     // The taker reconnects with the same swap id. Admission must refuse it:
     // the id belongs to the unfinished swap on disk.
-    let response = taker
+    let response = world
+        .taker()
+        .inner()
         .test_resend_swap_details(0)
         .expect("the resend itself must get an answer");
     match response {
@@ -2731,14 +2624,16 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
         other => panic!("expected AckSwapDetails, got {:?}", other),
     }
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("Swap id belongs to an unfinished swap", &log_path);
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("Swap id belongs to an unfinished swap", &log_path);
 
-    test_framework.set_block_gen_paused(false);
+    world.framework().set_block_gen_paused(false);
 
     restarted.shutdown.store(true, Relaxed);
     restarted_thread.join().unwrap();
-    test_framework.finish(takers, block_generation_handle);
+    world.finish();
 }
 
 /// A maker that funds at the relay floor against a negotiated 3 sat/vB swap:
@@ -2767,29 +2662,29 @@ fn test_legacy_rejects_funding_fee_underpayment_electrum() {
 }
 
 fn run_rejects_funding_fee_underpayment<B: TestBackend>(protocol: ProtocolVersion) {
-    let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
-        1,
-        vec![TakerBehavior::Normal],
-        vec![MakerBehavior::UnderpayFundingFee],
-    );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    let mut world = World::builder::<B>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::UnderpayFundingFee])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
 
     // The hook only bites above the floor: at the 1 sat/vB default the floor
     // and the negotiated rate coincide, so negotiate a custom rate.
-    let summary = taker
-        .prepare_swap(
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(protocol, Amount::from_sat(500_000), 1)
                 .with_tx_count(2)
                 .with_feerate(3)
                 .with_required_confirms(1),
         )
         .expect("prepare swap");
-    let error = taker
-        .start_swap(&summary.swap_id)
+    let error = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect_err("the underpaying maker's funding must be rejected");
     assert!(
         format!("{error:?}").contains("the agreed feerate requires"),
@@ -2799,12 +2694,20 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(protocol: ProtocolVersio
 
     // The shortfall is arithmetically proven, so the maker's standing steps
     // off Good.
-    let standing = taker
+    let standing = world
+        .taker()
+        .inner()
         .fetch_offers()
         .unwrap()
         .all_makers()
         .into_iter()
-        .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
+        .find(|m| {
+            m.address.to_string()
+                == format!(
+                    "127.0.0.1:{}",
+                    world.makers()[0].inner().config.network_port
+                )
+        })
         .expect("the maker must be in the offerbook");
     assert!(
         matches!(
@@ -2817,50 +2720,40 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(protocol: ProtocolVersio
         "a proven fee shortfall must ban the maker"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// The setup both keepalive tests share: one funded maker and one admitted swap
 /// that is not started yet.
-#[allow(clippy::type_complexity)]
 fn keepalive_admission(
     taker_behavior: TakerBehavior,
     pause_mining: bool,
-) -> (
-    Arc<TestFramework>,
-    Vec<Taker>,
-    Vec<Arc<MakerServer>>,
-    JoinHandle<()>,
-    Vec<JoinHandle<()>>,
-    String,
-    String,
-) {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![taker_behavior],
-            vec![MakerBehavior::Normal],
-        );
+) -> (World, String, String) {
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![taker_behavior])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    fund_taker_default(takers.get_mut(0).unwrap(), bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
 
-    let log_path = test_framework.taker_log_path();
-    let maker_addr = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let log_path = world.taker_log_path();
+    let maker_addr = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    );
 
     // Hold the tip still when the test needs contract txs mempool-visible.
     if pause_mining {
-        test_framework.set_block_gen_paused(true);
+        world.framework().set_block_gen_paused(true);
     }
 
-    let summary = takers
-        .get_mut(0)
-        .unwrap()
-        .prepare_swap(
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
                 .with_tx_count(1)
                 .with_required_confirms(1)
@@ -2868,15 +2761,7 @@ fn keepalive_admission(
         )
         .expect("the maker must admit the swap");
 
-    (
-        test_framework,
-        takers,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        summary.swap_id.clone(),
-        log_path,
-    )
+    (world, summary.swap_id.clone(), log_path)
 }
 
 /// A keepalive naming funding the backend can see still refreshes: with
@@ -2887,18 +2772,12 @@ fn keepalive_admission(
 fn keepalive_with_mempool_funding_still_refreshes() {
     warn!("Running Test: keepalive with mempool-visible funding still refreshes");
 
-    let (
-        test_framework,
-        mut takers,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        swap_id,
-        log_path,
-    ) = keepalive_admission(TakerBehavior::SkipFundingConfirmWait, true);
+    let (mut world, swap_id, log_path) =
+        keepalive_admission(TakerBehavior::SkipFundingConfirmWait, true);
 
-    let mut taker = takers.remove(0);
-    let swap_thread = thread::spawn(move || taker.start_swap(&swap_id));
+    // The swap runs on its own thread, so the taker leaves the world here.
+    let mut taker = world.take_taker();
+    let swap_thread = thread::spawn(move || taker.start(&swap_id));
 
     // The maker claimed the taker's contract txids and is waiting for a
     // confirmation the paused miner will not give.
@@ -2911,11 +2790,11 @@ fn keepalive_with_mempool_funding_still_refreshes() {
     // Wait past the 30s idle timeout: the swap must still be held.
     thread::sleep(Duration::from_secs(25));
     assert!(
-        makers[0].has_ongoing_swaps().unwrap(),
+        world.makers()[0].inner().has_ongoing_swaps().unwrap(),
         "a swap with mempool-visible funding must survive the idle timeout"
     );
 
-    test_framework.set_block_gen_paused(false);
+    world.framework().set_block_gen_paused(false);
     swap_thread
         .join()
         .unwrap()
@@ -2931,8 +2810,8 @@ fn keepalive_with_mempool_funding_still_refreshes() {
         "a swap with mempool-visible funding must never be drained"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A keepalive naming funding the backend cannot see must not refresh:
@@ -2942,18 +2821,12 @@ fn keepalive_with_mempool_funding_still_refreshes() {
 fn keepalive_naming_unseen_funding_is_refused() {
     warn!("Running Test: keepalive naming unseen funding is refused");
 
-    let (
-        test_framework,
-        mut takers,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        swap_id,
-        log_path,
-    ) = keepalive_admission(TakerBehavior::WithholdFundingBroadcast, true);
+    let (mut world, swap_id, log_path) =
+        keepalive_admission(TakerBehavior::WithholdFundingBroadcast, true);
 
-    let mut taker = takers.remove(0);
-    let swap_thread = thread::spawn(move || taker.start_swap(&swap_id));
+    // The swap runs on its own thread, so the taker leaves the world here.
+    let mut taker = world.take_taker();
+    let swap_thread = thread::spawn(move || taker.start(&swap_id));
 
     // The maker claimed the withheld txids and waits for a tx that will never
     // arrive. Everything logged after this point is post-claim.
@@ -2997,13 +2870,13 @@ fn keepalive_naming_unseen_funding_is_refused() {
         Duration::from_secs(400),
     );
     assert!(
-        !makers[0].has_ongoing_swaps().unwrap(),
+        !world.makers()[0].inner().has_ongoing_swaps().unwrap(),
         "the maker must hold no swap after the idle drain"
     );
 
-    test_framework.set_block_gen_paused(false);
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.framework().set_block_gen_paused(false);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A taker that returns after the maker drained its idle admission is
@@ -3012,27 +2885,20 @@ fn keepalive_naming_unseen_funding_is_refused() {
 fn slow_taker_is_readmitted_before_funding() {
     warn!("Running Test: slow taker is re-admitted before funding");
 
-    let (
-        test_framework,
-        mut takers,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        swap_id,
-        log_path,
-    ) = keepalive_admission(TakerBehavior::Normal, false);
+    let (mut world, swap_id, log_path) = keepalive_admission(TakerBehavior::Normal, false);
 
     wait_for_log(
         &log_path,
         "Released idle unfunded swap",
         Duration::from_secs(400),
     );
-    takers[0]
-        .start_swap(&swap_id)
+    world
+        .taker_mut()
+        .start(&swap_id)
         .expect("the re-check must re-admit the drained swap");
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A Legacy maker hands its funding txs to the taker before it holds the
@@ -3042,30 +2908,30 @@ fn slow_taker_is_readmitted_before_funding() {
 fn legacy_handed_out_funding_cannot_be_broadcast() {
     warn!("Running Test: Legacy handed-out funding cannot be broadcast");
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::BroadcastHandedOutFunding],
-            vec![MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::BroadcastHandedOutFunding])
+        .build();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
 
-    let summary = taker
-        .prepare_swap(
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
                 .with_tx_count(2)
                 .with_required_confirms(1),
         )
         .expect("prepare swap");
-    assert!(taker.start_swap(&summary.swap_id).is_err());
+    assert!(world.taker_mut().start(&summary.swap_id).is_err());
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("handed-out funding tx", &log_path);
-    let contents = fs::read_to_string(&log_path).unwrap();
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("handed-out funding tx", &log_path);
+    let contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         !contents
             .lines()
@@ -3073,8 +2939,8 @@ fn legacy_handed_out_funding_cannot_be_broadcast() {
         "a handed-out funding tx must not be broadcastable"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A maker that re-admits a drained swap with a different plan shape fails
@@ -3083,43 +2949,45 @@ fn legacy_handed_out_funding_cannot_be_broadcast() {
 fn readmission_with_a_new_shape_fails_before_funding() {
     warn!("Running Test: re-admission with a new plan shape fails before funding");
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    fund_taker_default(takers.get_mut(0).unwrap(), bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
-    let log_path = test_framework.taker_log_path();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
+    let log_path = world.taker_log_path();
 
-    let taker = takers.get_mut(0).unwrap();
-    let summary = taker
-        .prepare_swap(
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
                 .with_tx_count(2)
                 .with_required_confirms(1),
         )
         .expect("the maker must admit the swap");
-    test_framework.assert_log("with 2 funding split(s)", &log_path);
+    world
+        .framework()
+        .assert_log("with 2 funding split(s)", &log_path);
 
     // Leave the maker one coin, so a fresh plan can have only one split.
-    let spendable = makers[0]
+    let maker = world.makers()[0].inner();
+    let spendable = maker
         .wallet
         .read()
         .unwrap()
         .get_balances()
         .unwrap()
         .spendable;
-    let external = bitcoind
+    let external = world
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
         .require_network(Network::Regtest)
         .unwrap();
-    makers[0]
+    maker
         .wallet
         .write()
         .unwrap()
@@ -3130,32 +2998,33 @@ fn readmission_with_a_new_shape_fails_before_funding() {
             None,
         )
         .unwrap();
-    generate_blocks(bitcoind, 1);
-    sync_maker_wallets(&makers);
+    world.mine(1);
+    world.sync_makers();
 
     wait_for_log(
         &log_path,
         "Released idle unfunded swap",
         Duration::from_secs(400),
     );
-    let before = taker.get_wallet().read().unwrap().get_balances().unwrap();
-    let error = taker
-        .start_swap(&summary.swap_id)
+    let before = world.taker().balances();
+    let error = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect_err("a changed plan shape must stop the swap");
     assert!(
         format!("{error:?}").contains("no longer holds this swap's plan"),
         "unexpected error: {:?}",
         error
     );
-    let after = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let after = world.taker().balances();
     assert_eq!(
         after.spendable, before.spendable,
         "the taker funded nothing"
     );
     assert_eq!(after.contract, Amount::ZERO);
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A failed sweep puts the completed swap's state back after it was removed.
@@ -3164,51 +3033,50 @@ fn readmission_with_a_new_shape_fails_before_funding() {
 fn completed_swap_state_is_restored_after_a_failed_sweep() {
     warn!("Running Test: completed swap state is restored after a failed sweep");
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::FailSweep],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::FailSweep])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
 
-    let summary = taker
-        .prepare_swap(
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
                 .with_tx_count(1)
                 .with_required_confirms(1),
         )
         .expect("prepare swap");
-    taker
-        .start_swap(&summary.swap_id)
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("the taker's side completes before the maker sweeps");
 
-    let log_path = test_framework.taker_log_path();
+    let log_path = world.taker_log_path();
     wait_for_log(
         &log_path,
         "Failed to sweep incoming swapcoins",
         Duration::from_secs(60),
     );
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !makers[0].has_ongoing_swaps().unwrap() {
+    while !world.makers()[0].inner().has_ongoing_swaps().unwrap() {
         assert!(
             Instant::now() < deadline,
             "the completed swap's state must be put back"
         );
         thread::sleep(Duration::from_millis(500));
     }
-    let contents = fs::read_to_string(&log_path).unwrap();
+    let contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         !contents.contains("Rejecting late message"),
         "restoring a completed swap is not a late message"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// An Ack that declares more inputs per split than the maker funds with
@@ -3225,27 +3093,26 @@ fn test_legacy_rejects_overreported_funding_inputs() {
 }
 
 fn run_rejects_overreported_funding_inputs(protocol: ProtocolVersion) {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::OverreportFundingInputs],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::OverreportFundingInputs])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
+    world.spawn_ready_makers_and_mine();
 
-    let summary = taker
-        .prepare_swap(
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(protocol, Amount::from_sat(500_000), 1)
                 .with_tx_count(2)
                 .with_required_confirms(1),
         )
         .expect("prepare swap");
-    let error = taker
-        .start_swap(&summary.swap_id)
+    let error = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect_err("funding with fewer inputs than declared must be rejected");
     assert!(
         format!("{error:?}").contains("its plan declared"),
@@ -3253,12 +3120,20 @@ fn run_rejects_overreported_funding_inputs(protocol: ProtocolVersion) {
         error
     );
 
-    let standing = taker
+    let standing = world
+        .taker()
+        .inner()
         .fetch_offers()
         .unwrap()
         .all_makers()
         .into_iter()
-        .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
+        .find(|m| {
+            m.address.to_string()
+                == format!(
+                    "127.0.0.1:{}",
+                    world.makers()[0].inner().config.network_port
+                )
+        })
         .expect("the maker must be in the offerbook");
     assert!(
         matches!(
@@ -3271,8 +3146,8 @@ fn run_rejects_overreported_funding_inputs(protocol: ProtocolVersion) {
         "a proven input overreport must ban the maker"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// The concurrency cap rejects before any admission planning runs: the
@@ -3282,34 +3157,27 @@ fn run_rejects_overreported_funding_inputs(protocol: ProtocolVersion) {
 fn swap_cap_rejects_before_planning() {
     warn!("Running Test: swap cap rejects before admission planning");
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-        );
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .maker_behaviors(vec![MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    fund_taker_default(taker, bitcoind, 1);
+    world.fund_taker_default(1);
     // 31 UTXOs: the fidelity bond consumes one net (two inputs, one change
     // back), leaving exactly 30 — one per admission's single-input plan.
-    fund_makers(
-        &makers,
-        bitcoind,
-        31,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
+    world.fund_makers(31, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
+
+    world.spawn_ready_makers_and_mine();
+
+    let maker_addr = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
     );
 
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
-
-    let maker = &makers[0];
-    let maker_addr = format!("127.0.0.1:{}", maker.config.network_port);
-
-    let _summary = taker
-        .prepare_swap(
+    let _summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
                 .with_tx_count(1)
                 .with_max_input_budget(1)
@@ -3317,7 +3185,9 @@ fn swap_cap_rejects_before_planning() {
                 .with_preferred_makers(vec![maker_addr.clone()]),
         )
         .expect("the first admission must succeed");
-    let template = taker
+    let template = world
+        .taker()
+        .inner()
         .test_current_swap_details(0)
         .expect("the negotiated SwapDetails rebuild");
 
@@ -3325,7 +3195,9 @@ fn swap_cap_rejects_before_planning() {
     for n in 1..30u64 {
         let mut details = template.clone();
         details.id = format!("{:016x}", n);
-        match taker
+        match world
+            .taker()
+            .inner()
             .test_send_swap_details(&maker_addr, &details)
             .expect("every admission must get an answer")
         {
@@ -3343,7 +3215,9 @@ fn swap_cap_rejects_before_planning() {
     // The 31st swap is refused at the cap.
     let mut details = template.clone();
     details.id = format!("{:016x}", 30u64);
-    match taker
+    match world
+        .taker()
+        .inner()
         .test_send_swap_details(&maker_addr, &details)
         .expect("the capped admission must still get an answer")
     {
@@ -3356,16 +3230,18 @@ fn swap_cap_rejects_before_planning() {
         other => panic!("the capped admission got unexpected response: {:?}", other),
     }
 
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("30 active swaps at the 30 cap", &log_path);
+    let log_path = world.taker_log_path();
+    world
+        .framework()
+        .assert_log("30 active swaps at the 30 cap", &log_path);
     let contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         !contents.contains("Rejecting swap at admission"),
         "the cap must fire before the planner runs"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// An offer whose minimum exceeds its maximum cannot price any amount. That is
@@ -3379,34 +3255,26 @@ fn an_unpriceable_offer_sidelines_without_banning() {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::SendMalformedOffer, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || start_server(maker_clone).unwrap())
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    generate_blocks(bitcoind, 1);
+    world.start_makers_without_sync(120);
+    world.mine(1);
 
     // One hop, so the honest maker alone can carry the route while the
     // malformed offer is judged during the same offerbook sync.
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 1)
         .with_tx_count(2)
         .with_required_confirms(1);
-    let _ = taker.prepare_swap(swap_params);
+    let _ = world.taker_mut().prepare(swap_params);
 
-    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standings = world.taker().inner().fetch_offers().unwrap().all_makers();
     let standing_of = |port: u16| {
         standings
             .iter()
@@ -3416,7 +3284,7 @@ fn an_unpriceable_offer_sidelines_without_banning() {
             .clone()
     };
 
-    let publisher = standing_of(makers[0].config.network_port);
+    let publisher = standing_of(world.makers()[0].inner().config.network_port);
     assert!(
         matches!(
             publisher,
@@ -3429,7 +3297,7 @@ fn an_unpriceable_offer_sidelines_without_banning() {
         publisher
     );
 
-    let honest = standing_of(makers[1].config.network_port);
+    let honest = standing_of(world.makers()[1].inner().config.network_port);
     assert!(
         !matches!(honest, MakerState::Banned(_)),
         "the honest maker must not be blamed, got {:?}",
@@ -3437,9 +3305,8 @@ fn an_unpriceable_offer_sidelines_without_banning() {
     );
 
     info!("Unpriceable offer test completed successfully!");
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// Signatures made with a key nobody agreed to are well formed and still
@@ -3455,41 +3322,34 @@ fn wrong_key_sender_signatures_ban_their_signer() {
         MakerBehavior::Normal,
     ];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || start_server(maker_clone).unwrap())
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    generate_blocks(bitcoind, 1);
+    world.start_makers_without_sync(120);
+    world.mine(1);
 
     // Both makers are on the route, so there is no spare to substitute and the
     // failure lands on the signer wherever it sits in the order.
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(2)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare must succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
         swap_result.is_err(),
         "a swap signed with the wrong key must fail"
     );
 
-    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standings = world.taker().inner().fetch_offers().unwrap().all_makers();
     let standing_of = |port: u16| {
         standings
             .iter()
@@ -3499,7 +3359,7 @@ fn wrong_key_sender_signatures_ban_their_signer() {
             .clone()
     };
 
-    let signer = standing_of(makers[0].config.network_port);
+    let signer = standing_of(world.makers()[0].inner().config.network_port);
     assert!(
         matches!(
             signer,
@@ -3512,7 +3372,7 @@ fn wrong_key_sender_signatures_ban_their_signer() {
         signer
     );
 
-    let honest = standing_of(makers[1].config.network_port);
+    let honest = standing_of(world.makers()[1].inner().config.network_port);
     assert!(
         !matches!(honest, MakerState::Banned(_)),
         "the honest maker must not be blamed, got {:?}",
@@ -3521,9 +3381,13 @@ fn wrong_key_sender_signatures_ban_their_signer() {
 
     // Naming the banned maker by address must not get it back into a route:
     // the only candidate is refused, so no route can be built at all.
-    let banned_address = format!("127.0.0.1:{}", makers[0].config.network_port);
-    let refusal = taker
-        .prepare_swap(
+    let banned_address = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    );
+    let refusal = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 1)
                 .with_tx_count(2)
                 .with_required_confirms(1)
@@ -3542,25 +3406,30 @@ fn wrong_key_sender_signatures_ban_their_signer() {
         let wallet = maker.wallet.read().unwrap();
         wallet.get_fidelity_bonds().last().unwrap().clone()
     };
-    let old_bonds: Vec<_> = makers.iter().map(|m| latest_bond(m)).collect();
+    let old_bonds: Vec<_> = world
+        .makers()
+        .iter()
+        .map(|m| latest_bond(m.inner()))
+        .collect();
     let expiry = old_bonds
         .iter()
         .map(|bond| bond.lock_time.to_consensus_u32())
         .max()
         .unwrap();
-    let height = bitcoind.client.get_block_count().unwrap() as u32;
+    let height = world.bitcoind().client.get_block_count().unwrap() as u32;
     let mut remaining = expiry.saturating_sub(height) + 10;
     while remaining > 0 {
         let batch = remaining.min(100);
-        generate_blocks(bitcoind, batch as u64);
+        world.mine(batch as u64);
         remaining -= batch;
     }
 
     let renewal_start = Instant::now();
-    while makers
+    while world
+        .makers()
         .iter()
         .zip(&old_bonds)
-        .any(|(maker, old)| latest_bond(maker).outpoint() == old.outpoint())
+        .any(|(maker, old)| latest_bond(maker.inner()).outpoint() == old.outpoint())
     {
         assert!(
             renewal_start.elapsed() < Duration::from_secs(180),
@@ -3571,8 +3440,11 @@ fn wrong_key_sender_signatures_ban_their_signer() {
 
     // Only the taker runs discovery, so this line is its registry taking the
     // banned maker's new bond.
-    let rebond_txid = latest_bond(&makers[0]).outpoint().txid.to_string();
-    let log_path = test_framework.temp_dir.join("taker/debug.log");
+    let rebond_txid = latest_bond(world.makers()[0].inner())
+        .outpoint()
+        .txid
+        .to_string();
+    let log_path = world.temp_dir().join("taker/debug.log");
     let discovery_start = Instant::now();
     while !fs::read_to_string(&log_path).unwrap().lines().any(|line| {
         line.contains("Stored validated fidelity candidate") && line.contains(&rebond_txid)
@@ -3586,8 +3458,10 @@ fn wrong_key_sender_signatures_ban_their_signer() {
 
     // The sync now meets the expired bond and the new one for the same
     // address. Neither may lift the ban.
-    taker.sync_offerbook_and_wait().unwrap();
-    let rebonded = taker
+    world.taker().inner().sync_offerbook_and_wait().unwrap();
+    let rebonded = world
+        .taker()
+        .inner()
         .fetch_offers()
         .unwrap()
         .all_makers()
@@ -3612,9 +3486,8 @@ fn wrong_key_sender_signatures_ban_their_signer() {
     );
 
     info!("Wrong-key signature test completed successfully!");
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A hashlock built for a key nobody agreed to would pay the next hop to the
@@ -3627,36 +3500,30 @@ fn wrong_hashlock_key_bans_its_builder() {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::WrongHashlockKey, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || start_server(maker_clone).unwrap())
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    generate_blocks(bitcoind, 1);
+    world.start_makers_without_sync(120);
+    world.mine(1);
 
     // The builder is the first hop, so its hashlock must derive from the next
     // maker's key and the taker's nonce.
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(2)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare must succeed");
-    let swap_error = taker
-        .start_swap(&summary.swap_id)
+    let swap_error = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect_err("a swap with a wrong-key hashlock must fail");
     assert!(
         format!("{:?}", swap_error).contains("hashlock pubkey verification failed"),
@@ -3664,7 +3531,7 @@ fn wrong_hashlock_key_bans_its_builder() {
         swap_error
     );
 
-    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standings = world.taker().inner().fetch_offers().unwrap().all_makers();
     let standing_of = |port: u16| {
         standings
             .iter()
@@ -3674,7 +3541,7 @@ fn wrong_hashlock_key_bans_its_builder() {
             .clone()
     };
 
-    let builder = standing_of(makers[0].config.network_port);
+    let builder = standing_of(world.makers()[0].inner().config.network_port);
     assert!(
         matches!(
             builder,
@@ -3687,7 +3554,7 @@ fn wrong_hashlock_key_bans_its_builder() {
         builder
     );
 
-    let honest = standing_of(makers[1].config.network_port);
+    let honest = standing_of(world.makers()[1].inner().config.network_port);
     assert!(
         !matches!(honest, MakerState::Banned(_)),
         "the honest maker must not be blamed, got {:?}",
@@ -3695,9 +3562,8 @@ fn wrong_hashlock_key_bans_its_builder() {
     );
 
     info!("Wrong hashlock key test completed successfully!");
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// The last maker takes the keys it was owed and hands back one that does not
@@ -3710,38 +3576,31 @@ fn wrong_handover_key_bans_the_last_maker() {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::SendWrongHandoverKey];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || start_server(maker_clone).unwrap())
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    generate_blocks(bitcoind, 1);
+    world.start_makers_without_sync(120);
+    world.mine(1);
 
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(2)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("prepare must succeed");
     assert!(
-        taker.start_swap(&summary.swap_id).is_err(),
+        world.taker_mut().start(&summary.swap_id).is_err(),
         "a swap with a wrong handover key must fail"
     );
 
-    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standings = world.taker().inner().fetch_offers().unwrap().all_makers();
     let standing_of = |port: u16| {
         standings
             .iter()
@@ -3751,7 +3610,7 @@ fn wrong_handover_key_bans_the_last_maker() {
             .clone()
     };
 
-    let last = standing_of(makers[1].config.network_port);
+    let last = standing_of(world.makers()[1].inner().config.network_port);
     assert!(
         matches!(
             last,
@@ -3764,7 +3623,7 @@ fn wrong_handover_key_bans_the_last_maker() {
         last
     );
 
-    let honest = standing_of(makers[0].config.network_port);
+    let honest = standing_of(world.makers()[0].inner().config.network_port);
     assert!(
         !matches!(honest, MakerState::Banned(_)),
         "the honest maker must not be blamed, got {:?}",
@@ -3774,21 +3633,16 @@ fn wrong_handover_key_bans_the_last_maker() {
     // The taker holds the preimage, so the background recovery claims the
     // last maker's contract by hashlock without waiting on any timelock.
     let recovery_start = Instant::now();
-    while !taker.is_recovery_complete() {
+    while !world.taker().inner().is_recovery_complete() {
         assert!(
             recovery_start.elapsed() < Duration::from_secs(300),
             "background recovery did not complete within timeout"
         );
         thread::sleep(Duration::from_secs(5));
     }
-    generate_blocks(bitcoind, 1);
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&NO_SHUTDOWN)
-        .unwrap();
-    let balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    world.mine(1);
+    world.taker().sync();
+    let balances = world.taker().balances();
     info!(
         "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
         balances.regular, balances.swap, balances.contract, balances.spendable,
@@ -3798,9 +3652,8 @@ fn wrong_handover_key_bans_the_last_maker() {
     assert_eq!(balances.contract, Amount::ZERO, "Taker contract balance");
 
     info!("Wrong handover key test completed successfully!");
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A legacy maker whose planned coin is taken re-plans onto two smaller coins
@@ -3810,53 +3663,34 @@ fn wrong_handover_key_bans_the_last_maker() {
 fn legacy_replan_with_extra_inputs_completes() {
     warn!("Running Test: a legacy re-plan funds a split with more inputs than declared");
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            2,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::ForceReplan, MakerBehavior::Normal],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .maker_behaviors(vec![MakerBehavior::ForceReplan, MakerBehavior::Normal])
+        .takers(vec![TakerBehavior::Normal])
+        .build();
+    world.fund_taker_default(3);
     // The bond takes its exact coin. The 600k coin funds the split alone;
     // once it is taken, the split needs two 300k coins.
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(5_000_243),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        1,
-        Amount::from_sat(600_000),
-        AddressType::P2TR,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        3,
-        Amount::from_sat(300_000),
-        AddressType::P2TR,
-    );
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    world.fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR);
+    world.fund_makers(1, Amount::from_sat(600_000), AddressType::P2TR);
+    world.fund_makers(3, Amount::from_sat(300_000), AddressType::P2TR);
+    world.spawn_ready_makers_and_mine();
 
-    let summary = taker
-        .prepare_swap(
+    let summary = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
                 .with_tx_count(1)
                 .with_required_confirms(1),
         )
         .expect("prepare swap");
     let swap_id = summary.swap_id.clone();
-    taker
-        .start_swap(&swap_id)
+    world
+        .taker_mut()
+        .start(&swap_id)
         .expect("a split with extra inputs must be accepted");
 
-    let log = fs::read_to_string(test_framework.taker_log_path()).unwrap();
+    let log = std::fs::read_to_string(world.taker_log_path()).unwrap();
     assert!(log.contains(&format!("Re-planned funding for swap {swap_id}")));
     // Inputs per maker funding tx; the normal maker funds from its 600k coin.
     let inputs: Vec<usize> = log
@@ -3864,7 +3698,8 @@ fn legacy_replan_with_extra_inputs_completes() {
         .filter_map(|line| line.split("Broadcast Legacy funding tx: ").nth(1))
         .map(|txid| {
             let txid = txid.trim().parse().unwrap();
-            bitcoind
+            world
+                .bitcoind()
                 .client
                 .get_raw_transaction(&txid, None)
                 .unwrap()
@@ -3878,7 +3713,6 @@ fn legacy_replan_with_extra_inputs_completes() {
         "only the re-planned split spends two coins against one declared: {inputs:?}"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
