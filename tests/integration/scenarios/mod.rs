@@ -7,3 +7,4 @@
 //! them.
 
 pub(crate) mod maker_abort;
+pub(crate) mod taker_abort;
