@@ -18,13 +18,12 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{
         swap_tracker::{RecoveryPhase, SwapTracker},
         SwapParams, Taker, TakerBehavior,
     },
-    utill::NO_SHUTDOWN,
 };
 
 use super::test_framework::*;
@@ -55,60 +54,45 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, last_maker];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
     // Owned, not borrowed: this taker gets dropped mid-test.
-    let mut taker = takers.remove(0);
+    let mut taker = world.take_taker();
 
-    let taker_original_balance = fund_taker_default(&taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    let taker_original_balance = fund_taker_default(taker.inner(), world.bitcoind(), 3);
+    world.fund_makers_default();
 
     info!("Starting Maker servers...");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
-        .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let summary = taker.prepare(swap_params).expect("Prepare should succeed");
+    let swap_result = taker.start(&summary.swap_id);
     assert!(
         swap_result.is_err(),
         "Swap should fail at the private key handover"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    test_framework.set_block_gen_paused(true);
+    world.framework().set_block_gen_paused(true);
 
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&NO_SHUTDOWN)
-        .unwrap();
+    taker.sync();
     let before_outgoing = taker
+        .inner()
         .get_wallet()
         .read()
         .unwrap()
         .get_outgoing_swapcoins_count();
     let before_incoming = taker
+        .inner()
         .get_wallet()
         .read()
         .unwrap()
@@ -126,7 +110,7 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
         "taker should have persisted incoming swapcoins before the restart"
     );
 
-    let taker_dir = test_framework.temp_dir.join("taker1");
+    let taker_dir = world.temp_dir().join("taker1");
     let wallet_path = taker_dir.join("wallets").join("taker1");
     let tracker_path = taker_dir.join("swap_tracker.cbor");
     let wallet_snapshot = taker_dir.join("wallet.snapshot");
@@ -134,9 +118,10 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     std::fs::copy(&wallet_path, &wallet_snapshot).unwrap();
     std::fs::copy(&tracker_path, &tracker_snapshot).unwrap();
 
-    test_framework.set_block_gen_paused(false);
+    world.framework().set_block_gen_paused(false);
     let sweep_deadline = Instant::now() + Duration::from_secs(120);
     while taker
+        .inner()
         .get_wallet()
         .read()
         .unwrap()
@@ -156,8 +141,10 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     std::fs::copy(&tracker_snapshot, &tracker_path).unwrap();
     thread::sleep(Duration::from_secs(5));
 
-    let restarted = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
-        .expect("restarted taker should open the same wallet");
+    world.adopt_taker(
+        Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0))
+            .expect("restarted taker should open the same wallet"),
+    );
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -165,11 +152,11 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     info!("Waiting for timelocks to mature...");
     thread::sleep(Duration::from_secs(300));
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
     info!("Waiting for the restarted taker's recovery loop to finish...");
     let deadline = Instant::now() + Duration::from_secs(120);
-    while !restarted.is_recovery_complete() {
+    while !world.taker().inner().is_recovery_complete() {
         assert!(
             Instant::now() < deadline,
             "recovery after restart did not complete within 120s"
@@ -177,20 +164,10 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
         thread::sleep(Duration::from_secs(5));
     }
 
-    generate_blocks(bitcoind, 1);
-    restarted
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.taker().sync();
 
-    let balances = restarted
-        .get_wallet()
-        .read()
-        .unwrap()
-        .get_balances()
-        .unwrap();
+    let balances = world.taker().balances();
     info!(
         "Taker balances after restart recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
         balances.regular, balances.swap, balances.contract, balances.spendable,
@@ -218,14 +195,9 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
         "taker did not get its funds back after restart recovery"
     );
 
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&NO_SHUTDOWN)
-            .unwrap();
-        let mb = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, maker) in world.makers().iter().enumerate() {
+        maker.sync();
+        let mb = maker.balances();
         info!(
             "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
             i, mb.regular, mb.swap, mb.contract, mb.spendable,
@@ -239,7 +211,7 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     );
     assert_eq!(balances.fidelity, Amount::ZERO);
 
-    let wallet = restarted.get_wallet();
+    let wallet = world.taker().inner().get_wallet();
     let wallet = wallet.read().unwrap();
     assert_eq!(
         wallet.get_incoming_swapcoins_count(),
@@ -255,7 +227,7 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
 
     // If the cross-session lookup had come up empty, recover_active_swap would
     // have bailed with this instead of recovering.
-    let log_path = test_framework.taker_log_path();
+    let log_path = world.taker_log_path();
     let log_contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         !log_contents.contains("No persisted swapcoins found for recovery"),
@@ -264,12 +236,14 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
 
     // Crash again before the tracker saw the cleanup: the chain and wallet are
     // settled, so startup has nothing to recover but must still finish the swap.
-    drop(restarted);
+    world.drop_takers();
     std::fs::copy(&tracker_snapshot, &tracker_path).unwrap();
-    let settled = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
-        .expect("settled taker should open the same wallet");
+    world.adopt_taker(
+        Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0))
+            .expect("settled taker should open the same wallet"),
+    );
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !settled.is_recovery_complete() {
+    while !world.taker().inner().is_recovery_complete() {
         assert!(Instant::now() < deadline, "settled swap was not finished");
         thread::sleep(Duration::from_secs(1));
     }
@@ -282,6 +256,5 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
 
     info!("Taker restart recovery test completed successfully!");
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
