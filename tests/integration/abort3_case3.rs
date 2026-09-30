@@ -13,236 +13,28 @@
 //! 5. Everyone falls back to timelock recovery.
 //! 6. After blocks mature, verify: taker recovered funds (minus fees), no contract balance.
 
-use bitcoin::Amount;
-use openswap::{
-    maker::{start_server, MakerBehavior},
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{maker::MakerBehavior, protocol::common_messages::ProtocolVersion};
 
-use super::test_framework::*;
+use super::scenarios::maker_abort::{run_maker_abort_recovery, MakerAbortExpect};
 
-use log::{info, warn};
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use log::warn;
 
 /// Test: Maker drops at hash preimage handover. Recovery via timelock.
 #[test]
 fn maker_abort3_case3() {
-    // ---- Setup ----
     warn!("Running Test: Maker Abort3 Case 3 - CloseAtHashPreimage");
 
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::CloseAtHashPreimage];
-
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-
-    // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
-
-    // Start the maker server threads
-    log::info!("Starting Maker servers...");
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup
-    sync_maker_wallets(&makers);
-
-    // Use post-fidelity, pre-swap balances as the correct baseline
-    verify_maker_pre_swap_balances(&makers);
-    log::info!("Starting Legacy abort3 case 3 test...");
-
-    // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
+    run_maker_abort_recovery(
+        ProtocolVersion::Legacy,
+        MakerBehavior::CloseAtHashPreimage,
+        "Swap should fail due to Maker2 closing at hash preimage handover",
+        &MakerAbortExpect {
+            taker_regular: 14499538,
+            taker_swap: 495997,
+            taker_loss: 4465,
+            maker_regular: [14500865, 14502398],
+            maker_swap: [499550, 497530],
+            maker_spendable: Some([15000415, 14999928]),
+        },
     );
-
-    // Swap params for openswap (Legacy)
-    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
-
-    generate_blocks(bitcoind, 1);
-
-    // Prepare should succeed; execution should fail because Maker2 drops
-    let summary = taker
-        .prepare_swap(swap_params)
-        .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
-    assert!(
-        swap_result.is_err(),
-        "Swap should fail due to Maker2 closing at hash preimage handover"
-    );
-    info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
-
-    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-    // 5 blocks/3s; remaining ~105s is scheduling margin.
-    info!("Waiting for makers to timeout and blocks to mature timelocks...");
-    thread::sleep(Duration::from_secs(300));
-
-    // Verify maker balances after recovery
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
-        info!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i,
-            maker_balances.regular,
-            maker_balances.swap,
-            maker_balances.contract,
-            maker_balances.spendable,
-        );
-        assert_eq!(
-            maker_balances.contract,
-            Amount::ZERO,
-            "Maker {} should have no contract balance after recovery",
-            i
-        );
-    }
-
-    info!("Makers shut down. Waiting for background recovery loop to complete...");
-
-    // The background recovery loop (spawned by recover_active_swap) periodically
-    // retries timelock recovery. Wait for it to finish.
-    let recovery_timeout = Duration::from_secs(120);
-    let recovery_start = Instant::now();
-    while !taker.is_recovery_complete() {
-        if recovery_start.elapsed() > recovery_timeout {
-            panic!("Background recovery did not complete within timeout");
-        }
-        thread::sleep(Duration::from_secs(5));
-    }
-    info!("Background recovery loop completed.");
-
-    // Mine a block to confirm recovery txs, then sync wallet
-    generate_blocks(bitcoind, 1);
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-
-    // Verify taker balance
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
-
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
-    assert_eq!(
-        taker_balances.regular.to_sat(),
-        14499538,
-        "Taker regular balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.swap.to_sat(),
-        495997,
-        "Taker swap balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.contract.to_sat(),
-        0,
-        "Taker contract balance mismatch"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-
-    let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
-        .unwrap_or(Amount::ZERO);
-
-    info!(
-        "Taker balance diff: {} sats (original: {}, current: {})",
-        balance_diff.to_sat(),
-        taker_original_balance,
-        taker_balances.spendable,
-    );
-
-    assert_eq!(
-        balance_diff.to_sat(),
-        4465,
-        "Taker spendable balance change mismatch"
-    );
-
-    // Verify maker balances
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
-        let expected_regular = [14500865u64, 14502398][i];
-        let expected_swap = [499550u64, 497530][i];
-        assert_eq!(
-            maker_balances.regular.to_sat(),
-            expected_regular,
-            "Maker {} regular balance mismatch",
-            i
-        );
-        assert_eq!(
-            maker_balances.swap.to_sat(),
-            expected_swap,
-            "Maker {} swap balance mismatch",
-            i
-        );
-        assert_eq!(
-            maker_balances.contract.to_sat(),
-            0,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
-
-        let expected_spendable = [15000415u64, 14999928][i];
-        assert_eq!(
-            maker_balances.spendable.to_sat(),
-            expected_spendable,
-            "Maker {} spendable balance mismatch",
-            i,
-        );
-    }
-
-    taker.log_tracker_state();
-    info!("Legacy abort3 case 3 test completed successfully!");
-
-    shutdown_makers(&makers, maker_threads);
-
-    tracker_logger.stop();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
 }
