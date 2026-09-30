@@ -53,30 +53,65 @@ jobs:
       - name: Add nostr-rs-relay to PATH
         run: echo "$HOME/.nostr-relay-bin" >> "$GITHUB_PATH"
 
-      - name: Setup nextest config
-        run: |
-          mkdir -p .config
-          cat <<'EOF' > .config/nextest.toml
-          [profile.default]
-          global-timeout = "1h"
-          slow-timeout = "3m"
-          EOF
-
       - name: Run cargo-llvm-cov
         # Surface electrs stderr in the job log, or a hung electrum test
-        # leaves no evidence of what the server was doing.
+        # leaves no evidence of what the server was doing. The `ci` profile in
+        # .config/nextest.toml carries the partition timeouts.
         env:
           ELECTRS_LOG: "1"
+          NEXTEST_PROFILE: ci
         run: |
           mkdir -p ./coverage/reports/
           cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 2:immediate --partition hash:${{ matrix.partition }}/${{strategy.job-total}} --features integration-test --no-capture
           cargo llvm-cov report --cobertura --output-path ./coverage/reports/cobertura-${{ strategy.job-index }}.xml
+
+      # A failing test keeps its data dir (logs, wallets, swap trackers) as
+      # /tmp/openswap-*; bitcoind's chain data sits in a hidden .bitcoin dir,
+      # which upload-artifact skips by default.
+      - name: Upload failed test data
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-data-partition-${{ matrix.partition }}
+          path: /tmp/openswap-*/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/reports/cobertura-${{ strategy.job-index }}.xml
+
+  # Every test name is pinned in tests/TESTS.golden: CI selects tests by name
+  # and nextest partitions them by name hash, so a rename must be reviewed.
+  test_names:
+    name: Test names match tests/TESTS.golden
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{  hashFiles('**/Cargo.toml','**/Cargo.lock') }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Check test names
+        run: tests/check_test_names.sh
 
   # Electrum over a real Tor SOCKS proxy. These publish an ephemeral onion
   # service, so they need live network access to reach the HSDir ring.
@@ -156,3 +191,12 @@ jobs:
       - name: Dump tor log
         if: always()
         run: cat /tmp/tor-it/tor.log || true
+
+      - name: Upload failed test data
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-data-${{ matrix.test }}
+          path: /tmp/openswap-*/
+          if-no-files-found: ignore
+          retention-days: 7
