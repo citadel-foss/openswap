@@ -3,9 +3,10 @@
 This guide covers:
 - Installing Tor  
 - Configuring Tor settings  
-- Setting up a Hidden Service  
 - Configuring the Control Port (with/without password)  
 - Setting the SOCKS Port  
+
+You do not need to set up a Hidden Service. Makerd creates its own onion address through the Control Port.
 
 ---
 
@@ -78,23 +79,7 @@ This allows unrestricted access—use it **only for testing**.
    HashedControlPassword 16:872860B76453A77D60CA2BB8C1A7042072093276A3D701AD684053EC4C
    ```
 
-### **Option 3: Cookie Authentication**
-1. Enable cookie authentication in `torrc`:
-   ```ini
-   ControlPort 9051
-   CookieAuthentication 1
-   CookieAuthFileGroupReadable 1
-   DataDirectoryGroupReadable 1
-   ```
-2. Restart Tor:
-   ```bash
-   sudo systemctl restart tor
-   ```
-3. The **cookie file** is usually located at:
-   ```bash
-   /var/lib/tor/control_auth_cookie
-   ```
-4. Use it in your applications for authentication.
+> **Note**: OpenSwap does not support cookie authentication. It only logs in to the Control Port with a password. Use Option 2, or Option 1 for testing.
 
 
 

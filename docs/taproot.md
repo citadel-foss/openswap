@@ -29,59 +29,124 @@ P2TR Output:
 
 ## Complete Message Flow (1 Taker + 2 Makers)
 
+Every connection starts with the same handshake. The taker sends `TakerHello`. The maker answers `MakerHello` with the protocol versions it supports. During a Taproot swap, the taker stops if Taproot is not in that list.
+
+The taker opens a new connection to each maker for each phase. Each message travels as a variant of `TakerToMakerMessage` or `MakerToTakerMessage`.
+
 ### Phase 1: Discovery and Negotiation
 
+The taker talks to the makers one at a time, in route order. Maker0 goes first, because Maker1's amount depends on Maker0's reply.
+
 ```
-1. Taker → Maker0: GetOffer
-2. Maker0 → Taker: RespOffer { max_size, min_size, fee_rate, tweakable_point }
+1. Taker → Maker0: TakerHello
+2. Maker0 → Taker: MakerHello { supported_protocols }
 
-3. Taker → Maker1: GetOffer  
-4. Maker1 → Taker: RespOffer { max_size, min_size, fee_rate, tweakable_point }
+3. Taker → Maker0: GetOffer
+4. Maker0 → Taker: Offer {
+    base_fee, amount_relative_fee_pct, time_relative_fee_pct,
+    required_confirms, minimum_locktime, max_size, min_size,
+    tweakable_point, fidelity, tweak_chain_code, name, lightning,
+}
 
-5. Taker → Maker0: SwapDetails { amount, maker_count, timelock }
-6. Maker0 → Taker: AckResponse::Ack
+5. Taker → Maker0: SwapDetails {
+    id, protocol_version: Taproot, amount, tx_count, incoming_count,
+    max_input_budget, feerate, timelock, refund_locktime_offset,
+}
+6. Maker0 → Taker: AckSwapDetails {
+    tweakable_point: Some(maker0_tweakable_point),
+    funding_splits: [inputs per planned contract tx],
+}
 
-7. Taker → Maker1: SwapDetails { amount, maker_count, timelock }
-8. Maker1 → Taker: AckResponse::Ack
+7.  Taker → Maker1: TakerHello
+8.  Maker1 → Taker: MakerHello { supported_protocols }
+9.  Taker → Maker1: GetOffer
+10. Maker1 → Taker: Offer { ... }
+11. Taker → Maker1: SwapDetails { ... }
+12. Maker1 → Taker: AckSwapDetails { tweakable_point: Some(maker1_tweakable_point), funding_splits }
 ```
+
+For Taproot, `timelock` is an absolute block height: the negotiation height plus `refund_locktime_offset`. A maker rejects with `AckSwapDetails { tweakable_point: None, funding_splits: [] }`.
+
+The taker also fetches offers earlier, when it syncs its offer book. That sync uses the same `TakerHello` and `GetOffer` exchange on its own connections.
 
 ### Phase 2: Contract Creation (Cyclic Flow)
 
+Both directions use one message type, `TaprootContractData`. The taker sends it to a maker. The maker answers with its own `TaprootContractData` for the next hop.
+
+Before funding, the taker draws one random hashlock nonce per maker. The hashlock key for hop `i` is `tweakable_point_i + nonce_i·G`. The taker sends `nonce_i` to maker `i` so that maker can rebuild the private key. The last hop's hashlock key is the taker's own key, with no nonce.
+
 #### Step 1: Taker → Maker0 Contract
 ```
-9. Taker creates and broadcasts contract transaction:
-   - Input: Taker's UTXO
-   - Output: P2TR(MuSig2(taker_pubkey, maker0_pubkey), script_tree)
-   - Amount: swap_amount
+13. Taker creates, broadcasts, and waits for its contract transactions to confirm:
+    - One contract tx per funding split
+    - Output: P2TR(MuSig2(taker_contract_pubkey, maker0_tweakable_point), script_tree)
+    - Hashlock key: maker0_tweakable_point + nonce_0·G
+    - Timelock key: taker_contract_pubkey
 
-10. Taker → Maker0: SendersContract {
-    contract_txs: [taker_to_maker0_txid],
-    pubkeys_a: [taker_pubkey],
-    next_party_tweakable_point: maker1_pubkey,
-    next_party_pub_nonces: [taker_contract_nonce],
+14. Taker → Maker0: TakerHello          (new connection)
+15. Maker0 → Taker: MakerHello
+
+16. Taker → Maker0: TaprootContractData {
+    id,
+    pubkeys: [taker_contract_pubkey, ...],
+    next_hop_point: maker1_tweakable_point,
+    internal_keys, tap_tweaks,
+    hashlock_script,                      // shared by every contract of the hop
+    timelock_scripts,
+    contract_txs: [taker_to_maker0_tx, ...],
+    amounts,
+    hashlock_nonce: Some(nonce_0),        // Maker0 rebuilds its hashlock key
+    next_hashlock_nonce: Some(nonce_1),   // Maker0 builds Maker1's hashlock key
 }
 
-11. Maker0 → Taker: ReceiversContract {
-    contract_txs: [maker0_to_maker1_txid],
-    pubkeys_b: [maker0_pubkey], 
-    receiver_nonces: [maker0_contract_nonce],
+17. Maker0 checks the data and waits for the taker's contracts to confirm.
+    Then it creates and broadcasts its own contract transactions:
+    - Output: P2TR(MuSig2(maker0_outgoing_pubkey, maker1_tweakable_point), script_tree)
+    - Hashlock key: maker1_tweakable_point + nonce_1·G
+
+18. Maker0 → Taker: TaprootContractData {
+    id,
+    pubkeys: [maker0_outgoing_pubkey, ...],
+    next_hop_point: maker0_tweakable_point,
+    internal_keys, tap_tweaks, hashlock_script, timelock_scripts,
+    contract_txs: [maker0_to_maker1_tx, ...],
+    amounts,
+    hashlock_nonce: None,
+    next_hashlock_nonce: None,
 }
+
+19. Taker checks Maker0's hashlock key and waits for Maker0's contracts to confirm.
 ```
 
 #### Step 2: Maker0 → Maker1 Contract (Forwarded via Taker)
 ```
-12. Taker → Maker1: SendersContract {
-    contract_txs: [maker0_to_maker1_txid],     // Forwarded from Maker0
-    pubkeys_a: [maker0_pubkey],                // Forwarded from Maker0
-    next_party_tweakable_point: taker_pubkey,  // Cycle back to taker
-    next_party_pub_nonces: [maker0_contract_nonce],
+20. Taker → Maker1: TakerHello          (new connection)
+21. Maker1 → Taker: MakerHello
+
+22. Taker → Maker1: TaprootContractData {
+    id,
+    pubkeys: [maker0_outgoing_pubkey, ...],     // Forwarded from Maker0
+    next_hop_point: taker_incoming_pubkey,      // Cycle back to taker
+    internal_keys, tap_tweaks, hashlock_script,
+    timelock_scripts, contract_txs, amounts,    // Forwarded from Maker0
+    hashlock_nonce: Some(nonce_1),
+    next_hashlock_nonce: None,                  // Next hop is the taker
 }
 
-13. Maker1 → Taker: ReceiversContract {
-    contract_txs: [maker1_to_taker_txid],      // Final contract back to taker
-    pubkeys_b: [maker1_pubkey],
-    receiver_nonces: [maker1_contract_nonce],
+23. Maker1 checks the data and waits for Maker0's contracts to confirm.
+    Then it creates and broadcasts its own contract transactions:
+    - Output: P2TR(MuSig2(maker1_outgoing_pubkey, taker_incoming_pubkey), script_tree)
+    - Hashlock key: taker_incoming_pubkey
+
+24. Maker1 → Taker: TaprootContractData {
+    pubkeys: [maker1_outgoing_pubkey, ...],
+    contract_txs: [maker1_to_taker_tx, ...],    // Final contracts back to taker
+    ...
+    hashlock_nonce: None,
+    next_hashlock_nonce: None,
 }
+
+25. Taker checks that the hashlock key is its own key and waits for Maker1's contracts to confirm.
 ```
 
 ### Phase 3: Private Key Handover and Sweeping
@@ -91,59 +156,67 @@ P2TR Output:
 #### Flow Description (1 Taker + 2 Makers)
 
 ```
-13. Taker → Maker0: PrivateKeyHandover {
-    keypair: taker_outgoing_contract_keypair  // Taker's key for Taker→Maker0 contract
+26. Taker → Maker0: TakerHello          (new connection)
+27. Maker0 → Taker: MakerHello
+
+28. Taker → Maker0: TaprootPrivateKeyHandover {
+    id,
+    privkeys: [taker_contract_privkey, ...]   // Taker's keys for Taker→Maker0 contracts
 }
 
-14. Maker0 receives taker's outgoing key:
-    - Creates spending transaction for incoming contract (Taker→Maker0)
-    - Generates fresh nonce pairs for both maker0 and taker (using received key)
-    - Creates partial signatures from both keys using MuSig2
-    - Aggregates partial signatures into final signature
-    - Broadcasts sweep transaction to claim from Taker→Maker0 contract
+29. Maker0 checks each key against its incoming contracts and stores it.
 
-15. Maker0 → Taker: PrivateKeyHandover {
-    keypair: maker0_outgoing_contract_keypair  // Maker0's key for Maker0→Maker1 contract
+30. Maker0 → Taker: TaprootPrivateKeyHandover {
+    id,
+    privkeys: [maker0_outgoing_privkey, ...]  // Maker0's keys for Maker0→Maker1 contracts
 }
 
-16. Taker → Maker1: PrivateKeyHandover {
-    keypair: maker0_outgoing_contract_keypair  // Relayed from Maker0
+31. After sending its reply, Maker0 sweeps the Taker→Maker0 contracts:
+    - Creates the spending transaction
+    - Generates fresh nonce pairs for both keys it now holds
+    - Creates both partial signatures with MuSig2 and aggregates them
+    - Broadcasts the sweep transaction
+
+32. Taker → Maker1: TakerHello          (new connection)
+33. Maker1 → Taker: MakerHello
+
+34. Taker → Maker1: TaprootPrivateKeyHandover {
+    id,
+    privkeys: [maker0_outgoing_privkey, ...]  // Relayed from Maker0
 }
 
-17. Maker1 receives maker0's outgoing key:
-    - Creates spending transaction for incoming contract (Maker0→Maker1)
-    - Generates fresh nonce pairs for both maker1 and maker0 (using received key)
-    - Creates partial signatures from both keys using MuSig2
-    - Aggregates partial signatures into final signature
-    - Broadcasts sweep transaction to claim from Maker0→Maker1 contract
+35. Maker1 checks each key against its incoming contracts and stores it.
 
-18. Maker1 → Taker: PrivateKeyHandover {
-    keypair: maker1_outgoing_contract_keypair  // Maker1's key for Maker1→Taker contract
+36. Maker1 → Taker: TaprootPrivateKeyHandover {
+    id,
+    privkeys: [maker1_outgoing_privkey, ...]  // Maker1's keys for Maker1→Taker contracts
 }
 
-19. Taker receives maker1's outgoing key:
-    - Creates spending transaction for incoming contract (Maker1→Taker)
-    - Generates fresh nonce pairs for both taker and maker1 (using received key)
-    - Creates partial signatures from both keys using MuSig2
-    - Aggregates partial signatures into final signature
-    - Broadcasts sweep transaction to claim from Maker1→Taker contract
+37. After sending its reply, Maker1 sweeps the Maker0→Maker1 contracts the same way.
+
+38. Taker checks that each of Maker1's keys matches the expected pubkey of its incoming contracts.
+    Then it sweeps the Maker1→Taker contracts the same way.
 ```
 
 #### Message Type for Private Key Handover
 
 ```rust
+TakerToMakerMessage::TaprootPrivateKeyHandover(PrivateKeyHandover)
+MakerToTakerMessage::TaprootPrivateKeyHandover(PrivateKeyHandover)
+
 PrivateKeyHandover {
-    keypair: Keypair,  // Contains the outgoing contract private key
+    id: String,                  // Swap ID
+    privkeys: Vec<SwapPrivkey>,  // One outgoing contract key per contract
 }
 ```
 
 #### Key Characteristics
 
-1. **Forward Flow**: Each party sends their OUTGOING contract private key
+1. **Forward Flow**: Each party sends their OUTGOING contract private keys
 2. **Independent Sweeping**: Each party generates their own nonces and performs MuSig2 aggregation locally
 3. **No Coordination Required**: No need to exchange nonces or partial signatures between parties
-4. **Simplified Protocol**: Reduced from 16 messages to 4 messages (2 per maker)
-5. **Security Note**: Uses master-derived keys (m/175' path) - parties trust each other not to double-spend during the brief handover window
+4. **Two Messages per Maker**: One key handover in, one key handover back, after the handshake
+5. **Security Note**: Contract keys are fresh for each swap. The taker draws a random key for each outgoing contract, and a fresh one for its incoming side. A maker's outgoing key is its tweakable key plus a fresh random tweak. The m/175' path gives only the maker's tweakable key. The maker uses it as its side of each incoming contract and never hands it over. A handed-over key belongs to that one contract only
 
 ## Spending Transaction Details
 
@@ -186,10 +259,10 @@ Taker_Spending_Transaction:
 ```
 
 ### Sighash Calculation
-Each pair of parties must calculate an identical sighash for their respective spending transaction:
+After the handover, the receiver holds both keys. It calculates the sighash once and makes both partial signatures from it:
 
 ```rust
-// Example: Taker and Maker1 calculating sighash for taker's spending tx
+// Example: Taker calculating the sighash for its spending tx
 let sighash = SighashCache::new(&taker_spending_tx)
     .taproot_key_spend_signature_hash(
         0,                           // input_index
@@ -198,41 +271,43 @@ let sighash = SighashCache::new(&taker_spending_tx)
     )?;
 let message = Message::from(sighash);
 
-// Both taker and maker1 use this same message for their partial signatures
+// The taker signs this message with its own key and with maker1's handed-over key
 ```
 
 ## Complete Protocol Summary
 
 ### Total Message Flow
-The complete taproot openswap involves **16 messages** across 3 phases:
+With 2 makers, the complete taproot openswap involves **28 messages** across 3 phases. Each maker adds 14:
 
-1. **Discovery (8 messages)**: Offer fetching and swap negotiation
-2. **Contract Creation (4 messages)**: Cyclic contract setup
-3. **Private Key Handover (4 messages)**: Forward-flow exchange of outgoing contract keys
+1. **Discovery (12 messages, 6 per maker)**: Handshake, offer fetching, and swap negotiation
+2. **Contract Creation (8 messages, 4 per maker)**: Handshake and cyclic contract setup
+3. **Private Key Handover (8 messages, 4 per maker)**: Handshake and forward-flow exchange of outgoing contract keys
+
+These counts leave out the offer book sync, retries, and keepalives. During phases 2 and 3, the taker sends `WaitingFundingConfirmation(swap_id)` keepalives to each maker on separate connections. The maker does not reply to them.
 
 ### Execution Order
 The protocol phases execute sequentially with taker coordination:
 
 ```
-Phase 1: Discovery & Negotiation (messages 1-8)
+Phase 1: Discovery & Negotiation (messages 1-12)
     ↓
-Phase 2: Contract Creation (messages 9-12)
+Phase 2: Contract Creation (steps 13-25)
     ↓
-Phase 3: Private Key Handover & Sweeping (messages 13-16)
-    ├─ Taker → Maker0: Taker's outgoing key
-    ├─ Maker0 sweeps & returns Maker0's outgoing key
-    ├─ Taker → Maker1: Maker0's outgoing key (relayed)
-    ├─ Maker1 sweeps & returns Maker1's outgoing key
-    └─ Taker sweeps using Maker1's outgoing key
+Phase 3: Private Key Handover & Sweeping (steps 26-38)
+    ├─ Taker → Maker0: Taker's outgoing keys
+    ├─ Maker0 returns Maker0's outgoing keys, then sweeps
+    ├─ Taker → Maker1: Maker0's outgoing keys (relayed)
+    ├─ Maker1 returns Maker1's outgoing keys, then sweeps
+    └─ Taker sweeps using Maker1's outgoing keys
 ```
 
 ### Non-Cooperative Cases (Recovery Paths)
 
 #### Hashlock Path (Receiver Claiming)
 ```rust
-// Taker can claim using preimage without maker cooperation
+// Receiver can claim using preimage without sender cooperation
 witness: [
-    taker_signature,
+    receiver_signature,
     preimage,
     hashlock_script,
     control_block,  // Proves script is in taproot tree
@@ -241,10 +316,9 @@ witness: [
 
 #### Timelock Path (Sender Recovery)
 ```rust
-// Maker can recover funds after timeout without receiver cooperation
+// Sender can recover funds after timeout without receiver cooperation
 witness: [
-    maker_signature,
-    empty_vector,   // No preimage needed
+    sender_signature,
     timelock_script,
     control_block,
 ]
@@ -252,48 +326,79 @@ witness: [
 
 ## Message Types
 
-### Discovery Messages
+Messages travel as variants of `TakerToMakerMessage` and `MakerToTakerMessage`.
+
+### Handshake and Discovery Messages
 ```rust
-GetOffer { }
-RespOffer { 
-    max_size: Amount,
-    min_size: Amount, 
-    fee_rate: f64,
+TakerHello
+MakerHello {
+    supported_protocols: Vec<ProtocolVersion>,  // Legacy, Taproot
+}
+
+GetOffer
+Offer {
+    base_fee: u64,
+    amount_relative_fee_pct: f64,
+    time_relative_fee_pct: f64,
+    required_confirms: u32,
+    minimum_locktime: u16,
+    max_size: u64,
+    min_size: u64,
     tweakable_point: PublicKey,
+    fidelity: FidelityProof,
+    tweak_chain_code: ChainCode,
+    name: String,
+    lightning: Option<LightningOffer>,
 }
 
 SwapDetails {
+    id: String,
+    protocol_version: ProtocolVersion,
     amount: Amount,
-    maker_count: u8,
-    timelock: u16,
+    tx_count: u32,                // Most contract txs this hop may send
+    incoming_count: u32,          // Exact contract txs the taker sends this hop
+    max_input_budget: u32,
+    feerate: u64,                 // sats/vB
+    timelock: u32,                // Taproot: absolute block height
+    refund_locktime_offset: u16,
 }
-AckResponse::Ack | AckResponse::Nack
+AckSwapDetails {
+    tweakable_point: Option<PublicKey>,  // None means rejected
+    funding_splits: Vec<u32>,            // Inputs per planned contract tx
+}
 ```
 
 ### Contract Messages
 ```rust
-SendersContract {
-    contract_txs: Vec<Txid>,
-    pubkeys_a: Vec<PublicKey>,
-    next_party_tweakable_point: PublicKey,
-    next_party_pub_nonces: Vec<SerializablePublicNonce>,
-}
-
-ReceiversContract {
-    contract_txs: Vec<Txid>,
-    pubkeys_b: Vec<PublicKey>,
-    receiver_nonces: Vec<SerializablePublicNonce>,
+TaprootContractData {
+    id: String,
+    pubkeys: Vec<PublicKey>,
+    next_hop_point: PublicKey,
+    internal_keys: Vec<XOnlyPublicKey>,
+    tap_tweaks: Vec<SerializableScalar>,
+    hashlock_script: ScriptBuf,
+    timelock_scripts: Vec<ScriptBuf>,
+    contract_txs: Vec<Transaction>,
+    amounts: Vec<Amount>,
+    hashlock_nonce: Option<SecretKey>,       // None in maker replies
+    next_hashlock_nonce: Option<SecretKey>,  // None for the last maker and in maker replies
 }
 ```
 
 ### Private Key Handover Message
 ```rust
 PrivateKeyHandover {
-    keypair: Keypair,  // Contains the outgoing contract private key
+    id: String,
+    privkeys: Vec<SwapPrivkey>,
+}
+
+SwapPrivkey {
+    identifier: ScriptBuf,
+    key: SecretKey,
 }
 ```
 
-**Usage**: After contract creation, each party sends their OUTGOING contract private key to enable the receiver to sweep independently without coordination.
+**Usage**: After contract creation, each party sends their OUTGOING contract private keys to enable the receiver to sweep independently without coordination. The taproot flow sends it as `TaprootPrivateKeyHandover`.
 
 ## Implementation Architecture
 
@@ -309,9 +414,9 @@ PrivateKeyHandover {
    - P2TR output creation
    - Control block generation
 
-3. **Protocol Messages** (`src/protocol/messages2.rs`)
-   - Serializable message types
-   - Network communication protocol
+3. **Protocol Messages** (`src/protocol/taproot_messages.rs` and `src/protocol/common_messages.rs`)
+   - Taproot contract data in `taproot_messages.rs`
+   - Handshake, offer, negotiation, handover, and the top-level message enums in `common_messages.rs`
 
 4. **State Management**
    - Taker: `OngoingSwapState` for tracking multi-maker flow

@@ -1,6 +1,6 @@
 # Fee policy and funding splits
 
-This document explains what a coinswap costs and why. It covers the settings
+This document explains what a swap costs and why. It covers the settings
 that shape the price, who pays which part, and how both sides check the
 numbers.
 
@@ -129,8 +129,11 @@ The planner works like this:
 - Each split uses the fewest coins that cover it. Ties go to the smallest
   total value. That way an early split never eats coins a later split
   needs.
-- No split may be smaller than 5,000 sats. Below that, the miner fees
-  cost more than the split is worth.
+- Every split must be worth claiming. The smallest allowed split covers
+  the miner fee of the most expensive way to claim it, at the swap
+  feerate. On top of that, it keeps enough for an output that Bitcoin
+  nodes still forward. At 1 sat/vB the floor is 485 sats for taproot and
+  630 sats for legacy. A higher feerate raises it.
 - Once the maker accepts a swap, it freezes the plan. It reserves the
   chosen coins for that swap. Nothing else can spend them. Funding follows
   the frozen plan exactly and never re-plans.
@@ -159,9 +162,9 @@ chain:
   one rate and builds cheaper.
 
 Your node records a proven cheat in the offerbook, its local record of
-known makers. One proof already sidelines the maker. Enough proofs mark it
-bad for good. A timeout or a node failure never counts as proof. Only
-arithmetic does.
+known makers. One proof bans the maker for good. Only removing the maker
+with `taker remove-maker` lifts the ban. A timeout or a node failure never
+counts as proof. Only arithmetic does.
 
 ## Before you confirm
 

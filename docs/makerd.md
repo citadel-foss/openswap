@@ -29,13 +29,13 @@ socks_port = 9050
 # Control port for Tor interface
 control_port = 9051
 # Authentication password for Tor interface
-tor_auth_password = ""
+tor_auth_password =
 # Fidelity Bond amount in satoshis
 fidelity_amount = 10000
 # Fidelity Bond timelock in blocks (must be between 12960 and 25920)
 fidelity_timelock = 15000
-# Fee rate in sats/vB for the fidelity bond transaction (must be at least 1.0)
-fidelity_feerate = 1.0
+# Fee rate in sats/vB for the fidelity bond transaction (must be at least 1)
+fidelity_feerate = 1
 # A fixed base fee charged by the Maker for providing its services (in satoshis)
 base_fee = 500
 # A percentage fee based on the swap amount
@@ -44,6 +44,10 @@ amount_relative_fee_pct = 0.0025
 time_relative_fee_pct = 0.0001
 # Required confirmations for funding transactions
 required_confirms = 1
+# Check funding inputs against the address blocklist
+check_blocklist = false
+# Public name shown to takers (required, at most 32 characters, no control characters)
+name = "default-maker"
 ```
 - `network_port`: TCP port where the Maker listens for incoming OpenSwap protocol messages.
 - `rpc_port`: The port through which `makerd` listens for RPC commands from `maker-cli`.
@@ -57,6 +61,9 @@ required_confirms = 1
 - `amount_relative_fee_pct`: A percentage fee based on the swap amount.
 - `time_relative_fee_pct`: A percentage fee based on the swap duration.
 - `required_confirms`: Number of confirmations required for funding transactions (default: 1). Must be at least 1: the maker refuses to start with 0.
+- `check_blocklist`: When `true`, your node refuses a swap if the coins paid into it come straight from an address on your blocklist. Defaults to `false`. See [the blocklist doc](./blocklist.md).
+- `name`: The public name takers see for your maker. Defaults to `default-maker`. It must be 1 to 32 characters long. It must not contain control characters, the invisible characters such as tabs and line breaks. Otherwise the maker refuses to start.
+- `ldk_server_url`, `ldk_api_key_path`, `ldk_tls_cert_path`: Optional settings that connect your maker to a Lightning node. They are absent by default. See [the Lightning doc](./lightning.md).
 - The per-hop parameters the taker negotiates (`tx_count`, `max_input_budget`, `feerate`) — and what the maker is reimbursed on top of its service fees — are covered in [the fee policy](./fee-policy.md).
 
 There is no minimum swap setting. Your node works out the smallest swap it accepts for each request. The swap must pay your fee and the mining fees. Every coin you receive or send must also stay above dust after you pay to spend it. Dust is an amount too small for the network to forward. At 1 sat/vB, one taproot coin needs at least 485 sats: 330 sats of dust plus 155 sats to spend it.
@@ -70,10 +77,12 @@ Your node advertises a minimum swap size that is sure to pass. It works this out
 5. Your percentage fees round that up to 1,446.
 6. Rounding up to the next 500 gives 1,500.
 
-A swap with more coins, more makers, or a higher fee rate needs more. If your percentage fees add up to 100% or more, your node refuses to start.
+A swap with more coins, more makers, or a higher fee rate needs more.
+
+Each percentage fee must be at least 0 and below 100. Your node refuses to start otherwise. Your node also checks that some swap can pay your fees. A one-maker swap locks coins for 20 blocks. Your node adds your amount fee to 20 times your time fee. If the sum is 100 or more, no swap can pay your fees. Your node then stops with an error before it takes any swaps. With the default fees, the sum is 0.0025 + 20 × 0.0001 = 0.0045, far below 100.
 
 > **Note:**  
-> On the first run, if the default `network_port` or `rpc_port` is already in use, `makerd` automatically discovers a free port and persists it to `config.toml`.
+> If `network_port` is still the default 6102, `makerd` picks a free port and saves it to `config.toml`. This normally happens only on the first run. `makerd` does the same for `rpc_port` on every start.
 
 > **Important:**  
 > At the moment, OpenSwap operates only on the **TOR** network for peer-to-peer connections. There is no clearnet option; the app will only work over Tor until multi-network support is added.
@@ -111,7 +120,7 @@ This section focuses on `Makerd`, walking you through the process of starting an
 
 ### 1. Start the Blockchain Backend (Pre-requisite)
 
-`Makerd` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on the **custom signet** (check [demo doc](./demo.md)). The examples below use Bitcoin Core. To get started, start `bitcoind`:
+`Makerd` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on the **custom signet** (check the [bitcoind doc](./bitcoind.md)). The examples below use Bitcoin Core. To get started, start `bitcoind`:
 
 > **Important:**  
 > All apps are designed to run on our **custom signet** for testing purposes. The marketplace is only live in custom signet. Running the maker in other networks will not work as there's no marketplace in that network.
@@ -119,7 +128,7 @@ This section focuses on `Makerd`, walking you through the process of starting an
 To start `bitcoind`:
 
 ```bash
-$ bitcoind
+$ bitcoind -signet
 ```
 
 **Note:** If you don't have `bitcoind` installed or need help setting it up, refer to the [bitcoind demo documentation](./bitcoind.md).
@@ -139,7 +148,7 @@ This will display information about the `makerd` binary and its options.
 ```bash
 OpenSwap Maker Server
 
-The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet. It requires some starting balance — around 50,000 sats for Fidelity + Swap Liquidity. A 0.001 BTC top-up covers this with margin. Suggested faucet: <https://faucet.citadelfoss.xyz/>
+The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet. It requires some starting balance — around 50,000 sats for Fidelity + Swap Liquidity. A 0.001 BTC top-up covers this with margin. Suggested faucet: <https://faucet.openswap.live/>
 
 All server processes will start after the fidelity bond transaction is confirmed. This may take some time. Approx: 10 mins. Once the bond is confirmed, the server starts listening for incoming swap requests. As it performs swaps for clients, it keeps earning fees.
 
@@ -200,7 +209,7 @@ This will give you detailed information about the options and arguments availabl
 
 - The `-a` or `--USER:PASSWORD` option specifies the Bitcoin Core RPC authentication. By default, this is set to **`user:password`**.
 
-- The `--electrum <ELECTRUM_URL>` option switches the wallet to an Electrum backend instead of Bitcoin Core (e.g. `tcp://localhost:50001`). It is mutually exclusive with `--rpc`, `--zmq`, and `--auth`. Add `--electrum-tor` to route the Electrum connection through the Tor SOCKS proxy (required for onion servers). Peer-to-peer Tor is unaffected either way.
+- The `--electrum <ELECTRUM_URL>` option switches the wallet to an Electrum backend instead of Bitcoin Core (e.g. `tcp://localhost:50001`). It is mutually exclusive with `-r`, `-z`, and `-a`. Add `--electrum-tor` to route the Electrum connection through the Tor SOCKS proxy (required for onion servers). Peer-to-peer Tor is unaffected either way.
 
 - The `-w` or `--WALLET` option selects the wallet file. The default wallet name is **`maker`**.
 
@@ -253,7 +262,7 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
 
   Write these words down and store them offline. They will not be shown again.
 
-  INFO openswap::maker::api - New Wallet created at : "$HOME/.openswap/maker/wallets/maker".
+  INFO openswap::wallet::api - New Wallet created at : "$HOME/.openswap/maker/wallets/maker"
   ```
 
 - **Configuration File**: If no `config` file exists, `makerd` will create a default `config.toml` file at `$HOME/.openswap/maker/config.toml`:
@@ -266,8 +275,8 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
 - **Wallet Sync**: The wallet will sync to catch up with the latest updates:
 
   ```bash
-  INFO openswap::wallet::rpc - Initializing wallet sync and save
-  INFO openswap::wallet::rpc - Completed wallet sync and save
+  INFO openswap::wallet::api - Sync Started for "maker"
+  INFO openswap::wallet::api - Synced & Saved "maker"
   ```
 
 - **TOR Initialization**: `makerd` will start the TOR process and listen for connections on a TOR address.
@@ -297,10 +306,10 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   INFO openswap::maker::api - Next sync in 10 secs
   ```
 
-  To fund the wallet, you can use [this faucet](https://faucet.citadelfoss.xyz/).
+  To fund the wallet, you can use [this faucet](https://faucet.openswap.live/).
   We suggest taking `0.01 BTC` testcoins as the extra amount will be used in doing wallet related operations in [maker-cli demo](./maker-cli.md)
 
-- **Regular Wallet Sync**: The server will regularly sync the wallet every 10 seconds, increasing the interval in the pattern 10,20,30..., to detect any incoming funds.
+- **Regular Wallet Sync**: The server syncs the wallet every 10 seconds to detect incoming funds.
 
 - **Fidelity Transaction Creation**: Once the server detects sufficient funding (for new setups), it will automatically create and broadcast a fidelity transaction using the funding UTXOs:
 
@@ -315,26 +324,28 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   ```
 
 
-- **Thread Spawning**: Several threads will be spawned to handle specific tasks — a Nostr background task (to announce the fidelity bond), the RPC server, an idle-state checker, and a fidelity renewal loop:
+- **Nostr Task**: `makerd` starts a background task that announces the fidelity bond over Nostr:
 
   ```bash
   INFO openswap::maker::server - [6102] Spawning nostr background task
-  INFO openswap::maker::rpc::server - [6102] RPC socket binding successful at 127.0.0.1:6103
   ```
 
-- **Server Ready**: Finally, the `makerd` server is fully set up and ready to connect with other takers for coin swaps:
+- **Liquidity Check**: `makerd` checks that the wallet holds enough coins for the smallest swap:
+
+  ```bash
+  INFO openswap::maker::api - Swap Liquidity: 5001672 sats | Min: 1500 sats | Listening for requests.
+  ```
+
+- **Server Ready**: Finally, the `makerd` server is fully set up and ready to connect with other takers for coin swaps. It shows the network and the spendable balance. It then starts the RPC server for `maker-cli`:
 
 ```bash
-INFO openswap::maker::server - [6102] Server setup complete! Listening on port 6102
-```
-
-The server will display information about swap liquidity and continue listening for requests:
-
-```bash
-INFO openswap::maker::api - Swap Liquidity: 5001672 sats | Min: 1500 sats | Listening for requests.
 INFO openswap::maker::server - [6102] Bitcoin Network: regtest
 INFO openswap::maker::server - [6102] Spendable Wallet Balance: 0.05001672 BTC
+INFO openswap::maker::server - [6102] Server setup complete! Listening on port 6102
+INFO openswap::maker::rpc::server - [6103] RPC socket binding successful at 127.0.0.1:6103
 ```
+
+`makerd` also starts an idle-state checker and a fidelity renewal loop in the background. It then keeps listening for requests.
 
 ---
 

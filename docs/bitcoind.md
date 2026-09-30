@@ -1,8 +1,8 @@
-# Working with `bitcoind` for the Mutinynet
+# Working with `bitcoind` for the OpenSwap signet
 
-In this tutorial, we will guide you through setting up [Mutinynet](https://github.com/benthecarman/bitcoin/tree/mutinynet-inq-29), which runs on the [inquisition hardfork](https://github.com/bitcoin-inquisition/bitcoin) of Bitcoin Core, to allow experimental consensus rules while maintaining compatibility with existing Bitcoin consensus rules.
+In this tutorial, we will guide you through setting up `bitcoind` for the OpenSwap signet. A signet is a public test network. One fixed key signs all its blocks. The Citadel FOSS developers run this custom signet to host the openswap marketplace.
 
-OpenSwap doesn't need any experimental consensus. Mutinynet serves as a stable public Bitcoin Signet network to host the first movers of the openswap marketplace.
+OpenSwap doesn't need any experimental consensus. The install steps below use the [Mutinynet](https://github.com/benthecarman/bitcoin/tree/mutinynet-inq-29) build of Bitcoin Core as one way to run the node. That build runs on the [inquisition hardfork](https://github.com/bitcoin-inquisition/bitcoin) of Bitcoin Core.
 
 This tutorial will cover basic operations like setting up, creating wallets, getting funds, checking balances, and sending sats between two wallets using `bitcoin-cli`.
 
@@ -13,7 +13,7 @@ This tutorial will cover basic operations like setting up, creating wallets, get
 1. Download and install:
 
    - Download the [latest binaries](https://github.com/benthecarman/bitcoin/releases/latest) from the Mutinynet project repository.
-   - Extract the zip folder. The required binaries are in the `bin/` folder.
+   - Extract the `.tar.gz` archive. The required binaries are in the `bin/` folder.
    - Copy the `bitcoind` and `bitcoin-cli` binaries to a directory in your PATH (for Unix: `/usr/local/bin/`).
 
 2. Verify installation:
@@ -39,7 +39,7 @@ Copy this [`bitcoin.conf`](./bitcoin.conf) file from the docs folder into the da
 cp ./docs/bitcoin.conf ~/.bitcoin/bitcoin.conf
 ```
 
-This reference configuration contains the settings required to run `bitcoind` for OpenSwap on either Mutinynet (Signet) or Regtest.
+This reference configuration contains the settings required to run `bitcoind` for OpenSwap on either the OpenSwap signet or Regtest.
 
 ---
 
@@ -49,7 +49,7 @@ Once the `bitcoin.conf` file is configured, you can start `bitcoind` and perform
 
 #### 3.1 Start the `bitcoind` daemon
 
-Run the Mutinynet:
+Run the OpenSwap signet:
 
 ```bash
 $ bitcoind -signet
@@ -59,18 +59,17 @@ Or, run local Regtest
 $ bitcoind -regtest 
 ```
 
-> **Note**: The OpenSwap marketplace is live on Mutinynet. To access the market and perform swaps with other makers, start `bitcoind -signet`.
+> **Note**: The OpenSwap marketplace is live on the OpenSwap signet. To access the market and perform swaps with other makers, start `bitcoind -signet`.
 
-Useful links for Mutinynet operations:
- - [Mutinynet Block Explorer](https://mutinynet.com/mining)
- - [Mutinynet Faucet](https://faucet.mutinynet.com/)
+Useful link for signet operations:
+ - [OpenSwap Signet Faucet](https://faucet.openswap.live/)
 
-> **Note**: Command outputs for the rest of the tutorial below are shown for Regtest, but all commands are equivalent for Mutinynet. Except for the mining command, `bitcoin-cli generatetoaddress`. Instead of that, to get funds in the wallet, use the Mutiny Faucet.
+> **Note**: The rest of the tutorial runs on Regtest. Every `bitcoin-cli` command below uses `-regtest`. On the OpenSwap signet, use `-signet` instead. The mining command, `bitcoin-cli generatetoaddress`, does not work on the signet. Use the faucet to fund your wallet there.
 
 To check the status of the node and confirm that it's running, use:
 
 ```bash
-$ bitcoin-cli getblockchaininfo
+$ bitcoin-cli -regtest getblockchaininfo
 ```
 
 This will output the current state of the blockchain, including the number of blocks and synchronization status, for example:
@@ -98,7 +97,7 @@ This will output the current state of the blockchain, including the number of bl
 Create a wallet named `alice` to perform wallet-related operations in the regtest environment:
 
 ```bash
-$ bitcoin-cli createwallet "alice"
+$ bitcoin-cli -regtest createwallet "alice"
 ```
 
 The response will confirm that the wallet `alice` has been created:
@@ -114,7 +113,7 @@ The response will confirm that the wallet `alice` has been created:
 Similarly, create another wallet named `bob`:
 
 ```bash
-$ bitcoin-cli createwallet "bob"
+$ bitcoin-cli -regtest createwallet "bob"
 ```
 
 The response will confirm that the wallet `bob` has been created:
@@ -130,7 +129,7 @@ The response will confirm that the wallet `bob` has been created:
 Generate a new Bitcoin address for `alice` to receive funds:
 
 ```bash
-$ bitcoin-cli -rpcwallet=alice getnewaddress
+$ bitcoin-cli -regtest -rpcwallet=alice getnewaddress
 ```
 
 This returns a new address for `alice`:
@@ -144,7 +143,7 @@ bcrt1qfvgecwpwtn77f7vv6wfc78zdcxseq4pjpyn9jv
 Since we’re using `regtest`, you can generate new blocks to Alice's address and receive Bitcoin as block rewards:
 
 ```bash
-$ bitcoin-cli -rpcwallet=alice generatetoaddress 101 <alice_address>
+$ bitcoin-cli -regtest -rpcwallet=alice generatetoaddress 101 <alice_address>
 ```
 
 This will return a list of block hashes in hex format, corresponding to the 101 newly generated blocks, for example:
@@ -165,7 +164,7 @@ This will return a list of block hashes in hex format, corresponding to the 101 
 Now check the balance in `alice`'s wallet:
 
 ```bash
-$ bitcoin-cli -rpcwallet=alice getbalances
+$ bitcoin-cli -regtest -rpcwallet=alice getbalances
 ```
 
 This will show a balance corresponding to the block rewards for the generated blocks:
@@ -191,7 +190,7 @@ Now, let’s send 1 BTC from `alice` to `bob` using the `sendtoaddress` RPC comm
 Generate a new Bitcoin address for `bob`:
 
 ```bash
-$ bitcoin-cli -rpcwallet=bob getnewaddress
+$ bitcoin-cli -regtest -rpcwallet=bob getnewaddress
 ```
 
 This returns a new address for `bob`:
@@ -205,7 +204,7 @@ bcrt1q2nys4aedf448ngt5gpw5gmun6gdjqgy04qj6cq
 Next, send 1 BTC from `alice` to `bob` using the `sendtoaddress` command:
 
 ```bash
-$ bitcoin-cli -rpcwallet=alice sendtoaddress <bob_address> 1
+$ bitcoin-cli -regtest -rpcwallet=alice sendtoaddress <bob_address> 1
 ```
 
 This will create and broadcast a signed transaction, returning the transaction hash:
@@ -219,7 +218,7 @@ This will create and broadcast a signed transaction, returning the transaction h
 Generate a block to confirm the transaction:
 
 ```bash
-$ bitcoin-cli -rpcwallet=bob generatetoaddress 1 <bob_address>
+$ bitcoin-cli -regtest -rpcwallet=bob generatetoaddress 1 <bob_address>
 ```
 
 This will return the block hash in hex format:
@@ -235,7 +234,7 @@ Finally, check the balance of both wallets to confirm that the transaction was s
 ##### For Bob's wallet:
 
 ```bash
-$ bitcoin-cli -rpcwallet=bob getbalances
+$ bitcoin-cli -regtest -rpcwallet=bob getbalances
 ```
 
 The response should show that `bob` has received the 1 BTC:
@@ -253,7 +252,7 @@ The response should show that `bob` has received the 1 BTC:
 ##### For Alice's wallet:
 
 ```bash
-$ bitcoin-cli -rpcwallet=alice getbalances
+$ bitcoin-cli -regtest -rpcwallet=alice getbalances
 ```
 
 Alice's balance will be reduced by slightly more than 1 BTC: 1 BTC was sent to Bob and the remainder was paid as transaction fees. For example:

@@ -58,20 +58,22 @@ handles the encoding itself — do not try to paste the contents into the config
 
 ## Taker setup
 
-Add three keys to the taker config at `~/.openswap/taker/config.toml`:
+Add these keys to the taker config at `~/.openswap/taker/config.toml`:
 
 ```toml
 # LDK Server gRPC address (host:port, no scheme)
 ldk_server_url = 127.0.0.1:3536
 # Path to the LDK Server API key file
 ldk_api_key_path = /home/you/.ldk-server/regtest/api_key
-# Path to the LDK Server TLS certificate
+# Path to the LDK Server TLS certificate (optional)
 ldk_tls_cert_path = /home/you/.ldk-server/tls.crt
 ```
 
-All three are required together. If `ldk_server_url` is set but a credential
-path is missing or unreadable, Lightning is disabled and the reason is logged —
-the taker still starts and on-chain swaps are unaffected.
+Set `ldk_server_url` and `ldk_api_key_path` together. `ldk_tls_cert_path` is
+optional. Without it, your node reads `tls.crt` from ldk-server's default data
+directory. Your node turns Lightning off and logs the reason in two cases:
+`ldk_server_url` has no `ldk_api_key_path` beside it, or your node cannot read
+a credential file. The taker still starts. On-chain swaps work as usual.
 
 Openswap verifies the backend at startup with a real call. If the sidecar is
 unreachable you will see this in the log, and the `ln-swap-*` commands will

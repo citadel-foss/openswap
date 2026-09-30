@@ -3,6 +3,14 @@
 The blocklist allows a participant to refuse a swap when the counterparty's coins originate from a listed address.
 It applies to both the Legacy (v1) and Taproot (v2) protocols, and is disabled by default.
 
+## Turning screening on
+
+Set `check_blocklist = true` in the maker's or the taker's `config.toml`. It defaults to `false`.
+
+Your node keeps the list in `blocklist.json`, in the parent of its data directory. By default, that is `~/.openswap/blocklist.json`. A missing file counts as an empty list.
+
+With screening on, your node reads the file at startup. If your node cannot read or parse the file, it refuses to start.
+
 ## Matching
 
 Screening examines the transaction by which the counterparty pays into the swap.
@@ -48,7 +56,7 @@ The taker always funds first, so this asymmetry follows from the protocol rather
 
 | Condition | Behaviour |
 |-----------|-----------|
-| Input count above the configured maximum | Refused without screening |
+| More than 25 inputs | Refused without screening |
 | Previous output cannot be resolved | Refused |
 | List empty | Returns without querying the node |
 | Entry's address encodes a different network | Skipped, with address and reason recorded |
@@ -89,6 +97,17 @@ This prevents peers from probing which addresses a participant considers unaccep
 Two participants may hold different lists, or none, without affecting the protocol.
 
 ## Populating the list
+
+To add or remove one address, use these commands:
+
+```bash
+$ ./maker-cli blocklist-add <address> --label "<why it is blocked>"
+$ ./maker-cli blocklist-remove <address>
+$ ./taker blocklist-add <address> --label "<why it is blocked>"
+$ ./taker blocklist-remove <address>
+```
+
+`maker-cli` sends the change to a running `makerd`. `taker` edits the file itself. Both print the result, such as `Added: 1, updated: 0` or `Removed: 1`. See the [maker-cli doc](./maker-cli.md#blocklist) for details.
 
 Addresses may be added individually or imported in bulk from a published dataset such as [OpenSanctions](https://www.opensanctions.org/), which publishes sanctioned crypto wallets.
 

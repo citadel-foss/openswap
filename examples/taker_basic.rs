@@ -19,7 +19,7 @@
 //! ```
 //!
 //! Wallet files are always encrypted, so the config sets a demo passphrase.
-//! In production, supply your own via `-p`/`--password` on every start.
+//! In production, supply your own via `-p`/`--PASSWORD` on every start.
 
 use bitcoin::Amount;
 use bitcoind::{

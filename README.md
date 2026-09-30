@@ -1,28 +1,28 @@
 <div align="center">
 
 # OpenSwap
-Functioning, minimal-viable binaries and libraries to perform a trustless, p2p [Maxwell-Belcher OpenSwap Protocol](https://gist.github.com/chris-belcher/9144bd57a91c194e332fb5ca371d0964).
+Functioning, minimal-viable binaries and libraries to perform a trustless, p2p [Maxwell-Belcher Coinswap Protocol](https://gist.github.com/chris-belcher/9144bd57a91c194e332fb5ca371d0964).
 
 [![MIT or Apache-2.0 Licensed](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](https://github.com/citadel-foss/openswap/blob/master/LICENSE)
 [![Build Status](https://github.com/citadel-foss/openswap/actions/workflows/build.yaml/badge.svg)](https://github.com/citadel-foss/openswap/actions/workflows/build.yaml)
 [![Lint Status](https://github.com/citadel-foss/openswap/actions/workflows/lint.yaml/badge.svg)](https://github.com/citadel-foss/openswap/actions/workflows/lint.yaml)
 [![Test Status](https://github.com/citadel-foss/openswap/actions/workflows/test.yaml/badge.svg)](https://github.com/citadel-foss/openswap/actions/workflows/test.yaml)
 [![Coverage](https://codecov.io/github/citadel-foss/openswap/coverage.svg?branch=master)](https://codecov.io/github/citadel-foss/openswap?branch=master)
-[![Rustc Version 1.75.0+](https://img.shields.io/badge/rustc-1.75.0%2B-lightgrey.svg)](https://blog.rust-lang.org/2023/12/28/Rust-1.75.0.html)
+[![Rustc Version 1.88.0+](https://img.shields.io/badge/rustc-1.88.0%2B-lightgrey.svg)](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/)
 
 [![Latest Release](https://img.shields.io/github/v/release/citadel-foss/openswap?label=latest%20release&color=orange)](https://github.com/citadel-foss/openswap/releases/latest)
-[![Website](https://img.shields.io/badge/website-citadelfoss.xyz-blue)](https://citadelfoss.xyz/)
+[![Website](https://img.shields.io/badge/website-openswap.live-blue)](https://openswap.live/)
 
 </div>
 
-## ⚠️ Warning
-This project is under active development. Mainnet use is **NOT recommended.**
+## Notice
+The project is in active beta with experimental Mainnet use.
 
 # About
 
-OpenSwap is a trustless, self-custodial [atomic swap](https://bitcoinops.org/en/topics/openswap/) protocol built on Bitcoin. Unlike existing solutions that rely on centralized servers as [single points of failure](https://en.wikipedia.org/wiki/Single_point_of_failure), OpenSwap's marketplace is seeded in the Bitcoin blockchain itself — no central host required, anyone with a Bitcoin node can participate. 
+OpenSwap is a trustless, self-custodial [atomic swap](https://bitcoinops.org/en/topics/coinswap/) protocol built on Bitcoin. Unlike existing solutions that rely on centralized servers as [single points of failure](https://en.wikipedia.org/wiki/Single_point_of_failure), OpenSwap's marketplace is seeded in the Bitcoin blockchain itself — no central host required, anyone with a Bitcoin node can participate. 
 
-For a quicker dive into the idea, see the [**Website**](https://citadelfoss.xyz/).
+For a quicker dive into the idea, see the [**Website**](https://openswap.live/).
 
 **Sybil resistance** is achieved through [Fidelity Bonds](https://github.com/JoinMarket-Org/joinmarket-clientserver/blob/master/docs/fidelity-bonds.md): time-locked UTXOs that make Sybil attacks economically costly while simultaneously bootstrapping the marketplace on-chain.
 
@@ -45,29 +45,25 @@ For an in-depth exploration of the repository, it's recommended to use [Deep Wik
 ## CLI Apps
 This crate compiles into the following CLI binaries. Useful for integration testing, and dev environments.
 
-**[makerd](./docs/makerd.md)**: A maker server daemon. Requires Bitcoin Core, and Tor. Runs a maker daemon to handle swap requests.
+**[makerd](./docs/makerd.md)**: A maker server daemon. Requires Bitcoin Core or an Electrum server, and Tor. Runs a maker daemon to handle swap requests.
 
 **[maker-cli](./docs/maker-cli.md)**: CLI controller for the `makerd`. Manage server, access wallet, view swap statistics, and more. [Demo](./docs/maker-cli.md)
 
 **[taker](./docs/taker.md)**: A command-line OpenSwap client app to perform swaps, discover market, etc. [Demo](./docs/taker.md)
 
-## GUI Apps
-GUI apps are built using the core library rust APIs ([taker api](https://github.com/citadel-foss/openswap/blob/master/src/taker/api.rs), [maker api](https://github.com/citadel-foss/openswap/blob/master/src/maker/api.rs)) and [FFIs](https://github.com/citadel-foss/openswap-ffi) built on top of it to support other languages. Suitable for power users and UI/UX stress testing. 
+## Portal (GUI OpenSwap Manager)
+[Portal](https://github.com/citadel-foss/portal) is a full-featured OpenSwap app, built directly on this crate's Rust APIs ([taker api](https://github.com/citadel-foss/openswap/blob/master/src/taker/api.rs), [maker api](https://github.com/citadel-foss/openswap/blob/master/src/maker/api.rs)). It is a full wallet (receive, send, coin control, history) with swaps built in.
 
-The apps provide the full suite of OpenSwap operations at "near production" quality. They can be locally compiled from their respective repos, or download precompiled binaries from their release pages.  
+- **Two roles:** pick **Wallet** to swap your coins (the taker), or **Router** to provide liquidity and earn swap fees (the maker).
+- **Desktop or server:** run it as a desktop app, or host it yourself as a server and reach it from a browser.
+- **Nothing else to install:** it bundles its own Tor and defaults to a public Electrum server. You can point it at your own Bitcoin Core node instead.
+- **Same data as the CLI:** its wallet data works with the OpenSwap CLI apps too.
 
-**[taker-app](https://github.com/citadel-foss/taker-app)**: A Desktop OpenSwap client, built with the JS FFIs, to manage the all operations of openswap wallet, discover and manage marketplace, and much more.
-
-**[maker-dashboard](https://github.com/citadel-foss/maker-dashboard)**: A Webapp for maker management dashboard, built in rust, designed for headless servers or desktops. Create and manage multiple makers, connect with the market, earn swap fees and much more, with a nice and useful UI.
-
-Check the [demo doc](./docs/demo.md) for quick setup guides.
+Download a precompiled build from the [release page](https://github.com/citadel-foss/portal/releases), or build it from source. The [Portal README](https://github.com/citadel-foss/portal#getting-started) has the setup guide.
 
 For swapping between on-chain BTC and the Lightning Network — including routed swaps that need no Lightning node of your own — see [lightning swaps](./docs/lightning.md).
 
 For how wallet keys and passphrases are protected — at-rest encryption, in-memory key sealing, and the exact threat model — see [wallet security](./docs/wallet-security.md).
-
-> [!NOTE]
-> These apps should be considered as "examples", rather than products. We encourage all Bitcoin wallet developers to take a look at our [examples](https://github.com/citadel-foss/openswap/tree/master/examples), [ffis](), and [apis](https://github.com/citadel-foss/openswap/blob/master/src/taker/api.rs), to build their own apps, or integrate OpenSwap within their existing apps. App ecosystem diversity is crucial for decentralization.
 
 # Development
 
@@ -76,6 +72,7 @@ For how wallet keys and passphrases are protected — at-rest encryption, in-mem
 Extensive functional testing simulates various protocol edge cases:
 
 ```console
+# needs nostr-rs-relay on PATH (cargo install nostr-rs-relay)
 cargo test --features=integration-test -- --nocapture
 ```
 
@@ -97,10 +94,24 @@ The repo contains pre-commit githooks to do auto-linting before commits. Set up 
 ln -s ../../git_hooks/pre-commit .git/hooks/pre-commit
 ```
 
+## Security
+
+We take the security of the protocol and its implementation seriously. If you discover a vulnerability, please report it responsibly.
+
+**Please do not open public GitHub issues for security vulnerabilities.**
+
+To report a security issue, email **security@citadelfoss.xyz** with a description of the vulnerability, steps to reproduce, and its potential impact. We will acknowledge your report and work with you on disclosure and remediation.
+
 ## Community
 
-Dev community: [Matrix](https://matrix.to/#/#ciatdel-foss:matrix.org)
+Dev community: [Matrix](https://matrix.to/#/#citadel-foss:matrix.org)
 
 Dev discussions predominantly happen via FOSS best practices, and by using Github as the major community forum.
 
 The Issues, PRs and Discussions are where all the hard lifting is happening.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

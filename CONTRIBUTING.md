@@ -49,7 +49,7 @@ See the Pull Request section below.
 
 ### Prerequisites
 - Rust (see [`rust-toolchain.toml`](rust-toolchain.toml))
-- [Mutinynet](./docs/bitcoind.md) (fully synced, preferably in regtest or mutinynet)
+- [Bitcoin Core](./docs/bitcoind.md) on the custom signet or regtest (fully synced), or an Electrum server
 - [Tor with the correct configuration](./docs/tor.md)
 - `build-essential`, `automake`, `libtool`, `protobuf-compiler` (on Ubuntu/Debian)
 
@@ -71,10 +71,11 @@ cargo build --release
 sudo install ./target/release/{taker,makerd,maker-cli} /usr/local/bin/
 ```
 
-Bitcoin Core must be configured with `-txindex=1` and ZMQ enabled:
+Bitcoin Core must be configured with `txindex=1` and ZMQ enabled:
 ```conf
--zmqpubrawtx=tcp://127.0.0.1:28332
--zmqpubrawblock=tcp://127.0.0.1:28333
+txindex=1
+zmqpubrawblock=tcp://127.0.0.1:28332
+zmqpubrawtx=tcp://127.0.0.1:28332
 ```
 See [`docs/bitcoind.md`](docs/bitcoind.md) for the full setup guide.
 
@@ -91,7 +92,6 @@ Full documentation is in the [`docs/`](docs/) folder:
 - [`docs/taker.md`](docs/taker.md)
 - [`docs/maker-cli.md`](docs/maker-cli.md)
 - [`docs/taproot.md`](docs/taproot.md)
-- [`docs/workshop.md`](docs/workshop.md)
 
 ## Coding Standards
 
@@ -112,6 +112,7 @@ All PRs **must** pass:
 cargo test
 
 # Full integration tests (required for most changes)
+# needs nostr-rs-relay on PATH (cargo install nostr-rs-relay)
 cargo test --features integration-test -- --nocapture
 ```
 

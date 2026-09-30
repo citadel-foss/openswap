@@ -25,7 +25,7 @@ use std::{
 /// It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an
 /// Electrum-protocol server (via `--electrum`). Both paths support the full swap flow
 /// and the `restore` subcommand. It currently only runs on the custom signet.
-/// Suggested faucet for getting signet coins: <https://faucet.citadelfoss.xyz/>
+/// Suggested faucet for getting signet coins: <https://faucet.openswap.live/>
 ///
 /// For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 ///

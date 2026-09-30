@@ -15,7 +15,7 @@ The taker CLI is an application that allows you to perform openswaps as a taker.
 
 ### Start the Blockchain Backend (Pre-requisite)
 
-`Taker` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on a **custom signet** (check [demo doc](./demo.md)). The examples below use Bitcoin Core.
+`Taker` talks to a **Bitcoin Core** node (RPC + ZMQ) by default, and can use an **Electrum** server instead via `--electrum` — either way running on a **custom signet** (check the [bitcoind doc](./bitcoind.md)). The examples below use Bitcoin Core.
 
 > **Important:**  
 > All apps are designed to run on our **custom signet** for testing purposes. The marketplace is only live in custom signet. Running the taker in other networks will not work as there's no marketplace in that network.
@@ -45,7 +45,7 @@ This will display a detailed guide about the app and its capabilities.
 ```bash
 A simple command line app to operate as openswap client.
 
-The app works as a regular Bitcoin wallet with the added capability to perform openswaps. It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an Electrum-protocol server (via `--electrum`). Both paths support the full swap flow and the `restore` subcommand. It currently only runs on the custom signet. Suggested faucet for getting signet coins: <https://faucet.citadelfoss.xyz/>
+The app works as a regular Bitcoin wallet with the added capability to perform openswaps. It can talk to either a Bitcoin Core node (over RPC + ZMQ — the default) or an Electrum-protocol server (via `--electrum`). Both paths support the full swap flow and the `restore` subcommand. It currently only runs on the custom signet. Suggested faucet for getting signet coins: <https://faucet.openswap.live/>
 
 For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 
@@ -65,6 +65,8 @@ Commands:
   list-offers         List makers from the locally cached offerbook without triggering a network sync
   poll-maker          Fetch an offer from a single maker address, verify the fidelity proof, and store the result in the offerbook. Adds the maker if absent
   remove-maker        Remove a maker from the local offerbook by address
+  blocklist-add       Add or update an address in the funding-source blocklist
+  blocklist-remove    Remove an address from the funding-source blocklist
   open-swap           Initiate the openswap process
   recover             Recover from all failed swaps
   backup              Backup the selected wallet.
@@ -117,6 +119,8 @@ Options:
           Print version
 ```
 
+If you build the taker with `--features lightning`, it also has the `ln-swap-in`, `ln-swap-out`, and `ln-swap-routed` commands. See [the Lightning doc](./lightning.md).
+
 ### Key Points About Command Arguments
 
 - The `-p` or `--PASSWORD` option sets the wallet encryption passphrase. It is **required** when creating a new wallet and to open an encrypted one — wallet files are always encrypted (see [wallet security](./wallet-security.md)). The passphrase must be supplied on every (re)start; it is never persisted.
@@ -127,7 +131,7 @@ Options:
 
 - The `-a` or `--USER:PASSWORD` option specifies the Bitcoin Core RPC authentication. By default, this is set to **`user:password`**.
 
-- The `--electrum <ELECTRUM_URL>` option switches the wallet to an Electrum backend instead of Bitcoin Core (e.g. `tcp://localhost:50001`). It is mutually exclusive with `--rpc`, `--zmq`, and `--auth`. Add `--electrum-tor` to route the Electrum connection through the Tor SOCKS proxy (required for onion servers). Peer-to-peer Tor is unaffected either way.
+- The `--electrum <ELECTRUM_URL>` option switches the wallet to an Electrum backend instead of Bitcoin Core (e.g. `tcp://localhost:50001`). It is mutually exclusive with `-r`, `-z`, and `-a`. Add `--electrum-tor` to route the Electrum connection through the Tor SOCKS proxy (required for onion servers). Peer-to-peer Tor is unaffected either way.
 
 - The `-v` or `--verbosity` option sets the log level of the `debug.log` file (default: `info`).
 
@@ -163,12 +167,12 @@ $ taker get-new-address
 **Output:**
 
 ```bash
-bcrt1qyywgd4we5y7u05lnrgs8runc3j7sspwqhekrdd
+bcrt1p...
 ```
 
-This returns a new Bitcoin receiving address from the taker's wallet.
+This returns a new taproot receiving address from the taker's wallet. The address starts with `bcrt1p` on regtest.
 
-Now we can use the signet faucet to send some coins to this address. Use [this faucet](https://faucet.citadelfoss.xyz/) to get some signet coins.
+Now we can use the signet faucet to send some coins to this address. Use [this faucet](https://faucet.openswap.live/) to get some signet coins.
 
 ### Check Wallet Balances
 
@@ -291,39 +295,40 @@ This blocks until the offerbook sync cycle completes (including Nostr-based make
 
 ```bash
 Waiting for offerbook synchronization to complete…
-Offerbook synchronized in 12.34s
+Offerbook synchronized in <elapsed>
 
 Discovered 2 makers
 
 
     Maker
     ─────
-    Address        : rywnaguli5qwad2ayqyu3673acyyl5dw7bsjifhge4zohftfi76ybbid.onion:6102
-    Protocol       : Legacy
+    Address        : rywnaguli5qwad2ayqyu3673acyyl5dw7bsjifhge4zohftfi76ybbid.onion
+    Protocol       : Unified
     State          : Good
 
     Offer
     ─────
+    Name           : default-maker
     Base Fee       : 500
     Amount Fee %   : 0.0025
     Time Fee %     : 0.0001
 
     Limits
     ──────
-    Min Size       : 10000
+    Min Size       : 1500
     Max Size       : 49949540
     Required Conf. : 1
-    Min Locktime   : 20
+    Min Locktime   : 10
 
     Fidelity Bond
     ─────────────
     Outpoint       : 21e3902cc0a2b94602fa94a7d3664f1a4d861df84af5049a334d5ddf402ed7f5:0
-    Value          : 904
+    Value          : <amount> BTC
     Expiry         : 28864
 
 ...
 
-Offerbook summary → good: 2, bad: 0, unresponsive: 0 (total: 2)
+Offerbook summary → good: 2, banned: 0, unavailable: 0 (total: 2)
 ```
 
 ### List Cached Offers
@@ -341,14 +346,36 @@ This prints the same per-maker display as `fetch-offers`, but reads only the loc
 You can fetch and verify the offer of one specific maker (adding it to the offerbook if absent):
 
 ```bash
-$ taker poll-maker --address <maker-onion-address:port>
+$ taker poll-maker --address <maker-onion-address>
 ```
 
 And remove a maker from the local offerbook by address:
 
 ```bash
-$ taker remove-maker --address <maker-onion-address:port>
+$ taker remove-maker --address <maker-onion-address>
 ```
+
+### Block Funding Sources
+
+The blocklist lets your node refuse a swap when the coins paid to you come from an address you listed. Set `check_blocklist = true` in the config file to turn the check on. See [the blocklist doc](./blocklist.md) for how the check works.
+
+Add an address, with an optional note:
+
+```bash
+$ taker blocklist-add <address> --label <note>
+Added: 1, updated: 0
+```
+
+If the address is already listed, the command replaces its note. It then prints `Added: 0, updated: 1`.
+
+Remove an address:
+
+```bash
+$ taker blocklist-remove <address>
+Removed: 1
+```
+
+If the address is not listed, the command prints `Removed: 0`.
 
 ### Initiate a OpenSwap
 
@@ -377,9 +404,9 @@ Options:
   -a, --amount <AMOUNT>
           Sets the swap amount in sats [default: 20000]
       --tx-count <TX_COUNT>
-          Maximum funding splits per hop; makers may forward fewer [default: 2]
+          Maximum contracts the swap may split into; bounded because every split costs both sides allocation and keygen work [default: 2]
       --max-input-budget <MAX_INPUT_BUDGET>
-          Maximum inputs per funding tx whose fee you cover; extra inputs are the maker's cost [default: 2]
+          Maximum inputs per forwarding tx whose fee the taker covers [default: 2]
       --feerate <FEERATE>
           Swap feerate in sats/vB; values below the 1 sat/vB relay floor are rejected [default: 1]
       --protocol <PROTOCOL>
@@ -404,19 +431,19 @@ The swap runs in two phases. First it prepares the swap — discovering makers, 
 
 ```bash
 ========== Swap Summary ==========
-Swap ID:   c874d9f7ac7e6230
+Swap ID:   <swap-id>
 Protocol:  Legacy
-Sending:   20000 sats
+Sending:   0.00020000 BTC
 
-  Hop 0: ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202 (Legacy)
+  Hop 0: ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion (Legacy)
          Fees: base=500 sats, amt=0.0025%, time=0.000100%
-         Locktime: 48 blocks, Estimated fee: 550 sats
-  Hop 1: rywnaguli5qwad2ayqyu3673acyyl5dw7bsjifhge4zohftfi76ybbid.onion:6102 (Legacy)
+         Locktime: 40 blocks, Estimated fee: 502 sats
+  Hop 1: rywnaguli5qwad2ayqyu3673acyyl5dw7bsjifhge4zohftfi76ybbid.onion (Legacy)
          Fees: base=500 sats, amt=0.0025%, time=0.000100%
-         Locktime: 24 blocks, Estimated fee: 530 sats
+         Locktime: 20 blocks, Estimated fee: 501 sats
 
-Maximum total cost (ceiling): 1080 sats
-Estimated receive:   18920 sats
+Maximum total cost (ceiling): <amount> BTC
+Estimated receive:   <amount> BTC
 ==================================
 
 Proceed with this swap? [y/N]
@@ -435,30 +462,34 @@ tail -f ~/.openswap/taker/debug.log
 ```
 
 ```bash
-INFO openswap::wallet::api - Wallet file at "/home/user/.openswap/taker/wallets/taker-wallet" successfully loaded.
-INFO openswap::taker::config - Successfully loaded config file from : /home/user/.openswap/taker/config.toml
-INFO openswap::utill - Tor is fully started and operational!
-INFO openswap::taker::api - Syncing Offerbook
-INFO openswap::taker::api - Found 5 suitable makers for this swap round
-INFO openswap::taker::api - Initiating openswap with id : c874d9f7ac7e6230
-INFO openswap::taker::api - Initializing First Hop.
-INFO openswap::taker::api - Choosing next maker: ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
-INFO openswap::wallet::spend - Created Funding tx, txid: 5eacac48... | Size: 220 vB | Fee: 440 sats | Feerate: 2.00 sat/vB
-INFO openswap::taker::api - ===> ReqContractSigsForSender | ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
-INFO openswap::taker::api - <=== RespContractSigsForSender | ewaexd2es2uzr34wp26cj5zgph7bug7znmmxolvwzmoeedbiyfgz3wqd.onion:8202
-INFO openswap::taker::api - Broadcasted Funding tx. txid: 5eacac48...
-INFO openswap::taker::api - Waiting for funding transaction confirmation. Txids : [5eacac48...]
-
+INFO openswap::taker::api - Preparing openswap: amount=0.00020000 BTC, makers=2, protocol=Legacy
+INFO openswap::taker::api - Preparing openswap with id: <swap-id>
+INFO openswap::taker::api - Discovering makers for 2 hops...
+INFO openswap::taker::api - Selected 2 makers (+ <n> spares): #1 <hop-0-address>, #2 <hop-1-address>
+INFO openswap::taker::api - Negotiating swap details with makers...
+INFO openswap::taker::api - Connecting to maker 0 at <hop-0-address>
+INFO openswap::taker::api - Handshake complete, protocol: Legacy
+INFO openswap::taker::api - Maker 0 accepted swap with tweakable point
 .
 .
 .
-
-INFO openswap::wallet::api - Successfully swept incoming swap coin, txid: aed232df...
-INFO openswap::taker::api - Successfully swept 1 incoming swap coins: [aed232df...]
-INFO openswap::taker::api - Successfully Completed OpenSwap.
-INFO openswap::taker::api - Shutting down taker.
-INFO openswap::taker::api - offerbook data saved to disk.
-INFO openswap::taker::api - Wallet data saved to disk.
+INFO openswap::taker::api - Swap prepared: id=<swap-id>, estimated_fee=<amount> BTC, estimated_receive=<amount> BTC
+INFO openswap::taker::api - Starting openswap execution for id: <swap-id>
+INFO openswap::taker::api - Initializing swap funding...
+INFO openswap::taker::api - Created <n> outgoing swapcoins for funding
+INFO openswap::taker::legacy_swap - Starting multi-hop Legacy swap with ProofOfFunding flow
+INFO openswap::taker::legacy_swap - Processing maker 1 of 2: <hop-0-address>
+INFO openswap::taker::legacy_swap - Step 1: Requesting sender contract signatures from maker 0
+INFO openswap::taker::legacy_swap - Broadcasting funding transactions and waiting for confirmation
+INFO openswap::taker::legacy_swap - Sending ProofOfFunding to maker 0
+.
+.
+.
+INFO openswap::taker::legacy_swap - Multi-hop Legacy swap contract exchange completed
+INFO openswap::taker::api - Finalizing swap...
+INFO openswap::taker::api - Swap finalized successfully
+INFO openswap::taker::api - Swept <n> incoming swapcoins
+INFO openswap::taker::api - OpenSwap completed successfully: <swap-report>
 ```
 
 ### Recovering Failed Swaps
@@ -483,12 +514,11 @@ $ taker recover
 **Output:**
 
 ```bash
-2025-08-13T14:36:38.734842084+05:30 INFO openswap::wallet::api - Unfinished incoming txids: []
-2025-08-13T14:36:38.734849418+05:30 INFO openswap::wallet::api - Unfinished outgoing txids: []
-2025-08-13T14:36:38.752510411+05:30 INFO openswap::taker::api - Recovery completed.
+WARN openswap::taker::api - Starting swap recovery...
+No unfinished coinswaps to recover
 ```
 
-This will attempt to recover all funds from failed swaps. In this case, since there are no unfinished transactions (both incoming and outgoing txids arrays are empty), the recovery process completes immediately with no funds to recover.
+This command recovers the funds from all failed swaps. In this example, your wallet holds no unfinished swap. The command has nothing to recover and exits.
 
 A contract can stay locked on purpose. Once your node receives its coins from a swap, the contract you sent is owed to the first maker, the one you paid directly. Your node takes it back only after that maker takes back its own contract. At that point nobody else can ever claim yours.
 
@@ -534,18 +564,22 @@ The data directory contains the following files:
 2. `debug.log` - The log file for the taker.
 3. `wallets` directory - Contains the wallet files for the taker.
 4. `offerbook.json` - The locally cached offerbook of known makers, updated by `fetch-offers` and `poll-maker`.
+5. `swap_tracker.cbor` - The saved state of your swaps, used to resume recovery after a restart.
 
 **Default Taker Configuration (`~/.openswap/taker/config.toml`):**
 
 ```toml
 control_port = 9051
 socks_port = 9050
-tor_auth_password = ""
+tor_auth_password = 
+check_blocklist = false
 ```
  
 - `control_port`: The Tor Control Port. Check the [tor doc](tor.md) for more details.
 - `socks_port`: The Tor Socks Port. Check the [tor doc](tor.md) for more details.
 - `tor_auth_password`: Optional password for Tor control authentication; empty by default.
+- `check_blocklist`: Set to `true` to refuse swaps funded from a listed address. Off by default. See the [blocklist doc](blocklist.md).
+- `ldk_server_url`, `ldk_api_key_path`, `ldk_tls_cert_path`: Optional keys that connect the taker to a Lightning node. They are absent by default. See the [Lightning doc](lightning.md).
 
 ### Wallets
 

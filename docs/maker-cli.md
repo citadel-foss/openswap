@@ -55,6 +55,8 @@ Commands:
   show-fidelity       Show all the fidelity bonds, current and previous, with an (index, {bond_proof, is_spent}) tuple
   sync-wallet         Sync the Maker wallet with the current blockchain state
   verify-deniability  Verify the deniability proof for a specific swap
+  blocklist-add       Add or update an address in the funding-source blocklist
+  blocklist-remove    Remove an address from the funding-source blocklist
   help                Print this message or the help of the given subcommand(s)
 
 Options:
@@ -87,7 +89,7 @@ Options:
   - Pass your custom port number using the `-p` or `--rpc-port` option, like this:
 
 ```bash
-  $ ./maker-cli -p 6104 <SUBCOMMAND>
+  $ ./maker-cli -p 127.0.0.1:6104 <SUBCOMMAND>
 ```
 
 ## For this tutorial, we'll assume the default configuration is being used. Output examples will reflect this setup.
@@ -127,7 +129,7 @@ $ ./maker-cli show-data-dir
 **Output:**
 
 ```bash
-<home_directory>/openswap/maker
+<home_directory>/.openswap/maker
 ```
 
 This is where all the maker's data is stored.
@@ -233,7 +235,7 @@ $ ./maker-cli get-balances
 
 This command shows the total wallet balances of different categories:
 
-- **contract**: All live contract transaction balance locked in timelocks. If you see value in this field, you have unfinished or malfinished swaps. You can claim them back with the recover command
+- **contract**: All live contract transaction balance locked in timelocks. If you see value in this field, you have unfinished or failed swaps. `makerd` claims these coins back on its own. `maker-cli` has no recover command.
 - **fidelity**: All coins locked in fidelity bonds
 - **regular**: All single signature regular wallet coins (seed balance)
 - **spendable**: Spendable amount in wallet (regular + swap balance)
@@ -243,7 +245,7 @@ This confirms the balance of our fidelity UTXOs matches the amount we set when c
 
 ---
 
-For more details about fidelity bonds, refer to the [Fidelity Bond Documentation](https://github.com/citadel-foss/OpenSwap-Protocol-Specification/blob/main/v1/4_fidelity.md).
+For more details about fidelity bonds, refer to the [Fidelity Bond Documentation](https://github.com/citadel-foss/OpenSwap-Protocol-Specification/blob/main/general%20specs/fidelity.md).
 
 ---
 
@@ -258,7 +260,7 @@ $ ./maker-cli list-utxo-swap
 []
 ```
 
-This lists UTXOs received from incoming swaps. Since we have not done any openswap yet, we have no swap UTXOs and thus no swap balances.
+This lists UTXOs received from incoming swaps. Since we have not done any swaps yet, we have no swap UTXOs and thus no swap balances.
 
 #### Contract UTXOs
 
@@ -267,7 +269,7 @@ $ ./maker-cli list-utxo-contract
 []
 ```
 
-This lists HTLC contract UTXOs. As mentioned above: We haven't participated in any openswap transactions yet, so we don't have any unsuccessful openswaps. Therefore, we have no `contract UTXOs` and no balance in this category.
+This lists HTLC contract UTXOs. As mentioned above: We haven't taken part in any swaps yet. That means we have no unsuccessful swaps. Therefore, we have no `contract UTXOs` and no balance in this category.
 
 Both categories show zero balances as confirmed by our `get-balances` output:
 
@@ -316,7 +318,7 @@ This lists all UTXOs in the wallet, including fidelity bonds. We created a fundi
 
 - Initially, we funded the wallet with `0.01 BTC` (1,000,000 sats).
 - `10,000 sats` were locked in the fidelity bond.
-- `1,000 sats` were paid as the mining fee for the fidelity transaction (at the default `fidelity_feerate` of 2 sats/vB).
+- `1,000 sats` were paid as the mining fee for the fidelity transaction. The fee depends on `fidelity_feerate`, which defaults to 1 sat/vB.
 
 The remaining balance after these transactions is:
 
@@ -373,12 +375,12 @@ Usage: maker-cli send-to-address [OPTIONS] --address <ADDRESS> --amount <AMOUNT>
 Options:
   -t, --address <ADDRESS>  Recipient's address
   -a, --amount <AMOUNT>    Amount to send in sats
-  -f, --feerate <FEERATE>  Feerate in sats/vByte. Defaults to 2 sats/vByte
+  -f, --feerate <FEERATE>  Feerate in sats/vByte. Defaults to the 1 sats/vByte relay floor; below-floor or non-finite values are rejected
   -h, --help               Print help
 ```
 
 > **Note:**  
-> The transaction fee is specified as a fee rate in sats/vByte via the `--feerate` option. If omitted, it defaults to 2 sats/vByte.
+> The transaction fee is specified as a fee rate in sats/vByte via the `--feerate` option. If you omit it, `maker-cli` uses 1 sat/vByte, the lowest rate the network forwards. `maker-cli` rejects any lower rate. It also rejects values that are not real numbers.
 
 Let's now send `10,000 sats` to the derived address, with a fee rate of 2 sats/vByte:
 
@@ -429,11 +431,11 @@ $ ./maker-cli list-utxo-fidelity
 $ ./maker-cli get-balances
 
 {
-    "regular": 978500,
-    "swap": 0,
-    "contract": 0,
-    "fidelity": 10000,
-    "spendable": 978500
+  "contract": 0,
+  "fidelity": 10000,
+  "regular": 978500,
+  "spendable": 978500,
+  "swap": 0
 }
 ```
 
@@ -449,11 +451,11 @@ $ ./maker-cli list-utxo-swap
 
 $ ./maker-cli get-balances
 {
-    "regular": 978500,
-    "swap": 0,
-    "contract": 0,
-    "fidelity": 10000,
-    "spendable": 978500
+  "contract": 0,
+  "fidelity": 10000,
+  "regular": 978500,
+  "spendable": 978500,
+  "swap": 0
 }
 ```
 
@@ -467,11 +469,11 @@ $ ./maker-cli list-utxo-contract
 
 $ ./maker-cli get-balances
 {
-    "regular": 978500,
-    "swap": 0,
-    "contract": 0,
-    "fidelity": 10000,
-    "spendable": 978500
+  "contract": 0,
+  "fidelity": 10000,
+  "regular": 978500,
+  "spendable": 978500,
+  "swap": 0
 }
 ```
 
@@ -499,11 +501,11 @@ $ ./maker-cli list-utxo
 
 $ ./maker-cli get-balances
 {
-    "regular": 978500,
-    "swap": 0,
-    "contract": 0,
-    "fidelity": 10000,
-    "spendable": 978500
+  "contract": 0,
+  "fidelity": 10000,
+  "regular": 978500,
+  "spendable": 978500,
+  "swap": 0
 }
 ```
 
@@ -522,6 +524,34 @@ Proof valid: swap participated in a completed openswap
 ```
 
 If the proof is missing or doesn't check out, the command prints `Proof invalid or not found for this swap ID`.
+
+---
+
+### Blocklist
+
+The blocklist is a list of addresses you refuse to take coins from. Your node uses it only when `config.toml` sets `check_blocklist = true`. Your node then refuses a swap if the coins paid into it come straight from a listed address.
+
+To add an address, with an optional label:
+
+```bash
+$ ./maker-cli blocklist-add <address> --label "<why it is blocked>"
+
+Added: 1, updated: 0
+```
+
+If the address is already listed, the command updates its label and prints `Added: 0, updated: 1`.
+
+To remove an address:
+
+```bash
+$ ./maker-cli blocklist-remove <address>
+
+Removed: 1
+```
+
+If the address was not listed, the command prints `Removed: 0`.
+
+Both commands edit `blocklist.json` in the parent of the maker data directory. By default, that is `~/.openswap/blocklist.json`. The taker reads the same file. Your node reads the file again for every swap. That way, a change applies to the next swap without a restart. See the [blocklist doc](./blocklist.md) for how matching works.
 
 ---
 
@@ -548,4 +578,4 @@ On shutdown, `makerd` also removes the `rpc_cookie` file from the data directory
 
 ---
 
-And that's it! Now you are ready to be a maker in the OpenSwap network. Start your maker servers, perform openswaps, and enjoy earning fees from takers who participate in openswaps with you.
+And that's it! Now you are ready to be a maker in the OpenSwap network. Start your maker servers, perform swaps, and enjoy earning fees from takers who swap with you.
