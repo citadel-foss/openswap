@@ -6,7 +6,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior, MakerError, MakerServer, MakerServerConfig},
+    maker::{MakerBehavior, MakerError, MakerServer, MakerServerConfig},
     protocol::common_messages::ProtocolVersion,
     taker::{
         error::TakerError, MakerState, SwapParams, TakerBehavior, UnavailableReason,
@@ -18,7 +18,7 @@ use openswap::{
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::{fs, sync::atomic::Ordering::Relaxed, thread};
+use std::fs;
 
 #[test]
 fn fidelity_limit_violation() {
@@ -31,39 +31,23 @@ fn fidelity_limit_violation() {
     let maker_behaviors = vec![MakerBehavior::InvalidFidelityTimelock];
 
     // Initialize test framework
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    let maker = &makers[0];
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
     info!("Funding taker and maker");
     // Fund the taker with 3 UTXOs of 0.05 BTC each (Taproot)
-    fund_taker_default(taker, bitcoind, 3);
+    world.fund_taker_default(3);
 
     // Fund the Maker with 4 UTXOs of 0.05 BTC each (Taproot)
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
-    // Start the Maker Server thread
+    // Start the Maker Server thread, wait for it to complete setup, then
+    // sync its wallet
     info!("Initiating Maker server...");
-    let maker_thread = {
-        let maker_clone = maker.clone();
-        thread::spawn(move || {
-            start_server(maker_clone).unwrap();
-        })
-    };
-
-    // Wait for maker to complete setup
-    wait_for_makers_setup(std::slice::from_ref(maker), 120);
-
-    // Sync wallets after setup
-    maker
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.start_makers(120);
 
     info!("Initiating openswap (Will fail due to invalid fidelity timelock)");
 
@@ -73,8 +57,9 @@ fn fidelity_limit_violation() {
         .with_required_confirms(1);
 
     // Prepare the swap - it will fail
-    let err = taker
-        .prepare_swap(swap_params)
+    let err = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect_err("Swap should have failed due to NotEnoughMakersInOfferBook");
     assert!(
         matches!(err, TakerError::NotEnoughMakersInOfferBook),
@@ -85,9 +70,14 @@ fn fidelity_limit_violation() {
 
     // Discovery drops an out-of-range bond before the offerbook ever sees it,
     // so reach the maker the way a user would: poll it by address.
-    let address = format!("127.0.0.1:{}", maker.config.network_port);
+    let address = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    );
     assert!(
-        taker
+        world
+            .taker()
+            .inner()
             .fetch_offers()
             .unwrap()
             .all_makers()
@@ -98,7 +88,9 @@ fn fidelity_limit_violation() {
 
     // The range is measured from our own confirmation height, which an honest
     // bond can miss by confirming late, so it sidelines rather than bans.
-    let standing = taker
+    let standing = world
+        .taker()
+        .inner()
         .poll_maker(address)
         .expect("the poll must be recorded");
     assert!(
@@ -114,8 +106,8 @@ fn fidelity_limit_violation() {
     );
 
     info!("Shutting down maker to simulate restart with corrupted config");
-    maker.shutdown.store(true, Relaxed);
-    maker_thread.join().unwrap();
+    world.shutdown_makers();
+    let maker = world.makers()[0].inner();
 
     // Write the Maker config to disk so we can modify and reload it.
     // (The test framework creates makers with direct config, not from a file.)
@@ -157,6 +149,5 @@ fn fidelity_limit_violation() {
 
     info!("Fidelity Timelock violation test passed");
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }

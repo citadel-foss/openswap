@@ -295,6 +295,18 @@ impl World {
         self.attach_threads(threads);
     }
 
+    /// Starts maker `index`'s server alone, e.g. to bring makers up in stages.
+    pub fn spawn_maker(&mut self, index: usize) {
+        let maker = &mut self.makers[index];
+        assert!(maker.thread.is_none(), "maker server started twice");
+        maker.thread = spawn_makers(std::slice::from_ref(&maker.server)).pop();
+    }
+
+    /// [`wait_for_makers_setup`] on the first `count` makers.
+    pub fn wait_for_first_makers_setup(&self, count: usize, setup_timeout_secs: u64) {
+        wait_for_makers_setup(&self.servers()[..count], setup_timeout_secs);
+    }
+
     /// [`wait_for_makers_setup`] on every maker.
     pub fn wait_for_makers_setup(&self, setup_timeout_secs: u64) {
         wait_for_makers_setup(&self.servers(), setup_timeout_secs);
@@ -488,7 +500,7 @@ pub struct MakerHandle {
 
 impl MakerHandle {
     /// The maker server itself, for what the handle does not wrap.
-    pub fn inner(&self) -> &MakerServer {
+    pub fn inner(&self) -> &Arc<MakerServer> {
         &self.server
     }
 
