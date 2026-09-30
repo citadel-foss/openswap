@@ -59,7 +59,7 @@ This crate compiles into the following CLI binaries. Useful for integration test
 - **Nothing else to install:** it bundles its own Tor and defaults to a public Electrum server. You can point it at your own Bitcoin Core node instead.
 - **Same data as the CLI:** its wallet data works with the OpenSwap CLI apps too.
 
-Download a precompiled build from the [release page](https://github.com/citadel-foss/portal/releases), or build it from source. The [Portal README](https://github.com/citadel-foss/portal#getting-started) has the setup guide.
+Download a precompiled build from the [releases page](https://github.com/citadel-foss/portal/releases) if one exists for your system, or build it from source. The [demo doc](./docs/demo.md) walks through setup and a first swap.
 
 For swapping between on-chain BTC and the Lightning Network — including routed swaps that need no Lightning node of your own — see [lightning swaps](./docs/lightning.md).
 
