@@ -10,7 +10,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
 };
@@ -34,38 +34,24 @@ fn test_taproot_taker_abort1() {
     let taker_behavior = vec![TakerBehavior::CloseAtAckResponse];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    let taker_original_balance = world.fund_taker_default(3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
+    world.start_makers(120);
 
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup
-    sync_maker_wallets(&makers);
-
-    let _maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    let _maker_spendable_balance = world.verify_maker_pre_swap_balances();
     log::info!("Starting taproot taker abort1 test...");
 
     // Swap params for openswap (Taproot)
@@ -73,11 +59,11 @@ fn test_taproot_taker_abort1() {
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // Prepare should fail at AckResponse — the taker closes the connection
     // right after receiving AckSwapDetails, before any funding is broadcast.
-    let prepare_result = taker.prepare_swap(swap_params.clone());
+    let prepare_result = world.taker_mut().prepare(swap_params.clone());
     assert!(
         prepare_result.is_err(),
         "Prepare should fail due to CloseAtAckResponse behavior"
@@ -86,19 +72,20 @@ fn test_taproot_taker_abort1() {
         "Prepare failed as expected: {:?}",
         prepare_result.err().unwrap()
     );
-    taker.log_tracker_state();
+    world.taker().inner().log_tracker_state();
 
     // The accepted-but-unfunded swap must be dropped without requiring a restart.
-    let log_path = test_framework.taker_log_path();
+    let log_path = world.taker_log_path();
     wait_for_log(
         &log_path,
         "Released idle unfunded swap",
         Duration::from_secs(60),
     );
     let release_deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while makers
+    while world
+        .makers()
         .iter()
-        .any(|maker| maker.has_ongoing_swaps().unwrap())
+        .any(|maker| maker.inner().has_ongoing_swaps().unwrap())
     {
         assert!(
             std::time::Instant::now() < release_deadline,
@@ -112,7 +99,7 @@ fn test_taproot_taker_abort1() {
     // AckSwapDetails after storing a new reservation, and the taker only emits
     // the CloseAtAckResponse test error after receiving that ack — so hitting
     // that exact error proves the makers accepted the retry.
-    let retry_result = taker.prepare_swap(swap_params);
+    let retry_result = world.taker_mut().prepare(swap_params);
     let retry_err = format!(
         "{:?}",
         retry_result.expect_err("Retry should still abort at AckSwapDetails")
@@ -123,21 +110,17 @@ fn test_taproot_taker_abort1() {
         retry_err
     );
     assert!(
-        makers
+        world
+            .makers()
             .iter()
-            .any(|maker| maker.has_ongoing_swaps().unwrap()),
+            .any(|maker| maker.inner().has_ongoing_swaps().unwrap()),
         "Accepted retry should hold a fresh reservation on a maker"
     );
 
     // Sync taker wallet and verify balance
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.taker().sync();
 
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances = world.taker().balances();
 
     info!(
         "Taker balances after abort: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
@@ -174,11 +157,10 @@ fn test_taproot_taker_abort1() {
         balance_diff.to_sat(),
     );
 
-    taker.log_tracker_state();
+    world.taker().inner().log_tracker_state();
     info!("Taproot taker abort1 test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
