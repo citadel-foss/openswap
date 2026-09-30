@@ -1,15 +1,6 @@
-//! Malice test 1: Taker broadcasts contract transactions maliciously after full setup.
-//!
-//! Scenario:
-//! 1. Taker initiates a Legacy openswap with 2 makers.
-//! 2. Full setup completes (funding broadcast, contract sigs exchanged).
-//! 3. Taker broadcasts outgoing contract txs maliciously (BroadcastContractAfterFullSetup).
-//! 4. Swap fails. Makers detect the broadcast contracts and recover via timelock.
-//! 5. After recovery, verify: makers recovered funds (contract == 0, small fee loss).
-
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
 };
@@ -17,10 +8,7 @@ use openswap::{
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use std::{thread, time::Duration};
 
 /// Test: Taker maliciously broadcasts contract txs after full setup.
 ///
@@ -32,42 +20,22 @@ fn test_malice1_taker_broadcast_contract() {
     // ---- Setup ----
     warn!("Running Test: Malice1 - Taker Broadcasts Contract After Full Setup");
 
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::BroadcastContractAfterFullSetup];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
-
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
+        .takers([TakerBehavior::BroadcastContractAfterFullSetup])
+        .build();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    let taker_original_balance = world.fund_taker_default(3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
-    // Start the maker server threads
     log::info!("Starting Maker servers...");
+    world.start_makers(120);
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup
-    sync_maker_wallets(&makers);
-
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
     log::info!("Starting malice1 test...");
 
     // Swap params for openswap (Legacy)
@@ -75,19 +43,20 @@ fn test_malice1_taker_broadcast_contract() {
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // Prepare should succeed; execution should fail with BroadcastContractAfterFullSetup
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
         swap_result.is_err(),
         "Swap should fail due to BroadcastContractAfterFullSetup behavior"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
+    world.taker().log_tracker_state();
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -96,80 +65,53 @@ fn test_malice1_taker_broadcast_contract() {
     thread::sleep(Duration::from_secs(300));
 
     // Verify maker balances -- makers should have recovered their outgoing funds via timelock
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    let expected_regular = [14998419, 14998419];
+    for (i, (maker, original)) in world
+        .makers()
+        .iter()
+        .zip(maker_spendable_balance)
+        .enumerate()
+    {
+        maker.sync();
+        let balances = maker.balances();
         info!(
             "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i,
-            maker_balances.regular,
-            maker_balances.swap,
-            maker_balances.contract,
-            maker_balances.spendable,
+            i, balances.regular, balances.swap, balances.contract, balances.spendable,
         );
-        let expected_regular = [14998419u64, 14998419][i];
-        assert_eq!(
-            maker_balances.regular.to_sat(),
-            expected_regular,
-            "Maker {} regular balance mismatch",
-            i
-        );
-        assert_eq!(
-            maker_balances.swap.to_sat(),
-            0,
-            "Maker {} swap balance mismatch",
-            i
-        );
-        assert_eq!(
-            maker_balances.contract.to_sat(),
-            0,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
+        BalanceExpect {
+            regular: Some(Is::Sats(expected_regular[i])),
+            swap: Some(Is::Sats(0)),
+            contract: Some(Is::Sats(0)),
+            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
+            spendable: None,
+            delta: None,
+        }
+        .assert(&format!("Maker {i}"), &balances);
 
         // Makers lost some funds due to taker maliciously broadcasting contracts
-        let original = maker_spendable_balance[i];
         let maker_diff = original
-            .checked_sub(maker_balances.spendable)
+            .checked_sub(balances.spendable)
             .unwrap_or(Amount::ZERO);
         info!(
             "Maker {} lost {} sats (pre-swap: {}, current: {})",
             i,
             maker_diff.to_sat(),
             original,
-            maker_balances.spendable,
+            balances.spendable,
         );
     }
 
     // Wait for taker's background recovery loop to finish
     info!("Waiting for background recovery loop to complete...");
-    let recovery_timeout = Duration::from_secs(120);
-    let recovery_start = Instant::now();
-    while !taker.is_recovery_complete() {
-        if recovery_start.elapsed() > recovery_timeout {
-            panic!("Background recovery did not complete within timeout");
-        }
-        thread::sleep(Duration::from_secs(5));
-    }
+    world.taker().await_recovery(Duration::from_secs(120));
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet
-    generate_blocks(bitcoind, 1);
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.taker().sync();
 
     // Verify taker balance
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances = world.taker().balances();
 
     info!(
         "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
@@ -179,12 +121,16 @@ fn test_malice1_taker_broadcast_contract() {
         taker_balances.spendable,
     );
 
-    assert_eq!(
-        taker_balances.contract.to_sat(),
-        0,
-        "Taker contract balance mismatch"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
+    // Only the contract and fidelity balances are asserted here.
+    BalanceExpect {
+        regular: None,
+        swap: None,
+        contract: Some(Is::Sats(0)),
+        fidelity: Some(Is::Amount(Amount::ZERO)),
+        spendable: None,
+        delta: None,
+    }
+    .assert("Taker", &taker_balances);
 
     let balance_diff = taker_original_balance
         .checked_sub(taker_balances.spendable)
@@ -197,11 +143,9 @@ fn test_malice1_taker_broadcast_contract() {
         taker_balances.spendable,
     );
 
-    taker.log_tracker_state();
+    world.taker().log_tracker_state();
     info!("Malice1 test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
-
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
