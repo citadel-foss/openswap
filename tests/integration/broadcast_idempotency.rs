@@ -43,17 +43,23 @@ fn spend_once(taker: &Taker, bitcoind: &BitcoinD) -> (bitcoin::Txid, bitcoin::Tr
 }
 
 fn run_rebroadcast_unmined<B: TestBackend>() {
-    let (test_framework, mut takers, _makers, block_generation_handle) =
-        TestFramework::init::<B>(0, vec![TakerBehavior::Normal], vec![]);
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let world = World::builder::<B>()
+        .makers(0)
+        .takers(vec![TakerBehavior::Normal])
+        .build();
 
-    fund_taker_default(taker, bitcoind, 3);
-    let (txid, tx) = spend_once(taker, bitcoind);
+    world.fund_taker_default(3);
+    let (txid, tx) = spend_once(world.taker().inner(), world.bitcoind());
 
     // A duplicate of an unconfirmed tx is not an error on either backend:
     // both accept it and hand the txid back.
-    let reply = taker.get_wallet().read().unwrap().send_tx(&tx);
+    let reply = world
+        .taker()
+        .inner()
+        .get_wallet()
+        .read()
+        .unwrap()
+        .send_tx(&tx);
     info!("unmined rebroadcast reply: {reply:?}");
     assert_eq!(
         reply.unwrap(),
@@ -61,22 +67,27 @@ fn run_rebroadcast_unmined<B: TestBackend>() {
         "an unconfirmed rebroadcast must succeed and return the txid"
     );
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 fn run_rebroadcast_mined<B: TestBackend>(core_backend: bool) {
-    let (test_framework, mut takers, _makers, block_generation_handle) =
-        TestFramework::init::<B>(0, vec![TakerBehavior::Normal], vec![]);
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let world = World::builder::<B>()
+        .makers(0)
+        .takers(vec![TakerBehavior::Normal])
+        .build();
 
-    fund_taker_default(taker, bitcoind, 3);
-    let (_, tx) = spend_once(taker, bitcoind);
-    generate_blocks(bitcoind, 1);
-    test_framework.wait_for_electrs_tip();
+    world.fund_taker_default(3);
+    let (_, tx) = spend_once(world.taker().inner(), world.bitcoind());
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
 
-    let reply = taker.get_wallet().read().unwrap().send_tx(&tx);
+    let reply = world
+        .taker()
+        .inner()
+        .get_wallet()
+        .read()
+        .unwrap()
+        .send_tx(&tx);
     info!("mined rebroadcast reply: {reply:?}");
     let err = reply.expect_err("a confirmed duplicate must be rejected");
     if core_backend {
@@ -100,8 +111,7 @@ fn run_rebroadcast_mined<B: TestBackend>(core_backend: bool) {
         }
     }
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 #[test]

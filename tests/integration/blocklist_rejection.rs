@@ -11,7 +11,7 @@ use openswap::{
 
 use super::test_framework::*;
 
-use std::{sync::atomic::Ordering::Relaxed, thread};
+use std::thread;
 
 #[test]
 fn maker_rejects_legacy_funding_from_blocked_address() {
@@ -47,12 +47,15 @@ fn run_disabled_blocklist(protocol: ProtocolVersion) {
     let maker_count = 1;
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal];
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behaviors)
+        .build();
 
-    let blocked_taker_address = taker
+    let blocked_taker_address = world
+        .taker()
+        .inner()
         .get_wallet()
         .write()
         .unwrap()
@@ -60,20 +63,16 @@ fn run_disabled_blocklist(protocol: ProtocolVersion) {
         .unwrap();
     for _ in 0..3 {
         send_to_address(
-            bitcoind,
+            world.bitcoind(),
             &blocked_taker_address,
             Amount::from_btc(0.05).unwrap(),
         );
     }
-    generate_blocks(bitcoind, 1);
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.taker().sync();
 
-    let maker_deposit_address = makers[0]
+    let maker_deposit_address = world.makers()[0]
+        .inner()
         .wallet
         .write()
         .unwrap()
@@ -81,36 +80,28 @@ fn run_disabled_blocklist(protocol: ProtocolVersion) {
         .unwrap();
     for _ in 0..4 {
         send_to_address(
-            bitcoind,
+            world.bitcoind(),
             &maker_deposit_address,
             Amount::from_btc(0.05).unwrap(),
         );
     }
-    generate_blocks(bitcoind, 1);
-    makers[0]
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.makers()[0].sync();
 
-    taker
+    world
+        .taker()
+        .inner()
         .add_blocklist_entry(
             blocked_taker_address.to_string(),
             Some("disabled maker-side check".to_string()),
         )
         .unwrap();
 
-    let maker_threads = spawn_makers(&makers);
-    wait_for_makers_setup(&makers, 120);
-    makers[0]
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.start_makers_without_sync(120);
+    world.makers()[0].sync();
 
-    let maker_regular_utxos = makers[0]
+    let maker_regular_utxos = world.makers()[0]
+        .inner()
         .wallet
         .read()
         .unwrap()
@@ -121,7 +112,9 @@ fn run_disabled_blocklist(protocol: ProtocolVersion) {
         Network::Regtest,
     )
     .unwrap();
-    taker
+    world
+        .taker()
+        .inner()
         .add_blocklist_entry(
             blocked_maker_address.to_string(),
             Some("disabled taker-side check".to_string()),
@@ -131,67 +124,56 @@ fn run_disabled_blocklist(protocol: ProtocolVersion) {
     let params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
         .with_tx_count(1)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(params)
+    let summary = world
+        .taker_mut()
+        .prepare(params)
         .expect("prepare_swap should succeed");
-    taker
-        .start_swap(&summary.swap_id)
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("a populated blocklist must be ignored when checking is disabled");
 
-    drop(takers);
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|handle| handle.join().unwrap());
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 fn run_maker_rejection(protocol: ProtocolVersion) {
     let maker_count = 2;
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init_with_blocklist::<BitcoindBackend>(
-            maker_count,
-            taker_behaviors,
-            maker_behaviors,
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behaviors)
+        .check_blocklist()
+        .build();
 
     // Every spendable taker UTXO comes from this address, so whichever coins
     // funding selects must trigger the maker's source-address check.
-    let blocked_address = taker
+    let blocked_address = world
+        .taker()
+        .inner()
         .get_wallet()
         .write()
         .unwrap()
         .get_next_external_address(AddressType::P2TR)
         .unwrap();
     for _ in 0..3 {
-        send_to_address(bitcoind, &blocked_address, Amount::from_btc(0.05).unwrap());
+        send_to_address(
+            world.bitcoind(),
+            &blocked_address,
+            Amount::from_btc(0.05).unwrap(),
+        );
     }
-    generate_blocks(bitcoind, 1);
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.taker().sync();
     assert_eq!(
-        taker
-            .get_wallet()
-            .read()
-            .unwrap()
-            .get_balances()
-            .unwrap()
-            .regular,
+        world.taker().balances().regular,
         Amount::from_btc(0.15).unwrap()
     );
 
-    let outcome = taker
+    let outcome = world
+        .taker()
+        .inner()
         .add_blocklist_entry(
             blocked_address.to_string(),
             Some("integration test source".to_string()),
@@ -200,73 +182,52 @@ fn run_maker_rejection(protocol: ProtocolVersion) {
     assert_eq!(outcome.added, 1);
     assert_eq!(outcome.updated, 0);
 
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
-    let maker_threads = spawn_makers(&makers);
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    let maker_spendable_before = verify_maker_pre_swap_balances(&makers);
+    world.start_makers(120);
+    let maker_spendable_before = world.verify_maker_pre_swap_balances();
 
     let params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
         .with_tx_count(1)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(params)
+    let summary = world
+        .taker_mut()
+        .prepare(params)
         .expect("prepare_swap should succeed");
     assert!(
-        taker.start_swap(&summary.swap_id).is_err(),
+        world.taker_mut().start(&summary.swap_id).is_err(),
         "the first maker must reject funding from the blocked source address"
     );
 
-    for (maker, spendable_before) in makers.iter().zip(maker_spendable_before) {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
+    for (maker, spendable_before) in world.makers().iter().zip(maker_spendable_before) {
+        maker.sync();
         assert_eq!(
-            maker
-                .wallet
-                .read()
-                .unwrap()
-                .get_balances()
-                .unwrap()
-                .spendable,
+            maker.balances().spendable,
             spendable_before,
             "blocklist rejection must happen before maker liquidity is spent"
         );
     }
 
-    drop(takers);
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|handle| handle.join().unwrap());
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 fn run_taker_rejection(protocol: ProtocolVersion) {
     let maker_count = 1;
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal];
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init_with_blocklist::<BitcoindBackend>(
-            maker_count,
-            taker_behaviors,
-            maker_behaviors,
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behaviors)
+        .check_blocklist()
+        .build();
 
-    fund_taker_default(taker, bitcoind, 3);
+    world.fund_taker_default(3);
 
     // Reuse one maker address for the initial deposits. Fidelity setup later
     // consolidates them into the regular UTXO used for swap funding.
-    let maker_deposit_address = makers[0]
+    let maker_deposit_address = world.makers()[0]
+        .inner()
         .wallet
         .write()
         .unwrap()
@@ -274,41 +235,25 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
         .unwrap();
     for _ in 0..4 {
         send_to_address(
-            bitcoind,
+            world.bitcoind(),
             &maker_deposit_address,
             Amount::from_btc(0.05).unwrap(),
         );
     }
-    generate_blocks(bitcoind, 1);
-    makers[0]
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.makers()[0].sync();
     assert_eq!(
-        makers[0]
-            .wallet
-            .read()
-            .unwrap()
-            .get_balances()
-            .unwrap()
-            .regular,
+        world.makers()[0].balances().regular,
         Amount::from_btc(0.20).unwrap()
     );
 
-    let maker_threads = spawn_makers(&makers);
-    wait_for_makers_setup(&makers, 120);
-    makers[0]
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.start_makers_without_sync(120);
+    world.makers()[0].sync();
 
     // Fidelity creation spends the deposits above. Block the resulting
     // regular change UTXO, which is the actual input to maker swap funding.
-    let maker_regular_utxos = makers[0]
+    let maker_regular_utxos = world.makers()[0]
+        .inner()
         .wallet
         .read()
         .unwrap()
@@ -319,7 +264,9 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
         Network::Regtest,
     )
     .unwrap();
-    let outcome = taker
+    let outcome = world
+        .taker()
+        .inner()
         .add_blocklist_entry(
             blocked_address.to_string(),
             Some("integration test maker source".to_string()),
@@ -331,10 +278,11 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
     let params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
         .with_tx_count(1)
         .with_required_confirms(1);
-    let summary = taker
-        .prepare_swap(params)
+    let summary = world
+        .taker_mut()
+        .prepare(params)
         .expect("prepare_swap should succeed");
-    match taker.start_swap(&summary.swap_id) {
+    match world.taker_mut().start(&summary.swap_id) {
         Err(TakerError::Blocklist(BlocklistError::BlockedAddress { entry, .. })) => {
             assert_eq!(entry.address, blocked_address.to_string());
         }
@@ -347,14 +295,9 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
     // sweeps them back. Rejecting must not strand maker funds.
     thread::sleep(timelock_recovery_wait::<BitcoindBackend>());
 
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, maker) in world.makers().iter().enumerate() {
+        maker.sync();
+        let maker_balances = maker.balances();
         println!(
             "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
             i,
@@ -378,13 +321,5 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
         assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
     }
 
-    drop(takers);
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|handle| handle.join().unwrap());
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }

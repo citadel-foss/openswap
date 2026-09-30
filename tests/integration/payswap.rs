@@ -9,7 +9,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{MakerState, SwapParams, TakerBehavior},
     wallet::AddressType,
@@ -20,7 +20,6 @@ use bitcoind::bitcoincore_rpc::RpcApi;
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::thread;
 
 /// Taproot PaySwap with multiple final swapcoins (`tx_count = 3`), so the
 /// settlement splits the receiver amount across several exact outputs.
@@ -33,33 +32,22 @@ fn test_taproot_payswap() {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let taker_original_balance = world.fund_taker_default(3);
 
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
     log::info!("Starting Maker servers...");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
+    world.start_makers(120);
+    world.verify_maker_pre_swap_balances();
 
-    wait_for_makers_setup(&makers, 120);
-
-    sync_maker_wallets(&makers);
-    verify_maker_pre_swap_balances(&makers);
-
-    let receiver_address = bitcoind
+    let receiver_address = world
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
@@ -67,13 +55,13 @@ fn test_taproot_payswap() {
         .unwrap();
     let payment_amount = Amount::from_sat(500_000);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // A wrong-network receiver address must be rejected up front.
     let mainnet_address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
         .parse()
         .unwrap();
-    let wrong_network_result = taker.prepare_swap(
+    let wrong_network_result = world.taker_mut().prepare(
         SwapParams::new(ProtocolVersion::Taproot, payment_amount, 2)
             .with_tx_count(3)
             .with_required_confirms(1)
@@ -95,8 +83,9 @@ fn test_taproot_payswap() {
         .with_required_confirms(1)
         .with_payment_address(receiver_address.as_unchecked().clone());
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Failed to prepare Taproot payment swap");
 
     let quote = summary
@@ -120,14 +109,16 @@ fn test_taproot_payswap() {
         "gross route amount must cover the receiver amount, settlement budget, and maker fees"
     );
 
-    let report = taker
-        .start_swap(&summary.swap_id)
+    let report = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("Taproot payment swap should complete successfully");
 
     // ---- Verify the exact payment ----
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let received = bitcoind
+    let received = world
+        .bitcoind()
         .client
         .get_received_by_address(&receiver_address, Some(1))
         .unwrap();
@@ -167,13 +158,8 @@ fn test_taproot_payswap() {
     );
 
     // The taker must own no output of the settlement.
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    world.taker().sync();
+    let taker_balances = world.taker().balances();
     info!(
         "Taker balances after payment swap: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
         taker_balances.regular,
@@ -208,9 +194,8 @@ fn test_taproot_payswap() {
 
     info!("Taproot PaySwap test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// Legacy PaySwap: the settlement budget covers both contract publication and
@@ -225,33 +210,22 @@ fn test_legacy_payswap() {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let taker_original_balance = world.fund_taker_default(3);
 
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
     log::info!("Starting Maker servers...");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
+    world.start_makers(120);
+    world.verify_maker_pre_swap_balances();
 
-    wait_for_makers_setup(&makers, 120);
-
-    sync_maker_wallets(&makers);
-    verify_maker_pre_swap_balances(&makers);
-
-    let receiver_address = bitcoind
+    let receiver_address = world
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
@@ -259,15 +233,16 @@ fn test_legacy_payswap() {
         .unwrap();
     let payment_amount = Amount::from_sat(500_000);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, payment_amount, 2)
         .with_tx_count(1)
         .with_required_confirms(1)
         .with_payment_address(receiver_address.as_unchecked().clone());
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Failed to prepare Legacy payment swap");
     let quote = summary
         .payment
@@ -285,14 +260,16 @@ fn test_legacy_payswap() {
         "gross route amount must cover the receiver amount, settlement budget, and maker fees"
     );
 
-    let report = taker
-        .start_swap(&summary.swap_id)
+    let report = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("Legacy payment swap should complete successfully");
 
     // ---- Verify the exact payment ----
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let received = bitcoind
+    let received = world
+        .bitcoind()
         .client
         .get_received_by_address(&receiver_address, Some(1))
         .unwrap();
@@ -331,13 +308,8 @@ fn test_legacy_payswap() {
         "mining fee must be derived after excluding the receiver payment"
     );
 
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    world.taker().sync();
+    let taker_balances = world.taker().balances();
     assert_eq!(
         taker_balances.swap,
         Amount::ZERO,
@@ -360,9 +332,8 @@ fn test_legacy_payswap() {
 
     info!("Legacy PaySwap test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A payment below the dust floor times the declared `tx_count` ceiling must
@@ -373,7 +344,6 @@ fn test_legacy_payswap() {
 fn test_payswap_dust_floor_rejects_before_funding() {
     warn!("Running Test: PaySwap below the dust floor - refused at quote time");
 
-    let makers_config_map = vec![(9012, Some(19041))];
     let taker_behavior = vec![TakerBehavior::Normal];
     // Armed to refuse SwapDetails: if the dust check ever ran after walk_route,
     // the refusal error would replace the dust error and this test fails.
@@ -381,55 +351,41 @@ fn test_payswap_dust_floor_rejects_before_funding() {
 
     let fee_overrides = vec![None];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init_with_fee_overrides::<BitcoindBackend>(
-            makers_config_map,
-            fee_overrides,
-            taker_behavior,
-            maker_behaviors,
-        );
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(1)
+        .fee_overrides(fee_overrides)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let taker_original_balance = world.fund_taker_default(1);
 
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 1);
-
-    fund_makers(
-        &makers,
-        bitcoind,
-        2,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    world.fund_makers(2, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
 
     log::info!("Starting Maker server...");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-    wait_for_makers_setup(&makers, 120);
+    world.start_makers_without_sync(120);
 
-    let receiver_address = bitcoind
+    let receiver_address = world
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
         .require_network(bitcoin::Network::Regtest)
         .unwrap();
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // One sat below the 546 * 10 ceiling: ten settlement outputs could never
     // each clear dust. The refusal must come back from `prepare_swap` itself.
     let payment_amount = Amount::from_sat(5459);
-    let mempool_before = bitcoind.client.get_raw_mempool().unwrap();
-    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let mempool_before = world.bitcoind().client.get_raw_mempool().unwrap();
+    let maker_address = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
+    );
 
-    let dust_err = taker
-        .prepare_swap(
+    let dust_err = world
+        .taker_mut()
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, payment_amount, 1)
                 .with_tx_count(10)
                 .with_feerate(3)
@@ -448,21 +404,16 @@ fn test_payswap_dust_floor_rejects_before_funding() {
     // Nothing was negotiated, funded, or spent: the refusal precedes the
     // route, so the maker never hears about the swap.
     assert!(
-        !makers[0].has_ongoing_swaps().unwrap(),
+        !world.makers()[0].inner().has_ongoing_swaps().unwrap(),
         "the maker must not be negotiated for a refused quote"
     );
     assert_eq!(
-        bitcoind.client.get_raw_mempool().unwrap(),
+        world.bitcoind().client.get_raw_mempool().unwrap(),
         mempool_before,
         "a refused quote must not broadcast any funding transaction"
     );
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    world.taker().sync();
+    let taker_balances = world.taker().balances();
     assert_eq!(
         taker_balances.spendable, taker_original_balance,
         "a refused quote must not cost the taker anything"
@@ -470,9 +421,8 @@ fn test_payswap_dust_floor_rejects_before_funding() {
 
     info!("PaySwap dust-floor refusal test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// A PaySwap quote is bound to its selected makers. Negotiation failure must
@@ -481,46 +431,46 @@ fn test_payswap_dust_floor_rejects_before_funding() {
 fn test_payswap_negotiation_guards_abort_before_funding() {
     warn!("Running Test: PaySwap negotiation guards abort before funding");
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            2,
-            vec![
-                TakerBehavior::Normal,
-                TakerBehavior::AlterPaymentQuoteBeforeNegotiation,
-            ],
-            vec![MakerBehavior::CloseAfterAckResponse, MakerBehavior::Normal],
-        );
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .maker_behaviors(vec![
+            MakerBehavior::CloseAfterAckResponse,
+            MakerBehavior::Normal,
+        ])
+        .takers(vec![
+            TakerBehavior::Normal,
+            TakerBehavior::AlterPaymentQuoteBeforeNegotiation,
+        ])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    for taker in &mut takers {
-        fund_taker_default(taker, bitcoind, 1);
+    for i in 0..world.takers().len() {
+        world.fund_nth_taker_default(i, 1);
     }
-    fund_makers(
-        &makers,
-        bitcoind,
-        2,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
+    world.fund_makers(2, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
+
+    world.start_makers(120);
+    world.mine(1);
+
+    let failing_maker = format!(
+        "127.0.0.1:{}",
+        world.makers()[0].inner().config.network_port
     );
-
-    let maker_threads = spawn_makers(&makers);
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-    generate_blocks(bitcoind, 1);
-
-    let failing_maker = format!("127.0.0.1:{}", makers[0].config.network_port);
-    let spare_maker = format!("127.0.0.1:{}", makers[1].config.network_port);
+    let spare_maker = format!(
+        "127.0.0.1:{}",
+        world.makers()[1].inner().config.network_port
+    );
     let payment_amount = Amount::from_sat(100_000);
-    let mempool_before = bitcoind.client.get_raw_mempool().unwrap();
+    let mempool_before = world.bitcoind().client.get_raw_mempool().unwrap();
 
-    let receiver = bitcoind
+    let receiver = world
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
         .require_network(bitcoin::Network::Regtest)
         .unwrap();
-    let negotiation_err = takers[0]
-        .prepare_swap(
+    let negotiation_err = world.takers_mut()[0]
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, payment_amount, 1)
                 .with_required_confirms(1)
                 .with_preferred_makers(vec![failing_maker, spare_maker.clone()])
@@ -533,13 +483,17 @@ fn test_payswap_negotiation_guards_abort_before_funding() {
         negotiation_err
     );
     assert!(
-        !makers[1].has_ongoing_swaps().unwrap(),
+        !world.makers()[1].inner().has_ongoing_swaps().unwrap(),
         "the spare maker must not be negotiated"
     );
 
     // The quoted maker closed a connection. Refusing to substitute it is a
     // routing decision, not a verdict, so neither maker may be blamed.
-    let standings = takers[0].fetch_offers().unwrap().all_makers();
+    let standings = world.takers()[0]
+        .inner()
+        .fetch_offers()
+        .unwrap()
+        .all_makers();
     for standing in &standings {
         assert!(
             !matches!(standing.state, MakerState::Banned(_)),
@@ -549,14 +503,15 @@ fn test_payswap_negotiation_guards_abort_before_funding() {
         );
     }
 
-    let receiver = bitcoind
+    let receiver = world
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
         .require_network(bitcoin::Network::Regtest)
         .unwrap();
-    let repricing_err = takers[1]
-        .prepare_swap(
+    let repricing_err = world.takers_mut()[1]
+        .prepare(
             SwapParams::new(ProtocolVersion::Taproot, payment_amount, 1)
                 .with_required_confirms(1)
                 .with_preferred_makers(vec![spare_maker])
@@ -569,12 +524,11 @@ fn test_payswap_negotiation_guards_abort_before_funding() {
         repricing_err
     );
     assert_eq!(
-        bitcoind.client.get_raw_mempool().unwrap(),
+        world.bitcoind().client.get_raw_mempool().unwrap(),
         mempool_before,
         "negotiation guards must abort before any funding transaction is broadcast"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }

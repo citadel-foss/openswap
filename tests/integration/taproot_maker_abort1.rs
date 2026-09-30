@@ -6,7 +6,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
 };
@@ -14,7 +14,6 @@ use openswap::{
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::thread;
 
 /// Test: Not enough makers for Taproot swap.
 ///
@@ -33,38 +32,24 @@ fn test_taproot_maker_abort1() {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    let taker_original_balance = world.fund_taker_default(3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
     // Start the maker server threads
     log::info!("Starting Maker servers...");
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
+    world.start_makers(120);
 
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup
-    sync_maker_wallets(&makers);
-
-    let _maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    let _maker_spendable_balance = world.verify_maker_pre_swap_balances();
     log::info!("Starting Taproot maker abort1 test (not enough makers)...");
 
     // Swap params: Taproot, requires 2 makers but only 1 is available
@@ -72,10 +57,10 @@ fn test_taproot_maker_abort1() {
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // prepare_swap should FAIL because only 1 maker is available for a 2-maker swap
-    let prepare_result = taker.prepare_swap(swap_params);
+    let prepare_result = world.taker_mut().prepare(swap_params);
     assert!(
         prepare_result.is_err(),
         "prepare_swap should fail because only 1 maker is available for a 2-maker swap"
@@ -86,14 +71,9 @@ fn test_taproot_maker_abort1() {
     );
 
     // Sync taker wallet and verify balance is unchanged
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.taker().sync();
 
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances = world.taker().balances();
 
     info!(
         "Taker balances after failed prepare: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
@@ -118,8 +98,7 @@ fn test_taproot_maker_abort1() {
 
     info!("Taproot maker abort1 test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
