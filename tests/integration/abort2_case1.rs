@@ -6,141 +6,42 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior, MakerServer},
+    maker::MakerBehavior,
     protocol::common_messages::{MakerToTakerMessage, ProtocolVersion},
-    taker::{MakerState, SwapParams, SwapSummary, Taker, TakerBehavior},
+    taker::{MakerState, SwapParams, SwapSummary, TakerBehavior},
 };
 
-use super::test_framework::*;
+use super::{
+    scenarios::spare_maker::{complete_with_spare, SpareMakerExpect},
+    test_framework::*,
+};
 
 use log::{info, warn};
-use std::{
-    fs,
-    sync::Arc,
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
-};
+use std::{fs, thread, time::Duration};
 
 #[test]
 fn maker_abort2_case1() {
     warn!("Running Test: Maker drops before sending sender's sigs. Taker continues with spare.");
 
-    let maker_count = 3;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![
-        MakerBehavior::Normal,
-        MakerBehavior::CloseAtReqContractSigsForSender,
-        MakerBehavior::Normal,
-    ];
-
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-
-    // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
-
-    // Start the maker server threads
-    log::info!("Starting Maker servers...");
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup to ensure fidelity bonds are accounted for
-    sync_maker_wallets(&makers);
-
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
-
-    // Swap params for openswap (Legacy)
-    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
-
-    generate_blocks(bitcoind, 1);
-
-    // Prepare and execute the swap — taker should retry with the spare maker
-    let summary = taker
-        .prepare_swap(swap_params)
-        .expect("Failed to prepare openswap");
-    taker
-        .start_swap(&summary.swap_id)
-        .expect("Swap should succeed with spare maker");
-
-    // Sync wallets and verify results
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-
-    generate_blocks(bitcoind, 1);
-
-    sync_maker_wallets(&makers);
-
-    // Verify taker balance
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
-
-    info!(
-        "Taker balance: original={}, after={}",
-        taker_original_balance, taker_balances.spendable
+    let mut world = complete_with_spare(
+        ProtocolVersion::Legacy,
+        [
+            MakerBehavior::Normal,
+            MakerBehavior::CloseAtReqContractSigsForSender,
+            MakerBehavior::Normal,
+        ],
+        "Failed to prepare openswap",
+        &SpareMakerExpect {
+            taker_spendable: 14995985,
+            maker_spendable: [15000415, 14999757, 15000378],
+        },
     );
-
-    assert_eq!(
-        taker_balances.spendable.to_sat(),
-        14995985,
-        "Taker spendable balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.contract.to_sat(),
-        0,
-        "Taker contract balance mismatch"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-
-    // Verify makers earned fees (only the two that participated)
-    for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
-        info!(
-            "Maker {} balances: original={}, after={}",
-            i, original, balances.spendable
-        );
-        let expected_spendable = [15000415, 14999757, 15000378][i];
-        assert_eq!(
-            balances.spendable.to_sat(),
-            expected_spendable,
-            "Maker {} spendable balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.contract.to_sat(),
-            0,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-    }
 
     // Maker 1 dropped the connection. We cannot tell its failure from our own
     // link failing, so nothing about it may be recorded as its fault.
-    let standings = taker.fetch_offers().unwrap().all_makers();
-    for maker in &makers {
-        let address = format!("127.0.0.1:{}", maker.config.network_port);
+    let standings = world.taker().inner().fetch_offers().unwrap().all_makers();
+    for maker in world.makers() {
+        let address = format!("127.0.0.1:{}", maker.inner().config.network_port);
         if let Some(standing) = standings.iter().find(|m| m.address.to_string() == address) {
             assert!(
                 !matches!(standing.state, MakerState::Banned(_)),
@@ -152,9 +53,8 @@ fn maker_abort2_case1() {
     }
 
     info!("maker_abort2_case1 completed successfully!");
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// Maker 0 has to re-plan its funding, then rebuild it for the spare's keys
@@ -209,62 +109,40 @@ fn rebuild_after_replan_uses_the_claimed_coins() {
 }
 
 /// The setup all three heterogeneous-route tests share: funded makers with
-/// per-maker fee overrides and a prepared 2-hop Legacy route.
-#[allow(clippy::type_complexity)]
+/// per-maker fee overrides and a prepared 2-hop Legacy route. Returns the
+/// world, the taker's funding, the makers' pre-swap spendable balances and
+/// the prepared swap.
 fn heterogeneous_route_setup(
     fee_overrides: Vec<Option<MakerFeeOverride>>,
     maker_behaviors: Vec<MakerBehavior>,
-) -> (
-    Arc<TestFramework>,
-    Vec<Taker>,
-    Vec<Arc<MakerServer>>,
-    JoinHandle<()>,
-    Vec<JoinHandle<()>>,
-    Amount,
-    Vec<Amount>,
-    SwapSummary,
-) {
-    let makers_config_map = (0..maker_behaviors.len() as u16)
-        .map(|i| (6102 + i * 10000, None))
-        .collect::<Vec<_>>();
+) -> (World, Amount, Vec<Amount>, SwapSummary) {
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_behaviors.len())
+        .fee_overrides(fee_overrides)
+        .maker_behaviors(maker_behaviors)
+        .takers([TakerBehavior::Normal])
+        .build();
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init_with_fee_overrides::<BitcoindBackend>(
-            makers_config_map,
-            fee_overrides,
-            vec![TakerBehavior::Normal],
-            maker_behaviors,
-        );
+    let taker_original_balance = world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.start_makers(120);
 
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = spawn_makers(&makers);
-    wait_for_makers_setup(&makers, 120);
-
-    sync_maker_wallets(&makers);
-
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Failed to prepare openswap");
 
     (
-        test_framework,
-        takers,
-        makers,
-        block_generation_handle,
-        maker_threads,
+        world,
         taker_original_balance,
         maker_spendable_balance,
         summary,
@@ -307,43 +185,38 @@ fn heterogeneous_substitution_aborts_without_cascade() {
         MakerBehavior::Normal,
     ];
 
-    let (
-        test_framework,
-        mut takers,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        taker_original_balance,
-        maker_spendable_balance,
-        summary,
-    ) = heterogeneous_route_setup(fee_overrides, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let (mut world, taker_original_balance, maker_spendable_balance, summary) =
+        heterogeneous_route_setup(fee_overrides, maker_behaviors);
 
     // Route order follows the maker index (ports ascend), so hop 0 is the
     // dropper and hop 1 is the downstream maker that must never be re-negotiated.
     assert_eq!(summary.makers.len(), 2, "route should have 2 makers");
     assert!(
-        summary.makers[0]
-            .address
-            .ends_with(&format!(":{}", makers[0].config.network_port)),
+        summary.makers[0].address.ends_with(&format!(
+            ":{}",
+            world.makers()[0].inner().config.network_port
+        )),
         "hop 0 should be maker0 (the dropper), got {}",
         summary.makers[0].address
     );
     assert!(
-        summary.makers[1]
-            .address
-            .ends_with(&format!(":{}", makers[1].config.network_port)),
+        summary.makers[1].address.ends_with(&format!(
+            ":{}",
+            world.makers()[1].inner().config.network_port
+        )),
         "hop 1 should be maker1 (downstream), got {}",
         summary.makers[1].address
     );
 
     // Baseline: hop 1 admitted these exact terms; a replay is still accepted.
-    let downstream_details = taker
+    let downstream_details = world
+        .taker()
+        .inner()
         .test_current_swap_details(1)
         .expect("downstream swap details should rebuild");
-    match taker
+    match world
+        .taker()
+        .inner()
         .test_resend_swap_details(1)
         .expect("baseline resend should get an answer")
     {
@@ -356,14 +229,15 @@ fn heterogeneous_substitution_aborts_without_cascade() {
 
     // maker0 drops; the spare prices hop 0 differently, so its derived next
     // hop cannot match what hop 1 admitted. The swap aborts on the shape check.
-    let err = taker
-        .start_swap(&summary.swap_id)
+    let err = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect_err("swap must abort on the spare shape mismatch");
     info!("Swap aborted as expected: {:?}", err);
 
     // Snapshot once: assert_log echoes its needle into the same file, which
     // would poison the substitution count.
-    let taker_log = test_framework.taker_log_path();
+    let taker_log = world.taker_log_path();
     let taker_log_contents = fs::read_to_string(&taker_log).unwrap();
     assert!(
         taker_log_contents
@@ -395,7 +269,7 @@ fn heterogeneous_substitution_aborts_without_cascade() {
     assert!(
         taker_log_contents.contains(&format!(
             "[{}] Accepting swap",
-            makers[3].config.network_port
+            world.makers()[3].inner().config.network_port
         )),
         "the cheaper maker3 spare must be selected first"
     );
@@ -409,7 +283,9 @@ fn heterogeneous_substitution_aborts_without_cascade() {
     );
 
     // Hop 1 still honors the originally admitted terms after the abort.
-    match taker
+    match world
+        .taker()
+        .inner()
         .test_send_swap_details(&summary.makers[1].address, &downstream_details)
         .expect("post-abort resend should get an answer")
     {
@@ -421,15 +297,15 @@ fn heterogeneous_substitution_aborts_without_cascade() {
     }
 
     // Nothing reached the chain: every maker keeps its pre-swap balance.
-    generate_blocks(bitcoind, 1);
-    for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    world.mine(1);
+    for (i, (maker, original)) in world
+        .makers()
+        .iter()
+        .zip(maker_spendable_balance)
+        .enumerate()
+    {
+        maker.sync();
+        let balances = maker.balances();
         info!(
             "Maker {} balances: original={}, after={}",
             i, original, balances.spendable
@@ -442,13 +318,8 @@ fn heterogeneous_substitution_aborts_without_cascade() {
         assert_eq!(balances.contract, Amount::ZERO);
     }
 
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    world.taker().sync();
+    let taker_balances = world.taker().balances();
     info!(
         "Taker balance: original={}, after={}",
         taker_original_balance, taker_balances.spendable
@@ -460,9 +331,8 @@ fn heterogeneous_substitution_aborts_without_cascade() {
     assert_eq!(taker_balances.contract, Amount::ZERO);
 
     info!("heterogeneous_substitution_aborts_without_cascade completed successfully!");
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// Heterogeneous offers, last hop: the cheap maker in the last slot drops at
@@ -497,38 +367,29 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing() {
         MakerBehavior::Normal,
     ];
 
-    let (
-        test_framework,
-        mut takers,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        taker_original_balance,
-        maker_spendable_balance,
-        summary,
-    ) = heterogeneous_route_setup(fee_overrides, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let (mut world, taker_original_balance, maker_spendable_balance, summary) =
+        heterogeneous_route_setup(fee_overrides, maker_behaviors);
 
     // Route order follows the maker index (ports ascend): hop 1 is the cheap
     // dropper; the expensive spare waits in the pool.
     assert_eq!(summary.makers.len(), 2, "route should have 2 makers");
     assert!(
-        summary.makers[1]
-            .address
-            .ends_with(&format!(":{}", makers[1].config.network_port)),
+        summary.makers[1].address.ends_with(&format!(
+            ":{}",
+            world.makers()[1].inner().config.network_port
+        )),
         "hop 1 should be maker1 (the cheap dropper), got {}",
         summary.makers[1].address
     );
 
-    let err = taker
-        .start_swap(&summary.swap_id)
+    let err = world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect_err("swap must abort on the last-hop price guard");
     info!("Swap aborted as expected: {:?}", err);
 
     // Snapshot once: assert_log echoes its needle into the same file.
-    let taker_log = test_framework.taker_log_path();
+    let taker_log = world.taker_log_path();
     let taker_log_contents = fs::read_to_string(&taker_log).unwrap();
     assert!(
         taker_log_contents.contains("sats where the failed maker forwarded"),
@@ -548,25 +409,12 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing() {
     info!("Waiting for the taker's timelock recovery...");
     thread::sleep(Duration::from_secs(300));
 
-    let recovery_timeout = Duration::from_secs(120);
-    let recovery_start = Instant::now();
-    while !taker.is_recovery_complete() {
-        assert!(
-            recovery_start.elapsed() <= recovery_timeout,
-            "Background recovery did not complete within timeout"
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
+    world.taker().await_recovery(Duration::from_secs(120));
 
-    generate_blocks(bitcoind, 1);
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.mine(1);
+    world.taker().sync();
 
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances = world.taker().balances();
     let balance_diff = taker_original_balance
         .checked_sub(taker_balances.spendable)
         .unwrap_or(Amount::ZERO);
@@ -588,14 +436,14 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing() {
 
     // No maker broadcast anything: the drop fired before the taker relayed
     // combined sigs, so every maker returns to its pre-swap balance.
-    for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, (maker, original)) in world
+        .makers()
+        .iter()
+        .zip(maker_spendable_balance)
+        .enumerate()
+    {
+        maker.sync();
+        let balances = maker.balances();
         info!(
             "Maker {} balances after recovery: original={}, after={}",
             i, original, balances.spendable
@@ -611,9 +459,8 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing() {
     }
 
     info!("last_hop_expensive_spare_aborts_instead_of_repricing completed successfully!");
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
 
 /// Same drop at the last hop, but the spare prices the hop identically to the
@@ -644,25 +491,15 @@ fn last_hop_equal_priced_spare_completes() {
         MakerBehavior::Normal,
     ];
 
-    let (
-        test_framework,
-        mut takers,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        taker_original_balance,
-        maker_spendable_balance,
-        summary,
-    ) = heterogeneous_route_setup(fee_overrides, maker_behaviors);
+    let (mut world, taker_original_balance, maker_spendable_balance, summary) =
+        heterogeneous_route_setup(fee_overrides, maker_behaviors);
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    taker
-        .start_swap(&summary.swap_id)
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
         .expect("Swap with an equally priced spare must complete");
 
-    let taker_log = test_framework.taker_log_path();
+    let taker_log = world.taker_log_path();
     let taker_log_contents = fs::read_to_string(&taker_log).unwrap();
     assert_eq!(
         taker_log_contents
@@ -676,18 +513,13 @@ fn last_hop_equal_priced_spare_completes() {
         "the price guard must not fire for an equally priced spare"
     );
 
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.taker().sync();
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    sync_maker_wallets(&makers);
+    world.sync_makers();
 
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances = world.taker().balances();
     info!(
         "Taker balance: original={}, after={}",
         taker_original_balance, taker_balances.spendable
@@ -704,8 +536,13 @@ fn last_hop_equal_priced_spare_completes() {
     // maker0 and maker2 (the spare) ran the route; maker1 dropped before
     // funding anything and keeps its pre-swap balance. Pinned from a real run:
     // hop 0 earns the default schedule, the spare earns the cheap one.
-    for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, (maker, original)) in world
+        .makers()
+        .iter()
+        .zip(maker_spendable_balance)
+        .enumerate()
+    {
+        let balances = maker.balances();
         info!(
             "Maker {} balances: original={}, after={}",
             i, original, balances.spendable
@@ -722,7 +559,6 @@ fn last_hop_equal_priced_spare_completes() {
     }
 
     info!("last_hop_equal_priced_spare_completes completed successfully!");
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }
