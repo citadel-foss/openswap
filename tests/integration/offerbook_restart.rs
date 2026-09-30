@@ -17,7 +17,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     taker::{Taker, TakerBehavior},
     wallet::AddressType,
 };
@@ -46,41 +46,31 @@ fn test_offerbook_removal_survives_restart() {
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    fund_makers(
-        &makers,
-        &test_framework.bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2TR,
-    );
+    world.fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
 
     info!("Starting Maker servers...");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
+    world.start_makers_without_sync(120);
 
-    wait_for_makers_setup(&makers, 120);
-
-    let maker_addrs: Vec<String> = makers
+    let maker_addrs: Vec<String> = world
+        .makers()
         .iter()
-        .map(|m| format!("127.0.0.1:{}", m.config.network_port))
+        .map(|m| format!("127.0.0.1:{}", m.inner().config.network_port))
         .collect();
 
     // ---- 1. Discover both makers into the offerbook ----
-    let taker = takers.remove(0);
+    // The taker is dropped and reopened below, so it leaves the world here.
+    let taker = world.take_taker();
     taker
+        .inner()
         .sync_offerbook_and_wait()
         .expect("initial offerbook sync");
-    let listed = listed_addresses(&taker);
+    let listed = listed_addresses(taker.inner());
     assert!(
         maker_addrs.iter().all(|a| listed.contains(a)),
         "both makers must be discovered, got {:?}",
@@ -90,18 +80,18 @@ fn test_offerbook_removal_survives_restart() {
     // ---- 2. Kill the relay, remove maker 0, persist by dropping the taker ----
     // The relay goes first: with it up, the periodic sync re-upserts a removed
     // maker within milliseconds and the drop would persist the wrong book.
-    test_framework.kill_relay();
+    world.framework().kill_relay();
     // The sync service can evict the entry as the relay goes down, in which
     // case remove_maker correctly reports false. What must hold is its absence.
-    taker.remove_maker(maker_addrs[0].clone()).unwrap();
+    taker.inner().remove_maker(maker_addrs[0].clone()).unwrap();
     assert!(
-        !listed_addresses(&taker).contains(&maker_addrs[0]),
+        !listed_addresses(taker.inner()).contains(&maker_addrs[0]),
         "maker must be absent before restart"
     );
     drop(taker);
 
     // ---- 3. Restart with the relay still down ----
-    let restarted = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
+    let restarted = Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0))
         .expect("restarted taker should open the same data dir");
     // Give the startup sync time to fail against the dead relay, so a pass
     // here cannot be credited to a sync that merely had not run yet.
@@ -127,7 +117,13 @@ fn test_offerbook_removal_survives_restart() {
         .iter()
         .filter_map(|m| m.offer.as_ref().map(|o| o.name.clone()))
         .collect();
-    assert_eq!(names, [format!("maker{}", makers[1].config.network_port)]);
+    assert_eq!(
+        names,
+        [format!(
+            "maker{}",
+            world.makers()[1].inner().config.network_port
+        )]
+    );
 
     // ---- 4b. A direct poll rediscovers the removed maker without a relay ----
     restarted
@@ -141,13 +137,10 @@ fn test_offerbook_removal_survives_restart() {
     );
 
     // ---- 5. A corrupted book is reset and rewritten ----
-    let book_path = test_framework
-        .temp_dir
-        .join("taker1")
-        .join("offerbook.json");
+    let book_path = world.temp_dir().join("taker1").join("offerbook.json");
     drop(restarted);
     std::fs::write(&book_path, b"not json").unwrap();
-    let after_corruption = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
+    let after_corruption = Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0))
         .expect("taker should start over a corrupted offerbook");
     let listed = listed_addresses(&after_corruption);
     assert!(
@@ -162,10 +155,12 @@ fn test_offerbook_removal_survives_restart() {
         raw
     );
 
-    shutdown_makers(&makers, maker_threads);
+    // The world drops the last taker at teardown, before stopping the framework.
+    world.adopt_taker(after_corruption);
+
+    world.shutdown_makers();
 
     info!("Offerbook restart test completed successfully!");
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }

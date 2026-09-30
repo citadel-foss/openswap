@@ -289,6 +289,17 @@ impl World {
         sync_maker_wallets(&servers);
     }
 
+    /// [`spawn_makers`] on every maker, without waiting for their setup.
+    pub fn spawn_makers(&mut self) {
+        let threads = spawn_makers(&self.servers());
+        self.attach_threads(threads);
+    }
+
+    /// [`wait_for_makers_setup`] on every maker.
+    pub fn wait_for_makers_setup(&self, setup_timeout_secs: u64) {
+        wait_for_makers_setup(&self.servers(), setup_timeout_secs);
+    }
+
     /// [`spawn_makers`] then [`wait_for_makers_setup`]: [`World::start_makers`]
     /// without its wallet sync.
     pub fn start_makers_without_sync(&mut self, setup_timeout_secs: u64) {
@@ -361,6 +372,39 @@ impl World {
             .filter_map(|maker| Some((maker.server.clone(), maker.thread.take()?)))
             .unzip();
         shutdown_makers(&servers, threads);
+    }
+
+    /// Joins every started maker's thread without signalling shutdown, for a
+    /// maker expected to exit on its own; propagates a maker thread's panic.
+    pub fn join_makers(&mut self) {
+        for maker in &mut self.makers {
+            if let Some(thread) = maker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    /// Drops every taker now, e.g. before restarting the makers or the taker
+    /// itself from its config.
+    pub fn drop_takers(&mut self) {
+        drop(mem::take(&mut self.takers));
+    }
+
+    /// Hands a taker the test built (e.g. restarted from its config) to the
+    /// world, which then drops it at teardown like any other taker.
+    pub fn adopt_taker(&mut self, taker: Taker) {
+        self.takers.push(TakerHandle { taker });
+    }
+
+    /// Hands maker servers the test built (e.g. restarted from their configs)
+    /// to the world, unstarted; the world then shuts them down at teardown
+    /// like any other maker.
+    pub fn adopt_makers(&mut self, servers: impl IntoIterator<Item = Arc<MakerServer>>) {
+        self.makers
+            .extend(servers.into_iter().map(|server| MakerHandle {
+                server,
+                thread: None,
+            }));
     }
 
     /// Drops every maker, releasing its server, for a test that restarts a
