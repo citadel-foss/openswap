@@ -1,157 +1,36 @@
-//! Integration test: Taproot timelock recovery - Maker drops at contract sigs exchange.
-//!
-//! Route: Taker -> Maker1 (Normal) -> Maker2 (CloseAtContractSigsExchange) -> Taker
-//!
-//! Scenario:
-//! 1. Taker initiates a Taproot openswap with 2 makers.
-//! 2. Funding transactions are broadcast and confirmed.
-//! 3. Maker2 drops the connection at the taproot contract sigs exchange phase.
-//! 4. Taker detects the failure and calls `recover_active_swap()`.
-//! 5. Everyone falls back to timelock recovery.
-//! 6. After blocks mature, verify: taker recovered funds (minus fees), no contract balance.
-
-use bitcoin::{Amount, Sequence, Txid};
+use bitcoin::{Sequence, Txid};
 use bitcoind::bitcoincore_rpc::RpcApi;
-use openswap::{
-    maker::{start_server, MakerBehavior},
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{maker::MakerBehavior, protocol::common_messages::ProtocolVersion};
 
-use super::test_framework::*;
+use super::scenarios::maker_abort::{MakerAbort, MakerAbortExpect};
 
-use log::{info, warn};
-use std::{
-    fs, thread,
-    time::{Duration, Instant},
-};
+use log::warn;
+use std::fs;
 
 /// Test: Maker drops at taproot contract sigs exchange. Recovery via timelock.
 #[test]
 fn test_taproot_timelock_recovery() {
-    // ---- Setup ----
     warn!("Running Test: Taproot Timelock Recovery - CloseAtContractSigsExchange");
 
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![
-        MakerBehavior::Normal,
+    let abort = MakerAbort::fail_swap(
+        ProtocolVersion::Taproot,
         MakerBehavior::CloseAtContractSigsExchange,
-    ];
-
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-
-    // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
-
-    // Start the maker server threads
-    log::info!("Starting Maker servers...");
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup
-    sync_maker_wallets(&makers);
-
-    // Use post-fidelity, pre-swap balances as the correct baseline
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
-    log::info!("Starting Taproot timelock recovery test...");
-
-    // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
+        "Swap should fail due to Maker2 closing at contract sigs exchange",
     );
-
-    // Swap params for openswap (Taproot)
-    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
-
-    generate_blocks(bitcoind, 1);
-
-    // Prepare should succeed; execution should fail because Maker2 drops at contract sigs exchange
-    let summary = taker
-        .prepare_swap(swap_params)
-        .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
-    assert!(
-        swap_result.is_err(),
-        "Swap should fail due to Maker2 closing at contract sigs exchange"
-    );
-    info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
-    let outgoing_coins = taker
+    let outgoing_coins = abort
+        .world()
+        .taker()
+        .inner()
         .get_wallet()
         .read()
         .unwrap()
         .get_outgoing_swapcoins_count();
     assert!(outgoing_coins > 1, "the batch check needs several refunds");
-
-    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-    // 5 blocks/3s; remaining ~105s is scheduling margin.
-    info!("Waiting for makers to timeout and blocks to mature timelocks...");
-    thread::sleep(Duration::from_secs(300));
-
-    // Verify maker balances after recovery
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
-        info!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i,
-            maker_balances.regular,
-            maker_balances.swap,
-            maker_balances.contract,
-            maker_balances.spendable,
-        );
-        assert_eq!(
-            maker_balances.contract,
-            Amount::ZERO,
-            "Maker {} should have no contract balance after recovery",
-            i
-        );
-    }
-
-    info!("Makers shut down. Waiting for background recovery loop to complete...");
-
-    // The background recovery loop (spawned by recover_active_swap) periodically
-    // retries timelock recovery. Wait for it to finish.
-    let recovery_timeout = Duration::from_secs(120);
-    let recovery_start = Instant::now();
-    while !taker.is_recovery_complete() {
-        if recovery_start.elapsed() > recovery_timeout {
-            panic!("Background recovery did not complete within timeout");
-        }
-        thread::sleep(Duration::from_secs(5));
-    }
-    info!("Background recovery loop completed.");
+    abort.recover();
 
     // An underpriced recovery must stay replaceable, so it has to signal RBF.
-    let taker_log = fs::read_to_string(test_framework.taker_log_path()).unwrap();
+    let world = abort.world();
+    let taker_log = fs::read_to_string(world.taker_log_path()).unwrap();
     let recovery_txids: Vec<Txid> = taker_log
         .lines()
         .filter_map(|line| {
@@ -164,7 +43,11 @@ fn test_taproot_timelock_recovery() {
         "no timelock recovery in the taker log"
     );
     for txid in recovery_txids {
-        let tx = bitcoind.client.get_raw_transaction(&txid, None).unwrap();
+        let tx = world
+            .bitcoind()
+            .client
+            .get_raw_transaction(&txid, None)
+            .unwrap();
         assert!(tx
             .input
             .iter()
@@ -175,7 +58,13 @@ fn test_taproot_timelock_recovery() {
     // them all. Waiting per coin would record one refund per pass.
     let taker_wallet = format!(
         "Wallet: {} |",
-        taker.get_wallet().read().unwrap().get_name()
+        world
+            .taker()
+            .inner()
+            .get_wallet()
+            .read()
+            .unwrap()
+            .get_name()
     );
     let refunded = format!("| Refunded: {outgoing_coins} |");
     assert!(
@@ -186,104 +75,12 @@ fn test_taproot_timelock_recovery() {
         outgoing_coins
     );
 
-    // Mine a block to confirm recovery txs, then sync wallet
-    generate_blocks(bitcoind, 1);
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-
-    // Verify taker balance
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
-
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
-    assert_eq!(
-        taker_balances.regular.to_sat(),
-        14999118,
-        "Taker regular balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.swap.to_sat(),
-        0,
-        "Taker swap balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.contract.to_sat(),
-        0,
-        "Taker contract balance mismatch"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-
-    let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
-        .unwrap_or(Amount::ZERO);
-
-    info!(
-        "Taker balance diff: {} sats (original: {}, current: {})",
-        balance_diff.to_sat(),
-        taker_original_balance,
-        taker_balances.spendable,
-    );
-
-    assert_eq!(
-        balance_diff.to_sat(),
-        882,
-        "Taker spendable balance change mismatch"
-    );
-
-    // Verify maker balances
-    for (i, maker) in makers.iter().enumerate() {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
-        let original = maker_spendable_balance[i];
-
-        info!(
-            "Maker {} balance diff: pre-swap: {}, current: {}",
-            i, original, maker_balances.spendable,
-        );
-
-        let expected_regular = [14998875, 14999757];
-        assert_eq!(
-            maker_balances.regular.to_sat(),
-            expected_regular[i],
-            "Maker {} regular balance mismatch",
-            i
-        );
-        assert_eq!(
-            maker_balances.swap.to_sat(),
-            0,
-            "Maker {} swap balance mismatch",
-            i
-        );
-        assert_eq!(
-            maker_balances.contract.to_sat(),
-            0,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
-    }
-
-    taker.log_tracker_state();
-    info!("Taproot timelock recovery test completed successfully!");
-
-    shutdown_makers(&makers, maker_threads);
-
-    tracker_logger.stop();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    abort.assert_recovered(&MakerAbortExpect {
+        taker_regular: 14999118,
+        taker_swap: 0,
+        taker_loss: 882,
+        maker_regular: [14998875, 14999757],
+        maker_swap: [0, 0],
+        maker_spendable: None,
+    });
 }
