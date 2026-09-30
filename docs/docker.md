@@ -33,8 +33,6 @@ graph TD
     tor_vol["tor-data"]
     maker_vol["maker-data"]
     
-    network["openswap-network"]
-    
     makerd <-->|"RPC calls <br> (on bitcoind rpc-port)"| bitcoind
     makerd -->|SOCKS proxy| tor
     makerd -->|Control commands| tor
@@ -43,18 +41,15 @@ graph TD
     tor --> tor_vol
     makerd --> maker_vol
     
-    bitcoind --> network
-    tor --> network
-    makerd --> network
-    
     style bitcoind fill:#f9a825
     style tor fill:#7d4698
     style makerd fill:#3498db
-    style network fill:#e8f4f
     style bitcoin_vol fill:#ecf0f
     style tor_vol fill:#ecf0f
     style maker_vol fill:#fcf0f
 ```
+
+All three containers share your host network. Bitcoind RPC and ZMQ and the Tor ports listen only on `127.0.0.1`.
 
 The Docker setup uses:
 
@@ -110,7 +105,10 @@ The setup script will prompt for:
 3. **Service Ports**:
    - Makerd RPC port (default: 6103)
 
-Configuration is saved to `.docker-config` and reused on subsequent runs.
+4. **Maker Wallet**:
+   - Wallet passphrase. The maker wallet is always encrypted, so makerd needs it on every start.
+
+Configuration is saved to `.docker-config` and reused on subsequent runs. The file holds your RPC password and wallet passphrase, so the script makes it readable only by you.
 
 ## Building Docker Images
 
@@ -127,7 +125,7 @@ cd openswap
 ./docker-setup build-bitcoin
 
 # Or build manually
-docker build -f docker/Dockerfile -t openswap:latest .
+docker build -f docker/Dockerfile -t openswap/openswap:latest .
 ```
 
 ### Available Images
@@ -150,7 +148,7 @@ docker run -d \
   --name openswap-makerd \
   --network host \
   -v openswap-maker-data:/home/openswap/.openswap \
-  openswap:latest makerd \
+  openswap/openswap:latest makerd \
     -r 127.0.0.1:38332 \
     -a user:password \
     -p <wallet-passphrase>
@@ -189,8 +187,8 @@ Run taker operations:
 # Or manually
 docker run --rm -it \
   -v openswap-taker-data:/home/openswap/.openswap \
-  --network openswap-network \
-  openswap:latest taker --help
+  --network host \
+  openswap/openswap:latest taker --help
 ```
 
 ## Docker Compose Setup
@@ -238,5 +236,5 @@ docker compose logs -f makerd-internal
 ./docker-setup shell
 
 # or manually
-docker run --rm -it openswap:latest sh
+docker run --rm -it openswap/openswap:latest sh
 ```

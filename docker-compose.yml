@@ -3,14 +3,9 @@ services:
     image: openswap/${BITCOIN_IMAGE_NAME:-bitcoin-mutinynet}:${BITCOIN_TAG:-latest}
     container_name: openswap-bitcoind
     profiles: ["internal-bitcoind"]
-    command: >
-      bitcoind 
-      ${BITCOIN_NETWORK_ARG}
-      -rpcbind=0.0.0.0
-      -rpcallowip=0.0.0.0/0
-    ports:
-      - "${BITCOIN_RPC_PORT:-38332}:${BITCOIN_RPC_PORT:-38332}"
-      - "${BITCOIN_ZMQ_PORT:-28332}:${BITCOIN_ZMQ_PORT:-28332}"
+    # Host network, like makerd, so RPC and ZMQ stay on 127.0.0.1 exactly as docs/bitcoin.conf sets them.
+    network_mode: "host"
+    command: bitcoind ${BITCOIN_NETWORK_ARG}
     volumes:
       - bitcoin-data:/home/bitcoin/.bitcoin
       - ./docs/bitcoin.conf:/home/bitcoin/.bitcoin/bitcoin.conf:ro
@@ -34,8 +29,8 @@ services:
         
         # use /tmp/torrc because the container runs as non-root and cannot write to /etc/tor/
         cat > /tmp/torrc << EOF
-        SocksPort 0.0.0.0:$${TOR_SOCKS_PORT:-9050}
-        ControlPort 0.0.0.0:$${TOR_CONTROL_PORT:-9051}
+        SocksPort 127.0.0.1:$${TOR_SOCKS_PORT:-9050}
+        ControlPort 127.0.0.1:$${TOR_CONTROL_PORT:-9051}
         DataDirectory /var/lib/tor
         HashedControlPassword $$HASH
         EOF
@@ -76,7 +71,6 @@ services:
         tor_auth_password = "$${TOR_AUTH_PASSWORD}"
         fidelity_amount = $${FIDELITY_AMOUNT:-50000}
         fidelity_timelock = $${FIDELITY_TIMELOCK:-13104}
-        connection_type = "TOR"
         base_fee = $${BASE_FEE:-500}
         amount_relative_fee_pct = $${AMOUNT_RELATIVE_FEE_PCT:-0.0025}
         time_relative_fee_pct = $${TIME_RELATIVE_FEE_PCT:-0.0001}
@@ -85,9 +79,9 @@ services:
         WALLET_NAME="$${BITCOIN_WALLET_NAME:-openswap-maker}"
         echo "INFO: Using wallet: $$WALLET_NAME"
 
-        echo "[DEBUG] Running: makerd -t \"$${TOR_AUTH_PASSWORD}\" -r $${BITCOIN_RPC_HOST} -a $${BITCOIN_RPC_AUTH} $${MAKERD_EXTRA_ARGS} -w \"$$WALLET_NAME\""
+        echo "[DEBUG] Running: makerd -r $${BITCOIN_RPC_HOST} -z $${BITCOIN_ZMQ_ADDR} -w \"$$WALLET_NAME\""
 
-        makerd -t "$${TOR_AUTH_PASSWORD}" -r $${BITCOIN_RPC_HOST} -a $${BITCOIN_RPC_AUTH} $${MAKERD_EXTRA_ARGS} -w "$$WALLET_NAME"
+        exec makerd -t "$${TOR_AUTH_PASSWORD}" -r $${BITCOIN_RPC_HOST} -z $${BITCOIN_ZMQ_ADDR} -a $${BITCOIN_RPC_AUTH} -w "$$WALLET_NAME" -p "$${WALLET_PASSPHRASE}"
     ports:
       - "${MAKERD_RPC_PORT:-6103}:${MAKERD_RPC_PORT:-6103}"
     volumes:
@@ -106,7 +100,8 @@ services:
       - TIME_RELATIVE_FEE_PCT=${TIME_RELATIVE_FEE_PCT:-0.0001}
       - BITCOIN_RPC_HOST=${BITCOIN_RPC_HOST}
       - BITCOIN_RPC_AUTH=${BITCOIN_RPC_AUTH:-user:password}
-      - MAKERD_EXTRA_ARGS=${MAKERD_EXTRA_ARGS}
+      - BITCOIN_ZMQ_ADDR=${BITCOIN_ZMQ_ADDR}
+      - WALLET_PASSPHRASE=${WALLET_PASSPHRASE}
       - BITCOIN_WALLET_NAME=${BITCOIN_WALLET_NAME:-openswap-maker}
     restart: unless-stopped
 

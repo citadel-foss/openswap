@@ -59,7 +59,7 @@ BITCOIN_RPC_USER="$BITCOIN_RPC_USER"
 BITCOIN_RPC_PASSWORD="$BITCOIN_RPC_PASSWORD"
 MAKERD_PORT="$MAKERD_PORT"
 MAKERD_RPC_PORT="$MAKERD_RPC_PORT"
-USE_TAPROOT="$USE_TAPROOT"
+WALLET_PASSPHRASE="$WALLET_PASSPHRASE"
 TOR_SOCKS_PORT="$TOR_SOCKS_PORT"
 TOR_CONTROL_PORT="$TOR_CONTROL_PORT"
 TOR_AUTH_PASSWORD="$TOR_AUTH_PASSWORD"
@@ -69,6 +69,7 @@ EXTERNAL_BITCOIND_HOST="$EXTERNAL_BITCOIND_HOST"
 EXTERNAL_TOR_HOST="$EXTERNAL_TOR_HOST"
 BITCOIN_WALLET_NAME="$BITCOIN_WALLET_NAME"
 EOF
+    chmod 600 "$CONFIG_FILE"
     print_success "Configuration saved to $CONFIG_FILE"
 }
 
@@ -111,7 +112,6 @@ setup_env() {
     BITCOIN_RPC_PASSWORD="${BITCOIN_RPC_PASSWORD:-$DEFAULT_RPC_PASSWORD}"
     MAKERD_PORT="${MAKERD_PORT:-$DEFAULT_MAKERD_PORT}"
     MAKERD_RPC_PORT="${MAKERD_RPC_PORT:-$DEFAULT_MAKERD_RPC_PORT}"
-    USE_TAPROOT="${USE_TAPROOT:-true}"
     TOR_SOCKS_PORT="${TOR_SOCKS_PORT:-$DEFAULT_TOR_SOCKS_PORT}"
     TOR_CONTROL_PORT="${TOR_CONTROL_PORT:-$DEFAULT_TOR_CONTROL_PORT}"
     TOR_AUTH_PASSWORD="${TOR_AUTH_PASSWORD:-$DEFAULT_TOR_AUTH}"
@@ -138,18 +138,13 @@ setup_env() {
     export TOR_SOCKS_PORT
     export TOR_CONTROL_PORT
     export BITCOIN_WALLET_NAME
+    export WALLET_PASSPHRASE
     
     export BITCOIN_NETWORK_ARG=""
     if [[ "$BITCOIN_NETWORK" == "signet" ]]; then
         export BITCOIN_NETWORK_ARG="-signet=1"
     else
         export BITCOIN_NETWORK_ARG="-regtest=1"
-    fi
-    
-    # makerd args
-    export MAKERD_EXTRA_ARGS=""
-    if [[ "$USE_TAPROOT" == "true" ]]; then
-        export MAKERD_EXTRA_ARGS="--taproot"
     fi
     
     # profiles and hosts
@@ -171,6 +166,7 @@ setup_env() {
     fi
     
     export TOR_AUTH_PASSWORD
+    export BITCOIN_ZMQ_ADDR="tcp://${BITCOIN_RPC_HOST%:*}:${BITCOIN_ZMQ_PORT}"
     export COMPOSE_PROFILES="${profiles%,}"
 }
 
@@ -256,6 +252,14 @@ select_bitcoin_wallet() {
     fi
 }
 
+# The maker wallet is always encrypted, so makerd needs a passphrase to create or open it.
+prompt_wallet_passphrase() {
+    while [ -z "$WALLET_PASSPHRASE" ]; do
+        read -s -p "Maker wallet passphrase: " WALLET_PASSPHRASE
+        echo ""
+    done
+}
+
 configure_setup() {
     echo ""
     print_info "OpenSwap Docker Configuration"
@@ -270,7 +274,7 @@ configure_setup() {
     
     echo ""
     echo "Select Bitcoin network:"
-    echo "1) Mutinynet (signet - default)"
+    echo "1) OpenSwap custom signet (default)"
     echo "2) Regtest (local testing)"
     read -p "Network [1]: " network_choice
     
@@ -430,25 +434,7 @@ configure_setup() {
     MAKERD_RPC_PORT="${makerd_rpc:-$DEFAULT_MAKERD_RPC_PORT}"
     
     echo ""
-    echo "Select Swap Type:"
-    echo ""
-    echo "  1) Taproot (Recommended New Protocol)"
-    echo "     - Contract Tx with [Musig2 + Taproot HTLC]. Cheaper swap fees, more private. "
-    echo ""
-    echo "  2) Legacy (Original Atomic Swap Protocol)"
-    echo "     - Contract Tx with [2of2 Multisig + P2WSH HTLC]. Higher swap fees, less private."
-    echo -e "${YELLOW}NOTE:${NC}"
-    echo -e "${YELLOW}  Currently, a maker can only perform Legacy or Taproot swaps, but cannot perform both.${NC}"
-    echo -e "${YELLOW}  Although it can handle both taproot and legacy transactions for regular wallet operations.${NC}" 
-    echo -e "${YELLOW}  If you wanna serve both types of swap in the market, run two separate makers of each type.${NC}" 
-    echo -e "${YELLOW}  You can use the existing bitcoind Docker sockets for the second maker too to avoid multiple node IBD.${NC}"
-    read -p "Selected Option [1]: " swap_type
-
-    if [[ "${swap_type:-1}" == "1" ]]; then
-        USE_TAPROOT="true"
-    else
-        USE_TAPROOT="false"
-    fi
+    prompt_wallet_passphrase
     
     echo ""
     print_info "Configuration Summary"
@@ -473,7 +459,6 @@ configure_setup() {
     echo "Tor Auth Password: $TOR_AUTH_PASSWORD"
     echo "Makerd Port: $MAKERD_PORT"
     echo "Makerd RPC Port: $MAKERD_RPC_PORT"
-    echo "Use Taproot: $USE_TAPROOT"
     echo ""
     
     read -p "Save this configuration? [Y/n]: " save_config_prompt
@@ -501,7 +486,7 @@ build_image() {
     print_info "Building OpenSwap Docker image..."
     cd "$SCRIPT_DIR"
     
-    if docker build -f docker/Dockerfile -t "${IMAGE_NAME}:latest" .; then
+    if docker build -f docker/Dockerfile -t "openswap/${IMAGE_NAME}:latest" .; then
         print_success "OpenSwap image built successfully"
     else
         print_error "Failed to build OpenSwap image"
@@ -528,8 +513,8 @@ build_bitcoin_image() {
         --build-arg FILENAME_ARM64="$f_arm64" \
         --build-arg SHA256_ARM64="$s_arm64" \
         -f docker/Dockerfile.bitcoin-mutinynet \
-        -t "${BITCOIN_IMAGE_NAME}:${tag}" \
-        -t "${BITCOIN_IMAGE_NAME}:latest" .; then
+        -t "openswap/${BITCOIN_IMAGE_NAME}:${tag}" \
+        -t "openswap/${BITCOIN_IMAGE_NAME}:latest" .; then
             print_success "Bitcoin Mutinynet image built successfully"
         else
             print_error "Failed to build Bitcoin Mutinynet image"
@@ -569,6 +554,7 @@ start_stack() {
         fi
     fi
     
+    prompt_wallet_passphrase
     setup_env
     
     print_info "Starting OpenSwap stack with docker-compose..."
@@ -594,7 +580,8 @@ start_stack() {
         docker compose ps
         echo ""
         
-        wait_for_ibd_complete
+        # A fresh regtest node reports initial sync until its first block, which never comes on its own.
+        [[ "$BITCOIN_NETWORK" == "regtest" ]] || wait_for_ibd_complete
         
         start_makerd
     else
@@ -697,16 +684,15 @@ start_makerd() {
         echo -e "Ensure you have enough Swap Liquidity to participate in the market."
         echo -e ""
         echo -e "If the maker server starts successfully, you will see a log like below:"
-        echo -e "  [6102] Taproot maker setup completed"
-        echo -e "  [6102] Taproot swap liquidity: 49540 sats, 0 ongoing swaps"
-        echo -e "  [6102] RPC socket binding successful at 127.0.0.1:6103"
+        echo -e "  [6102] Server setup complete! Listening on port 6102"
+        echo -e "  [6103] RPC socket binding successful at 127.0.0.1:6103"
         echo -e ""
         echo -e "Press Ctrl+C to stop watching logs (this will keep the maker server running in the background)."
-        echo -e "To restart makerd later, run: ./docker-setup.sh restart"
-        echo -e "To view logs later, run: ./docker-setup.sh logs [service] or docker compose logs -f [service]"
-        echo -e "To show all logs, run: ./docker-setup.sh logs"
-        echo -e "To stop the stack, run: ./docker-setup.sh stop"
-        echo -e "Show all available commands: ./docker-setup.sh help"
+        echo -e "To restart makerd later, run: ./docker-setup restart"
+        echo -e "To view logs later, run: ./docker-setup logs [service] or docker compose logs -f [service]"
+        echo -e "To show all logs, run: ./docker-setup logs"
+        echo -e "To stop the stack, run: ./docker-setup stop"
+        echo -e "Show all available commands: ./docker-setup help"
         echo -e "${YELLOW}==============================================================${NC}"
         echo ""
 
@@ -723,7 +709,13 @@ run_command() {
     local cmd="$1"
     shift
     setup_env
-    docker run --rm -it --network openswap-network "${IMAGE_NAME}:latest" "$cmd" "$@"
+    local tty="-i"
+    [ -t 0 ] && tty="-it"
+    case "$cmd" in
+        maker-cli) docker exec $tty openswap-makerd maker-cli "$@" ;;
+        bitcoin-cli) docker exec $tty openswap-bitcoind bitcoin-cli $BITCOIN_NETWORK_ARG "$@" ;;
+        *) docker run --rm $tty --network host "openswap/${IMAGE_NAME}:latest" "$cmd" "$@" ;;
+    esac
 }
 
 show_help() {
@@ -741,7 +733,7 @@ show_help() {
     echo "  stop             Stop the OpenSwap stack"
     echo "  restart          Restart the OpenSwap stack"
     echo "  logs [service]   Show logs (optionally for specific service)"
-    echo "                   Services: bitcoind, tor, makerd"
+    echo "                   Services: bitcoind, tor, makerd-internal (makerd with your own Tor)"
     echo "  status           Show status of running services"
     echo "  shell            Open shell in a new container"
     echo ""
@@ -755,8 +747,8 @@ show_help() {
     echo "  $0 build"
     echo "  $0 start"
     echo "  $0 taker --help"
-    echo "  $0 maker-cli ping"
-    echo "  $0 logs makerd"
+    echo "  $0 maker-cli send-ping"
+    echo "  $0 logs makerd-internal"
 }
 
 case "${1:-}" in
@@ -793,7 +785,7 @@ case "${1:-}" in
     ;;
     "shell")
         setup_env
-        docker run --rm -it --network openswap-network "openswap/${IMAGE_NAME}:latest" /bin/sh
+        docker run --rm -it --network host "openswap/${IMAGE_NAME}:latest" /bin/sh
     ;;
     "makerd"|"maker-cli"|"taker"|"bitcoin-cli")
         run_command "$@"
