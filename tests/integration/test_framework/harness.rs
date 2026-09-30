@@ -21,6 +21,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{atomic::Ordering::Relaxed, Arc},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use bitcoin::Amount;
@@ -40,6 +41,7 @@ use super::{
     },
     backend::TestBackend,
     procs::bitcoind::generate_blocks,
+    tracker::{spawn_tracker_logger, TrackerLoggerHandle},
     world::TestFramework,
 };
 
@@ -208,9 +210,38 @@ impl World {
         verify_maker_pre_swap_balances(&self.servers())
     }
 
+    /// Syncs each maker in turn and asserts its contract balance is zero: it
+    /// recovered every contract it held.
+    #[track_caller]
+    pub fn assert_makers_contract_zero(&self) {
+        for (i, maker) in self.makers.iter().enumerate() {
+            maker.sync();
+            let balances = maker.balances();
+            log::info!(
+                "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+                i,
+                balances.regular,
+                balances.swap,
+                balances.contract,
+                balances.spendable,
+            );
+            assert_eq!(
+                balances.contract,
+                Amount::ZERO,
+                "Maker {} should have no contract balance after recovery",
+                i
+            );
+        }
+    }
+
     /// Mines `n` blocks.
     pub fn mine(&self, n: u64) {
         generate_blocks(self.bitcoind(), n);
+    }
+
+    /// [`spawn_tracker_logger`] over the first taker's data dir, `taker1`.
+    pub fn spawn_tracker_logger(&self, interval: Duration) -> TrackerLoggerHandle {
+        spawn_tracker_logger(self.temp_dir().join("taker1"), interval)
     }
 
     /// [`shutdown_makers`] on every started maker: signal all, then join all,
@@ -332,9 +363,27 @@ pub struct TakerHandle {
 
 impl TakerHandle {
     /// The taker itself, for what the handle does not wrap.
-    #[allow(dead_code)] // for log_tracker_state / is_recovery_complete in the abort-recovery bodies
+    #[allow(dead_code)] // first used by the Electrum abort tests
     pub fn inner(&self) -> &Taker {
         &self.taker
+    }
+
+    /// [`Taker::log_tracker_state`].
+    pub fn log_tracker_state(&self) {
+        self.taker.log_tracker_state();
+    }
+
+    /// Polls [`Taker::is_recovery_complete`] every 5s, panicking once
+    /// `timeout` has passed without it.
+    #[track_caller]
+    pub fn await_recovery(&self, timeout: Duration) {
+        let start = Instant::now();
+        while !self.taker.is_recovery_complete() {
+            if start.elapsed() > timeout {
+                panic!("Background recovery did not complete within timeout");
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
     }
 
     /// Syncs the taker's wallet against the backend and saves it.

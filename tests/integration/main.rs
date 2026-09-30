@@ -66,6 +66,7 @@ mod lightning_swap_out;
 mod offerbook_restart;
 mod offerbook_sync_race;
 mod rejection;
+mod scenarios;
 mod taker_cli;
 mod taker_restart_recovery;
 mod utxo_behavior;
