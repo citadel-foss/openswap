@@ -1,0 +1,14 @@
+# nextest profiles for the test suite.
+#
+# Integration tests spawn bitcoind, a nostr relay and (on Electrum) electrs per
+# test, and the abort-recovery tests wait out timelocks, so many run for several
+# minutes. `slow-timeout` only flags them; nothing is killed by it.
+
+[profile.default]
+slow-timeout = "3m"
+
+# CI runs the suite in 20 partitions; a partition that takes an hour is hung.
+# Selected with NEXTEST_PROFILE=ci (cargo llvm-cov keeps --profile for itself).
+[profile.ci]
+global-timeout = "1h"
+slow-timeout = "3m"
