@@ -209,6 +209,16 @@ impl CoreRPC {
         Ok(self.rpc.get_block_header_info(block_hash)?.height as u64)
     }
 
+    /// The node's `incrementalrelayfee` in sat/vB: what a replacement must
+    /// add over the tx it replaces. `None` when the node does not report one.
+    pub(crate) fn incremental_relay_feerate(&self) -> Result<Option<f64>, WalletError> {
+        Ok(self
+            .rpc
+            .get_mempool_info()?
+            .incremental_relay_fee
+            .map(|per_kvb| per_kvb.to_sat() as f64 / 1000.0))
+    }
+
     pub(crate) fn spending_transaction(
         &self,
         outpoint: &OutPoint,

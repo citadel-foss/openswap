@@ -403,6 +403,19 @@ enum ContractChainState {
     NotYet,
 }
 
+/// True when `replacement_fee` beats `pending_fee` by what a node asks of a
+/// replacement: `increment_rate` sat/vB over the replacement's own size.
+fn outbids(
+    pending_fee: Amount,
+    replacement_fee: Amount,
+    replacement_vsize: u64,
+    increment_rate: f64,
+) -> bool {
+    fee_at_rate_sats(replacement_vsize, increment_rate)
+        .and_then(|increment| pending_fee.checked_add(Amount::from_sat(increment)))
+        .is_some_and(|needed| replacement_fee >= needed)
+}
+
 fn recovery_address_or_else<F>(
     stored: Option<Address<NetworkUnchecked>>,
     create: F,
@@ -1009,9 +1022,13 @@ impl Wallet {
                     .get_tx_out(&contract_txid, contract_vout, Some(true))?
                     .is_none()
             {
-                if let Some(pending) = Self::pending_own_recovery(chain, swapcoin)? {
-                    return Ok(ContractChainState::RecoveryPending(pending));
-                }
+                return Ok(match Self::pending_own_recovery(chain, swapcoin)? {
+                    Some(pending) => ContractChainState::RecoveryPending(pending),
+                    // The other side's claim is in the mempool. A refund would
+                    // conflict with it, and would give up our incoming claim
+                    // for a swap that is settling by hashlock.
+                    None => ContractChainState::NotYet,
+                });
             }
             return Ok(ContractChainState::OnChain);
         }
@@ -1258,12 +1275,13 @@ impl Wallet {
     }
 
     /// Replaces our unconfirmed recovery once the current feerates outbid it by
-    /// the relay increment a replacement must add (BIP125). Returns the
+    /// the increment the backend asks of a replacement. Returns the
     /// replacement's txid, or `None` when the pending tx stays.
     ///
-    /// The replacement pays the pending tx's script, so a bump never burns an
-    /// address. It goes through the same fee ladder and dust cap as a first
-    /// recovery.
+    /// The replacement pays the coin's stored recovery address and goes through
+    /// the same fee ladder and dust cap as a first recovery. `pending` comes
+    /// from the backend, which vouches for nothing about an unconfirmed tx: it
+    /// only sets the fee to beat, never where the refund goes.
     fn replace_underpriced_recovery(
         chain: &AnyBlockchain,
         swapcoin: &super::swapcoin::OutgoingSwapCoin,
@@ -1271,6 +1289,13 @@ impl Wallet {
         fee_rates: &[f64],
     ) -> Option<Txid> {
         let pending_txid = pending.compute_txid();
+        // Saved and network-checked before the first refund went out. A coin
+        // without one never sent a refund of ours, so there is nothing to bump.
+        let script_pubkey = swapcoin
+            .recovery_address
+            .as_ref()?
+            .assume_checked_ref()
+            .script_pubkey();
         let contract_value = swapcoin
             .contract_tx
             .output
@@ -1279,16 +1304,15 @@ impl Wallet {
         let fee_of = |tx: &Transaction| {
             contract_value.checked_sub(tx.output.iter().map(|output| output.value).sum())
         };
-        let replacement = Self::create_timelock_recovery_tx(
-            swapcoin,
-            fee_rates,
-            pending.output.first()?.script_pubkey.clone(),
-        )
-        .inspect_err(|e| log::warn!("Failed to reprice recovery {}: {:?}", pending_txid, e))
-        .ok()?;
-        let vsize = contract_and_timelock_vsize(swapcoin.protocol, SpendKind::Timelock);
-        let increment = Amount::from_sat(fee_at_rate_sats(vsize, MIN_RELAY_FEE_RATE)?);
-        if fee_of(&replacement)? < fee_of(pending)?.checked_add(increment)? {
+        let replacement = Self::create_timelock_recovery_tx(swapcoin, fee_rates, script_pubkey)
+            .inspect_err(|e| log::warn!("Failed to reprice recovery {}: {:?}", pending_txid, e))
+            .ok()?;
+        if !outbids(
+            fee_of(pending)?,
+            fee_of(&replacement)?,
+            replacement.vsize() as u64,
+            chain.replacement_increment_rate(),
+        ) {
             return None;
         }
         match chain.send_raw_transaction(&replacement) {
@@ -1309,6 +1333,50 @@ impl Wallet {
                 None
             }
         }
+    }
+
+    /// True once every first-maker hop of `swap_id` went back by a confirmed
+    /// timelock refund.
+    ///
+    /// The first maker learns the preimage only from a spend of its own
+    /// outgoing: the first hops, all at the one locktime we gave it. Once each
+    /// went back by timelock, our outgoing is left dangling.
+    fn first_maker_refunded(
+        wallet: &std::sync::RwLock<Wallet>,
+        chain: &AnyBlockchain,
+        swap_id: &str,
+    ) -> Result<bool, WalletError> {
+        let hops = lock_debug!(wallet.read())
+            .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?
+            .store
+            .watchonly_swapcoins
+            .get(swap_id)
+            .cloned()
+            .unwrap_or_default();
+        let timelock = |hop: &WatchOnlySwapCoin| {
+            contract_timelock(
+                hop.protocol,
+                Some(&hop.contract_redeemscript),
+                hop.timelock_script.as_deref(),
+            )
+        };
+        let first_maker_lock = hops.first().and_then(timelock);
+        if first_maker_lock.is_none() {
+            return Ok(false);
+        }
+        for hop in hops.iter().filter(|hop| timelock(hop) == first_maker_lock) {
+            let outpoint = hop.contract_outpoint();
+            let refunded = match hop.contract_tx.output.get(outpoint.vout as usize) {
+                Some(output) => chain
+                    .confirmed_spending_transaction(&outpoint, &output.script_pubkey)?
+                    .is_some_and(|tx| hop.is_timelock_spend(&tx)),
+                None => false,
+            };
+            if !refunded {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Attempt to recover timelocked outgoing swapcoins.
@@ -1462,10 +1530,14 @@ impl Wallet {
                     // Our refund is out but stuck. A replacement is waited on like
                     // a first broadcast; an unreplaced one is recorded once mined.
                     ContractChainState::RecoveryPending(pending) => {
-                        // A swap we claim by hashlock no longer races for its
-                        // refund, so that refund gets no higher bid.
-                        if swapcoin.swap_id.as_deref().is_some_and(claimed_by_hashlock) {
-                            return Ok(());
+                        // While the first maker can still claim by hashlock, the
+                        // swap settles that way and its refund gets no higher bid.
+                        if let Some(id) = swapcoin.swap_id.as_deref() {
+                            if claimed_by_hashlock(id)
+                                && !Self::first_maker_refunded(wallet, chain, id)?
+                            {
+                                return Ok(());
+                            }
                         }
                         let fee_rates = fee_rates.get_or_insert_with(|| chain.recovery_feerates());
                         if let Some(txid) = Self::replace_underpriced_recovery(
@@ -1520,41 +1592,10 @@ impl Wallet {
                     Err(e) => return Err(e),
                 }
 
-                // The first maker learns the preimage only from a spend of its own
-                // outgoing: the first hops, all at the one locktime we gave it.
-                // Once each went back by timelock, our outgoing is left dangling.
                 let claimed = swapcoin.swap_id.as_deref().is_some_and(claimed_by_hashlock);
                 let proven = swapcoin.swap_id.as_deref().is_some_and(claim_proven);
                 if let Some(swap_id) = swapcoin.swap_id.as_deref().filter(|_| claimed) {
-                    let hops = lock_debug!(wallet.read())
-                        .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?
-                        .store
-                        .watchonly_swapcoins
-                        .get(swap_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let timelock = |hop: &WatchOnlySwapCoin| {
-                        contract_timelock(
-                            hop.protocol,
-                            Some(&hop.contract_redeemscript),
-                            hop.timelock_script.as_deref(),
-                        )
-                    };
-                    let first_maker_lock = hops.first().and_then(timelock);
-                    let mut dangling = first_maker_lock.is_some();
-                    for hop in hops.iter().filter(|hop| timelock(hop) == first_maker_lock) {
-                        let outpoint = hop.contract_outpoint();
-                        dangling = match hop.contract_tx.output.get(outpoint.vout as usize) {
-                            Some(output) => chain
-                                .confirmed_spending_transaction(&outpoint, &output.script_pubkey)?
-                                .is_some_and(|tx| hop.is_timelock_spend(&tx)),
-                            None => false,
-                        };
-                        if !dangling {
-                            break;
-                        }
-                    }
-                    if !dangling {
+                    if !Self::first_maker_refunded(wallet, chain, swap_id)? {
                         log::debug!(
                             "Holding refund of {} for the first maker's hashlock claim",
                             contract_txid
@@ -5484,7 +5525,7 @@ mod timelock_reconcile_tests {
 
     /// A Taproot outgoing swapcoin whose contract output commits to both
     /// leaves, and our own signed timelock recovery of it.
-    fn taproot_coin_and_recovery() -> (OutgoingSwapCoin, Transaction) {
+    pub(super) fn taproot_coin_and_recovery() -> (OutgoingSwapCoin, Transaction) {
         use crate::protocol::contract2::{create_hashlock_script, create_timelock_script};
         use bitcoin::{key::Keypair, secp256k1::Scalar, taproot::TaprootBuilder, XOnlyPublicKey};
 
@@ -5653,6 +5694,11 @@ mod timelock_reconcile_tests {
                     "coinbase": false,
                 }),
                 "gettxout" => Value::Null,
+                "getmempoolinfo" => json!({
+                    "loaded": true, "size": 1, "bytes": 1, "usage": 1, "maxmempool": 1,
+                    "mempoolminfee": 0.00001, "minrelaytxfee": 0.00001,
+                    "incrementalrelayfee": 0.00005,
+                }),
                 "gettxspendingprevout" => {
                     let spender = (!recovery_mined).then(|| recovery.compute_txid());
                     json!([{
@@ -5746,6 +5792,35 @@ mod timelock_reconcile_tests {
         let state = Wallet::ensure_contract_on_chain(&core(url), "swap", &coin, &|_| true).unwrap();
         assert_eq!(state, ContractChainState::RecoveryPending(recovery));
     }
+
+    /// The next hop's unconfirmed claim leaves the output in Core's confirmed
+    /// view too. Reading that as untouched would send a conflicting refund.
+    #[test]
+    fn core_waits_on_an_unconfirmed_claim_by_the_other_side() {
+        let (coin, _) = legacy_coin_and_recovery();
+        let claim = tx(
+            OutPoint::new(coin.contract_tx.compute_txid(), 0),
+            49_000,
+            ScriptBuf::new_p2wpkh(&pubkey(6).wpubkey_hash().unwrap()),
+        );
+        let url = start_core_stub_with(coin.contract_tx.clone(), claim, false);
+        let state = Wallet::ensure_contract_on_chain(&core(url), "swap", &coin, &|_| true).unwrap();
+        assert_eq!(state, ContractChainState::NotYet);
+    }
+
+    /// A replacement must add the node's own increment, which an operator can
+    /// set above the relay floor. Electrum cannot report one.
+    #[test]
+    fn replacement_increment_comes_from_the_backend() {
+        let (coin, recovery) = legacy_coin_and_recovery();
+        let core_url = start_core_stub(coin.contract_tx.clone(), recovery.clone());
+        assert_eq!(core(core_url).replacement_increment_rate(), 5.0);
+        let electrum_url = start_electrum_stub(coin.contract_tx, recovery);
+        assert_eq!(
+            electrum(&electrum_url).replacement_increment_rate(),
+            MIN_RELAY_FEE_RATE
+        );
+    }
 }
 
 /// An incoming contract still in the mempool is swept on a later pass, and its
@@ -5773,7 +5848,8 @@ mod mempool_deferral_tests {
         sync::{Arc, Mutex, RwLock},
     };
 
-    const TIP: i64 = 100;
+    /// Past the 500-block CLTV of the Taproot fixture.
+    const TIP: i64 = 600;
     /// Leaves the outgoing contract's 20-block CSV matured at `TIP`.
     pub(super) const OUTGOING_HEIGHT: i64 = 50;
     pub(super) const SWAP: &str = "swap";
@@ -6083,68 +6159,190 @@ mod recovery_fee_bump_tests {
         mempool_deferral_tests::{
             outgoing_coin, start_electrum_stub, StubChain, OUTGOING_HEIGHT, SWAP,
         },
-        timelock_reconcile_tests::{electrum, pubkey, shutdown_after, stub_wallet},
+        timelock_reconcile_tests::{
+            electrum, key, pubkey, shutdown_after, stub_wallet, taproot_coin_and_recovery, tx,
+        },
         *,
     };
+    use crate::{
+        protocol::contract::{create_contract_redeemscript, Hash160},
+        wallet::swapcoin::OutgoingSwapCoin,
+    };
+    use bitcoin::hashes::Hash;
     use bitcoind::tempfile::tempdir;
     use std::sync::RwLock;
 
-    /// Our recovery of `outgoing_coin`, priced at 1 sat/vB.
-    fn pending_recovery() -> Transaction {
-        let script = ScriptBuf::new_p2wpkh(&pubkey(7).wpubkey_hash().unwrap());
-        Wallet::create_timelock_recovery_tx(&outgoing_coin(), &[1.0], script).unwrap()
+    /// Where our refunds go: the address saved with the coin.
+    fn recovery_script() -> ScriptBuf {
+        ScriptBuf::new_p2wpkh(&pubkey(7).wpubkey_hash().unwrap())
     }
 
-    /// Runs one refund pass with the recovery stuck in the mempool and every
-    /// fee estimate at `feerate`. Returns the refunds the pass sent and the txs
-    /// it broadcast.
-    fn refund_pass(feerate: f64, claimed: bool) -> (Vec<SentSpend>, Vec<Transaction>) {
-        let (coin, pending) = (outgoing_coin(), pending_recovery());
-        let chain = StubChain::with(&[(&coin.contract_tx, OUTGOING_HEIGHT), (&pending, 0)]);
-        chain.lock().unwrap().feerate = feerate;
-        let url = start_electrum_stub(chain.clone());
-        let temp_dir = tempdir().unwrap();
-        let mut wallet = stub_wallet(&temp_dir.path().join("wallet.cbor"), electrum(&url));
-        wallet.add_outgoing_swapcoin(&coin);
-        wallet.save_to_disk().unwrap();
+    fn with_recovery_address(mut coin: OutgoingSwapCoin) -> OutgoingSwapCoin {
+        let address = Address::from_script(&recovery_script(), bitcoin::Network::Regtest).unwrap();
+        coin.recovery_address = Some(address.into_unchecked());
+        coin
+    }
 
-        let (refunds, discarded) = Wallet::broadcast_timelock_recoveries(
-            &RwLock::new(wallet),
-            &electrum(&url),
-            &shutdown_after(60),
-            None,
-            &|_| true,
-            &|swap_id| claimed && swap_id == SWAP,
-            &|_| false,
-        )
-        .unwrap();
-        assert!(discarded.is_empty());
-        let chain = chain.lock().unwrap();
-        let broadcast = chain
-            .broadcast
-            .iter()
-            .map(|txid| chain.txs[txid].0.clone())
-            .collect();
-        (refunds, broadcast)
+    fn legacy_coin() -> OutgoingSwapCoin {
+        with_recovery_address(outgoing_coin())
+    }
+
+    fn taproot_coin() -> OutgoingSwapCoin {
+        let mut coin = taproot_coin_and_recovery().0;
+        // Recovery only considers a coin holding its own key.
+        coin.my_privkey = Some(key(1));
+        with_recovery_address(coin)
+    }
+
+    /// Our recovery of `coin`, priced at 1 sat/vB.
+    fn pending_recovery(coin: &OutgoingSwapCoin) -> Transaction {
+        Wallet::create_timelock_recovery_tx(coin, &[1.0], recovery_script()).unwrap()
+    }
+
+    /// The first maker's Legacy hop and its confirmed timelock refund.
+    fn refunded_first_maker_hop() -> (WatchOnlySwapCoin, Transaction) {
+        let redeemscript =
+            create_contract_redeemscript(&pubkey(2), &pubkey(3), &Hash160::all_zeros(), &20);
+        let contract_tx = tx(
+            OutPoint::new(Txid::from_byte_array([6; 32]), 0),
+            50_000,
+            redeemscript.to_p2wsh(),
+        );
+        let mut refund = tx(
+            OutPoint::new(contract_tx.compute_txid(), 0),
+            49_000,
+            recovery_script(),
+        );
+        refund.input[0].witness =
+            bitcoin::Witness::from_slice(&[vec![1; 72], Vec::new(), redeemscript.to_bytes()]);
+        let hop = WatchOnlySwapCoin::new_legacy(
+            pubkey(3),
+            pubkey(2),
+            contract_tx,
+            redeemscript,
+            Amount::from_sat(50_000),
+        );
+        (hop, refund)
+    }
+
+    /// One refund pass over `coin`, with `pending` spending its contract from
+    /// the mempool and every fee estimate at `feerate`.
+    struct Pass {
+        coin: OutgoingSwapCoin,
+        pending: Transaction,
+        feerate: f64,
+        /// The swap's incoming coin is being claimed by hashlock.
+        claimed: bool,
+        /// The first maker took its own outgoing back by timelock.
+        first_maker_refunded: bool,
+    }
+
+    impl Pass {
+        fn over(coin: OutgoingSwapCoin, feerate: f64) -> Self {
+            Pass {
+                pending: pending_recovery(&coin),
+                coin,
+                feerate,
+                claimed: false,
+                first_maker_refunded: false,
+            }
+        }
+
+        /// Returns the refunds the pass sent and the txs it broadcast.
+        fn run(self) -> (Vec<SentSpend>, Vec<Transaction>) {
+            let chain = StubChain::with(&[
+                (&self.coin.contract_tx, OUTGOING_HEIGHT),
+                (&self.pending, 0),
+            ]);
+            chain.lock().unwrap().feerate = self.feerate;
+            let url = start_electrum_stub(chain.clone());
+            let temp_dir = tempdir().unwrap();
+            let mut wallet = stub_wallet(&temp_dir.path().join("wallet.cbor"), electrum(&url));
+            wallet.add_outgoing_swapcoin(&self.coin);
+            if self.first_maker_refunded {
+                let (hop, refund) = refunded_first_maker_hop();
+                let mut chain = chain.lock().unwrap();
+                for tx in [&hop.contract_tx, &refund] {
+                    chain
+                        .txs
+                        .insert(tx.compute_txid(), (tx.clone(), OUTGOING_HEIGHT));
+                }
+                wallet
+                    .store
+                    .watchonly_swapcoins
+                    .insert(SWAP.to_string(), vec![hop]);
+            }
+            wallet.save_to_disk().unwrap();
+
+            let claimed = self.claimed;
+            let (refunds, discarded) = Wallet::broadcast_timelock_recoveries(
+                &RwLock::new(wallet),
+                &electrum(&url),
+                &shutdown_after(60),
+                None,
+                &|_| true,
+                &|swap_id| claimed && swap_id == SWAP,
+                &|_| false,
+            )
+            .unwrap();
+            assert!(discarded.is_empty());
+            let chain = chain.lock().unwrap();
+            let broadcast = chain
+                .broadcast
+                .iter()
+                .map(|txid| chain.txs[txid].0.clone())
+                .collect();
+            (refunds, broadcast)
+        }
+    }
+
+    /// Checks `pass` sent exactly one replacement of its pending tx: ours, to
+    /// the stored address, at a higher fee.
+    fn assert_replaces(pass: Pass) {
+        let (coin, pending) = (pass.coin.clone(), pass.pending.clone());
+        let contract_txid = coin.contract_tx.compute_txid();
+        let (refunds, broadcast) = pass.run();
+        let [replacement] = &broadcast[..] else {
+            panic!("expected one replacement, got {:?}", broadcast);
+        };
+        assert_eq!(
+            refunds,
+            vec![(
+                contract_txid.to_string(),
+                contract_txid,
+                replacement.compute_txid()
+            )]
+        );
+        assert!(coin.is_own_timelock_spend(replacement));
+        assert_eq!(replacement.output.len(), 1);
+        assert_eq!(replacement.output[0].script_pubkey, recovery_script());
+        assert!(replacement.output[0].value < pending.output[0].value);
+        // The fee is priced on the size estimate, so the signed tx must fit it.
+        assert!(
+            replacement.vsize() as u64
+                <= contract_and_timelock_vsize(coin.protocol, SpendKind::Timelock)
+        );
     }
 
     /// Electrum hides a mempool-spent output, which used to read as "nothing
     /// to do". Our own recovery spending it must be told apart from that.
     #[test]
     fn electrum_classifies_our_unconfirmed_recovery_as_pending() {
-        let (coin, pending) = (outgoing_coin(), pending_recovery());
-        let chain = StubChain::with(&[(&coin.contract_tx, OUTGOING_HEIGHT), (&pending, 0)]);
-        let url = start_electrum_stub(chain);
-        let state =
-            Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true).unwrap();
-        assert_eq!(state, ContractChainState::RecoveryPending(pending));
+        for coin in [legacy_coin(), taproot_coin()] {
+            let pending = pending_recovery(&coin);
+            let chain = StubChain::with(&[(&coin.contract_tx, OUTGOING_HEIGHT), (&pending, 0)]);
+            let url = start_electrum_stub(chain);
+            let state = Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true)
+                .unwrap();
+            assert_eq!(state, ContractChainState::RecoveryPending(pending));
+        }
     }
 
     /// The other side's unconfirmed claim is not ours to replace.
     #[test]
     fn electrum_leaves_an_unconfirmed_claim_by_the_other_side() {
-        let coin = outgoing_coin();
-        let mut claim = pending_recovery();
+        let coin = legacy_coin();
+        let mut claim = pending_recovery(&coin);
         // A hashlock claim carries the preimage where a refund leaves it empty.
         claim.input[0].witness = bitcoin::Witness::from_slice(&[
             vec![1; 72],
@@ -6158,42 +6356,79 @@ mod recovery_fee_bump_tests {
         assert_eq!(state, ContractChainState::NotYet);
     }
 
+    /// Legacy refunds lock by CSV `nSequence`, Taproot ones by `nLockTime`, and
+    /// each has its own size estimate behind the fee.
     #[test]
     fn stuck_recovery_is_replaced_when_fees_rise() {
-        let (coin, pending) = (outgoing_coin(), pending_recovery());
-        let contract_txid = coin.contract_tx.compute_txid();
-
-        let (refunds, broadcast) = refund_pass(10.0, false);
-        let [replacement] = &broadcast[..] else {
-            panic!("expected one replacement, got {:?}", broadcast);
-        };
-        assert_eq!(
-            refunds,
-            vec![(
-                contract_txid.to_string(),
-                contract_txid,
-                replacement.compute_txid()
-            )]
-        );
-        assert!(coin.is_own_timelock_spend(replacement));
-        // Same destination, higher fee.
-        assert_eq!(
-            replacement.output[0].script_pubkey,
-            pending.output[0].script_pubkey
-        );
-        assert!(replacement.output[0].value < pending.output[0].value);
+        assert_replaces(Pass::over(legacy_coin(), 10.0));
+        assert_replaces(Pass::over(taproot_coin(), 10.0));
     }
 
-    /// No replacement goes out unless it can pay the relay increment over the
-    /// pending tx, or when the swap is being claimed by hashlock instead.
+    /// A backend can hand us any unconfirmed tx shaped like our refund. Its
+    /// output must never choose where the replacement pays.
+    #[test]
+    fn forged_pending_tx_cannot_redirect_the_refund() {
+        let mut pass = Pass::over(legacy_coin(), 10.0);
+        pass.pending.output[0].script_pubkey =
+            ScriptBuf::new_p2wpkh(&pubkey(9).wpubkey_hash().unwrap());
+        pass.pending.input[0].witness = bitcoin::Witness::from_slice(&[
+            vec![0x30; 72],
+            Vec::new(),
+            pass.coin
+                .contract_redeemscript
+                .clone()
+                .unwrap()
+                .into_bytes(),
+        ]);
+        assert!(pass.coin.is_own_timelock_spend(&pass.pending));
+        assert_replaces(pass);
+    }
+
+    /// A coin with no stored address never sent a refund of ours.
+    #[test]
+    fn pending_tx_is_not_replaced_without_a_stored_address() {
+        let mut pass = Pass::over(legacy_coin(), 10.0);
+        pass.coin.recovery_address = None;
+        assert_eq!(pass.run(), (Vec::new(), Vec::new()));
+    }
+
     #[test]
     fn stuck_recovery_stays_when_a_replacement_is_not_due() {
         // The market has not moved.
-        assert_eq!(refund_pass(1.0, false), (Vec::new(), Vec::new()));
+        assert_eq!(
+            Pass::over(legacy_coin(), 1.0).run(),
+            (Vec::new(), Vec::new())
+        );
         // It moved by less than the 1 sat/vB a replacement must add.
-        assert_eq!(refund_pass(1.5, false), (Vec::new(), Vec::new()));
-        // It moved, but we no longer race for this refund.
-        assert_eq!(refund_pass(10.0, true), (Vec::new(), Vec::new()));
+        assert_eq!(
+            Pass::over(legacy_coin(), 1.5).run(),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    /// A swap we claim by hashlock holds its refund while the first maker can
+    /// still claim our outgoing. Once that maker took its own outgoing back by
+    /// timelock, ours dangles and its stuck refund is bumped like any other.
+    #[test]
+    fn claimed_swap_is_bumped_only_once_its_outgoing_dangles() {
+        let claimed = |first_maker_refunded| Pass {
+            claimed: true,
+            first_maker_refunded,
+            ..Pass::over(legacy_coin(), 10.0)
+        };
+        assert_eq!(claimed(false).run(), (Vec::new(), Vec::new()));
+        assert_replaces(claimed(true));
+    }
+
+    /// The replacement must add `increment_rate` sat/vB over its own size.
+    #[test]
+    fn outbids_needs_the_full_increment() {
+        let fee = Amount::from_sat;
+        assert!(outbids(fee(100), fee(250), 150, 1.0));
+        assert!(!outbids(fee(100), fee(249), 150, 1.0));
+        // A node with a higher increment rejects what the default accepts.
+        assert!(!outbids(fee(100), fee(250), 150, 5.0));
+        assert!(outbids(fee(100), fee(850), 150, 5.0));
     }
 }
 
