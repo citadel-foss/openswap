@@ -1,12 +1,5 @@
-//! Integration test for multi-maker openswap with Taproot protocol.
-//!
-//! Setup: 1 taker with Normal behavior, 4 makers with Normal behavior.
-//! Protocol: Taproot (MuSig2), AddressType::P2TR.
-//! The taker routes the swap through all 4 makers.
-
 use bitcoin::Amount;
 use openswap::{
-    maker::start_server,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
 };
@@ -14,50 +7,31 @@ use openswap::{
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::thread;
 
 #[test]
 fn test_taproot_multi_maker_openswap() {
     // ---- Setup ----
     warn!("Running Test: Multi-Maker OpenSwap with Taproot (MuSig2) Protocol - 4 Makers");
 
-    let maker_count = 4;
-    let taker_behavior = vec![TakerBehavior::Normal];
-
     // Initialize test framework with 1 taker and 4 makers
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(4)
+        .takers([TakerBehavior::Normal])
+        .build();
 
     // Fund the taker with 5 UTXOs of 0.05 BTC each (P2TR for Taproot)
     // Need more UTXOs for a 4-maker route
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 5);
+    let taker_original_balance = world.fund_taker_default(5);
 
     // Fund makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
-    // Start the maker server threads
+    // Start the makers, wait for their setup, then sync their wallets so the
+    // fidelity bonds are accounted for
     log::info!("Starting Maker servers...");
+    world.start_makers(120);
 
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for all makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup to ensure fidelity bonds are accounted for
-    sync_maker_wallets(&makers);
-
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
     log::info!("Starting end-to-end swap test with Taproot protocol and 4 makers...");
 
     // Swap params for openswap (Taproot) with 4 makers
@@ -66,16 +40,17 @@ fn test_taproot_multi_maker_openswap() {
         .with_required_confirms(1);
 
     // Mine some blocks before the swap to ensure wallet is ready
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // Prepare the swap (negotiate with makers, get fee summary)
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Failed to prepare Taproot openswap with 4 makers");
     log::info!("Swap summary: {:?}", summary);
 
     // Execute the swap
-    match taker.start_swap(&summary.swap_id) {
+    match world.taker_mut().start(&summary.swap_id) {
         Ok(report) => {
             log::info!("OpenSwap (Taproot, 4 makers) completed successfully!");
             log::info!("Swap report: {:?}", report);
@@ -89,23 +64,17 @@ fn test_taproot_multi_maker_openswap() {
     log::info!("All openswaps processed successfully. Transaction complete.");
 
     // Sync wallets and verify results
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    world.taker().sync();
 
     // Mine a block to confirm the sweep transactions
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // Synchronize each maker's wallet
-    for maker in makers.iter() {
-        let mut wallet = maker.wallet.write().unwrap();
-        wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    for maker in world.makers() {
+        maker.sync();
     }
 
-    let taker_balances_after = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances_after = world.taker().balances();
     info!("Taker balance after completing swap (Taproot, 4 makers):");
     info!(
         "  Regular: {}, Contract: {}, Spendable: {}, Swap: {}",
@@ -115,7 +84,9 @@ fn test_taproot_multi_maker_openswap() {
         taker_balances_after.swap,
     );
 
-    // Verify swap results
+    // Verify swap results. Spendable is checked ahead of contract and
+    // fidelity here, which is not BalanceExpect's field order, so these stay
+    // plain asserts.
     let balance_diff = taker_original_balance - taker_balances_after.spendable;
     info!(
         "Taker (Taproot, 4 makers) balance verification passed. Original spendable: {}, After spendable: {} (fees paid: {})",
@@ -137,58 +108,41 @@ fn test_taproot_multi_maker_openswap() {
     assert_eq!(taker_balances_after.fidelity, Amount::ZERO);
     assert_eq!(balance_diff.to_sat(), 6697, "Taker fee paid mismatch");
 
-    // Verify all 4 makers earned fees
+    // Verify all 4 makers earned fees. Their wallets were synced above and are
+    // read as they stand.
     let expected_regular = [14500826, 14502320, 14503776, 14505194];
     let expected_swap = [499664, 498133, 496639, 495183];
     let expected_fees = [733, 696, 658, 620];
-    for (i, (maker, original_spendable)) in makers.iter().zip(maker_spendable_balance).enumerate() {
-        let wallet = maker.wallet.read().unwrap();
-        let balances = wallet.get_balances().unwrap();
+    for (i, (maker, original_spendable)) in world
+        .makers()
+        .iter()
+        .zip(maker_spendable_balance)
+        .enumerate()
+    {
+        let balances = maker.balances();
 
         info!(
             "Maker {} final balances - Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
             i, balances.regular, balances.swap, balances.contract, balances.fidelity, balances.spendable,
         );
 
-        assert_eq!(
-            balances.regular.to_sat(),
-            expected_regular[i],
-            "Maker {} regular balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.swap.to_sat(),
-            expected_swap[i],
-            "Maker {} swap balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.contract.to_sat(),
-            0,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-
-        let maker_fee = balances
-            .spendable
-            .checked_sub(original_spendable)
-            .unwrap_or(Amount::ZERO);
-
-        info!("Maker {} fee earned: {} sats", i, maker_fee.to_sat());
-
-        assert_eq!(
-            maker_fee.to_sat(),
-            expected_fees[i],
-            "Maker {} fee earned mismatch",
-            i
-        );
+        BalanceExpect {
+            regular: Some(Is::Sats(expected_regular[i])),
+            swap: Some(Is::Sats(expected_swap[i])),
+            contract: Some(Is::Sats(0)),
+            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
+            spendable: None,
+            delta: Some(Delta::Gain {
+                baseline: original_spendable,
+                style: DiffStyle::UnwrapOrZero,
+                sats: expected_fees[i],
+            }),
+        }
+        .assert(&format!("Maker {i}"), &balances);
     }
 
     info!("All multi-maker swap tests (Taproot, 4 makers) completed successfully!");
 
-    shutdown_makers(&makers, maker_threads);
-
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }

@@ -1,18 +1,11 @@
-//! Electrum-only openswap tests.
-//!
-//! - The watch-tower uses `ElectrumNotifier` + `electrum_chain_name`/`electrum_block_count` instead of ZMQ + Bitcoin Core REST.
-//! - The offer-sync and Nostr discovery use `electrum_block_count`/`electrum_get_raw_tx`.
-//!   Bitcoind is still spawned because it is the source of regtest funds and mines blocks, but the openswap code itself talks only to electrs.
-
 use super::test_framework::*;
 use bitcoin::Amount;
 use log::info;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
 };
-use std::{sync::atomic::Ordering::Relaxed, thread};
 
 /// Exact post-swap balances for one protocol run. Legacy and taproot spend
 /// different transaction shapes, so each protocol pins its own values.
@@ -47,64 +40,45 @@ const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
 /// exact post-swap taker / maker balances.
 fn run_electrum_swap(protocol: ProtocolVersion, expected: &ExpectedBalances) {
     info!("Running Test: Electrum OpenSwap Procedure ({protocol:?})");
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<ElectrumBackend>(maker_count, taker_behavior, maker_behaviors);
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    let mut world = World::builder::<ElectrumBackend>()
+        .makers(2)
+        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
+        .takers([TakerBehavior::Normal])
+        .build();
+    let taker_original_balance = world.fund_taker_default(3);
+    world.fund_makers_default();
     info!("Initiating Maker servers");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-    wait_for_makers_setup(&makers, 180);
-    sync_maker_wallets(&makers);
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    world.start_makers(180);
+    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
     // The taker's pre-swap sync must see the funding blocks, not a stale index.
-    test_framework.wait_for_electrs_tip();
-    let summary = taker.prepare_swap(swap_params).unwrap();
-    taker.start_swap(&summary.swap_id).unwrap();
+    world.framework().wait_for_electrs_tip();
+    let summary = world.taker_mut().prepare(swap_params).unwrap();
+    world.taker_mut().start(&summary.swap_id).unwrap();
     // electrs indexes asynchronously; let it reach the tip before the
     // post-swap syncs so the asserted balances aren't computed from a
     // stale index.
-    test_framework.wait_for_electrs_tip();
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-    generate_blocks(bitcoind, 1);
-    test_framework.wait_for_electrs_tip();
-    sync_maker_wallets(&makers);
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
-    let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
-        .expect("Taker spendable balance should not exceed original");
-    let maker_balances = makers
+    world.framework().wait_for_electrs_tip();
+    world.taker().sync();
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
+    world.sync_makers();
+    let taker_balances = world.taker().balances();
+    let maker_balances = world
+        .makers()
         .iter()
-        .map(|maker| maker.wallet.read().unwrap().get_balances().unwrap())
+        .map(|maker| maker.balances())
         .collect::<Vec<_>>();
     info!(
-        "Electrum {protocol:?} taker: regular {}, swap {}, contract {}, spendable {}, fee {}",
+        "Electrum {protocol:?} taker: regular {}, swap {}, contract {}, spendable {}, original {}",
         taker_balances.regular,
         taker_balances.swap,
         taker_balances.contract,
         taker_balances.spendable,
-        balance_diff,
+        taker_original_balance,
     );
     for (i, balances) in maker_balances.iter().enumerate() {
         info!(
@@ -121,68 +95,36 @@ fn run_electrum_swap(protocol: ProtocolVersion, expected: &ExpectedBalances) {
         );
     }
 
-    assert_eq!(
-        taker_balances.regular.to_sat(),
-        expected.taker_regular,
-        "Taker regular balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.swap.to_sat(),
-        expected.taker_swap,
-        "Taker swap balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.contract,
-        Amount::ZERO,
-        "All contract outputs should be resolved post-swap"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-    assert_eq!(
-        balance_diff.to_sat(),
-        expected.taker_fee,
-        "Taker fee mismatch"
-    );
+    BalanceExpect {
+        regular: Some(Is::Sats(expected.taker_regular)),
+        swap: Some(Is::Sats(expected.taker_swap)),
+        contract: Some(Is::Amount(Amount::ZERO)),
+        fidelity: Some(Is::Amount(Amount::ZERO)),
+        spendable: None,
+        delta: Some(Delta::Loss {
+            baseline: taker_original_balance,
+            style: DiffStyle::CheckedUnwrap,
+            sats: expected.taker_fee,
+        }),
+    }
+    .assert("Taker", &taker_balances);
     for (i, balances) in maker_balances.iter().enumerate() {
-        assert_eq!(
-            balances.regular.to_sat(),
-            expected.maker_regular[i],
-            "Maker {i} regular balance mismatch"
-        );
-        assert_eq!(
-            balances.swap.to_sat(),
-            expected.maker_swap[i],
-            "Maker {i} swap balance mismatch"
-        );
-        assert_eq!(
-            balances.contract,
-            Amount::ZERO,
-            "Maker {} contract balance should be zero",
-            i
-        );
-        assert_eq!(
-            balances.fidelity,
-            Amount::from_btc(0.05).unwrap(),
-            "Maker {} should still hold its fidelity bond",
-            i
-        );
-        let earned = balances
-            .spendable
-            .checked_sub(maker_spendable_balance[i])
-            .unwrap_or(Amount::ZERO);
-        assert_eq!(
-            earned.to_sat(),
-            expected.maker_earnings[i],
-            "Maker {i} earnings mismatch"
-        );
+        BalanceExpect {
+            regular: Some(Is::Sats(expected.maker_regular[i])),
+            swap: Some(Is::Sats(expected.maker_swap[i])),
+            contract: Some(Is::Amount(Amount::ZERO)),
+            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
+            spendable: None,
+            delta: Some(Delta::Gain {
+                baseline: maker_spendable_balance[i],
+                style: DiffStyle::UnwrapOrZero,
+                sats: expected.maker_earnings[i],
+            }),
+        }
+        .assert(&format!("Maker {i}"), balances);
     }
     info!("Electrum-only openswap test ({protocol:?}) completed successfully!");
-    drop(takers);
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads.into_iter().for_each(|t| t.join().unwrap());
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 #[test]

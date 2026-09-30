@@ -10,10 +10,9 @@
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
-    utill::NO_SHUTDOWN,
 };
 
 use super::test_framework::*;
@@ -63,46 +62,36 @@ fn run_multi_confirm_swap(
     } else {
         REQUIRED_CONFIRMS
     };
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
+        .takers([TakerBehavior::Normal])
+        .build();
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
+    let taker_original_balance = world.fund_taker_default(3);
+    world.fund_makers_default();
 
     info!("Starting Maker servers...");
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
+    world.start_makers(120);
 
-    wait_for_makers_setup(&makers, 120);
-
-    sync_maker_wallets(&makers);
-
-    let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(required_confirms);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Failed to prepare openswap");
-    let log_path = test_framework.taker_log_path();
+    let log_path = world.taker_log_path();
     let swap_result = if delay_first_confirmation {
+        // The miner thread holds its own handle on the framework, so the swap
+        // below can borrow the taker mutably.
+        let test_framework = world.framework().clone();
+        let bitcoind = &test_framework.bitcoind;
         test_framework.set_block_gen_paused(true);
         // Let any in-flight mining tick finish before broadcasting funding.
         thread::sleep(Duration::from_secs(4));
@@ -145,36 +134,33 @@ fn run_multi_confirm_swap(
                 let mempool = bitcoind.client.get_raw_mempool().unwrap();
                 assert!(funding_txids.iter().all(|txid| mempool.contains(txid)));
             });
-            let result = taker.start_swap(&summary.swap_id);
+            let result = world.taker_mut().start(&summary.swap_id);
             miner.join().expect("delayed miner panicked");
             result
         })
     } else {
-        taker.start_swap(&summary.swap_id)
+        world.taker_mut().start(&summary.swap_id)
     };
     swap_result.expect("OpenSwap should complete successfully despite the longer funding wait");
 
     info!("OpenSwap completed with required_confirms = {required_confirms}");
 
-    shutdown_makers(&makers, maker_threads);
+    world.shutdown_makers();
 
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&NO_SHUTDOWN)
-        .unwrap();
-    generate_blocks(bitcoind, 1);
-    sync_maker_wallets(&makers);
+    world.taker().sync();
+    world.mine(1);
+    world.sync_makers();
 
     // Verify the requested confirmation count and that route heartbeats ran.
-    test_framework.assert_log(
+    world.framework().assert_log(
         &format!("Waiting for {required_confirms} confirmation(s)"),
         &log_path,
     );
-    test_framework.assert_log("Taker is waiting for funding confirmation", &log_path);
+    world
+        .framework()
+        .assert_log("Taker is waiting for funding confirmation", &log_path);
 
-    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let taker_balances = world.taker().balances();
     info!(
         "Taker balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
         taker_balances.regular,
@@ -183,55 +169,47 @@ fn run_multi_confirm_swap(
         taker_balances.spendable,
     );
 
+    // Waiting longer must not change what the swap costs.
     let expected_taker_regular = 14499538;
     let expected_taker_swap = match protocol {
         ProtocolVersion::Legacy => 496447,
         ProtocolVersion::Taproot => 496789,
     };
-    assert_eq!(
-        taker_balances.regular.to_sat(),
-        expected_taker_regular,
-        "Taker regular balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.swap.to_sat(),
-        expected_taker_swap,
-        "Taker swap balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.contract.to_sat(),
-        0,
-        "Taker contract balance mismatch"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-
-    // Waiting longer must not change what the swap costs.
-    let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
-        .unwrap();
-    info!("Taker fees paid: {} sats", balance_diff.to_sat());
     let expected_diff = match protocol {
         ProtocolVersion::Legacy => 4015,
         ProtocolVersion::Taproot => 3673,
     };
-    assert_eq!(
-        balance_diff.to_sat(),
-        expected_diff,
-        "Taker spendable balance change mismatch"
-    );
+    BalanceExpect {
+        regular: Some(Is::Sats(expected_taker_regular)),
+        swap: Some(Is::Sats(expected_taker_swap)),
+        contract: Some(Is::Sats(0)),
+        fidelity: Some(Is::Amount(Amount::ZERO)),
+        spendable: None,
+        delta: Some(Delta::Loss {
+            baseline: taker_original_balance,
+            style: DiffStyle::CheckedUnwrap,
+            sats: expected_diff,
+        }),
+    }
+    .assert("Taker", &taker_balances);
 
     let expected_regular = match protocol {
-        ProtocolVersion::Legacy => [14500865u64, 14502398],
-        ProtocolVersion::Taproot => [14500751u64, 14502170],
+        ProtocolVersion::Legacy => [14500865, 14502398],
+        ProtocolVersion::Taproot => [14500751, 14502170],
     };
     let expected_swap = match protocol {
-        ProtocolVersion::Legacy => [499550u64, 497980],
-        ProtocolVersion::Taproot => [499664u64, 498208],
+        ProtocolVersion::Legacy => [499550, 497980],
+        ProtocolVersion::Taproot => [499664, 498208],
     };
-    let expected_fee = [658u64, 621];
+    let expected_fee = [658, 621];
 
-    for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, (maker, original)) in world
+        .makers()
+        .iter()
+        .zip(maker_spendable_balance)
+        .enumerate()
+    {
+        let balances = maker.balances();
         info!(
             "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
             i,
@@ -242,41 +220,22 @@ fn run_multi_confirm_swap(
             balances.spendable,
         );
 
-        assert_eq!(
-            balances.regular.to_sat(),
-            expected_regular[i],
-            "Maker {} regular balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.swap.to_sat(),
-            expected_swap[i],
-            "Maker {} swap balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.contract.to_sat(),
-            0,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-
-        let maker_fee = balances
-            .spendable
-            .checked_sub(original)
-            .unwrap_or(Amount::ZERO);
-        info!("Maker {} fee earned: {} sats", i, maker_fee.to_sat());
-        assert_eq!(
-            maker_fee.to_sat(),
-            expected_fee[i],
-            "Maker {} fee earned mismatch",
-            i
-        );
+        BalanceExpect {
+            regular: Some(Is::Sats(expected_regular[i])),
+            swap: Some(Is::Sats(expected_swap[i])),
+            contract: Some(Is::Sats(0)),
+            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
+            spendable: None,
+            delta: Some(Delta::Gain {
+                baseline: original,
+                style: DiffStyle::UnwrapOrZero,
+                sats: expected_fee[i],
+            }),
+        }
+        .assert(&format!("Maker {i}"), &balances);
     }
 
     info!("Multi-confirmation swap test completed successfully!");
 
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
