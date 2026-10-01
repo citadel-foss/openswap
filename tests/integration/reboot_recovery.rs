@@ -149,21 +149,13 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
             .read()
             .unwrap()
             .get_incoming_swapcoins_count();
-        wait_for_log(
-            &log_path,
+        wait_logged!(
+            world,
             "Incomplete swaps detected on startup",
-            Duration::from_secs(120),
+            Duration::from_secs(120)
         );
-        wait_for_log(
-            &log_path,
-            "recover_from_swap started",
-            Duration::from_secs(120),
-        );
-        wait_for_log(
-            &log_path,
-            "Removed outgoing swapcoin",
-            Duration::from_secs(120),
-        );
+        wait_logged!(world, "recover_from_swap started", Duration::from_secs(120));
+        wait_logged!(world, "Removed outgoing swapcoin", Duration::from_secs(120));
         let log_contents = std::fs::read_to_string(&log_path).unwrap();
         assert!(
             !log_contents.contains("Funding was never broadcast for swap"),
@@ -180,22 +172,22 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
         );
     } else {
         let restarted = world.makers()[0].inner();
-        wait_for_log(
-            &log_path,
+        wait_logged!(
+            world,
             "Incomplete swaps detected on startup",
-            Duration::from_secs(120),
+            Duration::from_secs(120)
         );
         assert!(
             TcpStream::connect(("127.0.0.1", restarted.config.network_port)).is_err(),
             "recovery-only maker must not accept swap connections"
         );
-        wait_for_log(
-            &log_path,
+        wait_logged!(
+            world,
             &format!(
                 "[{}] Recovered {} incoming swapcoins via hashlock",
                 restarted.config.network_port, before_incoming
             ),
-            Duration::from_secs(120),
+            Duration::from_secs(120)
         );
         assert!(!restarted.is_setup_complete.load(Relaxed));
         // The recovery-only maker exits on its own once recovery is done.

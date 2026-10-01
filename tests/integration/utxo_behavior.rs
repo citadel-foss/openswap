@@ -709,13 +709,10 @@ fn run_degraded_split_swap(protocol: ProtocolVersion) {
     info!("Degraded-split taker balance: {:?}", taker_balance);
 
     world.shutdown_makers();
-    let log_path = world.taker_log_path();
     let bitcoind = world.bitcoind();
     match protocol {
         ProtocolVersion::Legacy => {
-            world
-                .framework()
-                .assert_log("3 receivers, 1 senders", &log_path);
+            assert_logged!(world, "3 receivers, 1 senders");
         }
         ProtocolVersion::Taproot => {
             // The "receivers, senders" line is Legacy-only, so the degradation

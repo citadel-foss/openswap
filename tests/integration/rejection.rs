@@ -232,23 +232,14 @@ fn test_maker_rejects_out_of_bounds_swap_details() {
 
     world.shutdown_makers();
 
-    let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("closing early after maker selection", &log_path);
+    assert_logged!(world, "closing early after maker selection");
     // The forged amounts got past both taker-side layers, so the refusal must
     // come from the maker's own guard, logged as a handler error on drop.
-    world
-        .framework()
-        .assert_log("Swap amount below the incoming contract floor", &log_path);
-    world
-        .framework()
-        .assert_log("Swap amount above maximum", &log_path);
+    assert_logged!(world, "Swap amount below the incoming contract floor");
+    assert_logged!(world, "Swap amount above maximum");
     // The mutated resend dies on the whole-agreement compare: one value, so
     // no single field — feerate included — can drift between connections.
-    world
-        .framework()
-        .assert_log("parameters differ from stored swap", &log_path);
+    assert_logged!(world, "parameters differ from stored swap");
 
     // Nothing was funded, so nothing may have moved.
     world.taker().sync();
@@ -482,13 +473,11 @@ fn makers_reject_duplicate_funding_outpoints() {
 
     // Assert both the taker side duplicate contract passing and the maker-side rejection.
     let log_path = world.taker_log_path();
-    world.framework().assert_log(
-        "Test behavior: duplicating Taproot contract outpoint",
-        &log_path,
+    assert_logged!(
+        world,
+        "Test behavior: duplicating Taproot contract outpoint"
     );
-    world
-        .framework()
-        .assert_log("Duplicate Taproot contract outpoint", &log_path);
+    assert_logged!(world, "Duplicate Taproot contract outpoint");
 
     let log_contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
@@ -524,8 +513,7 @@ fn run_legacy_proof_guard(behavior: TakerBehavior, tx_count: u32, expected: &str
         .taker_mut()
         .swap_fails(params, "maker must reject the crafted ProofOfFunding");
 
-    let log_path = world.taker_log_path();
-    world.framework().assert_log(expected, &log_path);
+    assert_logged!(world, expected);
 
     world.shutdown_makers();
 
@@ -635,8 +623,7 @@ fn run_taproot_declaration_guard(behavior: TakerBehavior, expected: &str) {
         "maker must reject contract data that breaks the declaration",
     );
 
-    let log_path = world.taker_log_path();
-    world.framework().assert_log(expected, &log_path);
+    assert_logged!(world, expected);
 
     world.shutdown_makers();
 
@@ -667,10 +654,7 @@ fn one_utxo_taker_completes_degraded_swap(world: &mut World) {
         .swap(params)
         .expect("a degraded one-split swap must complete");
 
-    let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("with 1 funding txs", &log_path);
+    assert_logged!(world, "with 1 funding txs");
 }
 
 /// The maker forwards 1,075 sats. Two splits net to 372 each, under the 485
@@ -726,13 +710,11 @@ fn run_rejects_spent_funding_outpoint<B: TestBackend>(behavior: TakerBehavior) {
     );
 
     let log_path = world.taker_log_path();
-    world.framework().assert_log(
-        "Test behavior: spending the funding outpoint before ProofOfFunding",
-        &log_path,
+    assert_logged!(
+        world,
+        "Test behavior: spending the funding outpoint before ProofOfFunding"
     );
-    world
-        .framework()
-        .assert_log("Funding output already spent", &log_path);
+    assert_logged!(world, "Funding output already spent");
 
     let log_contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
@@ -881,13 +863,11 @@ fn maker_rejects_proof_of_funding_with_missing_contract_cache() {
 
     // Assert both the adversarial action and the maker's fail-closed reason.
     let log_path = world.taker_log_path();
-    world.framework().assert_log(
-        "Test behavior: skipping sender contract signature request before funding",
-        &log_path,
+    assert_logged!(
+        world,
+        "Test behavior: skipping sender contract signature request before funding"
     );
-    world
-        .framework()
-        .assert_log("No cached sender contract for funding prevout", &log_path);
+    assert_logged!(world, "No cached sender contract for funding prevout");
 
     // Rejection must happen before the maker reaches the outgoing broadcast
     // boundary in process_resp_contract_sigs_for_recvr_and_sender.
@@ -941,10 +921,7 @@ fn test_taproot_maker_rejects_contract_amount_mismatch() {
         "Taproot swap should fail when taker lies about contract amount"
     );
 
-    let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("does not match output value", &log_path);
+    assert_logged!(world, "does not match output value");
 
     world.shutdown_makers();
 
@@ -998,12 +975,8 @@ fn test_legacy_taker_rejects_malformed_maker_funding_output() {
         error
     );
 
-    let log_path = world.taker_log_path();
     // Pin the operator-visible rejection, not just the returned Rust error.
-    world.framework().assert_log(
-        "funding output does not pay to advertised multisig",
-        &log_path,
-    );
+    assert_logged!(world, "funding output does not pay to advertised multisig");
 
     world.shutdown_makers();
 
@@ -1101,10 +1074,7 @@ fn test_taproot_rejects_underfunded_maker_contract() {
     }
 
     // Assert the rejection came from the exact-amount check.
-    let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("does not match the negotiated hop total", &log_path);
+    assert_logged!(world, "does not match the negotiated hop total");
 
     // ---- Cleanup ----
     world.shutdown_makers();
@@ -1636,10 +1606,7 @@ fn maker_rejects_over_budget_funding_plan() {
     );
 
     world.shutdown_makers();
-    let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("above the taker's input budget", &log_path);
+    assert_logged!(world, "above the taker's input budget");
     world.finish();
 }
 
@@ -1710,9 +1677,7 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
     );
 
     let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("Test behavior: failing the second", &log_path);
+    assert_logged!(world, "Test behavior: failing the second");
 
     // The 30s idle timeout starts recovery; the timelock path then needs the
     // maker's outgoing timelock (150 CSV blocks from the contract broadcast).
@@ -1828,10 +1793,7 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
     );
 
     let log_path = world.taker_log_path();
-    world.framework().assert_log(
-        "Test behavior: failing the second funding broadcast",
-        &log_path,
-    );
+    assert_logged!(world, "Test behavior: failing the second funding broadcast");
 
     // The chain check found split 1 in the mempool, so the spare maker must
     // stay unused and the recovery material must survive.
@@ -2106,11 +2068,7 @@ fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     let swap2 = world.taker_mut().start(&summary2.swap_id);
     assert!(swap2.is_err(), "{}", s.swap2_reject_msg);
 
-    wait_for_log(
-        &log_path,
-        s.needle,
-        Duration::from_secs(s.needle_timeout_secs),
-    );
+    wait_logged!(world, s.needle, Duration::from_secs(s.needle_timeout_secs));
 
     let contents = std::fs::read_to_string(&log_path).unwrap();
     let tail = contents
@@ -2470,9 +2428,7 @@ fn maker_reprocesses_own_contracts_after_partial_broadcast() {
     );
 
     let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("Test behavior: maker 0 dropped mid-exchange", &log_path);
+    assert_logged!(world, "Test behavior: maker 0 dropped mid-exchange");
 
     let contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
@@ -2599,10 +2555,7 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
         other => panic!("expected AckSwapDetails, got {:?}", other),
     }
 
-    let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("Swap id belongs to an unfinished swap", &log_path);
+    assert_logged!(world, "Swap id belongs to an unfinished swap");
 
     world.framework().set_block_gen_paused(false);
 
@@ -3201,9 +3154,7 @@ fn swap_cap_rejects_before_planning() {
     }
 
     let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("30 active swaps at the 30 cap", &log_path);
+    assert_logged!(world, "30 active swaps at the 30 cap");
     let contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         !contents.contains("Rejecting swap at admission"),
