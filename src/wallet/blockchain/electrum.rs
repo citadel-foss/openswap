@@ -37,7 +37,9 @@ use electrum_client::{
 };
 use serde_json::{json, Value};
 
-use super::{network_from_electrum_genesis, BlockRef, Blockchain, HdOrigin, WatchEvent};
+use super::{
+    network_from_electrum_genesis, BlockRef, Blockchain, FeePriority, HdOrigin, WatchEvent,
+};
 use crate::{lock_debug, wallet::error::WalletError};
 
 /// Configuration for connecting to an Electrum-protocol server.
@@ -1125,9 +1127,9 @@ impl Blockchain for Electrum {
             .collect())
     }
 
-    fn estimate_feerate(&self, conf_target: u16) -> Result<f64, WalletError> {
+    fn estimate_feerate(&self, priority: FeePriority) -> Result<f64, WalletError> {
         // BTC/kvB. Servers that forward to Core answer -1 when it has no estimate.
-        let per_kvb = self.call(|c| c.estimate_fee(conf_target as usize))?;
+        let per_kvb = self.call(|c| c.estimate_fee(priority as usize))?;
         if per_kvb <= 0.0 {
             return Err(WalletError::General(format!("no estimate: {per_kvb}")));
         }
@@ -1723,8 +1725,8 @@ mod tests {
         });
 
         let backend = Electrum::new(&cfg(&format!("tcp://{addr}"), None)).unwrap();
-        assert_eq!(backend.estimate_feerate(2).unwrap(), 20.0);
-        assert!(backend.estimate_feerate(144).is_err());
+        assert_eq!(backend.estimate_feerate(FeePriority::Urgent).unwrap(), 20.0);
+        assert!(backend.estimate_feerate(FeePriority::Economy).is_err());
         server.join().unwrap();
     }
 

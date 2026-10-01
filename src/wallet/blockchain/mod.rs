@@ -38,9 +38,20 @@ use serde_json::Value;
 use super::error::WalletError;
 use crate::utill::MIN_RELAY_FEE_RATE;
 
-/// Confirmation targets for recovery feerates. Core and every
-/// Electrum server we checked accept each one.
-const RECOVERY_CONF_TARGETS: [u16; 4] = [2, 12, 25, 144];
+/// Fee estimate buckets; each value is its confirmation target in blocks.
+#[derive(Debug, Clone, Copy)]
+pub enum FeePriority {
+    /// Next couple of blocks.
+    Urgent = 2,
+    /// About an hour.
+    High = 6,
+    /// About two hours.
+    Medium = 12,
+    /// About four hours.
+    Low = 25,
+    /// About a day.
+    Economy = 144,
+}
 
 /// Error for a [`Blockchain`] method the active backend does not support
 /// (e.g. `block_at_height` on Electrum).
@@ -258,9 +269,9 @@ pub trait Blockchain: Send + Sync + 'static {
         descriptor: &str,
         range: Option<[u32; 2]>,
     ) -> Result<Vec<Address<NetworkUnchecked>>, WalletError>;
-    /// Feerate in sat/vB to confirm within `conf_target` blocks. An `Err` when
+    /// Feerate in sat/vB to confirm within `priority`'s target blocks. An `Err` when
     /// the backend has no estimate carries its own reason.
-    fn estimate_feerate(&self, conf_target: u16) -> Result<f64, WalletError>;
+    fn estimate_feerate(&self, priority: FeePriority) -> Result<f64, WalletError>;
     /// Recent wallet transactions, newest window first, ordered oldest-first
     /// like Core. Used by the FFI history view, so every backend must answer it.
     fn list_transactions(
@@ -447,12 +458,18 @@ impl AnyBlockchain {
     /// estimate drops only its rate; a dead Electrum link stops the rest.
     pub(crate) fn recovery_feerates(&self) -> Vec<f64> {
         let mut rates = Vec::new();
-        for target in RECOVERY_CONF_TARGETS {
-            match self.estimate_feerate(target) {
+        // Core and every Electrum server we checked accept each of these.
+        for priority in [
+            FeePriority::Urgent,
+            FeePriority::Medium,
+            FeePriority::Low,
+            FeePriority::Economy,
+        ] {
+            match self.estimate_feerate(priority) {
                 Ok(rate) => rates.push(rate.max(MIN_RELAY_FEE_RATE)),
                 Err(e) => {
                     log::error!(
-                        "Fee estimation for {target} blocks failed, skipping that rate: {e:?}"
+                        "Fee estimation for {priority:?} priority failed, skipping that rate: {e:?}"
                     );
                     if matches!(e, WalletError::ElectrumUnreachable { .. }) {
                         break;
@@ -582,10 +599,10 @@ impl Blockchain for AnyBlockchain {
             AnyBlockchain::Electrum(b) => b.derive_addresses(descriptor, range),
         }
     }
-    fn estimate_feerate(&self, conf_target: u16) -> Result<f64, WalletError> {
+    fn estimate_feerate(&self, priority: FeePriority) -> Result<f64, WalletError> {
         match self {
-            AnyBlockchain::CoreRPC(b) => b.estimate_feerate(conf_target),
-            AnyBlockchain::Electrum(b) => b.estimate_feerate(conf_target),
+            AnyBlockchain::CoreRPC(b) => b.estimate_feerate(priority),
+            AnyBlockchain::Electrum(b) => b.estimate_feerate(priority),
         }
     }
     fn list_transactions(

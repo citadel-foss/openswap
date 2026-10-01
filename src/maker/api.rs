@@ -35,8 +35,9 @@ use crate::{
         funding::{net_policy_fees, SplitPlan},
         min_contract_value_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
-        AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FidelityError,
-        RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK,
+        AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FeePriority,
+        FidelityError, RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK,
+        MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::service::WatchService,
 };
@@ -731,12 +732,6 @@ pub struct MakerServer {
 #[cfg(feature = "lightning")]
 const LN_OFFER_TTL: Duration = Duration::from_secs(15);
 
-/// Confirmation target for a Lightning HTLC funding, in blocks. Comfortably
-/// inside the budget the swap-out hold-window check assumes, so the promise
-/// that check makes is one the funding can keep.
-#[cfg(feature = "lightning")]
-const FUNDING_CONF_TARGET: u16 = 6;
-
 /// Idle swap data returned by [`MakerServer::drain_idle_swaps`].
 pub struct IdleSwapData {
     /// Unique swap identifier.
@@ -1217,9 +1212,26 @@ impl MakerServer {
                         } = e
                         {
                             log::warn!("Insufficient funds to create fidelity bond.");
-                            let needed = required - available;
+                            // Bond change must also fund the first swap and stay at our minimum
+                            // swap size, or the liquidity check right after keeps us off the market.
+                            let swap_feerate = match lock_debug!(self.wallet.read())
+                                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                                .blockchain
+                                .estimate_feerate(FeePriority::Urgent)
+                            {
+                                Ok(rate) => rate.max(MIN_RELAY_FEE_RATE),
+                                Err(e) => {
+                                    log::error!("Fee estimation for urgent priority failed, using the relay floor: {e:?}");
+                                    MIN_RELAY_FEE_RATE
+                                }
+                            };
+                            let needed = funding_fee_policy_sats(1, 1, swap_feerate)
+                                .and_then(|fee| fee.checked_add(min_swap_amount(&self.config)))
+                                .map_or(u64::MAX, |extra| {
+                                    (required - available).saturating_add(extra)
+                                });
                             log::info!(
-                                "Send at least {:.8} BTC to {:?}",
+                                "Send at least {:.8} BTC to {:?} (fidelity bond + fees + minimum swap liquidity)",
                                 Amount::from_sat(needed).to_btc(),
                                 addr
                             );
@@ -3340,11 +3352,11 @@ impl MakerTrait for MakerServer {
         // confirms late moves the CSV refund past the Lightning deadline.
         let feerate = {
             use crate::wallet::Blockchain;
-            match wallet.blockchain.estimate_feerate(FUNDING_CONF_TARGET) {
+            match wallet.blockchain.estimate_feerate(FeePriority::High) {
                 Ok(rate) if rate.is_finite() => rate.max(MIN_RELAY_FEE_RATE),
                 other => {
                     log::warn!(
-                        "lightning: no feerate estimate for {FUNDING_CONF_TARGET} blocks \
+                        "lightning: no feerate estimate for high priority \
                          ({other:?}); funding at the relay floor"
                     );
                     MIN_RELAY_FEE_RATE

@@ -21,7 +21,7 @@ use bitcoind::bitcoincore_rpc::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::{BlockRef, Blockchain, WatchEvent};
+use super::{BlockRef, Blockchain, FeePriority, WatchEvent};
 use crate::{lock_debug, wallet::error::WalletError};
 
 /// Configuration for connecting to a Bitcoin Core node via JSON-RPC + ZMQ.
@@ -448,8 +448,8 @@ impl Blockchain for CoreRPC {
             .list_transactions(label, count, skip, include_watchonly)?)
     }
 
-    fn estimate_feerate(&self, conf_target: u16) -> Result<f64, WalletError> {
-        let res = self.rpc.estimate_smart_fee(conf_target, None)?;
+    fn estimate_feerate(&self, priority: FeePriority) -> Result<f64, WalletError> {
+        let res = self.rpc.estimate_smart_fee(priority as u16, None)?;
         let per_kvb = res.fee_rate.ok_or_else(|| {
             WalletError::General(format!("no estimate: {:?}", res.errors.unwrap_or_default()))
         })?;
@@ -621,8 +621,11 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(core.estimate_feerate(2).unwrap(), 20.0);
-        let err = format!("{:?}", core.estimate_feerate(144).unwrap_err());
+        assert_eq!(core.estimate_feerate(FeePriority::Urgent).unwrap(), 20.0);
+        let err = format!(
+            "{:?}",
+            core.estimate_feerate(FeePriority::Economy).unwrap_err()
+        );
         assert!(err.contains("Insufficient data"), "{}", err);
         server.join().unwrap();
     }

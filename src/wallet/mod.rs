@@ -23,7 +23,7 @@ pub use api::{
 pub use backup::WalletBackup;
 pub use blockchain::{
     AnyBlockchain, BackendConfig, Blockchain, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
-    HdOrigin,
+    FeePriority, HdOrigin,
 };
 pub use deniability::{verify_deniability, DeniabilityProof, DeniabilityProofData};
 pub use error::WalletError;
