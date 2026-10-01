@@ -76,10 +76,7 @@ fn test_legacy_hashlock_recovery() {
 
     // The point of the test: the preimage was on-chain, so recovery must have
     // gone through the hashlock branch, not the timelock one.
-    let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("Signing legacy hashlock spend with preimage", &log_path);
+    assert_logged!(world, "Signing legacy hashlock spend with preimage");
 
     // The hashlock sweep is a separate tx per contract, so the taker pays more
     // than the 4339 sats a clean legacy swap costs.

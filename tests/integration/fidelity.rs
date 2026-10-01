@@ -129,13 +129,10 @@ fn test_fidelity_creation() {
 
     thread::sleep(Duration::from_secs(6));
 
-    let log_path = world.taker_log_path();
-    world
-        .framework()
-        .assert_log("Send at least 0.01001909 BTC to", &log_path);
-    world.framework().assert_log(
-        "(fidelity bond + fees + minimum swap liquidity) to be visible in the market",
-        &log_path,
+    assert_logged!(world, "Send at least 0.01001909 BTC to");
+    assert_logged!(
+        world,
+        "(fidelity bond + fees + minimum swap liquidity) to be visible in the market"
     );
 
     log::info!("Sending exactly the quoted amount");
@@ -150,9 +147,7 @@ fn test_fidelity_creation() {
     let _ = maker_thread.join().unwrap();
 
     // Assert that successful fidelity bond creation is logged
-    world
-        .framework()
-        .assert_log("Successfully created fidelity bond", &log_path);
+    assert_logged!(world, "Successfully created fidelity bond");
 
     log::info!("Verifying first fidelity bond creation");
     // Verify that the fidelity bond is created correctly.
@@ -222,7 +217,7 @@ fn test_fidelity_creation() {
     restarted.shutdown.store(true, Relaxed);
     let _ = restarted_thread.join().unwrap();
     assert_eq!(
-        std::fs::read_to_string(&log_path)
+        std::fs::read_to_string(world.taker_log_path())
             .unwrap()
             .matches("No active Fidelity Bonds found. Creating one.")
             .count(),
@@ -1097,10 +1092,10 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
 
     // The restart must detect the eviction and rebroadcast the stored raw
     // transaction, which reproduces the original txid.
-    wait_for_log(
-        &log_path,
+    wait_logged!(
+        world,
         "evicted from mempool?); rebroadcasting",
-        Duration::from_secs(120),
+        Duration::from_secs(120)
     );
     assert!(
         new_bitcoind.client.get_mempool_entry(&bond_txid).is_ok(),
@@ -1322,10 +1317,10 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum() {
         let _ = start_server(restarted_clone);
     });
 
-    wait_for_log(
-        &log_path,
+    wait_logged!(
+        world,
         "evicted from mempool?); rebroadcasting",
-        Duration::from_secs(120),
+        Duration::from_secs(120)
     );
     assert!(
         new_bitcoind.client.get_mempool_entry(&bond_txid).is_ok(),

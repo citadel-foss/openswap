@@ -128,15 +128,9 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
         .read()
         .unwrap()
         .get_incoming_swapcoins_count();
-    world
-        .framework()
-        .assert_log("Incomplete swaps detected on startup", &log_path);
-    world
-        .framework()
-        .assert_log("recover_from_swap started", &log_path);
-    world
-        .framework()
-        .assert_log("Removed outgoing swapcoin", &log_path);
+    assert_logged!(world, "Incomplete swaps detected on startup");
+    assert_logged!(world, "recover_from_swap started");
+    assert_logged!(world, "Removed outgoing swapcoin");
     let log_contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         !log_contents.contains("Funding was never broadcast for swap"),

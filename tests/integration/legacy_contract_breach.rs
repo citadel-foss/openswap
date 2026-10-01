@@ -146,6 +146,5 @@ fn test_legacy_breach_before_handover() {
 
 /// The maker refused because of the breach, not for any other reason.
 fn assert_breach_refused(world: &World) {
-    let log_path = world.taker_log_path();
-    world.framework().assert_log("ContractBroadcast", &log_path);
+    assert_logged!(world, "ContractBroadcast");
 }

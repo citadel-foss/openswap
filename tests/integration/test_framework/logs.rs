@@ -7,6 +7,7 @@ use std::{
 
 /// Poll a log file until `expected` appears; panics after `timeout`.
 #[allow(dead_code)]
+#[track_caller]
 pub(crate) fn wait_for_log(log_path: &str, expected: &str, timeout: Duration) {
     let start = Instant::now();
     loop {
@@ -30,6 +31,7 @@ pub(crate) fn wait_for_log(log_path: &str, expected: &str, timeout: Duration) {
 /// Use when the needle can already sit in the file from an earlier phase
 /// (fidelity-setup sightings look identical to swap-funding sightings).
 #[allow(dead_code)]
+#[track_caller]
 pub(crate) fn wait_for_new_log(log_path: &str, expected: &str, timeout: Duration) {
     let start = Instant::now();
     let offset = fs::metadata(log_path).map(|m| m.len()).unwrap_or(0);

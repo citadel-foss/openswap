@@ -239,7 +239,6 @@ fn electrum_sweeps_after_breach() {
     world.mine(1);
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
-    let log_path = world.taker_log_path();
     let summary = world
         .taker_mut()
         .prepare(swap_params)
@@ -252,10 +251,10 @@ fn electrum_sweeps_after_breach() {
     );
 
     // Three incoming contracts, all swept: the loop tallies them in one line.
-    wait_for_log(
-        &log_path,
+    wait_logged!(
+        world,
         "Recovery loop: swept 3 incoming swapcoins",
-        Duration::from_secs(180),
+        Duration::from_secs(180)
     );
     // The log line only proves the sweeps were broadcast. Confirm them and
     // check the money actually landed, otherwise a wrong-amount sweep passes.
@@ -350,7 +349,6 @@ fn electrum_discards_only_on_confirmed_spend() {
 
     world.mine(1);
 
-    let log_path = world.taker_log_path();
     let summary = world
         .taker_mut()
         .prepare(swap_params)
@@ -364,10 +362,10 @@ fn electrum_discards_only_on_confirmed_spend() {
 
     // The cascade: taker sweeps its incoming, maker 1 extracts the preimage
     // and sweeps its incoming, then maker 0 announces it will sweep too.
-    wait_for_log(
-        &log_path,
+    wait_logged!(
+        world,
         "All preimages known, recovering via hashlock path",
-        Duration::from_secs(300),
+        Duration::from_secs(300)
     );
 
     // Hold the chain still: maker 0's hashlock sweep of the taker's outgoing
