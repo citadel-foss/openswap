@@ -9,7 +9,6 @@
 use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
-    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
@@ -208,9 +207,22 @@ fn dummy_watch(vout: u32) -> bitcoin::OutPoint {
     }
 }
 
-fn cleanup(root_dir: &Path) {
+/// Stops the forwarder, electrs and bitcoind, then deletes the test's data.
+/// Deleting while bitcoind still ran let its shutdown write the datadir back.
+fn cleanup(s: Setup) {
+    let Setup {
+        bitcoind,
+        _electrsd,
+        forwarder,
+        root_dir,
+    } = s;
+    drop(forwarder);
+    // electrs polls bitcoind, so it goes first.
+    drop(_electrsd);
+    // A persistent-datadir BitcoinD stops the node and waits for it on drop.
+    drop(bitcoind);
     if root_dir.exists() {
-        let _ = std::fs::remove_dir_all(root_dir);
+        let _ = std::fs::remove_dir_all(&root_dir);
     }
 }
 
@@ -251,7 +263,7 @@ fn held_connection_is_reused_across_calls() {
     );
 
     drop(electrum);
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
 
 /// A sync asks only about scripts the server reported changed, yet still sees a
@@ -321,7 +333,7 @@ fn a_sync_asks_only_about_changed_scripts() {
     wait_for(&|u| u.len() == 2);
 
     drop(electrum);
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
 
 /// A watcher with nothing subscribed has nothing to read, so it sends nothing;
@@ -351,7 +363,7 @@ fn an_idle_watcher_sends_nothing() {
     assert_eq!(requests() - before, 1, "a watching watcher should ping");
 
     drop(electrum);
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
 
 /// A subscribe the client refuses must not fail the sync. Here the watcher left
@@ -396,7 +408,7 @@ fn a_refused_subscribe_still_answers_the_sync() {
     assert_eq!(electrum.reconnect_count(), 1);
 
     drop(electrum);
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
 
 /// Wait for electrs to index up to bitcoind's tip, polling over the connection
@@ -498,7 +510,7 @@ fn confirmed_spend_requires_an_input_consuming_the_outpoint() {
     );
 
     drop(electrum);
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
 
 /// A broken socket in front of a live server must be bridged, not surfaced.
@@ -542,7 +554,7 @@ fn a_shared_script_stays_subscribed_until_the_last_watcher_goes() {
 
     drop(electrum);
     let _ = &s.bitcoind;
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
 
 #[test]
@@ -597,7 +609,7 @@ fn reconnects_after_the_connection_drops() {
 
     drop(electrum);
     let _ = &s.bitcoind;
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
 
 /// The opening connect retries too, so a circuit that is still settling does not
@@ -625,7 +637,7 @@ fn connect_retries_until_the_server_answers() {
         .expect("tip after retried connect");
 
     drop(electrum);
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
 
 /// A server that never answers must fail at connect with the dedicated variant.
@@ -645,7 +657,7 @@ fn connect_gives_up_with_unreachable() {
         other => panic!("expected ElectrumUnreachable, got {:?}", other.map(|_| ())),
     }
 
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
 
 /// When the server really is gone, fail with the dedicated variant rather than a
@@ -671,7 +683,7 @@ fn unreachable_server_reports_exhausted_attempts() {
     }
 
     drop(electrum);
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
 
 /// Proves shutdown interrupts an active Electrum retry before the caller joins.
@@ -700,5 +712,5 @@ fn shutdown_interrupts_an_active_retry_and_allows_join() {
         .expect("Electrum call did not stop after shutdown");
     assert!(matches!(result, Err(WalletError::Interrupted(_))));
     handle.join().expect("Electrum caller thread panicked");
-    cleanup(&s.root_dir);
+    cleanup(s);
 }
