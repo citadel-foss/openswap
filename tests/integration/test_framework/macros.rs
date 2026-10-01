@@ -1,8 +1,15 @@
 //! Macros that generate test items around hand-written scenario bodies.
 //!
-//! They reach the whole suite through `#[macro_use] mod test_framework;` in
-//! `main.rs`. Neither generates test logic: a scenario body is a plain
-//! generic function, and a matrix row only names it.
+//! The `macro_rules!` ones reach the whole suite through
+//! `#[macro_use] mod test_framework;` in `main.rs`; `world_test` arrives with
+//! `use super::test_framework::*;`. None generates test logic: a scenario body
+//! is a plain function, and a matrix row only names it.
+
+/// `#[world_test(..)]`: one `#[test]` from a declared world, its setup steps
+/// and a body, which keeps its name. Rust only defines attribute macros in a
+/// `proc-macro` crate, so the code lives in `tests/macros`; see its docs for
+/// the keys and the expansion.
+pub use openswap_test_macros::world_test;
 
 /// Returns from the enclosing test unless the Tor integration tests are
 /// enabled, i.e. `if !tor_it_enabled() { return; }`.

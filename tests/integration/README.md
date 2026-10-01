@@ -42,10 +42,11 @@ test_framework/   the harness; nothing in here is a test
   world.rs        TestFramework::init: starts the processes, builds takers/makers
   harness.rs      World, WorldBuilder, MakerHandle, TakerHandle, the steps
   expect.rs       BalanceExpect: which balance fields a test asserts
-  macros.rs       swap_matrix!, tor_gate!
+  macros.rs       swap_matrix!, tor_gate!, and the world_test re-export
   actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
 scenarios/        bodies shared by tests in more than one file
 *.rs              the tests, one file per scenario
+../macros/        the #[world_test] proc-macro crate (attribute macros need their own crate)
 ```
 
 ## Writing a test
@@ -93,6 +94,39 @@ fn maker_abort3_case2() {
     world.finish();
 }
 ```
+
+When the test builds its own world, declare it with `#[world_test]` instead
+and write only the scenario. It expands to the same builder chain, the setup
+steps in the order listed, a call to the body and `world.finish()`:
+
+```rust
+/// A taker holding a single UTXO cannot fund 2 splits, ...
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(1) as baseline,
+        fund_makers_default(),
+        start_makers(120),
+        mine(1),
+    ],
+)]
+fn one_utxo_taker_completes_degraded_swap(world: &mut World, baseline: Amount) {
+    // the scenario only
+}
+```
+
+- The test keeps the body's name, so `TESTS.golden` does not change.
+- `backend` is required. Every other key except `setup` calls the builder
+  method of the same name (`check_blocklist`, `fee_overrides = ..`); `makers`
+  is the length of a `maker_behaviors` list when omitted. Behaviors are
+  written without the `MakerBehavior::` / `TakerBehavior::` prefix.
+- `setup` steps are `World` methods; `step(..) as x` passes the result to the
+  body parameter `x`. Do not end the body with `world.finish()`.
+- The body stays a normal fn, so rustfmt and rust-analyzer still work on it.
+  Bodies shared between tests (`scenarios/`, `swap_matrix!`) keep building
+  their world themselves.
 
 The pieces:
 
