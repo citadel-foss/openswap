@@ -624,4 +624,22 @@ impl TakerHandle {
     pub fn start(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
         self.taker.start_swap(swap_id)
     }
+
+    /// [`prepare`](Self::prepare) then [`start`](Self::start) the prepared
+    /// swap; an error from either stage is returned.
+    pub fn swap(&mut self, params: SwapParams) -> Result<TakerReport, TakerError> {
+        let summary = self.prepare(params)?;
+        self.start(&summary.swap_id)
+    }
+
+    /// Prepares a swap, which must succeed, and starts it, which must fail
+    /// for the stated `reason`; returns the start error.
+    #[track_caller]
+    pub fn swap_fails(&mut self, params: SwapParams, reason: &str) -> TakerError {
+        let summary = self.prepare(params).expect("prepare_swap should succeed");
+        match self.start(&summary.swap_id) {
+            Ok(_) => panic!("{}", reason),
+            Err(err) => err,
+        }
+    }
 }

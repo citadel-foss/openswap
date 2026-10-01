@@ -207,13 +207,9 @@ fn test_separated_utxo_coin_selection() {
         .with_tx_count(1)
         .with_required_confirms(1);
 
-    let summary = world
-        .taker_mut()
-        .prepare(swap_params)
-        .expect("prepare_swap should succeed");
     world
         .taker_mut()
-        .start(&summary.swap_id)
+        .swap(swap_params)
         .expect("openswap should succeed");
 
     // Sync both maker wallets
@@ -424,13 +420,9 @@ fn test_manual_coinselection() {
         .with_required_confirms(1)
         .with_utxos(manually_selected_utxos.clone());
 
-    let summary = world
-        .taker_mut()
-        .prepare(swap_params)
-        .expect("prepare_swap should succeed");
     world
         .taker_mut()
-        .start(&summary.swap_id)
+        .swap(swap_params)
         .expect("the swap must complete funded only by the selected coins");
 
     // After Swap is done, wait for maker threads to conclude.
@@ -708,13 +700,9 @@ fn run_degraded_split_swap(protocol: ProtocolVersion) {
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
         .with_tx_count(3)
         .with_required_confirms(1);
-    let summary = world
-        .taker_mut()
-        .prepare(swap_params)
-        .expect("prepare swap");
     world
         .taker_mut()
-        .start(&summary.swap_id)
+        .swap(swap_params)
         .expect("swap must complete with degraded splits");
 
     let taker_balance = world.taker().balances();

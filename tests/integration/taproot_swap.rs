@@ -37,13 +37,9 @@ fn test_taproot_openswap(
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
     // Prepare and execute the swap
-    let summary = world
-        .taker_mut()
-        .prepare(swap_params)
-        .expect("Failed to prepare Taproot openswap");
     world
         .taker_mut()
-        .start(&summary.swap_id)
+        .swap(swap_params)
         .expect("Taproot openswap should complete successfully");
     log::info!("Taproot openswap completed successfully!");
 
