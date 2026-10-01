@@ -4,7 +4,7 @@ use std::{
 };
 
 use bip39::rand;
-use bitcoin::{Address, Amount};
+use bitcoin::{absolute::LockTime, Address, Amount};
 use bitcoind::{
     bitcoincore_rpc::{self, Auth},
     BitcoinD,
@@ -16,7 +16,10 @@ use openswap::wallet::{
     Wallet, WalletBackup,
 };
 
-use openswap::security::{load_sensitive_struct, KeyMaterial, SecurityError, SerdeCbor, SerdeJson};
+use openswap::{
+    security::{load_sensitive_struct, KeyMaterial, SecurityError, SerdeCbor, SerdeJson},
+    utill::MIN_RELAY_FEE_RATE,
+};
 
 use super::test_framework::{
     generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
@@ -80,6 +83,21 @@ fn send_and_mine(
     Ok(())
 }
 
+/// Locks a bond the way a maker does, OP_RETURN included. A backup holds only
+/// the seed, so the restore must find this bond on-chain.
+fn create_maker_bond(wallet: &mut Wallet) {
+    let (tip, _) = wallet.chain_tip().unwrap();
+    wallet
+        .create_fidelity(
+            Amount::from_btc(0.02).unwrap(),
+            LockTime::from_height(tip as u32 + 950).unwrap(),
+            Some("127.0.0.1:6102"),
+            MIN_RELAY_FEE_RATE,
+            AddressType::P2TR,
+        )
+        .unwrap();
+}
+
 /// Asserts the wallet file on disk is genuinely encrypted with the given
 /// passphrase: it must be an encrypted container, reject a wrong password,
 /// and open with the correct one. (The missing-password `PasswordRequired`
@@ -128,6 +146,10 @@ fn encwallet_encbackup_encrestore() {
     send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
 
     let _ = wallet.backup(&wallet_backup_file, km.clone());
+
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    create_maker_bond(&mut wallet);
+    generate_blocks(&bitcoind, 1);
 
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
     send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
@@ -237,6 +259,10 @@ fn encwallet_encbackup_encrestore_electrum() {
     wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
 
     wallet.backup(&s.backup_file, km.clone()).unwrap();
+
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    create_maker_bond(&mut wallet);
+    generate_blocks(&s.bitcoind, 1);
 
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
     send_and_mine(&mut s.bitcoind, &addr, 0.05, 1).unwrap();

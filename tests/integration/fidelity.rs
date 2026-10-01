@@ -5,6 +5,7 @@
 //! - The Maker starts with insufficient funds to create a fidelity bond (0.04 BTC),
 //!   triggering log messages requesting more funds.
 //! - Once provided with sufficient funds (1 BTC), the Maker creates the first fidelity bond (0.05 BTC).
+//! - The Maker is restored from a seed-only backup and must find that bond again.
 //! - A second fidelity bond (0.08 BTC) is created and its higher value is verified.
 //! - The test simulates bond maturity by advancing the blockchain height and redeems them sequentially,
 //!   verifying correct balances and proper bond status updates after redemption.
@@ -16,9 +17,13 @@ use bitcoin::{absolute::LockTime, Amount, Txid};
 use bitcoind::bitcoincore_rpc::{Auth, RpcApi};
 use openswap::{
     maker::{start_server, MakerServer, MakerServerConfig},
+    security::KeyMaterial,
     taker::TakerBehavior,
     utill::MIN_RELAY_FEE_RATE,
-    wallet::{AddressType, Blockchain, CoreRPC, CoreRpcConfig, Destination, ElectrumConfig},
+    wallet::{
+        AddressType, Blockchain, CoreRPC, CoreRpcConfig, Destination, ElectrumConfig, Wallet,
+        WalletBackup,
+    },
 };
 
 use super::test_framework::*;
@@ -197,6 +202,39 @@ fn test_fidelity_creation() {
 
         bond.lock_time.to_consensus_u32()
     };
+
+    // ----- Restore the maker from a backup and restart it -----
+    // A backup holds only the seed, so the restarted maker must find its bond
+    // on-chain instead of locking a second one.
+    let bond_txid = maker.wallet.read().unwrap().get_fidelity_bonds()[0]
+        .outpoint()
+        .txid;
+    let backup = WalletBackup::from(&*maker.wallet.read().unwrap());
+    let config = maker_restart_config(maker);
+    let wallet_path = config.data_dir.join("wallets").join(&config.wallet_name);
+    std::fs::remove_file(&wallet_path).unwrap();
+    Wallet::restore(
+        &backup,
+        &wallet_path,
+        &config.backend,
+        KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap(),
+    )
+    .unwrap();
+    let restarted = Arc::new(MakerServer::init(config).unwrap());
+    let restarted_clone = restarted.clone();
+    let restarted_thread = thread::spawn(move || start_server(restarted_clone));
+    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+    assert_single_adopted_bond(&restarted, bond_txid);
+    restarted.shutdown.store(true, Relaxed);
+    let _ = restarted_thread.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&log_path)
+            .unwrap()
+            .matches("No active Fidelity Bonds found. Creating one.")
+            .count(),
+        1,
+        "the restored maker must not create a second bond"
+    );
 
     log::info!("Creating second fidelity bond with higher amount");
     fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);

@@ -4135,6 +4135,12 @@ impl Wallet {
     ) -> Result<(), WalletError> {
         log::info!("Sync Started for {:?}", self.store.file_name);
         self.sync_no_fail(shutdown)?;
+        // A backup carries no bond records. Rebuild them, then rescan from the
+        // birthday so Core finds their coins.
+        if self.restore_scan && self.recover_fidelity_bonds()? {
+            self.store.last_synced_height = None;
+            self.sync_no_fail(shutdown)?;
+        }
         self.save_to_disk()?;
         self.restore_scan = false;
         log::info!("Synced & Saved {:?}", self.store.file_name);
@@ -4805,6 +4811,10 @@ mod restore_history_probe_tests {
         let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
         let genesis_hash = genesis.block_hash().to_string();
         let header_hex = serialize_hex(&genesis.header);
+        // Restore lists the history's transactions, so the stub must serve one.
+        let history_tx = genesis.txdata[0].clone();
+        let history_txid = history_tx.compute_txid().to_string();
+        let history_tx_hex = serialize_hex(&history_tx);
 
         thread::spawn(move || {
             for incoming in listener.incoming() {
@@ -4813,6 +4823,7 @@ mod restore_history_probe_tests {
                 // delay to every single one of them.
                 let _ = stream.set_nodelay(true);
                 let (hash, header) = (genesis_hash.clone(), header_hex.clone());
+                let (txid, tx_hex) = (history_txid.clone(), history_tx_hex.clone());
                 let known = with_history.clone();
                 thread::spawn(move || {
                     let mut out = stream.try_clone().expect("clone stub stream");
@@ -4838,12 +4849,13 @@ mod restore_history_probe_tests {
                             "blockchain.scripthash.get_history" => {
                                 let sh = req["params"][0].as_str().unwrap_or_default();
                                 if known.contains(sh) {
-                                    json!([{"height": 1, "tx_hash": Txid::all_zeros().to_string()}])
+                                    json!([{"height": 1, "tx_hash": txid}])
                                 } else {
                                     json!([])
                                 }
                             }
                             "blockchain.scripthash.listunspent" => json!([]),
+                            "blockchain.transaction.get" => json!(tx_hex),
                             _ => json!(Value::Null),
                         };
                         let resp = json!({"jsonrpc": "2.0", "id": id, "result": result});

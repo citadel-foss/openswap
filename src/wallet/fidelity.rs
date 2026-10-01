@@ -2,6 +2,7 @@ use crate::{
     protocol::common_messages::FidelityProof,
     utill::redeemscript_to_scriptpubkey,
     wallet::{infer_address_type, AddressType, Blockchain, Wallet},
+    watch_tower::utils::{extract_op_return_data, parse_fidelity_op_return},
 };
 use bitcoin::{
     absolute::LockTime,
@@ -13,8 +14,10 @@ use bitcoin::{
     secp256k1::{Keypair, Message, Secp256k1},
     Address, Amount, OutPoint, PublicKey, ScriptBuf, Transaction, Txid,
 };
+use bitcoind::bitcoincore_rpc::json::GetTransactionResultDetailCategory;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -736,6 +739,70 @@ impl Wallet {
         let onion = onion.strip_suffix(".onion").unwrap_or(onion);
         let payload = format!("{onion}#{locktime_height}");
         Ok(payload.into_bytes().into_boxed_slice())
+    }
+
+    /// Rebuilds the bond records a backup does not carry, from the wallet's own
+    /// sends: the OP_RETURN gives the locktime, the seed gives the key per index.
+    pub(crate) fn recover_fidelity_bonds(&mut self) -> Result<bool, WalletError> {
+        // Only our own send can fund a bond; anyone can pay us a lookalike.
+        let txids: HashSet<Txid> = self
+            .blockchain
+            .list_transactions(None, Some(i32::MAX as usize), None, Some(true))?
+            .into_iter()
+            .filter(|entry| {
+                entry.detail.vout == 0
+                    && matches!(
+                        entry.detail.category,
+                        GetTransactionResultDetailCategory::Send
+                    )
+            })
+            .map(|entry| entry.info.txid)
+            .collect();
+        let mut candidates = Vec::new();
+        for txid in txids {
+            let tx = self.blockchain.get_raw_transaction(&txid, None)?;
+            let lock_time = tx
+                .output
+                .get(1)
+                .and_then(|out| extract_op_return_data(out.script_pubkey.as_bytes()))
+                .and_then(parse_fidelity_op_return)
+                .and_then(|announcement| {
+                    LockTime::from_height(announcement.expires_at_height).ok()
+                });
+            if let Some(lock_time) = lock_time {
+                candidates.push((tx, lock_time));
+            }
+        }
+
+        // Bond positions must equal their index, so stop at the first index
+        // no transaction pays to.
+        let found = self.store.fidelity_bond.len();
+        'next_index: loop {
+            for (tx, lock_time) in &candidates {
+                let (bond_index, address, pubkey) = self.get_next_fidelity_address(*lock_time)?;
+                let bond_out = &tx.output[0];
+                if bond_out.script_pubkey != address.script_pubkey() {
+                    continue;
+                }
+                let outpoint = OutPoint::new(tx.compute_txid(), 0);
+                let is_spent = self
+                    .blockchain
+                    .is_confirmed_spend(&outpoint, &bond_out.script_pubkey)?;
+                // Left unconfirmed with its tx, so maker startup fills in the height.
+                self.store.fidelity_bond.push(FidelityBond {
+                    outpoint,
+                    amount: bond_out.value,
+                    lock_time: *lock_time,
+                    pubkey,
+                    conf_height: None,
+                    is_spent,
+                    bond_index,
+                    tx: Some(tx.clone()),
+                });
+                continue 'next_index;
+            }
+            return Ok(self.store.fidelity_bond.len() > found);
+        }
     }
 }
 

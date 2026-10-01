@@ -183,10 +183,10 @@ impl Wallet {
     /// genesis, and the effective start may be up to 2h of blocks later. Electrum
     /// ignores it and never rescans.
     ///
-    /// Recovers exactly what a [`WalletBackup`] file does: HD funds, including
-    /// already-swept swap coins — though those lose the label that keeps them out of
-    /// the regular coin pool. Live swap keys are per-swap `OsRng` and unrecoverable
-    /// from any seed.
+    /// Recovers exactly what a [`WalletBackup`] file does: HD funds, fidelity bonds
+    /// and already-swept swap coins — though swap coins lose the label that keeps
+    /// them out of the regular coin pool. Live swap keys are per-swap `OsRng` and
+    /// unrecoverable from any seed.
     pub fn restore_from_mnemonic(
         phrase: &str,
         wallet_path: &Path,

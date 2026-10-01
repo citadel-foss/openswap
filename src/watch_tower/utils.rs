@@ -43,7 +43,7 @@ pub struct FidelityAnnouncement {
     pub expires_at_height: u32,
 }
 
-fn extract_op_return_data(script: &[u8]) -> Option<&[u8]> {
+pub(crate) fn extract_op_return_data(script: &[u8]) -> Option<&[u8]> {
     if script.first()? != &0x6a {
         return None; // OP_RETURN
     }
@@ -126,7 +126,7 @@ fn normalize_onion_address(s: &str) -> Option<String> {
     }
 }
 
-fn parse_fidelity_op_return(data: &[u8]) -> Option<FidelityAnnouncement> {
+pub(crate) fn parse_fidelity_op_return(data: &[u8]) -> Option<FidelityAnnouncement> {
     let decoded = std::str::from_utf8(data).ok()?;
     let (endpoint, locktime_str) = decoded.split_once('#')?;
     if locktime_str.is_empty()
