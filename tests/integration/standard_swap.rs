@@ -317,7 +317,7 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     });
 
     // "confirmation(s) on tx" is logged only by the maker's wait_for_tx_on_chain.
-    wait_for_log(&log_path, "confirmation(s) on tx", Duration::from_secs(120));
+    wait_logged!(world, "confirmation(s) on tx", Duration::from_secs(120));
 
     // Hold the block past the maker's 30s idle timeout so an idle-drain pass
     // (every 3s) fires while the handler is parked: only the wait's activity

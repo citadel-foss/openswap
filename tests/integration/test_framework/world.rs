@@ -89,6 +89,7 @@ impl TestFramework {
     }
 
     /// Assert that a log message exists in the debug.log file
+    #[track_caller]
     pub fn assert_log(&self, expected_message: &str, log_path: &str) {
         match std::fs::read_to_string(log_path) {
             Ok(log_contents) => {

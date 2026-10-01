@@ -75,11 +75,10 @@ fn test_taproot_taker_abort1() {
     world.taker().inner().log_tracker_state();
 
     // The accepted-but-unfunded swap must be dropped without requiring a restart.
-    let log_path = world.taker_log_path();
-    wait_for_log(
-        &log_path,
+    wait_logged!(
+        world,
         "Released idle unfunded swap",
-        Duration::from_secs(60),
+        Duration::from_secs(60)
     );
     let release_deadline = std::time::Instant::now() + Duration::from_secs(15);
     while world
