@@ -124,13 +124,9 @@ fn run_disabled_blocklist(protocol: ProtocolVersion) {
     let params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
         .with_tx_count(1)
         .with_required_confirms(1);
-    let summary = world
-        .taker_mut()
-        .prepare(params)
-        .expect("prepare_swap should succeed");
     world
         .taker_mut()
-        .start(&summary.swap_id)
+        .swap(params)
         .expect("a populated blocklist must be ignored when checking is disabled");
 
     world.finish();
@@ -190,13 +186,9 @@ fn run_maker_rejection(protocol: ProtocolVersion) {
     let params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
         .with_tx_count(1)
         .with_required_confirms(1);
-    let summary = world
-        .taker_mut()
-        .prepare(params)
-        .expect("prepare_swap should succeed");
-    assert!(
-        world.taker_mut().start(&summary.swap_id).is_err(),
-        "the first maker must reject funding from the blocked source address"
+    world.taker_mut().swap_fails(
+        params,
+        "the first maker must reject funding from the blocked source address",
     );
 
     for (maker, spendable_before) in world.makers().iter().zip(maker_spendable_before) {

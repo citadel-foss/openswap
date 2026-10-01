@@ -164,13 +164,9 @@ fn maker_recovers_swap_past_refund_deadline() {
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
         .with_tx_count(1)
         .with_required_confirms(1);
-    let summary = world
-        .taker_mut()
-        .prepare(swap_params)
-        .expect("Legacy prepare_swap should succeed");
-    assert!(
-        world.taker_mut().start(&summary.swap_id).is_err(),
-        "The swap must fail once the maker gives up on it"
+    world.taker_mut().swap_fails(
+        swap_params,
+        "The swap must fail once the maker gives up on it",
     );
 
     let log_path = world.taker_log_path();
