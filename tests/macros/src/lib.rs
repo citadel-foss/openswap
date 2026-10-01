@@ -52,6 +52,8 @@
 //! - The body's first parameter receives the world; every later parameter
 //!   must be bound by a setup step of the same name.
 //! - The test is named after the body, which keeps its name when converted.
+//! - Once the world is built, the test logs `Running Test: <name> - <first
+//!   doc line>`, so the body needs no `warn!("Running Test: ...")` of its own.
 
 use std::collections::HashSet;
 
@@ -195,6 +197,7 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
     let attrs = std::mem::take(&mut body.attrs);
     body.vis = syn::Visibility::Inherited;
     let name = body.sig.ident.clone();
+    let running = running_line(&name, &attrs);
     let step_stmts = steps.iter().map(|step| {
         let call = &step.call;
         match &step.binding {
@@ -211,11 +214,31 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
             let mut #world = crate::test_framework::World::builder::<#backend>()
                 #(#builder_calls)*
                 .build();
+            // After build: the framework sets the logger up.
+            ::log::warn!("{}", #running);
             #(#step_stmts)*
             #name(&mut #world, #(#call_args),*);
             #world.finish();
         }
     })
+}
+
+/// `Running Test: <name> - <first doc line>`, or just the name without docs.
+fn running_line(name: &Ident, attrs: &[syn::Attribute]) -> String {
+    let summary = attrs.iter().find_map(|attr| match &attr.meta {
+        Meta::NameValue(nv) if nv.path.is_ident("doc") => match &nv.value {
+            Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(doc),
+                ..
+            }) => Some(doc.value().trim().to_string()),
+            _ => None,
+        },
+        _ => None,
+    });
+    match summary {
+        Some(summary) if !summary.is_empty() => format!("Running Test: {name} - {summary}"),
+        _ => format!("Running Test: {name}"),
+    }
 }
 
 /// `backend = BitcoindBackend` arrives as a path expression; read it as a type.
@@ -320,6 +343,7 @@ mod tests {
             ". takers",
             ". check_blocklist ()",
             ". build ()",
+            "\"Running Test: scenario - Docs.\"",
             "let baseline = world . fund_taker_default (3)",
             "world . mine (1)",
             "scenario (& mut world , baseline)",
