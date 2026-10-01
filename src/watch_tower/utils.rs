@@ -14,7 +14,7 @@ use bitcoin::{
 use sha3::{Digest, Sha3_256};
 
 use crate::{
-    wallet::{MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK},
+    wallet::{MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK},
     watch_tower::{registry_storage::FileRegistry, watcher::Role, watcher_error::WatcherError},
 };
 
@@ -22,8 +22,6 @@ use crate::{
 const MAX_SEEN_TXIDS: usize = 5_000;
 /// Maximum payload size for a 56-byte onion label, `#`, and a 10-digit expiry height.
 const MAX_FIDELITY_ANNOUNCEMENT_BYTES: usize = 67;
-/// Minimum bond value accepted for maker discovery to prevent cheap dust-bond spam.
-const MIN_FIDELITY_BOND_AMOUNT_SATS: u64 = 10_000;
 
 /// Bounded deduplication.
 /// Combines HashSet for O(1) lookup with VecDeque for ordering.

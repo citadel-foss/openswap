@@ -30,7 +30,7 @@ socks_port = 9050
 control_port = 9051
 # Authentication password for Tor interface
 tor_auth_password =
-# Fidelity Bond amount in satoshis
+# Fidelity Bond amount in satoshis (must be at least 10000)
 fidelity_amount = 10000
 # Fidelity Bond timelock in blocks (must be between 12960 and 25920)
 fidelity_timelock = 15000
@@ -54,7 +54,7 @@ name = "default-maker"
 - `socks_port`: The Tor Socks Port.  Check the [tor doc](tor.md) for more details.
 - `control_port`: The Tor Control Port. Check the [tor doc](tor.md) for more details.
 - `tor_auth_password`: Optional password for Tor control authentication; empty by default.
-- `fidelity_amount`: Amount (in satoshis) locked as a fidelity bond to deter Sybil attacks. Defaults to 10,000 sats.
+- `fidelity_amount`: Amount (in satoshis) locked as a fidelity bond to deter Sybil attacks. Defaults to 10,000 sats, which is also the minimum; lower values are refused at startup, because takers drop announcements for bonds below that floor and the maker would never be discovered.
 - `fidelity_timelock`: Lock duration in block heights for the fidelity bond. Defaults to 15,000 blocks; must be within the accepted range of 12,960–25,920 blocks.
 - `fidelity_feerate`: Fee rate (in sats/vB) for the fidelity bond transaction. Defaults to 1.0, the relay minimum; lower values are clamped to it.
 - `base_fee`: A fixed fee charged by the Maker for providing its services (in satoshis).
