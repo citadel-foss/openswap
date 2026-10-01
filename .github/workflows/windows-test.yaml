@@ -1,0 +1,146 @@
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+name: windows-test
+
+# zizmor: default GITHUB_TOKEN permissions are broader than this job needs.
+permissions:
+  contents: read
+
+jobs:
+  # electrsd ships no Windows binary. nostr-rs-relay does not compile on
+  # Windows (Unix signals and cln-rpc), so tests use the in-process relay.
+  tools:
+    name: Build electrs
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-windows-electrs-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache electrs
+        id: daemon-cache
+        uses: actions/cache@v4
+        with:
+          path: tools-bin
+          key: win-electrs-0.10.10
+
+      # electrs 0.9.11 through 0.10.7 do not compile on Windows: src/signals.rs
+      # uses signal_hook::iterator and SIGUSR1, which are Unix-only. 0.10.8 is
+      # the first release with a Windows signal path. 0.10.10 is the newest
+      # 0.10.x; it still uses bitcoincore-rpc 0.19, whose `warnings` field
+      # accepts both a string and an array, so `-deprecatedrpc=warnings`
+      # (required by the Linux electrs 0.9.11 binary) still deserializes.
+      # Its rocksdb bindgen is 0.55 and rejects libclang 18, so this is Clang 13.
+      # The NuGet package is the DLL only; a full LLVM install is not required.
+      - name: Install libclang
+        if: steps.daemon-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP "libclang"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $zip = Join-Path $dest "libclang.zip"
+          curl.exe -fsSL -o $zip "https://api.nuget.org/v3-flatcontainer/libclang.runtime.win-x64/13.0.0/libclang.runtime.win-x64.13.0.0.nupkg"
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $dest "pkg")
+          $dll = Get-ChildItem -Recurse (Join-Path $dest "pkg") -Filter libclang.dll | Select-Object -First 1
+          if (-not $dll) { throw "libclang.dll was not in the NuGet package" }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$($dll.DirectoryName)"
+
+      - name: Install electrs 0.10.10
+        if: steps.daemon-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tools-bin
+          cargo install electrs --version 0.10.10 --locked --root "$RUNNER_TEMP/electrs-install"
+          cp "$RUNNER_TEMP/electrs-install/bin/electrs.exe" tools-bin/
+
+      - name: Upload electrs
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-daemons
+          path: tools-bin/electrs.exe
+          if-no-files-found: error
+
+  test:
+    name: Windows tests (Partition ${{ matrix.partition }}/${{ strategy.job-total }})
+    needs: tools
+    runs-on: windows-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-windows-test-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Download test daemons
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-test-daemons
+          path: tools-bin
+
+      # Pinned to the Bitcoin Core 28.1 SHA256SUMS entry for bitcoin-28.1-win64.zip.
+      - name: Download and verify Bitcoin Core
+        shell: pwsh
+        run: |
+          curl.exe -fsSL -o bitcoin-28.1-win64.zip https://bitcoincore.org/bin/bitcoin-core-28.1/bitcoin-28.1-win64.zip
+          $expected = "2d636ad562b347c96d36870d6ed810f4a364f446ca208258299f41048b35eab0"
+          $actual = (Get-FileHash bitcoin-28.1-win64.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "Bitcoin Core checksum mismatch: $actual" }
+          Add-Content -Path $env:GITHUB_ENV -Value "BITCOIND_TARBALL_FILE=$pwd\bitcoin-28.1-win64.zip"
+
+      - name: Setup nextest config
+        shell: bash
+        run: |
+          mkdir -p .config
+          cat <<'EOF' > .config/nextest.toml
+          [profile.default]
+          global-timeout = "1h"
+          slow-timeout = "3m"
+          EOF
+
+      # `--no-capture` would force each partition to run tests one at a time.
+      # `--test-threads=2` still caps how many bitcoind processes a 4-core
+      # runner starts. Ignored Tor tests are not included.
+      - name: Run tests
+        shell: bash
+        env:
+          ELECTRS_EXEC: ${{ github.workspace }}\tools-bin\electrs.exe
+        run: |
+          cargo nextest run --features integration-test \
+            --lib --bins --tests \
+            --retries 1 \
+            --max-fail 2:immediate \
+            --partition hash:${{ matrix.partition }}/${{ strategy.job-total }} \
+            --test-threads=2
