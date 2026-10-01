@@ -10,8 +10,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 list() {
+    # --color never: CI sets CARGO_TERM_COLOR=always, which nextest honours
+    # even when piped, and colored names never match the golden file.
     cargo nextest list --features integration-test --run-ignored all \
-        --message-format oneline | LC_ALL=C sort
+        --message-format oneline --color never | LC_ALL=C sort
 }
 
 if [ "${1:-}" = "--update" ]; then
