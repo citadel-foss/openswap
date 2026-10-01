@@ -130,6 +130,10 @@ fn test_fidelity_creation() {
 
     let log_path = test_framework.taker_log_path();
     test_framework.assert_log("Send at least 0.01001777 BTC to", &log_path);
+    test_framework.assert_log(
+        "(fidelity bond + fees + minimum swap liquidity) to be visible in the market",
+        &log_path,
+    );
 
     log::info!("Adding sufficient funds for fidelity bond creation");
     // Provide the Maker with more funds.

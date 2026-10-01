@@ -302,7 +302,7 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
 
   ```bash
   WARN openswap::maker::api - Insufficient funds to create fidelity bond.
-  INFO openswap::maker::api - Send at least 0.00011719 BTC to tb1p... (fidelity bond + fees + minimum swap liquidity)
+  INFO openswap::maker::api - Send at least 0.00011719 BTC to tb1p... (fidelity bond + fees + minimum swap liquidity) to be visible in the market
   INFO openswap::maker::api - Next sync in 10 secs
   ```
 

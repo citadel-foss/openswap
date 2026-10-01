@@ -1231,7 +1231,7 @@ impl MakerServer {
                                     (required - available).saturating_add(extra)
                                 });
                             log::info!(
-                                "Send at least {:.8} BTC to {:?} (fidelity bond + fees + minimum swap liquidity)",
+                                "Send at least {:.8} BTC to {:?} (fidelity bond + fees + minimum swap liquidity) to be visible in the market",
                                 Amount::from_sat(needed).to_btc(),
                                 addr
                             );
