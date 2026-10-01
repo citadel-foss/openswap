@@ -7,7 +7,7 @@
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
-    maker::{start_server, MakerBehavior},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{BanReason, BanRecord, MakerState, SwapParams, TakerBehavior},
 };
@@ -620,42 +620,32 @@ fn late_incoming_after_refund_is_never_swept() {
         MakerBehavior::WithholdFundingSilently,
     ];
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
 
     // The last maker's withheld contracts are the taker's incoming side. Grab
     // them mid-swap: its recovery drops them once the swap fails.
     let withheld = {
-        let (maker, swap_id) = (makers[1].clone(), summary.swap_id.clone());
+        let (maker, swap_id) = (world.makers()[1].inner().clone(), summary.swap_id.clone());
         let deadline = Instant::now() + Duration::from_secs(300);
         thread::spawn(move || loop {
             let txs = maker.outgoing_contract_txs(&swap_id).unwrap();
@@ -666,7 +656,7 @@ fn late_incoming_after_refund_is_never_swept() {
         })
     };
     assert!(
-        taker.start_swap(&summary.swap_id).is_err(),
+        world.taker_mut().start(&summary.swap_id).is_err(),
         "Swap must fail when the last maker withholds its funding"
     );
     let withheld = withheld.join().unwrap();
@@ -677,7 +667,9 @@ fn late_incoming_after_refund_is_never_swept() {
 
     // The taker drops an outgoing coin once its timelock refund is mined.
     let deadline = Instant::now() + Duration::from_secs(400);
-    while taker
+    while world
+        .taker()
+        .inner()
         .get_wallet()
         .read()
         .unwrap()
@@ -693,9 +685,9 @@ fn late_incoming_after_refund_is_never_swept() {
 
     info!("Taker refunded; publishing the withheld incoming contracts");
     for tx in &withheld {
-        bitcoind.client.send_raw_transaction(tx).unwrap();
+        world.bitcoind().client.send_raw_transaction(tx).unwrap();
     }
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // Several recovery passes, each of which would sweep a claimable coin.
     thread::sleep(Duration::from_secs(40));
@@ -703,7 +695,8 @@ fn late_incoming_after_refund_is_never_swept() {
         let txid = tx.compute_txid();
         for vout in 0..tx.output.len() as u32 {
             assert!(
-                bitcoind
+                world
+                    .bitcoind()
                     .client
                     .get_tx_out(&txid, vout, Some(false))
                     .unwrap()
@@ -716,7 +709,7 @@ fn late_incoming_after_refund_is_never_swept() {
     }
 
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !taker.is_recovery_complete() {
+    while !world.taker().inner().is_recovery_complete() {
         assert!(
             Instant::now() < deadline,
             "recovery kept waiting on an incoming it gave up"
@@ -724,7 +717,9 @@ fn late_incoming_after_refund_is_never_swept() {
         thread::sleep(Duration::from_secs(2));
     }
     assert_eq!(
-        taker
+        world
+            .taker()
+            .inner()
             .get_wallet()
             .read()
             .unwrap()
@@ -733,7 +728,6 @@ fn late_incoming_after_refund_is_never_swept() {
         "the given-up incoming coins must be cleaned up"
     );
 
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.shutdown_makers();
+    world.finish();
 }

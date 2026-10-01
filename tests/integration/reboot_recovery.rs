@@ -544,52 +544,42 @@ fn test_legacy_electrum_crash_after_contract_exchange() {
 fn test_taproot_maker_finishes_when_its_incoming_was_refunded() {
     warn!("Running Test: Maker Finishes When Its Incoming Was Refunded");
 
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            2,
-            vec![TakerBehavior::CrashBeforeRecovery],
-            vec![MakerBehavior::Normal, MakerBehavior::CrashBeforeRecovery],
-        );
+    let mut world = World::builder::<BitcoindBackend>()
+        .makers(2)
+        .maker_behaviors(vec![
+            MakerBehavior::Normal,
+            MakerBehavior::CrashBeforeRecovery,
+        ])
+        .takers(vec![TakerBehavior::CrashBeforeRecovery])
+        .build();
 
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    world.fund_taker_default(3);
+    world.fund_makers_default();
 
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-
-    let mut maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
+    world.start_makers(120);
 
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
     assert!(
-        taker.start_swap(&summary.swap_id).is_err(),
+        world.taker_mut().start(&summary.swap_id).is_err(),
         "Swap should fail because the taker crashes before finalization"
     );
 
-    let mut taker_config = taker.config().clone();
+    let mut taker_config = world.taker().inner().config().clone();
     taker_config.password = Some("integration-test".to_string());
 
     info!("Waiting for Maker1 to refund Maker2's incoming...");
     let deadline = Instant::now() + Duration::from_secs(400);
-    while makers[0]
+    while world.makers()[0]
+        .inner()
         .wallet
         .read()
         .unwrap()
@@ -604,10 +594,12 @@ fn test_taproot_maker_finishes_when_its_incoming_was_refunded() {
     }
 
     // The taker's claim is what first puts the preimage on chain.
-    drop(takers);
-    let restarted_taker = Taker::init(taker_config).expect("taker restart should succeed");
+    world.drop_takers();
+    world.adopt_taker(Taker::init(taker_config).expect("taker restart should succeed"));
     let deadline = Instant::now() + Duration::from_secs(120);
-    while restarted_taker
+    while world
+        .taker()
+        .inner()
         .get_wallet()
         .read()
         .unwrap()
@@ -621,12 +613,10 @@ fn test_taproot_maker_finishes_when_its_incoming_was_refunded() {
         thread::sleep(Duration::from_secs(2));
     }
 
-    let victim = makers[1].clone();
-    let mut victim_config = victim.config.clone();
+    let mut victim_config = world.makers()[1].inner().config.clone();
     victim_config.password = Some("integration-test".to_string());
-    victim.shutdown.store(true, Relaxed);
-    maker_threads.remove(1).join().unwrap();
-    drop(victim);
+    // Only Maker2 stops; Maker1 keeps running.
+    world.shutdown_maker(1);
 
     // A crash between a finish's wallet save and its tracker save: the record
     // still says recovering, and the wallet holds nothing for it.
@@ -686,10 +676,7 @@ fn test_taproot_maker_finishes_when_its_incoming_was_refunded() {
 
     restarted.shutdown.store(true, Relaxed);
     restarted_thread.join().unwrap();
-    shutdown_makers(&makers[..1], maker_threads);
-    drop(restarted_taker);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 /// A maker that reserved inputs for a funding it never sent must still hold

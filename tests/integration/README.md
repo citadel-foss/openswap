@@ -110,10 +110,12 @@ The pieces:
 - **Teardown**: `world.finish()` drops the takers, shuts the makers down,
   stops the framework and joins the block generator, in that order. `Drop` runs
   the same teardown when a test panics, so a failure cleans up too.
-- **Restarts**: `drop_takers`, `shutdown_makers`, `drop_makers`, then
-  `adopt_makers` / `adopt_taker` hand the re-initialised servers and takers back
-  to the world, which tears them down like the originals. `take_taker` moves a
-  taker out, e.g. into a swap thread.
+- **Restarts**: `restart_maker(i, timeout)` stops one maker and brings it back
+  from its own config; `shutdown_maker(i)` stops one while the rest keep
+  running. For a whole restart, `drop_takers`, `shutdown_makers`, `drop_makers`,
+  then `adopt_makers` / `adopt_taker` hand the re-initialised servers and takers
+  back to the world, which tears them down like the originals. `take_taker`
+  moves a taker out, e.g. into a swap thread.
 
 ## Balance expectations
 
@@ -176,5 +178,6 @@ own name and attributes; `tor_gate!()` in a row skips it unless
 - **Log messages are ASCII.**
 
 Not every test fits the world. `electrum_transport.rs` (a TCP forwarder),
-`wallet_backup.rs` (wallets only) and `taker_cli.rs` (a subprocess) keep their
-own harnesses; that is expected.
+`wallet_backup.rs` (wallets only), `taker_cli.rs` (a subprocess) and the
+`lightning_*.rs` tests (an LDK Server sidecar, behind the `lightning` feature)
+keep their own harnesses; that is expected.
