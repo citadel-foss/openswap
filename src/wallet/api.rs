@@ -5614,7 +5614,7 @@ mod mempool_deferral_tests {
                         || tx
                             .input
                             .iter()
-                            .any(|i| self.script_of(&i.previous_output).is_some_and(&matches))
+                            .any(|i| self.script_of(&i.previous_output).is_some_and(matches))
                 })
                 .map(|(txid, (_, height))| json!({"tx_hash": txid.to_string(), "height": height}))
                 .collect()

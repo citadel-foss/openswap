@@ -1224,9 +1224,9 @@ impl MakerServer {
                                     .blockchain
                                     .estimate_feerate(FeePriority::Urgent)
                                 {
-                                    Ok(rate) => rate.max(MIN_RELAY_FEE_RATE),
-                                    Err(e) => {
-                                        log::error!("Fee estimation for urgent priority failed, using the relay floor: {e:?}");
+                                    Ok(rate) if rate.is_finite() => rate.max(MIN_RELAY_FEE_RATE),
+                                    other => {
+                                        log::error!("Fee estimation for urgent priority failed, using the relay floor: {other:?}");
                                         MIN_RELAY_FEE_RATE
                                     }
                                 };
@@ -1239,13 +1239,14 @@ impl MakerServer {
                                 fee_at_rate_sats(unpriced_vsize, self.config.fidelity_feerate)
                                     .zip(funding_fee_policy_sats(1, 1, swap_feerate))
                                     .and_then(|(bond_fee, swap_fee)| {
-                                        bond_fee
+                                        (required - available)
+                                            .checked_add(bond_fee)?
                                             .checked_add(swap_fee)?
                                             .checked_add(min_swap_amount(&self.config))
                                     })
-                                    .map_or(u64::MAX, |extra| {
-                                        (required - available).saturating_add(extra)
-                                    });
+                                    .ok_or(MakerError::General(
+                                        "Fee settings cannot price the fidelity funding amount",
+                                    ))?;
                             log::info!(
                                 "Send at least {:.8} BTC to {:?} (fidelity bond + fees + minimum swap liquidity) to be visible in the market",
                                 Amount::from_sat(needed).to_btc(),
