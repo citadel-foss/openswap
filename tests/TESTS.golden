@@ -7,6 +7,7 @@ openswap maker::api::lightning_config_tests::lightning_settings_round_trip_throu
 openswap maker::api::tests::advertised_min_swap_is_the_smallest_passing_round_amount
 openswap maker::api::tests::init_rejects_zero_required_confirms
 openswap maker::api::tests::maker_config_checks_file_values
+openswap maker::api::tests::maker_config_rejects_fidelity_amount_below_the_discovery_floor
 openswap maker::api::tests::maker_init_refuses_bad_fee_pcts
 openswap maker::api::tests::shutdown_join_releases_pool_lock_and_drains_late_child
 openswap maker::api::tests::shutdown_signal_latches_request_and_rearms_backend_after_joins
