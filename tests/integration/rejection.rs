@@ -655,21 +655,19 @@ fn run_taproot_declaration_guard(behavior: TakerBehavior, expected: &str) {
 /// A taker holding a single UTXO cannot fund 2 splits, so negotiation plans
 /// hop 0 as one split and declares 1. The maker's "with 1 funding txs" log
 /// proves the declared count flowed through, and the swap still completes.
-#[test]
-fn one_utxo_taker_completes_degraded_swap() {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .maker_behaviors(vec![MakerBehavior::Normal])
-        .takers(vec![TakerBehavior::Normal])
-        .build();
-
-    // One UTXO, so the hop-0 plan must degrade below the requested tx_count.
-    world.fund_taker_default(1);
-    world.fund_makers_default();
-
-    world.start_makers(120);
-    world.mine(1);
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        // One UTXO, so the hop-0 plan must degrade below the requested tx_count.
+        fund_taker_default(1),
+        fund_makers_default(),
+        start_makers(120),
+        mine(1),
+    ],
+)]
+fn one_utxo_taker_completes_degraded_swap(world: &mut World) {
     let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
         .with_tx_count(2)
         .with_required_confirms(1);
@@ -686,25 +684,17 @@ fn one_utxo_taker_completes_degraded_swap() {
     world
         .framework()
         .assert_log("with 1 funding txs", &log_path);
-
-    world.shutdown_makers();
-
-    world.finish();
 }
 
 /// The maker forwards 1,075 sats. Two splits net to 372 each, under the 485
 /// taproot floor, but one split nets to 910, so admission must re-plan with one.
-#[test]
-fn maker_degrades_split_count_when_netting_breaks_the_floor() {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .maker_behaviors(vec![MakerBehavior::Normal])
-        .takers(vec![TakerBehavior::Normal])
-        .build();
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-    world.spawn_ready_makers_and_mine();
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+)]
+fn maker_degrades_split_count_when_netting_breaks_the_floor(world: &mut World) {
     let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(1_800), 1)
         .with_tx_count(2)
         .with_required_confirms(1);
@@ -715,9 +705,6 @@ fn maker_degrades_split_count_when_netting_breaks_the_floor() {
     world
         .framework()
         .assert_log("with 1 funding split(s)", &world.taker_log_path());
-
-    world.shutdown_makers();
-    world.finish();
 }
 
 /// A confirmed funding txid proves nothing about its outputs. Here the taker claims

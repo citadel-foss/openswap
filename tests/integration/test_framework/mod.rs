@@ -42,6 +42,7 @@ pub use self::{
     chain::*,
     expect::*,
     harness::*,
+    macros::world_test,
     procs::{electrs::*, tor::*},
     reports::*,
     tracker::*,
