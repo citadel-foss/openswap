@@ -396,6 +396,30 @@ impl World {
         }
     }
 
+    /// Stops maker `index` alone: signal it, then join its thread,
+    /// propagating a panic. The other makers keep running.
+    pub fn shutdown_maker(&mut self, index: usize) {
+        let maker = &mut self.makers[index];
+        maker.server.shutdown.store(true, Relaxed);
+        if let Some(thread) = maker.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+
+    /// Brings maker `index` back the way a restarted daemon would: stops it,
+    /// re-initializes it from its own config (re-supplying the passphrase the
+    /// first init consumed), starts it, and waits up to `setup_timeout_secs`
+    /// for its setup. The new server is built before the old one is dropped.
+    pub fn restart_maker(&mut self, index: usize, setup_timeout_secs: u64) {
+        self.shutdown_maker(index);
+        let maker = &mut self.makers[index];
+        let mut config = maker.server.config.clone();
+        config.password = Some("integration-test".to_string());
+        maker.server = Arc::new(MakerServer::init(config).unwrap());
+        maker.thread = spawn_makers(std::slice::from_ref(&maker.server)).pop();
+        wait_for_makers_setup(std::slice::from_ref(&maker.server), setup_timeout_secs);
+    }
+
     /// Drops every taker now, e.g. before restarting the makers or the taker
     /// itself from its config.
     pub fn drop_takers(&mut self) {
