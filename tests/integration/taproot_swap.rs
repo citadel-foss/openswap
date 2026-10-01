@@ -1,5 +1,5 @@
 use bitcoin::Amount;
-use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
+use openswap::taker::SwapParams;
 
 use super::test_framework::*;
 
@@ -18,18 +18,15 @@ use log::info;
         start_makers(120),
         verify_maker_pre_swap_balances() as maker_spendable_balance,
     ],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
 )]
 fn test_taproot_openswap(
     world: &mut World,
     taker_original_balance: Amount,
     maker_spendable_balance: Vec<Amount>,
+    params: SwapParams,
 ) {
     log::info!("Starting end-to-end taproot swap test...");
-
-    // Swap params for taproot openswap
-    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
 
     // Mine some blocks before the swap to ensure wallet is ready
     world.mine(1);
@@ -38,7 +35,7 @@ fn test_taproot_openswap(
     // Prepare and execute the swap
     world
         .taker_mut()
-        .swap(swap_params)
+        .swap(params)
         .expect("Taproot openswap should complete successfully");
     log::info!("Taproot openswap completed successfully!");
 
