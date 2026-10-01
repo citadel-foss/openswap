@@ -20,7 +20,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{start_server, MakerBehavior, MakerServer},
+    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
 };
@@ -29,8 +29,7 @@ use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
-    sync::{atomic::Ordering::Relaxed, Arc},
-    thread::{self, JoinHandle},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -45,30 +44,6 @@ enum Ending {
     FirstMakerLate,
     /// Three makers: the middle one dies and the faulty last one returns.
     MiddleMakerDies,
-}
-
-/// Stops maker `i`: an orderly shutdown, so the test covers an offline maker, not a crash.
-fn stop_maker(makers: &[Arc<MakerServer>], threads: &mut [Option<JoinHandle<()>>], i: usize) {
-    makers[i].shutdown.store(true, Relaxed);
-    if let Some(thread) = threads[i].take() {
-        thread.join().unwrap();
-    }
-}
-
-/// Brings maker `i` back the way a restarted daemon would. The first init
-/// consumed the passphrase, so re-supply it.
-fn restart_maker(
-    makers: &mut [Arc<MakerServer>],
-    threads: &mut [Option<JoinHandle<()>>],
-    i: usize,
-) {
-    stop_maker(makers, threads, i);
-    let mut config = makers[i].config.clone();
-    config.password = Some("integration-test".to_string());
-    makers[i] = Arc::new(MakerServer::init(config).unwrap());
-    let maker = makers[i].clone();
-    threads[i] = Some(thread::spawn(move || start_server(maker).unwrap()));
-    wait_for_makers_setup(&makers[i..=i], 120);
 }
 
 /// Test: Maker maliciously broadcasts contract txs after setup.
@@ -101,45 +76,27 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     let mut maker_behaviors = vec![MakerBehavior::Normal; last];
     maker_behaviors.push(MakerBehavior::BroadcastContractAfterSetup);
 
-    let (test_framework, mut takers, mut makers, block_generation_handle) =
-        TestFramework::init::<B>(maker_count, taker_behavior, maker_behaviors);
-
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
+    let mut world = World::builder::<B>()
+        .makers(maker_count)
+        .maker_behaviors(maker_behaviors)
+        .takers(taker_behavior)
+        .build();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
+    let taker_original_balance = world.fund_taker_default(3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
-    fund_makers_default(&makers, bitcoind);
+    world.fund_makers_default();
 
-    // Start the maker server threads
+    // Start the makers, wait for their setup, then sync their wallets
     log::info!("Starting Maker servers...");
+    world.start_makers(120);
 
-    let mut maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            Some(thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            }))
-        })
-        .collect::<Vec<_>>();
-
-    // Wait for makers to complete setup
-    wait_for_makers_setup(&makers, 120);
-
-    // Sync wallets after setup
-    sync_maker_wallets(&makers);
-
-    let _maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
+    world.verify_maker_pre_swap_balances();
     log::info!("Starting malice2 test...");
 
     // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
+    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(
@@ -150,13 +107,14 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     .with_tx_count(1)
     .with_required_confirms(1);
 
-    generate_blocks(bitcoind, 1);
+    world.mine(1);
 
     // Prepare should succeed; execution should fail because maker broadcasts contracts
-    let summary = taker
-        .prepare_swap(swap_params)
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
         .expect("Prepare should succeed");
-    let swap_result = taker.start_swap(&summary.swap_id);
+    let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
         swap_result.is_err(),
         "Swap should fail due to maker BroadcastContractAfterSetup behavior"
@@ -164,14 +122,14 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     if expect_direct_breach_detection {
         wait_for_log(
-            &test_framework.taker_log_path(),
+            &world.taker_log_path(),
             "Breach detector: contract tx",
             Duration::from_secs(30),
         );
     }
-    taker.log_tracker_state();
+    world.taker().log_tracker_state();
 
-    let log_path = test_framework.taker_log_path();
+    let log_path = world.taker_log_path();
     // A dead maker stays offline: it must never learn the preimage.
     let dead = (ending == Ending::MiddleMakerDies).then_some(1);
     if ending == Ending::FaultyGone {
@@ -180,12 +138,12 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
         thread::sleep(timelock_recovery_wait::<B>());
     } else {
         if let Some(i) = dead {
-            stop_maker(&makers, &mut maker_threads, i);
+            world.shutdown_maker(i);
         }
         if ending == Ending::FirstMakerLate {
-            stop_maker(&makers, &mut maker_threads, 0);
+            world.shutdown_maker(0);
         }
-        restart_maker(&mut makers, &mut maker_threads, last);
+        world.restart_maker(last, 120);
         if ending == Ending::FirstMakerLate {
             // Our timelock matures while Maker[0] sleeps: the coin stays its to claim.
             wait_for_log(
@@ -193,7 +151,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
                 "Holding refund of",
                 timelock_recovery_wait::<B>() * 2,
             );
-            restart_maker(&mut makers, &mut maker_threads, 0);
+            world.restart_maker(0, 120);
         }
         if ending == Ending::MiddleMakerDies {
             wait_for_log(
@@ -206,8 +164,8 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
         // Every live maker settles and drops its swapcoins.
         info!("Waiting for the live makers to settle...");
         let settle_start = Instant::now();
-        while makers.iter().enumerate().any(|(i, maker)| {
-            let wallet = maker.wallet.read().unwrap();
+        while world.makers().iter().enumerate().any(|(i, maker)| {
+            let wallet = maker.inner().wallet.read().unwrap();
             Some(i) != dead
                 && wallet.get_incoming_swapcoins_count() + wallet.get_outgoing_swapcoins_count() > 0
         }) {
@@ -232,14 +190,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
 
     // The background recovery loop (spawned by recover_active_swap) periodically
     // retries hashlock sweeps and timelock recovery. Wait for it to finish.
-    let recovery_timeout = Duration::from_secs(120);
-    let recovery_start = Instant::now();
-    while !taker.is_recovery_complete() {
-        if recovery_start.elapsed() > recovery_timeout {
-            panic!("Background recovery did not complete within timeout");
-        }
-        thread::sleep(Duration::from_secs(5));
-    }
+    world.taker().await_recovery(Duration::from_secs(120));
     info!("Background recovery loop completed.");
     if ending == Ending::FaultyGone {
         wait_for_log(
@@ -268,14 +219,14 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     };
 
     let mut maker_balances = Vec::new();
-    for (i, maker) in makers.iter().enumerate().filter(|(i, _)| Some(*i) != dead) {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let balances = maker.wallet.read().unwrap().get_balances().unwrap();
+    for (i, maker) in world
+        .makers()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != dead)
+    {
+        maker.sync();
+        let balances = maker.balances();
         info!("Maker {} balances after recovery: {:?}", i, balances);
         assert_eq!(
             balances.contract,
@@ -289,14 +240,9 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     assert_eq!(maker_balances, expected_makers, "maker balances mismatch");
 
     // Mine a block to confirm recovery txs, then sync wallet
-    generate_blocks(bitcoind, 1);
-    taker
-        .get_wallet()
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-    let balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    world.mine(1);
+    world.taker().sync();
+    let balances = world.taker().balances();
     info!(
         "Taker balances after recovery: {:?} (original: {})",
         balances, taker_original_balance
@@ -313,14 +259,13 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
         "taker balances mismatch"
     );
 
-    taker.log_tracker_state();
+    world.taker().log_tracker_state();
     info!("Malice2 test completed successfully!");
 
-    shutdown_makers(&makers, maker_threads.into_iter().flatten().collect());
+    world.shutdown_makers();
 
     tracker_logger.stop();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
+    world.finish();
 }
 
 #[test]
