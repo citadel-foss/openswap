@@ -28,8 +28,8 @@ use crate::{
     },
     taker::api::{REFUND_LOCKTIME_BASE, REFUND_LOCKTIME_STEP},
     utill::{
-        funding_fee_policy_sats, get_maker_dir, parse_field, parse_toml, sweep_fee_policy_sats,
-        MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
+        fee_at_rate_sats, funding_fee_policy_sats, get_maker_dir, parse_field, parse_toml,
+        sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
         funding::{net_policy_fees, SplitPlan},
@@ -1214,22 +1214,38 @@ impl MakerServer {
                             log::warn!("Insufficient funds to create fidelity bond.");
                             // Bond change must also fund the first swap and stay at our minimum
                             // swap size, or the liquidity check right after keeps us off the market.
-                            let swap_feerate = match lock_debug!(self.wallet.read())
-                                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                                .blockchain
-                                .estimate_feerate(FeePriority::Urgent)
-                            {
-                                Ok(rate) => rate.max(MIN_RELAY_FEE_RATE),
-                                Err(e) => {
-                                    log::error!("Fee estimation for urgent priority failed, using the relay floor: {e:?}");
-                                    MIN_RELAY_FEE_RATE
-                                }
+                            let (op_return_len, swap_feerate) = {
+                                let wallet = lock_debug!(self.wallet.read())
+                                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                                let op_return = wallet
+                                    .encode_fidelity_op_return(maker_address, locktime)
+                                    .map_err(MakerError::Wallet)?;
+                                let rate = match wallet
+                                    .blockchain
+                                    .estimate_feerate(FeePriority::Urgent)
+                                {
+                                    Ok(rate) => rate.max(MIN_RELAY_FEE_RATE),
+                                    Err(e) => {
+                                        log::error!("Fee estimation for urgent priority failed, using the relay floor: {e:?}");
+                                        MIN_RELAY_FEE_RATE
+                                    }
+                                };
+                                (op_return.len() as u64, rate)
                             };
-                            let needed = funding_fee_policy_sats(1, 1, swap_feerate)
-                                .and_then(|fee| fee.checked_add(min_swap_amount(&self.config)))
-                                .map_or(u64::MAX, |extra| {
-                                    (required - available).saturating_add(extra)
-                                });
+                            // Coin selection priced only the bond output and coins we hold. The tx
+                            // also carries the OP_RETURN, P2TR change and the deposit as a P2TR input.
+                            let unpriced_vsize = ((11 + op_return_len + 43) * 4 + 230).div_ceil(4);
+                            let needed =
+                                fee_at_rate_sats(unpriced_vsize, self.config.fidelity_feerate)
+                                    .zip(funding_fee_policy_sats(1, 1, swap_feerate))
+                                    .and_then(|(bond_fee, swap_fee)| {
+                                        bond_fee
+                                            .checked_add(swap_fee)?
+                                            .checked_add(min_swap_amount(&self.config))
+                                    })
+                                    .map_or(u64::MAX, |extra| {
+                                        (required - available).saturating_add(extra)
+                                    });
                             log::info!(
                                 "Send at least {:.8} BTC to {:?} (fidelity bond + fees + minimum swap liquidity) to be visible in the market",
                                 Amount::from_sat(needed).to_btc(),

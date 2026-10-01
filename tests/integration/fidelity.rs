@@ -129,19 +129,22 @@ fn test_fidelity_creation() {
     thread::sleep(Duration::from_secs(6));
 
     let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("Send at least 0.01001777 BTC to", &log_path);
+    test_framework.assert_log("Send at least 0.01001909 BTC to", &log_path);
     test_framework.assert_log(
         "(fidelity bond + fees + minimum swap liquidity) to be visible in the market",
         &log_path,
     );
 
-    log::info!("Adding sufficient funds for fidelity bond creation");
-    // Provide the Maker with more funds.
-    fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
-
-    // Wait for the Maker to complete setup (fidelity bond creation + confirmation).
-    // The API's wait_for_tx_confirmation has a 10s polling interval, so
-    // a fixed sleep(6) is not enough. Use the proper setup-complete flag instead.
+    log::info!("Sending exactly the quoted amount");
+    // Setup completes only after the bond is made and the leftover passes the
+    // swap liquidity check, so this proves one deposit of the quote is enough.
+    fund_makers(
+        &makers,
+        bitcoind,
+        1,
+        Amount::from_sat(1_001_909),
+        AddressType::P2TR,
+    );
     wait_for_makers_setup(std::slice::from_ref(maker), 120);
 
     // stop the Maker server
@@ -196,6 +199,7 @@ fn test_fidelity_creation() {
     };
 
     log::info!("Creating second fidelity bond with higher amount");
+    fund_makers(&makers, bitcoind, 1, Amount::ONE_BTC, AddressType::P2TR);
     // Create another fidelity bond of 0.08 BTC and validate it.
     let second_maturity_height = {
         log::info!("Creating another fidelity bond using the `create_fidelity` API");
@@ -261,7 +265,7 @@ fn test_fidelity_creation() {
             balances.fidelity
         );
         assert_eq!(balances.fidelity.to_sat(), 13000000);
-        assert_eq!(balances.regular.to_sat(), 90999661);
+        assert_eq!(balances.regular.to_sat(), 92001512);
     }
 
     log::info!("Waiting for fidelity bonds to mature and testing redemption");
@@ -375,7 +379,7 @@ fn test_fidelity_creation() {
         let balances = wallet_read.get_balances().unwrap();
 
         assert_eq!(balances.fidelity.to_sat(), 0);
-        assert_eq!(balances.regular.to_sat(), 103999165);
+        assert_eq!(balances.regular.to_sat(), 105001016);
     }
 
     thread::sleep(Duration::from_secs(10));
