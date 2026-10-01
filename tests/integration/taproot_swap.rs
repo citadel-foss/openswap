@@ -1,38 +1,30 @@
 use bitcoin::Amount;
-use openswap::{
-    maker::MakerBehavior,
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use super::test_framework::*;
 
 use log::{info, warn};
 
 /// Test taproot openswap
-#[test]
-fn test_taproot_openswap() {
-    // ---- Setup ----
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    setup = [
+        // 3 x 0.05 BTC P2TR for the taker, 4 x 0.05 BTC for each maker.
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        // Spawn, wait for setup, then sync so the fidelity bonds count.
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+)]
+fn test_taproot_openswap(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+) {
     warn!("Running Test: Taproot OpenSwap Basic Functionality");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
-        .takers([TakerBehavior::Normal])
-        .build();
-
-    // Fund the Taproot Taker with 3 UTXOs of 0.05 BTC each (P2TR)
-    let taker_original_balance = world.fund_taker_default(3);
-
-    // Fund the Taproot Makers with 4 UTXOs of 0.05 BTC each
-    world.fund_makers_default();
-
-    // Start the makers, wait for their setup, then sync their wallets so the
-    // fidelity bonds are accounted for
-    log::info!("Initiating Taproot Makers...");
-    world.start_makers(120);
-
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
     log::info!("Starting end-to-end taproot swap test...");
 
     // Swap params for taproot openswap
@@ -157,6 +149,4 @@ fn test_taproot_openswap() {
             1,
         );
     }
-
-    world.finish();
 }
