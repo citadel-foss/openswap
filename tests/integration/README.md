@@ -42,7 +42,7 @@ test_framework/   the harness; nothing in here is a test
   world.rs        TestFramework::init: starts the processes, builds takers/makers
   harness.rs      World, WorldBuilder, MakerHandle, TakerHandle, the steps
   expect.rs       BalanceExpect: which balance fields a test asserts
-  macros.rs       swap_matrix!, tor_gate!, and the world_test re-export
+  macros.rs       swap_matrix!, tor_gate!, assert_logged!, wait_logged!, world_test
   actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
 scenarios/        bodies shared by tests in more than one file
 *.rs              the tests, one file per scenario
@@ -118,15 +118,49 @@ fn one_utxo_taker_completes_degraded_swap(world: &mut World, baseline: Amount) {
 ```
 
 - The test keeps the body's name, so `TESTS.golden` does not change.
-- `backend` is required. Every other key except `setup` calls the builder
-  method of the same name (`check_blocklist`, `fee_overrides = ..`); `makers`
-  is the length of a `maker_behaviors` list when omitted. Behaviors are
-  written without the `MakerBehavior::` / `TakerBehavior::` prefix.
+- `backend` is required. Every other key except `setup`, `swap` and `cases`
+  calls the builder method of the same name (`check_blocklist`,
+  `fee_overrides = ..`); `makers` is the length of a `maker_behaviors` list
+  when omitted. Behaviors are written without the `MakerBehavior::` /
+  `TakerBehavior::` prefix.
 - `setup` steps are `World` methods; `step(..) as x` passes the result to the
   body parameter `x`. Do not end the body with `world.finish()`.
+- `swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3)` builds
+  the `SwapParams` passed to the body parameter `params`; unset `tx_count`
+  and `confirms` keep the `SwapParams::new` defaults (2 and 1).
+- The test logs `Running Test: <name> - <first doc line>` once the world is
+  built, so the body needs no `warn!("Running Test: ..")`.
 - The body stays a normal fn, so rustfmt and rust-analyzer still work on it.
-  Bodies shared between tests (`scenarios/`, `swap_matrix!`) keep building
-  their world themselves.
+
+Tests that share one body and differ in data list their rows in `cases`.
+Each row is a `#[test]` with its own name and docs; its `name = value`
+arguments are locals before the world is built, so keys can use them, and
+the body takes the ones it needs by name:
+
+```rust
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [behavior],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120), mine(1)],
+    swap(protocol = Taproot, sats = 500_000, makers = 1, tx_count = 3),
+    cases = [
+        /// The taker declares 2 incoming contracts but funds 3. ...
+        maker_rejects_wrong_taproot_incoming_count(
+            behavior = TakerBehavior::ForgeIncomingCount(2),
+            expected = "!= declared incoming count",
+        ),
+        // ... more rows
+    ],
+)]
+fn run_taproot_declaration_guard(world: &mut World, expected: &str, params: SwapParams) {
+    world.taker_mut().swap_fails(params, "maker must reject ...");
+    assert_logged!(world, expected);
+}
+```
+
+Bodies under `scenarios/` and `swap_matrix!` rows still build their world
+themselves.
 
 The pieces:
 
