@@ -3,9 +3,9 @@ use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 
-/// Test taproot openswap
+/// Taproot OpenSwap Basic Functionality
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal, Normal],
@@ -24,7 +24,6 @@ fn test_taproot_openswap(
     taker_original_balance: Amount,
     maker_spendable_balance: Vec<Amount>,
 ) {
-    warn!("Running Test: Taproot OpenSwap Basic Functionality");
     log::info!("Starting end-to-end taproot swap test...");
 
     // Swap params for taproot openswap
