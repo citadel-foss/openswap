@@ -559,26 +559,6 @@ fn maker_rejects_underdelivered_legacy_amount() {
     );
 }
 
-/// Same under-delivery on Taproot: the declared amount is exact there too.
-#[test]
-fn maker_rejects_underdelivered_taproot_amount() {
-    run_taproot_declaration_guard(
-        TakerBehavior::ForgeBounds(Amount::from_sat(600_000)),
-        "does not match negotiated swap amount",
-    );
-}
-
-/// The taker funds 2 incoming contracts but skews one a sat below the
-/// contract floor, keeping the total exact. The equality and count checks
-/// pass, so only the maker's per-contract floor can refuse.
-#[test]
-fn maker_rejects_taproot_contract_below_floor() {
-    run_taproot_declaration_guard(
-        TakerBehavior::SkewSplitBelowFloor,
-        "Taproot contract below the contract floor",
-    );
-}
-
 /// Same skew on Legacy: one funding output sits below the floor while the
 /// declared sum stays exact, so the per-output floor is what refuses.
 #[test]
@@ -590,44 +570,42 @@ fn maker_rejects_legacy_funding_output_below_floor() {
     );
 }
 
-/// The taker declares 2 incoming contracts but funds 3. The maker priced its
-/// sweep reimbursement on the declared count, so the equality check refuses.
-#[test]
-fn maker_rejects_wrong_taproot_incoming_count() {
-    run_taproot_declaration_guard(
-        TakerBehavior::ForgeIncomingCount(2),
-        "!= declared incoming count",
-    );
-}
-
 /// The taker funds honestly; the hook forges only the SwapDetails
 /// declaration, so the maker's own equality check is what refuses.
-fn run_taproot_declaration_guard(behavior: TakerBehavior, expected: &str) {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .maker_behaviors(vec![MakerBehavior::Normal])
-        .takers(vec![behavior])
-        .build();
-
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    world.start_makers(120);
-    world.mine(1);
-
-    let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
-        .with_tx_count(3)
-        .with_required_confirms(1);
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [behavior],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120), mine(1)],
+    swap(protocol = Taproot, sats = 500_000, makers = 1, tx_count = 3),
+    cases = [
+        /// Same under-delivery on Taproot: the declared amount is exact there too.
+        maker_rejects_underdelivered_taproot_amount(
+            behavior = TakerBehavior::ForgeBounds(Amount::from_sat(600_000)),
+            expected = "does not match negotiated swap amount",
+        ),
+        /// The taker funds 2 incoming contracts but skews one a sat below the
+        /// contract floor, keeping the total exact. The equality and count checks
+        /// pass, so only the maker's per-contract floor can refuse.
+        maker_rejects_taproot_contract_below_floor(
+            behavior = TakerBehavior::SkewSplitBelowFloor,
+            expected = "Taproot contract below the contract floor",
+        ),
+        /// The taker declares 2 incoming contracts but funds 3. The maker priced its
+        /// sweep reimbursement on the declared count, so the equality check refuses.
+        maker_rejects_wrong_taproot_incoming_count(
+            behavior = TakerBehavior::ForgeIncomingCount(2),
+            expected = "!= declared incoming count",
+        ),
+    ],
+)]
+fn run_taproot_declaration_guard(world: &mut World, expected: &str, params: SwapParams) {
     world.taker_mut().swap_fails(
         params,
         "maker must reject contract data that breaks the declaration",
     );
 
     assert_logged!(world, expected);
-
-    world.shutdown_makers();
-
-    world.finish();
 }
 
 /// A taker holding a single UTXO cannot fund 2 splits, so negotiation plans
