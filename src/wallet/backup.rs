@@ -185,7 +185,8 @@ impl Wallet {
     ///
     /// Recovers exactly what a [`WalletBackup`] file does: HD funds, fidelity bonds
     /// and already-swept swap coins — though swap coins lose the label that keeps
-    /// them out of the regular coin pool. Live swap keys are per-swap `OsRng` and
+    /// them out of the regular coin pool. Bonds are found by their OP_RETURN, up to
+    /// the first index without one. Live swap keys are per-swap `OsRng` and
     /// unrecoverable from any seed.
     pub fn restore_from_mnemonic(
         phrase: &str,

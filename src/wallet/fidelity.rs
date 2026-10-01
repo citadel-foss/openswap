@@ -750,11 +750,10 @@ impl Wallet {
             .list_transactions(None, Some(i32::MAX as usize), None, Some(true))?
             .into_iter()
             .filter(|entry| {
-                entry.detail.vout == 0
-                    && matches!(
-                        entry.detail.category,
-                        GetTransactionResultDetailCategory::Send
-                    )
+                matches!(
+                    entry.detail.category,
+                    GetTransactionResultDetailCategory::Send
+                )
             })
             .map(|entry| entry.info.txid)
             .collect();
