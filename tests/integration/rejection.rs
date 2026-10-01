@@ -520,14 +520,9 @@ fn run_legacy_proof_guard(behavior: TakerBehavior, tx_count: u32, expected: &str
     let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
         .with_tx_count(tx_count)
         .with_required_confirms(1);
-    let summary = world
+    world
         .taker_mut()
-        .prepare(params)
-        .expect("prepare_swap should succeed");
-    assert!(
-        world.taker_mut().start(&summary.swap_id).is_err(),
-        "maker must reject the crafted ProofOfFunding"
-    );
+        .swap_fails(params, "maker must reject the crafted ProofOfFunding");
 
     let log_path = world.taker_log_path();
     world.framework().assert_log(expected, &log_path);
@@ -635,13 +630,9 @@ fn run_taproot_declaration_guard(behavior: TakerBehavior, expected: &str) {
     let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
         .with_tx_count(3)
         .with_required_confirms(1);
-    let summary = world
-        .taker_mut()
-        .prepare(params)
-        .expect("prepare_swap should succeed");
-    assert!(
-        world.taker_mut().start(&summary.swap_id).is_err(),
-        "maker must reject contract data that breaks the declaration"
+    world.taker_mut().swap_fails(
+        params,
+        "maker must reject contract data that breaks the declaration",
     );
 
     let log_path = world.taker_log_path();
@@ -671,13 +662,9 @@ fn one_utxo_taker_completes_degraded_swap(world: &mut World) {
     let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
         .with_tx_count(2)
         .with_required_confirms(1);
-    let summary = world
-        .taker_mut()
-        .prepare(params)
-        .expect("prepare_swap should succeed");
     world
         .taker_mut()
-        .start(&summary.swap_id)
+        .swap(params)
         .expect("a degraded one-split swap must complete");
 
     let log_path = world.taker_log_path();
@@ -3574,14 +3561,9 @@ fn wrong_handover_key_bans_the_last_maker() {
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(2)
         .with_required_confirms(1);
-    let summary = world
+    world
         .taker_mut()
-        .prepare(swap_params)
-        .expect("prepare must succeed");
-    assert!(
-        world.taker_mut().start(&summary.swap_id).is_err(),
-        "a swap with a wrong handover key must fail"
-    );
+        .swap_fails(swap_params, "a swap with a wrong handover key must fail");
 
     let standings = world.taker().inner().fetch_offers().unwrap().all_makers();
     let standing_of = |port: u16| {

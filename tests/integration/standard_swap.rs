@@ -64,13 +64,9 @@ fn test_standard_openswap() {
     world.mine(1);
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
-    let summary = world
-        .taker_mut()
-        .prepare(swap_params)
-        .expect("Failed to prepare openswap");
     world
         .taker_mut()
-        .start(&summary.swap_id)
+        .swap(swap_params)
         .expect("OpenSwap should complete successfully");
 
     info!("All openswaps processed successfully. Transaction complete.");
@@ -224,13 +220,9 @@ fn run_swap_with_custom_feerate(
         .with_tx_count(2)
         .with_feerate(3)
         .with_required_confirms(1);
-    let summary = world
-        .taker_mut()
-        .prepare(swap_params)
-        .expect("prepare swap");
     world
         .taker_mut()
-        .start(&summary.swap_id)
+        .swap(swap_params)
         .expect("swap at a custom feerate must complete");
 
     world.mine(1);
