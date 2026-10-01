@@ -36,7 +36,8 @@ use crate::{
         min_contract_value_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FidelityError,
-        RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK,
+        RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS,
+        MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::service::WatchService,
 };
@@ -342,6 +343,25 @@ impl MakerServerConfig {
         let config_map = parse_toml(config_path)?;
         log::info!("Loaded config file from: {}", config_path.display());
 
+        let fidelity_amount = parse_field(
+            config_map.get("fidelity_amount"),
+            default_config.fidelity_amount,
+        );
+        // A bond under this floor funds and confirms fine, but every taker's
+        // discovery drops the announcement, leaving the maker unreachable with
+        // its coins locked. Refuse at startup rather than fail silently.
+        if fidelity_amount < MIN_FIDELITY_BOND_AMOUNT_SATS {
+            log::warn!(
+                "Invalid fidelity_amount: {} sats. Minimum accepted is {} sats.",
+                fidelity_amount,
+                MIN_FIDELITY_BOND_AMOUNT_SATS
+            );
+            return Err(WalletError::Fidelity(FidelityError::BondAmountTooLow {
+                configured: fidelity_amount,
+                minimum: MIN_FIDELITY_BOND_AMOUNT_SATS,
+            }));
+        }
+
         let fidelity_timelock = parse_field(
             config_map.get("fidelity_timelock"),
             default_config.fidelity_timelock,
@@ -404,10 +424,7 @@ impl MakerServerConfig {
                 config_map.get("check_blocklist"),
                 default_config.check_blocklist,
             ),
-            fidelity_amount: parse_field(
-                config_map.get("fidelity_amount"),
-                default_config.fidelity_amount,
-            ),
+            fidelity_amount,
             fidelity_timelock,
             fidelity_feerate,
             control_port: parse_field(config_map.get("control_port"), default_config.control_port),
@@ -454,7 +471,7 @@ socks_port = {}
 control_port = {}
 # Authentication password for Tor interface
 tor_auth_password = {}
-# Fidelity Bond amount in satoshis
+# Fidelity Bond amount in satoshis (must be at least {})
 fidelity_amount = {}
 # Fidelity Bond timelock in blocks (must be between {} and {})
 fidelity_timelock = {}
@@ -478,6 +495,7 @@ name = \"{}\"
             self.socks_port,
             self.control_port,
             self.tor_auth_password,
+            MIN_FIDELITY_BOND_AMOUNT_SATS,
             self.fidelity_amount,
             MIN_FIDELITY_TIMELOCK,
             MAX_FIDELITY_TIMELOCK,
@@ -3471,7 +3489,7 @@ mod tests {
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
         utill::MIN_RELAY_FEE_RATE,
-        wallet::WalletError,
+        wallet::{FidelityError, WalletError, MIN_FIDELITY_BOND_AMOUNT_SATS},
     };
     use std::{
         sync::{atomic::Ordering, mpsc, Arc, TryLockError},
@@ -3483,6 +3501,56 @@ mod tests {
     /// minimum; a valid value is kept. A plain `<` comparison would let
     /// `nan` through into the bond fee math. A name or fee percentage takers
     /// would refuse stops startup.
+    /// A bond below the shared discovery floor must stop startup, not fund a
+    /// bond no taker can find. The floor itself is exactly accepted.
+    #[test]
+    fn maker_config_rejects_fidelity_amount_below_the_discovery_floor() {
+        let timelock = if cfg!(feature = "integration-test") {
+            950
+        } else {
+            15_000
+        };
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let resolve = |amount: u64| {
+            std::fs::write(
+                &path,
+                format!("fidelity_timelock = {timelock}\nfidelity_amount = {amount}\n"),
+            )
+            .unwrap();
+            MakerServerConfig::new(Some(&path))
+        };
+
+        // The value that silently stranded makers before this check.
+        let err = resolve(1_000).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WalletError::Fidelity(FidelityError::BondAmountTooLow {
+                    configured: 1_000,
+                    minimum: MIN_FIDELITY_BOND_AMOUNT_SATS,
+                })
+            ),
+            "{:?}",
+            err
+        );
+
+        // Just under the floor is still refused; the floor itself is kept.
+        assert!(resolve(MIN_FIDELITY_BOND_AMOUNT_SATS - 1).is_err());
+        assert_eq!(
+            resolve(MIN_FIDELITY_BOND_AMOUNT_SATS)
+                .unwrap()
+                .fidelity_amount,
+            MIN_FIDELITY_BOND_AMOUNT_SATS
+        );
+        assert_eq!(
+            resolve(MIN_FIDELITY_BOND_AMOUNT_SATS * 50)
+                .unwrap()
+                .fidelity_amount,
+            MIN_FIDELITY_BOND_AMOUNT_SATS * 50
+        );
+    }
+
     #[test]
     fn maker_config_checks_file_values() {
         // The accepted timelock range depends on the integration-test

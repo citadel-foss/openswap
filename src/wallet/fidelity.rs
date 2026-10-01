@@ -48,6 +48,13 @@ pub const MIN_FIDELITY_TIMELOCK: u32 = 800;
 #[cfg(feature = "integration-test")]
 pub const MAX_FIDELITY_TIMELOCK: u32 = 6_000;
 
+/// Smallest bond amount in satoshis that a maker may lock, and that discovery
+/// will announce. This is the raw locked amount, not the time-weighted value
+/// `calculate_fidelity_value` computes; it exists to keep cheap bonds from
+/// spamming taker registries. Makers and takers must agree on it: a maker
+/// below this floor funds a valid bond that no taker ever discovers.
+pub const MIN_FIDELITY_BOND_AMOUNT_SATS: u64 = 10_000;
+
 /// Error structure defining possible fidelity related errors
 #[derive(Debug)]
 pub enum FidelityError {
@@ -74,6 +81,12 @@ pub enum FidelityError {
     /// can never be recovered by this maker.
     BondTransactionMissing {
         index: u32,
+    },
+    /// The configured bond amount is below `MIN_FIDELITY_BOND_AMOUNT_SATS`, so
+    /// the bond would fund but never be discovered by any taker.
+    BondAmountTooLow {
+        configured: u64,
+        minimum: u64,
     },
 }
 
@@ -103,6 +116,14 @@ impl std::fmt::Display for FidelityError {
             FidelityError::BondTransactionMissing { index } => write!(
                 f,
                 "fidelity bond at index {index} was evicted and has no stored transaction to rebroadcast"
+            ),
+            FidelityError::BondAmountTooLow {
+                configured,
+                minimum,
+            } => write!(
+                f,
+                "Fidelity bond amount {configured} sats is below the minimum of {minimum} sats; \
+                 takers would never discover it"
             ),
             FidelityError::General(msg) => write!(f, "{}", msg),
         }
