@@ -1186,6 +1186,11 @@ impl MakerServer {
 
             // Wait for funds and create fidelity bond
             const SYNC_INTERVAL: Duration = Duration::from_secs(10);
+            // One address for the whole wait, so each retry doesn't burn a new one.
+            let addr = lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                .get_next_external_address(AddressType::P2TR)
+                .map_err(MakerError::Wallet)?;
 
             while !self.shutdown.load(Ordering::Relaxed) {
                 log::info!("Sync at:----setup_fidelity_bond----");
@@ -1213,11 +1218,6 @@ impl MakerServer {
                         {
                             log::warn!("Insufficient funds to create fidelity bond.");
                             let needed = required - available;
-                            let addr = lock_debug!(self.wallet.write())
-                                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                                .get_next_external_address(AddressType::P2TR)
-                                .map_err(MakerError::Wallet)?;
-
                             log::info!(
                                 "Send at least {:.8} BTC to {:?}",
                                 Amount::from_sat(needed).to_btc(),
