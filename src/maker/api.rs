@@ -997,31 +997,51 @@ impl MakerServer {
         !self.is_shutdown()
     }
 
-    /// Waits for the bond at `index` to confirm, with no deadline, and returns
-    /// its height. Each poll rebroadcasts the bond if the backend has lost it.
+    /// Checks once whether the bond at `index` confirmed, rebroadcasting it if
+    /// the backend has lost it. A backend error reads as "not yet".
+    fn check_bond_confirmation(&self, index: u32) -> Result<Option<u32>, MakerError> {
+        // Lock per check only: holding it across a wait blocks every wallet writer.
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let checked = wallet
+            .ensure_fidelity_bond_broadcast(index)
+            .and_then(|txid| wallet.blockchain.tx_block_height(&txid))
+            .and_then(|height| {
+                height
+                    .map(|h| {
+                        u32::try_from(h).map_err(|_| {
+                            WalletError::General(format!("Bond height {h} is out of range"))
+                        })
+                    })
+                    .transpose()
+            });
+        match checked {
+            // A broken bond record never heals; anything else is the backend.
+            Err(e @ WalletError::Fidelity(_)) => Err(MakerError::Wallet(e)),
+            Err(e) => {
+                log::warn!(
+                    "[{}] Could not check fidelity bond {}: {:?}",
+                    self.config.network_port,
+                    index,
+                    e
+                );
+                Ok(None)
+            }
+            Ok(height) => Ok(height),
+        }
+    }
+
+    /// Waits for the bond at `index` to confirm, with no deadline, and returns its height.
     fn wait_for_bond_confirmation(&self, index: u32) -> Result<u32, MakerError> {
         const POLL_INTERVAL: Duration = Duration::from_secs(10);
         loop {
-            // Lock per poll only: holding it across the wait blocks every wallet writer.
-            let (txid, height) = {
-                let wallet = lock_debug!(self.wallet.read())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                let txid = wallet
-                    .ensure_fidelity_bond_broadcast(index)
-                    .map_err(MakerError::Wallet)?;
-                let height = wallet
-                    .blockchain
-                    .tx_block_height(&txid)
-                    .map_err(MakerError::Wallet)?;
-                (txid, height)
-            };
-            if let Some(height) = height {
-                return Ok(height as u32);
+            if let Some(height) = self.check_bond_confirmation(index)? {
+                return Ok(height);
             }
             log::info!(
                 "[{}] Fidelity bond {} not confirmed yet, checking again in {}s",
                 self.config.network_port,
-                txid,
+                index,
                 POLL_INTERVAL.as_secs()
             );
             if !self.wait_for_shutdown(POLL_INTERVAL) {
@@ -1039,8 +1059,9 @@ impl MakerServer {
     /// valuation (`calculate_bond_value` needs the confirmation height) and
     /// would be silently discarded by `get_highest_fidelity_index`, making
     /// the maker create a second bond and doubly lock funds. Finalizing it
-    /// here prevents that.
-    fn finalize_pending_fidelity_bonds(&self) -> Result<(), MakerError> {
+    /// here prevents that. With a `live_bond` to advertise, each pending bond is
+    /// only checked once; the renewal loop checks again later.
+    fn finalize_pending_fidelity_bonds(&self, live_bond: bool) -> Result<(), MakerError> {
         // Snapshot the pending bonds once: an unrecoverable bond stays
         // pending in the wallet, so re-finding inside the loop would spin
         // on it forever.
@@ -1054,14 +1075,26 @@ impl MakerServer {
             .collect();
 
         for (index, txid) in pending {
-            log::info!(
-                "[{}] Found unconfirmed fidelity bond {}, waiting for confirmation instead of creating a new one",
-                self.config.network_port,
-                txid
-            );
-
-            let conf_height = match self.wait_for_bond_confirmation(index) {
-                Ok(height) => height,
+            let confirmed = if live_bond {
+                self.check_bond_confirmation(index)
+            } else {
+                log::info!(
+                    "[{}] Found unconfirmed fidelity bond {}, waiting for confirmation instead of creating a new one",
+                    self.config.network_port,
+                    txid
+                );
+                self.wait_for_bond_confirmation(index).map(Some)
+            };
+            let conf_height = match confirmed {
+                Ok(Some(height)) => height,
+                Ok(None) => {
+                    log::info!(
+                        "[{}] Fidelity bond {} still unconfirmed; advertising the live bond meanwhile",
+                        self.config.network_port,
+                        txid
+                    );
+                    continue;
+                }
                 // The bond was evicted and there is no stored transaction to
                 // rebroadcast: it can never confirm. Losing the bond must not
                 // take the maker down — log it and start up anyway.
@@ -1102,7 +1135,17 @@ impl MakerServer {
         // Adopt any bond that was broadcast but not yet confirmed (e.g. the
         // maker shut down while waiting for confirmation) before deciding
         // whether a new bond is needed.
-        self.finalize_pending_fidelity_bonds()?;
+        let live_bond = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .get_highest_fidelity_index()
+            .map_err(MakerError::Wallet)?
+            .is_some();
+        // A just-redeemed bond must not stay advertised while a new one confirms.
+        if !live_bond {
+            *lock_debug!(self.highest_fidelity_proof.write())
+                .map_err(|_| MakerError::General("Failed to lock fidelity proof"))? = None;
+        }
+        self.finalize_pending_fidelity_bonds(live_bond)?;
 
         let highest_index = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
