@@ -6,7 +6,6 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::MakerBehavior,
     protocol::common_messages::{MakerToTakerMessage, ProtocolVersion},
     taker::{MakerState, SwapParams},
 };
@@ -16,20 +15,18 @@ use super::{
     test_framework::*,
 };
 
-use log::{info, warn};
+use log::info;
 use std::{fs, thread, time::Duration};
 
-#[test]
-fn maker_abort2_case1() {
-    warn!("Running Test: Maker drops before sending sender's sigs. Taker continues with spare.");
-
-    let mut world = complete_with_spare(
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtReqContractSigsForSender, Normal],
+    takers = [Normal],
+)]
+fn maker_abort2_case1(world: &mut World) {
+    complete_with_spare(
+        world,
         ProtocolVersion::Legacy,
-        [
-            MakerBehavior::Normal,
-            MakerBehavior::CloseAtReqContractSigsForSender,
-            MakerBehavior::Normal,
-        ],
         "Failed to prepare openswap",
         &SpareMakerExpect {
             taker_spendable: 14995985,
@@ -53,8 +50,6 @@ fn maker_abort2_case1() {
     }
 
     info!("maker_abort2_case1 completed successfully!");
-    world.shutdown_makers();
-    world.finish();
 }
 
 /// Maker 0 has to re-plan its funding, then rebuild it for the spare's keys
