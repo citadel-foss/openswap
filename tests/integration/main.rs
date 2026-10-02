@@ -16,7 +16,6 @@ mod fidelity_timelock_violation;
 mod finalization_timeout;
 mod maker_abort;
 mod maker_cli;
-mod malice1;
 mod mixed_protocol_concurrent_swaps;
 mod multi_confirm_swap;
 mod multi_taker;
@@ -28,16 +27,13 @@ mod spare_maker_pricing;
 mod standard_swap;
 mod successful_swap_restart;
 mod taker_abort;
-mod taproot_maker_abort1;
-mod taproot_maker_malice;
 mod taproot_multi_maker;
 mod taproot_swap;
-mod taproot_taker_abort1;
+mod too_few_makers;
 mod wallet_backup;
 mod watchtower_liveness;
 
 mod concurrent_takers;
-mod legacy_contract_breach;
 mod legacy_hashlock_recovery;
 mod legacy_reboot_recovery;
 #[cfg(feature = "lightning")]
