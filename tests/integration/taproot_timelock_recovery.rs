@@ -1,20 +1,23 @@
 use bitcoin::{Sequence, Txid};
 use bitcoind::bitcoincore_rpc::RpcApi;
-use openswap::{maker::MakerBehavior, protocol::common_messages::ProtocolVersion};
+use openswap::protocol::common_messages::ProtocolVersion;
 
 use super::scenarios::maker_abort::{MakerAbort, MakerAbortExpect};
 
-use log::warn;
+use super::test_framework::*;
+
 use std::fs;
 
 /// Test: Maker drops at taproot contract sigs exchange. Recovery via timelock.
-#[test]
-fn test_taproot_timelock_recovery() {
-    warn!("Running Test: Taproot Timelock Recovery - CloseAtContractSigsExchange");
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtContractSigsExchange],
+    takers = [Normal],
+)]
+fn test_taproot_timelock_recovery(world: &mut World) {
     let abort = MakerAbort::fail_swap(
+        world,
         ProtocolVersion::Taproot,
-        MakerBehavior::CloseAtContractSigsExchange,
         "Swap should fail due to Maker2 closing at contract sigs exchange",
     );
     let outgoing_coins = abort
