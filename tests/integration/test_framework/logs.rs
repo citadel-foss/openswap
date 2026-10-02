@@ -17,7 +17,7 @@ use log4rs::{
 
 /// Installs the process's logger once: everything goes to `taker/debug.log`
 /// under `temp_dir` and to stdout, where each line names the test, e.g.
-/// `2026-10-02T17:39:47Z [electrum_swap::taproot_openswap] INFO ...`, so
+/// `2026-10-02T17:39:47Z [swap::electrum::taproot_swap_completes] INFO ...`, so
 /// output from interleaved tests can be told apart in CI.
 ///
 /// The level is debug unless `OPENSWAP_TEST_LOG` sets one (e.g. `warn`, `off`).
