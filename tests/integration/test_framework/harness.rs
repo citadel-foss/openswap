@@ -28,7 +28,10 @@ use bitcoin::Amount;
 use bitcoind::BitcoinD;
 use openswap::{
     maker::{MakerBehavior, MakerServer},
-    taker::{error::TakerError, SwapParams, SwapSummary, Taker, TakerBehavior},
+    taker::{
+        error::TakerError, BanReason, BanRecord, MakerState, SwapParams, SwapSummary, Taker,
+        TakerBehavior,
+    },
     utill::NO_SHUTDOWN,
     wallet::{AddressType, Balances, TakerReport},
 };
@@ -228,6 +231,30 @@ impl World {
     /// The makers, in maker order.
     pub fn makers(&self) -> &[MakerHandle] {
         &self.makers
+    }
+
+    /// Maker `index`'s standing in the first taker's offerbook.
+    #[track_caller]
+    pub fn maker_standing(&self, index: usize) -> MakerState {
+        let address = self.makers[index].address();
+        self.taker()
+            .inner()
+            .fetch_offers()
+            .expect("offerbook unreadable")
+            .all_makers()
+            .into_iter()
+            .find(|maker| maker.address.to_string() == address)
+            .unwrap_or_else(|| panic!("maker {} ({}) is not in the offerbook", index, address))
+            .state
+    }
+
+    /// Why the first taker banned maker `index`, or `None` if it is not banned.
+    #[track_caller]
+    pub fn maker_ban_reason(&self, index: usize) -> Option<BanReason> {
+        match self.maker_standing(index) {
+            MakerState::Banned(BanRecord { reason, .. }) => Some(reason),
+            _ => None,
+        }
     }
 
     /// [`fund_taker_default`] on the first taker; returns its spendable balance.
@@ -526,6 +553,11 @@ impl MakerHandle {
     /// The maker server itself, for what the handle does not wrap.
     pub fn inner(&self) -> &Arc<MakerServer> {
         &self.server
+    }
+
+    /// The address takers dial, and the key the offerbook files this maker under.
+    pub fn address(&self) -> String {
+        format!("127.0.0.1:{}", self.server.config.network_port)
     }
 
     /// Syncs the maker's wallet against the backend and saves it.
