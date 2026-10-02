@@ -9,90 +9,48 @@ use std::{sync::Arc, thread, time::Duration};
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
-    lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest},
-    maker::{start_server, MakerBehavior},
-    taker::{lightning_swap::LnSwapParams, TakerBehavior},
+    lightning::{LightningBackend, MockLightningBackend},
+    taker::lightning_swap::LnSwapParams,
     wallet::AddressType,
 };
 
 use super::test_framework::*;
 
-use std::sync::atomic::Ordering::Relaxed;
+/// Two mock Lightning nodes over one shared ledger: the maker's first, the
+/// taker's second. The maker serves both directions, so its channel needs
+/// outbound capacity (to pay swap-in invoices) and inbound capacity (to receive
+/// swap-out payments) — different sides of the same channel.
+fn maker_and_taker_nodes() -> (Arc<MockLightningBackend>, Arc<MockLightningBackend>) {
+    let (maker_ln, taker_ln) = MockLightningBackend::new_pair();
+    open_ready_channel(
+        &maker_ln,
+        taker_ln.node_info().unwrap().node_id,
+        Some(500_000_000),
+    );
+    (maker_ln, taker_ln)
+}
 
 /// One maker, one taker; a swap-in followed by a swap-out over the same
 /// maker, asserting both layers settle and no recovery records remain.
-#[test]
-fn lightning_submarine_swaps_e2e() {
-    log::warn!("Running Test: Lightning submarine swaps end-to-end");
-
-    // Two mock Lightning nodes over one shared ledger: node 0 = maker's,
-    // node 1 = taker's. The maker serves both directions, so its channel
-    // needs outbound capacity (to pay swap-in invoices) and inbound capacity
-    // (to receive swap-out payments) — different sides of the same channel.
-    let (maker_ln, taker_ln) = MockLightningBackend::new_pair();
-    maker_ln.set_onchain_balance(Amount::from_btc(0.02).unwrap());
-    let channel = maker_ln
-        .open_channel(OpenChannelRequest {
-            node_pubkey: taker_ln.node_info().unwrap().node_id,
-            address: "127.0.0.1:9736".to_string(),
-            channel_amount: Amount::from_sat(1_000_000),
-            // Push half to the peer so the channel has inbound capacity too:
-            // swap-outs are bounded by inbound, and a freshly opened channel
-            // has none.
-            push_to_counterparty_msat: Some(500_000_000),
-            announce_channel: false,
-        })
-        .unwrap();
-    maker_ln.simulate_channel_ready(&channel);
-    // Drain the channel event so later polls only see swap events.
-    let _ = maker_ln.poll_event().unwrap();
-
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init_with_lightning::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-            vec![maker_ln.clone() as Arc<dyn LightningBackend>],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    taker.set_lightning_backend(taker_ln.clone() as Arc<dyn LightningBackend>);
-
-    fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2WPKH,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2WPKH,
-    );
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-    wait_for_makers_setup(&makers, 120);
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
-
-    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [(maker_ln, taker_ln) = maker_and_taker_nodes()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [maker_ln],
+    taker_lightning = [taker_ln],
+    setup = [
+        fund_taker(3, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        start_makers(120),
+    ],
+)]
+fn lightning_submarine_swaps_e2e(world: &mut World) {
+    // A handle of its own, so the node stays reachable while the taker is borrowed.
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker_address = world.makers()[0].address();
+    let taker = world.taker_mut().inner_mut();
 
     // ---- Swap-in: taker pays on-chain, gains Lightning balance ----
     let swap_in = taker
@@ -131,7 +89,6 @@ fn lightning_submarine_swaps_e2e() {
     assert!(swept, "maker must sweep the swap-in HTLC via the hashlock");
 
     // ---- Swap-out: taker pays Lightning, gains on-chain BTC ----
-    let taker = takers.get_mut(0).unwrap();
     let swap_out = taker
         .lightning_swap_out(LnSwapParams {
             amount: Amount::from_sat(40_000),
@@ -167,14 +124,4 @@ fn lightning_submarine_swaps_e2e() {
         "no pending lightning swaps should remain, got: {:?}",
         outcomes
     );
-
-    drop(takers);
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
 }
