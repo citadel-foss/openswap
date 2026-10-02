@@ -43,7 +43,7 @@ fn listed_addresses(taker: &Taker) -> Vec<String> {
         start_makers_without_sync(120),
     ],
 )]
-fn test_offerbook_removal_survives_restart(world: &mut World) {
+fn removal_survives_restart(world: &mut World) {
     let maker_addrs: Vec<String> = world.makers().iter().map(|m| m.address()).collect();
 
     // ---- 1. Discover both makers into the offerbook ----

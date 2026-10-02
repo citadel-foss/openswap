@@ -33,12 +33,12 @@ const RESULT_FAILED: u8 = 2;
     makers = maker_count,
     takers = [Normal, Normal],
     cases = [
-        test_concurrent_takers_legacy(
+        legacy_limited_liquidity(
             protocol = ProtocolVersion::Legacy,
             maker_count = 2,
             expected_maker_spendable = [1250473, 1250436],
         ),
-        test_concurrent_takers_taproot(
+        taproot_limited_liquidity(
             protocol = ProtocolVersion::Taproot,
             maker_count = 2,
             expected_maker_spendable = [1250473, 1250436],
@@ -295,7 +295,7 @@ fn concurrent_takers(
         start_makers(120),
     ],
 )]
-fn test_concurrent_funding_race(world: &mut World) {
+fn funding_race_has_one_winner(world: &mut World) {
     let maker_spendable = world.makers()[0].balances().spendable;
     info!("Maker spendable before the race: {}", maker_spendable);
     world.mine(1);
@@ -424,7 +424,7 @@ fn test_concurrent_funding_race(world: &mut World) {
         mine(1),
     ],
 )]
-fn test_concurrent_funding_conflict_replans(world: &mut World) {
+fn funding_conflict_replans_onto_free_coins(world: &mut World) {
     let maker_address = world.makers()[0].address();
     let params = || {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(300_000), 1)

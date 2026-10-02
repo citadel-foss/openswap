@@ -66,7 +66,7 @@ const TEST_CASES: &[(f64, &[f64], &str, &str)] = &[
     makers = 1,
     takers = [Normal],
 )]
-fn test_address_grouping_behavior(world: &mut World) {
+fn address_grouping_behavior(world: &mut World) {
     let bitcoind = world.bitcoind();
     let maker = world.makers()[0].inner();
 
@@ -185,7 +185,7 @@ fn test_address_grouping_behavior(world: &mut World) {
         start_makers_without_sync(120),
     ],
 )]
-fn test_separated_utxo_coin_selection(world: &mut World) {
+fn separated_utxo_coin_selection(world: &mut World) {
     // Perform openswap to create swap coins
     info!("Performing openswap to create swap coins");
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(35000000), 2)
@@ -336,7 +336,7 @@ fn test_separated_utxo_coin_selection(world: &mut World) {
     makers = 2,
     takers = [Normal],
 )]
-fn test_manual_coinselection(world: &mut World) {
+fn manual_coinselection(world: &mut World) {
     let amounts: Vec<u64> = vec![
         90_283, 150_813, 212_842, 185_372, 478_324, 314_332, 136_414, 23_894, 10_000,
     ];
@@ -665,10 +665,10 @@ fn test_manual_coinselection(world: &mut World) {
     ],
     swap(protocol = protocol, sats = 500_000, makers = 1, tx_count = 3),
     cases = [
-        test_legacy_swap_completes_with_degraded_splits(protocol = ProtocolVersion::Legacy),
+        legacy_swap_completes_with_degraded_splits(protocol = ProtocolVersion::Legacy),
         /// Same fragmented pool on Taproot: admission and funding share the planner
         /// with Legacy, so the same degradation must show on the other protocol.
-        test_taproot_swap_completes_with_degraded_splits(protocol = ProtocolVersion::Taproot),
+        taproot_swap_completes_with_degraded_splits(protocol = ProtocolVersion::Taproot),
     ],
 )]
 fn run_degraded_split_swap(world: &mut World, protocol: ProtocolVersion, params: SwapParams) {

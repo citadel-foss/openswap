@@ -24,7 +24,7 @@ use crate::test_framework::*;
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120), mine(1)],
     swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn test_legacy_taker_rejects_malformed_maker_funding_output(world: &mut World, params: SwapParams) {
+fn legacy_taker_rejects_malformed_maker_funding_output(world: &mut World, params: SwapParams) {
     // The taker must reject before signing/finalizing; otherwise it can later
     // report success while the incoming sweep is unspendable.
     let error = world.taker_mut().swap_fails(
@@ -54,7 +54,7 @@ fn test_legacy_taker_rejects_malformed_maker_funding_output(world: &mut World, p
     // to broadcast while still making the amount mismatch obvious.
     swap(protocol = Taproot, sats = 30_000, makers = 1, tx_count = 3),
 )]
-fn test_taproot_rejects_underfunded_maker_contract(world: &mut World, params: SwapParams) {
+fn taproot_rejects_underfunded_maker_contract(world: &mut World, params: SwapParams) {
     // The taker must reject during maker contract verification, before storing
     // an incoming swapcoin from the underfunded contract data. The maker's
     // response amounts are read from its actual funding outputs, so the
@@ -122,28 +122,28 @@ fn test_taproot_rejects_underfunded_maker_contract(world: &mut World, params: Sw
         ),
         /// An Ack that declares more inputs per split than the maker funds with
         /// would charge the taker for inputs nobody spends.
-        test_taproot_rejects_overreported_funding_inputs(
+        taproot_rejects_overreported_funding_inputs(
             protocol = ProtocolVersion::Taproot,
             sats = 500_000,
             behavior = MakerBehavior::OverreportFundingInputs,
             tx_count = 2,
             expected = "its plan declared",
         ),
-        test_legacy_rejects_overreported_funding_inputs(
+        legacy_rejects_overreported_funding_inputs(
             protocol = ProtocolVersion::Legacy,
             sats = 500_000,
             behavior = MakerBehavior::OverreportFundingInputs,
             tx_count = 2,
             expected = "its plan declared",
         ),
-        test_legacy_taker_rejects_fee_skimming_maker(
+        legacy_taker_rejects_fee_skimming_maker(
             protocol = ProtocolVersion::Legacy,
             sats = 500_000,
             behavior = MakerBehavior::FeeSkimming,
             tx_count = 3,
             expected = "does not match the negotiated hop total",
         ),
-        test_taproot_rejects_fee_skimming_maker(
+        taproot_rejects_fee_skimming_maker(
             protocol = ProtocolVersion::Taproot,
             sats = 30_000,
             behavior = MakerBehavior::FeeSkimming,

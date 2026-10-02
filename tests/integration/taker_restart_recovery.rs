@@ -39,11 +39,11 @@ use std::{
     maker_behaviors = [Normal, last_maker],
     takers = [Normal],
     cases = [
-        test_legacy_taker_restart_recovery(
+        legacy_recovers_after_restart(
             protocol = ProtocolVersion::Legacy,
             last_maker = MakerBehavior::CloseAtHashPreimage,
         ),
-        test_taproot_taker_restart_recovery(
+        taproot_recovers_after_restart(
             protocol = ProtocolVersion::Taproot,
             last_maker = MakerBehavior::CloseAtPrivateKeyHandover,
         ),

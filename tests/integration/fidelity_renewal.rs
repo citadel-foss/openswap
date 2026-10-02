@@ -17,7 +17,7 @@ use std::{sync::atomic::Ordering::Relaxed, thread, time::Duration};
     makers = 1,
     takers = [Normal],
 )]
-fn test_fidelity_auto_renewal(world: &mut World) {
+fn bond_auto_renewal(world: &mut World) {
     let bitcoind = world.bitcoind();
     let maker = world.makers()[0].inner().clone();
 

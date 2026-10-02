@@ -20,7 +20,7 @@ use log::info;
     ],
     swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn test_taproot_openswap(
+fn taproot_two_maker_swap_completes(
     world: &mut World,
     taker_original_balance: Amount,
     maker_spendable_balance: Vec<Amount>,

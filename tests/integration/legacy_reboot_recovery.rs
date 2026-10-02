@@ -36,10 +36,7 @@ use std::{
         start_makers(120),
     ],
 )]
-fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins(
-    world: &mut World,
-    taker_original_balance: Amount,
-) {
+fn maker_reboot_preserves_funded_swapcoins(world: &mut World, taker_original_balance: Amount) {
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
