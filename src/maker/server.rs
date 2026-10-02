@@ -243,6 +243,8 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         .then(|| maker.get_tor_hostname())
         .transpose()?;
 
+    maker.release_orphan_reservations()?;
+
     // Before the fidelity and liquidity waits, not after: both loop until the
     // wallet has funds, and a maker whose coins are locked in a Lightning
     // HTLC needs the watchdog to refund them before it can ever satisfy

@@ -88,11 +88,11 @@ fn test_taproot_taker_abort1() {
     );
     taker.log_tracker_state();
 
-    // The accepted-but-unfunded reservation must expire without requiring a restart.
+    // The accepted-but-unfunded swap must be dropped without requiring a restart.
     let log_path = test_framework.taker_log_path();
     wait_for_log(
         &log_path,
-        "Released idle unfunded reservation",
+        "Released idle unfunded swap",
         Duration::from_secs(60),
     );
     let release_deadline = std::time::Instant::now() + Duration::from_secs(15);

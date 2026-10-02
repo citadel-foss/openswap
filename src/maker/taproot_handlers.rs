@@ -216,8 +216,8 @@ fn process_taproot_contract<M: Maker>(
         if maker.contract_txid_seen(&contract_txid, &data.id)? {
             return Err(MakerError::General("Taproot contract txid already in use"));
         }
-        // Blocks passed while we waited. We have broadcast nothing yet, so aborting
-        // here costs only the reserved UTXOs.
+        // Blocks passed while we waited. We have not claimed or funded anything
+        // yet, so aborting here costs nothing.
         check_sweep_margin(maker, state.timelock)?;
         maker.screen_funding_tx(&incoming_contract_tx)?;
 

@@ -4,7 +4,7 @@
 //! Both takers run swaps concurrently via `thread::scope`, once per protocol.
 //! Makers have limited liquidity (only enough for ~1 swap), so one taker
 //! should succeed and the other should fail due to insufficient funds.
-//! This exercises the UTXO reservation mechanism that prevents double-spend.
+//! Coins are claimed at funding, so the loser fails there, never double-spends.
 
 use bitcoin::Amount;
 use openswap::{
@@ -206,15 +206,12 @@ fn concurrent_takers(
         completed_count - success_count
     );
 
-    // With limited liquidity, we expect one to succeed and one to fail
-    // The UTXO reservation mechanism prevents double-spend of maker UTXOs
+    // With limited liquidity, we expect one to succeed and one to fail.
+    // Both are admitted; the loser's maker runs out of coins at funding.
     assert!(success_count >= 1, "At least one taker should succeed");
-    let log_path = test_framework.taker_log_path();
-    // Maker-side log: the maker refused the second swap for liquidity.
-    test_framework.assert_log("Rejecting swap ", &log_path);
-    // Taker-side log: the losing taker got the rejection as a message and
-    // failed fast, not sat out a timeout on a dropped connection.
-    test_framework.assert_log("rejected swap", &log_path);
+    if success_count == 1 {
+        test_framework.assert_log("InsufficientLiquidity", &test_framework.taker_log_path());
+    }
     assert_eq!(
         completed_count, 2,
         "Both takers should have completed (success or failure)"
@@ -323,20 +320,16 @@ fn concurrent_takers(
 
 /// Two takers race ONE maker whose liquidity funds exactly one swap, both
 /// declaring the identical shape so the maker's deterministic planner draws
-/// the same inputs for each admission. Exactly one admission may win: the
-/// loser is rejected at admission and fails cleanly, and no reservation leaks
-/// — the maker still serves the losing taker's later swap.
+/// the same inputs for each admission. Both are admitted; exactly one may fund.
+/// The loser finds no free coins at funding and fails cleanly, and no
+/// reservation leaks — the maker still serves the losing taker's later swap.
 #[test]
-fn test_concurrent_admission_reservation_conflict() {
-    warn!("Running Test: Concurrent admission reservation conflict - identical plans on one maker");
+fn test_concurrent_funding_race() {
+    warn!("Running Test: concurrent funding race - identical plans on one maker");
 
     let taker_behavior = vec![TakerBehavior::Normal, TakerBehavior::Normal];
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            taker_behavior,
-            vec![MakerBehavior::AdmissionRaceBarrier],
-        );
+        TestFramework::init::<BitcoindBackend>(1, taker_behavior, vec![MakerBehavior::Normal]);
 
     let bitcoind = &test_framework.bitcoind;
 
@@ -393,7 +386,7 @@ fn test_concurrent_admission_reservation_conflict() {
     };
 
     // Barrier-start both takers: the tightest sequencing the framework
-    // offers, so both admissions plan before either reserves.
+    // offers, so both admissions plan over the same coins.
     let start = Arc::new(Barrier::new(2));
     let results = [AtomicU8::new(RESULT_PENDING), AtomicU8::new(RESULT_PENDING)];
 
@@ -414,7 +407,7 @@ fn test_concurrent_admission_reservation_conflict() {
                         result.store(RESULT_SUCCESS, Relaxed);
                     }
                     Err(e) => {
-                        warn!("Taker {} lost the admission race: {:?}", i + 1, e);
+                        warn!("Taker {} lost the funding race: {:?}", i + 1, e);
                         result.store(RESULT_FAILED, Relaxed);
                     }
                 }
@@ -427,7 +420,7 @@ fn test_concurrent_admission_reservation_conflict() {
     info!("Race results: {:?} ({} winner)", outcomes, success_count);
     assert_eq!(
         success_count, 1,
-        "exactly one admission may win the reservation race: {:?}",
+        "exactly one swap may win the funding race: {:?}",
         outcomes
     );
     let loser = outcomes
@@ -435,15 +428,11 @@ fn test_concurrent_admission_reservation_conflict() {
         .position(|&r| r == RESULT_FAILED)
         .expect("the losing taker must fail cleanly, not hang");
 
-    let log_path = test_framework.taker_log_path();
-    // Maker-side: the losing admission was refused at the reservation
-    // conflict check, proving both admissions raced on identical plans.
-    // Taker-side: the refusal arrived as a message and failed the swap fast.
-    test_framework.assert_log("a concurrent admission claimed a planned input", &log_path);
-    test_framework.assert_log("Rejecting swap ", &log_path);
-    test_framework.assert_log("rejected swap", &log_path);
+    // Maker-side: the loser's planned coin was taken and no free coin could
+    // replace it, proving both swaps raced on identical plans.
+    test_framework.assert_log("InsufficientLiquidity", &test_framework.taker_log_path());
 
-    // No reservation may leak from the rejected admission: the same maker
+    // No reservation may leak from the lost funding race: the same maker
     // still serves the losing taker's later swap. The amount must fit the
     // post-race offer max: that tracks max(swap, regular), and the winner's
     // unswept incoming coin caps it just under the race amount.
@@ -460,7 +449,7 @@ fn test_concurrent_admission_reservation_conflict() {
         .expect("the losing taker's later swap must prepare");
     let retry_report = loser_taker
         .start_swap(&retry_summary.swap_id)
-        .expect("the maker must serve a later swap after the rejected admission");
+        .expect("the maker must serve a later swap after the lost funding race");
     info!(
         "Losing taker's later swap completed: {:?}",
         retry_report.swap_id
@@ -486,13 +475,100 @@ fn test_concurrent_admission_reservation_conflict() {
         // The retry only proves the maker can serve again. A reservation that
         // leaked on inputs the retry never needed would still let it through.
         assert_eq!(
-            maker.live_reserved_inputs().unwrap(),
+            maker.reserved_inputs().unwrap(),
             0,
-            "the rejected admission must leave no reserved input behind"
+            "the lost funding race must leave no reserved input behind"
         );
     }
 
-    info!("Concurrent admission reservation conflict test completed successfully!");
+    info!("Concurrent funding race test completed successfully!");
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.finish(takers, block_generation_handle);
+}
+
+/// Two takers are admitted on the same maker coins, which the deterministic
+/// planner gives both swaps. The first to fund claims them; the second maker
+/// re-plans onto its other coin instead of failing, so both swaps complete.
+#[test]
+fn test_concurrent_funding_conflict_replans() {
+    warn!("Running Test: a funding conflict re-plans onto free coins");
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal, TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+
+    for taker in takers.iter() {
+        fund_taker_default(taker, bitcoind, 1);
+    }
+    // The bond takes the 0.05 BTC coin. Two equal 500k coins remain: each
+    // funds one swap alone, and a one-split plan picks the same one for both.
+    fund_makers(
+        &makers,
+        bitcoind,
+        1,
+        Amount::from_sat(5_000_243),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        2,
+        Amount::from_sat(500_000),
+        AddressType::P2TR,
+    );
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+    generate_blocks(bitcoind, 1);
+
+    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let params = || {
+        SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(300_000), 1)
+            .with_tx_count(1)
+            .with_required_confirms(1)
+            .with_preferred_makers(vec![maker_address.clone()])
+    };
+    // Admit both before either funds, so both plans name the same coin.
+    let summaries: Vec<_> = takers
+        .iter_mut()
+        .map(|taker| {
+            taker
+                .prepare_swap(params())
+                .expect("admission must succeed")
+        })
+        .collect();
+
+    let results = [AtomicU8::new(RESULT_PENDING), AtomicU8::new(RESULT_PENDING)];
+    thread::scope(|s| {
+        for ((taker, summary), result) in takers.iter_mut().zip(&summaries).zip(&results) {
+            s.spawn(move || match taker.start_swap(&summary.swap_id) {
+                Ok(_) => result.store(RESULT_SUCCESS, Relaxed),
+                Err(e) => {
+                    warn!("Swap {} failed: {:?}", summary.swap_id, e);
+                    result.store(RESULT_FAILED, Relaxed);
+                }
+            });
+        }
+    });
+
+    assert!(
+        results.iter().all(|r| r.load(Relaxed) == RESULT_SUCCESS),
+        "both swaps must complete: the second maker re-plans onto its free coin"
+    );
+    test_framework.assert_log(
+        "a planned coin went to another swap",
+        &test_framework.taker_log_path(),
+    );
+    assert_eq!(
+        makers[0].reserved_inputs().unwrap(),
+        0,
+        "both settled swaps must have released their coins"
+    );
 
     shutdown_makers(&makers, maker_threads);
     test_framework.finish(takers, block_generation_handle);

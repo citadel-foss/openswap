@@ -32,12 +32,10 @@ pub enum MakerError {
     General(&'static str),
     /// Represents a maker-side liquidity rejection for a new swap.
     InsufficientLiquidity {
-        /// Currently spendable swap liquidity.
+        /// Coins funding could draw on: neither locked nor held by another swap.
         available: Amount,
-        /// Liquidity already reserved by active swaps.
-        reserved: Amount,
-        /// Liquidity requested by the new swap.
-        requested: Amount,
+        /// The hop total the plan had to fund, before netting the policy fees.
+        required: Amount,
     },
     /// Represents a maker-side rejection because the concurrent swap cap is reached.
     TooManySwaps,

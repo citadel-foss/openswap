@@ -32,12 +32,8 @@ fn test_concurrent_legacy_and_taproot_swaps() {
         TestFramework::init::<BitcoindBackend>(
             2,
             vec![TakerBehavior::Normal, TakerBehavior::Normal],
-            // Hold each maker's two admissions at the post-plan, pre-reservation
-            // boundary, so both plans provably form over the same pool view.
-            vec![
-                MakerBehavior::AdmissionRaceBarrier,
-                MakerBehavior::AdmissionRaceBarrier,
-            ],
+            // Admission reserves nothing, so both plans form over the same pool.
+            vec![MakerBehavior::Normal, MakerBehavior::Normal],
         );
     let bitcoind = &test_framework.bitcoind;
 
@@ -45,9 +41,8 @@ fn test_concurrent_legacy_and_taproot_swaps() {
         .iter()
         .map(|taker| fund_taker_default(taker, bitcoind, 3))
         .collect::<Vec<_>>();
-    // Concurrent admissions plan over the same pool before either reserves,
-    // and identical needs plan onto identical coins — so the two plans must
-    // be disjoint by construction. Legacy splits (~167k) fit the 200k coins,
+    // Both admissions plan over the same pool, and identical needs plan onto
+    // identical coins — so the two plans must be disjoint by construction. Legacy splits (~167k) fit the 200k coins,
     // taproot splits (~233k) need the 300k ones; the bond takes its exact
     // UTXO and leaves no change in the pool.
     fund_makers(

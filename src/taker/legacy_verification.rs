@@ -381,18 +381,17 @@ impl Taker {
             )));
         }
 
-        // Each delivered funding tx must use the input count its split was
-        // declared with: the next hop's amount was priced from that shape, so
-        // a quiet change aborts the swap a hop later.
+        // The next hop was priced from each split's declared input count, so a
+        // split funded with fewer inputs pockets the difference.
         for (index, (info, declared)) in senders_info
             .iter()
             .zip(self.swap_state()?.makers[maker_idx].funding_splits.iter())
             .enumerate()
         {
-            if info.funding_tx.input.len() as u32 != *declared {
+            if (info.funding_tx.input.len() as u32) < *declared {
                 self.note_proven_violation(maker_idx);
                 return Err(TakerError::General(format!(
-                    "Maker {} funded split {} with {} inputs, but its reported plan declared {}",
+                    "Maker {} funded split {} with {} inputs, fewer than the {} its plan declared",
                     maker_idx,
                     index,
                     info.funding_tx.input.len(),
@@ -575,15 +574,14 @@ impl Taker {
             }
         }
 
-        // The deduction must equal the policy price of the actual funding
-        // txs: the swap fee and sweep price are already in `expected_amount`,
-        // so the funding fee is priced per real input count, capped at the
-        // negotiated budget. Exact equality, not a minimum.
+        // The deduction must equal the policy price of the declared plan: the
+        // swap fee and sweep price are already in `expected_amount`, and the next
+        // hop was priced from the declared shape, so a maker that re-planned onto
+        // other coins still forwards the same total. Exact equality, not a minimum.
         if let Some(forwardable) = expected_amount {
-            let expected = self.expected_hop_total(
-                forwardable,
-                senders_info.iter().map(|i| i.funding_tx.input.len()),
-            )?;
+            let declared = self.swap_state()?.makers[maker_idx].funding_splits.clone();
+            let expected = self
+                .expected_hop_total(forwardable, declared.iter().map(|&inputs| inputs as usize))?;
             let total_funding = sum_claimed_amounts(senders_info.iter().map(|i| i.funding_amount))
                 .map_err(|amount| {
                     TakerError::General(format!(

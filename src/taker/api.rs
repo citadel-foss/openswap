@@ -1317,6 +1317,9 @@ impl Taker {
         if !self.watch_service.is_alive() {
             return Err(TakerError::General("watchtower is down".into()));
         }
+        // A maker drops a swap left idle since admission; learn that before
+        // funding, while failing still costs nothing.
+        self.revalidate_admissions()?;
 
         let initial_utxos = self.read_wallet()?.list_all_utxo();
 
@@ -2102,8 +2105,7 @@ impl Taker {
     }
 
     /// Send `details` to `maker_address` on a fresh connection and return the
-    /// maker's raw response, accept or reject. Test hook for replaying admission.
-    #[cfg(feature = "integration-test")]
+    /// maker's raw response, accept or reject.
     pub fn resend_swap_details(
         &self,
         maker_address: &str,
@@ -2135,9 +2137,8 @@ impl Taker {
         Ok(serde_cbor::from_slice(&read_message(&mut stream)?)?)
     }
 
-    /// Rebuild the SwapDetails this swap negotiated with `maker_idx`, so test
-    /// hooks can resend them the way a reconnecting client would.
-    #[cfg(feature = "integration-test")]
+    /// Rebuild the SwapDetails this swap negotiated with `maker_idx`, so they can
+    /// be resent the way a reconnecting client would.
     pub fn current_swap_details(&self, maker_idx: usize) -> Result<SwapDetails, TakerError> {
         let swap = self.swap_state()?;
         let refund_locktime_offset = REFUND_LOCKTIME_BASE
@@ -2155,6 +2156,26 @@ impl Taker {
         })
     }
 
+    /// Resend every hop's SwapDetails and require the same accepted plan shape.
+    /// A maker that dropped or re-planned the swap fails it here, before funding.
+    fn revalidate_admissions(&self) -> Result<(), TakerError> {
+        for maker_idx in 0..self.swap_state()?.makers.len() {
+            let details = self.current_swap_details(maker_idx)?;
+            let maker = &self.swap_state()?.makers[maker_idx];
+            match self.resend_swap_details(&maker.address.to_string(), &details)? {
+                MakerToTakerMessage::AckSwapDetails(ack)
+                    if ack.tweakable_point.is_some()
+                        && ack.funding_splits == maker.funding_splits => {}
+                _ => {
+                    return Err(TakerError::General(format!(
+                        "Maker {maker_idx} no longer holds this swap's plan; prepare a new swap"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Resend the negotiated SwapDetails to `maker_idx` on a fresh connection
     /// and return the maker's raw response, accept or reject.
     #[cfg(feature = "integration-test")]
@@ -2169,7 +2190,7 @@ impl Taker {
 
     /// Send a bare `WaitingFundingConfirmation` keepalive for `swap_id` on a
     /// fresh connection, the way the route heartbeat does. Test hook for the
-    /// keepalive/lifetime tests; the maker answers with silence either way, so
+    /// keepalive tests; the maker answers with silence either way, so
     /// acceptance vs refusal is observable in its log only.
     #[cfg(feature = "integration-test")]
     pub fn test_send_keepalive(

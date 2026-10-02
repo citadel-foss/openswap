@@ -43,7 +43,7 @@ use crate::{
         capped_fee, compute_checksum, fee_at_rate_sats, generate_keypair,
         get_hd_path_from_descriptor, now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL,
         LEGACY_CONTRACT_SPEND_VSIZE, MIN_RELAY_FEE_RATE, TAPROOT_KEYPATH_VSIZE,
-        TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT, UNFUNDED_SWAP_LIFETIME,
+        TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
     },
 };
 
@@ -1935,8 +1935,8 @@ impl Wallet {
     }
 
     /// Reserve `outpoints` for the swap `swap_key`; they stay out of coin
-    /// selection until released, or until the reservation ages out. The
-    /// reservation is persisted, so a restart still honours it.
+    /// selection until released. The reservation is persisted, so a restart
+    /// still honours it.
     pub(crate) fn reserve_swap_locks(&mut self, swap_key: &str, outpoints: &[OutPoint]) {
         let entry = self
             .store
@@ -1949,9 +1949,30 @@ impl Wallet {
         entry.outpoints.extend(outpoints.iter().copied());
     }
 
-    /// `Some(inputs)` frees one funding transaction's inputs once its outcome is
-    /// proved; `None` drops the whole swap's reservation. Never release after an
-    /// ambiguous broadcast failure: the transaction may still reach the mempool.
+    /// Reserve `inputs` for `swap_key` only if each one is still a spendable
+    /// wallet coin that no swap holds; otherwise reserve nothing.
+    pub(crate) fn claim_swap_inputs(&mut self, swap_key: &str, inputs: &[OutPoint]) -> bool {
+        let spendable: HashSet<OutPoint> = self
+            .list_descriptor_utxo_spend_info()
+            .into_iter()
+            .chain(self.list_swept_incoming_swap_utxos())
+            .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+            .collect();
+        if inputs.iter().any(|outpoint| {
+            !spendable.contains(outpoint)
+                || self.locked_utxos.contains(outpoint)
+                || self.is_swap_reserved(outpoint)
+        }) {
+            return false;
+        }
+        self.reserve_swap_locks(swap_key, inputs);
+        true
+    }
+
+    /// `Some(inputs)` frees the inputs of a funding transaction the backend
+    /// accepted, and drops them from the cache so no claim reads them as free
+    /// before the next sync; `None` drops the whole swap's reservation. Never
+    /// release after an ambiguous broadcast failure: the tx may still land.
     pub(crate) fn release_swap_locks(
         &mut self,
         swap_key: &str,
@@ -1960,6 +1981,9 @@ impl Wallet {
         let Some(inputs) = inputs else {
             return self.store.swap_locks.remove(swap_key).is_some();
         };
+        for input in inputs {
+            self.store.utxo_cache.remove(input);
+        }
         let Some(locks) = self.store.swap_locks.get_mut(swap_key) else {
             return false;
         };
@@ -1974,38 +1998,23 @@ impl Wallet {
         freed
     }
 
-    /// True while an unexpired reservation holds `outpoint`. A committed swap's
-    /// reservation outlives the taker's connection on purpose: funding can still
-    /// arrive, and reusing its inputs invites a conflicting transaction.
+    /// True while a swap's reservation holds `outpoint`. Coins are reserved only
+    /// at funding, so a reservation lasts until its swap ends or fails.
     pub(crate) fn is_swap_reserved(&self, outpoint: &OutPoint) -> bool {
-        let now = now_secs();
-        self.store.swap_locks.values().any(|locks| {
-            locks.outpoints.contains(outpoint)
-                && now.saturating_sub(locks.reserved_at) < UNFUNDED_SWAP_LIFETIME.as_secs()
-        })
-    }
-
-    /// Outpoints still held out of coin selection by a live reservation.
-    #[cfg(feature = "integration-test")]
-    pub(crate) fn live_reserved_inputs(&self) -> usize {
-        let now = now_secs();
         self.store
             .swap_locks
             .values()
-            .filter(|l| now.saturating_sub(l.reserved_at) < UNFUNDED_SWAP_LIFETIME.as_secs())
-            .map(|l| l.outpoints.len())
-            .sum()
+            .any(|locks| locks.outpoints.contains(outpoint))
     }
 
-    /// Drop reservations past the grace, so an abandoned swap stops holding
-    /// liquidity. Returns true when anything was released.
-    pub(crate) fn expire_swap_locks(&mut self) -> bool {
-        let now = now_secs();
-        let before = self.store.swap_locks.len();
+    /// Outpoints currently held out of coin selection by a reservation.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn reserved_inputs(&self) -> usize {
         self.store
             .swap_locks
-            .retain(|_, l| now.saturating_sub(l.reserved_at) < UNFUNDED_SWAP_LIFETIME.as_secs());
-        self.store.swap_locks.len() != before
+            .values()
+            .map(|l| l.outpoints.len())
+            .sum()
     }
 
     /// When this swap's inputs were reserved, if the reservation still exists.
@@ -4659,24 +4668,53 @@ mod swap_reservation_tests {
     }
 
     #[test]
-    fn a_reservation_stops_holding_inputs_once_it_ages_out() {
+    fn only_a_spendable_coin_no_swap_holds_can_be_claimed() {
         let dir = tempdir().unwrap();
         let mut wallet = test_wallet(&dir.path().join("wallet.cbor"));
-        let reserved = outpoint(3);
-        wallet.reserve_swap_locks("swap-2", &[reserved]);
+        let coin = outpoint(3);
+        let amount = Amount::from_sat(50_000);
+        wallet.store.utxo_cache.insert(
+            coin,
+            (
+                ListUnspentResultEntry {
+                    txid: coin.txid,
+                    vout: coin.vout,
+                    address: None,
+                    label: None,
+                    redeem_script: None,
+                    witness_script: None,
+                    script_pub_key: ScriptBuf::from_bytes(vec![0x51]),
+                    amount,
+                    confirmations: 1,
+                    spendable: true,
+                    solvable: true,
+                    descriptor: None,
+                    safe: true,
+                },
+                UTXOSpendInfo::SeedCoin {
+                    path: "m/0/0".into(),
+                    input_value: amount,
+                    address_type: AddressType::P2WPKH,
+                },
+            ),
+        );
 
-        // Backdate past the grace: an abandoned swap must stop holding liquidity.
-        wallet
-            .store
-            .swap_locks
-            .get_mut("swap-2")
-            .unwrap()
-            .reserved_at -= UNFUNDED_SWAP_LIFETIME.as_secs() + 1;
-
-        assert!(!wallet.is_swap_reserved(&reserved));
-        assert!(wallet.expire_swap_locks());
-        assert!(wallet.store.swap_locks.is_empty());
-        assert!(!wallet.expire_swap_locks(), "expiry must be idempotent");
+        assert!(
+            !wallet.claim_swap_inputs("swap-a", &[outpoint(4)]),
+            "not a wallet coin"
+        );
+        assert_eq!(wallet.plannable_balance(), amount);
+        assert!(wallet.claim_swap_inputs("swap-a", &[coin]));
+        assert_eq!(
+            wallet.plannable_balance(),
+            Amount::ZERO,
+            "a claimed coin is not available to plan"
+        );
+        assert!(
+            !wallet.claim_swap_inputs("swap-b", &[coin]),
+            "held by another swap"
+        );
+        assert!(!wallet.store.swap_locks.contains_key("swap-b"));
     }
 }
 

@@ -94,14 +94,6 @@ pub const UNBROADCAST_DISCARD_GRACE: Duration = TX_CONFIRMATION_TIMEOUT;
 #[cfg(feature = "integration-test")]
 pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(120);
 
-/// Hard lifetime of a swap with no on-chain evidence, counted from admission.
-/// It spans two windows in sequence: the taker confirming its own funding, then
-/// the maker's one batched contract wait. Also the reservation TTL: a swap's
-/// locked inputs must stay locked for as long as the swap itself can live, or
-/// a second admission can claim them under the first swap's frozen plan.
-pub(crate) const UNFUNDED_SWAP_LIFETIME: Duration =
-    Duration::from_secs(2 * TX_CONFIRMATION_TIMEOUT.as_secs());
-
 /// Default fee rate in sats/vb for all transactions, and the absolute floor:
 /// Bitcoin Core's default `minrelaytxfee`. Lower rates stop relaying.
 pub const MIN_RELAY_FEE_RATE: f64 = 1.0;

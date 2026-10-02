@@ -416,8 +416,8 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
         .get(log_offset as usize..)
         .unwrap_or(log_contents.as_str());
     assert!(
-        !tail.contains("Released idle unfunded reservation"),
-        "the waiting swap must not be drained as an idle unfunded reservation"
+        !tail.contains("Released idle unfunded swap"),
+        "the waiting swap must not be drained as an idle unfunded swap"
     );
     assert!(
         !tail.contains("Potential dropped connection from taker"),

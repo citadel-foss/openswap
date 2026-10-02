@@ -725,8 +725,7 @@ fn maker_degrades_split_count_when_netting_breaks_the_floor() {
     taker
         .prepare_swap(params)
         .expect("admission must fall back to one split");
-    // Two splits would reserve at least two inputs.
-    assert_eq!(makers[0].live_reserved_inputs().unwrap(), 1);
+    test_framework.assert_log("with 1 funding split(s)", &test_framework.taker_log_path());
 
     shutdown_makers(&makers, maker_threads);
     test_framework.stop();
@@ -1265,9 +1264,11 @@ fn test_taproot_rejection(behavior: MakerBehavior, expected_error: &str) {
     block_generation_handle.join().unwrap();
 }
 
+/// Admission plans but reserves nothing: coins are claimed only at funding, so a
+/// second admission on the same liquidity is accepted and nothing stays locked.
 #[test]
-fn test_maker_rejects_insufficient_liquidity_from_active_reservation() {
-    warn!("Running Test: InsufficientLiquidity from active reservation");
+fn test_admission_reserves_no_liquidity() {
+    warn!("Running Test: admission reserves no liquidity");
 
     let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal, TakerBehavior::Normal];
@@ -1283,8 +1284,8 @@ fn test_maker_rejects_insufficient_liquidity_from_active_reservation() {
     fund_taker_default(&takers[1], bitcoind, 4);
 
     // Fund the maker with four 0.05 BTC UTXOs. After the fidelity bond, its
-    // spendable liquidity is ~15M sats, so two 9M-sat reservations cannot both
-    // be admitted, while each request is still below the advertised max_size.
+    // spendable liquidity is ~15M sats, so two 9M-sat swaps cannot both be
+    // funded, while each request is still below the advertised max_size.
     fund_makers_default(&makers, bitcoind);
 
     let maker_thread = {
@@ -1303,32 +1304,29 @@ fn test_maker_rejects_insufficient_liquidity_from_active_reservation() {
     let maker_addr = format!("127.0.0.1:{}", maker.config.network_port);
 
     // Taker 0 admits a swap with the maker. prepare_swap only negotiates;
-    // it does not fund, so the maker keeps an active reservation for the amount.
+    // it does not fund, so the maker reserves nothing yet.
     let first = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(9_000_000), 1)
         .with_tx_count(1)
         .with_required_confirms(1)
         .with_preferred_makers(vec![maker_addr.clone()]);
     takers[0]
         .prepare_swap(first)
-        .expect("first swap should be admitted and create a reservation");
+        .expect("first swap should be admitted");
 
-    // Taker 1 asks for the same amount. The advertised max_size is still large
-    // enough, but the active reservation leaves the maker short of liquidity.
+    // Taker 1 asks for the same amount and is admitted too: nothing is locked
+    // until one of them funds.
     let second = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(9_000_000), 1)
         .with_tx_count(1)
         .with_required_confirms(1)
         .with_preferred_makers(vec![maker_addr]);
-    let _err = takers[1]
+    takers[1]
         .prepare_swap(second)
-        .expect_err("second swap should fail due to reserved liquidity");
-
-    // The wire rejection is intentionally terse (AckSwapDetails::reject), so the
-    // precise reason is verified in the shared test log (maker warnings are
-    // emitted through the root appender).
-    let log_path = test_framework.taker_log_path();
-    test_framework.assert_log("Rejecting swap", &log_path);
-    test_framework.assert_log("cannot fund", &log_path);
-    test_framework.assert_log("sats forwardable", &log_path);
+        .expect("second swap should be admitted on the same liquidity");
+    assert_eq!(
+        maker.reserved_inputs().unwrap(),
+        0,
+        "admission must not reserve any input"
+    );
 
     maker.shutdown.store(true, Relaxed);
     maker_thread.join().unwrap();
@@ -2817,104 +2815,11 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(protocol: ProtocolVersio
     block_generation_handle.join().unwrap();
 }
 
-/// An Ack that under-reports its split input counts must be caught by the
-/// taker's shape binding: the swap fails and the maker takes a proven
-/// violation, on both protocols.
-#[test]
-fn test_taproot_rejects_underreported_funding_inputs() {
-    run_rejects_underreported_funding_inputs(ProtocolVersion::Taproot);
-}
-
-#[test]
-fn test_legacy_rejects_underreported_funding_inputs() {
-    run_rejects_underreported_funding_inputs(ProtocolVersion::Legacy);
-}
-
-fn run_rejects_underreported_funding_inputs(protocol: ProtocolVersion) {
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::UnderreportFundingInputs],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    fund_taker_default(taker, bitcoind, 3);
-    fund_makers_default(&makers, bitcoind);
-    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
-
-    let summary = taker
-        .prepare_swap(
-            SwapParams::new(protocol, Amount::from_sat(500_000), 1)
-                .with_tx_count(2)
-                .with_required_confirms(1),
-        )
-        .expect("prepare swap");
-    let error = taker
-        .start_swap(&summary.swap_id)
-        .expect_err("funding shaped differently from the Ack must be rejected");
-    assert!(
-        format!("{error:?}").contains("but its reported plan declared"),
-        "unexpected error: {:?}",
-        error
-    );
-
-    // The mismatch is arithmetically proven, so the maker's standing steps
-    // off Good.
-    let standing = taker
-        .fetch_offers()
-        .unwrap()
-        .all_makers()
-        .into_iter()
-        .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
-        .expect("the maker must be in the offerbook");
-    assert!(
-        matches!(
-            standing.state,
-            MakerState::Banned(BanRecord {
-                reason: BanReason::ProvenViolation,
-                ..
-            })
-        ),
-        "a proven shape mismatch must ban the maker"
-    );
-
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
-}
-
-/// The maker reads this at drain time; the default matches production.
-const LIFETIME_ENV: &str = "OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS";
-
-/// Shrinks the unfunded-swap lifetime for one test and puts the old value back
-/// on drop, so the override cannot leak into later tests in this process.
-struct LifetimeOverride(Option<String>);
-
-impl LifetimeOverride {
-    fn set(secs: &str) -> Self {
-        let previous = std::env::var(LIFETIME_ENV).ok();
-        std::env::set_var(LIFETIME_ENV, secs);
-        Self(previous)
-    }
-}
-
-impl Drop for LifetimeOverride {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(previous) => std::env::set_var(LIFETIME_ENV, previous),
-            None => std::env::remove_var(LIFETIME_ENV),
-        }
-    }
-}
-
-/// The setup all three keepalive tests share: one funded maker, one admitted
-/// swap that is never started. The returned lifetime guard must live to the
-/// end of the test or the two-hour default comes back.
+/// The setup both keepalive tests share: one funded maker and one admitted swap
+/// that is not started yet.
 #[allow(clippy::type_complexity)]
 fn keepalive_admission(
     taker_behavior: TakerBehavior,
-    lifetime_secs: Option<&str>,
     pause_mining: bool,
 ) -> (
     Arc<TestFramework>,
@@ -2924,9 +2829,7 @@ fn keepalive_admission(
     Vec<JoinHandle<()>>,
     String,
     String,
-    Option<LifetimeOverride>,
 ) {
-    let lifetime = lifetime_secs.map(LifetimeOverride::set);
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
             1,
@@ -2966,105 +2869,7 @@ fn keepalive_admission(
         maker_threads,
         summary.swap_id.clone(),
         log_path,
-        lifetime,
     )
-}
-
-/// An admitted swap whose funding never shows on-chain must die at its
-/// admission lifetime even while the taker keeps the reservation warm with
-/// keepalives and SwapDetails resends.
-#[test]
-fn unfunded_swap_dies_at_lifetime_despite_keepalives() {
-    warn!("Running Test: unfunded swap dies at its admission lifetime despite keepalives");
-
-    let (
-        test_framework,
-        mut takers,
-        makers,
-        block_generation_handle,
-        maker_threads,
-        swap_id,
-        log_path,
-        _lifetime,
-    ) = keepalive_admission(TakerBehavior::Normal, Some("120"), false);
-
-    let taker = takers.get_mut(0).unwrap();
-    let maker = &makers[0];
-    let maker_addr = format!("127.0.0.1:{}", maker.config.network_port);
-    let start = Instant::now();
-    let mut last_ping = Instant::now() - Duration::from_secs(10);
-    // The identical resend is the second keepalive vector; both must refresh
-    // right up to the lifetime.
-    let mut resend_at = vec![Duration::from_secs(45), Duration::from_secs(100)];
-    let mut alive_past_idle_cycles = false;
-    loop {
-        let elapsed = start.elapsed();
-        if elapsed >= Duration::from_secs(90) && !alive_past_idle_cycles {
-            // Three idle-timeout cycles in, the keepalives must still be
-            // holding the reservation.
-            alive_past_idle_cycles = maker.has_ongoing_swaps().unwrap();
-        }
-        if resend_at.first().is_some_and(|mark| elapsed >= *mark) {
-            resend_at.remove(0);
-            match taker.test_resend_swap_details(0) {
-                Ok(openswap::protocol::common_messages::MakerToTakerMessage::AckSwapDetails(
-                    ack,
-                )) => {
-                    assert!(
-                        ack.tweakable_point.is_some(),
-                        "an identical SwapDetails resend must be accepted while the swap lives"
-                    );
-                }
-                other => panic!("resend got unexpected response: {:?}", other),
-            }
-        }
-        if last_ping.elapsed() >= Duration::from_secs(10) {
-            taker
-                .test_send_keepalive(&maker_addr, &swap_id)
-                .expect("the keepalive send itself must work");
-            last_ping = Instant::now();
-        }
-        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-        if contents.contains("past its admission lifetime") {
-            break;
-        }
-        assert!(
-            elapsed < Duration::from_secs(200),
-            "the unfunded swap must be released at its admission lifetime"
-        );
-        thread::sleep(Duration::from_secs(1));
-    }
-
-    assert!(
-        alive_past_idle_cycles,
-        "keepalives must hold the reservation past idle-timeout cycles before the lifetime"
-    );
-    test_framework.assert_log("Released unfunded swap", &log_path);
-    // Accepted keepalives prove the idle timer was being refreshed; the drain
-    // reason must be the lifetime, never the idle branch.
-    test_framework.assert_log("Resetting timer", &log_path);
-    let contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !contents.contains("Released idle unfunded reservation"),
-        "the idle branch must not fire while keepalives arrive"
-    );
-
-    // The reservation is gone and the slot is reusable.
-    assert!(
-        !maker.has_ongoing_swaps().unwrap(),
-        "the maker must hold no swap after the lifetime drain"
-    );
-    taker
-        .prepare_swap(
-            SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
-                .with_tx_count(1)
-                .with_required_confirms(1)
-                .with_preferred_makers(vec![maker_addr]),
-        )
-        .expect("a fresh swap must be admitted into the freed slot");
-
-    shutdown_makers(&makers, maker_threads);
-    test_framework.finish(takers, block_generation_handle);
 }
 
 /// A keepalive naming funding the backend can see still refreshes: with
@@ -3083,8 +2888,7 @@ fn keepalive_with_mempool_funding_still_refreshes() {
         maker_threads,
         swap_id,
         log_path,
-        _lifetime,
-    ) = keepalive_admission(TakerBehavior::SkipFundingConfirmWait, None, true);
+    ) = keepalive_admission(TakerBehavior::SkipFundingConfirmWait, true);
 
     let mut taker = takers.remove(0);
     let swap_thread = thread::spawn(move || taker.start_swap(&swap_id));
@@ -3116,8 +2920,8 @@ fn keepalive_with_mempool_funding_still_refreshes() {
         "no keepalive may be refused while the funding is mempool-visible"
     );
     assert!(
-        !contents.contains("Released unfunded swap"),
-        "the swap must be funded well before the admission lifetime"
+        !contents.contains("Released idle unfunded swap"),
+        "a swap with mempool-visible funding must never be drained"
     );
 
     shutdown_makers(&makers, maker_threads);
@@ -3125,8 +2929,8 @@ fn keepalive_with_mempool_funding_still_refreshes() {
 }
 
 /// A keepalive naming funding the backend cannot see must not refresh:
-/// every post-claim keepalive is refused and the unfunded reservation
-/// still dies at its admission lifetime.
+/// every post-claim keepalive is refused and the unfunded swap is drained
+/// once idle.
 #[test]
 fn keepalive_naming_unseen_funding_is_refused() {
     warn!("Running Test: keepalive naming unseen funding is refused");
@@ -3139,8 +2943,7 @@ fn keepalive_naming_unseen_funding_is_refused() {
         maker_threads,
         swap_id,
         log_path,
-        _lifetime,
-    ) = keepalive_admission(TakerBehavior::WithholdFundingBroadcast, Some("120"), true);
+    ) = keepalive_admission(TakerBehavior::WithholdFundingBroadcast, true);
 
     let mut taker = takers.remove(0);
     let swap_thread = thread::spawn(move || taker.start_swap(&swap_id));
@@ -3179,19 +2982,246 @@ fn keepalive_naming_unseen_funding_is_refused() {
         "a refused keepalive must not refresh the idle timer"
     );
 
-    // The reservation still dies at the admission lifetime, not by idleness:
-    // the withheld funding is not on-chain evidence.
+    // With every keepalive refused, the swap goes idle and is drained: the
+    // withheld funding is not on-chain evidence.
     wait_for_log(
         &log_path,
-        "past its admission lifetime",
-        Duration::from_secs(240),
+        "Released idle unfunded swap",
+        Duration::from_secs(400),
     );
     assert!(
         !makers[0].has_ongoing_swaps().unwrap(),
-        "the maker must hold no swap after the lifetime drain"
+        "the maker must hold no swap after the idle drain"
     );
 
     test_framework.set_block_gen_paused(false);
+    shutdown_makers(&makers, maker_threads);
+    test_framework.finish(takers, block_generation_handle);
+}
+
+/// A taker that returns after the maker drained its idle admission is
+/// admitted again by the re-check before funding, and the swap completes.
+#[test]
+fn slow_taker_is_readmitted_before_funding() {
+    warn!("Running Test: slow taker is re-admitted before funding");
+
+    let (
+        test_framework,
+        mut takers,
+        makers,
+        block_generation_handle,
+        maker_threads,
+        swap_id,
+        log_path,
+    ) = keepalive_admission(TakerBehavior::Normal, false);
+
+    wait_for_log(
+        &log_path,
+        "Released idle unfunded swap",
+        Duration::from_secs(400),
+    );
+    takers[0]
+        .start_swap(&swap_id)
+        .expect("the re-check must re-admit the drained swap");
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.finish(takers, block_generation_handle);
+}
+
+/// A maker that re-admits a drained swap with a different plan shape fails
+/// the taker's re-check, before the taker funds anything.
+#[test]
+fn readmission_with_a_new_shape_fails_before_funding() {
+    warn!("Running Test: re-admission with a new plan shape fails before funding");
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    fund_taker_default(takers.get_mut(0).unwrap(), bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+    let log_path = test_framework.taker_log_path();
+
+    let taker = takers.get_mut(0).unwrap();
+    let summary = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
+                .with_tx_count(2)
+                .with_required_confirms(1),
+        )
+        .expect("the maker must admit the swap");
+    test_framework.assert_log("with 2 funding split(s)", &log_path);
+
+    // Leave the maker one coin, so a fresh plan can have only one split.
+    let spendable = makers[0]
+        .wallet
+        .read()
+        .unwrap()
+        .get_balances()
+        .unwrap()
+        .spendable;
+    let external = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap();
+    makers[0]
+        .wallet
+        .write()
+        .unwrap()
+        .send_to_address(
+            spendable.to_sat() - 700_000,
+            external.to_string(),
+            Some(MIN_RELAY_FEE_RATE),
+            None,
+        )
+        .unwrap();
+    generate_blocks(bitcoind, 1);
+    sync_maker_wallets(&makers);
+
+    wait_for_log(
+        &log_path,
+        "Released idle unfunded swap",
+        Duration::from_secs(400),
+    );
+    let before = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let error = taker
+        .start_swap(&summary.swap_id)
+        .expect_err("a changed plan shape must stop the swap");
+    assert!(
+        format!("{error:?}").contains("no longer holds this swap's plan"),
+        "unexpected error: {:?}",
+        error
+    );
+    let after = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    assert_eq!(
+        after.spendable, before.spendable,
+        "the taker funded nothing"
+    );
+    assert_eq!(after.contract, Amount::ZERO);
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.finish(takers, block_generation_handle);
+}
+
+/// A failed sweep puts the completed swap's state back after it was removed.
+/// That store must pass the stale-plan guard, or the maker loses the state.
+#[test]
+fn completed_swap_state_is_restored_after_a_failed_sweep() {
+    warn!("Running Test: completed swap state is restored after a failed sweep");
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::FailSweep],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let summary = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
+                .with_tx_count(1)
+                .with_required_confirms(1),
+        )
+        .expect("prepare swap");
+    taker
+        .start_swap(&summary.swap_id)
+        .expect("the taker's side completes before the maker sweeps");
+
+    let log_path = test_framework.taker_log_path();
+    wait_for_log(
+        &log_path,
+        "Failed to sweep incoming swapcoins",
+        Duration::from_secs(60),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !makers[0].has_ongoing_swaps().unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "the completed swap's state must be put back"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+    let contents = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        !contents.contains("Rejecting late message"),
+        "restoring a completed swap is not a late message"
+    );
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.finish(takers, block_generation_handle);
+}
+
+/// An Ack that declares more inputs per split than the maker funds with
+/// would charge the taker for inputs nobody spends. The taker catches it and
+/// records a proven violation, on both protocols.
+#[test]
+fn test_taproot_rejects_overreported_funding_inputs() {
+    run_rejects_overreported_funding_inputs(ProtocolVersion::Taproot);
+}
+
+#[test]
+fn test_legacy_rejects_overreported_funding_inputs() {
+    run_rejects_overreported_funding_inputs(ProtocolVersion::Legacy);
+}
+
+fn run_rejects_overreported_funding_inputs(protocol: ProtocolVersion) {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::OverreportFundingInputs],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let summary = taker
+        .prepare_swap(
+            SwapParams::new(protocol, Amount::from_sat(500_000), 1)
+                .with_tx_count(2)
+                .with_required_confirms(1),
+        )
+        .expect("prepare swap");
+    let error = taker
+        .start_swap(&summary.swap_id)
+        .expect_err("funding with fewer inputs than declared must be rejected");
+    assert!(
+        format!("{error:?}").contains("its plan declared"),
+        "unexpected error: {:?}",
+        error
+    );
+
+    let standing = taker
+        .fetch_offers()
+        .unwrap()
+        .all_makers()
+        .into_iter()
+        .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
+        .expect("the maker must be in the offerbook");
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a proven input overreport must ban the maker"
+    );
+
     shutdown_makers(&makers, maker_threads);
     test_framework.finish(takers, block_generation_handle);
 }

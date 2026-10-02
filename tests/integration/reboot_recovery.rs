@@ -2,8 +2,9 @@
 //!
 //! A restarted node knows its live swaps only from what it persisted. This
 //! file proves each piece of that: funded swapcoins survive a maker reboot
-//! with no tracker record yet, startup rebuilds every contract watch, and a
-//! crash inside the contract-acceptance window loses nothing.
+//! with no tracker record yet, startup rebuilds every contract watch, a
+//! crash inside the contract-acceptance window loses nothing, and a coin
+//! claim that nothing on disk owns is freed.
 //!
 //! Route for the reboot case: Taker -> Maker1 (Normal) -> Maker2 (closes at
 //! handover) -> Taker. Maker2 broadcasts its funding transaction and persists
@@ -810,7 +811,7 @@ fn run_reservations_survive_restart<B: TestBackend>(
     );
 
     let victim = makers[1].clone();
-    let before = victim.live_reserved_inputs().unwrap();
+    let before = victim.reserved_inputs().unwrap();
     assert!(
         before > 0,
         "Maker2 must reserve the inputs of the funding it planned"
@@ -861,7 +862,7 @@ fn run_reservations_survive_restart<B: TestBackend>(
         thread::sleep(Duration::from_millis(500));
     }
 
-    let after = restarted.live_reserved_inputs().unwrap();
+    let after = restarted.reserved_inputs().unwrap();
     assert_eq!(
         after, before,
         "startup recovery must not free inputs the planned funding can still spend"
@@ -886,7 +887,7 @@ fn run_reservations_survive_restart<B: TestBackend>(
         );
         thread::sleep(Duration::from_secs(2));
     }
-    let released = restarted.live_reserved_inputs().unwrap();
+    let released = restarted.reserved_inputs().unwrap();
     assert_eq!(
         released, 0,
         "past the grace the never-funded swap must release its inputs"
@@ -896,4 +897,74 @@ fn run_reservations_survive_restart<B: TestBackend>(
     restarted_thread.join().unwrap();
     test_framework.stop();
     block_generation_handle.join().unwrap();
+}
+
+/// A maker that dies after claiming its funding coins, before it saves any
+/// record of the swap, leaves a reservation nothing owns. The next start
+/// frees it instead of holding those coins forever.
+#[test]
+fn orphan_reservation_is_released_on_restart() {
+    warn!("Running Test: an orphan reservation is released on restart");
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::AbandonFundingClaim],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let summary = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
+                .with_tx_count(1)
+                .with_required_confirms(1),
+        )
+        .expect("prepare swap");
+    let log_path = test_framework.taker_log_path();
+    let victim = makers[0].clone();
+
+    // Stop the maker while it still holds the abandoned claim: its idle drain
+    // would otherwise free the coins before the restart.
+    let held = thread::scope(|scope| {
+        let swap = scope.spawn(|| taker.start_swap(&summary.swap_id));
+        wait_for_log(
+            &log_path,
+            "Test behavior: abandoning the funding claim",
+            Duration::from_secs(120),
+        );
+        let held = victim.reserved_inputs().unwrap();
+        shutdown_makers(&makers, maker_threads);
+        assert!(swap.join().unwrap().is_err(), "the swap must fail");
+        held
+    });
+    assert!(held > 0, "the abandoned claim must hold the planned coins");
+
+    let mut victim_config = victim.config.clone();
+    victim_config.password = Some("integration-test".to_string());
+    drop(victim);
+    drop(makers);
+
+    let restarted = Arc::new(MakerServer::init(victim_config).unwrap());
+    let restarted_thread = {
+        let maker_clone = restarted.clone();
+        thread::spawn(move || {
+            start_server(maker_clone).unwrap();
+        })
+    };
+    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+    test_framework.assert_log("nothing left owns it", &log_path);
+    assert_eq!(
+        restarted.reserved_inputs().unwrap(),
+        0,
+        "no swap owns the claim, so the restart must free it"
+    );
+
+    restarted.shutdown.store(true, Relaxed);
+    restarted_thread.join().unwrap();
+    test_framework.finish(takers, block_generation_handle);
 }

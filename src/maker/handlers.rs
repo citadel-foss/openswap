@@ -133,12 +133,17 @@ pub enum MakerBehavior {
     /// Build funding splits at the relay floor while the taker reimburses the
     /// negotiated rate (funding-fee underpayment rejection tests).
     UnderpayFundingFee,
-    /// Ack one input fewer per split than the plan will fund with; only the
-    /// taker's per-split input-count binding can catch it.
-    UnderreportFundingInputs,
-    /// Hold at a barrier between admission planning and reservation, so two
-    /// concurrent admissions plan identical inputs before either may reserve.
-    AdmissionRaceBarrier,
+    /// Ack one input more per split than the plan funds with, so the taker
+    /// prices fees for inputs the maker never spends.
+    OverreportFundingInputs,
+    /// Claim the funding coins, then fail before building anything, leaving
+    /// the claim behind as a crash would.
+    AbandonFundingClaim,
+    /// Fail the post-swap sweep, so the completed swap's state is put back.
+    FailSweep,
+    /// Hold the frozen plan's coins under a stand-in swap at funding, so the
+    /// first pass must re-plan as if another swap had taken them.
+    ForceReplan,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).
@@ -222,8 +227,8 @@ pub struct ConnectionState {
     /// partial batch must not read as never broadcast, or recovery discards
     /// recovery material for transactions already on-chain.
     pub funding_broadcast_txids: Vec<Txid>,
-    /// The funding plan frozen at admission; executed as-is, never re-planned.
-    /// Empty until admission succeeds.
+    /// The funding plan frozen at admission; its input counts are what the Ack
+    /// declared. Empty until admission succeeds.
     pub funding_plan: Vec<SplitPlan>,
     /// Last activity timestamp.
     pub last_activity: Instant,
@@ -364,7 +369,8 @@ pub trait Maker: Send + Sync {
 
     /// Execute the funding plan frozen at admission, one transaction per
     /// split. `amount` must match the plan's pre-netting total exactly; a
-    /// missing or mismatched plan is a protocol error, never a re-plan.
+    /// missing or mismatched plan is a protocol error. A planned coin another
+    /// swap took is replaced by a re-plan of the same shape.
     /// The `Vec<u32>` is `payment_output_positions`: each split's payment
     /// output index in its funding tx.
     fn create_funding_transactions(
@@ -482,7 +488,7 @@ pub trait Maker: Send + Sync {
     /// True when this swap has named its incoming funding txids (claimed at
     /// contract-data admission, or saved as incoming swapcoins) but the backend
     /// sees none of them, mempool included. Pre-evidence and unknown swaps
-    /// return false: their refresh is bounded by the unfunded lifetime instead.
+    /// return false: a later hop waits on upstream funding it cannot see.
     fn claimed_funding_unseen(&self, swap_id: &str) -> Result<bool, MakerError>;
 
     /// The spending txid when the watchtower saw a Legacy incoming funding
@@ -1114,7 +1120,7 @@ fn handle_swap_details<M: Maker>(
     let (_, tweakable_point, _) = maker.get_tweakable_keypair()?;
 
     // The Ack reports the shape of the plan frozen at admission, so the taker
-    // derives the next hop's amount and count from what we actually reserved.
+    // derives the next hop's amount and count from what we will fund.
     let stored = maker
         .get_connection_state(&details.id)?
         .ok_or(MakerError::General("Admission left no stored swap state"))?;
@@ -1124,21 +1130,21 @@ fn handle_swap_details<M: Maker>(
         .map(|split| split.utxos.len() as u32)
         .collect();
     state.funding_plan = stored.funding_plan;
-
     #[cfg(feature = "integration-test")]
-    let funding_splits = if maker.behavior() == MakerBehavior::UnderreportFundingInputs {
-        funding_splits
-            .iter()
-            .map(|count| count.saturating_sub(1))
-            .collect()
+    let funding_splits = if maker.behavior() == MakerBehavior::OverreportFundingInputs {
+        funding_splits.iter().map(|count| count + 1).collect()
     } else {
         funding_splits
     };
+    // A resend for a live swap keeps that admission's identity, or this
+    // connection's later stores would read as a stale admission.
+    state.swap_start_time = stored.swap_start_time;
 
     log::info!(
-        "[{}] Accepting swap (id: {})",
+        "[{}] Accepting swap (id: {}) with {} funding split(s)",
         Maker::network_port(maker.as_ref()),
-        details.id
+        details.id,
+        funding_splits.len()
     );
 
     #[cfg(feature = "integration-test")]

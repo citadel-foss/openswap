@@ -3,7 +3,7 @@
 #[cfg(feature = "integration-test")]
 use std::net::TcpListener;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryFrom,
     io::Write,
     net::TcpStream,
@@ -32,7 +32,7 @@ use crate::{
         sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
-        funding::{net_policy_fees, SplitPlan},
+        funding::{fit_declared_shape, net_policy_fees, SplitPlan},
         min_contract_value_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FeePriority,
@@ -41,11 +41,6 @@ use crate::{
     },
     watch_tower::service::WatchService,
 };
-
-use crate::utill::{TX_BROADCAST_TIMEOUT, UNFUNDED_SWAP_LIFETIME};
-
-#[cfg(feature = "integration-test")]
-use std::env;
 
 #[cfg(feature = "integration-test")]
 pub use super::handlers::MakerBehavior;
@@ -60,25 +55,11 @@ use super::{
     swap_tracker::{now_secs, MakerRecoveryPhase, MakerSwapPhase, MakerSwapTracker},
 };
 
+/// How often a pending fidelity bond is checked for confirmation.
+const BOND_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
 // Covers all production response timeouts and finalization retry delays.
 const COMPLETED_HANDOVER_TTL: Duration = Duration::from_secs(65 * 60);
-
-/// One source for the lifetime so the drain and the confirmation wait agree;
-/// tests override it through the env to skip the two-hour default.
-fn unfunded_swap_lifetime() -> Duration {
-    #[cfg(feature = "integration-test")]
-    {
-        env::var("OPENSWAP_UNFUNDED_SWAP_LIFETIME_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(UNFUNDED_SWAP_LIFETIME)
-    }
-    #[cfg(not(feature = "integration-test"))]
-    {
-        UNFUNDED_SWAP_LIFETIME
-    }
-}
 
 /// What a hop must keep after its own fee: the incoming sweeps plus one
 /// single-input outgoing contract. No swap of this shape passes with less.
@@ -181,10 +162,12 @@ struct SwapState {
     funding_broadcast_txids: Vec<Txid>,
     /// Maker service fee calculated from the accepted offer, excluding mining reimbursement.
     service_fee_sats: u64,
-    /// The funding plan frozen at admission, netted of policy fees. Executed
-    /// as-is; a maker never re-plans a live swap. Its inputs sit in the
-    /// wallet's swap-keyed reservation map, the single owner of reservations.
+    /// The funding plan frozen at admission, netted of policy fees. Its input
+    /// counts are what the taker was charged for; its coins are only a choice.
     funding_plan: Vec<SplitPlan>,
+    /// The plan whose coins funding claimed: the frozen one, or its re-plan when
+    /// another swap took a coin. A rebuild of built funding reuses exactly this.
+    claimed_plan: Vec<SplitPlan>,
     /// Last activity timestamp.
     last_activity: Instant,
     /// Time when this swap was accepted by the maker.
@@ -216,6 +199,7 @@ impl Default for SwapState {
             funding_broadcast_txids: Vec::new(),
             service_fee_sats: 0,
             funding_plan: Vec::new(),
+            claimed_plan: Vec::new(),
             last_activity: Instant::now(),
             swap_start_time: Instant::now(),
             funding_confirmation_height: None,
@@ -1033,7 +1017,6 @@ impl MakerServer {
 
     /// Waits for the bond at `index` to confirm, with no deadline, and returns its height.
     fn wait_for_bond_confirmation(&self, index: u32) -> Result<u32, MakerError> {
-        const POLL_INTERVAL: Duration = Duration::from_secs(10);
         loop {
             if let Some(height) = self.check_bond_confirmation(index)? {
                 return Ok(height);
@@ -1042,9 +1025,9 @@ impl MakerServer {
                 "[{}] Fidelity bond {} not confirmed yet, checking again in {}s",
                 self.config.network_port,
                 index,
-                POLL_INTERVAL.as_secs()
+                BOND_POLL_INTERVAL.as_secs()
             );
-            if !self.wait_for_shutdown(POLL_INTERVAL) {
+            if !self.wait_for_shutdown(BOND_POLL_INTERVAL) {
                 return Err(MakerError::General("Shutdown requested"));
             }
         }
@@ -1059,13 +1042,13 @@ impl MakerServer {
     /// valuation (`calculate_bond_value` needs the confirmation height) and
     /// would be silently discarded by `get_highest_fidelity_index`, making
     /// the maker create a second bond and doubly lock funds. Finalizing it
-    /// here prevents that. With a `live_bond` to advertise, each pending bond is
-    /// only checked once; the renewal loop checks again later.
-    fn finalize_pending_fidelity_bonds(&self, live_bond: bool) -> Result<(), MakerError> {
+    /// here prevents that. Pending bonds are checked together, and once any
+    /// bond is live the rest get one check each; the renewal loop checks again.
+    fn finalize_pending_fidelity_bonds(&self, mut live_bond: bool) -> Result<(), MakerError> {
         // Snapshot the pending bonds once: an unrecoverable bond stays
         // pending in the wallet, so re-finding inside the loop would spin
         // on it forever.
-        let pending: Vec<(u32, bitcoin::Txid)> = lock_debug!(self.wallet.read())
+        let mut pending: Vec<(u32, bitcoin::Txid)> = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
             .store
             .fidelity_bond
@@ -1073,58 +1056,65 @@ impl MakerServer {
             .filter(|b| !b.is_spent && b.conf_height.is_none())
             .map(|b| (b.bond_index, b.outpoint.txid))
             .collect();
-
-        for (index, txid) in pending {
-            let confirmed = if live_bond {
-                self.check_bond_confirmation(index)
-            } else {
+        if !live_bond {
+            for (_, txid) in &pending {
                 log::info!(
                     "[{}] Found unconfirmed fidelity bond {}, waiting for confirmation instead of creating a new one",
                     self.config.network_port,
                     txid
                 );
-                self.wait_for_bond_confirmation(index).map(Some)
-            };
-            let conf_height = match confirmed {
-                Ok(Some(height)) => height,
-                Ok(None) => {
+            }
+        }
+
+        while !pending.is_empty() {
+            let mut unconfirmed = Vec::new();
+            for (index, txid) in pending {
+                match self.check_bond_confirmation(index) {
+                    Ok(Some(conf_height)) => {
+                        lock_debug!(self.wallet.write())
+                            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                            .update_fidelity_bond_conf_details(index, conf_height)
+                            .map_err(MakerError::Wallet)?;
+                        log::info!(
+                            "[{}] Pending fidelity bond {} confirmed at height {}",
+                            self.config.network_port,
+                            txid,
+                            conf_height
+                        );
+                        live_bond = true;
+                    }
+                    Ok(None) => unconfirmed.push((index, txid)),
+                    // The bond was evicted and there is no stored transaction to
+                    // rebroadcast: it can never confirm. Losing the bond must not
+                    // take the maker down — log it and start up anyway.
+                    Err(MakerError::Wallet(WalletError::Fidelity(
+                        FidelityError::BondTransactionMissing { .. },
+                    ))) => {
+                        log::error!(
+                            "[{}] Pending fidelity bond {} was evicted and has no stored transaction; \
+                             it is unrecoverable. Skipping it and continuing startup.",
+                            self.config.network_port,
+                            txid
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            pending = unconfirmed;
+            if live_bond {
+                for (_, txid) in &pending {
                     log::info!(
                         "[{}] Fidelity bond {} still unconfirmed; advertising the live bond meanwhile",
                         self.config.network_port,
                         txid
                     );
-                    continue;
                 }
-                // The bond was evicted and there is no stored transaction to
-                // rebroadcast: it can never confirm. Losing the bond must not
-                // take the maker down — log it and start up anyway.
-                Err(MakerError::Wallet(WalletError::Fidelity(
-                    FidelityError::BondTransactionMissing { .. },
-                ))) => {
-                    log::error!(
-                        "[{}] Pending fidelity bond {} was evicted and has no stored transaction; \
-                         it is unrecoverable. Skipping it and continuing startup.",
-                        self.config.network_port,
-                        txid
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            lock_debug!(self.wallet.write())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .update_fidelity_bond_conf_details(index, conf_height)
-                .map_err(MakerError::Wallet)?;
-
-            log::info!(
-                "[{}] Pending fidelity bond {} confirmed at height {}",
-                self.config.network_port,
-                txid,
-                conf_height
-            );
+                break;
+            }
+            if !pending.is_empty() && !self.wait_for_shutdown(BOND_POLL_INTERVAL) {
+                return Err(MakerError::General("Shutdown requested"));
+            }
         }
-
         Ok(())
     }
 
@@ -1437,12 +1427,9 @@ impl MakerServer {
             lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
         let mut idle = Vec::new();
 
-        // An unfunded swap only reserves liquidity, so it is dropped without recovery:
-        // after the broadcast window of silence, or at the admission lifetime, which
-        // keepalives cannot extend.
-        let lifetime = unfunded_swap_lifetime();
-        let unfunded_idle = timeout.min(TX_BROADCAST_TIMEOUT);
-        let released_ids: Vec<(String, bool)> = swaps
+        // An unfunded swap holds no coins and nothing on-chain, so once idle it
+        // is dropped without recovery.
+        let unfunded_ids: Vec<String> = swaps
             .iter()
             .filter_map(|(id, state)| {
                 let unfunded = state.phase == SwapPhase::AwaitingContractData
@@ -1453,29 +1440,16 @@ impl MakerServer {
                 if !unfunded {
                     return None;
                 }
-                let expired = state.swap_start_time.elapsed() > lifetime;
-                (expired || state.last_activity.elapsed() > unfunded_idle)
-                    .then(|| (id.clone(), expired))
+                (state.last_activity.elapsed() > timeout).then(|| id.clone())
             })
             .collect();
-
-        let mut unfunded_ids = Vec::new();
-        for (id, expired) in released_ids {
-            swaps.remove(&id);
-            if expired {
-                log::warn!(
-                    "[{}] Released unfunded swap {} past its admission lifetime",
-                    self.config.network_port,
-                    id
-                );
-            } else {
-                log::info!(
-                    "[{}] Released idle unfunded reservation for swap {}",
-                    self.config.network_port,
-                    id
-                );
-            }
-            unfunded_ids.push(id);
+        for id in &unfunded_ids {
+            swaps.remove(id);
+            log::info!(
+                "[{}] Released idle unfunded swap {}",
+                self.config.network_port,
+                id
+            );
         }
 
         // Carries why each swap was drained: an operator reading "dropped connection"
@@ -1520,9 +1494,8 @@ impl MakerServer {
         }
 
         drop(swaps);
-        // An unfunded drain never reached contract data, so this maker will
-        // never fund it and holding its inputs would strand the balance.
-        // A committed swap keeps them: funding may still land, so only age frees those.
+        // A swap can claim its coins just before its state stops reading as
+        // unfunded; never leave that claim behind with the dropped entry.
         {
             let mut wallet = lock_debug!(self.wallet.write())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -1530,19 +1503,52 @@ impl MakerServer {
             for id in &unfunded_ids {
                 freed |= wallet.release_swap_locks(id, None);
             }
-            if wallet.expire_swap_locks() {
-                log::info!(
-                    "[{}] Released swap reservations past the grace",
-                    self.config.network_port
-                );
-                freed = true;
-            }
             if freed {
                 wallet.save_to_disk().map_err(MakerError::Wallet)?;
             }
         }
 
         Ok(idle)
+    }
+
+    /// After a restart nothing in memory owns a reservation. Keep one only while
+    /// a tracker record, saved swapcoins or a Lightning swap still points at it.
+    pub(crate) fn release_orphan_reservations(&self) -> Result<(), MakerError> {
+        let tracked: HashSet<String> = lock_debug!(self.swap_tracker.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .incomplete_swaps()
+            .into_iter()
+            .map(|record| record.swap_id.clone())
+            .collect();
+        let mut wallet = lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let (incoming, outgoing) = wallet.find_unfinished_swapcoins();
+        let owned: HashSet<String> = incoming
+            .iter()
+            .filter_map(|sc| sc.swap_id.clone())
+            .chain(outgoing.iter().filter_map(|sc| sc.swap_id.clone()))
+            .chain(wallet.store.ln_maker_swaps.keys().cloned())
+            .chain(tracked)
+            .collect();
+        let orphans: Vec<String> = wallet
+            .store
+            .swap_locks
+            .keys()
+            .filter(|id| !owned.contains(*id))
+            .cloned()
+            .collect();
+        for id in &orphans {
+            log::info!(
+                "[{}] Releasing reservation of swap {}: nothing left owns it",
+                self.config.network_port,
+                id
+            );
+            wallet.release_swap_locks(id, None);
+        }
+        if !orphans.is_empty() {
+            wallet.save_to_disk().map_err(MakerError::Wallet)?;
+        }
+        Ok(())
     }
 
     /// Remove a completed swap's entry from `ongoing_swaps`.
@@ -1568,10 +1574,10 @@ impl MakerServer {
 
     /// Outpoints this maker still holds reserved for in-flight swaps.
     #[cfg(feature = "integration-test")]
-    pub fn live_reserved_inputs(&self) -> Result<usize, MakerError> {
+    pub fn reserved_inputs(&self) -> Result<usize, MakerError> {
         Ok(lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .live_reserved_inputs())
+            .reserved_inputs())
     }
 
     /// Whether this maker has an unfinished outgoing swapcoin for `swap_id`.
@@ -1633,6 +1639,10 @@ impl MakerServer {
             - sweep_fee;
         let wallet = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let shortfall = || MakerError::InsufficientLiquidity {
+            available: wallet.plannable_balance(),
+            required: Amount::from_sat(forwardable),
+        };
         // Netting can push a split under the floor where fewer, larger splits
         // would pass, so retry one split fewer, re-planning from scratch.
         let mut max_splits = state.tx_count;
@@ -1655,26 +1665,14 @@ impl MakerServer {
                         forwardable,
                         e
                     );
-                    match e {
-                        WalletError::InsufficientFund {
-                            available,
-                            required,
-                        } => MakerError::InsufficientLiquidity {
-                            available: Amount::from_sat(available),
-                            reserved: Amount::ZERO,
-                            requested: Amount::from_sat(required),
-                        },
-                        _ => MakerError::InsufficientLiquidity {
-                            available: Amount::ZERO,
-                            reserved: Amount::ZERO,
-                            requested: state.swap_amount,
-                        },
-                    }
+                    shortfall()
                 })?;
             // Forwarding nets the taker-reimbursed fee out of each split; one
             // split the netting still pushes below the floor is a refusal.
+            let priced: Vec<usize> = plan.iter().map(|split| split.utxos.len()).collect();
             match net_policy_fees(
                 &mut plan,
+                &priced,
                 state.max_input_budget,
                 state.swap_feerate,
                 state.protocol,
@@ -1687,11 +1685,7 @@ impl MakerServer {
                         self.config.network_port,
                         e
                     );
-                    return Err(MakerError::InsufficientLiquidity {
-                        available: Amount::ZERO,
-                        reserved: Amount::ZERO,
-                        requested: state.swap_amount,
-                    });
+                    return Err(shortfall());
                 }
             }
         }
@@ -1700,7 +1694,7 @@ impl MakerServer {
     /// The funding plan frozen at admission. `amount` must equal the plan's
     /// pre-netting total: the frozen values plus each split's policy fee,
     /// derived from the plan shape at the negotiated rate. A missing or
-    /// mismatched plan is a protocol error — the maker never re-plans.
+    /// mismatched plan is a protocol error.
     fn frozen_funding_plan(
         &self,
         swap_id: &str,
@@ -1732,13 +1726,57 @@ impl MakerServer {
         Ok(state.funding_plan.clone())
     }
 
-    /// Build and sign one funding tx per split of an already-frozen plan.
-    /// A failure here is before any broadcast, so the whole reservation is
-    /// released rather than left half-spent.
+    /// Plan `old` again from free coins, as the same number of splits forwarding
+    /// the same total. The taker priced the next hop from `old`'s input counts,
+    /// so each new split is netted at its old count and must spend at least that.
+    fn replan_funding(
+        &self,
+        wallet: &Wallet,
+        swap_id: &str,
+        old: &[SplitPlan],
+        gross: Amount,
+    ) -> Result<Vec<SplitPlan>, MakerError> {
+        let (budget, feerate, protocol, service_fee) = {
+            let swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            let state = swaps
+                .get(swap_id)
+                .ok_or(MakerError::General("No stored state for this swap"))?;
+            (
+                state.negotiated.max_input_budget,
+                state.negotiated.swap_feerate,
+                state.negotiated.protocol,
+                state.service_fee_sats,
+            )
+        };
+        let out_of_coins = || MakerError::InsufficientLiquidity {
+            available: wallet.plannable_balance(),
+            required: gross,
+        };
+        let fresh = wallet
+            .plan_funding(
+                gross,
+                old.len() as u32,
+                feerate,
+                budget,
+                Some(service_fee),
+                None,
+                None,
+                protocol,
+            )
+            .map_err(|_| out_of_coins())?;
+        let declared: Vec<usize> = old.iter().map(|split| split.utxos.len()).collect();
+        fit_declared_shape(fresh, &declared, budget, feerate, protocol).map_err(|_| out_of_coins())
+    }
+
+    /// Claim the plan's coins, then build and sign one funding tx per split; a
+    /// rebuild reuses the plan it claimed before. `gross` is the plan's
+    /// pre-netting total. A build failure releases the whole reservation.
     fn execute_frozen_plan(
         &self,
         swap_id: &str,
         plan: &[SplitPlan],
+        gross: Amount,
         addresses: &[bitcoin::Address],
         feerate: f64,
     ) -> Result<(Vec<Transaction>, Vec<u32>, u64), MakerError> {
@@ -1751,6 +1789,103 @@ impl MakerServer {
         } else {
             feerate
         };
+
+        // A swap that built funding before may have some of it on the wire, so
+        // it rebuilds from the plan it claimed and the coins it still holds.
+        let claimed = lock_debug!(self.ongoing_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .get(swap_id)
+            .filter(|state| {
+                !state.outgoing_swapcoins.is_empty() || !state.funding_broadcast_txids.is_empty()
+            })
+            .map(|state| state.claimed_plan.clone());
+        let built = claimed.is_some();
+
+        // Coins are claimed only now, once the previous party's funding has
+        // confirmed: an admission alone costs the taker nothing.
+        let plan = {
+            let mut wallet = lock_debug!(self.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            let inputs = |plan: &[SplitPlan]| -> Vec<OutPoint> {
+                plan.iter()
+                    .flat_map(|split| split.utxos.iter().copied())
+                    .collect()
+            };
+            #[cfg(feature = "integration-test")]
+            let stand_in = (self.behavior() == MakerBehavior::ForceReplan)
+                .then(|| format!("{swap_id}-stand-in"));
+            #[cfg(feature = "integration-test")]
+            if let Some(key) = &stand_in {
+                wallet.reserve_swap_locks(key, &inputs(plan));
+            }
+            let plan = if let Some(claimed) = claimed {
+                let held = wallet.store.swap_locks.get(swap_id).is_some_and(|locks| {
+                    inputs(&claimed)
+                        .iter()
+                        .all(|input| locks.outpoints.contains(input))
+                });
+                if claimed.is_empty() || !held {
+                    return Err(MakerError::General(
+                        "Funding was already built; refusing to fund from other coins",
+                    ));
+                }
+                claimed
+            } else {
+                // Nothing built means nothing of this swap is out, so a claim an
+                // earlier failed pass left behind is simply dropped first.
+                wallet.release_swap_locks(swap_id, None);
+                if wallet.claim_swap_inputs(swap_id, &inputs(plan)) {
+                    plan.to_vec()
+                } else {
+                    let replanned = self.replan_funding(&wallet, swap_id, plan, gross)?;
+                    if !wallet.claim_swap_inputs(swap_id, &inputs(&replanned)) {
+                        return Err(MakerError::General(
+                            "Re-planned funding inputs are not free",
+                        ));
+                    }
+                    log::info!(
+                        "[{}] Re-planned funding for swap {}: a planned coin went to another swap",
+                        self.config.network_port,
+                        swap_id
+                    );
+                    replanned
+                }
+            };
+            #[cfg(feature = "integration-test")]
+            if let Some(key) = &stand_in {
+                wallet.release_swap_locks(key, None);
+            }
+            // A rebuild claimed nothing new, and releasing could free coins of a
+            // tx that is already out.
+            if !built {
+                let mut swaps =
+                    lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+                let Some(state) = swaps.get_mut(swap_id) else {
+                    // The idle drain dropped the swap while we claimed, so nothing
+                    // would ever release this claim.
+                    wallet.release_swap_locks(swap_id, None);
+                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                    return Err(MakerError::General(
+                        "Swap plan expired; the taker must send new SwapDetails",
+                    ));
+                };
+                state.claimed_plan = plan.clone();
+                drop(swaps);
+                if let Err(e) = wallet.save_to_disk() {
+                    wallet.release_swap_locks(swap_id, None);
+                    return Err(MakerError::Wallet(e));
+                }
+            }
+            plan
+        };
+        #[cfg(feature = "integration-test")]
+        if self.behavior() == MakerBehavior::AbandonFundingClaim {
+            log::warn!(
+                "[{}] Test behavior: abandoning the funding claim",
+                self.config.network_port
+            );
+            return Err(MakerError::General("Test: abandoning the funding claim"));
+        }
 
         let mut funding_txes = Vec::with_capacity(plan.len());
         let mut payment_output_positions = Vec::with_capacity(plan.len());
@@ -2097,7 +2232,7 @@ impl MakerTrait for MakerServer {
         };
 
         let (funding_txes, payment_output_positions, _) =
-            self.execute_frozen_plan(swap_id, &plan, addresses, feerate)?;
+            self.execute_frozen_plan(swap_id, &plan, amount, addresses, feerate)?;
         Ok((funding_txes, payment_output_positions))
     }
 
@@ -2132,15 +2267,12 @@ impl MakerTrait for MakerServer {
             .map_err(MakerError::Wallet)?;
         // The wait can outlast the idle-drain timeout, so the per-poll hook
         // refreshes this swap's stored activity: a live handler never drains.
-        // The admission lifetime stays a hard bound though: once it fires (or
-        // the drain already reaped the state) the wait must stop instead of
-        // holding the funding plan past the lifetime.
-        let lifetime = unfunded_swap_lifetime();
+        // If the swap is gone anyway, the wait stops.
         let keep_alive = || {
             if let Ok(mut swaps) = lock_debug!(self.ongoing_swaps.lock()) {
                 if let Some(state) = swaps.get_mut(swap_id) {
                     state.last_activity = Instant::now();
-                    return state.swap_start_time.elapsed() > lifetime;
+                    return false;
                 }
             }
             true
@@ -2354,6 +2486,10 @@ impl MakerTrait for MakerServer {
         &self,
         incoming_swapcoins: &[IncomingSwapCoin],
     ) -> Result<RecoveryOutcome, MakerError> {
+        #[cfg(feature = "integration-test")]
+        if self.behavior() == MakerBehavior::FailSweep {
+            return Err(MakerError::General("Test: sweep failed"));
+        }
         log::info!(
             "[{}] Sweeping coins after successful swap",
             self.config.network_port
@@ -2507,89 +2643,6 @@ impl MakerTrait for MakerServer {
             None
         };
 
-        // Reserve and persist before the swap is published. Once it appears in
-        // `ongoing_swaps` another connection can be accepted onto it and reach
-        // funding, so the admission it acts on must already be on disk.
-        let reserved_inputs: Vec<OutPoint> = planned
-            .iter()
-            .flatten()
-            .flat_map(|split| split.utxos.iter().copied())
-            .collect();
-        if planned.is_some() {
-            let inputs = &reserved_inputs;
-            // Two racing admissions both reach this barrier with their plans
-            // in hand; only then may either reserve, so the conflict check
-            // below is what actually loses one of them. Later admissions
-            // (a retry after the race) pass straight through.
-            #[cfg(feature = "integration-test")]
-            if self.behavior() == MakerBehavior::AdmissionRaceBarrier {
-                // Per maker port: a two-maker route must pair each maker's own
-                // requests, never one maker's request with the other's.
-                type RaceBarriers = std::sync::Mutex<
-                    std::collections::HashMap<u16, (Arc<std::sync::Barrier>, usize)>,
-                >;
-                static RACE_BARRIERS: std::sync::LazyLock<RaceBarriers> =
-                    std::sync::LazyLock::new(|| {
-                        std::sync::Mutex::new(std::collections::HashMap::new())
-                    });
-                let barrier = {
-                    let mut map = RACE_BARRIERS.lock().unwrap();
-                    let (barrier, arrivals) = map
-                        .entry(self.config.network_port)
-                        .or_insert_with(|| (Arc::new(std::sync::Barrier::new(2)), 0));
-                    *arrivals += 1;
-                    (*arrivals <= 2).then(|| barrier.clone())
-                };
-                if let Some(barrier) = barrier {
-                    log::info!(
-                        "[{}] Test behavior: admission waiting at the reservation barrier",
-                        self.config.network_port
-                    );
-                    barrier.wait();
-                }
-            }
-            // Planning ran outside this lock, so a concurrent admission may
-            // have claimed an input since. Reserve only a conflict-free plan.
-            let mut wallet = lock_debug!(self.wallet.write())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-            if inputs.iter().any(|input| wallet.is_swap_reserved(input)) {
-                log::warn!(
-                    "[{}] Rejecting swap {}: a concurrent admission claimed a planned input",
-                    self.config.network_port,
-                    swap_id,
-                );
-                return Err(MakerError::InsufficientLiquidity {
-                    available: Amount::ZERO,
-                    reserved: Amount::ZERO,
-                    requested: state.swap_amount,
-                });
-            }
-            wallet.reserve_swap_locks(swap_id, inputs);
-            if let Err(e) = wallet.save_to_disk() {
-                // A concurrent admission under the same id shares the entry —
-                // roll back only our own inputs, never its persisted ones.
-                wallet.release_swap_locks(swap_id, Some(inputs));
-                // The failed save may already have renamed the reservation
-                // onto disk, so the rollback has to reach it too or a restart
-                // brings the reservation back.
-                if let Err(rollback) = wallet.save_to_disk() {
-                    log::error!(
-                        "[{}] Could not persist the reservation rollback for swap {}: {:?}",
-                        self.config.network_port,
-                        swap_id,
-                        rollback
-                    );
-                }
-                log::error!(
-                    "[{}] Could not persist the reservation for swap {}: {:?}; refusing admission",
-                    self.config.network_port,
-                    swap_id,
-                    e
-                );
-                return Err(MakerError::Wallet(e));
-            }
-        }
-
         let mut swaps = lock_debug!(self.ongoing_swaps.lock())?;
 
         // A resent SwapDetails for a live swap is a reconnect after a dropped
@@ -2604,16 +2657,6 @@ impl MakerTrait for MakerServer {
                 swap_state.last_activity = Instant::now();
             }
             drop(swaps);
-            // Another connection published this swap while we planned, so the plan
-            // we just reserved is never funded. Hand back exactly our own inputs:
-            // the conflict check above proves they are disjoint from the winner's.
-            if !reserved_inputs.is_empty() {
-                let mut wallet = lock_debug!(self.wallet.write())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                if wallet.release_swap_locks(swap_id, Some(&reserved_inputs)) {
-                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
-                }
-            }
             if mismatched {
                 log::warn!(
                     "[{}] Rejecting duplicate SwapDetails for {}: parameters differ from stored swap",
@@ -2642,21 +2685,17 @@ impl MakerTrait for MakerServer {
                 swap_id,
                 MAX_CONCURRENT_SWAPS,
             );
-            // Same cleanup as the reconnect branch: the conflict check proved
-            // these inputs are ours, so hand back exactly them.
-            if !reserved_inputs.is_empty() {
-                let mut wallet = lock_debug!(self.wallet.write())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                if wallet.release_swap_locks(swap_id, Some(&reserved_inputs)) {
-                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
-                }
-            }
             return Err(MakerError::TooManySwaps);
         }
 
-        // A drained swap already released its coins; recreating it here would fund an
-        // unreserved plan. The taker must send new SwapDetails for a fresh plan.
-        if !admission && !swaps.contains_key(swap_id) {
+        // Only the admission a connection holds may write: a store for a drained
+        // swap, or from an older admission of a reused id, would revive a stale
+        // plan. A completed swap is removed before settling and may be put back.
+        let stale = match swaps.get(swap_id) {
+            Some(stored) => stored.swap_start_time != state.swap_start_time,
+            None => state.phase != SwapPhase::Completed,
+        };
+        if !admission && stale {
             log::warn!(
                 "[{}] Rejecting late message for swap {}: its plan expired",
                 self.config.network_port,
@@ -2791,8 +2830,8 @@ impl MakerTrait for MakerServer {
                 }))
                 .collect()
         };
-        // No funding named yet: the unfunded lifetime, not this check, bounds
-        // the keepalive refresh.
+        // No funding named yet: a later hop waits on upstream funding it cannot
+        // see, so its keepalive still counts.
         if claimed.is_empty() {
             return Ok(false);
         }
@@ -2949,7 +2988,6 @@ impl MakerTrait for MakerServer {
             utill::redeemscript_to_scriptpubkey,
         };
         use bitcoin::{hashes::Hash, OutPoint};
-        use std::collections::HashSet;
 
         log::info!(
             "[{}] Verifying proof of funding for swap {}",
@@ -3160,8 +3198,13 @@ impl MakerTrait for MakerServer {
                 .unzip()
         };
 
-        let (funding_txes, payment_output_positions, total_miner_fee) =
-            self.execute_frozen_plan(swap_id, &plan, &openswap_addresses, contract_feerate)?;
+        let (funding_txes, payment_output_positions, total_miner_fee) = self.execute_frozen_plan(
+            swap_id,
+            &plan,
+            send_amount,
+            &openswap_addresses,
+            contract_feerate,
+        )?;
 
         let mut outgoing_swapcoins = Vec::new();
         for (
