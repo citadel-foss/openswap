@@ -10,7 +10,7 @@ use bitcoin::Amount;
 use openswap::{
     maker::{MakerBehavior, MakerServer},
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
+    taker::SwapParams,
 };
 
 use super::test_framework::*;
@@ -21,19 +21,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn run_successful_swap_restart(protocol: ProtocolVersion) {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .maker_behaviors(vec![MakerBehavior::Normal, MakerBehavior::Normal])
-        .takers(vec![TakerBehavior::Normal])
-        .build();
-
-    world.fund_nth_taker_default(0, 3);
-    world.fund_makers_default();
-
-    world.start_makers(120);
-
-    world.mine(1);
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120), mine(1)],
+    cases = [
+        successful_legacy_swap_stays_complete_after_maker_restart(protocol = ProtocolVersion::Legacy),
+        successful_taproot_swap_stays_complete_after_maker_restart(protocol = ProtocolVersion::Taproot),
+    ],
+)]
+fn run_successful_swap_restart(world: &mut World, protocol: ProtocolVersion) {
     let summary = world.takers_mut()[0]
         .prepare(
             SwapParams::new(protocol, Amount::from_sat(500_000), 2)
@@ -94,34 +92,35 @@ fn run_successful_swap_restart(protocol: ProtocolVersion) {
             "restarted maker retained outgoing swapcoins for a successful {protocol:?} swap"
         );
     }
-
-    world.shutdown_makers();
-    world.finish();
 }
 
-fn run_interrupted_restart(
-    protocol: ProtocolVersion,
-    behavior: MakerBehavior,
-    incoming_remains: bool,
-) {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .maker_behaviors(vec![behavior, behavior])
-        .takers(vec![TakerBehavior::Normal])
-        .build();
-
-    world.fund_nth_taker_default(0, 3);
-    world.fund_makers_default();
-
-    world.start_makers(120);
-
-    world.mine(1);
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [behavior, behavior],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120), mine(1)],
+    swap(protocol = protocol, sats = 500_000, makers = 2),
+    cases = [
+        restart_sweeps_handed_over_incoming_swapcoins(
+            protocol = ProtocolVersion::Taproot,
+            behavior = MakerBehavior::CloseAfterHandoverResponse,
+            incoming_remains = true,
+        ),
+        restart_removes_spent_outgoing_swapcoins_legacy(
+            protocol = ProtocolVersion::Legacy,
+            behavior = MakerBehavior::CloseBeforeSwapFinalization,
+            incoming_remains = false,
+        ),
+        restart_removes_spent_outgoing_swapcoins_taproot(
+            protocol = ProtocolVersion::Taproot,
+            behavior = MakerBehavior::CloseBeforeSwapFinalization,
+            incoming_remains = false,
+        ),
+    ],
+)]
+fn run_interrupted_restart(world: &mut World, incoming_remains: bool, params: SwapParams) {
     let summary = world.takers_mut()[0]
-        .prepare(
-            SwapParams::new(protocol, Amount::from_sat(500_000), 2)
-                .with_tx_count(2)
-                .with_required_confirms(1),
-        )
+        .prepare(params)
         .expect("prepare interrupted swap");
     world.takers_mut()[0]
         .start(&summary.swap_id)
@@ -170,34 +169,5 @@ fn run_interrupted_restart(
             "restart did not finish the interrupted successful swap"
         );
         thread::sleep(Duration::from_millis(250));
-    }
-
-    world.shutdown_makers();
-    world.finish();
-}
-
-#[test]
-fn successful_legacy_swap_stays_complete_after_maker_restart() {
-    run_successful_swap_restart(ProtocolVersion::Legacy);
-}
-
-#[test]
-fn successful_taproot_swap_stays_complete_after_maker_restart() {
-    run_successful_swap_restart(ProtocolVersion::Taproot);
-}
-
-#[test]
-fn restart_sweeps_handed_over_incoming_swapcoins() {
-    run_interrupted_restart(
-        ProtocolVersion::Taproot,
-        MakerBehavior::CloseAfterHandoverResponse,
-        true,
-    );
-}
-
-#[test]
-fn restart_removes_spent_outgoing_swapcoins() {
-    for protocol in [ProtocolVersion::Legacy, ProtocolVersion::Taproot] {
-        run_interrupted_restart(protocol, MakerBehavior::CloseBeforeSwapFinalization, false);
     }
 }

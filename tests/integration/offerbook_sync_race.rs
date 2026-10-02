@@ -2,10 +2,8 @@
 
 use super::test_framework::*;
 use bitcoin::Amount;
-use log::warn;
 use openswap::{
-    maker::MakerBehavior,
-    taker::{MakerProtocol, MakerState, TakerBehavior},
+    taker::{MakerProtocol, MakerState},
     wallet::AddressType,
 };
 
@@ -27,24 +25,18 @@ fn good_maker_count(taker: &openswap::taker::Taker) -> usize {
         .count()
 }
 
-#[test]
-fn test_repeated_manual_sync_is_bounded() {
-    warn!("Running Test: Staged maker discovery across repeated syncs ");
-
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 11,
+    maker_behaviors = [Normal; 11],
+    takers = [Normal],
+    setup = [
+        // Fund all makers
+        fund_makers(3, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
+    ],
+)]
+fn test_repeated_manual_sync_is_bounded(world: &mut World) {
     let expected_makers = 11usize;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors: Vec<MakerBehavior> = (0..expected_makers)
-        .map(|_| MakerBehavior::Normal)
-        .collect();
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(expected_makers)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    // Fund all makers
-    world.fund_makers(3, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
 
     // Spawn makers in stages: 2, 1, 3, 5
     let stage_plan = [2usize, 1usize, 3usize, 5usize];
@@ -82,6 +74,4 @@ fn test_repeated_manual_sync_is_bounded() {
     );
 
     // Shutdown
-    world.shutdown_makers();
-    world.finish();
 }

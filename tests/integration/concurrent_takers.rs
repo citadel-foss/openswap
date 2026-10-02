@@ -8,9 +8,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
+    protocol::common_messages::ProtocolVersion, taker::SwapParams, wallet::AddressType,
 };
 
 use super::test_framework::*;
@@ -30,33 +28,28 @@ const RESULT_PENDING: u8 = 0;
 const RESULT_SUCCESS: u8 = 1;
 const RESULT_FAILED: u8 = 2;
 
-#[test]
-fn test_concurrent_takers_legacy() {
-    concurrent_takers(ProtocolVersion::Legacy, 2, [1250473, 1250436]);
-}
-
-#[test]
-fn test_concurrent_takers_taproot() {
-    concurrent_takers(ProtocolVersion::Taproot, 2, [1250473, 1250436]);
-}
-
+#[world_test(
+    backend = BitcoindBackend,
+    makers = maker_count,
+    takers = [Normal, Normal],
+    cases = [
+        test_concurrent_takers_legacy(
+            protocol = ProtocolVersion::Legacy,
+            maker_count = 2,
+            expected_maker_spendable = [1250473, 1250436],
+        ),
+        test_concurrent_takers_taproot(
+            protocol = ProtocolVersion::Taproot,
+            maker_count = 2,
+            expected_maker_spendable = [1250473, 1250436],
+        ),
+    ],
+)]
 fn concurrent_takers(
+    world: &mut World,
     protocol: ProtocolVersion,
-    maker_count: usize,
     expected_maker_spendable: [u64; 2],
 ) {
-    // ---- Setup ----
-    warn!(
-        "Running Test: Concurrent Takers with {:?} Protocol - Limited Liquidity",
-        protocol
-    );
-
-    // Initialize test framework with 2 takers and 2 makers
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .takers([TakerBehavior::Normal, TakerBehavior::Normal])
-        .build();
-
     // Fund each taker thrice with one 0.05 BTC UTXO (0.15 total), one per call so
     // each lands on a distinct address.
     let mut taker1_original_balance = Amount::ZERO;
@@ -281,7 +274,6 @@ fn concurrent_takers(
 
     // `finish` drops the takers before stopping the framework, so their
     // background services shut down while bitcoind is still running.
-    world.finish();
 }
 
 /// Two takers race ONE maker whose liquidity funds exactly one swap, both
@@ -289,35 +281,28 @@ fn concurrent_takers(
 /// the same inputs for each admission. Both are admitted; exactly one may fund.
 /// The loser finds no free coins at funding and fails cleanly, and no
 /// reservation leaks — the maker still serves the losing taker's later swap.
-#[test]
-fn test_concurrent_funding_race() {
-    warn!("Running Test: concurrent funding race - identical plans on one maker");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .takers([TakerBehavior::Normal, TakerBehavior::Normal])
-        .build();
-
-    for i in 0..world.takers().len() {
-        world.fund_nth_taker_default(i, 1);
-    }
-    // The 0.05 BTC UTXO covers the fidelity bond; what remains plus the 250k
-    // funds exactly one 500k swap, so a second admission can never fit.
-    world.fund_makers(1, Amount::from_sat(5_500_000), AddressType::P2TR);
-    world.fund_makers(1, Amount::from_sat(250_000), AddressType::P2TR);
-
-    log::info!("Starting Maker server...");
-    world.start_makers(120);
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 1,
+    takers = [Normal, Normal],
+    setup = [
+        fund_nth_taker_default(0, 1),
+        fund_nth_taker_default(1, 1),
+        // The 0.05 BTC UTXO covers the fidelity bond; what remains plus the 250k
+        // funds exactly one 500k swap, so a second admission can never fit.
+        fund_makers(1, Amount::from_sat(5_500_000), AddressType::P2TR),
+        fund_makers(1, Amount::from_sat(250_000), AddressType::P2TR),
+        start_makers(120),
+    ],
+)]
+fn test_concurrent_funding_race(world: &mut World) {
     let maker_spendable = world.makers()[0].balances().spendable;
     info!("Maker spendable before the race: {}", maker_spendable);
     world.mine(1);
 
     // 400k twice would not fit the ~750k pool; one always fits, even after
     // the winner's swap shrinks the maker's offer max below the race amount.
-    let maker_address = format!(
-        "127.0.0.1:{}",
-        world.makers()[0].inner().config.network_port
-    );
+    let maker_address = world.makers()[0].address();
     let swap_params = || {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(400_000), 1)
             .with_tx_count(3)
@@ -419,37 +404,28 @@ fn test_concurrent_funding_race() {
     }
 
     info!("Concurrent funding race test completed successfully!");
-
-    world.shutdown_makers();
-    world.finish();
 }
 
 /// Two takers are admitted on the same maker coins, which the deterministic
 /// planner gives both swaps. The first to fund claims them; the second maker
 /// re-plans onto its other coin instead of failing, so both swaps complete.
-#[test]
-fn test_concurrent_funding_conflict_replans() {
-    warn!("Running Test: a funding conflict re-plans onto free coins");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .takers([TakerBehavior::Normal, TakerBehavior::Normal])
-        .build();
-
-    for i in 0..world.takers().len() {
-        world.fund_nth_taker_default(i, 1);
-    }
-    // The bond takes the 0.05 BTC coin. Two equal 500k coins remain: each
-    // funds one swap alone, and a one-split plan picks the same one for both.
-    world.fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR);
-    world.fund_makers(2, Amount::from_sat(500_000), AddressType::P2TR);
-    world.start_makers(120);
-    world.mine(1);
-
-    let maker_address = format!(
-        "127.0.0.1:{}",
-        world.makers()[0].inner().config.network_port
-    );
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 1,
+    takers = [Normal, Normal],
+    setup = [
+        fund_nth_taker_default(0, 1),
+        fund_nth_taker_default(1, 1),
+        // The bond takes the 0.05 BTC coin. Two equal 500k coins remain: each
+        // funds one swap alone, and a one-split plan picks the same one for both.
+        fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR),
+        fund_makers(2, Amount::from_sat(500_000), AddressType::P2TR),
+        start_makers(120),
+        mine(1),
+    ],
+)]
+fn test_concurrent_funding_conflict_replans(world: &mut World) {
+    let maker_address = world.makers()[0].address();
     let params = || {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(300_000), 1)
             .with_tx_count(1)
@@ -482,16 +458,10 @@ fn test_concurrent_funding_conflict_replans() {
         results.iter().all(|r| r.load(Relaxed) == RESULT_SUCCESS),
         "both swaps must complete: the second maker re-plans onto its free coin"
     );
-    world.framework().assert_log(
-        "a planned coin went to another swap",
-        &world.taker_log_path(),
-    );
+    assert_logged!(world, "a planned coin went to another swap");
     assert_eq!(
         world.makers()[0].inner().reserved_inputs().unwrap(),
         0,
         "both settled swaps must have released their coins"
     );
-
-    world.shutdown_makers();
-    world.finish();
 }

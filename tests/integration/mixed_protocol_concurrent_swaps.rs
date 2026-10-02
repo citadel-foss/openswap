@@ -7,9 +7,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
+    protocol::common_messages::ProtocolVersion, taker::SwapParams, wallet::AddressType,
 };
 
 use super::test_framework::*;
@@ -23,16 +21,13 @@ use std::{
     thread,
 };
 
-#[test]
-fn test_concurrent_legacy_and_taproot_swaps() {
-    warn!("Running Test: Concurrent Legacy and Taproot swaps through the same makers");
-
+#[world_test(
+    backend = BitcoindBackend,
     // Admission reserves nothing, so both plans form over the same pool.
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .takers([TakerBehavior::Normal, TakerBehavior::Normal])
-        .build();
-
+    makers = 2,
+    takers = [Normal, Normal],
+)]
+fn test_concurrent_legacy_and_taproot_swaps(world: &mut World) {
     let taker_original_balances = (0..world.takers().len())
         .map(|i| world.fund_nth_taker_default(i, 3))
         .collect::<Vec<_>>();
@@ -214,7 +209,4 @@ fn test_concurrent_legacy_and_taproot_swaps() {
         }
         .assert(&format!("Maker {i}"), balances);
     }
-
-    world.shutdown_makers();
-    world.finish();
 }

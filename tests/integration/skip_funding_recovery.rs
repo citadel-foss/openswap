@@ -7,14 +7,13 @@
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
-    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
-    taker::{BanReason, BanRecord, MakerState, SwapParams, TakerBehavior},
+    taker::{BanReason, SwapParams},
 };
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{
     thread,
     time::{Duration, Instant},
@@ -51,42 +50,15 @@ fn assert_grace_then_discard(log_path: &str, swap_id: &str) {
 ///    - Taker recovers outgoing (to Maker1) via timelock.
 ///    - Maker1 recovers outgoing (to Maker2) via timelock.
 ///    - Maker2 has nothing to recover (outgoing was never broadcast).
-fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
-    // ---- Setup ----
-    warn!("Running Test: Legacy Timelock-Only Recovery");
-
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::SkipFundingBroadcast];
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = world.fund_taker_default(3);
-
-    // Fund the makers with 4 UTXOs of 0.05 BTC each
-    world.fund_makers_default();
-
-    // Start the maker server threads
-    log::info!("Starting Maker servers...");
-
-    world.start_makers(120);
-
-    // Use post-fidelity, pre-swap balances as the correct baseline
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
-    log::info!("Starting Legacy timelock-only recovery test...");
-
+pub(crate) fn run_legacy_timelock_only_recovery(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+    params: SwapParams,
+    stop_watcher: bool,
+) {
     // Start periodic swap tracker logging (every 10s)
     let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
-
-    // Swap params for openswap (Legacy)
-    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
 
     world.mine(1);
     world.framework().wait_for_electrs_tip();
@@ -94,7 +66,7 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     // Prepare should succeed; execution should fail because Maker2 closes the connection
     let summary = world
         .taker_mut()
-        .prepare(swap_params)
+        .prepare(params)
         .expect("Prepare should succeed");
     let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
@@ -266,16 +238,34 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     world.shutdown_makers();
 
     tracker_logger.stop();
-    world.finish();
 }
 
-#[test]
-fn test_legacy_timelock_only_recovery() {
-    run_legacy_timelock_only_recovery(false);
-}
-
-pub(crate) fn run_legacy_timelock_recovery_without_watcher() {
-    run_legacy_timelock_only_recovery(true);
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, SkipFundingBroadcast],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        start_makers(120),
+        // Post-fidelity, pre-swap balances are the baseline.
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+    swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn test_legacy_timelock_only_recovery(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+    params: SwapParams,
+) {
+    run_legacy_timelock_only_recovery(
+        world,
+        taker_original_balance,
+        maker_spendable_balance,
+        params,
+        false,
+    );
 }
 
 /// Test: Timelock-only recovery when last maker skips Taproot funding broadcast.
@@ -292,57 +282,32 @@ pub(crate) fn run_legacy_timelock_recovery_without_watcher() {
 ///    - Taker recovers outgoing (to Maker1) via timelock.
 ///    - Maker1 recovers outgoing (to Maker2) via timelock.
 ///    - Maker2 has nothing to recover (outgoing was never broadcast).
-#[test]
-fn test_taproot_timelock_only_recovery() {
-    run_taproot_timelock_only_recovery::<BitcoindBackend>();
-}
-
-/// Same timelock-only recovery on Electrum: the grace and discard decisions
-/// read the indexer rather than the maker's own node.
-#[test]
-fn test_taproot_timelock_only_recovery_electrum() {
-    run_taproot_timelock_only_recovery::<ElectrumBackend>();
-}
-
-fn run_taproot_timelock_only_recovery<B: TestBackend>() {
-    // ---- Setup ----
-    warn!("Running Test: Taproot Timelock-Only Recovery");
-
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![
-        MakerBehavior::Normal,
-        MakerBehavior::SkipFundingBroadcastUnrecorded,
-    ];
-
-    let mut world = World::builder::<B>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
-    let taker_original_balance = world.fund_taker_default(3);
-
-    // Fund the makers with 4 UTXOs of 0.05 BTC each
-    world.fund_makers_default();
-
-    // Start the maker server threads
-    log::info!("Starting Maker servers...");
-
-    world.start_makers(120);
-
-    // Use post-fidelity, pre-swap balances as the correct baseline
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
-    log::info!("Starting Taproot timelock-only recovery test...");
-
+#[world_test(
+    maker_behaviors = [Normal, SkipFundingBroadcastUnrecorded],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        start_makers(120),
+        // Post-fidelity, pre-swap balances are the baseline.
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+    cases = [
+        test_taproot_timelock_only_recovery(backend = BitcoindBackend),
+        /// Same timelock-only recovery on Electrum: the grace and discard decisions
+        /// read the indexer rather than the maker's own node.
+        test_taproot_timelock_only_recovery_electrum(backend = ElectrumBackend),
+    ],
+)]
+fn run_taproot_timelock_only_recovery(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+    params: SwapParams,
+) {
     // Start periodic swap tracker logging (every 10s)
     let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
-
-    // Swap params for openswap (Taproot)
-    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
 
     world.mine(1);
     world.framework().wait_for_electrs_tip();
@@ -350,7 +315,7 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     // Prepare should succeed; execution should fail because Maker2 closes the connection
     let summary = world
         .taker_mut()
-        .prepare(swap_params)
+        .prepare(params)
         .expect("Prepare should succeed");
     let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
@@ -508,138 +473,73 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     world.shutdown_makers();
 
     tracker_logger.stop();
-    world.finish();
 }
 
 /// A maker that answers normally but never sends its funding is not a dropped
 /// connection: the taker waits, our own node confirms every tx is absent, and
 /// that maker alone is banned.
-fn run_withheld_funding_bans_its_maker<B: TestBackend>(protocol: ProtocolVersion) {
-    warn!("Running Test: Withheld Funding Bans Its Maker ({protocol:?})");
-
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![
-        MakerBehavior::Normal,
-        MakerBehavior::WithholdFundingSilently,
-    ];
-
-    let mut world = World::builder::<B>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    world.start_makers(120);
-
-    let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
-
+#[world_test(
+    maker_behaviors = [Normal, WithholdFundingSilently],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = protocol, sats = 500_000, makers = 2, tx_count = 3),
+    cases = [
+        withheld_taproot_funding_bans_only_its_own_maker(
+            backend = BitcoindBackend,
+            protocol = ProtocolVersion::Taproot,
+        ),
+        withheld_legacy_funding_bans_only_its_own_maker(
+            backend = BitcoindBackend,
+            protocol = ProtocolVersion::Legacy,
+        ),
+        /// Same policy on Electrum: the indexer's definite "no such transaction" is
+        /// taken at its word, exactly as our own node's would be.
+        withheld_taproot_funding_bans_only_its_own_maker_electrum(
+            backend = ElectrumBackend,
+            protocol = ProtocolVersion::Taproot,
+        ),
+    ],
+)]
+fn run_withheld_funding_bans_its_maker(world: &mut World, params: SwapParams) {
     world.mine(1);
     world.framework().wait_for_electrs_tip();
 
-    let summary = world
+    let error = world
         .taker_mut()
-        .prepare(swap_params)
-        .expect("Prepare should succeed");
-    let swap_result = world.taker_mut().start(&summary.swap_id);
-    assert!(
-        swap_result.is_err(),
-        "Swap must fail when a maker withholds its funding"
-    );
-    info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
+        .swap_fails(params, "Swap must fail when a maker withholds its funding");
+    info!("Swap failed as expected: {error:?}");
 
-    let standings = world.taker().inner().fetch_offers().unwrap().all_makers();
-    let standing_of = |port: u16| {
-        standings
-            .iter()
-            .find(|m| m.address.to_string() == format!("127.0.0.1:{port}"))
-            .unwrap_or_else(|| panic!("maker on {} must be in the offerbook", port))
-            .state
-            .clone()
-    };
-
-    let withholder = standing_of(world.makers()[1].inner().config.network_port);
-    assert!(
-        matches!(
-            withholder,
-            MakerState::Banned(BanRecord {
-                reason: BanReason::FundingWithheld,
-                ..
-            })
-        ),
-        "the maker that withheld funding must be banned, got {:?}",
-        withholder
+    assert_eq!(
+        world.maker_ban_reason(1),
+        Some(BanReason::FundingWithheld),
+        "the maker that withheld funding must be banned"
     );
 
-    let honest = standing_of(world.makers()[0].inner().config.network_port);
-    assert!(
-        !matches!(honest, MakerState::Banned(_)),
-        "the honest maker must not be blamed, got {:?}",
-        honest
+    assert_eq!(
+        world.maker_ban_reason(0),
+        None,
+        "the honest maker must not be blamed"
     );
 
     info!("Withheld funding test completed successfully!");
-
-    world.shutdown_makers();
-    world.finish();
-}
-
-#[test]
-fn withheld_taproot_funding_bans_only_its_own_maker() {
-    run_withheld_funding_bans_its_maker::<BitcoindBackend>(ProtocolVersion::Taproot);
-}
-
-#[test]
-fn withheld_legacy_funding_bans_only_its_own_maker() {
-    run_withheld_funding_bans_its_maker::<BitcoindBackend>(ProtocolVersion::Legacy);
-}
-
-/// Same policy on Electrum: the indexer's definite "no such transaction" is
-/// taken at its word, exactly as our own node's would be.
-#[test]
-fn withheld_taproot_funding_bans_only_its_own_maker_electrum() {
-    run_withheld_funding_bans_its_maker::<ElectrumBackend>(ProtocolVersion::Taproot);
 }
 
 /// A refund settles the swap one way. The last maker publishes the taker's
 /// incoming contract only after the taker refunded its outgoing: sweeping it
 /// now would reveal the preimage and take both sides, so no sweep may follow.
-#[test]
-fn late_incoming_after_refund_is_never_swept() {
-    warn!("Running Test: Late Incoming After Refund Is Never Swept");
-
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![
-        MakerBehavior::Normal,
-        MakerBehavior::WithholdFundingSilently,
-    ];
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    world.start_makers(120);
-
-    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, WithholdFundingSilently],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn late_incoming_after_refund_is_never_swept(world: &mut World, params: SwapParams) {
     world.mine(1);
 
     let summary = world
         .taker_mut()
-        .prepare(swap_params)
+        .prepare(params)
         .expect("Prepare should succeed");
 
     // The last maker's withheld contracts are the taker's incoming side. Grab
@@ -727,7 +627,4 @@ fn late_incoming_after_refund_is_never_swept() {
         0,
         "the given-up incoming coins must be cleaned up"
     );
-
-    world.shutdown_makers();
-    world.finish();
 }

@@ -1,13 +1,9 @@
 use bitcoin::Amount;
-use openswap::{
-    maker::MakerBehavior,
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{thread, time::Duration};
 
 /// Test: Taker maliciously broadcasts contract txs after full setup.
@@ -15,29 +11,24 @@ use std::{thread, time::Duration};
 /// The taker completes the full contract exchange, then broadcasts contract
 /// transactions and closes. Makers detect the on-chain contracts and recover
 /// their funds via timelock spending.
-#[test]
-fn test_malice1_taker_broadcast_contract() {
-    // ---- Setup ----
-    warn!("Running Test: Malice1 - Taker Broadcasts Contract After Full Setup");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
-        .takers([TakerBehavior::BroadcastContractAfterFullSetup])
-        .build();
-
-    // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = world.fund_taker_default(3);
-
-    // Fund the makers with 4 UTXOs of 0.05 BTC each
-    world.fund_makers_default();
-
-    log::info!("Starting Maker servers...");
-    world.start_makers(120);
-
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
-    log::info!("Starting malice1 test...");
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [BroadcastContractAfterFullSetup],
+    setup = [
+        // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
+        fund_taker_default(3) as taker_original_balance,
+        // Fund the makers with 4 UTXOs of 0.05 BTC each
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+)]
+fn test_malice1_taker_broadcast_contract(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+) {
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -145,7 +136,4 @@ fn test_malice1_taker_broadcast_contract() {
 
     world.taker().log_tracker_state();
     info!("Malice1 test completed successfully!");
-
-    world.shutdown_makers();
-    world.finish();
 }

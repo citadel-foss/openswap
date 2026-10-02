@@ -2,7 +2,6 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
     taker::{error::TakerError, SwapParams, TakerBehavior},
     wallet::AddressType,
@@ -10,19 +9,17 @@ use openswap::{
 
 use super::test_framework::*;
 
-#[test]
-fn maker_rejects_new_swaps_after_watcher_exit() {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .maker_behaviors(vec![MakerBehavior::Normal])
-        .takers(vec![TakerBehavior::Normal])
-        .build();
-
-    world.fund_taker_default(2);
-    world.fund_makers(2, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
-
-    world.start_makers_without_sync(120);
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(2),
+        fund_makers(2, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
+        start_makers_without_sync(120),
+    ],
+)]
+fn maker_rejects_new_swaps_after_watcher_exit(world: &mut World) {
     let maker = world.makers()[0].inner();
     assert!(maker.watch_service.is_alive());
     maker.watch_service.stop_watcher_for_test();
@@ -43,23 +40,19 @@ fn maker_rejects_new_swaps_after_watcher_exit() {
             other => panic!("unexpected admission result: {:?}", other),
         }
     }
-
-    world.finish();
 }
 
-#[test]
-fn taker_refuses_swap_before_funding_after_watcher_exit() {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .maker_behaviors(vec![MakerBehavior::Normal])
-        .takers(vec![TakerBehavior::Normal])
-        .build();
-
-    world.fund_taker_default(2);
-    world.fund_makers(2, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
-
-    world.start_makers_without_sync(120);
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(2),
+        fund_makers(2, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
+        start_makers_without_sync(120),
+    ],
+)]
+fn taker_refuses_swap_before_funding_after_watcher_exit(world: &mut World) {
     let summary = world
         .taker_mut()
         .prepare(
@@ -83,16 +76,43 @@ fn taker_refuses_swap_before_funding_after_watcher_exit() {
             .get_outgoing_swapcoins_count(),
         0
     );
-
-    world.finish();
 }
 
-#[test]
-fn funded_maker_restarts_recovery_only_without_watcher() {
-    super::reboot_recovery::run_reboot_recovery_without_watcher::<BitcoindBackend>();
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtPrivateKeyHandover],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn funded_maker_restarts_recovery_only_without_watcher(world: &mut World, params: SwapParams) {
+    super::reboot_recovery::run_reboot_recovery(world, params, false);
 }
 
-#[test]
-fn funded_legacy_maker_reaches_timelock_recovery_without_watcher() {
-    super::skip_funding_recovery::run_legacy_timelock_recovery_without_watcher();
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, SkipFundingBroadcast],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        start_makers(120),
+        // Post-fidelity, pre-swap balances are the baseline.
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+    swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn funded_legacy_maker_reaches_timelock_recovery_without_watcher(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+    params: SwapParams,
+) {
+    super::skip_funding_recovery::run_legacy_timelock_only_recovery(
+        world,
+        taker_original_balance,
+        maker_spendable_balance,
+        params,
+        true,
+    );
 }

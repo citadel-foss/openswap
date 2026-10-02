@@ -9,15 +9,11 @@
 
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
-use openswap::{
-    maker::MakerBehavior,
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{
     thread,
     time::{Duration, Instant},
@@ -30,31 +26,40 @@ use std::{
 /// forces a wall-clock wait beyond the maker's pending-connection deadline.
 const REQUIRED_CONFIRMS: u32 = 15;
 
-#[test]
-fn test_legacy_multi_confirm_swap() {
-    warn!("Running Test: Legacy Swap With required_confirms > 1");
-    run_multi_confirm_swap(ProtocolVersion::Legacy, 2, false);
-}
-
-#[test]
-fn test_taproot_multi_confirm_swap() {
-    warn!("Running Test: Taproot Swap With required_confirms > 1");
-    run_multi_confirm_swap(ProtocolVersion::Taproot, 2, false);
-}
-
-#[test]
-fn test_legacy_confirmation_wait_exceeds_admission_deadline() {
-    run_multi_confirm_swap(ProtocolVersion::Legacy, 2, true);
-}
-
-#[test]
-fn test_taproot_confirmation_wait_exceeds_admission_deadline() {
-    run_multi_confirm_swap(ProtocolVersion::Taproot, 2, true);
-}
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+    cases = [
+        test_legacy_multi_confirm_swap(
+            protocol = ProtocolVersion::Legacy,
+            delay_first_confirmation = false,
+        ),
+        test_taproot_multi_confirm_swap(
+            protocol = ProtocolVersion::Taproot,
+            delay_first_confirmation = false,
+        ),
+        test_legacy_confirmation_wait_exceeds_admission_deadline(
+            protocol = ProtocolVersion::Legacy,
+            delay_first_confirmation = true,
+        ),
+        test_taproot_confirmation_wait_exceeds_admission_deadline(
+            protocol = ProtocolVersion::Taproot,
+            delay_first_confirmation = true,
+        ),
+    ],
+)]
 fn run_multi_confirm_swap(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
     protocol: ProtocolVersion,
-    maker_count: usize,
     delay_first_confirmation: bool,
 ) {
     let required_confirms = if delay_first_confirmation {
@@ -62,20 +67,6 @@ fn run_multi_confirm_swap(
     } else {
         REQUIRED_CONFIRMS
     };
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
-        .takers([TakerBehavior::Normal])
-        .build();
-
-    let taker_original_balance = world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    info!("Starting Maker servers...");
-    world.start_makers(120);
-
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
-
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(required_confirms);
@@ -236,6 +227,4 @@ fn run_multi_confirm_swap(
     }
 
     info!("Multi-confirmation swap test completed successfully!");
-
-    world.finish();
 }

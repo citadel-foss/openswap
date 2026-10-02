@@ -10,7 +10,7 @@ use bitcoind::bitcoincore_rpc::{
     json::GetTransactionResultDetailCategory as Category, RpcApi as _,
 };
 use log::info;
-use openswap::{taker::TakerBehavior, utill::MIN_RELAY_FEE_RATE, wallet::AddressType};
+use openswap::{utill::MIN_RELAY_FEE_RATE, wallet::AddressType};
 
 use super::test_framework::*;
 
@@ -18,16 +18,15 @@ const UTXO_VALUE: Amount = Amount::from_sat(5_000_000);
 const UTXO_COUNT: u32 = 3;
 const SEND_AMOUNT: Amount = Amount::from_sat(1_000_000);
 
-#[test]
-fn test_electrum_list_transactions() {
-    info!("Running Test: Electrum wallet transaction history");
-    let world = World::builder::<ElectrumBackend>()
-        .makers(0)
-        .takers(vec![TakerBehavior::Normal])
-        .build();
-
-    world.fund_taker(UTXO_COUNT, UTXO_VALUE, AddressType::P2WPKH);
-
+#[world_test(
+    backend = ElectrumBackend,
+    makers = 0,
+    takers = [Normal],
+    setup = [
+        fund_taker(UTXO_COUNT, UTXO_VALUE, AddressType::P2WPKH),
+    ],
+)]
+fn test_electrum_list_transactions(world: &mut World) {
     let txs = world
         .taker()
         .inner()
@@ -144,5 +143,4 @@ fn test_electrum_list_transactions() {
     assert_ne!(skipped[0].info.txid, spend_txid, "{skipped:#?}");
 
     info!("Electrum transaction history test completed successfully!");
-    world.finish();
 }

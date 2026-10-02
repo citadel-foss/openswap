@@ -216,32 +216,21 @@ fn taker_abort_1_legacy_electrum() {
 /// Recovery skips each contract while it is unconfirmed and sweeps it on a
 /// later cycle, well inside the timelock window. This test asserts the
 /// outcome — every incoming coin swept, no hang.
-#[test]
-fn electrum_sweeps_after_breach() {
-    let mut world = World::builder::<ElectrumBackend>()
-        .makers(2)
-        .maker_behaviors([
-            MakerBehavior::Normal,
-            MakerBehavior::BroadcastContractAfterSetup,
-        ])
-        // Skip the funding waits so recovery can meet the contracts unconfirmed.
-        .takers([TakerBehavior::SkipFundingConfirmWait])
-        .build();
-
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    world.start_makers(120);
-
-    let swap_params =
-        SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2).with_tx_count(3);
-
+#[world_test(
+    backend = ElectrumBackend,
+    maker_behaviors = [Normal, BroadcastContractAfterSetup],
+    // Skip the funding waits so recovery can meet the contracts unconfirmed.
+    takers = [SkipFundingConfirmWait],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn electrum_sweeps_after_breach(world: &mut World, params: SwapParams) {
     world.mine(1);
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
     let summary = world
         .taker_mut()
-        .prepare(swap_params)
+        .prepare(params)
         .expect("Prepare should succeed");
 
     let swap_result = world.taker_mut().start(&summary.swap_id);
@@ -319,9 +308,6 @@ fn electrum_sweeps_after_breach() {
             txid
         );
     }
-
-    world.shutdown_makers();
-    world.finish();
 }
 
 /// Plan A4: a swapcoin whose contract output is spent only in the mempool
@@ -331,27 +317,19 @@ fn electrum_sweeps_after_breach() {
 /// with the hashlock preimage. Mining is paused while that sweep is a
 /// mempool tx: the taker's recovery must keep its outgoing coins (a mempool
 /// spend can be evicted). After the sweep confirms, they are discarded.
-#[test]
-fn electrum_discards_only_on_confirmed_spend() {
-    let mut world = World::builder::<ElectrumBackend>()
-        .makers(2)
-        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
-        .takers([TakerBehavior::DropAfterFundsBroadcast])
-        .build();
-
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    world.start_makers(120);
-
-    let swap_params =
-        SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2).with_tx_count(3);
-
+#[world_test(
+    backend = ElectrumBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [DropAfterFundsBroadcast],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn electrum_discards_only_on_confirmed_spend(world: &mut World, params: SwapParams) {
     world.mine(1);
 
     let summary = world
         .taker_mut()
-        .prepare(swap_params)
+        .prepare(params)
         .expect("Prepare should succeed");
 
     let swap_result = world.taker_mut().start(&summary.swap_id);
@@ -402,7 +380,4 @@ fn electrum_discards_only_on_confirmed_spend() {
         );
         thread::sleep(Duration::from_secs(5));
     }
-
-    world.shutdown_makers();
-    world.finish();
 }

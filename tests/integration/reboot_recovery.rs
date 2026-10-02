@@ -28,7 +28,7 @@ use openswap::{
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{
     net::TcpStream,
     sync::{atomic::Ordering::Relaxed, Arc},
@@ -46,45 +46,14 @@ use std::{
 /// Maker2's outgoing contract, revealing the preimage on-chain; the restarted
 /// maker's watchtower sees that spend and uses the preimage to sweep its
 /// incoming contract from Maker1 — the same end state as a completed swap.
-pub(crate) fn run_reboot_recovery<B: TestBackend>() {
-    run_reboot_recovery_with_watcher::<B>(true);
-}
-
-pub(crate) fn run_reboot_recovery_without_watcher<B: TestBackend>() {
-    run_reboot_recovery_with_watcher::<B>(false);
-}
-
-fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
-    warn!("Running Test: Taproot Maker Reboot Recovery Preserves Funded Swapcoins");
-
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![
-        MakerBehavior::Normal,
-        MakerBehavior::CloseAtPrivateKeyHandover,
-    ];
-
-    let mut world = World::builder::<B>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    info!("Starting Maker servers...");
-    world.start_makers(120);
-
-    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
-
+///
+/// `watchtower_liveness` runs the same body with the maker's watcher stopped.
+pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, watcher_available: bool) {
     world.mine(1);
 
     let summary = world
         .taker_mut()
-        .prepare(swap_params)
+        .prepare(params)
         .expect("Prepare should succeed");
     let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
@@ -205,13 +174,20 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
             "restarted maker did not clean up its spent outgoing contracts"
         );
     }
-
-    world.finish();
 }
 
-#[test]
-fn test_taproot_maker_reboot_recovery_preserves_funded_swapcoins() {
-    run_reboot_recovery::<BitcoindBackend>();
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtPrivateKeyHandover],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn test_taproot_maker_reboot_recovery_preserves_funded_swapcoins(
+    world: &mut World,
+    params: SwapParams,
+) {
+    run_reboot_recovery(world, params, true);
 }
 
 /// Test: everyone in the route crashes with funding on chain, then each restarts
@@ -235,43 +211,46 @@ fn test_taproot_maker_reboot_recovery_preserves_funded_swapcoins() {
 /// t~20s restart both makers -> rebuild -> each reads the preimage revealed by
 ///       the party downstream and claims via hashlock in turn
 /// ```
-pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
-    protocol: ProtocolVersion,
-    crash_behavior: TakerBehavior,
-) {
-    warn!("Running Test: Restart Rebuilds Watches ({protocol:?}, {crash_behavior:?})");
-
-    // The framework assigns real ports; this specifies how many makers to start.
-    let maker_count = 2;
+#[world_test(
     // All three die holding unclaimed contracts, none of them recovering in
     // process, so only the restarts can settle anything.
-    let taker_behavior = vec![crash_behavior];
-    let maker_behaviors = vec![
-        MakerBehavior::CrashBeforeRecovery,
-        MakerBehavior::CrashBeforeRecovery,
-    ];
-
-    let mut world = World::builder::<B>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    info!("Starting Maker servers...");
-    world.start_makers(120);
-
-    let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
-
+    maker_behaviors = [CrashBeforeRecovery, CrashBeforeRecovery],
+    takers = [crash_behavior],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = protocol, sats = 500_000, makers = 2, tx_count = 3),
+    cases = [
+        test_taproot_restart_rebuilds_watches(
+            backend = BitcoindBackend,
+            protocol = ProtocolVersion::Taproot,
+            crash_behavior = TakerBehavior::CrashBeforeRecovery,
+        ),
+        test_legacy_electrum_restart_rebuilds_watches(
+            backend = ElectrumBackend,
+            protocol = ProtocolVersion::Legacy,
+            crash_behavior = TakerBehavior::CrashBeforeRecovery,
+        ),
+        // The taker dies right after the contract exchange — before the old code
+        // ever persisted what it was owed. The pre-restart `incoming count > 0`
+        // assertion is the proof: red without acceptance-time persistence, green
+        // with it.
+        test_taproot_crash_after_contract_exchange(
+            backend = BitcoindBackend,
+            protocol = ProtocolVersion::Taproot,
+            crash_behavior = TakerBehavior::CrashAfterContractExchange,
+        ),
+        test_legacy_electrum_crash_after_contract_exchange(
+            backend = ElectrumBackend,
+            protocol = ProtocolVersion::Legacy,
+            crash_behavior = TakerBehavior::CrashAfterContractExchange,
+        ),
+    ],
+)]
+fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
     world.mine(1);
 
     let summary = world
         .taker_mut()
-        .prepare(swap_params)
+        .prepare(params)
         .expect("Prepare should succeed");
     let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
@@ -479,45 +458,6 @@ pub(crate) fn run_restart_rebuilds_watches<B: TestBackend>(
         Amount::ZERO,
         "restarted taker left a contract unresolved"
     );
-
-    world.shutdown_makers();
-
-    world.finish();
-}
-
-#[test]
-fn test_taproot_restart_rebuilds_watches() {
-    run_restart_rebuilds_watches::<BitcoindBackend>(
-        ProtocolVersion::Taproot,
-        TakerBehavior::CrashBeforeRecovery,
-    );
-}
-
-#[test]
-fn test_legacy_electrum_restart_rebuilds_watches() {
-    run_restart_rebuilds_watches::<ElectrumBackend>(
-        ProtocolVersion::Legacy,
-        TakerBehavior::CrashBeforeRecovery,
-    );
-}
-
-// The taker dies right after the contract exchange — before the old code ever
-// persisted what it was owed. The pre-restart `incoming count > 0` assertion
-// above is the proof: red without acceptance-time persistence, green with it.
-#[test]
-fn test_taproot_crash_after_contract_exchange() {
-    run_restart_rebuilds_watches::<BitcoindBackend>(
-        ProtocolVersion::Taproot,
-        TakerBehavior::CrashAfterContractExchange,
-    );
-}
-
-#[test]
-fn test_legacy_electrum_crash_after_contract_exchange() {
-    run_restart_rebuilds_watches::<ElectrumBackend>(
-        ProtocolVersion::Legacy,
-        TakerBehavior::CrashAfterContractExchange,
-    );
 }
 
 /// Test: a maker learns the preimage only after its sender refunded it.
@@ -532,33 +472,22 @@ fn test_legacy_electrum_crash_after_contract_exchange() {
 ///
 /// Maker2 must still finish the swap instead of retrying the sweep forever. The
 /// same restart closes a record a crash left open with no coins behind it.
-#[test]
-fn test_taproot_maker_finishes_when_its_incoming_was_refunded() {
-    warn!("Running Test: Maker Finishes When Its Incoming Was Refunded");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .maker_behaviors(vec![
-            MakerBehavior::Normal,
-            MakerBehavior::CrashBeforeRecovery,
-        ])
-        .takers(vec![TakerBehavior::CrashBeforeRecovery])
-        .build();
-
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    world.start_makers(120);
-
-    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CrashBeforeRecovery],
+    takers = [CrashBeforeRecovery],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn test_taproot_maker_finishes_when_its_incoming_was_refunded(
+    world: &mut World,
+    params: SwapParams,
+) {
     world.mine(1);
 
     let summary = world
         .taker_mut()
-        .prepare(swap_params)
+        .prepare(params)
         .expect("Prepare should succeed");
     assert!(
         world.taker_mut().start(&summary.swap_id).is_err(),
@@ -668,7 +597,6 @@ fn test_taproot_maker_finishes_when_its_incoming_was_refunded() {
 
     restarted.shutdown.store(true, Relaxed);
     restarted_thread.join().unwrap();
-    world.finish();
 }
 
 /// A maker that reserved inputs for a funding it never sent must still hold
@@ -682,53 +610,25 @@ fn test_taproot_maker_finishes_when_its_incoming_was_refunded() {
 /// response timeout, by which point the reservation is older than
 /// UNBROADCAST_DISCARD_GRACE — expiring it then is the intended behavior, so
 /// the survival invariant has nothing to pin there.
-#[test]
-fn reservations_survive_a_maker_restart() {
-    run_reservations_survive_restart::<BitcoindBackend>(
-        ProtocolVersion::Taproot,
-        MakerBehavior::SkipFundingBroadcastUnrecorded,
-    );
-}
-
-/// Same restart on Electrum: the victim's startup recovery reads the indexer,
-/// not its own node, before it may free a reserved input.
-#[test]
-fn reservations_survive_a_maker_restart_electrum() {
-    run_reservations_survive_restart::<ElectrumBackend>(
-        ProtocolVersion::Taproot,
-        MakerBehavior::SkipFundingBroadcastUnrecorded,
-    );
-}
-
-fn run_reservations_survive_restart<B: TestBackend>(
-    protocol: ProtocolVersion,
-    skip_behavior: MakerBehavior,
-) {
-    warn!("Running Test: swap input reservations survive a maker restart");
-
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, skip_behavior];
-
-    let mut world = World::builder::<B>()
-        .makers(2)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    world.start_makers(120);
-
-    let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
-        .with_tx_count(3)
-        .with_required_confirms(1);
+#[world_test(
+    maker_behaviors = [Normal, SkipFundingBroadcastUnrecorded],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+    cases = [
+        reservations_survive_a_maker_restart(backend = BitcoindBackend),
+        /// Same restart on Electrum: the victim's startup recovery reads the indexer,
+        /// not its own node, before it may free a reserved input.
+        reservations_survive_a_maker_restart_electrum(backend = ElectrumBackend),
+    ],
+)]
+fn run_reservations_survive_restart(world: &mut World, params: SwapParams) {
     world.mine(1);
     world.framework().wait_for_electrs_tip();
 
     let summary = world
         .taker_mut()
-        .prepare(swap_params)
+        .prepare(params)
         .expect("Prepare should succeed");
     let swap_result = world.taker_mut().start(&summary.swap_id);
     assert!(
@@ -811,35 +711,20 @@ fn run_reservations_survive_restart<B: TestBackend>(
         released, 0,
         "past the grace the never-funded swap must release its inputs"
     );
-
-    world.shutdown_makers();
-    world.finish();
 }
 
 /// A maker that dies after claiming its funding coins, before it saves any
 /// record of the swap, leaves a reservation nothing owns. The next start
 /// frees it instead of holding those coins forever.
-#[test]
-fn orphan_reservation_is_released_on_restart() {
-    warn!("Running Test: an orphan reservation is released on restart");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .maker_behaviors([MakerBehavior::AbandonFundingClaim])
-        .takers([TakerBehavior::Normal])
-        .build();
-    world.fund_taker_default(3);
-    world.fund_makers_default();
-    world.spawn_ready_makers_and_mine();
-
-    let summary = world
-        .taker_mut()
-        .prepare(
-            SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
-                .with_tx_count(1)
-                .with_required_confirms(1),
-        )
-        .expect("prepare swap");
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [AbandonFundingClaim],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+    swap(protocol = Taproot, sats = 500_000, makers = 1, tx_count = 1),
+)]
+fn orphan_reservation_is_released_on_restart(world: &mut World, params: SwapParams) {
+    let summary = world.taker_mut().prepare(params).expect("prepare swap");
     let log_path = world.taker_log_path();
     let mut victim_config = world.makers()[0].inner().config.clone();
     victim_config.password = Some("integration-test".to_string());
@@ -864,9 +749,7 @@ fn orphan_reservation_is_released_on_restart() {
     world.drop_makers();
     world.adopt_makers([Arc::new(MakerServer::init(victim_config).unwrap())]);
     world.start_makers_without_sync(120);
-    world
-        .framework()
-        .assert_log("nothing left owns it", &log_path);
+    assert_logged!(world, "nothing left owns it");
     assert_eq!(
         world.makers()[0].inner().reserved_inputs().unwrap(),
         0,
@@ -875,5 +758,4 @@ fn orphan_reservation_is_released_on_restart() {
 
     world.shutdown_makers();
     drop(taker);
-    world.finish();
 }

@@ -9,15 +9,11 @@
 //! 5. Verify: taker balance is approximately unchanged (no fund loss).
 
 use bitcoin::Amount;
-use openswap::{
-    maker::MakerBehavior,
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{thread, time::Duration};
 
 /// Test: Taker aborts at AckSwapDetails response (Taproot).
@@ -25,35 +21,21 @@ use std::{thread, time::Duration};
 /// The taker closes the connection right after the Maker acknowledges the
 /// swap details. No funding transactions have been broadcast at this point,
 /// so no recovery is needed. Balances should remain unchanged.
-#[test]
-fn test_taproot_taker_abort1() {
-    // ---- Setup ----
-    warn!("Running Test: Taproot Taker Abort1 - Close at AckResponse");
-
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::CloseAtAckResponse];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
-    let taker_original_balance = world.fund_taker_default(3);
-
-    // Fund the makers with 4 UTXOs of 0.05 BTC each
-    world.fund_makers_default();
-
-    // Start the maker server threads
-    log::info!("Starting Maker servers...");
-
-    world.start_makers(120);
-
-    let _maker_spendable_balance = world.verify_maker_pre_swap_balances();
-    log::info!("Starting taproot taker abort1 test...");
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [CloseAtAckResponse],
+    setup = [
+        // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
+        fund_taker_default(3) as taker_original_balance,
+        // Fund the makers with 4 UTXOs of 0.05 BTC each
+        fund_makers_default(),
+        // Start the maker server threads
+        start_makers(120),
+        verify_maker_pre_swap_balances(),
+    ],
+)]
+fn test_taproot_taker_abort1(world: &mut World, taker_original_balance: Amount) {
     // Swap params for openswap (Taproot)
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -158,8 +140,4 @@ fn test_taproot_taker_abort1() {
 
     world.taker().inner().log_tracker_state();
     info!("Taproot taker abort1 test completed successfully!");
-
-    world.shutdown_makers();
-
-    world.finish();
 }

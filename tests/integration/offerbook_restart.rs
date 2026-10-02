@@ -16,15 +16,11 @@
 //!    the relay. A corrupted offerbook.json must be reset and rewritten.
 
 use bitcoin::Amount;
-use openswap::{
-    maker::MakerBehavior,
-    taker::{Taker, TakerBehavior},
-    wallet::AddressType,
-};
+use openswap::{taker::Taker, wallet::AddressType};
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{thread, time::Duration};
 
 /// Maker addresses currently in the taker's offerbook, as strings.
@@ -38,30 +34,17 @@ fn listed_addresses(taker: &Taker) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn test_offerbook_removal_survives_restart() {
-    warn!("Running Test: Offerbook Removal Survives Restart");
-
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    world.fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2TR);
-
-    info!("Starting Maker servers...");
-    world.start_makers_without_sync(120);
-
-    let maker_addrs: Vec<String> = world
-        .makers()
-        .iter()
-        .map(|m| format!("127.0.0.1:{}", m.inner().config.network_port))
-        .collect();
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    setup = [
+        fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
+        start_makers_without_sync(120),
+    ],
+)]
+fn test_offerbook_removal_survives_restart(world: &mut World) {
+    let maker_addrs: Vec<String> = world.makers().iter().map(|m| m.address()).collect();
 
     // ---- 1. Discover both makers into the offerbook ----
     // The taker is dropped and reopened below, so it leaves the world here.
@@ -161,6 +144,4 @@ fn test_offerbook_removal_survives_restart() {
     world.shutdown_makers();
 
     info!("Offerbook restart test completed successfully!");
-
-    world.finish();
 }

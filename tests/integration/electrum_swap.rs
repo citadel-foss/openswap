@@ -1,11 +1,7 @@
 use super::test_framework::*;
 use bitcoin::Amount;
 use log::info;
-use openswap::{
-    maker::MakerBehavior,
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 /// Exact post-swap balances for one protocol run. Legacy and taproot spend
 /// different transaction shapes, so each protocol pins its own values.
@@ -38,18 +34,28 @@ const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
 
 /// Run an Electrum-only openswap with the given protocol version and assert the
 /// exact post-swap taker / maker balances.
-fn run_electrum_swap(protocol: ProtocolVersion, expected: &ExpectedBalances) {
-    info!("Running Test: Electrum OpenSwap Procedure ({protocol:?})");
-    let mut world = World::builder::<ElectrumBackend>()
-        .makers(2)
-        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
-        .takers([TakerBehavior::Normal])
-        .build();
-    let taker_original_balance = world.fund_taker_default(3);
-    world.fund_makers_default();
-    info!("Initiating Maker servers");
-    world.start_makers(180);
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
+#[world_test(
+    backend = ElectrumBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        start_makers(180),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+    cases = [
+        test_taproot_openswap_electrum(protocol = ProtocolVersion::Taproot, expected = &TAPROOT_EXPECTED),
+        test_legacy_openswap_electrum(protocol = ProtocolVersion::Legacy, expected = &LEGACY_EXPECTED),
+    ],
+)]
+fn run_electrum_swap(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+    protocol: ProtocolVersion,
+    expected: &ExpectedBalances,
+) {
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
@@ -124,15 +130,4 @@ fn run_electrum_swap(protocol: ProtocolVersion, expected: &ExpectedBalances) {
         .assert(&format!("Maker {i}"), balances);
     }
     info!("Electrum-only openswap test ({protocol:?}) completed successfully!");
-    world.finish();
-}
-
-#[test]
-fn test_taproot_openswap_electrum() {
-    run_electrum_swap(ProtocolVersion::Taproot, &TAPROOT_EXPECTED);
-}
-
-#[test]
-fn test_legacy_openswap_electrum() {
-    run_electrum_swap(ProtocolVersion::Legacy, &LEGACY_EXPECTED);
 }
