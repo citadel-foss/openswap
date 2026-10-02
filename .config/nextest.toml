@@ -17,7 +17,9 @@ global-timeout = "1h"
 # output instead of the whole partition at the global timeout. The longest test,
 # fidelity::creation::bond_creation_and_redemption, takes about 11m.
 slow-timeout = { period = "3m", terminate-after = 6 }
-# Output is captured so tests can run in parallel; print it for a failing or
-# killed test, once when it fails and again in the final summary.
+# Output is captured so tests can run in parallel, and printed as one block
+# per test when it finishes: every test's logs reach the job log without
+# interleaving. A failing or killed test's output is printed again in the final
+# summary.
 failure-output = "immediate-final"
-success-output = "never"
+success-output = "immediate"

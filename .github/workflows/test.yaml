@@ -67,8 +67,8 @@ jobs:
         # Surface electrs stderr in a failing test's output, or a hung electrum
         # test leaves no evidence of what the server was doing. No
         # `--no-capture`: it would run the partition's tests one at a time. The
-        # `ci` profile in .config/nextest.toml prints a failing or killed
-        # test's captured output and carries the timeouts.
+        # `ci` profile in .config/nextest.toml prints each test's captured
+        # output when it finishes and carries the timeouts.
         env:
           ELECTRS_LOG: "1"
           NEXTEST_PROFILE: ci
