@@ -26,7 +26,11 @@ What a run needs:
 | electrs 0.9.11 | the `electrsd` crate's bundled binary, or `ELECTRS_EXEC` |
 | tor (Tor lane only) | a bootstrapped tor on control port 9051 / SOCKS 9050, `OPENSWAP_TOR_IT=1`, and `OPENSWAP_TOR_PASSWORD` if the control port needs one |
 
-`ELECTRS_LOG=1` prints electrs' stderr.
+`ELECTRS_LOG=1` prints electrs' stderr. Logs go to the test's `debug.log` and
+to stdout at debug level (`OPENSWAP_TEST_LOG=warn`, or `off`, lowers it), less
+the lock WAIT/GOT traces, which `OPENSWAP_TEST_LOG_LOCKS=debug` brings back.
+Each stdout line names its test, e.g. `[electrum_swap::taproot_openswap]`, so
+interleaved CI output can be traced back.
 
 The three Tor tests (`electrum_recovery::tor_taproot_taker_drops_after_funding`,
 `electrum_recovery::tor_legacy_taker_drops_after_funding`,

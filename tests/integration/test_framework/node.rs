@@ -16,13 +16,11 @@ use std::{
 use bip39::rand;
 use bitcoind::{bitcoincore_rpc::Auth, BitcoinD};
 use electrsd::ElectrsD;
-use openswap::{
-    utill::setup_logger,
-    wallet::{CoreRpcConfig, ElectrumConfig},
-};
+use openswap::wallet::{CoreRpcConfig, ElectrumConfig};
 
 use super::{
     backend::TestBackend,
+    logs::setup_test_logger,
     ports::free_ports,
     procs::{
         bitcoind::{generate_blocks, init_bitcoind},
@@ -41,11 +39,7 @@ impl<B: TestBackend> NodeBuilder<B> {
     #[must_use = "dropping the Node stops it at once"]
     pub fn build(self) -> Node {
         let temp_dir = env::temp_dir().join(format!("openswap-node-{}", rand::random::<u64>()));
-        let log_level = env::var("OPENSWAP_TEST_LOG")
-            .ok()
-            .and_then(|level| level.parse().ok())
-            .unwrap_or(log::LevelFilter::Debug);
-        setup_logger(log_level, Some(temp_dir.clone()));
+        setup_test_logger(&temp_dir);
         log::info!("temporary directory : {}", temp_dir.display());
         log::info!("test: {}", thread::current().name().unwrap_or("<unnamed>"));
 
