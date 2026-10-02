@@ -278,7 +278,8 @@ pub fn net_policy_fees(
 /// Fits a re-plan to the input counts the taker was charged for: split `i`
 /// of the result spends at least `declared[i]` inputs and is netted at that
 /// count. Splits pair by size; a short one takes the smallest spare coins of
-/// its own pool, since the taker already pays for those inputs.
+/// its own pool that pay for their own input, so the split stays fundable
+/// even where the declared count exceeds the reimbursed budget.
 pub fn fit_declared_shape(
     mut fresh: Vec<SplitPlan>,
     declared: &[usize],
@@ -306,8 +307,10 @@ pub fn fit_declared_shape(
         .flat_map(|split| split.utxos.iter().copied())
         .collect();
     let swept: HashSet<OutPoint> = pools[1].iter().map(|(outpoint, _)| *outpoint).collect();
+    let input_fee = fee_at_rate_sats(funding_tx_vsize(2) - funding_tx_vsize(1), fee_rate)
+        .ok_or_else(|| WalletError::General("input fee arithmetic overflow".to_string()))?;
     let mut spare = pools.map(|mut pool| {
-        pool.retain(|(outpoint, _)| !used.contains(outpoint));
+        pool.retain(|(outpoint, amount)| !used.contains(outpoint) && amount.to_sat() > input_fee);
         pool.sort_by_key(|(_, amount)| *amount);
         pool.into_iter()
             .map(|(outpoint, _)| outpoint)
@@ -1044,6 +1047,17 @@ mod tests {
             fit_declared_shape(fresh, &[2], coins, 2, 1.0, ProtocolVersion::Taproot).unwrap();
         assert_eq!(fitted[0].utxos, vec![utxo(1, 0).0, utxo(3, 0).0]);
         assert_eq!(fitted[0].value.to_sat(), 150_000 - 233);
+    }
+
+    #[test]
+    fn padding_skips_a_spare_coin_worth_less_than_its_input_fee() {
+        // At 1 sat/vB an input costs 68 sats; a 50-sat coin would shrink the
+        // split's funds, so the next smallest spare is taken instead.
+        let fresh = vec![split(&[1], 150_000)];
+        let coins = pools(&[(1, 300_000), (2, 50), (3, 10_000)], &[]);
+        let fitted =
+            fit_declared_shape(fresh, &[2], coins, 2, 1.0, ProtocolVersion::Taproot).unwrap();
+        assert_eq!(fitted[0].utxos, vec![utxo(1, 0).0, utxo(3, 0).0]);
     }
 
     #[test]

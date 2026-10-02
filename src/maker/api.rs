@@ -207,7 +207,7 @@ struct SwapState {
     /// counts are what the taker was charged for; its coins are only a choice.
     funding_plan: Vec<SplitPlan>,
     /// The plan whose coins funding claimed: the frozen one, or its re-plan when
-    /// another swap took a coin. A rebuild of built funding reuses exactly this.
+    /// another swap took a coin. Every later pass reuses exactly this claim.
     claimed_plan: Vec<SplitPlan>,
     /// Last activity timestamp.
     last_activity: Instant,
@@ -726,6 +726,8 @@ pub struct MakerServer {
     pub highest_fidelity_proof: RwLock<Option<FidelityProof>>,
     /// Ongoing swap states by swap_id.
     ongoing_swaps: Mutex<HashMap<String, SwapState>>,
+    /// Serializes funding claims, so two passes for one swap cannot both claim.
+    funding_claims: Mutex<()>,
     /// Recently completed handovers, retained for exact retry replay.
     completed_handovers: Mutex<HashMap<String, CompletedHandover>>,
     /// Watch service for contract monitoring.
@@ -933,6 +935,7 @@ impl MakerServer {
             is_setup_complete: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
+            funding_claims: Mutex::new(()),
             watch_service,
             completed_handovers: Mutex::new(HashMap::new()),
             thread_pool: Arc::new(ThreadPool::new(config.network_port)),
@@ -1791,23 +1794,24 @@ impl MakerServer {
             feerate
         };
 
-        // A swap that built funding before may have some of it on the wire, so
-        // it rebuilds from the plan it claimed and the coins it still holds.
+        // Once a swap has claimed coins, every later pass reuses exactly that
+        // claim: some of its funding may be out, or a concurrent pass may be
+        // building from it. The lock makes the check and the claim one step.
+        let _claiming =
+            lock_debug!(self.funding_claims.lock()).map_err(|_| MakerError::MutexPossion)?;
         let (claimed, terms, service_fee) = {
             let swaps =
                 lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
             let state = swaps
                 .get(swap_id)
                 .ok_or(MakerError::General("No stored state for this swap"))?;
-            let built =
-                !state.outgoing_swapcoins.is_empty() || !state.funding_broadcast_txids.is_empty();
             (
-                built.then(|| state.claimed_plan.clone()),
+                (!state.claimed_plan.is_empty()).then(|| state.claimed_plan.clone()),
                 state.negotiated,
                 state.service_fee_sats,
             )
         };
-        let built = claimed.is_some();
+        let fresh = claimed.is_none();
 
         // Coins are claimed only now, once the previous party's funding has
         // confirmed: an admission alone costs the taker nothing.
@@ -1832,40 +1836,33 @@ impl MakerServer {
                         .iter()
                         .all(|input| locks.outpoints.contains(input))
                 });
-                if claimed.is_empty() || !held {
+                if !held {
                     return Err(MakerError::General(
                         "Funding was already built; refusing to fund from other coins",
                     ));
                 }
                 claimed
+            } else if wallet.claim_swap_inputs(swap_id, &inputs(plan)) {
+                plan.to_vec()
             } else {
-                // Nothing built means nothing of this swap is out, so a claim an
-                // earlier failed pass left behind is simply dropped first.
-                wallet.release_swap_locks(swap_id, None);
-                if wallet.claim_swap_inputs(swap_id, &inputs(plan)) {
-                    plan.to_vec()
-                } else {
-                    let replanned = replan_funding(&wallet, &terms, service_fee, plan, gross)?;
-                    if !wallet.claim_swap_inputs(swap_id, &inputs(&replanned)) {
-                        return Err(MakerError::General(
-                            "Re-planned funding inputs are not free",
-                        ));
-                    }
-                    log::info!(
-                        "[{}] Re-planned funding for swap {}: a planned coin went to another swap",
-                        self.config.network_port,
-                        swap_id
-                    );
-                    replanned
+                let replanned = replan_funding(&wallet, &terms, service_fee, plan, gross)?;
+                if !wallet.claim_swap_inputs(swap_id, &inputs(&replanned)) {
+                    return Err(MakerError::General(
+                        "Re-planned funding inputs are not free",
+                    ));
                 }
+                log::info!(
+                    "[{}] Re-planned funding for swap {}: a planned coin went to another swap",
+                    self.config.network_port,
+                    swap_id
+                );
+                replanned
             };
             #[cfg(feature = "integration-test")]
             if let Some(key) = &stand_in {
                 wallet.release_swap_locks(key, None);
             }
-            // A rebuild claimed nothing new, and releasing could free coins of a
-            // tx that is already out.
-            if !built {
+            if fresh {
                 if let Err(e) = wallet.save_to_disk() {
                     wallet.release_swap_locks(swap_id, None);
                     return Err(MakerError::Wallet(e));
@@ -1873,7 +1870,7 @@ impl MakerServer {
             }
             plan
         };
-        if !built {
+        if fresh {
             let mut swaps =
                 lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
             if let Some(state) = swaps.get_mut(swap_id) {
@@ -1891,6 +1888,7 @@ impl MakerServer {
                 ));
             }
         }
+        drop(_claiming);
         #[cfg(feature = "integration-test")]
         if self.behavior() == MakerBehavior::AbandonFundingClaim {
             log::warn!(
@@ -1928,6 +1926,13 @@ impl MakerServer {
                         if wallet.release_swap_locks(swap_id, None) {
                             let _ = wallet.save_to_disk();
                         }
+                    }
+                    // The claim is gone, so the next pass must claim afresh.
+                    if let Some(state) = lock_debug!(self.ongoing_swaps.lock())
+                        .map_err(|_| MakerError::MutexPossion)?
+                        .get_mut(swap_id)
+                    {
+                        state.claimed_plan.clear();
                     }
                     return Err(MakerError::Wallet(e));
                 }
