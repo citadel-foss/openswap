@@ -85,7 +85,7 @@ impl<'n> TakerCli<'n> {
 }
 
 #[world_test(backend = BitcoindBackend)]
-fn test_taker_cli(node: &mut Node) {
+fn wallet_commands(node: &mut Node) {
     let taker_cli = TakerCli::new(node);
     info!("TakerCli initialized successfully");
 

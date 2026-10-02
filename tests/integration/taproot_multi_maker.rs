@@ -21,7 +21,7 @@ use log::info;
         verify_maker_pre_swap_balances() as maker_spendable_balance,
     ],
 )]
-fn test_taproot_multi_maker_openswap(
+fn taproot_four_maker_swap_completes(
     world: &mut World,
     taker_original_balance: Amount,
     maker_spendable_balance: Vec<Amount>,

@@ -35,7 +35,7 @@ fn good_maker_count(taker: &openswap::taker::Taker) -> usize {
         fund_makers(3, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
     ],
 )]
-fn test_repeated_manual_sync_is_bounded(world: &mut World) {
+fn repeated_manual_sync_is_bounded(world: &mut World) {
     let expected_makers = 11usize;
 
     // Spawn makers in stages: 2, 1, 3, 5

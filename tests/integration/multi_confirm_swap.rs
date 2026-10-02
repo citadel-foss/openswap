@@ -37,19 +37,19 @@ const REQUIRED_CONFIRMS: u32 = 15;
         verify_maker_pre_swap_balances() as maker_spendable_balance,
     ],
     cases = [
-        test_legacy_multi_confirm_swap(
+        legacy_multi_confirm_swap(
             protocol = ProtocolVersion::Legacy,
             delay_first_confirmation = false,
         ),
-        test_taproot_multi_confirm_swap(
+        taproot_multi_confirm_swap(
             protocol = ProtocolVersion::Taproot,
             delay_first_confirmation = false,
         ),
-        test_legacy_confirmation_wait_exceeds_admission_deadline(
+        legacy_confirmation_wait_exceeds_admission_deadline(
             protocol = ProtocolVersion::Legacy,
             delay_first_confirmation = true,
         ),
-        test_taproot_confirmation_wait_exceeds_admission_deadline(
+        taproot_confirmation_wait_exceeds_admission_deadline(
             protocol = ProtocolVersion::Taproot,
             delay_first_confirmation = true,
         ),

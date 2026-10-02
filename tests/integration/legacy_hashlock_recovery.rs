@@ -17,7 +17,7 @@ use std::{thread, time::Duration};
         verify_maker_pre_swap_balances() as maker_spendable_balance,
     ],
 )]
-fn test_legacy_hashlock_recovery(
+fn maker_drops_after_sweep(
     world: &mut World,
     taker_original_balance: Amount,
     maker_spendable_balance: Vec<Amount>,

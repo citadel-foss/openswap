@@ -323,5 +323,5 @@ fn reconnects_after_the_connection_drops(node: &mut Node) {
 ```
 
 `electrum_transport.rs`, `wallet_backup.rs`, `taker_cli.rs`, the
-`lightning_swap_*.rs` chain tests and `fidelity::test_mempool_only_spend_reads_as_spent`
+`lightning_swap_*.rs` chain tests and `fidelity::mempool_only_spend_reads_as_spent`
 use it. Tests that touch no chain at all stay plain `#[test]`s.

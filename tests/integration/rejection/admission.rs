@@ -37,7 +37,7 @@ use std::time::Duration;
         mine(1),
     ],
 )]
-fn test_maker_rejects_out_of_bounds_swap_details(
+fn maker_rejects_out_of_bounds_swap_details(
     world: &mut World,
     taker_original_balance: Amount,
     maker_spendable_balance: Vec<Amount>,
@@ -302,7 +302,7 @@ fn test_maker_rejects_out_of_bounds_swap_details(
     setup = [fund_taker_default(3), fund_makers_default(), start_makers_without_sync(120)],
     swap(protocol = Taproot, sats = 500_000, makers = 1),
 )]
-fn test_low_swap_liquidity(world: &mut World, params: SwapParams) {
+fn low_swap_liquidity(world: &mut World, params: SwapParams) {
     // Drain the Maker wallet after fidelity bond is created
     drain_maker_liquidity_after_fidelity(world.makers()[0].inner(), world.bitcoind());
     // Mine a block to confirm the drain, then sync maker wallet
@@ -460,7 +460,7 @@ fn maker_degrades_split_count_when_netting_breaks_the_floor(world: &mut World) {
         start_makers(120),
     ],
 )]
-fn test_admission_reserves_no_liquidity(world: &mut World) {
+fn admission_reserves_no_liquidity(world: &mut World) {
     let maker_addr = world.makers()[0].address();
 
     // Taker 0 admits a swap with the maker. prepare_swap only negotiates;

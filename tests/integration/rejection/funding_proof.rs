@@ -253,7 +253,7 @@ fn maker_rejects_proof_of_funding_with_missing_contract_cache(
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120), mine(1)],
     swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn test_taproot_maker_rejects_contract_amount_mismatch(world: &mut World, params: SwapParams) {
+fn taproot_maker_rejects_contract_amount_mismatch(world: &mut World, params: SwapParams) {
     world.taker_mut().swap_fails(
         params,
         "Taproot swap should fail when taker lies about contract amount",

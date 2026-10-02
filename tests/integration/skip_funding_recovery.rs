@@ -253,7 +253,7 @@ pub(crate) fn run_legacy_timelock_only_recovery(
     ],
     swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn test_legacy_timelock_only_recovery(
+fn legacy_timelock_only_recovery(
     world: &mut World,
     taker_original_balance: Amount,
     maker_spendable_balance: Vec<Amount>,
@@ -294,10 +294,10 @@ fn test_legacy_timelock_only_recovery(
     ],
     swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
     cases = [
-        test_taproot_timelock_only_recovery(backend = BitcoindBackend),
+        taproot_timelock_only_recovery(backend = BitcoindBackend),
         /// Same timelock-only recovery on Electrum: the grace and discard decisions
         /// read the indexer rather than the maker's own node.
-        test_taproot_timelock_only_recovery_electrum(backend = ElectrumBackend),
+        taproot_timelock_only_recovery_electrum(backend = ElectrumBackend),
     ],
 )]
 fn run_taproot_timelock_only_recovery(

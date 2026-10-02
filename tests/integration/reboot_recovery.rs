@@ -183,10 +183,7 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, watcher
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
     swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn test_taproot_maker_reboot_recovery_preserves_funded_swapcoins(
-    world: &mut World,
-    params: SwapParams,
-) {
+fn taproot_maker_reboot_preserves_funded_swapcoins(world: &mut World, params: SwapParams) {
     run_reboot_recovery(world, params, true);
 }
 
@@ -219,12 +216,12 @@ fn test_taproot_maker_reboot_recovery_preserves_funded_swapcoins(
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
     swap(protocol = protocol, sats = 500_000, makers = 2, tx_count = 3),
     cases = [
-        test_taproot_restart_rebuilds_watches(
+        taproot_restart_rebuilds_watches(
             backend = BitcoindBackend,
             protocol = ProtocolVersion::Taproot,
             crash_behavior = TakerBehavior::CrashBeforeRecovery,
         ),
-        test_legacy_electrum_restart_rebuilds_watches(
+        legacy_electrum_restart_rebuilds_watches(
             backend = ElectrumBackend,
             protocol = ProtocolVersion::Legacy,
             crash_behavior = TakerBehavior::CrashBeforeRecovery,
@@ -233,12 +230,12 @@ fn test_taproot_maker_reboot_recovery_preserves_funded_swapcoins(
         // ever persisted what it was owed. The pre-restart `incoming count > 0`
         // assertion is the proof: red without acceptance-time persistence, green
         // with it.
-        test_taproot_crash_after_contract_exchange(
+        taproot_crash_after_contract_exchange(
             backend = BitcoindBackend,
             protocol = ProtocolVersion::Taproot,
             crash_behavior = TakerBehavior::CrashAfterContractExchange,
         ),
-        test_legacy_electrum_crash_after_contract_exchange(
+        legacy_electrum_crash_after_contract_exchange(
             backend = ElectrumBackend,
             protocol = ProtocolVersion::Legacy,
             crash_behavior = TakerBehavior::CrashAfterContractExchange,
@@ -479,10 +476,7 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
     swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn test_taproot_maker_finishes_when_its_incoming_was_refunded(
-    world: &mut World,
-    params: SwapParams,
-) {
+fn taproot_maker_finishes_when_its_incoming_was_refunded(world: &mut World, params: SwapParams) {
     world.mine(1);
 
     let summary = world

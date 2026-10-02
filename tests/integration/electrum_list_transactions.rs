@@ -26,7 +26,7 @@ const SEND_AMOUNT: Amount = Amount::from_sat(1_000_000);
         fund_taker(UTXO_COUNT, UTXO_VALUE, AddressType::P2WPKH),
     ],
 )]
-fn test_electrum_list_transactions(world: &mut World) {
+fn lists_funding_transactions(world: &mut World) {
     let txs = world
         .taker()
         .inner()

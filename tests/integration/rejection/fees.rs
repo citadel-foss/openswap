@@ -115,21 +115,21 @@ fn maker_rejects_over_budget_funding_plan(world: &mut World, taker_original_bala
     takers = [Normal],
     setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
     cases = [
-        test_taproot_bans_funding_fee_underpayment(
+        taproot_bans_funding_fee_underpayment(
             backend = BitcoindBackend,
             protocol = ProtocolVersion::Taproot,
         ),
-        test_legacy_bans_funding_fee_underpayment(
+        legacy_bans_funding_fee_underpayment(
             backend = BitcoindBackend,
             protocol = ProtocolVersion::Legacy,
         ),
         /// Same underpayment on Electrum: the real-fee check reads the funding
         /// inputs' prev txs from the indexer.
-        test_taproot_bans_funding_fee_underpayment_electrum(
+        taproot_bans_funding_fee_underpayment_electrum(
             backend = ElectrumBackend,
             protocol = ProtocolVersion::Taproot,
         ),
-        test_legacy_bans_funding_fee_underpayment_electrum(
+        legacy_bans_funding_fee_underpayment_electrum(
             backend = ElectrumBackend,
             protocol = ProtocolVersion::Legacy,
         ),

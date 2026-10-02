@@ -45,8 +45,8 @@ const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
         verify_maker_pre_swap_balances() as maker_spendable_balance,
     ],
     cases = [
-        test_taproot_openswap_electrum(protocol = ProtocolVersion::Taproot, expected = &TAPROOT_EXPECTED),
-        test_legacy_openswap_electrum(protocol = ProtocolVersion::Legacy, expected = &LEGACY_EXPECTED),
+        taproot_swap_completes(protocol = ProtocolVersion::Taproot, expected = &TAPROOT_EXPECTED),
+        legacy_swap_completes(protocol = ProtocolVersion::Legacy, expected = &LEGACY_EXPECTED),
     ],
 )]
 fn run_electrum_swap(
