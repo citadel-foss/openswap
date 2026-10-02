@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::support::wait_for_log_after;
+use super::wait_for_log_after;
 
 /// One replay-guard scenario: swap 1 either completes or dies with the maker's
 /// claim live, then swap 2 replays its funding under a fresh id and must be
