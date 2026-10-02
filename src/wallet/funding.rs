@@ -277,10 +277,12 @@ pub fn net_policy_fees(
 
 /// Fits a re-plan to the input counts the taker was charged for: split `i`
 /// of the result spends at least `declared[i]` inputs and is netted at that
-/// count. Pairing by size covers every count whenever any pairing does.
+/// count. Splits pair by size; a short one takes the smallest spare coins of
+/// its own pool, since the taker already pays for those inputs.
 pub fn fit_declared_shape(
     mut fresh: Vec<SplitPlan>,
     declared: &[usize],
+    pools: [Vec<(OutPoint, Amount)>; 2],
     max_input_budget: u32,
     fee_rate: f64,
     protocol: ProtocolVersion,
@@ -298,14 +300,28 @@ pub fn fit_declared_shape(
         rank[i] = r;
     }
     let mut fitted: Vec<SplitPlan> = rank.iter().map(|&r| fresh[r].clone()).collect();
-    if fitted
+
+    let used: HashSet<OutPoint> = fitted
         .iter()
-        .zip(declared)
-        .any(|(split, &inputs)| split.utxos.len() < inputs)
-    {
-        return Err(WalletError::General(
-            "a re-planned split spends fewer inputs than declared".to_string(),
-        ));
+        .flat_map(|split| split.utxos.iter().copied())
+        .collect();
+    let swept: HashSet<OutPoint> = pools[1].iter().map(|(outpoint, _)| *outpoint).collect();
+    let mut spare = pools.map(|mut pool| {
+        pool.retain(|(outpoint, _)| !used.contains(outpoint));
+        pool.sort_by_key(|(_, amount)| *amount);
+        pool.into_iter()
+            .map(|(outpoint, _)| outpoint)
+            .collect::<Vec<_>>()
+    });
+    for (split, &inputs) in fitted.iter_mut().zip(declared) {
+        let short = inputs.saturating_sub(split.utxos.len());
+        let pool = &mut spare[usize::from(split.utxos.first().is_some_and(|o| swept.contains(o)))];
+        if pool.len() < short {
+            return Err(WalletError::General(
+                "too few spare coins to keep a split's declared input count".to_string(),
+            ));
+        }
+        split.utxos.extend(pool.drain(..short));
     }
     net_policy_fees(&mut fitted, declared, max_input_budget, fee_rate, protocol)?;
     Ok(fitted)
@@ -367,7 +383,7 @@ fn plan_from_pools(
 impl Wallet {
     /// The regular and swept-swap pools planning may draw on: wallet coins
     /// neither locked nor held by an in-flight swap.
-    fn plannable_pools(&self) -> [Vec<(OutPoint, Amount)>; 2] {
+    pub(crate) fn plannable_pools(&self) -> [Vec<(OutPoint, Amount)>; 2] {
         let locked: HashSet<OutPoint> = self.list_lock_unspent().into_iter().collect();
         let to_pool = |listing: Vec<(ListUnspentResultEntry, _)>| -> Vec<(OutPoint, Amount)> {
             listing
@@ -998,13 +1014,20 @@ mod tests {
         }
     }
 
+    /// The regular pool holds `regular`, the swept-swap pool `swept`.
+    fn pools(regular: &[(u32, u64)], swept: &[(u32, u64)]) -> [Vec<(OutPoint, Amount)>; 2] {
+        [pool(regular), pool(swept)]
+    }
+
     #[test]
     fn a_replan_pairs_each_split_with_a_declared_count_it_covers() {
         // Declared [2, 1]; the re-plan comes back as [1 input, 2 inputs]. The
         // 2-input split takes slot 0 and both are netted at the declared
         // prices: 233 sats for two inputs, 165 for one, at 1 sat/vB.
         let fresh = vec![split(&[1], 40_000), split(&[2, 3], 60_000)];
-        let fitted = fit_declared_shape(fresh, &[2, 1], 2, 1.0, ProtocolVersion::Taproot).unwrap();
+        let coins = pools(&[(1, 50_000), (2, 30_000), (3, 40_000)], &[]);
+        let fitted =
+            fit_declared_shape(fresh, &[2, 1], coins, 2, 1.0, ProtocolVersion::Taproot).unwrap();
         assert_eq!(fitted[0].utxos.len(), 2);
         assert_eq!(fitted[0].value.to_sat(), 60_000 - 233);
         assert_eq!(fitted[1].utxos.len(), 1);
@@ -1012,13 +1035,29 @@ mod tests {
     }
 
     #[test]
-    fn a_replan_that_spends_fewer_inputs_than_declared_is_refused() {
-        // Charging the taker for two inputs and spending one keeps the
-        // difference; no pairing of these splits avoids it.
-        let fresh = vec![split(&[1], 40_000), split(&[2], 60_000)];
-        assert!(fit_declared_shape(fresh, &[2, 1], 2, 1.0, ProtocolVersion::Taproot).is_err());
+    fn a_short_replanned_split_takes_the_smallest_spare_coin_of_its_pool() {
+        // Declared [2]; one large coin now covers the split alone. The taker
+        // pays for two inputs, so the smallest spare regular coin joins it.
+        let fresh = vec![split(&[1], 150_000)];
+        let coins = pools(&[(1, 300_000), (2, 20_000), (3, 10_000)], &[(4, 1_000)]);
+        let fitted =
+            fit_declared_shape(fresh, &[2], coins, 2, 1.0, ProtocolVersion::Taproot).unwrap();
+        assert_eq!(fitted[0].utxos, vec![utxo(1, 0).0, utxo(3, 0).0]);
+        assert_eq!(fitted[0].value.to_sat(), 150_000 - 233);
+    }
+
+    #[test]
+    fn a_replan_without_spare_coins_in_the_split_pool_is_refused() {
+        // The only spare coin sits in the swept-swap pool; pools never mix.
+        let fresh = vec![split(&[1], 150_000)];
+        let coins = pools(&[(1, 300_000)], &[(4, 1_000)]);
+        assert!(fit_declared_shape(fresh, &[2], coins, 2, 1.0, ProtocolVersion::Taproot).is_err());
         let short = vec![split(&[1, 2], 100_000)];
-        assert!(fit_declared_shape(short, &[1, 1], 2, 1.0, ProtocolVersion::Taproot).is_err());
+        let coins = pools(&[(1, 60_000), (2, 60_000)], &[]);
+        assert!(
+            fit_declared_shape(short, &[1, 1], coins, 2, 1.0, ProtocolVersion::Taproot).is_err(),
+            "a different split count is refused"
+        );
     }
 
     #[test]

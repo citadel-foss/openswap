@@ -61,6 +61,47 @@ const BOND_POLL_INTERVAL: Duration = Duration::from_secs(10);
 // Covers all production response timeouts and finalization retry delays.
 const COMPLETED_HANDOVER_TTL: Duration = Duration::from_secs(65 * 60);
 
+/// Plan `old` again from free coins, as the same number of splits forwarding
+/// the same total. The taker priced the next hop from `old`'s input counts,
+/// so each new split is netted at its old count and spends at least that.
+fn replan_funding(
+    wallet: &Wallet,
+    terms: &NegotiatedTerms,
+    service_fee: u64,
+    old: &[SplitPlan],
+    gross: Amount,
+) -> Result<Vec<SplitPlan>, MakerError> {
+    let out_of_coins = || MakerError::InsufficientLiquidity {
+        available: wallet.plannable_balance(),
+        required: gross,
+    };
+    let fresh = wallet
+        .plan_funding(
+            gross,
+            old.len() as u32,
+            terms.swap_feerate,
+            terms.max_input_budget,
+            Some(service_fee),
+            None,
+            None,
+            terms.protocol,
+        )
+        .map_err(|e| match e {
+            WalletError::InsufficientFund { .. } => out_of_coins(),
+            other => MakerError::Wallet(other),
+        })?;
+    let declared: Vec<usize> = old.iter().map(|split| split.utxos.len()).collect();
+    fit_declared_shape(
+        fresh,
+        &declared,
+        wallet.plannable_pools(),
+        terms.max_input_budget,
+        terms.swap_feerate,
+        terms.protocol,
+    )
+    .map_err(|_| out_of_coins())
+}
+
 /// What a hop must keep after its own fee: the incoming sweeps plus one
 /// single-input outgoing contract. No swap of this shape passes with less.
 fn swap_cost_floor(
@@ -1665,7 +1706,10 @@ impl MakerServer {
                         forwardable,
                         e
                     );
-                    shortfall()
+                    match e {
+                        WalletError::InsufficientFund { .. } => shortfall(),
+                        other => MakerError::Wallet(other),
+                    }
                 })?;
             // Forwarding nets the taker-reimbursed fee out of each split; one
             // split the netting still pushes below the floor is a refusal.
@@ -1726,49 +1770,6 @@ impl MakerServer {
         Ok(state.funding_plan.clone())
     }
 
-    /// Plan `old` again from free coins, as the same number of splits forwarding
-    /// the same total. The taker priced the next hop from `old`'s input counts,
-    /// so each new split is netted at its old count and must spend at least that.
-    fn replan_funding(
-        &self,
-        wallet: &Wallet,
-        swap_id: &str,
-        old: &[SplitPlan],
-        gross: Amount,
-    ) -> Result<Vec<SplitPlan>, MakerError> {
-        let (budget, feerate, protocol, service_fee) = {
-            let swaps =
-                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
-            let state = swaps
-                .get(swap_id)
-                .ok_or(MakerError::General("No stored state for this swap"))?;
-            (
-                state.negotiated.max_input_budget,
-                state.negotiated.swap_feerate,
-                state.negotiated.protocol,
-                state.service_fee_sats,
-            )
-        };
-        let out_of_coins = || MakerError::InsufficientLiquidity {
-            available: wallet.plannable_balance(),
-            required: gross,
-        };
-        let fresh = wallet
-            .plan_funding(
-                gross,
-                old.len() as u32,
-                feerate,
-                budget,
-                Some(service_fee),
-                None,
-                None,
-                protocol,
-            )
-            .map_err(|_| out_of_coins())?;
-        let declared: Vec<usize> = old.iter().map(|split| split.utxos.len()).collect();
-        fit_declared_shape(fresh, &declared, budget, feerate, protocol).map_err(|_| out_of_coins())
-    }
-
     /// Claim the plan's coins, then build and sign one funding tx per split; a
     /// rebuild reuses the plan it claimed before. `gross` is the plan's
     /// pre-netting total. A build failure releases the whole reservation.
@@ -1792,13 +1793,20 @@ impl MakerServer {
 
         // A swap that built funding before may have some of it on the wire, so
         // it rebuilds from the plan it claimed and the coins it still holds.
-        let claimed = lock_debug!(self.ongoing_swaps.lock())
-            .map_err(|_| MakerError::MutexPossion)?
-            .get(swap_id)
-            .filter(|state| {
-                !state.outgoing_swapcoins.is_empty() || !state.funding_broadcast_txids.is_empty()
-            })
-            .map(|state| state.claimed_plan.clone());
+        let (claimed, terms, service_fee) = {
+            let swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            let state = swaps
+                .get(swap_id)
+                .ok_or(MakerError::General("No stored state for this swap"))?;
+            let built =
+                !state.outgoing_swapcoins.is_empty() || !state.funding_broadcast_txids.is_empty();
+            (
+                built.then(|| state.claimed_plan.clone()),
+                state.negotiated,
+                state.service_fee_sats,
+            )
+        };
         let built = claimed.is_some();
 
         // Coins are claimed only now, once the previous party's funding has
@@ -1837,7 +1845,7 @@ impl MakerServer {
                 if wallet.claim_swap_inputs(swap_id, &inputs(plan)) {
                     plan.to_vec()
                 } else {
-                    let replanned = self.replan_funding(&wallet, swap_id, plan, gross)?;
+                    let replanned = replan_funding(&wallet, &terms, service_fee, plan, gross)?;
                     if !wallet.claim_swap_inputs(swap_id, &inputs(&replanned)) {
                         return Err(MakerError::General(
                             "Re-planned funding inputs are not free",
@@ -1858,19 +1866,6 @@ impl MakerServer {
             // A rebuild claimed nothing new, and releasing could free coins of a
             // tx that is already out.
             if !built {
-                let mut swaps =
-                    lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
-                let Some(state) = swaps.get_mut(swap_id) else {
-                    // The idle drain dropped the swap while we claimed, so nothing
-                    // would ever release this claim.
-                    wallet.release_swap_locks(swap_id, None);
-                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
-                    return Err(MakerError::General(
-                        "Swap plan expired; the taker must send new SwapDetails",
-                    ));
-                };
-                state.claimed_plan = plan.clone();
-                drop(swaps);
                 if let Err(e) = wallet.save_to_disk() {
                     wallet.release_swap_locks(swap_id, None);
                     return Err(MakerError::Wallet(e));
@@ -1878,6 +1873,24 @@ impl MakerServer {
             }
             plan
         };
+        if !built {
+            let mut swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            if let Some(state) = swaps.get_mut(swap_id) {
+                state.claimed_plan = plan.clone();
+            } else {
+                drop(swaps);
+                // The idle drain dropped the swap while we claimed, so nothing
+                // would ever release this claim.
+                let mut wallet = lock_debug!(self.wallet.write())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                wallet.release_swap_locks(swap_id, None);
+                wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                return Err(MakerError::General(
+                    "Swap plan expired; the taker must send new SwapDetails",
+                ));
+            }
+        }
         #[cfg(feature = "integration-test")]
         if self.behavior() == MakerBehavior::AbandonFundingClaim {
             log::warn!(

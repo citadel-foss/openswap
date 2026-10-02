@@ -1949,20 +1949,16 @@ impl Wallet {
         entry.outpoints.extend(outpoints.iter().copied());
     }
 
-    /// Reserve `inputs` for `swap_key` only if each one is still a spendable
-    /// wallet coin that no swap holds; otherwise reserve nothing.
+    /// Reserve `inputs` for `swap_key` only if planning could pick each one: a
+    /// wallet coin neither locked nor held by a swap. Otherwise reserve nothing.
     pub(crate) fn claim_swap_inputs(&mut self, swap_key: &str, inputs: &[OutPoint]) -> bool {
-        let spendable: HashSet<OutPoint> = self
-            .list_descriptor_utxo_spend_info()
+        let plannable: HashSet<OutPoint> = self
+            .plannable_pools()
+            .concat()
             .into_iter()
-            .chain(self.list_swept_incoming_swap_utxos())
-            .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+            .map(|(outpoint, _)| outpoint)
             .collect();
-        if inputs.iter().any(|outpoint| {
-            !spendable.contains(outpoint)
-                || self.locked_utxos.contains(outpoint)
-                || self.is_swap_reserved(outpoint)
-        }) {
+        if !inputs.iter().all(|outpoint| plannable.contains(outpoint)) {
             return false;
         }
         self.reserve_swap_locks(swap_key, inputs);

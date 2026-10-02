@@ -487,7 +487,12 @@ fn process_proof_of_funding<M: Maker>(
                 osc.contract_redeemscript.clone().unwrap_or_default()
             };
 
-        let funding_tx = funding_txes[i].clone();
+        // Hand the tx out without its signatures: a segwit txid excludes them,
+        // so the taker can check it and sign against it but never broadcast it.
+        let mut funding_tx = funding_txes[i].clone();
+        for input in &mut funding_tx.input {
+            input.witness.clear();
+        }
         #[cfg(not(feature = "integration-test"))]
         let contract_tx = osc.contract_tx.clone();
         #[cfg(feature = "integration-test")]

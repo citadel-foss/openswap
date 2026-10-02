@@ -171,7 +171,9 @@ chain:
   output. One funded output cannot back two contracts in the same hop.
 - **The real miner fee.** Your node fetches the maker's funding inputs and
   recomputes the fee actually paid. Your node catches a maker that charges
-  one rate and builds cheaper.
+  one rate and builds cheaper. On legacy, your node checks once the maker's
+  funding confirms. The maker shows you that funding unsigned, so only the
+  maker can broadcast it.
 
 Your node records a proven cheat in the offerbook, its local record of
 known makers. One proof bans the maker for good. Only removing the maker

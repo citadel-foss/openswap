@@ -598,12 +598,6 @@ impl Taker {
             }
         }
 
-        let maker_funding_txs: Vec<Transaction> = senders_info
-            .iter()
-            .map(|info| info.funding_tx.clone())
-            .collect();
-        self.verify_maker_funding_feerate(&maker_funding_txs, maker_idx)?;
-
         log::info!(
             "Verified {} maker sender contracts (structure, hashvalue, locktime, pubkeys, amounts)",
             senders_info.len()

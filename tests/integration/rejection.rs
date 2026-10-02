@@ -3028,6 +3028,48 @@ fn slow_taker_is_readmitted_before_funding() {
     test_framework.finish(takers, block_generation_handle);
 }
 
+/// A Legacy maker hands its funding txs to the taker before it holds the
+/// signatures for its refund. They go out unsigned, so a taker that tries to
+/// broadcast them is refused and cannot strand the maker's coins.
+#[test]
+fn legacy_handed_out_funding_cannot_be_broadcast() {
+    warn!("Running Test: Legacy handed-out funding cannot be broadcast");
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::BroadcastHandedOutFunding],
+            vec![MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let summary = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
+                .with_tx_count(2)
+                .with_required_confirms(1),
+        )
+        .expect("prepare swap");
+    assert!(taker.start_swap(&summary.swap_id).is_err());
+
+    let log_path = test_framework.taker_log_path();
+    test_framework.assert_log("handed-out funding tx", &log_path);
+    let contents = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        !contents
+            .lines()
+            .any(|line| line.contains("handed-out funding tx") && line.ends_with("accepted")),
+        "a handed-out funding tx must not be broadcastable"
+    );
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.finish(takers, block_generation_handle);
+}
+
 /// A maker that re-admits a drained swap with a different plan shape fails
 /// the taker's re-check, before the taker funds anything.
 #[test]

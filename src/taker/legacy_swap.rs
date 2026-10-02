@@ -25,7 +25,7 @@ use crate::{
     utill::{generate_keypair, generate_maker_keys, read_message, send_message},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
-        Wallet,
+        Blockchain, Wallet,
     },
 };
 
@@ -492,6 +492,25 @@ impl Taker {
                     &next_hashlock_nonces,
                     outgoing_locktime,
                 )?;
+            #[cfg(feature = "integration-test")]
+            if self.behavior == super::api::TakerBehavior::BroadcastHandedOutFunding {
+                for info in &senders_contract_txs_info {
+                    let outcome = self.read_wallet()?.send_tx(&info.funding_tx);
+                    log::warn!(
+                        "Test behavior: broadcasting maker {}'s handed-out funding tx {}: {}",
+                        maker_idx,
+                        info.funding_tx.compute_txid(),
+                        if outcome.is_ok() {
+                            "accepted"
+                        } else {
+                            "refused"
+                        }
+                    );
+                }
+                return Err(TakerError::General(
+                    "Test: stopped after broadcasting handed-out funding".to_string(),
+                ));
+            }
             {
                 let exch = self.swap_state_mut()?.makers[maker_idx].legacy_exchange_mut()?;
                 exch.proof_of_funding_sent = true;
@@ -744,6 +763,17 @@ impl Taker {
                     super::api::MAKER_FUNDING_TIMEOUT,
                 )
                 .inspect_err(|e| self.note_withheld_funding(maker_idx, e))?;
+
+            // The handed-out funding txs carry no signatures, so the feerate,
+            // which prices the real size, is checked on the confirmed txs.
+            let confirmed_funding = {
+                let wallet = self.read_wallet()?;
+                maker_funding_txids
+                    .iter()
+                    .map(|txid| wallet.blockchain.get_raw_transaction(txid, None))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            self.verify_maker_funding_feerate(&confirmed_funding, maker_idx)?;
 
             // Verify that the maker's funding confirmed within a few blocks of the
             // previous hop. For legacy (CSV relative locktime), a large gap between

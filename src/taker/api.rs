@@ -1984,27 +1984,7 @@ impl Taker {
         };
 
         #[cfg(feature = "integration-test")]
-        let mut swap_details = swap_details;
-        #[cfg(feature = "integration-test")]
-        if let TakerBehavior::ForgeBounds(amount) = self.behavior {
-            swap_details.amount = amount;
-        }
-        #[cfg(feature = "integration-test")]
-        if let TakerBehavior::ForgeIncomingCount(count) = self.behavior {
-            swap_details.incoming_count = count;
-        }
-        #[cfg(feature = "integration-test")]
-        if let TakerBehavior::ForgeFeerate(feerate) = self.behavior {
-            swap_details.feerate = feerate;
-        }
-        #[cfg(feature = "integration-test")]
-        if let TakerBehavior::ForgeTxCount(count) = self.behavior {
-            swap_details.tx_count = count;
-        }
-        #[cfg(feature = "integration-test")]
-        if let TakerBehavior::ForgeMaxInputBudget(budget) = self.behavior {
-            swap_details.max_input_budget = budget;
-        }
+        let mut swap_details = self.forge_swap_details(swap_details);
 
         send_message(
             &mut stream,
@@ -2143,7 +2123,7 @@ impl Taker {
         let swap = self.swap_state()?;
         let refund_locktime_offset = REFUND_LOCKTIME_BASE
             + REFUND_LOCKTIME_STEP * (swap.makers.len() - maker_idx - 1) as u16;
-        Ok(SwapDetails {
+        let details = SwapDetails {
             id: swap.id.clone(),
             protocol_version: swap.params.protocol,
             amount: swap.makers[maker_idx].amount,
@@ -2153,7 +2133,25 @@ impl Taker {
             feerate: swap.params.swap_feerate() as u64,
             timelock: swap.makers[maker_idx].negotiated_timelock,
             refund_locktime_offset,
-        })
+        };
+        #[cfg(feature = "integration-test")]
+        let details = self.forge_swap_details(details);
+        Ok(details)
+    }
+
+    /// Apply the declaration-forging test hooks, so a resend repeats exactly
+    /// what admission sent.
+    #[cfg(feature = "integration-test")]
+    fn forge_swap_details(&self, mut details: SwapDetails) -> SwapDetails {
+        match self.behavior {
+            TakerBehavior::ForgeBounds(amount) => details.amount = amount,
+            TakerBehavior::ForgeIncomingCount(count) => details.incoming_count = count,
+            TakerBehavior::ForgeFeerate(feerate) => details.feerate = feerate,
+            TakerBehavior::ForgeTxCount(count) => details.tx_count = count,
+            TakerBehavior::ForgeMaxInputBudget(budget) => details.max_input_budget = budget,
+            _ => {}
+        }
+        details
     }
 
     /// Resend every hop's SwapDetails and require the same accepted plan shape.
@@ -2165,6 +2163,7 @@ impl Taker {
             match self.resend_swap_details(&maker.address.to_string(), &details)? {
                 MakerToTakerMessage::AckSwapDetails(ack)
                     if ack.tweakable_point.is_some()
+                        && ack.tweakable_point == maker.tweakable_point
                         && ack.funding_splits == maker.funding_splits => {}
                 _ => {
                     return Err(TakerError::General(format!(
@@ -3750,6 +3749,9 @@ pub enum TakerBehavior {
     /// Normal behavior.
     #[default]
     Normal,
+    /// Try to broadcast the funding txs a Legacy maker hands out with its
+    /// contract-sig request, then stop: the handout must not be broadcastable.
+    BroadcastHandedOutFunding,
     /// Stop the watcher immediately before the taker's funding gate.
     StopWatcherBeforeSwap,
     /// Stop the watcher after Legacy breach sentinels are armed.

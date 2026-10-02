@@ -1575,24 +1575,16 @@ fn recover_from_swap(
             // it yet, both read as "no broadcast". Funding already in flight is
             // committed money, so age the record before believing that. Age is
             // measured from creation: recovery progress refreshes `updated_at`,
-            // which would hold the grace open forever.
-            //
-            // Legacy never reaches this discard: its outgoing swapcoins are
-            // persisted only with the contract-sig response, which carries the
-            // funding txs fully signed — so the peer may hold and broadcast
-            // them even when we never did. Only Taproot, which broadcasts
-            // before responding, can prove never-exposed here.
-            let legacy_exposed = outgoing_swapcoins
-                .first()
-                .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy);
+            // which would hold the grace open forever. Legacy hands its funding
+            // txs out unsigned, so only we can broadcast them, as with Taproot.
             let unrecorded_for = lock_debug!(maker.swap_tracker.lock())
                 .map_err(|_| MakerError::MutexPossion)?
                 .get_record(&swap_id)
                 .filter(|r| r.funding_broadcast_txids.is_empty())
                 .map(|r| now_secs().saturating_sub(r.created_at));
-            let never_recorded = !legacy_exposed
-                && unrecorded_for.is_some_and(|age| age >= UNBROADCAST_DISCARD_GRACE.as_secs());
-            discard_pending = !legacy_exposed && unrecorded_for.is_some() && !never_recorded;
+            let never_recorded =
+                unrecorded_for.is_some_and(|age| age >= UNBROADCAST_DISCARD_GRACE.as_secs());
+            discard_pending = unrecorded_for.is_some() && !never_recorded;
             if let Some(age) = unrecorded_for.filter(|_| discard_pending) {
                 if !discard_deferred_logged {
                     discard_deferred_logged = true;
@@ -1915,19 +1907,15 @@ fn recover_from_swap(
 
             let chain = chain.as_ref().expect("connection created for this branch");
 
-            let legacy_funding_shared = outgoing_swapcoins
-                .first()
-                .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy);
             let swap_scope = HashSet::from([swap_id.clone()]);
             let recovered = Wallet::recover_timelocked_swapcoins(
                 &maker.wallet,
                 chain,
                 &maker.shutdown,
                 Some(&swap_scope),
-                // Legacy funding rides the contract-sig response, so the peer
-                // may hold it even when we never broadcast. The pass is scoped
-                // to one swap, so every coin gets the same answer.
-                &|_| legacy_funding_shared,
+                // Our funding txs leave us unsigned, so no peer can broadcast
+                // them for us.
+                &|_| false,
             )
             // Nothing respawns this thread: a failed wait retries on the next pass.
             .unwrap_or_else(|e| {
