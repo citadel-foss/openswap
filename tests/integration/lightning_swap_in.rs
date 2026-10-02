@@ -19,9 +19,7 @@ use openswap::lightning::{
     SwapHtlc, SwapInMaker, SwapInParams, SwapInTaker,
 };
 
-use super::test_framework::{
-    confirmations, fund_script, generate_blocks, miner_spk, setup_bitcoind,
-};
+use super::test_framework::*;
 
 fn test_params() -> SwapInParams {
     SwapInParams {
@@ -34,9 +32,9 @@ fn test_params() -> SwapInParams {
 
 /// Full happy path: request/accept, on-chain funding, invoice payment, taker
 /// claim, preimage learning and maker on-chain sweep through the hashlock.
-#[test]
-fn swap_in_happy_path() {
-    let bitcoind = setup_bitcoind("ln-swap-tests", "happy-path");
+#[world_test(backend = BitcoindBackend)]
+fn swap_in_happy_path(node: &mut Node) {
+    let bitcoind = node.bitcoind();
     // One shared mock backend plays both Lightning nodes (POC).
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
 
@@ -57,7 +55,7 @@ fn swap_in_happy_path() {
 
     // 4-5. Taker funds the HTLC on-chain.
     let (funding_txid, outpoint, funding_output) =
-        fund_script(&bitcoind, &spk, params.funding_amount());
+        fund_script(bitcoind, &spk, params.funding_amount());
     let funded = HtlcFunded {
         outpoint,
         value: funding_output.value,
@@ -68,7 +66,7 @@ fn swap_in_happy_path() {
         .verify_htlc(
             &funded,
             &funding_output,
-            confirmations(&bitcoind, &funding_txid),
+            confirmations(bitcoind, &funding_txid),
         )
         .unwrap();
     maker.pay_invoice().unwrap();
@@ -85,7 +83,7 @@ fn swap_in_happy_path() {
 
     // 10. Maker sweeps the on-chain HTLC through the hashlock branch.
     let claim_tx = maker
-        .claim_tx(outpoint, funding_output.value, miner_spk(&bitcoind))
+        .claim_tx(outpoint, funding_output.value, miner_spk(bitcoind))
         .unwrap();
     let witness: Vec<_> = claim_tx.input[0].witness.iter().collect();
     assert_eq!(
@@ -93,18 +91,18 @@ fn swap_in_happy_path() {
         "witness[1] must be the 32-byte Lightning preimage"
     );
     let claim_txid = bitcoind.client.send_raw_transaction(&claim_tx).unwrap();
-    generate_blocks(&bitcoind, 1);
+    generate_blocks(bitcoind, 1);
     assert!(
-        confirmations(&bitcoind, &claim_txid) >= 1,
+        confirmations(bitcoind, &claim_txid) >= 1,
         "maker's hashlock claim must confirm"
     );
 }
 
 /// Refund path: the maker never pays, so the taker recovers the on-chain
 /// funds through the timelock branch — but only after `locktime` blocks.
-#[test]
-fn swap_in_refund_path() {
-    let bitcoind = setup_bitcoind("ln-swap-tests", "refund-path");
+#[world_test(backend = BitcoindBackend)]
+fn swap_in_refund_path(node: &mut Node) {
+    let bitcoind = node.bitcoind();
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
 
     let params = test_params();
@@ -115,13 +113,13 @@ fn swap_in_refund_path() {
     let accept = maker.accept(request).unwrap();
     let spk = taker.on_accept(&accept).unwrap().script_pubkey().unwrap();
 
-    let (_txid, outpoint, funding_output) = fund_script(&bitcoind, &spk, params.funding_amount());
+    let (_txid, outpoint, funding_output) = fund_script(bitcoind, &spk, params.funding_amount());
 
     // Maker never pays the invoice; nothing is claimable.
     assert!(!taker.try_claim().unwrap());
 
     let refund_tx = taker
-        .refund_tx(outpoint, funding_output.value, miner_spk(&bitcoind))
+        .refund_tx(outpoint, funding_output.value, miner_spk(bitcoind))
         .unwrap();
 
     // Too early: CSV not yet satisfied.
@@ -134,20 +132,20 @@ fn swap_in_refund_path() {
     );
 
     // After `locktime` blocks the refund is valid.
-    generate_blocks(&bitcoind, params.locktime as u64);
+    generate_blocks(bitcoind, params.locktime as u64);
     let refund_txid = bitcoind.client.send_raw_transaction(&refund_tx).unwrap();
-    generate_blocks(&bitcoind, 1);
+    generate_blocks(bitcoind, 1);
     assert!(
-        confirmations(&bitcoind, &refund_txid) >= 1,
+        confirmations(bitcoind, &refund_txid) >= 1,
         "taker's timelock refund must confirm"
     );
 }
 
 /// A tampered preimage fails both layers: the Lightning claim is rejected by
 /// the backend and the on-chain hashlock spend is rejected by consensus.
-#[test]
-fn swap_in_wrong_preimage_fails_both_layers() {
-    let bitcoind = setup_bitcoind("ln-swap-tests", "wrong-preimage");
+#[world_test(backend = BitcoindBackend)]
+fn swap_in_wrong_preimage_fails_both_layers(node: &mut Node) {
+    let bitcoind = node.bitcoind();
     let mock = MockLightningBackend::new();
 
     let preimage = Preimage([0x55; 32]);
@@ -175,7 +173,7 @@ fn swap_in_wrong_preimage_fails_both_layers() {
     let htlc = SwapHtlc::new(&hashlock_pk, &timelock_pk, &payment_hash, 20);
     let spk = htlc.script_pubkey().unwrap();
 
-    let (_txid, outpoint, funding_output) = fund_script(&bitcoind, &spk, Amount::from_sat(55_000));
+    let (_txid, outpoint, funding_output) = fund_script(bitcoind, &spk, Amount::from_sat(55_000));
 
     let bad_claim = htlc
         .create_hashlock_spend(
@@ -183,7 +181,7 @@ fn swap_in_wrong_preimage_fails_both_layers() {
             funding_output.value,
             &hashlock_sk,
             &wrong_preimage,
-            miner_spk(&bitcoind),
+            miner_spk(bitcoind),
         )
         .unwrap();
     assert!(
@@ -198,9 +196,9 @@ fn swap_in_wrong_preimage_fails_both_layers() {
             funding_output.value,
             &hashlock_sk,
             &preimage,
-            miner_spk(&bitcoind),
+            miner_spk(bitcoind),
         )
         .unwrap();
     bitcoind.client.send_raw_transaction(&good_claim).unwrap();
-    generate_blocks(&bitcoind, 1);
+    generate_blocks(bitcoind, 1);
 }

@@ -27,6 +27,7 @@ mod harness;
 #[cfg(feature = "lightning")]
 mod lightning;
 mod logs;
+mod node;
 mod ports;
 mod procs;
 mod reports;
@@ -43,6 +44,7 @@ pub use self::{
     expect::*,
     harness::*,
     macros::world_test,
+    node::*,
     procs::{electrs::*, tor::*},
     reports::*,
     tracker::*,
