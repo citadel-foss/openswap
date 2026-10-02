@@ -45,20 +45,24 @@
 //! }
 //! ```
 //!
-//! - `backend` is required. Every other key except `setup`, `swap` and
-//!   `cases` is the `WorldBuilder` method of the same name: `key = value`
-//!   calls `.key(value)`, a bare `key` calls `.key()`. Nothing is defaulted,
-//!   except that `makers` is the length of a `maker_behaviors` list when
-//!   omitted.
+//! - `backend` is required, unless every case names its own. Every other
+//!   key except `setup`, `swap` and `cases` is the `WorldBuilder` method of
+//!   the same name: `key = value` calls `.key(value)`, a bare `key` calls
+//!   `.key()`. Nothing is defaulted, except that `makers` is the length of a
+//!   `maker_behaviors` list when omitted.
 //! - `maker_behaviors` and `takers` see the `MakerBehavior` and
 //!   `TakerBehavior` variants unqualified.
 //! - `setup` lists `World` steps run in order after `build()`. `step(..) as x`
 //!   binds the step's result to the body parameter named `x`.
 //! - `swap(protocol, sats, makers[, tx_count][, confirms])` builds the
 //!   `SwapParams` passed to the body parameter `params`. Unset `tx_count` and
-//!   `confirms` keep `SwapParams::new`'s defaults (2 and 1).
+//!   `confirms` keep `SwapParams::new`'s defaults (2 and 1). `protocol` is
+//!   `Legacy`, `Taproot` or any `ProtocolVersion` expression, and every value
+//!   may name a case argument.
 //! - The body's first parameter receives the world; every later parameter
-//!   is a setup binding, `params` or a case argument, matched by name.
+//!   is a setup binding, `params` or a case argument, matched by name. A body
+//!   with one type parameter (`fn body<B: TestBackend>(..)`) receives the
+//!   test's backend type through it.
 //! - Once the world is built, the test logs `Running Test: <name> - <first
 //!   doc line>`, so the body needs no `warn!("Running Test: ...")` of its own.
 //!
@@ -68,7 +72,8 @@
 //! arguments; they are bound as locals before `build()`, so keys can use them
 //! (`takers = [behavior]`), and the body takes the ones it needs by name. A
 //! case's own `///` docs and attributes go to its test; the body's non-doc
-//! attributes go to every case.
+//! attributes go to every case. `backend = ElectrumBackend` in a case is not
+//! a local: it builds that case's world on its own backend.
 
 use std::collections::HashSet;
 
@@ -95,10 +100,11 @@ struct Step {
     call: TokenStream2,
 }
 
-/// One `cases` row: its test's name, attributes and named arguments.
+/// One `cases` row: its test's name, attributes, backend and named arguments.
 struct Case {
     attrs: Vec<Attribute>,
     name: Ident,
+    backend: Option<Type>,
     args: Vec<(Ident, Expr)>,
 }
 
@@ -175,12 +181,17 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
             _ => builder_calls.push(quote!(.#key(#value))),
         }
     }
-    let backend = backend.ok_or_else(|| {
-        Error::new(
+    // A case's own `backend` overrides the shared one; every test needs one.
+    let every_case_has_backend = cases
+        .as_deref()
+        .is_some_and(|cases: &[Case]| cases.iter().all(|case| case.backend.is_some()));
+    if backend.is_none() && !every_case_has_backend {
+        return Err(Error::new(
             Span::call_site(),
-            "`backend = ...` is required, e.g. `backend = BitcoindBackend`",
-        )
-    })?;
+            "`backend = ...` is required, e.g. `backend = BitcoindBackend`, \
+             unless every case gives its own",
+        ));
+    }
     if let (false, Some(count)) = (makers_given, maker_count) {
         builder_calls.insert(0, quote!(.makers(#count)));
     }
@@ -191,10 +202,22 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
             "#[world_test] adds #[test] itself; remove this one",
         ));
     }
-    if !body.sig.generics.params.is_empty() || body.sig.asyncness.is_some() {
+    // A body may take one type parameter: the test's backend.
+    let generics = &body.sig.generics.params;
+    let takes_backend = match generics.first() {
+        None => false,
+        Some(syn::GenericParam::Type(_)) if generics.len() == 1 => true,
+        Some(_) => {
+            return Err(Error::new(
+                generics.span(),
+                "a #[world_test] body takes at most one type parameter, the backend",
+            ))
+        }
+    };
+    if body.sig.asyncness.is_some() {
         return Err(Error::new(
             body.sig.span(),
-            "a #[world_test] body is a plain, non-generic fn",
+            "a #[world_test] body is not async",
         ));
     }
 
@@ -270,8 +293,17 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         })
         .collect();
     let swap_stmt = swap.map(|swap| quote!(let #params = #swap;));
-    let run = |name: &Ident, summary: &[Attribute], locals: TokenStream2, call: TokenStream2| {
+    let run = |name: &Ident,
+               summary: &[Attribute],
+               backend: &Type,
+               locals: TokenStream2,
+               call: TokenStream2| {
         let running = running_line(name, summary);
+        let call = if takes_backend {
+            quote!(#call::<#backend>)
+        } else {
+            call
+        };
         quote! {
             #locals
             let mut #world = crate::test_framework::World::builder::<#backend>()
@@ -290,7 +322,8 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         let attrs = std::mem::take(&mut body.attrs);
         body.vis = syn::Visibility::Inherited;
         let name = body.sig.ident.clone();
-        let test_body = run(&name, &attrs, quote!(), quote!(#name));
+        let backend = backend.expect("checked above");
+        let test_body = run(&name, &attrs, &backend, quote!(), quote!(#name));
         return Ok(quote! {
             #(#attrs)*
             #[test]
@@ -332,7 +365,9 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         } else {
             &docs
         };
-        let test_body = run(&case.name, summary, locals, quote!(#body_name));
+        let backend = case.backend.as_ref().or(backend.as_ref());
+        let backend = backend.expect("checked above");
+        let test_body = run(&case.name, summary, backend, locals, quote!(#body_name));
         let (case_attrs, name) = (&case.attrs, &case.name);
         tests.push(quote! {
             #(#case_attrs)*
@@ -350,13 +385,14 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
 }
 
 /// `Running Test: <name> - <first doc line>`, or just the name without docs.
+/// Logs stay ASCII, so the doc line's typographic punctuation is spelled out.
 fn running_line(name: &Ident, attrs: &[Attribute]) -> String {
     let summary = attrs.iter().find_map(|attr| match &attr.meta {
         Meta::NameValue(nv) if nv.path.is_ident("doc") => match &nv.value {
             Expr::Lit(syn::ExprLit {
                 lit: syn::Lit::Str(doc),
                 ..
-            }) => Some(doc.value().trim().to_string()),
+            }) => Some(ascii(doc.value().trim())),
             _ => None,
         },
         _ => None,
@@ -365,6 +401,21 @@ fn running_line(name: &Ident, attrs: &[Attribute]) -> String {
         Some(summary) if !summary.is_empty() => format!("Running Test: {name} - {summary}"),
         _ => format!("Running Test: {name}"),
     }
+}
+
+/// `text` with dashes, quotes and arrows in ASCII; any other non-ASCII is dropped.
+fn ascii(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\u{2013}' | '\u{2014}' => Some("-".to_string()),
+            '\u{2018}' | '\u{2019}' => Some("'".to_string()),
+            '\u{201c}' | '\u{201d}' => Some("\"".to_string()),
+            '\u{2192}' => Some("->".to_string()),
+            '\u{2026}' => Some("...".to_string()),
+            c if c.is_ascii() => Some(c.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `backend = BitcoindBackend` arrives as a path expression; read it as a type.
@@ -393,14 +444,17 @@ fn swap_params(list: &MetaList) -> Result<TokenStream2> {
         }
         let value = field.value;
         match key.to_string().as_str() {
+            // A bare variant name is qualified; anything else, such as a case
+            // argument, is a `ProtocolVersion` expression already.
             "protocol" => match &value {
-                Expr::Path(path) => {
-                    let variant = path.path.require_ident()?;
+                Expr::Path(path)
+                    if path.path.is_ident("Legacy") || path.path.is_ident("Taproot") =>
+                {
                     protocol = Some(quote! {
-                        ::openswap::protocol::common_messages::ProtocolVersion::#variant
+                        ::openswap::protocol::common_messages::ProtocolVersion::#path
                     });
                 }
-                other => return Err(Error::new(other.span(), "expected `Legacy` or `Taproot`")),
+                other => protocol = Some(quote!(#other)),
             },
             "sats" => sats = Some(quote!(::bitcoin::Amount::from_sat(#value))),
             "makers" => makers = Some(quote!(#value)),
@@ -493,23 +547,28 @@ fn case_rows(value: Expr) -> Result<Vec<Case>> {
             let Expr::Path(path) = &*func else {
                 return Err(Error::new(func.span(), "expected the case's test name"));
             };
-            let args = args
-                .into_iter()
-                .map(|arg| match arg {
-                    Expr::Assign(assign) => match *assign.left {
-                        Expr::Path(name) => Ok((name.path.require_ident()?.clone(), *assign.right)),
-                        other => Err(Error::new(other.span(), "expected `name = value`")),
-                    },
-                    other => Err(Error::new(
-                        other.span(),
-                        "case arguments are `name = value`",
-                    )),
-                })
-                .collect::<Result<_>>()?;
+            let mut backend = None;
+            let mut named = Vec::new();
+            for arg in args {
+                let Expr::Assign(assign) = arg else {
+                    return Err(Error::new(arg.span(), "case arguments are `name = value`"));
+                };
+                let Expr::Path(name) = *assign.left else {
+                    return Err(Error::new(assign.left.span(), "expected `name = value`"));
+                };
+                let name = name.path.require_ident()?.clone();
+                // `backend` picks the row's builder type; it is not a local.
+                if name == "backend" {
+                    backend = Some(backend_type(*assign.right)?);
+                } else {
+                    named.push((name, *assign.right));
+                }
+            }
             Ok(Case {
                 attrs,
                 name: path.path.require_ident()?.clone(),
-                args,
+                backend,
+                args: named,
             })
         })
         .collect()
@@ -667,6 +726,26 @@ mod tests {
             assert!(tokens.contains(piece), "`{piece}` missing in {tokens}");
         }
         assert!(!tokens.contains("with_required_confirms"));
+
+        let tokens = expand(
+            quote!(
+                backend = BitcoindBackend,
+                swap(
+                    protocol = protocol,
+                    sats = 1,
+                    makers = 1,
+                    tx_count = tx_count
+                ),
+                cases = [a(protocol = ProtocolVersion::Legacy, tx_count = 2)],
+            ),
+            quote!(
+                fn scenario(world: &mut World, params: SwapParams) {}
+            ),
+        )
+        .unwrap()
+        .to_string();
+        assert!(tokens.contains("SwapParams :: new (protocol ,"), "{tokens}");
+        assert!(tokens.contains(". with_tx_count (tx_count)"), "{tokens}");
     }
 
     #[test]
@@ -752,5 +831,64 @@ mod tests {
             let err = expand_err(args, body.clone());
             assert!(err.contains(expected), "`{err}` lacks `{expected}`");
         }
+    }
+
+    #[test]
+    fn a_case_backend_builds_its_world_and_reaches_a_generic_body() {
+        let tokens = expand(
+            quote!(
+                backend = BitcoindBackend,
+                cases = [
+                    on_bitcoind(n = 1),
+                    on_electrum(backend = ElectrumBackend, n = 2),
+                ],
+            ),
+            quote!(
+                fn run<B: TestBackend>(world: &mut World, n: u32) {}
+            ),
+        )
+        .unwrap()
+        .to_string();
+        let electrum = tokens.find("fn on_electrum").expect("on_electrum test");
+        let (bitcoind, electrum) = tokens.split_at(electrum);
+        for (test, backend) in [(bitcoind, "BitcoindBackend"), (electrum, "ElectrumBackend")] {
+            assert!(
+                test.contains(&format!("World :: builder :: < {backend} >")),
+                "{test}"
+            );
+            assert!(
+                test.contains(&format!("run :: < {backend} > (& mut world")),
+                "{test}"
+            );
+        }
+        assert!(!electrum.contains("let backend"), "{electrum}");
+
+        // Without a shared backend, every case must bring one.
+        let err = expand_err(
+            quote!(cases = [a(backend = ElectrumBackend, n = 1), b(n = 2)]),
+            quote!(
+                fn run(world: &mut World, n: u32) {}
+            ),
+        );
+        assert!(err.contains("unless every case gives its own"), "{err}");
+    }
+
+    #[test]
+    fn the_running_line_is_ascii() {
+        let tokens = expand(
+            quote!(backend = BitcoindBackend),
+            quote!(
+                /// Guards run in order — count, sum → duplicates, “x”.
+                fn scenario(world: &mut World) {}
+            ),
+        )
+        .unwrap()
+        .to_string();
+        assert!(
+            tokens.contains(
+                r#"Running Test: scenario - Guards run in order - count, sum -> duplicates, \"x\"."#
+            ),
+            "{tokens}"
+        );
     }
 }
