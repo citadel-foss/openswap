@@ -159,6 +159,25 @@ fn run_taproot_declaration_guard(world: &mut World, expected: &str, params: Swap
 }
 ```
 
+A row can also pick its backend: `backend = ElectrumBackend` is not a local
+but the builder type for that row, and the shared `backend` key may be
+dropped when every row gives one. A body that needs the type itself takes one
+type parameter, which receives the row's backend:
+
+```rust
+#[world_test(
+    maker_behaviors = [FailSecondBroadcast],
+    ..
+    cases = [
+        maker_recovers_partial_broadcast_legacy(backend = BitcoindBackend, ..),
+        maker_recovers_partial_broadcast_electrum(backend = ElectrumBackend, ..),
+    ],
+)]
+fn run_maker_partial_broadcast<B: TestBackend>(world: &mut World, ..) {
+    // .. timelock_recovery_wait::<B>() ..
+}
+```
+
 Bodies under `scenarios/` and `swap_matrix!` rows still build their world
 themselves.
 
