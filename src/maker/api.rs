@@ -2654,6 +2654,18 @@ impl MakerTrait for MakerServer {
             return Err(MakerError::TooManySwaps);
         }
 
+        // A drained swap already released its coins; recreating it here would fund an
+        // unreserved plan. The taker must send new SwapDetails for a fresh plan.
+        if !admission && !swaps.contains_key(swap_id) {
+            log::warn!(
+                "[{}] Rejecting late message for swap {}: its plan expired",
+                self.config.network_port,
+                swap_id
+            );
+            return Err(MakerError::General(
+                "Swap plan expired; the taker must send new SwapDetails",
+            ));
+        }
         let swap_state = swaps.entry(swap_id.to_string()).or_default();
         #[cfg(debug_assertions)]
         if swap_state.phase != state.phase
