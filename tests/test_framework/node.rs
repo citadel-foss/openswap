@@ -20,7 +20,7 @@ use openswap::wallet::{CoreRpcConfig, ElectrumConfig};
 
 use super::{
     backend::TestBackend,
-    logs::setup_test_logger,
+    logs::{end_test_log_group, setup_test_logger},
     ports::free_ports,
     procs::{
         bitcoind::{generate_blocks, init_bitcoind},
@@ -161,5 +161,6 @@ impl Drop for Node {
         } else {
             let _ = fs::remove_dir_all(&self.temp_dir);
         }
+        end_test_log_group();
     }
 }

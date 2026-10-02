@@ -45,6 +45,7 @@ use super::{
         verify_maker_pre_swap_balances, wait_for_makers_setup,
     },
     backend::TestBackend,
+    logs::end_test_log_group,
     procs::bitcoind::generate_blocks,
     tracker::{spawn_tracker_logger, TrackerLoggerHandle},
     world::{MakerFeeOverride, TestFramework},
@@ -560,6 +561,7 @@ impl World {
                 let _ = block_generation.join();
             }
         }
+        end_test_log_group();
     }
 }
 
