@@ -1,4 +1,10 @@
-//! Contract breach: a maker broadcasts its contract transactions after setup.
+//! Contract breach: a party broadcasts its contract transactions mid-swap.
+//!
+//! The scenario below is the maker's breach; the tests after it cover a
+//! Taproot maker's, and a taker breaching before maker funding, before the
+//! key handover, and after full setup.
+//!
+//! The maker's breach in detail:
 //!
 //! Scenario:
 //! 1. Taker initiates a Legacy openswap with 2 makers.
@@ -320,4 +326,401 @@ fn run_contract_breach<B: TestBackend>(
     world.shutdown_makers();
 
     tracker_logger.stop();
+}
+
+/// Test: Taker maliciously broadcasts contract txs after full setup.
+///
+/// The taker completes the full contract exchange, then broadcasts contract
+/// transactions and closes. Makers detect the on-chain contracts and recover
+/// their funds via timelock spending.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [BroadcastContractAfterFullSetup],
+    setup = [
+        // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
+        fund_taker_default(3) as taker_original_balance,
+        // Fund the makers with 4 UTXOs of 0.05 BTC each
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+)]
+fn taker_broadcasts_contract_after_full_setup(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+) {
+    // Swap params for openswap (Legacy)
+    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+
+    world.mine(1);
+
+    // Prepare should succeed; execution should fail with BroadcastContractAfterFullSetup
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
+        .expect("Prepare should succeed");
+    let swap_result = world.taker_mut().start(&summary.swap_id);
+    assert!(
+        swap_result.is_err(),
+        "Swap should fail due to BroadcastContractAfterFullSetup behavior"
+    );
+    info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
+    world.taker().log_tracker_state();
+
+    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
+    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
+    // 5 blocks/3s; remaining ~105s is scheduling margin.
+    info!("Waiting for makers to timeout and blocks to mature timelocks...");
+    thread::sleep(Duration::from_secs(300));
+
+    // Verify maker balances -- makers should have recovered their outgoing funds via timelock
+    let expected_regular = [14998419, 14998419];
+    for (i, (maker, original)) in world
+        .makers()
+        .iter()
+        .zip(maker_spendable_balance)
+        .enumerate()
+    {
+        maker.sync();
+        let balances = maker.balances();
+        info!(
+            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+            i, balances.regular, balances.swap, balances.contract, balances.spendable,
+        );
+        BalanceExpect {
+            regular: Some(Is::Sats(expected_regular[i])),
+            swap: Some(Is::Sats(0)),
+            contract: Some(Is::Sats(0)),
+            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
+            spendable: None,
+            delta: None,
+        }
+        .assert(&format!("Maker {i}"), &balances);
+
+        // Makers lost some funds due to taker maliciously broadcasting contracts
+        let maker_diff = original
+            .checked_sub(balances.spendable)
+            .unwrap_or(Amount::ZERO);
+        info!(
+            "Maker {} lost {} sats (pre-swap: {}, current: {})",
+            i,
+            maker_diff.to_sat(),
+            original,
+            balances.spendable,
+        );
+    }
+
+    // Wait for taker's background recovery loop to finish
+    info!("Waiting for background recovery loop to complete...");
+    world.taker().await_recovery(Duration::from_secs(120));
+    info!("Background recovery loop completed.");
+
+    // Mine a block to confirm recovery txs, then sync wallet
+    world.mine(1);
+    world.taker().sync();
+
+    // Verify taker balance
+    let taker_balances = world.taker().balances();
+
+    info!(
+        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+        taker_balances.regular,
+        taker_balances.swap,
+        taker_balances.contract,
+        taker_balances.spendable,
+    );
+
+    // Only the contract and fidelity balances are asserted here.
+    BalanceExpect {
+        regular: None,
+        swap: None,
+        contract: Some(Is::Sats(0)),
+        fidelity: Some(Is::Amount(Amount::ZERO)),
+        spendable: None,
+        delta: None,
+    }
+    .assert("Taker", &taker_balances);
+
+    let balance_diff = taker_original_balance
+        .checked_sub(taker_balances.spendable)
+        .unwrap_or(Amount::ZERO);
+
+    info!(
+        "Taker balance diff: {} sats (original: {}, current: {})",
+        balance_diff.to_sat(),
+        taker_original_balance,
+        taker_balances.spendable,
+    );
+
+    world.taker().log_tracker_state();
+    info!("Malice1 test completed successfully!");
+}
+
+/// Test: Maker locks its funds on-chain after setup, then closes.
+///
+/// Maker[1] broadcasts its contract transaction and closes without sending
+/// its contract-data response. The taker detects the failure and all parties
+/// recover via timelock.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, BroadcastContractAfterSetup],
+    takers = [Normal],
+    setup = [
+        // Fund the taker with 3 UTXOs of 0.05 BTC each
+        fund_taker_default(3) as taker_original_balance,
+        // Fund the makers with 4 UTXOs of 0.05 BTC each
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+)]
+fn taproot_maker_broadcasts_contract(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+) {
+    // Start periodic swap tracker logging (every 10s)
+    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
+
+    // Swap params for openswap (Taproot)
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+
+    world.mine(1);
+
+    // Prepare should succeed; execution should fail because maker broadcasts contracts
+    let summary = world
+        .taker_mut()
+        .prepare(swap_params)
+        .expect("Prepare should succeed");
+    let swap_result = world.taker_mut().start(&summary.swap_id);
+    assert!(
+        swap_result.is_err(),
+        "Swap should fail due to maker BroadcastContractAfterSetup behavior"
+    );
+    info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
+    world.taker().log_tracker_state();
+
+    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
+    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
+    // 5 blocks/3s; remaining ~105s is scheduling margin.
+    info!("Waiting for makers to timeout and blocks to mature timelocks...");
+    thread::sleep(Duration::from_secs(300));
+
+    // Shut down makers
+    world.shutdown_makers();
+
+    // Log all maker balances before asserting so one run reports every value.
+    let mut maker_balances_all = Vec::new();
+    for (i, maker) in world.makers().iter().enumerate() {
+        maker.sync();
+        let maker_balances = maker.balances();
+        info!(
+            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+            i,
+            maker_balances.regular,
+            maker_balances.swap,
+            maker_balances.contract,
+            maker_balances.spendable,
+        );
+        maker_balances_all.push(maker_balances);
+    }
+
+    info!("Makers shut down. Waiting for background recovery loop to complete...");
+
+    // The background recovery loop (spawned by recover_active_swap) periodically
+    // retries hashlock sweeps and timelock recovery. Wait for it to finish.
+    world.taker().await_recovery(Duration::from_secs(120));
+    info!("Background recovery loop completed.");
+
+    // Mine a block to confirm recovery txs, then sync wallet
+    world.mine(1);
+    world.taker().sync();
+
+    let taker_balances = world.taker().balances();
+
+    info!(
+        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+        taker_balances.regular,
+        taker_balances.swap,
+        taker_balances.contract,
+        taker_balances.spendable,
+    );
+
+    // Verify maker balances -- makers should have recovered their outgoing funds via timelock.
+    // Nobody earns a fee here; each maker only pays for its own recovery.
+    let expected_regular = [14999463, 14999463];
+    for (i, (maker_balances, original)) in maker_balances_all
+        .iter()
+        .zip(maker_spendable_balance)
+        .enumerate()
+    {
+        BalanceExpect {
+            regular: Some(Is::Sats(expected_regular[i])),
+            swap: Some(Is::Sats(0)),
+            contract: Some(Is::Sats(0)),
+            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
+            spendable: None,
+            delta: Some(Delta::Loss {
+                baseline: original,
+                style: DiffStyle::UnwrapOrZero,
+                sats: 294,
+            }),
+        }
+        .assert(&format!("Maker {i}"), maker_balances);
+    }
+
+    // Verify taker balance. The taker recovered its own funding, so it only
+    // pays the recovery fees.
+    BalanceExpect {
+        regular: Some(Is::Sats(14999706)),
+        swap: Some(Is::Sats(0)),
+        contract: Some(Is::Sats(0)),
+        fidelity: Some(Is::Amount(Amount::ZERO)),
+        spendable: None,
+        delta: Some(Delta::Loss {
+            baseline: taker_original_balance,
+            style: DiffStyle::UnwrapOrZero,
+            sats: 294,
+        }),
+    }
+    .assert("Taker", &taker_balances);
+
+    // TODO: the maker that broadcasts its contract is never banned. The swap
+    // aborts on the transport error before the ContractsBroadcasted ban site, and
+    // the breach detector fires on the taker's OWN recovery broadcast, so its
+    // signal cannot attribute the breach to a maker.
+    // assert_only_makers_banned(taker, &makers, &[1]);
+
+    world.taker().log_tracker_state();
+    info!("Taproot maker malice test completed successfully!");
+
+    tracker_logger.stop();
+}
+
+/// Breach before maker 0 funds: maker 0 must not broadcast its funding txs.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [BroadcastContractBeforeMakerFunding],
+    setup = [
+        fund_taker_default(3),
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances(),
+    ],
+    swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn taker_broadcasts_contract_before_maker_funding(world: &mut World, params: SwapParams) {
+    let regular_before: Vec<Amount> = world
+        .makers()
+        .iter()
+        .map(|m| m.balances().regular)
+        .collect();
+
+    world.mine(1);
+
+    let summary = world
+        .taker_mut()
+        .prepare(params)
+        .expect("Prepare should succeed");
+    let swap_result = world.taker_mut().start(&summary.swap_id);
+    assert!(swap_result.is_err(), "Swap must fail: maker 0 never funds");
+    info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
+
+    // The first maker reached its funding step and saved the signed swapcoins,
+    // then refused because of the breach rather than for any other reason.
+    assert!(
+        world.makers().iter().any(|m| m
+            .inner()
+            .has_unfinished_outgoing_swapcoin(&summary.swap_id)
+            .unwrap()),
+        "No maker saved the swap's outgoing swapcoins"
+    );
+
+    // Let any stray maker broadcast confirm before comparing balances.
+    thread::sleep(Duration::from_secs(20));
+    world.sync_makers();
+    assert_breach_refused(world);
+
+    for (i, maker) in world.makers().iter().enumerate() {
+        let balances = maker.balances();
+        info!(
+            "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+            i, balances.regular, balances.swap, balances.contract, balances.spendable
+        );
+        assert_eq!(
+            balances.regular, regular_before[i],
+            "Maker {i} regular balance changed: its funding must not have been broadcast"
+        );
+        assert_eq!(
+            balances.contract,
+            Amount::ZERO,
+            "Maker {i} contract balance"
+        );
+    }
+}
+
+/// Breach after full setup: maker 0 must refuse the key handover and recover.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [BroadcastContractBeforeHandover],
+    setup = [
+        fund_taker_default(3),
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances(),
+    ],
+    swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn taker_broadcasts_contract_before_handover(world: &mut World, params: SwapParams) {
+    world.mine(1);
+
+    let summary = world
+        .taker_mut()
+        .prepare(params)
+        .expect("Prepare should succeed");
+    let swap_result = world.taker_mut().start(&summary.swap_id);
+    assert!(
+        swap_result.is_err(),
+        "Swap must fail: maker 0 refuses the handover"
+    );
+    info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
+
+    info!("Waiting for makers to recover on-chain...");
+    thread::sleep(timelock_recovery_wait::<BitcoindBackend>());
+    world.sync_makers();
+    assert_breach_refused(world);
+
+    // Observed in a real run: each maker swept its incoming contract via the
+    // hashlock. A maker that had handed over its outgoing leg would be ~500k short.
+    let expected_regular = [14500865, 14502398];
+    let expected_swap = [499100, 497530];
+    for (i, maker) in world.makers().iter().enumerate() {
+        let balances = maker.balances();
+        info!(
+            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+            i, balances.regular, balances.swap, balances.contract, balances.spendable
+        );
+        BalanceExpect {
+            regular: Some(Is::Sats(expected_regular[i])),
+            swap: Some(Is::Sats(expected_swap[i])),
+            contract: Some(Is::Amount(Amount::ZERO)),
+            fidelity: None,
+            spendable: None,
+            delta: None,
+        }
+        .assert(&format!("Maker {i}"), &balances);
+    }
+}
+
+/// The maker refused because of the breach, not for any other reason.
+fn assert_breach_refused(world: &World) {
+    assert_logged!(world, "ContractBroadcast");
 }

@@ -1,7 +1,9 @@
 //! Two Normal makers; the taker drops at a given step once funding is on-chain,
 //! and every party timelock-recovers. Each case's taker behavior sets its drop
 //! point, and its golden balances pin how that drop point settles.
-//! `maker_recovers_swap_past_refund_deadline` has the taker stall instead.
+//! `taproot_drop_at_ack_response` drops before any funding, so nothing needs
+//! recovering; `maker_recovers_swap_past_refund_deadline` has the taker stall
+//! instead.
 
 use bitcoin::Amount;
 use openswap::{
@@ -324,4 +326,130 @@ fn maker_recovers_swap_past_refund_deadline(world: &mut World, params: SwapParam
     // still arriving every 5s, so the idle timeout could not have drained it.
     framework.assert_log("reached its refund deadline; recovering now", &log_path);
     framework.assert_log("Recovering from swap", &log_path);
+}
+
+/// Test: Taker aborts at AckSwapDetails response (Taproot).
+///
+/// The taker closes the connection right after the Maker acknowledges the
+/// swap details. No funding transactions have been broadcast at this point,
+/// so no recovery is needed. Balances should remain unchanged.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [CloseAtAckResponse],
+    setup = [
+        // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
+        fund_taker_default(3) as taker_original_balance,
+        // Fund the makers with 4 UTXOs of 0.05 BTC each
+        fund_makers_default(),
+        // Start the maker server threads
+        start_makers(120),
+        verify_maker_pre_swap_balances(),
+    ],
+)]
+fn taproot_drop_at_ack_response(world: &mut World, taker_original_balance: Amount) {
+    // Swap params for openswap (Taproot)
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+
+    world.mine(1);
+
+    // Prepare should fail at AckResponse — the taker closes the connection
+    // right after receiving AckSwapDetails, before any funding is broadcast.
+    let prepare_result = world.taker_mut().prepare(swap_params.clone());
+    assert!(
+        prepare_result.is_err(),
+        "Prepare should fail due to CloseAtAckResponse behavior"
+    );
+    info!(
+        "Prepare failed as expected: {:?}",
+        prepare_result.err().unwrap()
+    );
+    world.taker().inner().log_tracker_state();
+
+    // The accepted-but-unfunded swap must be dropped without requiring a restart.
+    wait_logged!(
+        world,
+        "Released idle unfunded swap",
+        Duration::from_secs(60)
+    );
+    let release_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while world
+        .makers()
+        .iter()
+        .any(|maker| maker.inner().has_ongoing_swaps().unwrap())
+    {
+        assert!(
+            std::time::Instant::now() < release_deadline,
+            "Early-abort reservations should be released after the idle timeout"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    // With the stale reservation gone, the makers must be back at full capacity:
+    // a fresh swap request has to be accepted again. The maker only sends
+    // AckSwapDetails after storing a new reservation, and the taker only emits
+    // the CloseAtAckResponse test error after receiving that ack — so hitting
+    // that exact error proves the makers accepted the retry.
+    let retry_result = world.taker_mut().prepare(swap_params);
+    let retry_err = format!(
+        "{:?}",
+        retry_result.expect_err("Retry should still abort at AckSwapDetails")
+    );
+    assert!(
+        retry_err.contains("closing at ack response"),
+        "Retry should have been accepted up to AckSwapDetails, got: {}",
+        retry_err
+    );
+    assert!(
+        world
+            .makers()
+            .iter()
+            .any(|maker| maker.inner().has_ongoing_swaps().unwrap()),
+        "Accepted retry should hold a fresh reservation on a maker"
+    );
+
+    // Sync taker wallet and verify balance
+    world.taker().sync();
+
+    let taker_balances = world.taker().balances();
+
+    info!(
+        "Taker balances after abort: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+        taker_balances.regular,
+        taker_balances.swap,
+        taker_balances.contract,
+        taker_balances.spendable,
+    );
+
+    // Contract balance should be 0 (no contracts were created on-chain)
+    assert_eq!(
+        taker_balances.contract,
+        Amount::ZERO,
+        "Taker should have no contract balance after early abort"
+    );
+
+    // Balance diff should be 0 or very small (no funds were spent on-chain)
+    let balance_diff = taker_original_balance
+        .checked_sub(taker_balances.spendable)
+        .unwrap_or(Amount::ZERO);
+
+    info!(
+        "Taker balance diff: {} sats (original: {}, current: {})",
+        balance_diff.to_sat(),
+        taker_original_balance,
+        taker_balances.spendable,
+    );
+
+    // No funds should have been lost since no transactions were broadcast
+    assert_eq!(
+        balance_diff.to_sat(),
+        0,
+        "Taker should not have lost funds on early abort. Lost {} sats",
+        balance_diff.to_sat(),
+    );
+
+    world.taker().inner().log_tracker_state();
+    info!("Taproot drop-at-ack-response test completed successfully!");
 }
