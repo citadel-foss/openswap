@@ -13,8 +13,8 @@
 //!
 //! [World] wraps the same `init` call and owns what it returns: [MakerHandle]s, [TakerHandle]s
 //! and a single teardown order that `Drop` also runs when a test panics. [BalanceExpect] states
-//! which balance fields a test asserts, and `swap_matrix!` / `tor_gate!` (in `macros.rs`)
-//! generate `#[test]` items around shared scenario bodies.
+//! which balance fields a test asserts, and `#[world_test]` (in `macros.rs`) declares each
+//! test's world, or a `cases` table of them, around a plain body.
 
 #[macro_use]
 mod macros;

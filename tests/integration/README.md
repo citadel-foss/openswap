@@ -9,7 +9,7 @@ test per process.
 
 ```bash
 cargo nextest run --features integration-test                 # everything
-cargo nextest run --features integration-test -E 'test(abort1::)'  # one file
+cargo nextest run --features integration-test -E 'test(taker_abort::)'  # one file
 ```
 
 Use nextest, not `cargo test`: the logger is process-wide, so with every test
@@ -26,8 +26,25 @@ What a run needs:
 | electrs 0.9.11 | the `electrsd` crate's bundled binary, or `ELECTRS_EXEC` |
 | tor (Tor lane only) | a bootstrapped tor on control port 9051 / SOCKS 9050, `OPENSWAP_TOR_IT=1`, and `OPENSWAP_TOR_PASSWORD` if the control port needs one |
 
-`ELECTRS_LOG=1` prints electrs' stderr. The three Tor tests in
-`electrum_tor.rs` are `#[ignore]`d; run them with `--run-ignored only`.
+`ELECTRS_LOG=1` prints electrs' stderr.
+
+The three Tor tests (`electrum_recovery::tor_taproot_taker_drops_after_funding`,
+`electrum_recovery::tor_legacy_taker_drops_after_funding`,
+`contract_breach::tor_maker_broadcasts_contract`) run their
+scenario's body over `TorElectrumBackend` and assert the same balances as the
+clearnet rows, so a Tor-specific divergence in a watchtower path fails loudly.
+An onion service must upload its descriptor and the client fetch it back, so
+they cannot work offline: they are `#[ignore]`d, and `skip_unless =
+tor_it_enabled()` skips them unless `OPENSWAP_TOR_IT=1`. With the variable set
+and Tor unreachable they panic, so a misconfigured Tor never passes silently:
+
+```text
+OPENSWAP_TOR_IT=1 cargo nextest run --features integration-test \
+    --run-ignored only --test-threads=1 -E 'test(tor_)'
+```
+
+The onion services are created with `Flags=Detach` and outlive the test
+process; CI's tor is ephemeral and drops them on restart.
 
 Each test keeps its data in `$TMPDIR/openswap-<random>/`: logs in
 `taker/debug.log` (every taker and maker writes there), wallets, swap trackers.
@@ -43,7 +60,7 @@ test_framework/   the harness; nothing in here is a test
   harness.rs      World, WorldBuilder, MakerHandle, TakerHandle, the steps
   node.rs         Node: a bare regtest bitcoind (+ electrs) for chain-only tests
   expect.rs       BalanceExpect: which balance fields a test asserts
-  macros.rs       swap_matrix!, tor_gate!, assert_logged!, wait_logged!, world_test
+  macros.rs       world_test, assert_logged!, wait_logged!
   actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
 *.rs              the tests, one file per scenario family
 ../macros/        the #[world_test] proc-macro crate (attribute macros need their own crate)
@@ -196,7 +213,6 @@ way, because a maker takes its node at init:
 fn lightning_submarine_swaps_e2e(world: &mut World) { .. }
 ```
 
-`swap_matrix!` rows (`electrum_tor.rs`) still build their world themselves.
 
 The pieces:
 
@@ -269,10 +285,9 @@ between them (`MakerAbort::fail_swap`, `recover`, `assert_recovered`; see
 `taproot_drop_at_contract_sigs_exchange` in `maker_abort.rs`). Do not add flags to a body to cover a test
 that runs different steps; give that test its own body.
 
-To run one body over several backends or parameters in one file, use
-`swap_matrix!` (see `electrum_tor.rs`). Each row becomes a `#[test]` with its
-own name and attributes; `tor_gate!()` in a row skips it unless
-`OPENSWAP_TOR_IT` is set.
+To run one body over several backends, give each row its own `backend = ..`
+(see `electrum_recovery.rs`, whose Tor rows also carry `#[ignore]` and
+`skip_unless = tor_it_enabled()`).
 
 ## Rules
 
