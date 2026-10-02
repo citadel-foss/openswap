@@ -42,7 +42,7 @@ use crate::{
     watch_tower::service::WatchService,
 };
 
-use crate::utill::UNFUNDED_SWAP_LIFETIME;
+use crate::utill::{TX_BROADCAST_TIMEOUT, UNFUNDED_SWAP_LIFETIME};
 
 #[cfg(feature = "integration-test")]
 use std::env;
@@ -1394,11 +1394,11 @@ impl MakerServer {
             lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
         let mut idle = Vec::new();
 
-        // An accepted swap with no funding material only reserves liquidity;
-        // there is nothing on-chain to recover, so it is dropped without recovery.
-        // Activity refreshes the idle timer, but the admission lifetime is a hard
-        // bound: keepalives cannot pin a reservation forever.
+        // An unfunded swap only reserves liquidity, so it is dropped without recovery:
+        // after the broadcast window of silence, or at the admission lifetime, which
+        // keepalives cannot extend.
         let lifetime = unfunded_swap_lifetime();
+        let unfunded_idle = timeout.min(TX_BROADCAST_TIMEOUT);
         let released_ids: Vec<(String, bool)> = swaps
             .iter()
             .filter_map(|(id, state)| {
@@ -1411,7 +1411,8 @@ impl MakerServer {
                     return None;
                 }
                 let expired = state.swap_start_time.elapsed() > lifetime;
-                (expired || state.last_activity.elapsed() > timeout).then(|| (id.clone(), expired))
+                (expired || state.last_activity.elapsed() > unfunded_idle)
+                    .then(|| (id.clone(), expired))
             })
             .collect();
 
