@@ -67,6 +67,7 @@ test_framework/   the harness; nothing in here is a test
   macros.rs       world_test, assert_logged!, wait_logged!
   actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
 *.rs              the tests, one file per scenario family
+rejection/        everything either side must refuse, one file per theme
 ../macros/        the #[world_test] proc-macro crate (attribute macros need their own crate)
 ```
 
