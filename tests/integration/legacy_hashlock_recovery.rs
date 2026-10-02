@@ -1,33 +1,27 @@
 use bitcoin::Amount;
-use openswap::{
-    maker::MakerBehavior,
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{thread, time::Duration};
 
-#[test]
-fn test_legacy_hashlock_recovery() {
-    warn!("Running Test: Legacy Hashlock Recovery - CloseAfterSweep");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::CloseAfterSweep])
-        .takers([TakerBehavior::Normal])
-        .build();
-
-    let taker_original_balance = world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    info!("Starting Maker servers...");
-    world.start_makers(120);
-
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAfterSweep],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+)]
+fn test_legacy_hashlock_recovery(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+) {
     let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
@@ -130,5 +124,4 @@ fn test_legacy_hashlock_recovery() {
     info!("Legacy hashlock recovery test completed successfully!");
 
     tracker_logger.stop();
-    world.finish();
 }

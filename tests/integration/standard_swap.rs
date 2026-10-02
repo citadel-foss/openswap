@@ -4,41 +4,33 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
-    taker::{error::TakerError, SwapParams, TakerBehavior},
+    taker::{error::TakerError, SwapParams},
 };
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{fs, thread, time::Duration};
 
 /// This test demonstrates a standard openswap round between a Taker and 2 Makers. Nothing goes wrong
 /// and the openswap completes successfully.
-#[test]
-fn test_standard_openswap() {
-    // ---- Setup ----
-    warn!("Running Test: Standard OpenSwap Procedure");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
-        .takers([TakerBehavior::Normal])
-        .build();
-
-    // Fund the taker with 3 UTXOs of 0.05 BTC each
-    let taker_original_balance = world.fund_taker_default(3);
-
-    // Fund the makers with 4 UTXOs of 0.05 BTC each
-    world.fund_makers_default();
-
-    // Start the maker servers, wait for their setup, then sync their wallets
-    log::info!("Initiating Maker servers");
-    world.start_makers(120);
-
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+)]
+fn test_standard_openswap(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+) {
     // Only 2 makers are running, so a 3-hop route must fail at discovery
     // before any funds are committed.
     let too_many_hops = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 3)
@@ -179,41 +171,42 @@ fn test_standard_openswap() {
             1,
         );
     }
-
-    world.finish();
 }
 
 /// A swap at 3 sats/vB: every swap transaction is built and priced at the
 /// negotiated rate, so the taker pays more than at the 1 sat/vB floor and the
 /// swap still completes.
-#[test]
-fn test_swap_with_custom_feerate() {
-    run_swap_with_custom_feerate(ProtocolVersion::Taproot, 3846, 112);
-}
-
-/// Same 3 sats/vB swap on Legacy: funding txs price their real vsize and the
-/// multisig contract sweeps pay the 150 vB model at the negotiated rate.
-#[test]
-fn test_legacy_swap_with_custom_feerate() {
-    run_swap_with_custom_feerate(ProtocolVersion::Legacy, 4302, 150);
-}
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        spawn_ready_makers_and_mine(),
+    ],
+    cases = [
+        test_swap_with_custom_feerate(
+            protocol = ProtocolVersion::Taproot,
+            expected_fee_paid = 3846,
+            sweep_vsize_model = 112,
+        ),
+        /// Same 3 sats/vB swap on Legacy: funding txs price their real vsize and the
+        /// multisig contract sweeps pay the 150 vB model at the negotiated rate.
+        test_legacy_swap_with_custom_feerate(
+            protocol = ProtocolVersion::Legacy,
+            expected_fee_paid = 4302,
+            sweep_vsize_model = 150,
+        ),
+    ],
+)]
 fn run_swap_with_custom_feerate(
+    world: &mut World,
+    taker_original_balance: Amount,
     protocol: ProtocolVersion,
     expected_fee_paid: u64,
     sweep_vsize_model: u64,
 ) {
-    warn!("Running Test: OpenSwap with a custom feerate");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .maker_behaviors([MakerBehavior::Normal])
-        .takers([TakerBehavior::Normal])
-        .build();
-
-    let taker_original_balance = world.fund_taker_default(3);
-    world.fund_makers_default();
-    world.spawn_ready_makers_and_mine();
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
@@ -271,8 +264,6 @@ fn run_swap_with_custom_feerate(
             sweep_vsize_model
         );
     }
-
-    world.finish();
 }
 
 /// A maker blocked in its contract-confirmation wait refreshes the swap's
@@ -281,22 +272,23 @@ fn run_swap_with_custom_feerate(
 /// swap starts so the maker blocks in `wait_for_tx_on_chain`; the 40s hold
 /// crosses an idle-drain pass, and the +60s poll slot catches the confirming
 /// block inside the taker's 180s response window.
-#[test]
-fn taproot_swap_survives_unconfirmed_confirmation_wait() {
-    warn!("Running Test: maker confirmation wait survives the idle timeout");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .maker_behaviors([MakerBehavior::Normal])
-        .takers([TakerBehavior::SkipFundingConfirmWait])
-        .build();
-
-    let taker_original_balance = world.fund_taker_default(3);
-    world.fund_makers_default();
-    world.start_makers(120);
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
-    world.mine(1);
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [SkipFundingConfirmWait],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        mine(1),
+    ],
+)]
+fn taproot_swap_survives_unconfirmed_confirmation_wait(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+) {
     // The taker skips its own confirmation wait, so its contract data reaches
     // the maker unconfirmed and parks the maker in its wait.
     let swap_params =
@@ -403,5 +395,4 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     // The taker left the world above; dropping it first keeps the world's
     // teardown order.
     drop(taker);
-    world.finish();
 }

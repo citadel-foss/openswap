@@ -6,51 +6,32 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{MakerBehavior, MakerError, MakerServer, MakerServerConfig},
+    maker::{MakerError, MakerServer, MakerServerConfig},
     protocol::common_messages::ProtocolVersion,
-    taker::{
-        error::TakerError, MakerState, SwapParams, TakerBehavior, UnavailableReason,
-        UnavailableState,
-    },
+    taker::{error::TakerError, MakerState, SwapParams, UnavailableReason, UnavailableState},
     wallet::WalletError,
 };
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::fs;
 
-#[test]
-fn fidelity_limit_violation() {
-    // ---- Setup ----
-    warn!("Running Test: Fidelity Timelock violation");
-
-    // Create a maker with InvalidFidelityTimelock behavior
-    let maker_count = 1;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::InvalidFidelityTimelock];
-
-    // Initialize test framework
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    info!("Funding taker and maker");
-    // Fund the taker with 3 UTXOs of 0.05 BTC each (Taproot)
-    world.fund_taker_default(3);
-
-    // Fund the Maker with 4 UTXOs of 0.05 BTC each (Taproot)
-    world.fund_makers_default();
-
-    // Start the Maker Server thread, wait for it to complete setup, then
-    // sync its wallet
-    info!("Initiating Maker server...");
-    world.start_makers(120);
-
-    info!("Initiating openswap (Will fail due to invalid fidelity timelock)");
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [InvalidFidelityTimelock],
+    takers = [Normal],
+    setup = [
+        // Fund the taker with 3 UTXOs of 0.05 BTC each (Taproot)
+        fund_taker_default(3),
+        // Fund the Maker with 4 UTXOs of 0.05 BTC each (Taproot)
+        fund_makers_default(),
+        // Start the Maker Server thread, wait for it to complete setup, then
+        // sync its wallet
+        start_makers(120),
+    ],
+)]
+fn fidelity_limit_violation(world: &mut World) {
     // Swap params - small amount for faster testing
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 1)
         .with_tx_count(2)
@@ -70,10 +51,7 @@ fn fidelity_limit_violation() {
 
     // Discovery drops an out-of-range bond before the offerbook ever sees it,
     // so reach the maker the way a user would: poll it by address.
-    let address = format!(
-        "127.0.0.1:{}",
-        world.makers()[0].inner().config.network_port
-    );
+    let address = world.makers()[0].address();
     assert!(
         world
             .taker()
@@ -148,6 +126,4 @@ fn fidelity_limit_violation() {
     }
 
     info!("Fidelity Timelock violation test passed");
-
-    world.finish();
 }

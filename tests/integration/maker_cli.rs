@@ -10,15 +10,15 @@
 
 use bitcoin::{Address, Amount};
 use openswap::{
-    maker::{AuthenticatedRpcRequest, MakerBehavior, RpcMsgReq, RpcMsgResp},
+    maker::{AuthenticatedRpcRequest, RpcMsgReq, RpcMsgResp},
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
+    taker::SwapParams,
     utill::{read_message, send_message},
 };
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{
     fs,
     net::TcpStream,
@@ -51,28 +51,22 @@ fn rpc_call(rpc_port: u16, cookie: &str, request: RpcMsgReq) -> RpcMsgResp {
     serde_cbor::from_slice(&bytes).expect("failed to decode RPC response")
 }
 
-#[test]
-fn test_maker_rpc_server() {
-    warn!("Running Test: Maker RPC Server");
-
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    let taker_original_balance = world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    info!("Starting Maker servers...");
-    world.start_makers(120);
-
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+)]
+fn test_maker_rpc_server(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+) {
     // A completed swap gives the maker incoming swap coins and a swap id.
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -388,6 +382,4 @@ fn test_maker_rpc_server() {
     world.shutdown_makers();
 
     info!("Maker RPC server test completed successfully!");
-
-    world.finish();
 }

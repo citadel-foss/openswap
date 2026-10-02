@@ -12,15 +12,11 @@
 //!    it cannot find a matching tracker record.
 
 use bitcoin::Amount;
-use openswap::{
-    maker::{MakerBehavior, MakerServer},
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{maker::MakerServer, protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{
     sync::Arc,
     thread,
@@ -30,26 +26,20 @@ use std::{
 /// Test: maker reboot recovery should preserve Legacy swapcoins when funding
 /// was broadcast but the maker has not yet persisted an idle-recovery tracker
 /// record for the original swap id.
-#[test]
-fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
-    warn!("Running Test: Legacy Maker Reboot Recovery Preserves Funded Swapcoins");
-
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::CloseAtHashPreimage];
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
-    let taker_original_balance = world.fund_taker_default(3);
-    world.fund_makers_default();
-
-    info!("Starting Maker servers...");
-    world.start_makers(120);
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtHashPreimage],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3) as taker_original_balance,
+        fund_makers_default(),
+        start_makers(120),
+    ],
+)]
+fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins(
+    world: &mut World,
+    taker_original_balance: Amount,
+) {
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
@@ -214,8 +204,6 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
     assert_eq!(wallet.get_incoming_swapcoins_count(), 0);
     assert_eq!(wallet.get_outgoing_swapcoins_count(), 0);
     drop(wallet);
-
-    world.finish();
 
     assert!(
         after_incoming > 0 || recovered_via_hashlock,
