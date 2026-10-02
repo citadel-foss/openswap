@@ -38,7 +38,7 @@ use std::{
 /// mempool-only spend, while `Some(false)` — the argument it used to pass — reports
 /// that output live on Core. Pins the backend, not the maker's call site.
 #[world_test(backend = BitcoindBackend)]
-fn test_mempool_only_spend_reads_as_spent(node: &mut Node) {
+fn mempool_only_spend_reads_as_spent(node: &mut Node) {
     // A bare node: nothing mines in the background, so the spend cannot
     // confirm while the assertions run.
     let bitcoind = node.bitcoind();
@@ -85,7 +85,7 @@ fn test_mempool_only_spend_reads_as_spent(node: &mut Node) {
     makers = 1,
     takers = [Normal],
 )]
-fn test_fidelity_creation(world: &mut World) {
+fn bond_creation_and_redemption(world: &mut World) {
     let bitcoind = world.bitcoind();
     let maker = world.makers()[0].inner();
 
@@ -396,7 +396,7 @@ fn test_fidelity_creation(world: &mut World) {
     makers = 1,
     takers = [Normal],
 )]
-fn test_fidelity_spending(world: &mut World) {
+fn bond_spending(world: &mut World) {
     const TIMELOCK_DURATION: u32 = 50;
     const FIDELITY_AMOUNT: u64 = 5_000_000;
     const REGULAR_TX_AMOUNT: u64 = 100_000;
@@ -782,11 +782,11 @@ fn assert_single_adopted_bond(maker: &MakerServer, bond_txid: Txid) {
 #[world_test(
     makers = 1,
     cases = [
-        test_unconfirmed_fidelity_bond_not_duplicated(backend = BitcoindBackend),
+        unconfirmed_bond_not_duplicated(backend = BitcoindBackend),
         /// Electrum variant: a maker that shuts down with an unconfirmed bond must
         /// adopt it on restart instead of creating a second one, this time over the
         /// Electrum backend.
-        test_unconfirmed_fidelity_bond_not_duplicated_electrum(backend = ElectrumBackend),
+        unconfirmed_bond_not_duplicated_electrum(backend = ElectrumBackend),
     ],
 )]
 fn run_unconfirmed_fidelity_bond_not_duplicated(world: &mut World) {
@@ -882,7 +882,7 @@ fn run_unconfirmed_fidelity_bond_not_duplicated(world: &mut World) {
     backend = BitcoindBackend,
     makers = 1,
 )]
-fn test_live_bond_is_advertised_while_another_is_pending(world: &mut World) {
+fn live_bond_is_advertised_while_another_is_pending(world: &mut World) {
     let bitcoind = world.bitcoind();
     let maker = world.makers()[0].inner();
     let log_path = world.taker_log_path();
@@ -950,14 +950,14 @@ fn test_live_bond_is_advertised_while_another_is_pending(world: &mut World) {
 /// restarting bitcoind with `-persistmempool=0` on the same datadir: the
 /// chain (and every confirmed coin) survives, the mempool does not.
 ///
-/// Anchored to `test_unconfirmed_fidelity_bond_not_duplicated`, which covers
+/// Anchored to `unconfirmed_bond_not_duplicated`, which covers
 /// the mempool-present early return; this test covers the rebroadcast branch
 /// of `FidelityBond::ensure_broadcast`.
 #[world_test(
     backend = BitcoindBackend,
     makers = 1,
 )]
-fn test_evicted_fidelity_bond_rebroadcast_on_restart(world: &mut World) {
+fn evicted_bond_rebroadcast_on_restart(world: &mut World) {
     let bitcoind = world.bitcoind();
     let maker = world.makers()[0].inner();
     let log_path = world.taker_log_path();
@@ -1086,7 +1086,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart(world: &mut World) {
     let _ = new_bitcoind.client.stop();
 }
 
-/// Electrum variant of `test_evicted_fidelity_bond_rebroadcast_on_restart`:
+/// Electrum variant of `evicted_bond_rebroadcast_on_restart`:
 /// the unconfirmed bond is evicted while the maker is offline (bitcoind
 /// restarted with `-persistmempool=0`), and the restart must rebroadcast the
 /// stored raw transaction over Electrum, keeping the original txid.
@@ -1098,7 +1098,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart(world: &mut World) {
     backend = ElectrumBackend,
     makers = 1,
 )]
-fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum(world: &mut World) {
+fn evicted_bond_rebroadcast_on_restart_electrum(world: &mut World) {
     let bitcoind = world.bitcoind();
     let maker = world.makers()[0].inner();
     let log_path = world.taker_log_path();

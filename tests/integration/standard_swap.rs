@@ -26,7 +26,7 @@ use std::{fs, thread, time::Duration};
         verify_maker_pre_swap_balances() as maker_spendable_balance,
     ],
 )]
-fn test_standard_openswap(
+fn legacy_two_maker_swap_completes(
     world: &mut World,
     taker_original_balance: Amount,
     maker_spendable_balance: Vec<Amount>,
@@ -186,14 +186,14 @@ fn test_standard_openswap(
         spawn_ready_makers_and_mine(),
     ],
     cases = [
-        test_swap_with_custom_feerate(
+        taproot_swap_at_custom_feerate(
             protocol = ProtocolVersion::Taproot,
             expected_fee_paid = 3846,
             sweep_vsize_model = 112,
         ),
         /// Same 3 sats/vB swap on Legacy: funding txs price their real vsize and the
         /// multisig contract sweeps pay the 150 vB model at the negotiated rate.
-        test_legacy_swap_with_custom_feerate(
+        legacy_swap_at_custom_feerate(
             protocol = ProtocolVersion::Legacy,
             expected_fee_paid = 4302,
             sweep_vsize_model = 150,

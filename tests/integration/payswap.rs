@@ -33,7 +33,7 @@ use log::info;
         verify_maker_pre_swap_balances(),
     ],
 )]
-fn test_taproot_payswap(world: &mut World, taker_original_balance: Amount) {
+fn taproot_exact_payment(world: &mut World, taker_original_balance: Amount) {
     let receiver_address = world
         .bitcoind()
         .client
@@ -197,7 +197,7 @@ fn test_taproot_payswap(world: &mut World, taker_original_balance: Amount) {
         verify_maker_pre_swap_balances(),
     ],
 )]
-fn test_legacy_payswap(world: &mut World, taker_original_balance: Amount) {
+fn legacy_exact_payment(world: &mut World, taker_original_balance: Amount) {
     let receiver_address = world
         .bitcoind()
         .client
@@ -325,10 +325,7 @@ fn test_legacy_payswap(world: &mut World, taker_original_balance: Amount) {
         start_makers_without_sync(120),
     ],
 )]
-fn test_payswap_dust_floor_rejects_before_funding(
-    world: &mut World,
-    taker_original_balance: Amount,
-) {
+fn dust_floor_rejects_before_funding(world: &mut World, taker_original_balance: Amount) {
     let receiver_address = world
         .bitcoind()
         .client
@@ -397,7 +394,7 @@ fn test_payswap_dust_floor_rejects_before_funding(
         mine(1),
     ],
 )]
-fn test_payswap_negotiation_guards_abort_before_funding(world: &mut World) {
+fn negotiation_guards_abort_before_funding(world: &mut World) {
     let failing_maker = world.makers()[0].address();
     let spare_maker = world.makers()[1].address();
     let payment_amount = Amount::from_sat(100_000);

@@ -62,7 +62,7 @@ fn rpc_call(rpc_port: u16, cookie: &str, request: RpcMsgReq) -> RpcMsgResp {
         verify_maker_pre_swap_balances() as maker_spendable_balance,
     ],
 )]
-fn test_maker_rpc_server(
+fn rpc_server(
     world: &mut World,
     taker_original_balance: Amount,
     maker_spendable_balance: Vec<Amount>,

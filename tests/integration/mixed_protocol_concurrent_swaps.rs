@@ -27,7 +27,7 @@ use std::{
     makers = 2,
     takers = [Normal, Normal],
 )]
-fn test_concurrent_legacy_and_taproot_swaps(world: &mut World) {
+fn legacy_and_taproot_swaps_run_together(world: &mut World) {
     let taker_original_balances = (0..world.takers().len())
         .map(|i| world.fund_nth_taker_default(i, 3))
         .collect::<Vec<_>>();
