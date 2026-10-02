@@ -45,11 +45,14 @@
 //! }
 //! ```
 //!
+//! - `skip_unless = expr` returns from the test before anything is built when
+//!   `expr` is false, e.g. `skip_unless = tor_it_enabled()`; a case may give
+//!   its own.
 //! - `backend` is required, unless every case names its own. Every other
-//!   key except `setup`, `bind`, `swap` and `cases` is the `WorldBuilder`
-//!   method of the same name: `key = value` calls `.key(value)`, a bare `key`
-//!   calls `.key()`. Nothing is defaulted, except that `makers` is the length
-//!   of a `maker_behaviors` list when omitted.
+//!   key except `setup`, `bind`, `skip_unless`, `swap` and `cases` is the
+//!   `WorldBuilder` method of the same name: `key = value` calls
+//!   `.key(value)`, a bare `key` calls `.key()`. Nothing is defaulted, except
+//!   that `makers` is the length of a `maker_behaviors` list when omitted.
 //! - `maker_behaviors` and `takers` see the `MakerBehavior` and
 //!   `TakerBehavior` variants unqualified.
 //! - `setup` lists `World` steps run in order after `build()`. `step(..) as x`
@@ -108,11 +111,13 @@ struct Step {
     call: TokenStream2,
 }
 
-/// One `cases` row: its test's name, attributes, backend and named arguments.
+/// One `cases` row: its test's name, attributes, backend, gate and named
+/// arguments.
 struct Case {
     attrs: Vec<Attribute>,
     name: Ident,
     backend: Option<Type>,
+    skip_unless: Option<Expr>,
     args: Vec<(Ident, Expr)>,
 }
 
@@ -125,6 +130,7 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
 
     let mut seen = HashSet::new();
     let mut backend = None;
+    let mut skip_unless = None;
     let mut steps = Vec::new();
     let mut swap = None;
     let mut cases = None;
@@ -159,6 +165,7 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
             "backend" => backend = Some(backend_type(value)?),
             "setup" => steps = setup_steps(value, &world)?,
             "bind" => (bind_names, bind_stmts) = bindings(value)?,
+            "skip_unless" => skip_unless = Some(value),
             "cases" => cases = Some(case_rows(value)?),
             "swap" => {
                 return Err(Error::new(
@@ -311,15 +318,19 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
     let run = |name: &Ident,
                summary: &[Attribute],
                backend: &Type,
+               gate: Option<&Expr>,
                locals: TokenStream2,
                call: TokenStream2| {
         let running = running_line(name, summary);
+        // Ahead of everything: a skipped test builds nothing.
+        let gate = gate.map(|gate| quote!(if !(#gate) { return; }));
         let call = if takes_backend {
             quote!(#call::<#backend>)
         } else {
             call
         };
         quote! {
+            #gate
             #bind_stmts
             #locals
             let mut #world = crate::test_framework::#fixture::builder::<#backend>()
@@ -339,7 +350,14 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         body.vis = syn::Visibility::Inherited;
         let name = body.sig.ident.clone();
         let backend = backend.expect("checked above");
-        let test_body = run(&name, &attrs, &backend, quote!(), quote!(#name));
+        let test_body = run(
+            &name,
+            &attrs,
+            &backend,
+            skip_unless.as_ref(),
+            quote!(),
+            quote!(#name),
+        );
         return Ok(quote! {
             #(#attrs)*
             #[test]
@@ -383,7 +401,15 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         };
         let backend = case.backend.as_ref().or(backend.as_ref());
         let backend = backend.expect("checked above");
-        let test_body = run(&case.name, summary, backend, locals, quote!(#body_name));
+        let gate = case.skip_unless.as_ref().or(skip_unless.as_ref());
+        let test_body = run(
+            &case.name,
+            summary,
+            backend,
+            gate,
+            locals,
+            quote!(#body_name),
+        );
         let (case_attrs, name) = (&case.attrs, &case.name);
         tests.push(quote! {
             #(#case_attrs)*
@@ -622,7 +648,7 @@ fn case_rows(value: Expr) -> Result<Vec<Case>> {
             let Expr::Path(path) = &*func else {
                 return Err(Error::new(func.span(), "expected the case's test name"));
             };
-            let mut backend = None;
+            let (mut backend, mut skip_unless) = (None, None);
             let mut named = Vec::new();
             for arg in args {
                 let Expr::Assign(assign) = arg else {
@@ -632,9 +658,12 @@ fn case_rows(value: Expr) -> Result<Vec<Case>> {
                     return Err(Error::new(assign.left.span(), "expected `name = value`"));
                 };
                 let name = name.path.require_ident()?.clone();
-                // `backend` picks the row's builder type; it is not a local.
+                // `backend` picks the row's builder type and `skip_unless` gates
+                // the row; neither is a local.
                 if name == "backend" {
                     backend = Some(backend_type(*assign.right)?);
+                } else if name == "skip_unless" {
+                    skip_unless = Some(*assign.right);
                 } else {
                     named.push((name, *assign.right));
                 }
@@ -643,6 +672,7 @@ fn case_rows(value: Expr) -> Result<Vec<Case>> {
                 attrs,
                 name: path.path.require_ident()?.clone(),
                 backend,
+                skip_unless,
                 args: named,
             })
         })
@@ -1035,5 +1065,35 @@ mod tests {
             let err = expand_err(quote!(backend = BitcoindBackend), body);
             assert!(err.contains("`&mut World` or `&mut Node`"), "{err}");
         }
+    }
+
+    #[test]
+    fn skip_unless_returns_before_anything_is_built() {
+        let tokens = expand(
+            quote!(
+                backend = BitcoindBackend,
+                cases = [
+                    always(n = 1),
+                    gated(
+                        backend = ElectrumBackend,
+                        skip_unless = tor_it_enabled(),
+                        n = 2
+                    ),
+                ],
+            ),
+            quote!(
+                fn run(world: &mut World, n: u32) {}
+            ),
+        )
+        .unwrap()
+        .to_string();
+        let gated = tokens.find("fn gated").expect("gated test");
+        let (always, gated) = tokens.split_at(gated);
+        assert!(!always.contains("tor_it_enabled"), "{always}");
+        let gate = gated
+            .find("if ! (tor_it_enabled ()) { return ; }")
+            .expect(gated);
+        assert!(gate < gated.find("let n = 2").expect(gated), "{gated}");
+        assert!(!gated.contains("let skip_unless"), "{gated}");
     }
 }

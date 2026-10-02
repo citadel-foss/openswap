@@ -1,7 +1,8 @@
-//! Abort 1 (Electrum backend): TAKER Drops After Full Setup.
+//! Recovery on the Electrum backend: the taker drops after full setup (both
+//! protocols, and over Tor), and a breached taker sweeps once contracts confirm.
 //!
-//! Same scenario as `abort1.rs`, but every participant runs on the Electrum
-//! backend, and the scenario runs over both protocols (Taproot and Legacy).
+//! The drop is the scenario of `taker_abort::legacy_drop_after_funding`, but
+//! every participant runs on the Electrum backend, over both protocols.
 //! This is the most Electrum-critical abort case: the taker vanishes after
 //! broadcasting the funding transactions, so the makers must detect the
 //! failure autonomously and recover via the preimage/hashlock cascade or
@@ -19,14 +20,13 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
-    taker::{error::TakerError, SwapParams, TakerBehavior},
+    taker::{error::TakerError, SwapParams},
 };
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{
     thread,
     time::{Duration, Instant},
@@ -35,7 +35,7 @@ use std::{
 /// Exact post-recovery balances for one protocol run. Fees differ between the
 /// Legacy and Taproot transaction shapes (and locktime values), so each
 /// protocol pins its own values.
-pub(crate) struct ExpectedBalances {
+struct ExpectedBalances {
     taker_regular: u64,
     taker_swap: u64,
     taker_spendable_diff: u64,
@@ -44,7 +44,7 @@ pub(crate) struct ExpectedBalances {
     maker_spendable: [u64; 2],
 }
 
-pub(crate) const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
+const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
     taker_regular: 14499538,
     taker_swap: 495997,
     taker_spendable_diff: 4465,
@@ -53,7 +53,7 @@ pub(crate) const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
     maker_spendable: [14999965, 14999928],
 };
 
-pub(crate) const TAPROOT_EXPECTED: ExpectedBalances = ExpectedBalances {
+const TAPROOT_EXPECTED: ExpectedBalances = ExpectedBalances {
     taker_regular: 14499538,
     taker_swap: 496660,
     taker_spendable_diff: 3802,
@@ -62,21 +62,52 @@ pub(crate) const TAPROOT_EXPECTED: ExpectedBalances = ExpectedBalances {
     maker_spendable: [15000286, 15000249],
 };
 
-/// Run the abort1 scenario (taker drops after funds broadcast) with the given
+/// Run the taker-drops-after-funding scenario with the given
 /// protocol and assert the exact recovery balances.
 ///
-/// Generic over the backend so `electrum_tor.rs` can run the identical body over
-/// Tor and assert the same balances.
-pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &ExpectedBalances) {
-    // ---- Setup ----
-    warn!("Running Test: Taker Drops After Full Setup (Electrum backend, {protocol:?})");
-
-    let mut world = World::builder::<B>()
-        .makers(2)
-        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
-        .takers([TakerBehavior::DropAfterFundsBroadcast])
-        .build();
-
+/// The Tor rows run the identical body over [`TorElectrumBackend`] and assert
+/// the same balances, so a Tor-specific divergence in any watchtower path fails
+/// loudly. The taker vanishes after funding is on-chain, so makers must detect
+/// it with no ZMQ and no mempool scan: `subscribe_script` / `poll_event`, the
+/// preimage/hashlock cascade, timelock fallback, and `unsubscribe_script` on
+/// cleanup. See the integration README for running the Tor rows.
+#[world_test(
+    maker_behaviors = [Normal, Normal],
+    takers = [DropAfterFundsBroadcast],
+    cases = [
+        taproot_taker_drops_after_funding(
+            backend = ElectrumBackend,
+            protocol = ProtocolVersion::Taproot,
+            expected = &TAPROOT_EXPECTED,
+        ),
+        legacy_taker_drops_after_funding(
+            backend = ElectrumBackend,
+            protocol = ProtocolVersion::Legacy,
+            expected = &LEGACY_EXPECTED,
+        ),
+        /// The Taproot drop over Tor: the widest watchtower path in the suite.
+        #[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
+        tor_taproot_taker_drops_after_funding(
+            backend = TorElectrumBackend,
+            skip_unless = tor_it_enabled(),
+            protocol = ProtocolVersion::Taproot,
+            expected = &TAPROOT_EXPECTED,
+        ),
+        /// The Legacy drop over Tor. Same cascade, different contract shape.
+        #[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
+        tor_legacy_taker_drops_after_funding(
+            backend = TorElectrumBackend,
+            skip_unless = tor_it_enabled(),
+            protocol = ProtocolVersion::Legacy,
+            expected = &LEGACY_EXPECTED,
+        ),
+    ],
+)]
+fn run_taker_drops_after_funding<B: TestBackend>(
+    world: &mut World,
+    protocol: ProtocolVersion,
+    expected: &ExpectedBalances,
+) {
     // Fund the taker with 3 UTXOs of 0.05 BTC each
     let taker_original_balance = world.fund_taker_default(3);
 
@@ -190,23 +221,10 @@ pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &E
     }
 
     world.taker().log_tracker_state();
-    info!("Electrum abort1 test ({protocol:?}) completed successfully!");
+    info!("Electrum taker-drop test ({protocol:?}) completed successfully!");
 
     world.shutdown_makers();
     tracker_logger.stop();
-    // Drop the taker while relay, electrs, and bitcoind are still up, so its
-    // background services shut down against live servers instead of dead ones.
-    world.finish();
-}
-
-#[test]
-fn taker_abort_1_taproot_electrum() {
-    run_abort1::<ElectrumBackend>(ProtocolVersion::Taproot, &TAPROOT_EXPECTED);
-}
-
-#[test]
-fn taker_abort_1_legacy_electrum() {
-    run_abort1::<ElectrumBackend>(ProtocolVersion::Legacy, &LEGACY_EXPECTED);
 }
 
 /// A breached taker recovers all its incoming coins once the contracts
@@ -224,7 +242,7 @@ fn taker_abort_1_legacy_electrum() {
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
     swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn electrum_sweeps_after_breach(world: &mut World, params: SwapParams) {
+fn sweeps_after_breach(world: &mut World, params: SwapParams) {
     world.mine(1);
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
@@ -313,7 +331,7 @@ fn electrum_sweeps_after_breach(world: &mut World, params: SwapParams) {
 /// Plan A4: a swapcoin whose contract output is spent only in the mempool
 /// must survive recovery; once that spend confirms, the coin is discarded.
 ///
-/// The abort1 cascade makes maker 0 sweep the taker's outgoing contracts
+/// The taker-drop cascade makes maker 0 sweep the taker's outgoing contracts
 /// with the hashlock preimage. Mining is paused while that sweep is a
 /// mempool tx: the taker's recovery must keep its outgoing coins (a mempool
 /// spend can be evicted). After the sweep confirms, they are discarded.
@@ -324,7 +342,7 @@ fn electrum_sweeps_after_breach(world: &mut World, params: SwapParams) {
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
     swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn electrum_discards_only_on_confirmed_spend(world: &mut World, params: SwapParams) {
+fn discards_only_on_confirmed_spend(world: &mut World, params: SwapParams) {
     world.mine(1);
 
     let summary = world

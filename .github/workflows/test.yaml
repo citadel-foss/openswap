@@ -132,9 +132,9 @@ jobs:
       fail-fast: false
       matrix:
         test:
-          - tor_abort1_taproot
-          - tor_abort1_legacy
-          - tor_malice2
+          - tor_taproot_taker_drops_after_funding
+          - tor_legacy_taker_drops_after_funding
+          - tor_maker_broadcasts_contract
     steps:
       - name: Checkout
         uses: actions/checkout@v4

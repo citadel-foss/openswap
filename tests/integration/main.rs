@@ -3,13 +3,12 @@
 #[macro_use]
 mod test_framework;
 
-mod abort1;
 mod blocklist_rejection;
 mod broadcast_idempotency;
-mod electrum_abort1;
+mod contract_breach;
 mod electrum_list_transactions;
+mod electrum_recovery;
 mod electrum_swap;
-mod electrum_tor;
 mod electrum_transport;
 mod fidelity;
 mod fidelity_renewal;
@@ -18,7 +17,6 @@ mod finalization_timeout;
 mod maker_abort;
 mod maker_cli;
 mod malice1;
-mod malice2;
 mod mixed_protocol_concurrent_swaps;
 mod multi_confirm_swap;
 mod multi_taker;

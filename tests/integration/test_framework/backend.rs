@@ -40,7 +40,8 @@ pub struct ElectrumBackend;
 ///
 /// Publishes the local `electrsd` as an ephemeral onion service so the client
 /// has something a proxy can actually route to — Tor cannot reach a loopback
-/// address. Requires a bootstrapped `tor`; see `electrum_tor.rs` for the gating.
+/// address. Requires a bootstrapped `tor`; see the integration README for the
+/// gating.
 pub struct TorElectrumBackend;
 
 impl TestBackend for BitcoindBackend {

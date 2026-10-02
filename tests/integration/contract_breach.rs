@@ -1,4 +1,4 @@
-//! Malice test 2: Maker broadcasts contract transactions maliciously after setup.
+//! Contract breach: a maker broadcasts its contract transactions after setup.
 //!
 //! Scenario:
 //! 1. Taker initiates a Legacy openswap with 2 makers.
@@ -27,7 +27,7 @@ use openswap::{
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{
     thread,
     time::{Duration, Instant},
@@ -48,39 +48,94 @@ enum Ending {
 
 /// Test: Maker maliciously broadcasts contract txs after setup.
 ///
-/// Maker[1] completes the contract exchange, then broadcasts its outgoing
-/// contract transactions and closes the connection. The taker sweeps its
-/// incoming via the preimage; once Maker[1] returns, both makers claim by
-/// hashlock. Generic over the backend so `electrum_tor.rs` can reuse the body
-/// over Tor.
-/// This is the only scenario driving the taker's breach detector.
-pub(crate) fn run_malice2<B: TestBackend>() {
-    run_malice2_with_taker_behavior::<B>(TakerBehavior::Normal, false, Ending::FaultyReturns);
-}
-
-fn run_malice2_with_taker_behavior<B: TestBackend>(
-    taker_behavior: TakerBehavior,
+/// The last maker completes the contract exchange, then broadcasts its outgoing
+/// contract transactions and closes the connection; each case's ending decides
+/// how the swap settles from there. This is the only scenario driving the
+/// taker's breach detector, so `tor_maker_broadcasts_contract` runs it over Tor too.
+#[world_test(
+    makers = behaviors.len(),
+    maker_behaviors = behaviors,
+    takers = [taker_behavior],
+    cases = [
+        maker_broadcasts_contract(
+            backend = BitcoindBackend,
+            behaviors = [
+                MakerBehavior::Normal,
+                MakerBehavior::BroadcastContractAfterSetup,
+            ],
+            taker_behavior = TakerBehavior::Normal,
+            expect_direct_breach_detection = false,
+            ending = Ending::FaultyReturns,
+        ),
+        breach_detected_after_watcher_exit(
+            backend = BitcoindBackend,
+            behaviors = [
+                MakerBehavior::Normal,
+                MakerBehavior::BroadcastContractAfterSetup,
+            ],
+            taker_behavior = TakerBehavior::StopWatcherAfterSentinels,
+            expect_direct_breach_detection = true,
+            ending = Ending::FaultyReturns,
+        ),
+        /// Maker[1] never returns. The taker refunds its outgoing only after proving
+        /// Maker[0] refunded its own, so nobody else could ever claim it.
+        taker_refunds_dangling_outgoing(
+            backend = BitcoindBackend,
+            behaviors = [
+                MakerBehavior::Normal,
+                MakerBehavior::BroadcastContractAfterSetup,
+            ],
+            taker_behavior = TakerBehavior::Normal,
+            expect_direct_breach_detection = false,
+            ending = Ending::FaultyGone,
+        ),
+        /// Maker[0] sleeps past the taker's timelock. The taker holds its refund, so
+        /// Maker[0] still claims by hashlock when it wakes.
+        taker_holds_refund_for_late_first_maker(
+            backend = BitcoindBackend,
+            behaviors = [
+                MakerBehavior::Normal,
+                MakerBehavior::BroadcastContractAfterSetup,
+            ],
+            taker_behavior = TakerBehavior::Normal,
+            expect_direct_breach_detection = false,
+            ending = Ending::FirstMakerLate,
+        ),
+        /// Three makers, and the middle one dies after the last one claims from it.
+        /// Only Maker[0]'s refund matters: the taker refunds its dangling outgoing.
+        taker_refunds_past_dead_middle_maker(
+            backend = BitcoindBackend,
+            behaviors = [
+                MakerBehavior::Normal,
+                MakerBehavior::Normal,
+                MakerBehavior::BroadcastContractAfterSetup,
+            ],
+            taker_behavior = TakerBehavior::Normal,
+            expect_direct_breach_detection = false,
+            ending = Ending::MiddleMakerDies,
+        ),
+        /// Malicious contract broadcast over Tor, exercising the taker's breach detector.
+        #[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
+        tor_maker_broadcasts_contract(
+            backend = TorElectrumBackend,
+            skip_unless = tor_it_enabled(),
+            behaviors = [
+                MakerBehavior::Normal,
+                MakerBehavior::BroadcastContractAfterSetup,
+            ],
+            taker_behavior = TakerBehavior::Normal,
+            expect_direct_breach_detection = false,
+            ending = Ending::FaultyReturns,
+        ),
+    ],
+)]
+fn run_contract_breach<B: TestBackend>(
+    world: &mut World,
     expect_direct_breach_detection: bool,
     ending: Ending,
 ) {
-    // ---- Setup ----
-    warn!("Running Test: Malice2 - Maker Broadcasts Contract After Setup");
-
-    let maker_count = if ending == Ending::MiddleMakerDies {
-        3
-    } else {
-        2
-    };
+    let maker_count = world.makers().len();
     let last = maker_count - 1;
-    let taker_behavior = vec![taker_behavior];
-    let mut maker_behaviors = vec![MakerBehavior::Normal; last];
-    maker_behaviors.push(MakerBehavior::BroadcastContractAfterSetup);
-
-    let mut world = World::builder::<B>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
     let taker_original_balance = world.fund_taker_default(3);
@@ -93,7 +148,7 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     world.start_makers(120);
 
     world.verify_maker_pre_swap_balances();
-    log::info!("Starting malice2 test...");
+    log::info!("Starting contract breach test...");
 
     // Start periodic swap tracker logging (every 10s)
     let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
@@ -265,52 +320,4 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     world.shutdown_makers();
 
     tracker_logger.stop();
-    world.finish();
-}
-
-#[test]
-fn test_malice2_maker_broadcast_contract() {
-    run_malice2::<BitcoindBackend>();
-}
-
-#[test]
-fn test_malice2_detects_breach_after_watcher_exit() {
-    run_malice2_with_taker_behavior::<BitcoindBackend>(
-        TakerBehavior::StopWatcherAfterSentinels,
-        true,
-        Ending::FaultyReturns,
-    );
-}
-
-/// Maker[1] never returns. The taker refunds its outgoing only after proving
-/// Maker[0] refunded its own, so nobody else could ever claim it.
-#[test]
-fn test_malice2_taker_refunds_dangling_outgoing() {
-    run_malice2_with_taker_behavior::<BitcoindBackend>(
-        TakerBehavior::Normal,
-        false,
-        Ending::FaultyGone,
-    );
-}
-
-/// Maker[0] sleeps past the taker's timelock. The taker holds its refund, so
-/// Maker[0] still claims by hashlock when it wakes.
-#[test]
-fn test_malice2_taker_holds_refund_for_late_first_maker() {
-    run_malice2_with_taker_behavior::<BitcoindBackend>(
-        TakerBehavior::Normal,
-        false,
-        Ending::FirstMakerLate,
-    );
-}
-
-/// Three makers, and the middle one dies after the last one claims from it.
-/// Only Maker[0]'s refund matters: the taker refunds its dangling outgoing.
-#[test]
-fn test_malice2_taker_refunds_past_dead_middle_maker() {
-    run_malice2_with_taker_behavior::<BitcoindBackend>(
-        TakerBehavior::Normal,
-        false,
-        Ending::MiddleMakerDies,
-    );
 }
