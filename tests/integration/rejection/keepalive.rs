@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::support::wait_for_log_after;
+use super::wait_for_log_after;
 
 /// The step every keepalive test shares once its maker is up: one admitted
 /// swap that is not started yet. Returns its id and the log path.

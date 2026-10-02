@@ -18,7 +18,7 @@ use openswap::{
 
 use crate::test_framework::*;
 
-use super::support::wait_for_log_after;
+use super::wait_for_log_after;
 
 use log::info;
 use std::time::Duration;
