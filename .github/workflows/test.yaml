@@ -6,6 +6,13 @@ on:
 
 name: test
 
+# A new push to a PR cancels that PR's run still in progress: every run holds
+# about two dozen runners, and superseded runs left queued made jobs wait close
+# to an hour for one. Pushes to master always run to completion.
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test_with_codecov:
     name: Run tests coverage (Partition ${{ matrix.partition }}/${{ strategy.job-total }})
@@ -13,7 +20,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+        # Tests run in parallel within a partition (one per core), so a
+        # partition takes about as long as its slowest test; 8 keep each near
+        # that floor without holding more runners than that buys.
+        partition: [1,2,3,4,5,6,7,8]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,15 +64,17 @@ jobs:
         run: echo "$HOME/.nostr-relay-bin" >> "$GITHUB_PATH"
 
       - name: Run cargo-llvm-cov
-        # Surface electrs stderr in the job log, or a hung electrum test
-        # leaves no evidence of what the server was doing. The `ci` profile in
-        # .config/nextest.toml carries the partition timeouts.
+        # Surface electrs stderr in a failing test's output, or a hung electrum
+        # test leaves no evidence of what the server was doing. No
+        # `--no-capture`: it would run the partition's tests one at a time. The
+        # `ci` profile in .config/nextest.toml prints a failing or killed
+        # test's captured output and carries the timeouts.
         env:
           ELECTRS_LOG: "1"
           NEXTEST_PROFILE: ci
         run: |
           mkdir -p ./coverage/reports/
-          cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 2:immediate --partition hash:${{ matrix.partition }}/${{strategy.job-total}} --features integration-test --no-capture
+          cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 2:immediate --partition hash:${{ matrix.partition }}/${{strategy.job-total}} --features integration-test
           cargo llvm-cov report --cobertura --output-path ./coverage/reports/cobertura-${{ strategy.job-index }}.xml
 
       # A failing test keeps its data dir (logs, wallets, swap trackers) as
