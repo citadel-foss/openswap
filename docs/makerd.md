@@ -82,7 +82,7 @@ A swap with more coins, more makers, or a higher fee rate needs more.
 Each percentage fee must be at least 0 and below 100. Your node refuses to start otherwise. Your node also checks that some swap can pay your fees. A one-maker swap locks coins for 20 blocks. Your node adds your amount fee to 20 times your time fee. If the sum is 100 or more, no swap can pay your fees. Your node then stops with an error before it takes any swaps. With the default fees, the sum is 0.0025 + 20 × 0.0001 = 0.0045, far below 100.
 
 > **Note:**  
-> If `network_port` is still the default 6102, `makerd` picks a free port and saves it to `config.toml`. This normally happens only on the first run. `makerd` does the same for `rpc_port` on every start.
+> If `network_port` is still the default 6102, `makerd` binds 6102 or the next free port above it and saves that to `config.toml`. `makerd` does the same for `rpc_port` on every start, beginning at the configured port.
 
 > **Important:**  
 > At the moment, OpenSwap operates only on the **TOR** network for peer-to-peer connections. There is no clearnet option; the app will only work over Tor until multi-network support is added.
