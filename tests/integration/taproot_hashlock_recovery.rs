@@ -10,20 +10,22 @@
 //! 5. Recovery proceeds (may partially complete via hashlock or timelock).
 //! 6. After blocks mature, verify: taker recovered funds (minus fees), no contract balance.
 
-use openswap::{maker::MakerBehavior, protocol::common_messages::ProtocolVersion};
+use openswap::protocol::common_messages::ProtocolVersion;
 
 use super::scenarios::maker_abort::{run_maker_abort_recovery, MakerAbortExpect};
 
-use log::warn;
+use super::test_framework::*;
 
 /// Test: Maker drops after sweep (Taproot). Recovery via hashlock/timelock.
-#[test]
-fn test_taproot_hashlock_recovery() {
-    warn!("Running Test: Taproot Hashlock Recovery - CloseAfterSweep");
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAfterSweep],
+    takers = [Normal],
+)]
+fn test_taproot_hashlock_recovery(world: &mut World) {
     run_maker_abort_recovery(
+        world,
         ProtocolVersion::Taproot,
-        MakerBehavior::CloseAfterSweep,
         "Swap should fail due to Maker2 closing after sweep",
         &MakerAbortExpect {
             taker_regular: 14499538,

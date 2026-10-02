@@ -1,17 +1,19 @@
-use openswap::{maker::MakerBehavior, protocol::common_messages::ProtocolVersion};
+use openswap::protocol::common_messages::ProtocolVersion;
 
 use super::scenarios::maker_abort::{MakerAbort, MakerAbortExpect};
 
-use log::warn;
+use super::test_framework::*;
 
 /// Test: Maker drops at private key handover phase (Taproot). Recovery via timelock.
-#[test]
-fn test_taproot_maker_abort2() {
-    warn!("Running Test: Taproot Maker Abort2 - CloseAtPrivateKeyHandover");
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtPrivateKeyHandover],
+    takers = [Normal],
+)]
+fn test_taproot_maker_abort2(world: &mut World) {
     let abort = MakerAbort::fail_swap(
+        world,
         ProtocolVersion::Taproot,
-        MakerBehavior::CloseAtPrivateKeyHandover,
         "Swap should fail due to Maker2 closing at private key handover",
     );
 

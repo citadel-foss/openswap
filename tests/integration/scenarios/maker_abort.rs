@@ -2,16 +2,13 @@
 //! every party falls back to on-chain recovery.
 //!
 //! [`run_maker_abort_recovery`] serves `abort2_case3`, `abort3_case1`,
-//! `abort3_case2`, `abort3_case3` and `taproot_hashlock_recovery`.
+//! `abort3_case2`, `abort3_case3` and `taproot_hashlock_recovery`; each declares
+//! the behavior Maker2 breaks off with.
 //! `taproot_maker_abort2` and `taproot_timelock_recovery` run the same three
 //! [`MakerAbort`] stages with their own checks in between.
 
 use bitcoin::Amount;
-use openswap::{
-    maker::MakerBehavior,
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use crate::test_framework::*;
 
@@ -32,37 +29,31 @@ pub(crate) struct MakerAbortExpect {
 
 /// Runs the three [`MakerAbort`] stages back to back.
 pub(crate) fn run_maker_abort_recovery(
+    world: &mut World,
     protocol: ProtocolVersion,
-    behavior: MakerBehavior,
     failure: &str,
     expected: &MakerAbortExpect,
 ) {
-    let abort = MakerAbort::fail_swap(protocol, behavior, failure);
+    let abort = MakerAbort::fail_swap(world, protocol, failure);
     abort.recover();
     abort.assert_recovered(expected);
 }
 
 /// A world whose swap Maker2 has just broken off.
-pub(crate) struct MakerAbort {
-    world: World,
+pub(crate) struct MakerAbort<'w> {
+    world: &'w mut World,
     taker_original_balance: Amount,
     tracker_logger: TrackerLoggerHandle,
 }
 
-impl MakerAbort {
-    /// Runs a Taker -> Maker1 (Normal) -> Maker2 (`behavior`) swap over
-    /// `protocol` and asserts it fails, with `failure` as the message.
+impl<'w> MakerAbort<'w> {
+    /// Runs a Taker -> Maker1 -> Maker2 swap over `protocol` on a world whose
+    /// Maker2 breaks off, and asserts it fails, with `failure` as the message.
     pub(crate) fn fail_swap(
+        world: &'w mut World,
         protocol: ProtocolVersion,
-        behavior: MakerBehavior,
         failure: &str,
     ) -> Self {
-        let mut world = World::builder::<BitcoindBackend>()
-            .makers(2)
-            .maker_behaviors([MakerBehavior::Normal, behavior])
-            .takers([TakerBehavior::Normal])
-            .build();
-
         // Fund the taker with 3 UTXOs of 0.05 BTC each
         let taker_original_balance = world.fund_taker_default(3);
 
@@ -101,13 +92,13 @@ impl MakerAbort {
     }
 
     pub(crate) fn world(&self) -> &World {
-        &self.world
+        self.world
     }
 
     /// Waits out the timelocks, asserts both makers recovered their
     /// contracts, then waits for the taker's recovery loop.
     pub(crate) fn recover(&self) {
-        let world = &self.world;
+        let world = &*self.world;
         world.taker().log_tracker_state();
 
         // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
@@ -126,10 +117,10 @@ impl MakerAbort {
     }
 
     /// Mines the recovery txs, asserts the taker's and then each maker's
-    /// balances, and tears the world down.
+    /// balances, and shuts the makers down.
     pub(crate) fn assert_recovered(self, expected: &MakerAbortExpect) {
         let MakerAbort {
-            mut world,
+            world,
             taker_original_balance,
             tracker_logger,
         } = self;
@@ -189,6 +180,5 @@ impl MakerAbort {
 
         world.shutdown_makers();
         tracker_logger.stop();
-        world.finish();
     }
 }

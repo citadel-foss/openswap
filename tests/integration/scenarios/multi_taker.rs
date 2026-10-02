@@ -4,9 +4,7 @@
 
 use bitcoin::Amount;
 use openswap::{
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-    wallet::AddressType,
+    protocol::common_messages::ProtocolVersion, taker::SwapParams, wallet::AddressType,
 };
 
 use crate::test_framework::*;
@@ -25,13 +23,11 @@ pub(crate) struct MultiTakerExpect {
 
 /// Funds two takers and two makers, runs taker 1's swap, mines, runs taker 2's
 /// swap, and asserts every wallet.
-pub(crate) fn run_sequential_multi_taker(protocol: ProtocolVersion, expected: &MultiTakerExpect) {
-    // Initialize test framework with 2 takers and 2 makers
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .takers([TakerBehavior::Normal, TakerBehavior::Normal])
-        .build();
-
+pub(crate) fn run_sequential_multi_taker(
+    world: &mut World,
+    protocol: ProtocolVersion,
+    expected: &MultiTakerExpect,
+) {
     // Fund each taker thrice with one 0.05 BTC UTXO (0.15 total), one per call so
     // each lands on a distinct address and coin_select doesn't group them.
     let mut taker1_original_balance = Amount::ZERO;
@@ -203,5 +199,4 @@ pub(crate) fn run_sequential_multi_taker(protocol: ProtocolVersion, expected: &M
     );
 
     world.shutdown_makers();
-    world.finish();
 }

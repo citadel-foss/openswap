@@ -2,14 +2,10 @@
 //! the taker substitutes the spare, and the swap completes.
 //!
 //! Serves `abort2_case1::maker_abort2_case1`, `abort2_case2` and
-//! `taproot_maker_abort3`.
+//! `taproot_maker_abort3`, each of which declares its three makers.
 
 use bitcoin::Amount;
-use openswap::{
-    maker::MakerBehavior,
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use crate::test_framework::*;
 
@@ -21,33 +17,14 @@ pub(crate) struct SpareMakerExpect {
     pub maker_spendable: [u64; 3],
 }
 
-/// Runs [`complete_with_spare`] and tears the world down.
-pub(crate) fn run_spare_maker_swap(
+/// Swaps over `protocol` on a world of three makers and one taker, expects the
+/// swap to complete, and asserts the balances. The makers keep running.
+pub(crate) fn complete_with_spare(
+    world: &mut World,
     protocol: ProtocolVersion,
-    maker_behaviors: [MakerBehavior; 3],
     prepare_failure: &str,
     expected: &SpareMakerExpect,
 ) {
-    let mut world = complete_with_spare(protocol, maker_behaviors, prepare_failure, expected);
-    world.shutdown_makers();
-    world.finish();
-}
-
-/// Swaps over `protocol` with three makers running `maker_behaviors`, expects
-/// the swap to complete, and asserts the balances. Returns the world with its
-/// makers still running.
-pub(crate) fn complete_with_spare(
-    protocol: ProtocolVersion,
-    maker_behaviors: [MakerBehavior; 3],
-    prepare_failure: &str,
-    expected: &SpareMakerExpect,
-) -> World {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(3)
-        .maker_behaviors(maker_behaviors)
-        .takers([TakerBehavior::Normal])
-        .build();
-
     // Fund the taker with 3 UTXOs of 0.05 BTC each
     let taker_original_balance = world.fund_taker_default(3);
 
@@ -132,6 +109,4 @@ pub(crate) fn complete_with_spare(
         );
         assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
     }
-
-    world
 }

@@ -1,20 +1,18 @@
-use openswap::{maker::MakerBehavior, protocol::common_messages::ProtocolVersion};
+use openswap::protocol::common_messages::ProtocolVersion;
 
-use super::scenarios::spare_maker::{run_spare_maker_swap, SpareMakerExpect};
+use super::scenarios::spare_maker::{complete_with_spare, SpareMakerExpect};
 
-use log::warn;
+use super::test_framework::*;
 
-#[test]
-fn maker_abort2_case2() {
-    warn!("Running Test: First maker drops before sending sender's sigs. Taker continues with remaining makers.");
-
-    run_spare_maker_swap(
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [CloseAtReqContractSigsForSender, Normal, Normal],
+    takers = [Normal],
+)]
+fn maker_abort2_case2(world: &mut World) {
+    complete_with_spare(
+        world,
         ProtocolVersion::Legacy,
-        [
-            MakerBehavior::CloseAtReqContractSigsForSender,
-            MakerBehavior::Normal,
-            MakerBehavior::Normal,
-        ],
         "Failed to prepare openswap",
         &SpareMakerExpect {
             taker_spendable: 14995985,

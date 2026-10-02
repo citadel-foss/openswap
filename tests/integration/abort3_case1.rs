@@ -13,20 +13,22 @@
 //! 5. Everyone falls back to timelock recovery.
 //! 6. After blocks mature, verify: taker recovered funds (minus fees), no contract balance.
 
-use openswap::{maker::MakerBehavior, protocol::common_messages::ProtocolVersion};
+use openswap::protocol::common_messages::ProtocolVersion;
 
 use super::scenarios::maker_abort::{run_maker_abort_recovery, MakerAbortExpect};
 
-use log::warn;
+use super::test_framework::*;
 
 /// Test: Maker drops at RespContractSigsForRecvrAndSender after funding. Recovery via timelock.
-#[test]
-fn maker_abort3_case1() {
-    warn!("Running Test: Maker Abort3 Case 1 - CloseAtContractSigsForRecvrAndSender");
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtContractSigsForRecvrAndSender],
+    takers = [Normal],
+)]
+fn maker_abort3_case1(world: &mut World) {
     run_maker_abort_recovery(
+        world,
         ProtocolVersion::Legacy,
-        MakerBehavior::CloseAtContractSigsForRecvrAndSender,
         "Swap should fail due to Maker2 closing at RespContractSigsForRecvrAndSender",
         &MakerAbortExpect {
             taker_regular: 14998662,

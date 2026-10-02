@@ -1,14 +1,11 @@
 //! Two Normal makers; the taker drops at a given step once funding is on-chain,
 //! and every party timelock-recovers.
 //!
-//! Serves `taproot_taker_abort2` and both tests in `taproot_taker_abort3`.
+//! Serves `taproot_taker_abort2` and both tests in `taproot_taker_abort3`; each
+//! declares the taker behavior that sets its drop point.
 
 use bitcoin::Amount;
-use openswap::{
-    maker::MakerBehavior,
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use crate::test_framework::*;
 
@@ -28,13 +25,7 @@ pub(crate) struct TakerAbortExpect {
 
 /// Drives one taker-drop case through timelock recovery and asserts the
 /// golden balances that pin how that drop point settles.
-pub(crate) fn run_taproot_taker_abort(behavior: TakerBehavior, expected: &TakerAbortExpect) {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .maker_behaviors([MakerBehavior::Normal, MakerBehavior::Normal])
-        .takers([behavior])
-        .build();
-
+pub(crate) fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
     let taker_original_balance = world.fund_taker_default(3);
     world.fund_makers_default();
 
@@ -60,7 +51,7 @@ pub(crate) fn run_taproot_taker_abort(behavior: TakerBehavior, expected: &TakerA
     assert!(
         swap_result.is_err(),
         "Swap should fail due to {:?} behavior",
-        behavior
+        world.taker().inner().behavior
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     world.taker().log_tracker_state();
@@ -135,5 +126,4 @@ pub(crate) fn run_taproot_taker_abort(behavior: TakerBehavior, expected: &TakerA
 
     world.shutdown_makers();
     tracker_logger.stop();
-    world.finish();
 }
