@@ -997,6 +997,39 @@ impl MakerServer {
         !self.is_shutdown()
     }
 
+    /// Waits for the bond at `index` to confirm, with no deadline, and returns
+    /// its height. Each poll rebroadcasts the bond if the backend has lost it.
+    fn wait_for_bond_confirmation(&self, index: u32) -> Result<u32, MakerError> {
+        const POLL_INTERVAL: Duration = Duration::from_secs(10);
+        loop {
+            // Lock per poll only: holding it across the wait blocks every wallet writer.
+            let (txid, height) = {
+                let wallet = lock_debug!(self.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                let txid = wallet
+                    .ensure_fidelity_bond_broadcast(index)
+                    .map_err(MakerError::Wallet)?;
+                let height = wallet
+                    .blockchain
+                    .tx_block_height(&txid)
+                    .map_err(MakerError::Wallet)?;
+                (txid, height)
+            };
+            if let Some(height) = height {
+                return Ok(height as u32);
+            }
+            log::info!(
+                "[{}] Fidelity bond {} not confirmed yet, checking again in {}s",
+                self.config.network_port,
+                txid,
+                POLL_INTERVAL.as_secs()
+            );
+            if !self.wait_for_shutdown(POLL_INTERVAL) {
+                return Err(MakerError::General("Shutdown requested"));
+            }
+        }
+    }
+
     /// Waits for live but unconfirmed fidelity bonds to confirm and records
     /// their confirmation height. No-op if no such bond exists.
     ///
@@ -1027,18 +1060,14 @@ impl MakerServer {
                 txid
             );
 
-            // An evicted bond tx would never confirm; rebroadcast the stored
-            // raw transaction before waiting. Returns the original txid
-            // unchanged if the broadcast is still live.
-            let txid = match lock_debug!(self.wallet.read())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .ensure_fidelity_bond_broadcast(index)
-            {
-                Ok(txid) => txid,
+            let conf_height = match self.wait_for_bond_confirmation(index) {
+                Ok(height) => height,
                 // The bond was evicted and there is no stored transaction to
                 // rebroadcast: it can never confirm. Losing the bond must not
                 // take the maker down — log it and start up anyway.
-                Err(WalletError::Fidelity(FidelityError::BondTransactionMissing { .. })) => {
+                Err(MakerError::Wallet(WalletError::Fidelity(
+                    FidelityError::BondTransactionMissing { .. },
+                ))) => {
                     log::error!(
                         "[{}] Pending fidelity bond {} was evicted and has no stored transaction; \
                          it is unrecoverable. Skipping it and continuing startup.",
@@ -1047,45 +1076,7 @@ impl MakerServer {
                     );
                     continue;
                 }
-                Err(e) => return Err(MakerError::Wallet(e)),
-            };
-
-            // Wait on a fresh backend connection so the wallet lock is not
-            // held for the duration of the wait.
-            let chain = lock_debug!(self.wallet.read())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .blockchain
-                .new_connection()
-                .map_err(MakerError::Wallet)?;
-            // A bond has no confirmation deadline: wait again until it confirms.
-            let conf_height = loop {
-                match crate::wallet::wait_for_tx_confirmation(
-                    &chain,
-                    &[txid],
-                    1,
-                    crate::utill::TX_BROADCAST_TIMEOUT,
-                    Some(&self.shutdown),
-                    None,
-                ) {
-                    Err(WalletError::TxConfirmationTimeout(_)) => continue,
-                    result => break result,
-                }
-            };
-            let conf_height = match conf_height {
-                Ok(height) => height,
-                // The backend no longer knows the bond tx (evicted again). Losing
-                // it must not take the maker down: skip it, the next restart rebroadcasts.
-                Err(e @ WalletError::TxNeverBroadcast(_)) => {
-                    log::error!(
-                        "[{}] Pending fidelity bond {} did not confirm ({}); \
-                         skipping it and continuing startup.",
-                        self.config.network_port,
-                        txid,
-                        e
-                    );
-                    continue;
-                }
-                Err(e) => return Err(MakerError::Wallet(e)),
+                Err(e) => return Err(e),
             };
 
             lock_debug!(self.wallet.write())
@@ -1117,9 +1108,6 @@ impl MakerServer {
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
             .get_highest_fidelity_index()
             .map_err(MakerError::Wallet)?;
-
-        let mut proof = lock_debug!(self.highest_fidelity_proof.write())
-            .map_err(|_| MakerError::General("Failed to lock fidelity proof"))?;
 
         if let Some(i) = highest_index {
             // Existing fidelity bond found
@@ -1154,7 +1142,9 @@ impl MakerServer {
                 bond_value
             );
 
-            *proof = Some(highest_proof);
+            *lock_debug!(self.highest_fidelity_proof.write())
+                .map_err(|_| MakerError::General("Failed to lock fidelity proof"))? =
+                Some(highest_proof);
         } else {
             // Need to create new fidelity bond
             log::info!("No active Fidelity Bonds found. Creating one.");
@@ -1294,16 +1284,7 @@ impl MakerServer {
                             self.config.network_port,
                             txid
                         );
-                        // A bond has no confirmation deadline: wait again until it confirms.
-                        let conf_height = loop {
-                            match lock_debug!(self.wallet.read())
-                                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                                .wait_for_tx_confirmation(&[txid], 1, Some(&self.shutdown), None)
-                            {
-                                Err(WalletError::TxConfirmationTimeout(_)) => continue,
-                                result => break result.map_err(MakerError::Wallet)?,
-                            }
-                        };
+                        let conf_height = self.wait_for_bond_confirmation(index)?;
 
                         // Re-acquire write lock briefly to finalize
                         lock_debug!(self.wallet.write())
@@ -1320,7 +1301,10 @@ impl MakerServer {
                             .generate_fidelity_proof(index, maker_address)
                             .map_err(MakerError::Wallet)?;
 
-                        *proof = Some(highest_proof);
+                        // Locked only to write: held across the bond wait it blocks every reader.
+                        *lock_debug!(self.highest_fidelity_proof.write())
+                            .map_err(|_| MakerError::General("Failed to lock fidelity proof"))? =
+                            Some(highest_proof);
 
                         log::info!("Sync at end:----setup_fidelity_bond----");
                         lock_debug!(self.wallet.write())
@@ -1333,7 +1317,8 @@ impl MakerServer {
             }
         }
 
-        proof
+        lock_debug!(self.highest_fidelity_proof.read())
+            .map_err(|_| MakerError::General("Failed to lock fidelity proof"))?
             .clone()
             .ok_or(MakerError::General("No fidelity proof after setup"))
     }
