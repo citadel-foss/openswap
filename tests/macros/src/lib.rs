@@ -14,7 +14,7 @@
 //!     ],
 //!     swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
 //! )]
-//! fn maker_abort3_case2(world: &mut World, baseline: Amount, params: SwapParams) {
+//! fn legacy_drop_at_contract_sigs_for_recvr(world: &mut World, baseline: Amount, params: SwapParams) {
 //!     // the scenario
 //! }
 //! ```
@@ -24,8 +24,8 @@
 //! ```ignore
 //! /// Docs and other attributes pass through to the test.
 //! #[test]
-//! fn maker_abort3_case2() {
-//!     fn maker_abort3_case2(world: &mut World, baseline: Amount, params: SwapParams) {
+//! fn legacy_drop_at_contract_sigs_for_recvr() {
+//!     fn legacy_drop_at_contract_sigs_for_recvr(world: &mut World, baseline: Amount, params: SwapParams) {
 //!         // the scenario
 //!     }
 //!     let mut world = crate::test_framework::World::builder::<BitcoindBackend>()
@@ -33,14 +33,14 @@
 //!         .maker_behaviors({ use ::openswap::maker::MakerBehavior::*; [Normal, CloseAtContractSigsForRecvr] })
 //!         .takers({ use ::openswap::taker::TakerBehavior::*; [Normal] })
 //!         .build();
-//!     ::log::warn!("{}", "Running Test: maker_abort3_case2 - Docs and other ...");
+//!     ::log::warn!("{}", "Running Test: legacy_drop_at_contract_sigs_for_recvr - Docs and other ...");
 //!     let baseline = world.fund_taker_default(3);
 //!     world.fund_makers_default();
 //!     world.start_makers(120);
 //!     world.mine(1);
 //!     let params = ::openswap::taker::SwapParams::new(ProtocolVersion::Legacy,
 //!         Amount::from_sat(500_000), 2).with_tx_count(3);
-//!     maker_abort3_case2(&mut world, baseline, params);
+//!     legacy_drop_at_contract_sigs_for_recvr(&mut world, baseline, params);
 //!     world.finish();
 //! }
 //! ```

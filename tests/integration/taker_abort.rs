@@ -1,31 +1,81 @@
 //! Two Normal makers; the taker drops at a given step once funding is on-chain,
-//! and every party timelock-recovers.
-//!
-//! Serves `taproot_taker_abort2` and both tests in `taproot_taker_abort3`; each
-//! declares the taker behavior that sets its drop point.
+//! and every party timelock-recovers. Each case's taker behavior sets its drop
+//! point, and its golden balances pin how that drop point settles.
 
 use bitcoin::Amount;
-use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
+use openswap::{
+    protocol::common_messages::ProtocolVersion,
+    taker::{SwapParams, TakerBehavior},
+};
 
-use crate::test_framework::*;
+use super::test_framework::*;
 
 use log::info;
 use std::{thread, time::Duration};
 
 /// The balances one taker-abort test asserts once recovery is done.
-pub(crate) struct TakerAbortExpect {
-    pub maker_regular: [u64; 2],
+struct TakerAbortExpect {
+    maker_regular: [u64; 2],
     /// Each maker's pre-swap spendable balance minus its final one; `None`
     /// where the test does not assert it.
-    pub maker_loss: Option<[u64; 2]>,
-    pub taker_regular: u64,
+    maker_loss: Option<[u64; 2]>,
+    taker_regular: u64,
     /// Taker funding minus its final spendable balance.
-    pub taker_loss: u64,
+    taker_loss: u64,
 }
 
 /// Drives one taker-drop case through timelock recovery and asserts the
 /// golden balances that pin how that drop point settles.
-pub(crate) fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [behavior],
+    cases = [
+        /// Taker aborts at sender's contract exchange (Taproot).
+        ///
+        /// The taker drops the connection when about to send sender's contract data
+        /// to a maker. Funding transactions are already on-chain, so timelock
+        /// recovery is required for all parties to reclaim their funds.
+        taproot_drop_at_senders_contract(
+            behavior = TakerBehavior::CloseAtSendersContract,
+            expected = &TakerAbortExpect {
+                maker_regular: [14999757; 2],
+                maker_loss: None,
+                taker_regular: 14999118,
+                taker_loss: 882,
+            },
+        ),
+        /// Taker aborts after receiving maker's contract response (Taproot).
+        ///
+        /// The taker drops the connection after receiving the maker's contract data
+        /// response. Funding transactions are already on-chain, so timelock recovery
+        /// is required.
+        taproot_drop_after_makers_contract_response(
+            behavior = TakerBehavior::CloseAtSendersContractFromMaker,
+            expected = &TakerAbortExpect {
+                maker_regular: [14998875, 14999757],
+                maker_loss: Some([882, 0]),
+                taker_regular: 14999118,
+                taker_loss: 882,
+            },
+        ),
+        /// Taker aborts after receiving maker's contract response (Taproot).
+        ///
+        /// The taker drops the connection after receiving the maker's contract data
+        /// response. Funding transactions are already on-chain, so timelock recovery
+        /// is required.
+        taproot_drop_after_full_setup(
+            behavior = TakerBehavior::CloseAtSendersContractFromMaker,
+            expected = &TakerAbortExpect {
+                maker_regular: [14998875, 14999757],
+                maker_loss: Some([882, 0]),
+                taker_regular: 14999118,
+                taker_loss: 882,
+            },
+        ),
+    ],
+)]
+fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
     let taker_original_balance = world.fund_taker_default(3);
     world.fund_makers_default();
 
