@@ -72,6 +72,10 @@ jobs:
         env:
           ELECTRS_LOG: "1"
           NEXTEST_PROFILE: ci
+          # Each test's output opens and closes a `::group::` (see
+          # setup_test_logger), which GitHub folds into one line per test; it
+          # only reads those commands at the start of a line.
+          NEXTEST_NO_OUTPUT_INDENT: "1"
         run: |
           mkdir -p ./coverage/reports/
           cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 2:immediate --partition hash:${{ matrix.partition }}/${{strategy.job-total}} --features integration-test

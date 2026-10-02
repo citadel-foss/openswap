@@ -30,7 +30,8 @@ What a run needs:
 to stdout at debug level (`OPENSWAP_TEST_LOG=warn`, or `off`, lowers it), less
 the lock WAIT/GOT traces, which `OPENSWAP_TEST_LOG_LOCKS=debug` brings back.
 Each stdout line names its test, e.g. `[swap::electrum::taproot_swap_completes]`, so
-interleaved CI output can be traced back.
+interleaved CI output can be traced back. In GitHub Actions each test's output
+is one collapsible group in the job log.
 
 The three Tor tests (`recovery::electrum::tor_taproot_taker_drops_after_funding`,
 `recovery::electrum::tor_legacy_taker_drops_after_funding`,
