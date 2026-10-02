@@ -22,44 +22,34 @@ use openswap::{
     protocol::common_messages::ProtocolVersion,
     taker::{
         swap_tracker::{RecoveryPhase, SwapTracker},
-        SwapParams, Taker, TakerBehavior,
+        SwapParams, Taker,
     },
 };
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{
     thread,
     time::{Duration, Instant},
 };
 
-#[test]
-fn test_legacy_taker_restart_recovery() {
-    warn!("Running Test: Legacy Taker Restart Recovery");
-    run_taker_restart_recovery(ProtocolVersion::Legacy, MakerBehavior::CloseAtHashPreimage);
-}
-
-#[test]
-fn test_taproot_taker_restart_recovery() {
-    warn!("Running Test: Taproot Taker Restart Recovery");
-    run_taker_restart_recovery(
-        ProtocolVersion::Taproot,
-        MakerBehavior::CloseAtPrivateKeyHandover,
-    );
-}
-
-fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavior) {
-    let maker_count = 2;
-    let taker_behavior = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, last_maker];
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behavior)
-        .build();
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, last_maker],
+    takers = [Normal],
+    cases = [
+        test_legacy_taker_restart_recovery(
+            protocol = ProtocolVersion::Legacy,
+            last_maker = MakerBehavior::CloseAtHashPreimage,
+        ),
+        test_taproot_taker_restart_recovery(
+            protocol = ProtocolVersion::Taproot,
+            last_maker = MakerBehavior::CloseAtPrivateKeyHandover,
+        ),
+    ],
+)]
+fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
     // Owned, not borrowed: this taker gets dropped mid-test.
     let mut taker = world.take_taker();
 
@@ -255,6 +245,4 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     );
 
     info!("Taker restart recovery test completed successfully!");
-
-    world.finish();
 }

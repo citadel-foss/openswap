@@ -6,11 +6,10 @@
 
 use bitcoin::{Amount, OutPoint};
 use bitcoind::bitcoincore_rpc::RpcApi;
-use log::{info, warn};
+use log::info;
 use openswap::{
-    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
+    taker::SwapParams,
     utill::MIN_RELAY_FEE_RATE,
     wallet::{AddressType, WalletError},
 };
@@ -61,16 +60,13 @@ const TEST_CASES: &[(f64, &[f64], &str, &str)] = &[
     ),
 ];
 
-#[test]
-fn test_address_grouping_behavior() {
-    // Initialize test environment with one maker (no swap needed, just wallet testing)
-    let world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .takers([TakerBehavior::Normal])
-        .build();
-
-    println!("=== Testing Smart Address Grouping Behavior ===");
-
+#[world_test(
+    backend = BitcoindBackend,
+    // One maker: no swap needed, just wallet testing.
+    makers = 1,
+    takers = [Normal],
+)]
+fn test_address_grouping_behavior(world: &mut World) {
     let bitcoind = world.bitcoind();
     let maker = world.makers()[0].inner();
 
@@ -177,30 +173,19 @@ fn test_address_grouping_behavior() {
 
     println!("\n=== Test Completed Successfully ===");
     println!("All address grouping scenarios work correctly");
-
-    // Clean shutdown
-    world.finish();
 }
 
-#[test]
-fn test_separated_utxo_coin_selection() {
-    // Initialize test environment with TWO makers and one taker
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .takers([TakerBehavior::Normal])
-        .build();
-
-    warn!("Running Test: Separated UTXO Coin Selection");
-
-    // Fund the taker and Makers
-    world.fund_taker(6, Amount::from_btc(0.1).unwrap(), AddressType::P2TR); // 60M sats total
-
-    world.fund_makers(6, Amount::from_btc(0.1).unwrap(), AddressType::P2TR); // 60M sats total
-
-    // Start the Maker Servers and wait for both makers setup completion
-    info!("Starting Maker servers");
-    world.start_makers_without_sync(120);
-
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 2,
+    takers = [Normal],
+    setup = [
+        fund_taker(6, Amount::from_btc(0.1).unwrap(), AddressType::P2TR), // 60M sats total
+        fund_makers(6, Amount::from_btc(0.1).unwrap(), AddressType::P2TR), // 60M sats total
+        start_makers_without_sync(120),
+    ],
+)]
+fn test_separated_utxo_coin_selection(world: &mut World) {
     // Perform openswap to create swap coins
     info!("Performing openswap to create swap coins");
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(35000000), 2)
@@ -344,18 +329,14 @@ fn test_separated_utxo_coin_selection() {
     }
 
     println!("\n=== Test Completed Successfully ===");
-
-    world.shutdown_makers();
-    world.finish();
 }
 
-#[test]
-fn test_manual_coinselection() {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .takers([TakerBehavior::Normal])
-        .build();
-
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 2,
+    takers = [Normal],
+)]
+fn test_manual_coinselection(world: &mut World) {
     let amounts: Vec<u64> = vec![
         90_283, 150_813, 212_842, 185_372, 478_324, 314_332, 136_414, 23_894, 10_000,
     ];
@@ -663,46 +644,39 @@ fn test_manual_coinselection() {
     }
 
     println!("All test cases completed successfully");
-    world.finish();
 }
 
 /// A maker with fragmented liquidity cannot fund the requested 3 splits within
 /// the input budget, so the planner degrades to 1 split (7 inputs, the excess
 /// over the budget is maker-paid) and the swap still completes. The taker's
 /// log line "3 receivers, 1 senders" pins the degradation.
-#[test]
-fn test_legacy_swap_completes_with_degraded_splits() {
-    run_degraded_split_swap(ProtocolVersion::Legacy);
-}
-
-/// Same fragmented pool on Taproot: admission and funding share the planner
-/// with Legacy, so the same degradation must show on the other protocol.
-#[test]
-fn test_taproot_swap_completes_with_degraded_splits() {
-    run_degraded_split_swap(ProtocolVersion::Taproot);
-}
-
-fn run_degraded_split_swap(protocol: ProtocolVersion) {
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(1)
-        .maker_behaviors([MakerBehavior::Normal])
-        .takers([TakerBehavior::Normal])
-        .build();
-    world.fund_taker_default(3);
-    // Bond UTXO is exact (5,000,000 + 243 fee) so no change UTXO joins the
-    // pool; liquidity is exactly one 400k UTXO plus six 20k UTXOs.
-    world.fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR);
-    world.fund_makers(1, Amount::from_sat(400_000), AddressType::P2TR);
-    world.fund_makers(6, Amount::from_sat(20_000), AddressType::P2TR);
-    world.spawn_ready_makers_and_mine();
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3),
+        // Bond UTXO is exact (5,000,000 + 243 fee) so no change UTXO joins the
+        // pool; liquidity is exactly one 400k UTXO plus six 20k UTXOs.
+        fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR),
+        fund_makers(1, Amount::from_sat(400_000), AddressType::P2TR),
+        fund_makers(6, Amount::from_sat(20_000), AddressType::P2TR),
+        spawn_ready_makers_and_mine(),
+    ],
+    swap(protocol = protocol, sats = 500_000, makers = 1, tx_count = 3),
+    cases = [
+        test_legacy_swap_completes_with_degraded_splits(protocol = ProtocolVersion::Legacy),
+        /// Same fragmented pool on Taproot: admission and funding share the planner
+        /// with Legacy, so the same degradation must show on the other protocol.
+        test_taproot_swap_completes_with_degraded_splits(protocol = ProtocolVersion::Taproot),
+    ],
+)]
+fn run_degraded_split_swap(world: &mut World, protocol: ProtocolVersion, params: SwapParams) {
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
-    let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
-        .with_tx_count(3)
-        .with_required_confirms(1);
     world
         .taker_mut()
-        .swap(swap_params)
+        .swap(params)
         .expect("swap must complete with degraded splits");
 
     let taker_balance = world.taker().balances();
@@ -743,5 +717,4 @@ fn run_degraded_split_swap(protocol: ProtocolVersion) {
             );
         }
     }
-    world.finish();
 }

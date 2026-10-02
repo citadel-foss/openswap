@@ -3,9 +3,8 @@
 use bitcoin::{Amount, Network};
 use openswap::{
     blocklist::BlocklistError,
-    maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
-    taker::{error::TakerError, SwapParams, TakerBehavior},
+    taker::{error::TakerError, SwapParams},
     wallet::AddressType,
 };
 
@@ -13,46 +12,16 @@ use super::test_framework::*;
 
 use std::thread;
 
-#[test]
-fn maker_rejects_legacy_funding_from_blocked_address() {
-    run_maker_rejection(ProtocolVersion::Legacy);
-}
-
-#[test]
-fn maker_rejects_taproot_funding_from_blocked_address() {
-    run_maker_rejection(ProtocolVersion::Taproot);
-}
-
-#[test]
-fn taker_rejects_legacy_funding_from_blocked_address() {
-    run_taker_rejection(ProtocolVersion::Legacy);
-}
-
-#[test]
-fn taker_rejects_taproot_funding_from_blocked_address() {
-    run_taker_rejection(ProtocolVersion::Taproot);
-}
-
-#[test]
-fn legacy_populated_blocklist_is_ignored_when_disabled() {
-    run_disabled_blocklist(ProtocolVersion::Legacy);
-}
-
-#[test]
-fn taproot_populated_blocklist_is_ignored_when_disabled() {
-    run_disabled_blocklist(ProtocolVersion::Taproot);
-}
-
-fn run_disabled_blocklist(protocol: ProtocolVersion) {
-    let maker_count = 1;
-    let taker_behaviors = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal];
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behaviors)
-        .build();
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    cases = [
+        legacy_populated_blocklist_is_ignored_when_disabled(protocol = ProtocolVersion::Legacy),
+        taproot_populated_blocklist_is_ignored_when_disabled(protocol = ProtocolVersion::Taproot),
+    ],
+)]
+fn run_disabled_blocklist(world: &mut World, protocol: ProtocolVersion) {
     let blocked_taker_address = world
         .taker()
         .inner()
@@ -128,21 +97,19 @@ fn run_disabled_blocklist(protocol: ProtocolVersion) {
         .taker_mut()
         .swap(params)
         .expect("a populated blocklist must be ignored when checking is disabled");
-
-    world.finish();
 }
 
-fn run_maker_rejection(protocol: ProtocolVersion) {
-    let maker_count = 2;
-    let taker_behaviors = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behaviors)
-        .check_blocklist()
-        .build();
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    check_blocklist,
+    cases = [
+        maker_rejects_legacy_funding_from_blocked_address(protocol = ProtocolVersion::Legacy),
+        maker_rejects_taproot_funding_from_blocked_address(protocol = ProtocolVersion::Taproot),
+    ],
+)]
+fn run_maker_rejection(world: &mut World, protocol: ProtocolVersion) {
     // Every spendable taker UTXO comes from this address, so whichever coins
     // funding selects must trigger the maker's source-address check.
     let blocked_address = world
@@ -199,23 +166,20 @@ fn run_maker_rejection(protocol: ProtocolVersion) {
             "blocklist rejection must happen before maker liquidity is spent"
         );
     }
-
-    world.finish();
 }
 
-fn run_taker_rejection(protocol: ProtocolVersion) {
-    let maker_count = 1;
-    let taker_behaviors = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal];
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .maker_behaviors(maker_behaviors)
-        .takers(taker_behaviors)
-        .check_blocklist()
-        .build();
-
-    world.fund_taker_default(3);
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    check_blocklist,
+    setup = [fund_taker_default(3)],
+    cases = [
+        taker_rejects_legacy_funding_from_blocked_address(protocol = ProtocolVersion::Legacy),
+        taker_rejects_taproot_funding_from_blocked_address(protocol = ProtocolVersion::Taproot),
+    ],
+)]
+fn run_taker_rejection(world: &mut World, protocol: ProtocolVersion) {
     // Reuse one maker address for the initial deposits. Fidelity setup later
     // consolidates them into the regular UTXO used for swap funding.
     let maker_deposit_address = world.makers()[0]
@@ -312,6 +276,4 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
         );
         assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
     }
-
-    world.finish();
 }

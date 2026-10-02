@@ -10,11 +10,7 @@ use bitcoind::{
     BitcoinD,
 };
 use log::info;
-use openswap::{
-    taker::{Taker, TakerBehavior},
-    utill::MIN_RELAY_FEE_RATE,
-    wallet::WalletError,
-};
+use openswap::{taker::Taker, utill::MIN_RELAY_FEE_RATE, wallet::WalletError};
 
 use super::test_framework::*;
 
@@ -42,13 +38,16 @@ fn spend_once(taker: &Taker, bitcoind: &BitcoinD) -> (bitcoin::Txid, bitcoin::Tr
     (txid, tx)
 }
 
-fn run_rebroadcast_unmined<B: TestBackend>() {
-    let world = World::builder::<B>()
-        .makers(0)
-        .takers(vec![TakerBehavior::Normal])
-        .build();
-
-    world.fund_taker_default(3);
+#[world_test(
+    makers = 0,
+    takers = [Normal],
+    setup = [fund_taker_default(3)],
+    cases = [
+        rebroadcast_unmined_bitcoind(backend = BitcoindBackend),
+        rebroadcast_unmined_electrum(backend = ElectrumBackend),
+    ],
+)]
+fn run_rebroadcast_unmined(world: &mut World) {
     let (txid, tx) = spend_once(world.taker().inner(), world.bitcoind());
 
     // A duplicate of an unconfirmed tx is not an error on either backend:
@@ -66,17 +65,18 @@ fn run_rebroadcast_unmined<B: TestBackend>() {
         txid,
         "an unconfirmed rebroadcast must succeed and return the txid"
     );
-
-    world.finish();
 }
 
-fn run_rebroadcast_mined<B: TestBackend>(core_backend: bool) {
-    let world = World::builder::<B>()
-        .makers(0)
-        .takers(vec![TakerBehavior::Normal])
-        .build();
-
-    world.fund_taker_default(3);
+#[world_test(
+    makers = 0,
+    takers = [Normal],
+    setup = [fund_taker_default(3)],
+    cases = [
+        rebroadcast_mined_bitcoind(backend = BitcoindBackend, core_backend = true),
+        rebroadcast_mined_electrum(backend = ElectrumBackend, core_backend = false),
+    ],
+)]
+fn run_rebroadcast_mined(world: &mut World, core_backend: bool) {
     let (_, tx) = spend_once(world.taker().inner(), world.bitcoind());
     world.mine(1);
     world.framework().wait_for_electrs_tip();
@@ -110,26 +110,4 @@ fn run_rebroadcast_mined<B: TestBackend>(core_backend: bool) {
             other => panic!("expected an Electrum protocol error, got {:?}", other),
         }
     }
-
-    world.finish();
-}
-
-#[test]
-fn rebroadcast_unmined_bitcoind() {
-    run_rebroadcast_unmined::<BitcoindBackend>();
-}
-
-#[test]
-fn rebroadcast_unmined_electrum() {
-    run_rebroadcast_unmined::<ElectrumBackend>();
-}
-
-#[test]
-fn rebroadcast_mined_bitcoind() {
-    run_rebroadcast_mined::<BitcoindBackend>(true);
-}
-
-#[test]
-fn rebroadcast_mined_electrum() {
-    run_rebroadcast_mined::<ElectrumBackend>(false);
 }

@@ -5,26 +5,19 @@
 
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
-use openswap::{maker::start_server, taker::TakerBehavior, wallet::AddressType};
+use openswap::{maker::start_server, wallet::AddressType};
 
 use super::test_framework::*;
 
 use std::{sync::atomic::Ordering::Relaxed, thread, time::Duration};
 
 /// Test automatic fidelity bond renewal for the maker server.
-#[test]
-fn test_fidelity_auto_renewal() {
-    // ---- Setup ----
-    let maker_count = 1;
-    let taker_behavior = vec![TakerBehavior::Normal];
-
-    let world = World::builder::<BitcoindBackend>()
-        .makers(maker_count)
-        .takers(taker_behavior)
-        .build();
-
-    log::info!("Running Test: Fidelity Bond Auto-Renewal ");
-
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 1,
+    takers = [Normal],
+)]
+fn test_fidelity_auto_renewal(world: &mut World) {
     let bitcoind = world.bitcoind();
     let maker = world.makers()[0].inner().clone();
 
@@ -214,7 +207,4 @@ fn test_fidelity_auto_renewal() {
     // Shutdown
     maker.shutdown.store(true, Relaxed);
     let _ = maker_thread.join();
-    world.finish();
-
-    log::info!("Fidelity bond auto-renewal test  completed successfully");
 }

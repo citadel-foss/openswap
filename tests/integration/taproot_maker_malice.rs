@@ -1,13 +1,9 @@
 use bitcoin::Amount;
-use openswap::{
-    maker::MakerBehavior,
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 use std::{thread, time::Duration};
 
 /// Test: Maker locks its funds on-chain after setup, then closes.
@@ -15,32 +11,24 @@ use std::{thread, time::Duration};
 /// Maker[1] broadcasts its contract transaction and closes without sending
 /// its contract-data response. The taker detects the failure and all parties
 /// recover via timelock.
-#[test]
-fn test_taproot_malice_maker_broadcast_contract() {
-    // ---- Setup ----
-    warn!("Running Test: Taproot Malice - Maker Broadcasts Contract After Setup");
-
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(2)
-        .maker_behaviors([
-            MakerBehavior::Normal,
-            MakerBehavior::BroadcastContractAfterSetup,
-        ])
-        .takers([TakerBehavior::Normal])
-        .build();
-
-    // Fund the taker with 3 UTXOs of 0.05 BTC each
-    let taker_original_balance = world.fund_taker_default(3);
-
-    // Fund the makers with 4 UTXOs of 0.05 BTC each
-    world.fund_makers_default();
-
-    log::info!("Starting Maker servers...");
-    world.start_makers(120);
-
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
-    log::info!("Starting taproot maker malice test...");
-
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, BroadcastContractAfterSetup],
+    takers = [Normal],
+    setup = [
+        // Fund the taker with 3 UTXOs of 0.05 BTC each
+        fund_taker_default(3) as taker_original_balance,
+        // Fund the makers with 4 UTXOs of 0.05 BTC each
+        fund_makers_default(),
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+)]
+fn test_taproot_malice_maker_broadcast_contract(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+) {
     // Start periodic swap tracker logging (every 10s)
     let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
@@ -159,5 +147,4 @@ fn test_taproot_malice_maker_broadcast_contract() {
     info!("Taproot maker malice test completed successfully!");
 
     tracker_logger.stop();
-    world.finish();
 }

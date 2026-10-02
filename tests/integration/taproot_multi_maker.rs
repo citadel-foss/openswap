@@ -1,39 +1,31 @@
 use bitcoin::Amount;
-use openswap::{
-    protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
-};
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use super::test_framework::*;
 
-use log::{info, warn};
+use log::info;
 
-#[test]
-fn test_taproot_multi_maker_openswap() {
-    // ---- Setup ----
-    warn!("Running Test: Multi-Maker OpenSwap with Taproot (MuSig2) Protocol - 4 Makers");
-
-    // Initialize test framework with 1 taker and 4 makers
-    let mut world = World::builder::<BitcoindBackend>()
-        .makers(4)
-        .takers([TakerBehavior::Normal])
-        .build();
-
-    // Fund the taker with 5 UTXOs of 0.05 BTC each (P2TR for Taproot)
-    // Need more UTXOs for a 4-maker route
-    let taker_original_balance = world.fund_taker_default(5);
-
-    // Fund makers with 4 UTXOs of 0.05 BTC each
-    world.fund_makers_default();
-
-    // Start the makers, wait for their setup, then sync their wallets so the
-    // fidelity bonds are accounted for
-    log::info!("Starting Maker servers...");
-    world.start_makers(120);
-
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
-    log::info!("Starting end-to-end swap test with Taproot protocol and 4 makers...");
-
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 4,
+    takers = [Normal],
+    setup = [
+        // Fund the taker with 5 UTXOs of 0.05 BTC each (P2TR for Taproot)
+        // Need more UTXOs for a 4-maker route
+        fund_taker_default(5) as taker_original_balance,
+        // Fund makers with 4 UTXOs of 0.05 BTC each
+        fund_makers_default(),
+        // Start the makers, wait for their setup, then sync their wallets so the
+        // fidelity bonds are accounted for
+        start_makers(120),
+        verify_maker_pre_swap_balances() as maker_spendable_balance,
+    ],
+)]
+fn test_taproot_multi_maker_openswap(
+    world: &mut World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: Vec<Amount>,
+) {
     // Swap params for openswap (Taproot) with 4 makers
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 4)
         .with_tx_count(3)
@@ -142,7 +134,4 @@ fn test_taproot_multi_maker_openswap() {
     }
 
     info!("All multi-maker swap tests (Taproot, 4 makers) completed successfully!");
-
-    world.shutdown_makers();
-    world.finish();
 }
