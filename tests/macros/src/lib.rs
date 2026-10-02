@@ -46,10 +46,10 @@
 //! ```
 //!
 //! - `backend` is required, unless every case names its own. Every other
-//!   key except `setup`, `swap` and `cases` is the `WorldBuilder` method of
-//!   the same name: `key = value` calls `.key(value)`, a bare `key` calls
-//!   `.key()`. Nothing is defaulted, except that `makers` is the length of a
-//!   `maker_behaviors` list when omitted.
+//!   key except `setup`, `bind`, `swap` and `cases` is the `WorldBuilder`
+//!   method of the same name: `key = value` calls `.key(value)`, a bare `key`
+//!   calls `.key()`. Nothing is defaulted, except that `makers` is the length
+//!   of a `maker_behaviors` list when omitted.
 //! - `maker_behaviors` and `takers` see the `MakerBehavior` and
 //!   `TakerBehavior` variants unqualified.
 //! - `setup` lists `World` steps run in order after `build()`. `step(..) as x`
@@ -74,6 +74,11 @@
 //! case's own `///` docs and attributes go to its test; the body's non-doc
 //! attributes go to every case. `backend = ElectrumBackend` in a case is not
 //! a local: it builds that case's world on its own backend.
+//!
+//! `bind = [name = value, (a, b) = value, ...]` makes locals before `build()`
+//! for every test the attribute declares, ahead of any case's own arguments.
+//! Keys can use them (`maker_lightning = [node.clone()]`), and the body takes
+//! the ones it needs by name.
 
 use std::collections::HashSet;
 
@@ -120,6 +125,8 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
     let mut steps = Vec::new();
     let mut swap = None;
     let mut cases = None;
+    let mut bind_names = Vec::new();
+    let mut bind_stmts = TokenStream2::new();
     let mut builder_calls = Vec::new();
     let mut maker_count = None;
     let mut makers_given = false;
@@ -148,6 +155,7 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         match key.to_string().as_str() {
             "backend" => backend = Some(backend_type(value)?),
             "setup" => steps = setup_steps(value, &world)?,
+            "bind" => (bind_names, bind_stmts) = bindings(value)?,
             "cases" => cases = Some(case_rows(value)?),
             "swap" => {
                 return Err(Error::new(
@@ -259,6 +267,7 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         None => Vec::new(),
     };
     bound.extend(case_names.iter().cloned());
+    bound.extend(bind_names.iter().map(Ident::to_string));
     let mut call_args = Vec::new();
     for input in inputs {
         let name = match input {
@@ -275,7 +284,7 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
                 name.span(),
                 format!(
                     "nothing binds `{name}`: add `... as {name}` to `setup`, \
-                     `swap(..)` for `params`, or `{name} = ..` to every case"
+                     `{name} = ..` to `bind` or to every case, or `swap(..)` for `params`"
                 ),
             ));
         }
@@ -305,6 +314,7 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
             call
         };
         quote! {
+            #bind_stmts
             #locals
             let mut #world = crate::test_framework::World::builder::<#backend>()
                 #(#builder_calls)*
@@ -522,6 +532,46 @@ fn setup_steps(value: Expr, world: &Ident) -> Result<Vec<Step>> {
             })
         })
         .collect()
+}
+
+/// `bind = [name = value, (a, b) = value, ...]`: the bound names and their
+/// `let` statements.
+fn bindings(value: Expr) -> Result<(Vec<Ident>, TokenStream2)> {
+    let Expr::Array(list) = value else {
+        return Err(Error::new(
+            value.span(),
+            "expected `bind = [name = value, ...]`",
+        ));
+    };
+    let (mut names, mut stmts) = (Vec::new(), Vec::new());
+    for elem in list.elems {
+        let Expr::Assign(assign) = elem else {
+            return Err(Error::new(elem.span(), "a binding is `name = value`"));
+        };
+        let name_of = |expr: Expr| match expr {
+            Expr::Path(path) => path.path.require_ident().cloned(),
+            other => Err(Error::new(other.span(), "expected a name")),
+        };
+        let pattern = match *assign.left {
+            Expr::Tuple(tuple) => {
+                let parts = tuple
+                    .elems
+                    .into_iter()
+                    .map(name_of)
+                    .collect::<Result<Vec<_>>>()?;
+                names.extend(parts.iter().cloned());
+                quote!((#(#parts),*))
+            }
+            other => {
+                let name = name_of(other)?;
+                names.push(name.clone());
+                quote!(#name)
+            }
+        };
+        let value = assign.right;
+        stmts.push(quote!(let #pattern = #value;));
+    }
+    Ok((names, quote!(#(#stmts)*)))
 }
 
 /// `cases = [/// docs \n test_name(arg = value, ...), ...]`.
@@ -890,5 +940,43 @@ mod tests {
             ),
             "{tokens}"
         );
+    }
+
+    #[test]
+    fn bind_makes_locals_before_build_for_keys_and_body() {
+        let tokens = expand(
+            quote!(
+                backend = BitcoindBackend,
+                bind = [node = mock_node(), (a, b) = pair()],
+                maker_lightning = [node.clone()],
+            ),
+            quote!(
+                fn scenario(world: &mut World, b: Node, node: Node) {}
+            ),
+        )
+        .unwrap()
+        .to_string();
+        let order = [
+            "let node = mock_node () ;",
+            "let (a , b) = pair () ;",
+            "World :: builder",
+            ". maker_lightning ([node . clone ()])",
+            "scenario (& mut world , b , node)",
+        ];
+        let mut from = 0;
+        for piece in order {
+            let at = tokens[from..]
+                .find(piece)
+                .unwrap_or_else(|| panic!("`{piece}` missing or out of order in {tokens}"));
+            from += at + piece.len();
+        }
+
+        let err = expand_err(
+            quote!(backend = BitcoindBackend, bind = [node.0 = x()]),
+            quote!(
+                fn scenario(world: &mut World) {}
+            ),
+        );
+        assert!(err.contains("expected a name"), "{err}");
     }
 }

@@ -178,6 +178,24 @@ fn run_maker_partial_broadcast<B: TestBackend>(world: &mut World, ..) {
 }
 ```
 
+Values the world needs before it exists go in `bind`: each `name = value` (or
+`(a, b) = value`) is a local made before `build()`, usable in the other keys
+and passed to the body by name. The Lightning tests bind their mock nodes this
+way, because a maker takes its node at init:
+
+```rust
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [(maker_ln, taker_ln) = maker_and_taker_nodes()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [maker_ln],
+    taker_lightning = [taker_ln],
+    setup = [..],
+)]
+fn lightning_submarine_swaps_e2e(world: &mut World) { .. }
+```
+
 Bodies under `scenarios/` and `swap_matrix!` rows still build their world
 themselves.
 
