@@ -65,7 +65,7 @@ pub struct TestFramework {
     nostr_relay: Mutex<Option<Child>>,
 }
 
-/// Per-maker offer override for [`TestFramework::init_with_fee_overrides`].
+/// Per-maker offer override for [`TestFramework::init`].
 /// `None` keeps the shared default, so existing tests stay homogeneous.
 #[derive(Clone, Copy, Debug)]
 pub struct MakerFeeOverride {
@@ -113,72 +113,15 @@ impl TestFramework {
     ///
     /// This creates Taker and MakerServer instances that support
     /// both Legacy (ECDSA) and Taproot (MuSig2) protocols using message types.
+    /// `fee_overrides` holds one slot per maker (`None` keeps the shared fee
+    /// schedule), `check_blocklist` turns on runtime blocklist screening for every
+    /// taker and maker, and `maker_lightning[i]` goes to maker `i`.
     ///
     /// Mines [`BLOCKS_PER_TICK`](super::timing::BLOCKS_PER_TICK) blocks every [`BLOCK_TICK_INTERVAL`](super::timing::BLOCK_TICK_INTERVAL) so
     /// timelocks can mature during a test.
     #[allow(clippy::type_complexity)]
     pub fn init<B: TestBackend>(
         maker_count: usize,
-        taker_behavior: Vec<TakerBehavior>,
-        maker_behaviors: Vec<MakerBehavior>,
-    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        let makers_config_map = vec![(0, None); maker_count];
-        let fee_overrides = vec![None; maker_count];
-        Self::init_with_settings::<B>(
-            makers_config_map,
-            fee_overrides,
-            taker_behavior,
-            maker_behaviors,
-            false,
-            #[cfg(feature = "lightning")]
-            Vec::new(),
-        )
-    }
-
-    /// Initialize the test framework with runtime blocklist screening enabled.
-    #[allow(clippy::type_complexity)]
-    pub fn init_with_blocklist<B: TestBackend>(
-        maker_count: usize,
-        taker_behavior: Vec<TakerBehavior>,
-        maker_behaviors: Vec<MakerBehavior>,
-    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        let makers_config_map = vec![(0, None); maker_count];
-        let fee_overrides = vec![None; maker_count];
-        Self::init_with_settings::<B>(
-            makers_config_map,
-            fee_overrides,
-            taker_behavior,
-            maker_behaviors,
-            true,
-            #[cfg(feature = "lightning")]
-            Vec::new(),
-        )
-    }
-
-    /// Like [`TestFramework::init`], but each maker advertises its own fee
-    /// schedule. Heterogeneous offers are what makes spare substitution derive
-    /// a different next-hop shape than the failed maker's.
-    #[allow(clippy::type_complexity)]
-    pub fn init_with_fee_overrides<B: TestBackend>(
-        makers_config_map: Vec<(u16, Option<u16>)>,
-        fee_overrides: Vec<Option<MakerFeeOverride>>,
-        taker_behavior: Vec<TakerBehavior>,
-        maker_behaviors: Vec<MakerBehavior>,
-    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        Self::init_with_settings::<B>(
-            makers_config_map,
-            fee_overrides,
-            taker_behavior,
-            maker_behaviors,
-            false,
-            #[cfg(feature = "lightning")]
-            Vec::new(),
-        )
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn init_with_settings<B: TestBackend>(
-        makers_config_map: Vec<(u16, Option<u16>)>,
         fee_overrides: Vec<Option<MakerFeeOverride>>,
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
@@ -189,7 +132,7 @@ impl TestFramework {
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
         assert_eq!(
             fee_overrides.len(),
-            makers_config_map.len(),
+            maker_count,
             "one fee override slot per maker"
         );
         // Setup directory — use a unique suffix so tests can run in parallel
@@ -283,14 +226,12 @@ impl TestFramework {
             // takes its pair at server start. Network ports must ascend with
             // the maker index: the taker sorts makers by address, so port
             // order decides route order and the golden balances.
-            let mut network_listeners = reserve_listeners(makers_config_map.len()).into_iter();
-            let mut rpc_listeners = reserve_listeners(makers_config_map.len()).into_iter();
+            let mut network_listeners = reserve_listeners(maker_count).into_iter();
+            let mut rpc_listeners = reserve_listeners(maker_count).into_iter();
 
             // Create the MakerServers with message handling
-            let makers: Vec<Arc<MakerServer>> = makers_config_map
-                .into_iter()
-                .enumerate()
-                .map(|(i, _)| {
+            let makers: Vec<Arc<MakerServer>> = (0..maker_count)
+                .map(|i| {
                     let network_listener = network_listeners.next().expect("one port per maker");
                     let rpc_listener = rpc_listeners.next().expect("one port per maker");
                     let network_port = network_listener.local_addr().unwrap().port();
@@ -386,26 +327,6 @@ impl TestFramework {
         (framework, takers, makers, generate_blocks_handle)
     }
 
-    /// [`TestFramework::init`] with a Lightning backend handed to each maker,
-    /// `maker_lightning[i]` going to the maker at index `i`.
-    #[allow(clippy::type_complexity)]
-    #[cfg(feature = "lightning")]
-    pub fn init_with_lightning<B: TestBackend>(
-        maker_count: usize,
-        taker_behavior: Vec<TakerBehavior>,
-        maker_behaviors: Vec<MakerBehavior>,
-        maker_lightning: Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>,
-    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
-        Self::init_with_settings::<B>(
-            vec![(0, None); maker_count],
-            vec![None; maker_count],
-            taker_behavior,
-            maker_behaviors,
-            false,
-            maker_lightning,
-        )
-    }
-
     /// Rebuild taker `i`'s init config, so a test can drop the taker and re-init
     /// it against the same wallet and data dir the way a restarted daemon would.
     /// Must stay in step with the taker setup inside [`TestFramework::init`],
@@ -426,7 +347,7 @@ impl TestFramework {
                     .unwrap()
                     .as_ref()
                     .expect(
-                        "Electrum backend needs electrsd, which init_with_settings spawns \
+                        "Electrum backend needs electrsd, which init spawns \
                          only for an Electrum backend with at least one taker or maker, and \
                          which is gone after teardown or once a test takes it",
                     )

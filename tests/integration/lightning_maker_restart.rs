@@ -15,10 +15,10 @@ use bitcoin::{
 };
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
-    lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest, Preimage},
+    lightning::{LightningBackend, MockLightningBackend, Preimage},
     maker::{
         handlers::{handle_message, ConnectionState},
-        MakerBehavior, MakerServer,
+        MakerServer,
     },
     protocol::{
         common_messages::{MakerToTakerMessage, TakerHello, TakerToMakerMessage},
@@ -26,7 +26,6 @@ use openswap::{
             LightningMakerMessage, LightningTakerMessage, LnSwapOutPaid, LnSwapOutRequest,
         },
     },
-    taker::TakerBehavior,
     wallet::AddressType,
 };
 
@@ -45,47 +44,28 @@ fn expect_ln(response: Option<MakerToTakerMessage>) -> LightningMakerMessage {
     }
 }
 
-#[test]
-fn lightning_maker_restart_recovers_funded_swap() {
-    log::warn!("Running Test: maker restart recovers a funded Lightning swap");
-
-    // A standalone mock node with capacity, so the maker advertises
-    // Lightning terms and can hold an invoice.
-    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
-    ln.set_onchain_balance(Amount::from_btc(0.02).unwrap());
+/// A standalone mock node with a ready channel, so the maker advertises
+/// Lightning terms and can hold an invoice.
+fn maker_node() -> Arc<MockLightningBackend> {
+    let ln = Arc::new(MockLightningBackend::new());
     let peer = SecretKey::from_slice(&[0x21; 32]).unwrap();
-    let channel = ln
-        .open_channel(OpenChannelRequest {
-            node_pubkey: peer.public_key(&Secp256k1::new()),
-            address: "127.0.0.1:9735".to_string(),
-            channel_amount: Amount::from_sat(1_000_000),
-            // Push half to the peer so the channel has inbound capacity too:
-            // swap-outs are bounded by inbound, and a freshly opened channel
-            // has none.
-            push_to_counterparty_msat: Some(500_000_000),
-            announce_channel: false,
-        })
-        .unwrap();
-    ln.simulate_channel_ready(&channel);
-    let _ = ln.poll_event().unwrap();
+    open_ready_channel(&ln, peer.public_key(&Secp256k1::new()), Some(500_000_000));
+    ln
+}
 
-    let (test_framework, takers, makers, block_generation_handle) =
-        TestFramework::init_with_lightning::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-            vec![ln.clone() as Arc<dyn LightningBackend>],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2WPKH,
-    );
-
-    let maker = makers[0].clone();
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_restart_recovers_funded_swap(world: &mut World, ln: Arc<MockLightningBackend>) {
+    // A handle of its own: the makers are dropped mid-test, the node is not.
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
     // Must clear the maker's floor: enough window must remain after the
     // confirmations it waits for.
     let locktime: u16 = 30;
@@ -159,7 +139,7 @@ fn lightning_maker_restart_recovers_funded_swap() {
     maker.shutdown.store(true, Relaxed);
     maker.watch_service.shutdown();
     drop(maker);
-    drop(makers);
+    world.drop_makers();
 
     let mut restarted = MakerServer::init(config).expect("maker restarts");
     restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
@@ -214,9 +194,6 @@ fn lightning_maker_restart_recovers_funded_swap() {
         .unwrap_or(0);
     assert!(confirmations >= 1, "refund must confirm");
 
-    drop(takers);
     restarted.shutdown.store(true, Relaxed);
     restarted.watch_service.shutdown();
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
 }
