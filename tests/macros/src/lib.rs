@@ -59,8 +59,11 @@
 //!   `confirms` keep `SwapParams::new`'s defaults (2 and 1). `protocol` is
 //!   `Legacy`, `Taproot` or any `ProtocolVersion` expression, and every value
 //!   may name a case argument.
-//! - The body's first parameter receives the world; every later parameter
-//!   is a setup binding, `params` or a case argument, matched by name. A body
+//! - The body's first parameter receives the fixture, and its type picks it:
+//!   `world: &mut World` builds a `World`, `node: &mut Node` a bare `Node`.
+//!   Any fixture works that has `builder::<B>()`, `build()` and `finish()`.
+//!   Every later parameter is a setup binding, `params`, a `bind` name or a
+//!   case argument, matched by name. A body
 //!   with one type parameter (`fn body<B: TestBackend>(..)`) receives the
 //!   test's backend type through it.
 //! - Once the world is built, the test logs `Running Test: <name> - <first
@@ -231,12 +234,15 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
 
     // The first parameter takes the world; the rest are bindings or case args.
     let mut inputs = body.sig.inputs.iter();
-    if inputs.next().is_none() {
-        return Err(Error::new(
-            body.sig.span(),
-            "the body takes the world first, e.g. `world: &mut World`",
-        ));
-    }
+    let fixture = match inputs.next() {
+        Some(FnArg::Typed(typed)) => fixture_type(&typed.ty)?,
+        _ => {
+            return Err(Error::new(
+                body.sig.span(),
+                "the body takes its fixture first, e.g. `world: &mut World`",
+            ))
+        }
+    };
     let mut bound: HashSet<String> = steps
         .iter()
         .filter_map(|step| step.binding.as_ref().map(Ident::to_string))
@@ -316,7 +322,7 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         quote! {
             #bind_stmts
             #locals
-            let mut #world = crate::test_framework::World::builder::<#backend>()
+            let mut #world = crate::test_framework::#fixture::builder::<#backend>()
                 #(#builder_calls)*
                 .build();
             // After build: the framework sets the logger up.
@@ -426,6 +432,25 @@ fn ascii(text: &str) -> String {
             _ => None,
         })
         .collect()
+}
+
+/// `&mut World` -> `World`: the fixture a body's first parameter names.
+fn fixture_type(ty: &Type) -> Result<Ident> {
+    let wrong = || {
+        Error::new(
+            ty.span(),
+            "the fixture parameter is `&mut World` or `&mut Node`",
+        )
+    };
+    let Type::Reference(reference) = ty else {
+        return Err(wrong());
+    };
+    match (&reference.mutability, &*reference.elem) {
+        (Some(_), Type::Path(path)) if path.qself.is_none() => {
+            path.path.require_ident().cloned().map_err(|_| wrong())
+        }
+        _ => Err(wrong()),
+    }
 }
 
 /// `backend = BitcoindBackend` arrives as a path expression; read it as a type.
@@ -743,7 +768,7 @@ mod tests {
                 quote!(
                     fn scenario() {}
                 ),
-                "the body takes the world first",
+                "the body takes its fixture first",
             ),
         ];
         for (args, item, expected) in cases {
@@ -978,5 +1003,37 @@ mod tests {
             ),
         );
         assert!(err.contains("expected a name"), "{err}");
+    }
+
+    #[test]
+    fn the_first_parameter_picks_the_fixture() {
+        let tokens = expand(
+            quote!(backend = ElectrumBackend, setup = [mine(101)]),
+            quote!(
+                fn scenario(node: &mut Node) {}
+            ),
+        )
+        .unwrap()
+        .to_string();
+        for piece in [
+            "crate :: test_framework :: Node :: builder :: < ElectrumBackend > ()",
+            ". mine (101) ;",
+            "scenario (& mut world ,) ;",
+            ". finish () ;",
+        ] {
+            assert!(tokens.contains(piece), "`{piece}` missing in {tokens}");
+        }
+
+        for body in [
+            quote!(
+                fn scenario(world: World) {}
+            ),
+            quote!(
+                fn scenario(world: &World) {}
+            ),
+        ] {
+            let err = expand_err(quote!(backend = BitcoindBackend), body);
+            assert!(err.contains("`&mut World` or `&mut Node`"), "{err}");
+        }
     }
 }

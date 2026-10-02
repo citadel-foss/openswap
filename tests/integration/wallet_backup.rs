@@ -1,19 +1,14 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::Path;
 
-use bip39::rand;
 use bitcoin::{absolute::LockTime, Address, Amount};
 use bitcoind::{
-    bitcoincore_rpc::{self, Auth},
+    bitcoincore_rpc::{self},
     BitcoinD,
 };
-use electrsd::ElectrsD;
 
 use openswap::wallet::{
-    AddressType, AnyBlockchain, BackendConfig, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
-    Wallet, WalletBackup,
+    AddressType, AnyBlockchain, BackendConfig, CoreRPC, CoreRpcConfig, Electrum, Wallet,
+    WalletBackup,
 };
 
 use openswap::{
@@ -21,59 +16,10 @@ use openswap::{
     utill::MIN_RELAY_FEE_RATE,
 };
 
-use super::test_framework::{
-    generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
-};
-
-fn setup(test_name: String) -> (PathBuf, CoreRpcConfig, PathBuf, BitcoinD, PathBuf, PathBuf) {
-    let root_dir = std::env::temp_dir().join(format!("openswap-{}", rand::random::<u64>()));
-    let temp_dir = root_dir.join("wallet-tests").join(test_name);
-    let wallets_dir = temp_dir.join("");
-
-    let original_wallet_name = "original-wallet".to_string();
-    let original_wallet = wallets_dir.join(&original_wallet_name);
-    let wallet_backup_file = wallets_dir.join("wallet-backup.json");
-    let restored_wallet_name = "restored-wallet".to_string();
-    let restored_wallet_file = wallets_dir.join(&restored_wallet_name);
-    if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir).unwrap();
-    }
-
-    let port_zmq = 28332 + rand::random::<u16>() % 1000;
-
-    let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
-
-    let bitcoind = init_bitcoind(&temp_dir, zmq_addr).expect("bitcoind failed to start");
-
-    let url = bitcoind.rpc_url().split_at(7).1.to_string();
-    let auth = Auth::CookieFile(bitcoind.params.cookie_file.clone());
-
-    let rpc_config = CoreRpcConfig {
-        url,
-        auth,
-        wallet_name: original_wallet_name.clone(),
-        ..CoreRpcConfig::default()
-    };
-    (
-        original_wallet,
-        rpc_config,
-        wallet_backup_file,
-        bitcoind,
-        restored_wallet_file,
-        root_dir,
-    )
-}
-
-fn cleanup(bitcoind: &mut BitcoinD, root_dir: &Path) {
-    bitcoind.stop().unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    if root_dir.exists() {
-        let _ = fs::remove_dir_all(root_dir);
-    }
-}
+use super::test_framework::*;
 
 fn send_and_mine(
-    bitcoind: &mut BitcoinD,
+    bitcoind: &BitcoinD,
     address: &Address,
     btc_amount: f64,
     blocks_to_generate: u64,
@@ -122,16 +68,17 @@ fn assert_wallet_file_encrypted(path: &Path, password: &str) {
     assert!(material.is_some());
 }
 
-#[test]
-fn encwallet_encbackup_encrestore() {
-    let (
-        original_wallet,
-        rpc_config,
-        wallet_backup_file,
-        mut bitcoind,
-        restored_wallet_file,
-        root_dir,
-    ) = setup("encwallet_encbackup_encrestore".to_string());
+#[world_test(backend = BitcoindBackend)]
+fn encwallet_encbackup_encrestore(node: &mut Node) {
+    let wallets = node.temp_dir().join("wallets");
+    let original_wallet = wallets.join("original-wallet");
+    let wallet_backup_file = wallets.join("wallet-backup.json");
+    let restored_wallet_file = wallets.join("restored-wallet");
+    let rpc_config = CoreRpcConfig {
+        wallet_name: "original-wallet".to_string(),
+        ..node.rpc_config()
+    };
+    let bitcoind = node.bitcoind();
 
     let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
 
@@ -143,23 +90,23 @@ fn encwallet_encbackup_encrestore() {
     .unwrap();
 
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
+    send_and_mine(bitcoind, &addr, 0.05, 1).unwrap();
 
     let _ = wallet.backup(&wallet_backup_file, km.clone());
 
     // Bond 0 expires at once and is redeemed, so the restore must see it spent.
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
     create_maker_bond(&mut wallet, 1);
-    generate_blocks(&bitcoind, 2);
+    generate_blocks(bitcoind, 2);
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
     create_maker_bond(&mut wallet, 950);
     wallet
         .redeem_fidelity(0, MIN_RELAY_FEE_RATE, AddressType::P2TR)
         .unwrap();
-    generate_blocks(&bitcoind, 1);
+    generate_blocks(bitcoind, 1);
 
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
+    send_and_mine(bitcoind, &addr, 0.05, 1).unwrap();
 
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
 
@@ -194,7 +141,7 @@ fn encwallet_encbackup_encrestore() {
 
     // A nameless restore path resolves to the backup's original filename
     // instead of colliding with the wallets directory itself.
-    let nameless_dir = root_dir.join("nameless-restore");
+    let nameless_dir = node.temp_dir().join("nameless-restore");
     std::fs::create_dir_all(&nameless_dir).unwrap();
     Wallet::restore(
         &backup,
@@ -204,103 +151,60 @@ fn encwallet_encbackup_encrestore() {
     )
     .unwrap();
     assert_wallet_file_encrypted(&nameless_dir.join("original-wallet"), "integration-test");
-
-    cleanup(&mut bitcoind, &root_dir);
 }
 
-/// Setup state for the Electrum-backed backup/restore tests.
-struct ElectrumSetup {
-    original_wallet: PathBuf,
-    restored_wallet: PathBuf,
-    backup_file: PathBuf,
-    electrum_cfg: ElectrumConfig,
-    bitcoind: BitcoinD,
-    /// Owns the electrs child process for the lifetime of the test.
-    electrsd: ElectrsD,
-    root_dir: PathBuf,
-}
-
-fn setup_electrum(test_name: &str) -> ElectrumSetup {
-    let root_dir = std::env::temp_dir().join(format!("openswap-elec-{}", rand::random::<u64>()));
-    let temp_dir = root_dir.join("wallet-tests").join(test_name);
-    let wallets_dir = temp_dir.join("");
-    let original_wallet_name = "original-wallet".to_string();
-    let restored_wallet_name = "restored-wallet".to_string();
-
-    if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir).unwrap();
-    }
-
-    // bitcoind still mines and funds; electrs indexes for the wallet.
-    let port_zmq = 28332 + rand::random::<u16>() % 1000;
-    let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
-    let bitcoind = init_bitcoind(&temp_dir, zmq_addr).expect("bitcoind failed to start");
-    let electrsd = init_electrsd(&bitcoind, &temp_dir);
-    let electrum_url = format!("tcp://{}", electrsd.electrum_url);
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    let _ = electrsd.trigger();
-
-    ElectrumSetup {
-        original_wallet: wallets_dir.join(&original_wallet_name),
-        restored_wallet: wallets_dir.join(&restored_wallet_name),
-        backup_file: wallets_dir.join("wallet-backup.json"),
-        electrum_cfg: ElectrumConfig {
-            url: electrum_url,
-            ..Default::default()
-        },
-        bitcoind,
-        electrsd,
-        root_dir,
-    }
-}
-
-#[test]
-fn encwallet_encbackup_encrestore_electrum() {
-    let mut s = setup_electrum("encwallet_encbackup_encrestore_electrum");
+#[world_test(backend = ElectrumBackend)]
+fn encwallet_encbackup_encrestore_electrum(node: &mut Node) {
+    let wallets = node.temp_dir().join("wallets");
+    let original_wallet = wallets.join("original-wallet");
+    let backup_file = wallets.join("wallet-backup.json");
+    let restored_wallet_file = wallets.join("restored-wallet");
+    let electrum_cfg = node.electrum_config();
+    let bitcoind = node.bitcoind();
 
     let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
 
     let mut wallet = Wallet::init(
-        &s.original_wallet,
-        AnyBlockchain::Electrum(Electrum::new(&s.electrum_cfg).unwrap()),
+        &original_wallet,
+        AnyBlockchain::Electrum(Electrum::new(&electrum_cfg).unwrap()),
         km.clone(),
     )
     .unwrap();
 
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut s.bitcoind, &addr, 0.05, 1).unwrap();
-    wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
+    send_and_mine(bitcoind, &addr, 0.05, 1).unwrap();
+    wait_for_electrs_tip(bitcoind, node.electrsd(), &electrum_cfg);
 
-    wallet.backup(&s.backup_file, km.clone()).unwrap();
+    wallet.backup(&backup_file, km.clone()).unwrap();
 
     // Bond 0 expires at once and is redeemed, so the restore must see it spent.
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
     create_maker_bond(&mut wallet, 1);
-    generate_blocks(&s.bitcoind, 2);
-    wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
+    generate_blocks(bitcoind, 2);
+    wait_for_electrs_tip(bitcoind, node.electrsd(), &electrum_cfg);
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
     create_maker_bond(&mut wallet, 950);
     wallet
         .redeem_fidelity(0, MIN_RELAY_FEE_RATE, AddressType::P2TR)
         .unwrap();
-    generate_blocks(&s.bitcoind, 1);
+    generate_blocks(bitcoind, 1);
 
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
-    send_and_mine(&mut s.bitcoind, &addr, 0.05, 1).unwrap();
-    wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
+    send_and_mine(bitcoind, &addr, 0.05, 1).unwrap();
+    wait_for_electrs_tip(bitcoind, node.electrsd(), &electrum_cfg);
 
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
 
     let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
-        &s.backup_file,
+        &backup_file,
         Some("integration-test".to_string()),
     )
     .unwrap();
 
     let restored_wallet = Wallet::restore(
         &backup,
-        &s.restored_wallet,
-        &BackendConfig::Electrum(s.electrum_cfg.clone()),
+        &restored_wallet_file,
+        &BackendConfig::Electrum(electrum_cfg.clone()),
         km.clone(),
     )
     .unwrap();
@@ -315,9 +219,5 @@ fn encwallet_encbackup_encrestore_electrum() {
 
     // The restore must have written an *encrypted* wallet file, keyed by the
     // restore passphrase.
-    assert_wallet_file_encrypted(&s.restored_wallet, "integration-test");
-
-    // Kill electrs before cleanup wipes root_dir, which holds its datadir.
-    drop(s.electrsd);
-    cleanup(&mut s.bitcoind, &s.root_dir);
+    assert_wallet_file_encrypted(&restored_wallet_file, "integration-test");
 }

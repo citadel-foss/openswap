@@ -1,56 +1,12 @@
-//! Throwaway regtest nodes, mock-node channels and chain helpers for the
-//! Lightning tests.
+//! Mock-node channels and chain helpers for the Lightning tests.
 
-use std::{env, fs, path::PathBuf, thread, time::Duration};
+use std::{thread, time::Duration};
 
-use bip39::rand;
 use bitcoin::{secp256k1::PublicKey, Amount, Txid};
 use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
 use openswap::lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest};
 
-use super::procs::bitcoind::{generate_blocks, init_bitcoind, send_to_address};
-
-/// A throwaway regtest node that deletes its data directory when it drops.
-///
-/// Derefs to the [`BitcoinD`] so callers use it like the node itself.
-pub(crate) struct LnRegtest {
-    node: Option<BitcoinD>,
-    dir: PathBuf,
-}
-
-impl std::ops::Deref for LnRegtest {
-    type Target = BitcoinD;
-    fn deref(&self) -> &BitcoinD {
-        self.node.as_ref().expect("node lives until drop")
-    }
-}
-
-impl Drop for LnRegtest {
-    fn drop(&mut self) {
-        // Stop the node first: its data directory cannot be removed from
-        // under a running process.
-        drop(self.node.take());
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Spawns a throwaway regtest bitcoind under a unique temp directory, which
-/// is removed when the returned guard drops.
-///
-/// `suite` groups a test file's data directories; `test_name` names the run.
-pub(crate) fn setup_bitcoind(suite: &str, test_name: &str) -> LnRegtest {
-    // The unique root, not the leaf, is what gets removed: deleting only the
-    // leaf would leave an empty shell behind on every run.
-    let root = env::temp_dir().join(format!("coinswap-{}", rand::random::<u64>()));
-    let dir = root.join(suite).join(test_name);
-    let port_zmq = 28332 + rand::random::<u16>() % 20000;
-    let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
-    let node = init_bitcoind(&dir, zmq_addr).expect("bitcoind starts");
-    LnRegtest {
-        node: Some(node),
-        dir: root,
-    }
-}
+use super::procs::bitcoind::{generate_blocks, send_to_address};
 
 /// Fetches a transaction by txid, retrying briefly: the asynchronous txindex
 /// can lag behind a freshly mined block under parallel test load.

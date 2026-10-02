@@ -37,35 +37,19 @@ use std::{
 /// Pins the two backend answers the maker's funding check rests on: `None` sees a
 /// mempool-only spend, while `Some(false)` — the argument it used to pass — reports
 /// that output live on Core. Pins the backend, not the maker's call site.
-#[test]
-fn test_mempool_only_spend_reads_as_spent() {
-    // Its own bitcoind: nothing mines in the background, so the spend cannot
+#[world_test(backend = BitcoindBackend)]
+fn test_mempool_only_spend_reads_as_spent(node: &mut Node) {
+    // A bare node: nothing mines in the background, so the spend cannot
     // confirm while the assertions run.
-    let temp_dir =
-        std::env::temp_dir().join(format!("openswap-mempool-spend-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_dir).unwrap();
-    // Ask the OS for the zmq port rather than guessing one in a range.
-    let zmq_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let bitcoind = init_bitcoind(&temp_dir, format!("tcp://127.0.0.1:{}", zmq_port))
-        .expect("bitcoind failed to start");
-
-    let rpc_config = CoreRpcConfig {
-        url: bitcoind.rpc_url().split_at(7).1.to_string(),
-        auth: Auth::CookieFile(bitcoind.params.cookie_file.clone()),
-        ..Default::default()
-    };
-    let backend = CoreRPC::new(&rpc_config).expect("connect Core backend");
+    let bitcoind = node.bitcoind();
+    let backend = CoreRPC::new(&node.rpc_config()).expect("connect Core backend");
 
     let address = bitcoind
         .client
         .get_new_address(None, None)
         .unwrap()
         .assume_checked();
-    let spend_txid = send_to_address(&bitcoind, &address, Amount::ONE_BTC);
+    let spend_txid = send_to_address(bitcoind, &address, Amount::ONE_BTC);
     let spend = bitcoind
         .client
         .get_raw_transaction(&spend_txid, None)
@@ -93,8 +77,6 @@ fn test_mempool_only_spend_reads_as_spent() {
     );
 
     info!("Mempool-only spend reads as spent on the Core backend");
-    drop(bitcoind);
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
 /// Test Fidelity Bond Creation and Redemption

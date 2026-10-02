@@ -2,9 +2,7 @@
 //! This test exercises the taker CLI commands: get-new-address, get-balances, list-utxo,
 //! and send-to-address, verifying correct wallet behavior through the command-line interface.
 
-use bip39::rand;
 use bitcoin::{address::NetworkChecked, Address, Amount};
-use bitcoind::{bitcoincore_rpc::RpcApi, tempfile::env::temp_dir, BitcoinD};
 
 use serde_json::{json, Value};
 use std::{
@@ -15,43 +13,21 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use super::test_framework::{generate_blocks, init_bitcoind, send_to_address};
+use super::test_framework::*;
 
 use log::info;
 
-/// The taker-cli command struct
-struct TakerCli {
+/// Runs the `taker` binary against a node, with its data in the node's temp dir.
+struct TakerCli<'n> {
     data_dir: PathBuf,
-    temp_dir: PathBuf,
-    bitcoind: BitcoinD,
-    zmq_addr: String,
+    node: &'n Node,
 }
 
-impl TakerCli {
-    /// Construct a new [`TakerCli`] struct that also includes initiating bitcoind.
-    fn new() -> TakerCli {
-        // Initiate the bitcoind backend — unique dir for parallel test safety.
-        let unique_id = format!("openswap-cli-{}", bip39::rand::random::<u64>());
-        let temp_dir = temp_dir().join(unique_id);
-
-        // Remove if previously existing
-        if temp_dir.exists() {
-            fs::remove_dir_all(&temp_dir).unwrap();
-        }
-
-        let port_zmq = 28332 + rand::random::<u16>() % 1000;
-
-        let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
-
-        let bitcoind =
-            init_bitcoind(&temp_dir, zmq_addr.clone()).expect("bitcoind failed to start");
-        let data_dir = temp_dir.join("taker");
-
+impl<'n> TakerCli<'n> {
+    fn new(node: &'n Node) -> Self {
         TakerCli {
-            data_dir,
-            temp_dir,
-            bitcoind,
-            zmq_addr,
+            data_dir: node.temp_dir().join("taker"),
+            node,
         }
     }
 
@@ -60,13 +36,13 @@ impl TakerCli {
         let mut args = vec!["--data-directory", self.data_dir.to_str().unwrap()];
 
         // RPC authentication (user:password) from the cookie file
-        let cookie_file_path = &self.bitcoind.params.cookie_file;
+        let cookie_file_path = &self.node.bitcoind().params.cookie_file;
         let rpc_auth = fs::read_to_string(cookie_file_path).expect("failed to read from file");
         args.push("--USER:PASSWORD");
         args.push(&rpc_auth);
 
         // Full node address for RPC connection
-        let rpc_address = self.bitcoind.params.rpc_socket.to_string();
+        let rpc_address = self.node.bitcoind().params.rpc_socket.to_string();
         args.push("--ADDRESS:PORT");
         args.push(&rpc_address);
 
@@ -78,7 +54,7 @@ impl TakerCli {
         args.push("integration-test");
 
         args.push("--ZMQ");
-        args.push(&self.zmq_addr);
+        args.push(self.node.zmq_addr());
 
         for arg in cmd {
             args.push(arg);
@@ -108,14 +84,12 @@ impl TakerCli {
     }
 }
 
-#[test]
-fn test_taker_cli() {
-    info!("Running Test: Taker CLI functionality and wallet operations");
-
-    let taker_cli = TakerCli::new();
+#[world_test(backend = BitcoindBackend)]
+fn test_taker_cli(node: &mut Node) {
+    let taker_cli = TakerCli::new(node);
     info!("TakerCli initialized successfully");
 
-    let bitcoind = &taker_cli.bitcoind;
+    let bitcoind = node.bitcoind();
 
     info!("Funding taker with 3 UTXOs of 1 BTC each");
     // Fund the taker with 3 utxos of 1 BTC each.
@@ -189,28 +163,15 @@ fn test_taker_cli() {
     assert_eq!(4, no_of_seed_utxos);
     info!("Transfer verification successful");
 
-    info!("Shutting down bitcoind");
-    bitcoind.client.stop().unwrap();
-
-    // Wait for bitcoind to fully exit before removing its data directory.
-    std::thread::sleep(std::time::Duration::from_secs(3));
-
-    // Clean up temp directory
-    if taker_cli.temp_dir.exists() {
-        let _ = fs::remove_dir_all(&taker_cli.temp_dir);
-    }
-
     info!("Taker CLI test completed successfully!");
 }
 
 /// The CLI is the only place a maker's standing is put into words, so a state
 /// the binary stops printing would go unnoticed everywhere else.
-#[test]
-fn taker_cli_shows_maker_states() {
-    info!("Running Test: Taker CLI renders maker states");
-
-    let taker_cli = TakerCli::new();
-    let bitcoind = &taker_cli.bitcoind;
+#[world_test(backend = BitcoindBackend)]
+fn taker_cli_shows_maker_states(node: &mut Node) {
+    let taker_cli = TakerCli::new(node);
+    let _bitcoind = node.bitcoind();
 
     // Creating the wallet also creates the directory the offerbook lives in.
     taker_cli.execute(&["get-new-address"]);
@@ -291,11 +252,4 @@ fn taker_cli_shows_maker_states() {
         "the summary must count each state, got:\n{}",
         output
     );
-
-    info!("Shutting down bitcoind");
-    bitcoind.client.stop().unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    if taker_cli.temp_dir.exists() {
-        let _ = fs::remove_dir_all(&taker_cli.temp_dir);
-    }
 }
