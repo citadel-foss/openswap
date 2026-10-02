@@ -16,9 +16,7 @@ use openswap::lightning::{
     SwapOutTaker,
 };
 
-use super::test_framework::{
-    confirmations, fund_script, generate_blocks, miner_spk, raw_tx_with_retry, setup_bitcoind,
-};
+use super::test_framework::*;
 
 fn test_params() -> SwapOutParams {
     SwapOutParams {
@@ -32,9 +30,9 @@ fn test_params() -> SwapOutParams {
 /// Full happy path: request/accept, taker pays the hold invoice, maker funds
 /// on-chain, taker claims through the hashlock (publishing the preimage), and
 /// the maker settles the held Lightning payment from the claim witness.
-#[test]
-fn swap_out_happy_path() {
-    let bitcoind = setup_bitcoind("ln-swap-out-tests", "happy-path");
+#[world_test(backend = BitcoindBackend)]
+fn swap_out_happy_path(node: &mut Node) {
+    let bitcoind = node.bitcoind();
     // One shared mock backend plays both Lightning nodes (POC).
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
 
@@ -61,7 +59,7 @@ fn swap_out_happy_path() {
     );
 
     // 4. Maker funds the on-chain HTLC with exactly `amount`.
-    let (funding_txid, outpoint, funding_output) = fund_script(&bitcoind, &spk, params.amount);
+    let (funding_txid, outpoint, funding_output) = fund_script(bitcoind, &spk, params.amount);
     let funded = HtlcFunded {
         outpoint,
         value: funding_output.value,
@@ -72,22 +70,22 @@ fn swap_out_happy_path() {
         .verify_htlc(
             &funded,
             &funding_output,
-            confirmations(&bitcoind, &funding_txid),
+            confirmations(bitcoind, &funding_txid),
         )
         .unwrap();
     let claim_tx = taker
-        .claim_tx(outpoint, funding_output.value, miner_spk(&bitcoind))
+        .claim_tx(outpoint, funding_output.value, miner_spk(bitcoind))
         .unwrap();
     let claim_txid = bitcoind.client.send_raw_transaction(&claim_tx).unwrap();
-    generate_blocks(&bitcoind, 1);
+    generate_blocks(bitcoind, 1);
     assert!(
-        confirmations(&bitcoind, &claim_txid) >= 1,
+        confirmations(bitcoind, &claim_txid) >= 1,
         "taker's hashlock claim must confirm"
     );
 
     // 6. Maker reads the preimage from the confirmed claim and settles the
     // held Lightning payment.
-    let onchain_claim = raw_tx_with_retry(&bitcoind, &claim_txid);
+    let onchain_claim = raw_tx_with_retry(bitcoind, &claim_txid);
     let learned = maker.settle_from_spend(&onchain_claim).unwrap();
     assert_eq!(learned, taker.preimage());
 
@@ -113,9 +111,9 @@ fn swap_out_happy_path() {
 /// `locktime` blocks. The preimage is never revealed, so the maker cannot
 /// settle the held payment (it would fail back at the LN HTLC expiry on a
 /// real node).
-#[test]
-fn swap_out_refund_path() {
-    let bitcoind = setup_bitcoind("ln-swap-out-tests", "refund-path");
+#[world_test(backend = BitcoindBackend)]
+fn swap_out_refund_path(node: &mut Node) {
+    let bitcoind = node.bitcoind();
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
 
     let params = test_params();
@@ -128,10 +126,10 @@ fn swap_out_refund_path() {
     taker.pay_invoice().unwrap();
     assert!(maker.try_await_payment().unwrap());
 
-    let (_txid, outpoint, funding_output) = fund_script(&bitcoind, &spk, params.amount);
+    let (_txid, outpoint, funding_output) = fund_script(bitcoind, &spk, params.amount);
 
     let refund_tx = maker
-        .refund_tx(outpoint, funding_output.value, miner_spk(&bitcoind))
+        .refund_tx(outpoint, funding_output.value, miner_spk(bitcoind))
         .unwrap();
 
     // Too early: CSV not yet satisfied.
@@ -144,11 +142,11 @@ fn swap_out_refund_path() {
     );
 
     // After `locktime` blocks the refund is valid.
-    generate_blocks(&bitcoind, params.locktime as u64);
+    generate_blocks(bitcoind, params.locktime as u64);
     let refund_txid = bitcoind.client.send_raw_transaction(&refund_tx).unwrap();
-    generate_blocks(&bitcoind, 1);
+    generate_blocks(bitcoind, 1);
     assert!(
-        confirmations(&bitcoind, &refund_txid) >= 1,
+        confirmations(bitcoind, &refund_txid) >= 1,
         "maker's timelock refund must confirm"
     );
 

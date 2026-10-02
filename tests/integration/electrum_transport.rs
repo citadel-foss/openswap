@@ -17,15 +17,10 @@ use std::{
 };
 
 use bitcoin::hashes::Hash;
-use bitcoind::{
-    bitcoincore_rpc::{json::ListUnspentResultEntry, RpcApi},
-    BitcoinD,
-};
+use bitcoind::bitcoincore_rpc::{json::ListUnspentResultEntry, RpcApi};
 use openswap::wallet::{Blockchain, Electrum, ElectrumConfig, WalletError};
 
-use super::test_framework::{
-    generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
-};
+use super::test_framework::*;
 
 /// A TCP forwarder sitting between the client and electrs, so a test can break
 /// the socket without touching the server.
@@ -144,61 +139,6 @@ impl Forwarder {
     }
 }
 
-struct Setup {
-    bitcoind: BitcoinD,
-    _electrsd: electrsd::ElectrsD,
-    forwarder: Forwarder,
-    root_dir: std::path::PathBuf,
-}
-
-fn setup(name: &str) -> Setup {
-    // Unique per call: every test ends by deleting its root, so a root shared by
-    // pid would let the first test to finish delete the others' live datadirs
-    // when they run as threads of one process (cargo test).
-    let root_dir = std::env::temp_dir().join(format!(
-        "openswap-transport-{}-{}",
-        name,
-        bip39::rand::random::<u64>()
-    ));
-    let temp_dir = root_dir.join(name);
-    std::fs::create_dir_all(&temp_dir).unwrap();
-
-    // A fixed ZMQ port collides between concurrent bitcoinds, and a freed OS pick
-    // can be taken before bitcoind binds it, so retry on a fresh one.
-    let bitcoind = (1..=3)
-        .find_map(|attempt| {
-            let zmq_port = std::net::TcpListener::bind("127.0.0.1:0")
-                .and_then(|l| l.local_addr())
-                .expect("no free local port for ZMQ")
-                .port();
-            match init_bitcoind(&temp_dir, format!("tcp://127.0.0.1:{zmq_port}")) {
-                Ok(bitcoind) => Some(bitcoind),
-                Err(e) if attempt < 3 => {
-                    log::warn!("bitcoind failed to start on ZMQ port {zmq_port}, retrying: {e}");
-                    None
-                }
-                Err(e) => panic!("bitcoind failed to start: {}", e),
-            }
-        })
-        .expect("bitcoind failed to start");
-    let electrsd = init_electrsd(&bitcoind, &temp_dir);
-    generate_blocks(&bitcoind, 101);
-
-    let direct = ElectrumConfig {
-        url: format!("tcp://{}", electrsd.electrum_url),
-        ..Default::default()
-    };
-    wait_for_electrs_tip(&bitcoind, &electrsd, &direct);
-
-    let forwarder = Forwarder::start(electrsd.electrum_url.clone());
-    Setup {
-        bitcoind,
-        _electrsd: electrsd,
-        forwarder,
-        root_dir,
-    }
-}
-
 /// A stand-in watched outpoint. Only its identity matters to the refcount.
 fn dummy_watch(vout: u32) -> bitcoin::OutPoint {
     bitcoin::OutPoint {
@@ -207,32 +147,13 @@ fn dummy_watch(vout: u32) -> bitcoin::OutPoint {
     }
 }
 
-/// Stops the forwarder, electrs and bitcoind, then deletes the test's data.
-/// Deleting while bitcoind still ran let its shutdown write the datadir back.
-fn cleanup(s: Setup) {
-    let Setup {
-        bitcoind,
-        _electrsd,
-        forwarder,
-        root_dir,
-    } = s;
-    drop(forwarder);
-    // electrs polls bitcoind, so it goes first.
-    drop(_electrsd);
-    // A persistent-datadir BitcoinD stops the node and waits for it on drop.
-    drop(bitcoind);
-    if root_dir.exists() {
-        let _ = std::fs::remove_dir_all(&root_dir);
-    }
-}
-
 /// The connection is held: many calls of the kinds a sync and a watch loop make
 /// must not rebuild the transport even once.
-#[test]
-fn held_connection_is_reused_across_calls() {
-    let s = setup("held");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn held_connection_is_reused_across_calls(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
     let electrum = Electrum::new(&cfg).expect("connect via forwarder");
@@ -263,21 +184,20 @@ fn held_connection_is_reused_across_calls() {
     );
 
     drop(electrum);
-    cleanup(s);
 }
 
 /// A sync asks only about scripts the server reported changed, yet still sees a
 /// deposit, its confirmation, and a deposit made while the socket was down.
-#[test]
-fn a_sync_asks_only_about_changed_scripts() {
-    let s = setup("changed");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn a_sync_asks_only_about_changed_scripts(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
     let electrum = Electrum::new(&cfg).expect("connect via forwarder");
-    let addr = s
-        .bitcoind
+    let addr = node
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
@@ -290,14 +210,14 @@ fn a_sync_asks_only_about_changed_scripts() {
     }
 
     let sync = || {
-        let before = s.forwarder.requests.load(Ordering::SeqCst);
+        let before = forwarder.requests.load(Ordering::SeqCst);
         let utxos = electrum.list_unspent(None, None).expect("utxos");
-        (s.forwarder.requests.load(Ordering::SeqCst) - before, utxos)
+        (forwarder.requests.load(Ordering::SeqCst) - before, utxos)
     };
     let wait_for = |done: &dyn Fn(&[ListUnspentResultEntry]) -> bool| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let _ = s._electrsd.trigger();
+            let _ = node.electrsd().trigger();
             let (requests, utxos) = sync();
             if done(&utxos) {
                 return requests;
@@ -319,34 +239,33 @@ fn a_sync_asks_only_about_changed_scripts() {
         "an unchanged wallet should cost only the tip read"
     );
 
-    send_to_address(&s.bitcoind, &addr, bitcoin::Amount::from_sat(10_000));
+    send_to_address(node.bitcoind(), &addr, bitcoin::Amount::from_sat(10_000));
     assert_eq!(wait_for(&|u| u.len() == 1), 2, "a deposit costs one query");
-    generate_blocks(&s.bitcoind, 1);
+    generate_blocks(node.bitcoind(), 1);
     assert_eq!(
         wait_for(&|u| u.len() == 1 && u[0].confirmations == 1),
         2,
         "a confirmation costs one query"
     );
 
-    s.forwarder.drop_connections();
-    send_to_address(&s.bitcoind, &addr, bitcoin::Amount::from_sat(20_000));
+    forwarder.drop_connections();
+    send_to_address(node.bitcoind(), &addr, bitcoin::Amount::from_sat(20_000));
     wait_for(&|u| u.len() == 2);
 
     drop(electrum);
-    cleanup(s);
 }
 
 /// A watcher with nothing subscribed has nothing to read, so it sends nothing;
 /// the first subscription brings the ping back.
-#[test]
-fn an_idle_watcher_sends_nothing() {
-    let s = setup("idle");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn an_idle_watcher_sends_nothing(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
     let electrum = Electrum::new(&cfg).expect("connect via forwarder");
-    let requests = || s.forwarder.requests.load(Ordering::SeqCst);
+    let requests = || forwarder.requests.load(Ordering::SeqCst);
 
     let before = requests();
     for _ in 0..3 {
@@ -363,30 +282,29 @@ fn an_idle_watcher_sends_nothing() {
     assert_eq!(requests() - before, 1, "a watching watcher should ping");
 
     drop(electrum);
-    cleanup(s);
 }
 
 /// A subscribe the client refuses must not fail the sync. Here the watcher left
 /// its subscription behind on a shared connection, so the wallet's own is refused.
-#[test]
-fn a_refused_subscribe_still_answers_the_sync() {
-    let s = setup("refused");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn a_refused_subscribe_still_answers_the_sync(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
     let electrum = Electrum::new(&cfg).expect("connect via forwarder");
-    let addr = s
-        .bitcoind
+    let addr = node
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
         .require_network(bitcoin::Network::Regtest)
         .unwrap();
     let spk = addr.script_pubkey();
-    send_to_address(&s.bitcoind, &addr, bitcoin::Amount::from_sat(10_000));
-    generate_blocks(&s.bitcoind, 1);
-    wait_for_tip(&s, &electrum);
+    send_to_address(node.bitcoind(), &addr, bitcoin::Amount::from_sat(10_000));
+    generate_blocks(node.bitcoind(), 1);
+    wait_for_tip(node, &electrum);
 
     electrum.watch_script(&spk, None);
     electrum
@@ -408,16 +326,15 @@ fn a_refused_subscribe_still_answers_the_sync() {
     assert_eq!(electrum.reconnect_count(), 1);
 
     drop(electrum);
-    cleanup(s);
 }
 
 /// Wait for electrs to index up to bitcoind's tip, polling over the connection
 /// we already hold. A fresh connect fails outright while electrs is mid-index.
-fn wait_for_tip(s: &Setup, electrum: &Electrum) {
-    let expected = s.bitcoind.client.get_block_count().unwrap();
+fn wait_for_tip(node: &Node, electrum: &Electrum) {
+    let expected = node.bitcoind().client.get_block_count().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        let _ = s._electrsd.trigger();
+        let _ = node.electrsd().trigger();
         if electrum
             .get_block_count()
             .map(|tip| tip >= expected)
@@ -436,25 +353,29 @@ fn wait_for_tip(s: &Setup, electrum: &Electrum) {
 
 /// A second confirmed deposit to the same script must not read as a spend of
 /// the outpoint; only a confirmed tx whose input consumes it counts.
-#[test]
-fn confirmed_spend_requires_an_input_consuming_the_outpoint() {
-    let s = setup("spend-check");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn confirmed_spend_requires_an_input_consuming_the_outpoint(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
     let electrum = Electrum::new(&cfg).expect("connect via forwarder");
 
-    let addr = s
-        .bitcoind
+    let addr = node
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
         .require_network(bitcoin::Network::Regtest)
         .unwrap();
-    let txid = send_to_address(&s.bitcoind, &addr, bitcoin::Amount::from_btc(1.0).unwrap());
-    generate_blocks(&s.bitcoind, 1);
-    wait_for_tip(&s, &electrum);
+    let txid = send_to_address(
+        node.bitcoind(),
+        &addr,
+        bitcoin::Amount::from_btc(1.0).unwrap(),
+    );
+    generate_blocks(node.bitcoind(), 1);
+    wait_for_tip(node, &electrum);
 
     let spk = addr.script_pubkey();
     let tx = electrum.get_raw_transaction(&txid, None).expect("fetch tx");
@@ -467,10 +388,13 @@ fn confirmed_spend_requires_an_input_consuming_the_outpoint() {
 
     // Lock the outpoint before the second deposit, else coin selection may
     // fund that deposit from it and the tx really would spend it.
-    s.bitcoind.client.lock_unspent(&[outpoint]).expect("lock");
-    send_to_address(&s.bitcoind, &addr, bitcoin::Amount::from_sat(10_000));
-    generate_blocks(&s.bitcoind, 1);
-    wait_for_tip(&s, &electrum);
+    node.bitcoind()
+        .client
+        .lock_unspent(&[outpoint])
+        .expect("lock");
+    send_to_address(node.bitcoind(), &addr, bitcoin::Amount::from_sat(10_000));
+    generate_blocks(node.bitcoind(), 1);
+    wait_for_tip(node, &electrum);
 
     assert!(
         !electrum.is_confirmed_spend(&outpoint, &spk).unwrap(),
@@ -478,18 +402,18 @@ fn confirmed_spend_requires_an_input_consuming_the_outpoint() {
     );
 
     // Drain the wallet, which really spends the outpoint, and confirm it.
-    s.bitcoind
+    node.bitcoind()
         .client
         .unlock_unspent(&[outpoint])
         .expect("unlock");
-    let dest = s
-        .bitcoind
+    let dest = node
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
         .require_network(bitcoin::Network::Regtest)
         .unwrap();
-    s.bitcoind
+    node.bitcoind()
         .client
         .call::<serde_json::Value>(
             "sendall",
@@ -501,8 +425,8 @@ fn confirmed_spend_requires_an_input_consuming_the_outpoint() {
             ],
         )
         .expect("sendall");
-    generate_blocks(&s.bitcoind, 1);
-    wait_for_tip(&s, &electrum);
+    generate_blocks(node.bitcoind(), 1);
+    wait_for_tip(node, &electrum);
 
     assert!(
         electrum.is_confirmed_spend(&outpoint, &spk).unwrap(),
@@ -510,17 +434,16 @@ fn confirmed_spend_requires_an_input_consuming_the_outpoint() {
     );
 
     drop(electrum);
-    cleanup(s);
 }
 
 /// A broken socket in front of a live server must be bridged, not surfaced.
 /// Two outpoints can share one script. Dropping one must not take the
 /// subscription the other still needs.
-#[test]
-fn a_shared_script_stays_subscribed_until_the_last_watcher_goes() {
-    let s = setup("refcount");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn a_shared_script_stays_subscribed_until_the_last_watcher_goes(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
     let electrum = Electrum::new(&cfg).expect("connect via forwarder");
@@ -553,22 +476,21 @@ fn a_shared_script_stays_subscribed_until_the_last_watcher_goes() {
     );
 
     drop(electrum);
-    let _ = &s.bitcoind;
-    cleanup(s);
+    let _ = node.bitcoind();
 }
 
-#[test]
-fn reconnects_after_the_connection_drops() {
-    let s = setup("drop");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn reconnects_after_the_connection_drops(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
     let electrum = Electrum::new(&cfg).expect("connect via forwarder");
 
     let before = electrum.get_block_count().expect("tip before drop");
-    let addr = s
-        .bitcoind
+    let addr = node
+        .bitcoind()
         .client
         .get_new_address(None, None)
         .unwrap()
@@ -578,7 +500,7 @@ fn reconnects_after_the_connection_drops() {
     electrum
         .subscribe_script(&spk, dummy_watch(0))
         .expect("subscribe before reconnect");
-    s.forwarder.drop_connections();
+    forwarder.drop_connections();
 
     // Same answer, despite the socket having died underneath.
     let after = electrum.get_block_count().expect("tip after drop");
@@ -589,10 +511,10 @@ fn reconnects_after_the_connection_drops() {
         electrum.reconnect_count()
     );
 
-    send_to_address(&s.bitcoind, &addr, bitcoin::Amount::from_sat(10_000));
-    generate_blocks(&s.bitcoind, 1);
-    wait_for_tip(&s, &electrum);
-    let expected_tip = s.bitcoind.client.get_block_count().unwrap();
+    send_to_address(node.bitcoind(), &addr, bitcoin::Amount::from_sat(10_000));
+    generate_blocks(node.bitcoind(), 1);
+    wait_for_tip(node, &electrum);
+    let expected_tip = node.bitcoind().client.get_block_count().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let (mut saw_tx, mut saw_tip) = (false, false);
     while !(saw_tx && saw_tip) && std::time::Instant::now() < deadline {
@@ -608,24 +530,23 @@ fn reconnects_after_the_connection_drops() {
     assert!(saw_tip, "header subscription was not re-armed");
 
     drop(electrum);
-    let _ = &s.bitcoind;
-    cleanup(s);
+    let _ = node.bitcoind();
 }
 
 /// The opening connect retries too, so a circuit that is still settling does not
 /// kill process startup. Each participant in a swap opens its own connection.
-#[test]
-fn connect_retries_until_the_server_answers() {
-    let s = setup("connect-retry");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn connect_retries_until_the_server_answers(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
 
     // Refuse forwarding, then let it through again while the first connect is
     // still inside its backoff, so a retry is what makes it succeed.
-    s.forwarder.refuse_forwarding();
-    let allow = s.forwarder.refuse.clone();
+    forwarder.refuse_forwarding();
+    let allow = forwarder.refuse.clone();
     thread::spawn(move || {
         thread::sleep(std::time::Duration::from_secs(2));
         allow.store(false, Ordering::SeqCst);
@@ -637,18 +558,17 @@ fn connect_retries_until_the_server_answers() {
         .expect("tip after retried connect");
 
     drop(electrum);
-    cleanup(s);
 }
 
 /// A server that never answers must fail at connect with the dedicated variant.
-#[test]
-fn connect_gives_up_with_unreachable() {
-    let s = setup("connect-dead");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn connect_gives_up_with_unreachable(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
-    s.forwarder.refuse_forwarding();
+    forwarder.refuse_forwarding();
 
     match Electrum::new(&cfg) {
         Err(WalletError::ElectrumUnreachable { attempts, .. }) => {
@@ -656,23 +576,21 @@ fn connect_gives_up_with_unreachable() {
         }
         other => panic!("expected ElectrumUnreachable, got {:?}", other.map(|_| ())),
     }
-
-    cleanup(s);
 }
 
 /// When the server really is gone, fail with the dedicated variant rather than a
 /// bare Electrum error, so callers can tell "transport down" from "call failed".
-#[test]
-fn unreachable_server_reports_exhausted_attempts() {
-    let s = setup("unreachable");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn unreachable_server_reports_exhausted_attempts(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
     let electrum = Electrum::new(&cfg).expect("connect via forwarder");
     electrum.get_block_count().expect("tip while healthy");
 
-    s.forwarder.refuse_forwarding();
+    forwarder.refuse_forwarding();
 
     match electrum.get_block_count() {
         Err(WalletError::ElectrumUnreachable { attempts, .. }) => {
@@ -683,28 +601,27 @@ fn unreachable_server_reports_exhausted_attempts() {
     }
 
     drop(electrum);
-    cleanup(s);
 }
 
 /// Proves shutdown interrupts an active Electrum retry before the caller joins.
-#[test]
-fn shutdown_interrupts_an_active_retry_and_allows_join() {
-    let s = setup("shutdown-retry");
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn shutdown_interrupts_an_active_retry_and_allows_join(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
     let cfg = ElectrumConfig {
-        url: s.forwarder.url(),
+        url: forwarder.url(),
         ..Default::default()
     };
     let electrum = Electrum::new(&cfg).expect("connect via forwarder");
     electrum.get_block_count().expect("tip while healthy");
     let shutdown = electrum.shutdown_flag();
-    let connections = s.forwarder.connection_count();
-    s.forwarder.refuse_forwarding();
+    let connections = forwarder.connection_count();
+    forwarder.refuse_forwarding();
 
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let handle = thread::spawn(move || {
         done_tx.send(electrum.get_block_count()).unwrap();
     });
-    s.forwarder.wait_for_connection_after(connections);
+    forwarder.wait_for_connection_after(connections);
     shutdown.store(true, Ordering::SeqCst);
 
     let result = done_rx
@@ -712,5 +629,4 @@ fn shutdown_interrupts_an_active_retry_and_allows_join() {
         .expect("Electrum call did not stop after shutdown");
     assert!(matches!(result, Err(WalletError::Interrupted(_))));
     handle.join().expect("Electrum caller thread panicked");
-    cleanup(s);
 }

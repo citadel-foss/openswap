@@ -41,6 +41,7 @@ test_framework/   the harness; nothing in here is a test
   procs/          bitcoind, electrs, nostr relay, tor
   world.rs        TestFramework::init: starts the processes, builds takers/makers
   harness.rs      World, WorldBuilder, MakerHandle, TakerHandle, the steps
+  node.rs         Node: a bare regtest bitcoind (+ electrs) for chain-only tests
   expect.rs       BalanceExpect: which balance fields a test asserts
   macros.rs       swap_matrix!, tor_gate!, assert_logged!, wait_logged!, world_test
   actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
@@ -287,7 +288,20 @@ own name and attributes; `tor_gate!()` in a row skips it unless
   `fs::read_to_string` taken before any of them.
 - **Log messages are ASCII.**
 
-Not every test fits the world. `electrum_transport.rs` (a TCP forwarder),
-`wallet_backup.rs` (wallets only), `taker_cli.rs` (a subprocess) and the
-`lightning_*.rs` tests (an LDK Server sidecar, behind the `lightning` feature)
-keep their own harnesses; that is expected.
+Tests that need a chain but no takers, makers or relay take a bare `Node`
+instead: the body's first parameter picks the fixture, so `node: &mut Node`
+builds a regtest bitcoind under its own temp dir, with electrs when the backend
+is `ElectrumBackend`. Nothing mines in the background, and dropping the node
+stops electrs, then bitcoind, then deletes the dir (a failing test's dir stays):
+
+```rust
+#[world_test(backend = ElectrumBackend, setup = [mine(101)])]
+fn reconnects_after_the_connection_drops(node: &mut Node) {
+    let forwarder = Forwarder::start(node.electrsd().electrum_url.clone());
+    // ..
+}
+```
+
+`electrum_transport.rs`, `wallet_backup.rs`, `taker_cli.rs`, the
+`lightning_swap_*.rs` chain tests and `fidelity::test_mempool_only_spend_reads_as_spent`
+use it. Tests that touch no chain at all stay plain `#[test]`s.
