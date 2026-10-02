@@ -44,8 +44,7 @@ test_framework/   the harness; nothing in here is a test
   expect.rs       BalanceExpect: which balance fields a test asserts
   macros.rs       swap_matrix!, tor_gate!, assert_logged!, wait_logged!, world_test
   actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
-scenarios/        bodies shared by tests in more than one file
-*.rs              the tests, one file per scenario
+*.rs              the tests, one file per scenario family
 ../macros/        the #[world_test] proc-macro crate (attribute macros need their own crate)
 ```
 
@@ -55,7 +54,7 @@ A test builds a `World`, drives it with steps, asserts, and finishes it:
 
 ```rust
 #[test]
-fn maker_abort3_case2() {
+fn legacy_drop_at_contract_sigs_for_recvr() {
     warn!("Running Test: Maker Abort3 Case 2 - CloseAtContractSigsForRecvr");
 
     let mut world = World::builder::<BitcoindBackend>()
@@ -196,8 +195,7 @@ way, because a maker takes its node at init:
 fn lightning_submarine_swaps_e2e(world: &mut World) { .. }
 ```
 
-Bodies under `scenarios/` and `swap_matrix!` rows still build their world
-themselves.
+`swap_matrix!` rows (`electrum_tor.rs`) still build their world themselves.
 
 The pieces:
 
@@ -240,27 +238,34 @@ first, say) keeps plain `assert_eq!`s.
 
 ## Sharing a body
 
-When several tests run the same steps and differ only in data, write the body
-once in `scenarios/` and call it from each test, which stays in its own file so
-its name does not change:
+When several tests run the same steps and differ only in data, they are rows
+of one `cases` block in one file (`maker_abort.rs`, `spare_maker.rs`,
+`taker_abort.rs`, `multi_taker.rs`): the body once, then each test's name,
+docs and data:
 
 ```rust
-// abort3_case3.rs
-#[test]
-fn maker_abort3_case3() {
-    warn!("Running Test: Maker Abort3 Case 3 - CloseAtHashPreimage");
-    run_maker_abort_recovery(
-        ProtocolVersion::Legacy,
-        MakerBehavior::CloseAtHashPreimage,
-        "Swap should fail due to Maker2 closing at hash preimage handover",
-        &MakerAbortExpect { /* this test's balances */ },
-    );
-}
+// maker_abort.rs
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, behavior],
+    takers = [Normal],
+    cases = [
+        /// Maker drops at hash preimage handover. Recovery via timelock.
+        legacy_drop_at_hash_preimage(
+            protocol = ProtocolVersion::Legacy,
+            behavior = MakerBehavior::CloseAtHashPreimage,
+            failure = "Swap should fail due to Maker2 closing at hash preimage handover",
+            expected = &MakerAbortExpect { /* this test's balances */ },
+        ),
+        // ...
+    ],
+)]
+fn run_maker_abort_recovery(world: &mut World, protocol: ProtocolVersion, ..) { .. }
 ```
 
 A test with extra checks can run a body's stages itself and put its checks
 between them (`MakerAbort::fail_swap`, `recover`, `assert_recovered`; see
-`taproot_timelock_recovery.rs`). Do not add flags to a body to cover a test
+`taproot_drop_at_contract_sigs_exchange` in `maker_abort.rs`). Do not add flags to a body to cover a test
 that runs different steps; give that test its own body.
 
 To run one body over several backends or parameters in one file, use

@@ -1,85 +1,15 @@
-//! Maker drops before sending sender's contract sigs. Taker finds a spare maker and completes the swap.
-//!
-//! Setup: 3 makers (maker[0] Normal, maker[1] CloseAtReqContractSigsForSender, maker[2] Normal).
-//! The taker only needs 2 makers for the route, so when maker[1] drops, it retries with the spare.
-//! The swap should succeed.
+//! Spare substitution when the makers price their hops differently. A spare
+//! that would change an admitted hop's shape, or forward above the failed
+//! maker's terms, must abort the swap rather than renegotiate or re-price; an
+//! equally priced spare completes it.
 
 use bitcoin::Amount;
-use openswap::{
-    protocol::common_messages::{MakerToTakerMessage, ProtocolVersion},
-    taker::{MakerState, SwapParams},
-};
+use openswap::{protocol::common_messages::MakerToTakerMessage, taker::SwapParams};
 
-use super::{
-    scenarios::spare_maker::{complete_with_spare, SpareMakerExpect},
-    test_framework::*,
-};
+use super::test_framework::*;
 
 use log::info;
 use std::{fs, thread, time::Duration};
-
-#[world_test(
-    backend = BitcoindBackend,
-    maker_behaviors = [Normal, CloseAtReqContractSigsForSender, Normal],
-    takers = [Normal],
-)]
-fn maker_abort2_case1(world: &mut World) {
-    complete_with_spare(
-        world,
-        ProtocolVersion::Legacy,
-        "Failed to prepare openswap",
-        &SpareMakerExpect {
-            taker_spendable: 14995985,
-            maker_spendable: [15000415, 14999757, 15000378],
-        },
-    );
-
-    // Maker 1 dropped the connection. We cannot tell its failure from our own
-    // link failing, so nothing about it may be recorded as its fault.
-    let standings = world.taker().inner().fetch_offers().unwrap().all_makers();
-    for maker in world.makers() {
-        let address = maker.address();
-        if let Some(standing) = standings.iter().find(|m| m.address.to_string() == address) {
-            assert!(
-                !matches!(standing.state, MakerState::Banned(_)),
-                "a dropped connection must blame nobody, but {} is {:?}",
-                address,
-                standing.state
-            );
-        }
-    }
-
-    info!("maker_abort2_case1 completed successfully!");
-}
-
-/// Maker 0 has to re-plan its funding, then rebuild it for the spare's keys
-/// after maker 1 drops. The rebuild must reuse the coins the re-plan claimed,
-/// not the frozen plan's, or the substitution fails.
-#[world_test(
-    backend = BitcoindBackend,
-    maker_behaviors = [ForceReplan, CloseAtReqContractSigsForSender, Normal],
-    takers = [Normal],
-    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
-    swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 1),
-)]
-fn rebuild_after_replan_uses_the_claimed_coins(world: &mut World, params: SwapParams) {
-    world
-        .taker_mut()
-        .swap(params)
-        .expect("the rebuild must reuse the re-planned coins");
-
-    let contents = fs::read_to_string(world.taker_log_path()).unwrap();
-    assert_eq!(
-        contents.matches("Re-planned funding for swap").count(),
-        1,
-        "only the first pass re-plans; the rebuild reuses its claim"
-    );
-    assert!(
-        contents.contains("Substituting maker 1 with spare"),
-        "maker 0 must rebuild its funding for the spare"
-    );
-    assert_eq!(world.makers()[0].inner().reserved_inputs().unwrap(), 0);
-}
 
 /// One fee override per maker, as `(base_fee, amount_relative_fee_pct)`.
 fn fees(overrides: &[(u64, f64)]) -> Vec<Option<MakerFeeOverride>> {
@@ -339,7 +269,7 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing(
 
     // The taker broadcast its funding before the drop, so it recovers via
     // timelock: 225-block outer hop plus scheduling margin, mirroring
-    // maker_abort2_case3.
+    // `maker_abort::legacy_drop_at_proof_of_funding`.
     info!("Waiting for the taker's timelock recovery...");
     thread::sleep(Duration::from_secs(300));
 
