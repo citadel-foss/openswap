@@ -32,11 +32,12 @@ pub(crate) fn setup_test_logger(temp_dir: &Path) {
         let level = level_from("OPENSWAP_TEST_LOG").unwrap_or(LevelFilter::Debug);
         let lock_level =
             level_from("OPENSWAP_TEST_LOG_LOCKS").unwrap_or_else(|| level.min(LevelFilter::Info));
-        let test = thread::current()
-            .name()
-            .unwrap_or("<unnamed>")
-            .replace('{', "{{")
-            .replace('}', "}}");
+        let name = thread::current().name().unwrap_or("<unnamed>").to_string();
+        // Opens the block `end_test_log_group` closes; see there.
+        if in_github_actions() {
+            println!("::group::{name}");
+        }
+        let test = name.replace('{', "{{").replace('}', "}}");
         let stdout = ConsoleAppender::builder()
             .encoder(Box::new(PatternEncoder::new(&format!(
                 "{{d}} [{test}] {{l}} {{t}} - {{m}}{{n}}"
@@ -59,6 +60,21 @@ pub(crate) fn setup_test_logger(temp_dir: &Path) {
             .expect("the test logger config is valid");
         log4rs::init_config(config).expect("no other logger is installed");
     });
+}
+
+/// Closes the GitHub Actions group `setup_test_logger` opened. nextest prints a
+/// test's captured output as one block, so between the two markers the job log
+/// folds that test's lines into one collapsible entry. Outside GitHub Actions
+/// it prints nothing.
+pub(crate) fn end_test_log_group() {
+    if in_github_actions() {
+        log::logger().flush();
+        println!("::endgroup::");
+    }
+}
+
+fn in_github_actions() -> bool {
+    env::var("GITHUB_ACTIONS").is_ok_and(|value| value == "true")
 }
 
 /// Poll a log file until `expected` appears; panics after `timeout`.
