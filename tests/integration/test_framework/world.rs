@@ -26,12 +26,12 @@ use openswap::{
     maker::{MakerBehavior, MakerServer, MakerServerConfig},
     protocol::common_messages::ProtocolVersion,
     taker::{Taker, TakerBehavior, TakerInitConfig},
-    utill::setup_logger,
     wallet::{CoreRpcConfig, ElectrumConfig},
 };
 
 use super::{
     backend::TestBackend,
+    logs::setup_test_logger,
     ports::{free_ports, reserve_listeners},
     procs::{
         bitcoind::{init_bitcoind, try_generate_blocks},
@@ -142,14 +142,7 @@ impl TestFramework {
         if temp_dir.exists() {
             fs::remove_dir_all::<PathBuf>(temp_dir.clone()).unwrap();
         }
-        // Debug by default; override with e.g. OPENSWAP_TEST_LOG=warn (or
-        // `off`). Applies to both stdout (visible with --nocapture) and the
-        // debug.log files under the test's temp dir.
-        let log_level = env::var("OPENSWAP_TEST_LOG")
-            .ok()
-            .and_then(|level| level.parse().ok())
-            .unwrap_or(log::LevelFilter::Debug);
-        setup_logger(log_level, Some(temp_dir.clone()));
+        setup_test_logger(&temp_dir);
         log::info!("temporary directory : {}", temp_dir.display());
         // Names the test in its own log, so a kept data dir can be traced back.
         log::info!("test: {}", thread::current().name().unwrap_or("<unnamed>"));
