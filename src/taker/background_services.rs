@@ -5,6 +5,7 @@
 
 use std::{
     collections::HashSet,
+    net::TcpStream,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
@@ -18,7 +19,11 @@ use bitcoin::{OutPoint, ScriptBuf, Txid};
 
 use crate::{
     lock_debug,
-    taker::error::TakerError,
+    protocol::{common_messages::TakerToMakerMessage, ProtocolVersion},
+    taker::{
+        api::{connect_to_maker, handshake_with_maker, ConnectionType},
+        error::TakerError,
+    },
     utill::HEART_BEAT_INTERVAL,
     wallet::{AnyBlockchain, Blockchain, RecoveryReport, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
@@ -620,20 +625,112 @@ impl Drop for BreachDetector {
     }
 }
 
+/// Ticks to wait before the first reconnect attempt after a failure.
+const RECONNECT_BACKOFF_MIN_TICKS: u32 = 1;
+/// Ceiling on the doubling backoff, so a maker that is really gone costs one
+/// connect attempt per this many ticks instead of one per tick.
+const RECONNECT_BACKOFF_MAX_TICKS: u32 = 8;
+
+/// One maker in the route, with its keepalive stream and reconnect state.
+struct HeartbeatPeer {
+    address: String,
+    /// `None` while disconnected and waiting to retry.
+    stream: Option<TcpStream>,
+    /// Ticks still to wait before the next connect attempt.
+    retry_in: u32,
+    /// Ticks to wait after the next failure; doubles up to the ceiling.
+    backoff: u32,
+}
+
+impl HeartbeatPeer {
+    fn new(address: String) -> Self {
+        Self {
+            address,
+            stream: None,
+            retry_in: 0,
+            backoff: RECONNECT_BACKOFF_MIN_TICKS,
+        }
+    }
+
+    /// Reconnect if needed, then send one keepalive. Never returns an error:
+    /// a heartbeat must not become a failure path of the swap.
+    fn tick(
+        &mut self,
+        keepalive: &TakerToMakerMessage,
+        connection_type: ConnectionType,
+        socks_port: u16,
+        protocol: ProtocolVersion,
+    ) {
+        if self.stream.is_none() {
+            if self.retry_in > 0 {
+                self.retry_in -= 1;
+                return;
+            }
+            match connect_to_maker(&self.address, connection_type, socks_port)
+                .and_then(|mut stream| handshake_with_maker(&mut stream, protocol).map(|_| stream))
+            {
+                Ok(stream) => {
+                    log::debug!("route heartbeat: connected to {}", self.address);
+                    self.stream = Some(stream);
+                    self.backoff = RECONNECT_BACKOFF_MIN_TICKS;
+                }
+                Err(e) => {
+                    log::debug!(
+                        "route heartbeat: connect to {} failed, retrying in {} tick(s): {e:?}",
+                        self.address,
+                        self.backoff
+                    );
+                    self.retry_in = self.backoff;
+                    self.backoff = (self.backoff * 2).min(RECONNECT_BACKOFF_MAX_TICKS);
+                    return;
+                }
+            }
+        }
+
+        if let Some(stream) = self.stream.as_mut() {
+            if let Err(e) = crate::utill::send_message(stream, keepalive) {
+                // The maker may be perfectly alive with only this socket dead,
+                // and the protocol reads run on a different connection, so they
+                // would never notice. Drop it and reconnect on the next tick.
+                log::debug!(
+                    "route heartbeat: keepalive to {} failed, reconnecting: {e:?}",
+                    self.address
+                );
+                self.stream = None;
+                self.retry_in = 0;
+                self.backoff = RECONNECT_BACKOFF_MIN_TICKS;
+            }
+        }
+    }
+}
+
 /// Heartbeat that pings every maker in the route for the life of a swap.
 ///
 /// The maker's idle timer only sees messages; while the taker negotiates one
 /// hop, the other makers hear nothing and can read a live swap as dropped.
-/// Send failures are ignored — a dead maker fails the protocol's own reads
-/// soon enough, and the heartbeat must not become a failure path of its own.
+///
+/// Each peer owns its own connection and repairs it: a dropped keepalive socket
+/// is reconnected on the next tick, and a maker that cannot be reached is
+/// retried with a doubling backoff rather than abandoned. Failures never
+/// propagate — a dead maker fails the protocol's own reads soon enough, and the
+/// heartbeat must not become a failure path of its own. But it must not go
+/// silently deaf either: a socket that dies mid-swap used to starve that maker
+/// for the rest of the swap while every write was discarded.
 pub(crate) struct RouteHeartbeat {
     stop: mpsc::Sender<()>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl RouteHeartbeat {
-    /// Spawn the heartbeat thread over pre-connected, handshaked streams.
-    pub(crate) fn start(swap_id: &str, streams: Vec<std::net::TcpStream>) -> std::io::Result<Self> {
+    /// Spawn the heartbeat thread. Connecting happens in the thread, so a maker
+    /// that is unreachable at start is retried instead of dropped from the route.
+    pub(crate) fn start(
+        swap_id: &str,
+        addresses: Vec<String>,
+        connection_type: ConnectionType,
+        socks_port: u16,
+        protocol: ProtocolVersion,
+    ) -> std::io::Result<Self> {
         let (stop, stop_rx) = mpsc::channel();
         let keepalive =
             crate::protocol::common_messages::TakerToMakerMessage::WaitingFundingConfirmation(
@@ -642,13 +739,14 @@ impl RouteHeartbeat {
         let handle = thread::Builder::new()
             .name("Route heartbeat".to_string())
             .spawn(move || {
-                let mut streams = streams;
+                let mut peers: Vec<HeartbeatPeer> =
+                    addresses.into_iter().map(HeartbeatPeer::new).collect();
                 loop {
-                    for stream in streams.iter_mut() {
+                    for peer in peers.iter_mut() {
                         if stop_rx.try_recv().is_ok() {
                             return;
                         }
-                        let _ = crate::utill::send_message(stream, &keepalive);
+                        peer.tick(&keepalive, connection_type, socks_port, protocol);
                     }
                     match stop_rx.recv_timeout(super::api::ROUTE_HEARTBEAT_INTERVAL) {
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -676,5 +774,93 @@ impl Drop for RouteHeartbeat {
                 if result.is_ok() { "ok" } else { "panic" },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Shutdown, TcpListener};
+
+    fn peer_on(address: &str) -> HeartbeatPeer {
+        HeartbeatPeer::new(address.to_string())
+    }
+
+    fn keepalive() -> TakerToMakerMessage {
+        TakerToMakerMessage::WaitingFundingConfirmation("swap".to_string())
+    }
+
+    /// A maker that cannot be reached must be retried on a widening backoff
+    /// rather than abandoned (the old code dropped it from the route entirely)
+    /// or hammered once per tick.
+    #[test]
+    fn unreachable_peer_backs_off_instead_of_being_dropped() {
+        // Binding and dropping a listener leaves a port nothing is accepting on.
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let mut peer = peer_on(&format!("127.0.0.1:{port}"));
+
+        // First tick attempts immediately and fails, arming one tick of backoff.
+        peer.tick(
+            &keepalive(),
+            ConnectionType::Clearnet,
+            0,
+            ProtocolVersion::Taproot,
+        );
+        assert!(peer.stream.is_none());
+        assert_eq!(peer.retry_in, RECONNECT_BACKOFF_MIN_TICKS);
+
+        // Backoff doubles per failed attempt and stops at the ceiling, so a
+        // maker that is really gone costs one connect per ceiling ticks.
+        let mut attempts = 0;
+        for _ in 0..200 {
+            let retrying = peer.retry_in == 0;
+            peer.tick(
+                &keepalive(),
+                ConnectionType::Clearnet,
+                0,
+                ProtocolVersion::Taproot,
+            );
+            attempts += u32::from(retrying);
+            assert!(peer.stream.is_none());
+            assert!(peer.backoff <= RECONNECT_BACKOFF_MAX_TICKS);
+        }
+        assert!(
+            attempts < 200,
+            "peer retried every tick instead of backing off"
+        );
+        assert_eq!(peer.backoff, RECONNECT_BACKOFF_MAX_TICKS);
+    }
+
+    /// The incident this guards: a keepalive socket dies mid-swap while the
+    /// maker is alive. The protocol reads run on another connection and never
+    /// notice, so the heartbeat must drop the dead stream and reconnect at once
+    /// instead of discarding every write for the rest of the swap.
+    #[test]
+    fn dead_keepalive_socket_is_dropped_and_retried_immediately() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let stream = TcpStream::connect(&address).unwrap();
+        // Shutting down our own write half makes the next send fail for sure.
+        stream.shutdown(Shutdown::Write).unwrap();
+
+        let mut peer = HeartbeatPeer {
+            address,
+            stream: Some(stream),
+            retry_in: 0,
+            backoff: RECONNECT_BACKOFF_MAX_TICKS,
+        };
+        peer.tick(
+            &keepalive(),
+            ConnectionType::Clearnet,
+            0,
+            ProtocolVersion::Taproot,
+        );
+
+        assert!(peer.stream.is_none(), "dead stream must not be kept");
+        assert_eq!(peer.retry_in, 0, "reconnect must not wait out a backoff");
+        assert_eq!(peer.backoff, RECONNECT_BACKOFF_MIN_TICKS);
     }
 }

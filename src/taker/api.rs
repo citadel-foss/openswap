@@ -2539,32 +2539,53 @@ impl Taker {
         &self,
         stream: &mut TcpStream,
     ) -> Result<ProtocolVersion, TakerError> {
-        // Send TakerHello
-        send_message(stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
-
-        let msg_bytes = read_message(stream)?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
-
-        match msg {
-            MakerToTakerMessage::MakerHello(maker_hello) => {
-                let desired = self.swap_state()?.params.protocol;
-                if maker_hello.supported_protocols.contains(&desired) {
-                    Ok(desired)
-                } else {
-                    Err(TakerError::General(format!(
-                        "Maker does not support {:?}. Supported: {:?}",
-                        desired, maker_hello.supported_protocols
-                    )))
-                }
-            }
-            _ => Err(TakerError::General(
-                "Expected MakerHello response".to_string(),
-            )),
-        }
+        handshake_with_maker(stream, self.swap_state()?.params.protocol)
     }
 
     /// Connect to a maker using either direct connection or Tor proxy.
     pub(crate) fn net_connect(&self, address: &str) -> Result<TcpStream, TakerError> {
+        connect_to_maker(address, self.config.connection_type, self.config.socks_port)
+    }
+}
+
+/// Handshake over an already-connected stream, asserting the maker supports
+/// `desired`. Free of `Taker` so background threads can reconnect on their own.
+pub(crate) fn handshake_with_maker(
+    stream: &mut TcpStream,
+    desired: ProtocolVersion,
+) -> Result<ProtocolVersion, TakerError> {
+    send_message(stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
+
+    let msg_bytes = read_message(stream)?;
+    let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
+
+    match msg {
+        MakerToTakerMessage::MakerHello(maker_hello) => {
+            if maker_hello.supported_protocols.contains(&desired) {
+                Ok(desired)
+            } else {
+                Err(TakerError::General(format!(
+                    "Maker does not support {:?}. Supported: {:?}",
+                    desired, maker_hello.supported_protocols
+                )))
+            }
+        }
+        _ => Err(TakerError::General(
+            "Expected MakerHello response".to_string(),
+        )),
+    }
+}
+
+/// Connect to a maker directly or through Tor. Free of `Taker` so background
+/// threads can reconnect on their own.
+// The integration-test build connects directly and reads neither knob.
+#[cfg_attr(feature = "integration-test", allow(unused_variables))]
+pub(crate) fn connect_to_maker(
+    address: &str,
+    connection_type: ConnectionType,
+    socks_port: u16,
+) -> Result<TcpStream, TakerError> {
+    {
         log::debug!("Connecting to maker at {}", address);
         let timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
 
@@ -2573,21 +2594,14 @@ impl Taker {
             .map_err(|e| TakerError::General(format!("Failed to connect to {}: {}", address, e)))?;
 
         #[cfg(not(feature = "integration-test"))]
-        let socket = match self.config.connection_type {
+        let socket = match connection_type {
             ConnectionType::Clearnet => TcpStream::connect(address).map_err(|e| {
                 TakerError::General(format!("Failed to connect to {}: {}", address, e))
             })?,
             ConnectionType::Tor => {
                 use crate::protocol::common_messages::OPENSWAP_PORT;
 
-                socks5_connect(
-                    self.config.socks_port,
-                    address,
-                    OPENSWAP_PORT,
-                    None,
-                    timeout,
-                )
-                .map_err(|e| {
+                socks5_connect(socks_port, address, OPENSWAP_PORT, None, timeout).map_err(|e| {
                     TakerError::General(format!("Failed to connect to {} via Tor: {}", address, e))
                 })?
             }
@@ -2602,35 +2616,31 @@ impl Taker {
 
         Ok(socket)
     }
+}
 
-    /// Connect to every maker in the route and start the heartbeat that keeps
-    /// their idle timers warm while we negotiate each hop. Connection failures
-    /// are logged and skipped — the protocol's own reads report a dead maker.
+impl Taker {
+    /// Start the heartbeat that keeps every route maker's idle timer warm while
+    /// we negotiate each hop. The thread owns connecting and reconnecting, so a
+    /// maker that is unreachable now is retried rather than left uncovered, and
+    /// this returns without waiting on a Tor connect sweep.
     pub(crate) fn start_route_heartbeat(
         &self,
         swap_id: &str,
     ) -> Option<super::background_services::RouteHeartbeat> {
-        let addresses: Vec<String> = self
-            .swap_state()
-            .ok()?
+        let state = self.swap_state().ok()?;
+        let addresses: Vec<String> = state
             .makers
             .iter()
             .map(|maker| maker.address.to_string())
             .collect();
-        let mut streams = Vec::with_capacity(addresses.len());
-        for address in addresses {
-            match self.net_connect(&address) {
-                Ok(mut stream) => {
-                    if let Err(e) = self.net_handshake(&mut stream) {
-                        log::warn!("route heartbeat: handshake with {address} failed: {e:?}");
-                        continue;
-                    }
-                    streams.push(stream);
-                }
-                Err(e) => log::warn!("route heartbeat: connect to {address} failed: {e:?}"),
-            }
-        }
-        match super::background_services::RouteHeartbeat::start(swap_id, streams) {
+        let protocol = state.params.protocol;
+        match super::background_services::RouteHeartbeat::start(
+            swap_id,
+            addresses,
+            self.config.connection_type,
+            self.config.socks_port,
+            protocol,
+        ) {
             Ok(heartbeat) => Some(heartbeat),
             Err(e) => {
                 log::warn!("route heartbeat failed to start: {e:?}");
