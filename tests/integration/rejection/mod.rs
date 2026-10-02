@@ -15,6 +15,7 @@
 
 mod admission;
 mod bans;
+mod blocklist;
 mod contract_response;
 mod fees;
 mod funding_proof;
