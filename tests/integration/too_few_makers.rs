@@ -1,4 +1,4 @@
-//! Integration test: Taproot maker abort1 - Not enough makers.
+//! Too few makers: only one maker answers a swap that needs two.
 //!
 //! Only 1 maker is available, but the swap requires 2 makers (maker_count: 2).
 //! prepare_swap should FAIL because there are not enough makers.
@@ -32,7 +32,7 @@ use log::info;
         verify_maker_pre_swap_balances(),
     ],
 )]
-fn test_taproot_maker_abort1(world: &mut World, taker_original_balance: Amount) {
+fn taproot_swap_fails_before_funding(world: &mut World, taker_original_balance: Amount) {
     // Swap params: Taproot, requires 2 makers but only 1 is available
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -77,5 +77,5 @@ fn test_taproot_maker_abort1(world: &mut World, taker_original_balance: Amount) 
         "Taker should have no contract balance"
     );
 
-    info!("Taproot maker abort1 test completed successfully!");
+    info!("Too-few-makers test completed successfully!");
 }
