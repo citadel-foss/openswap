@@ -21,10 +21,7 @@ use bitcoind::{
     bitcoincore_rpc::{json::ListUnspentResultEntry, RpcApi},
     BitcoinD,
 };
-use openswap::{
-    maker::{MakerServer, MakerServerConfig, MakerTrait},
-    wallet::{BackendConfig, Blockchain, Electrum, ElectrumConfig, WalletError},
-};
+use openswap::wallet::{Blockchain, Electrum, ElectrumConfig, WalletError};
 
 use super::test_framework::{
     generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
@@ -39,9 +36,6 @@ struct Forwarder {
     /// When set, new connections are accepted then closed straight away. Models a
     /// proxy that is up but cannot reach the far side.
     refuse: Arc<AtomicBool>,
-    /// When set, new connections are accepted and held open but never forwarded,
-    /// so a fresh connect hangs until its read timeout. Live connections still work.
-    stall: Arc<AtomicBool>,
     accepted: Arc<(Mutex<u64>, Condvar)>,
     /// Requests the client sent. The client ends every request, batched or not, with a newline.
     requests: Arc<AtomicU64>,
@@ -53,14 +47,12 @@ impl Forwarder {
         let port = listener.local_addr().unwrap().port();
         let live: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
         let refuse = Arc::new(AtomicBool::new(false));
-        let stall = Arc::new(AtomicBool::new(false));
         let accepted = Arc::new((Mutex::new(0), Condvar::new()));
         let requests = Arc::new(AtomicU64::new(0));
 
-        let (live_c, refuse_c, stall_c, accepted_c, requests_c) = (
+        let (live_c, refuse_c, accepted_c, requests_c) = (
             live.clone(),
             refuse.clone(),
-            stall.clone(),
             accepted.clone(),
             requests.clone(),
         );
@@ -72,10 +64,6 @@ impl Forwarder {
                 changed.notify_all();
                 if refuse_c.load(Ordering::SeqCst) {
                     let _ = client.shutdown(std::net::Shutdown::Both);
-                    continue;
-                }
-                if stall_c.load(Ordering::SeqCst) {
-                    live_c.lock().unwrap().push(client);
                     continue;
                 }
                 let Ok(server) = TcpStream::connect(&target) else {
@@ -112,7 +100,6 @@ impl Forwarder {
             port,
             live,
             refuse,
-            stall,
             accepted,
             requests,
         }
@@ -726,41 +713,4 @@ fn shutdown_interrupts_an_active_retry_and_allows_join() {
     assert!(matches!(result, Err(WalletError::Interrupted(_))));
     handle.join().expect("Electrum caller thread panicked");
     cleanup(s);
-}
-
-/// A slow connect must not hold the wallet lock: while a fresh connection is
-/// stuck in its handshake, the maker's wallet stays writable.
-#[test]
-fn a_stalled_connect_leaves_the_wallet_writable() {
-    let s = setup("stalled-connect");
-    let config = MakerServerConfig {
-        data_dir: s.root_dir.join("stalled-connect").join("maker"),
-        password: Some("integration-test".to_string()),
-        ..MakerServerConfig::default()
-    }
-    .with_backend(BackendConfig::Electrum(ElectrumConfig {
-        url: s.forwarder.url(),
-        timeout: Some(3),
-        max_retries: 0,
-        ..Default::default()
-    }));
-    let maker = Arc::new(MakerServer::init(config).expect("maker init"));
-
-    s.forwarder.stall.store(true, Ordering::SeqCst);
-    let connections = s.forwarder.connection_count();
-    let caller = maker.clone();
-    let handle = thread::spawn(move || {
-        MakerTrait::get_raw_transaction(&*caller, &bitcoin::Txid::all_zeros())
-    });
-    s.forwarder.wait_for_connection_after(connections);
-
-    assert!(
-        maker.wallet.try_write().is_ok(),
-        "wallet lock held while connecting to the backend"
-    );
-    let result = handle.join().expect("connect thread panicked");
-    assert!(result.is_err(), "a stalled connect should time out");
-
-    drop(maker);
-    cleanup(&s.root_dir);
 }

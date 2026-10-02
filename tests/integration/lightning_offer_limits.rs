@@ -11,26 +11,18 @@ use bitcoin::{
     Amount, PublicKey,
 };
 use openswap::{
-    lightning::{
-        InvoiceParams, LightningBackend, MockLightningBackend, OpenChannelRequest, Preimage,
-    },
-    maker::{
-        handlers::{handle_message, ConnectionState},
-        MakerBehavior,
-    },
+    lightning::{InvoiceParams, LightningBackend, MockLightningBackend, Preimage},
+    maker::handlers::{handle_message, ConnectionState},
     protocol::{
         common_messages::{MakerToTakerMessage, TakerHello, TakerToMakerMessage},
         lightning_messages::{
             LightningMakerMessage, LightningTakerMessage, LnSwapInRequest, LnSwapOutRequest,
         },
     },
-    taker::TakerBehavior,
     wallet::AddressType,
 };
 
 use super::test_framework::*;
-
-use std::sync::atomic::Ordering::Relaxed;
 
 fn ln_message(msg: LightningTakerMessage) -> TakerToMakerMessage {
     TakerToMakerMessage::Lightning(Box::new(msg))
@@ -51,42 +43,24 @@ fn test_pubkey(byte: u8) -> PublicKey {
     )
 }
 
-#[test]
-fn maker_serves_only_the_direction_it_has_capacity_for() {
-    log::warn!("Running Test: per-direction Lightning offer limits");
+/// A standalone mock node whose fresh channel is all outbound: it can pay over
+/// Lightning (swap-in) but has nothing to receive with (swap-out).
+fn outbound_only_node() -> Arc<MockLightningBackend> {
+    let ln = Arc::new(MockLightningBackend::new());
+    open_ready_channel(&ln, test_pubkey(0x21).inner, None);
+    ln
+}
 
-    // A freshly opened channel is all outbound: the maker can pay over
-    // Lightning (swap-in) but has nothing to receive with (swap-out).
-    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
-    ln.set_onchain_balance(Amount::from_btc(0.02).unwrap());
-    let channel = ln
-        .open_channel(OpenChannelRequest {
-            node_pubkey: test_pubkey(0x21).inner,
-            address: "127.0.0.1:9735".to_string(),
-            channel_amount: Amount::from_sat(1_000_000),
-            push_to_counterparty_msat: None,
-            announce_channel: false,
-        })
-        .unwrap();
-    ln.simulate_channel_ready(&channel);
-    let _ = ln.poll_event().unwrap();
-
-    let (test_framework, takers, makers, block_generation_handle) =
-        TestFramework::init_with_lightning::<BitcoindBackend>(
-            1,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal],
-            vec![ln.clone() as Arc<dyn LightningBackend>],
-        );
-    fund_makers(
-        &makers,
-        &test_framework.bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2WPKH,
-    );
-
-    let maker = makers[0].clone();
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = outbound_only_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
+    let maker = world.makers()[0].inner().clone();
     let amount = Amount::from_sat(40_000);
     let preimage = Preimage([0x55; 32]);
     let payment_hash = preimage.payment_hash();
@@ -249,11 +223,4 @@ fn maker_serves_only_the_direction_it_has_capacity_for() {
         ),
         other => panic!("expected a duplicate-id rejection, got {}", other),
     }
-
-    drop(takers);
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
 }

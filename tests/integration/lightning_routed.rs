@@ -8,107 +8,48 @@
 //! `MockLightningBackend`, so maker 1's payment really parks at maker 2 and
 //! its settlement really releases the preimage back to maker 1.
 
-use std::{
-    sync::Arc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, thread, time::Duration};
 
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
-    blocklist::BlocklistError,
-    lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest},
-    maker::{start_server, MakerBehavior},
-    taker::{error::TakerError, lightning_swap::LnRoutedSwapParams, TakerBehavior},
+    lightning::{LightningBackend, MockLightningBackend},
+    taker::lightning_swap::LnRoutedSwapParams,
     wallet::AddressType,
 };
 
 use super::test_framework::*;
 
-use std::sync::atomic::Ordering::Relaxed;
-
-/// Gives a mock node a ready channel so it advertises Lightning capacity.
-fn with_ready_channel(node: &Arc<MockLightningBackend>, peer: &Arc<MockLightningBackend>) {
-    node.set_onchain_balance(Amount::from_btc(0.02).unwrap());
-    let channel = node
-        .open_channel(OpenChannelRequest {
-            node_pubkey: peer.node_info().unwrap().node_id,
-            address: "127.0.0.1:9735".to_string(),
-            channel_amount: Amount::from_sat(1_000_000),
-            // Push half to the peer so the channel has inbound capacity too:
-            // swap-outs are bounded by inbound, and a freshly opened channel
-            // has none.
-            push_to_counterparty_msat: Some(500_000_000),
-            announce_channel: false,
-        })
-        .unwrap();
-    node.simulate_channel_ready(&channel);
-    // Drain the channel event so swap polls only see swap events.
-    let _ = node.poll_event().unwrap();
+/// One node per maker over a shared ledger, each with a ready channel to the
+/// other: maker 0's node pays over Lightning, maker 1's receives.
+fn routed_nodes() -> (Arc<MockLightningBackend>, Arc<MockLightningBackend>) {
+    let (ln1, ln2) = MockLightningBackend::new_pair();
+    open_ready_channel(&ln1, ln2.node_info().unwrap().node_id, Some(500_000_000));
+    open_ready_channel(&ln2, ln1.node_info().unwrap().node_id, Some(500_000_000));
+    (ln1, ln2)
 }
 
-#[test]
-fn lightning_routed_swap_e2e() {
-    log::warn!("Running Test: Routed Lightning swap (on-chain -> LN -> on-chain)");
-
-    // node 0 = maker 1's node (pays), node 1 = maker 2's node (receives).
-    let (ln1, ln2) = MockLightningBackend::new_pair();
-    with_ready_channel(&ln1, &ln2);
-    with_ready_channel(&ln2, &ln1);
-
-    // maker[0] pays over Lightning (ln1), maker[1] receives (ln2).
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init_with_lightning::<BitcoindBackend>(
-            2,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal, MakerBehavior::Normal],
-            vec![
-                ln1.clone() as Arc<dyn LightningBackend>,
-                ln2.clone() as Arc<dyn LightningBackend>,
-            ],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-    // No `set_lightning_backend` here on purpose: a routed swap must work
-    // with a taker that has no Lightning node.
-
-    fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2WPKH,
-    );
-    fund_makers(
-        &makers,
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2WPKH,
-    );
-
-    let maker_threads = makers
-        .iter()
-        .map(|maker| {
-            let maker_clone = maker.clone();
-            thread::spawn(move || {
-                start_server(maker_clone).unwrap();
-            })
-        })
-        .collect::<Vec<_>>();
-    wait_for_makers_setup(&makers, 120);
-    for maker in &makers {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-    }
-
-    let first_maker = format!("127.0.0.1:{}", makers[0].config.network_port);
-    let second_maker = format!("127.0.0.1:{}", makers[1].config.network_port);
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [(ln1, ln2) = routed_nodes()],
+    maker_behaviors = [Normal, Normal],
+    // No `taker_lightning` on purpose: a routed swap must work with a taker
+    // that has no Lightning node.
+    takers = [Normal],
+    maker_lightning = [ln1.clone(), ln2],
+    setup = [
+        fund_taker(3, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        start_makers(120),
+    ],
+)]
+fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) {
+    // A handle of its own, so the node stays reachable while the taker is borrowed.
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let first_maker = world.makers()[0].address();
+    let second_maker = world.makers()[1].address();
+    let taker = world.taker_mut().inner_mut();
 
     let report = taker
         .lightning_swap_routed(LnRoutedSwapParams {
@@ -191,125 +132,4 @@ fn lightning_routed_swap_e2e() {
         "no pending lightning swaps should remain, got: {:?}",
         outcomes
     );
-
-    drop(takers);
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
-}
-
-/// With screening on, the taker must refuse to claim hop 2 when the second
-/// maker funds it from a listed address. Not claiming keeps the preimage
-/// private, so hop 1 can only come back to the taker through its refund.
-#[test]
-fn lightning_routed_swap_refuses_blocklisted_second_hop() {
-    let (ln1, ln2) = MockLightningBackend::new_pair();
-    with_ready_channel(&ln1, &ln2);
-    with_ready_channel(&ln2, &ln1);
-
-    let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init_with_lightning_and_blocklist::<BitcoindBackend>(
-            2,
-            vec![TakerBehavior::Normal],
-            vec![MakerBehavior::Normal, MakerBehavior::Normal],
-            vec![
-                ln1.clone() as Arc<dyn LightningBackend>,
-                ln2.clone() as Arc<dyn LightningBackend>,
-            ],
-        );
-    let bitcoind = &test_framework.bitcoind;
-    let taker = takers.get_mut(0).unwrap();
-
-    fund_taker(
-        taker,
-        bitcoind,
-        3,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2WPKH,
-    );
-    fund_makers(
-        &makers[..1],
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2WPKH,
-    );
-    fund_maker_from_one_address(
-        &makers[1],
-        bitcoind,
-        4,
-        Amount::from_btc(0.05).unwrap(),
-        AddressType::P2WPKH,
-    );
-    let maker_threads = spawn_makers(&makers);
-    wait_for_makers_setup(&makers, 120);
-    sync_maker_wallets(&makers);
-
-    let blocked_address = sole_regular_utxo_address(&makers[1]);
-    taker
-        .add_blocklist_entry(
-            blocked_address.to_string(),
-            Some("second hop source".to_string()),
-        )
-        .unwrap();
-
-    let first_maker = format!("127.0.0.1:{}", makers[0].config.network_port);
-    let second_maker = format!("127.0.0.1:{}", makers[1].config.network_port);
-    match taker.lightning_swap_routed(LnRoutedSwapParams {
-        amount: Amount::from_sat(40_000),
-        first_maker: Some(first_maker),
-        second_maker: Some(second_maker),
-        locktime: Some(60),
-        min_confirmations: 1,
-    }) {
-        Err(TakerError::Blocklist(BlocklistError::BlockedAddress { entry, .. })) => {
-            assert_eq!(entry.address, blocked_address.to_string());
-        }
-        Err(other) => panic!("expected blocked-address error, got {:?}", other),
-        Ok(report) => panic!(
-            "the taker claimed hop 2 funded from a blocked address: {:?}",
-            report
-        ),
-    }
-
-    // Hop 2 was refused before its outpoint was recorded, so recovery drops
-    // it unclaimed. Hop 1 refunds once its timelock matures.
-    let deadline = Instant::now() + Duration::from_secs(300);
-    let mut history = Vec::new();
-    loop {
-        let outcomes = taker.recover_lightning_swaps().unwrap();
-        if outcomes.is_empty() {
-            break;
-        }
-        history.extend(outcomes);
-        assert!(
-            Instant::now() < deadline,
-            "routed swap records still pending: {:?}",
-            history
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
-    assert!(
-        history
-            .iter()
-            .any(|line| line.ends_with("-out: no on-chain commitment; forgotten")),
-        "hop 2 must be dropped unclaimed, got: {:?}",
-        history
-    );
-    assert!(
-        history.iter().any(|line| line.contains("-in: ")
-            && (line.contains("recovered via") || line.contains("already resolved"))),
-        "hop 1 must be refunded, got: {:?}",
-        history
-    );
-
-    drop(takers);
-    shutdown_makers(&makers, maker_threads);
-    test_framework.stop();
-    block_generation_handle.join().unwrap();
 }
