@@ -631,6 +631,27 @@ const RECONNECT_BACKOFF_MIN_TICKS: u32 = 1;
 /// connect attempt per this many ticks instead of one per tick.
 const RECONNECT_BACKOFF_MAX_TICKS: u32 = 8;
 
+/// Deadline for a heartbeat's own connect and hello exchange. Deliberately far
+/// below the maker's idle budget and unrelated to `MAKER_RESPONSE_TIMEOUT_SECS`,
+/// which is sized for block-bound contract replies: reconnects run on the shared
+/// heartbeat thread, so a maker that accepts TCP and then withholds `MakerHello`
+/// would otherwise stall the keepalives every other maker on the route depends on.
+#[cfg(not(feature = "integration-test"))]
+const HEARTBEAT_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "integration-test")]
+const HEARTBEAT_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How a heartbeat peer reaches its maker.
+#[derive(Clone, Copy)]
+pub(crate) struct PeerDial {
+    /// Clearnet or Tor, from the taker's config.
+    pub(crate) connection_type: ConnectionType,
+    /// Tor SOCKS port, ignored for clearnet.
+    pub(crate) socks_port: u16,
+    /// Protocol the maker must support for this swap.
+    pub(crate) protocol: ProtocolVersion,
+}
+
 /// One maker in the route, with its keepalive stream and reconnect state.
 struct HeartbeatPeer {
     address: String,
@@ -654,20 +675,19 @@ impl HeartbeatPeer {
 
     /// Reconnect if needed, then send one keepalive. Never returns an error:
     /// a heartbeat must not become a failure path of the swap.
-    fn tick(
-        &mut self,
-        keepalive: &TakerToMakerMessage,
-        connection_type: ConnectionType,
-        socks_port: u16,
-        protocol: ProtocolVersion,
-    ) {
+    fn tick(&mut self, keepalive: &TakerToMakerMessage, dial: PeerDial, dial_timeout: Duration) {
         if self.stream.is_none() {
             if self.retry_in > 0 {
                 self.retry_in -= 1;
                 return;
             }
-            match connect_to_maker(&self.address, connection_type, socks_port)
-                .and_then(|mut stream| handshake_with_maker(&mut stream, protocol).map(|_| stream))
+            match connect_to_maker(
+                &self.address,
+                dial.connection_type,
+                dial.socks_port,
+                dial_timeout,
+            )
+            .and_then(|mut stream| handshake_with_maker(&mut stream, dial.protocol).map(|_| stream))
             {
                 Ok(stream) => {
                     log::debug!("route heartbeat: connected to {}", self.address);
@@ -727,9 +747,7 @@ impl RouteHeartbeat {
     pub(crate) fn start(
         swap_id: &str,
         addresses: Vec<String>,
-        connection_type: ConnectionType,
-        socks_port: u16,
-        protocol: ProtocolVersion,
+        dial: PeerDial,
     ) -> std::io::Result<Self> {
         let (stop, stop_rx) = mpsc::channel();
         let keepalive =
@@ -746,7 +764,7 @@ impl RouteHeartbeat {
                         if stop_rx.try_recv().is_ok() {
                             return;
                         }
-                        peer.tick(&keepalive, connection_type, socks_port, protocol);
+                        peer.tick(&keepalive, dial, HEARTBEAT_DIAL_TIMEOUT);
                     }
                     match stop_rx.recv_timeout(super::api::ROUTE_HEARTBEAT_INTERVAL) {
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -786,6 +804,14 @@ mod tests {
         HeartbeatPeer::new(address.to_string())
     }
 
+    fn test_dial() -> PeerDial {
+        PeerDial {
+            connection_type: ConnectionType::Clearnet,
+            socks_port: 0,
+            protocol: ProtocolVersion::Taproot,
+        }
+    }
+
     fn keepalive() -> TakerToMakerMessage {
         TakerToMakerMessage::WaitingFundingConfirmation("swap".to_string())
     }
@@ -803,12 +829,7 @@ mod tests {
         let mut peer = peer_on(&format!("127.0.0.1:{port}"));
 
         // First tick attempts immediately and fails, arming one tick of backoff.
-        peer.tick(
-            &keepalive(),
-            ConnectionType::Clearnet,
-            0,
-            ProtocolVersion::Taproot,
-        );
+        peer.tick(&keepalive(), test_dial(), HEARTBEAT_DIAL_TIMEOUT);
         assert!(peer.stream.is_none());
         assert_eq!(peer.retry_in, RECONNECT_BACKOFF_MIN_TICKS);
 
@@ -817,12 +838,7 @@ mod tests {
         let mut attempts = 0;
         for _ in 0..200 {
             let retrying = peer.retry_in == 0;
-            peer.tick(
-                &keepalive(),
-                ConnectionType::Clearnet,
-                0,
-                ProtocolVersion::Taproot,
-            );
+            peer.tick(&keepalive(), test_dial(), HEARTBEAT_DIAL_TIMEOUT);
             attempts += u32::from(retrying);
             assert!(peer.stream.is_none());
             assert!(peer.backoff <= RECONNECT_BACKOFF_MAX_TICKS);
@@ -832,6 +848,37 @@ mod tests {
             "peer retried every tick instead of backing off"
         );
         assert_eq!(peer.backoff, RECONNECT_BACKOFF_MAX_TICKS);
+    }
+
+    /// A maker that accepts TCP and then says nothing must not hold the shared
+    /// heartbeat thread past the deadline we chose, because every other peer on
+    /// the route is waiting its turn and its own idle budget is running.
+    #[test]
+    fn stalled_handshake_is_bounded_by_the_dial_timeout() {
+        // Accept connections but never answer MakerHello.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let _silent = thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                held.push(stream);
+            }
+        });
+
+        let dial_timeout = Duration::from_millis(300);
+        let mut peer = peer_on(&address);
+        let started = std::time::Instant::now();
+        peer.tick(&keepalive(), test_dial(), dial_timeout);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < dial_timeout * 10,
+            "a silent maker stalled the heartbeat for {:?}",
+            elapsed
+        );
+        // The handshake read timed out, so no stream is kept and we back off.
+        assert!(peer.stream.is_none());
+        assert_eq!(peer.retry_in, RECONNECT_BACKOFF_MIN_TICKS);
     }
 
     /// The incident this guards: a keepalive socket dies mid-swap while the
@@ -852,12 +899,7 @@ mod tests {
             retry_in: 0,
             backoff: RECONNECT_BACKOFF_MAX_TICKS,
         };
-        peer.tick(
-            &keepalive(),
-            ConnectionType::Clearnet,
-            0,
-            ProtocolVersion::Taproot,
-        );
+        peer.tick(&keepalive(), test_dial(), HEARTBEAT_DIAL_TIMEOUT);
 
         assert!(peer.stream.is_none(), "dead stream must not be kept");
         assert_eq!(peer.retry_in, 0, "reconnect must not wait out a backoff");

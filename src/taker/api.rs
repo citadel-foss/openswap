@@ -2544,7 +2544,12 @@ impl Taker {
 
     /// Connect to a maker using either direct connection or Tor proxy.
     pub(crate) fn net_connect(&self, address: &str) -> Result<TcpStream, TakerError> {
-        connect_to_maker(address, self.config.connection_type, self.config.socks_port)
+        connect_to_maker(
+            address,
+            self.config.connection_type,
+            self.config.socks_port,
+            Duration::from_secs(MAKER_RESPONSE_TIMEOUT_SECS),
+        )
     }
 }
 
@@ -2584,6 +2589,7 @@ pub(crate) fn connect_to_maker(
     address: &str,
     connection_type: ConnectionType,
     socks_port: u16,
+    read_timeout: Duration,
 ) -> Result<TcpStream, TakerError> {
     {
         log::debug!("Connecting to maker at {}", address);
@@ -2610,7 +2616,7 @@ pub(crate) fn connect_to_maker(
         // Reads can block for minutes: a maker answers contract data only after
         // our contracts confirm, and that wait is block-bound, not message-bound.
         socket
-            .set_read_timeout(Some(Duration::from_secs(MAKER_RESPONSE_TIMEOUT_SECS)))
+            .set_read_timeout(Some(read_timeout))
             .and_then(|_| socket.set_write_timeout(Some(timeout)))
             .map_err(|e| TakerError::General(format!("Failed to set socket timeout: {}", e)))?;
 
@@ -2633,14 +2639,12 @@ impl Taker {
             .iter()
             .map(|maker| maker.address.to_string())
             .collect();
-        let protocol = state.params.protocol;
-        match super::background_services::RouteHeartbeat::start(
-            swap_id,
-            addresses,
-            self.config.connection_type,
-            self.config.socks_port,
-            protocol,
-        ) {
+        let dial = super::background_services::PeerDial {
+            connection_type: self.config.connection_type,
+            socks_port: self.config.socks_port,
+            protocol: state.params.protocol,
+        };
+        match super::background_services::RouteHeartbeat::start(swap_id, addresses, dial) {
             Ok(heartbeat) => Some(heartbeat),
             Err(e) => {
                 log::warn!("route heartbeat failed to start: {e:?}");
