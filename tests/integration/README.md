@@ -9,7 +9,7 @@ test per process.
 
 ```bash
 cargo nextest run --features integration-test                 # everything
-cargo nextest run --features integration-test -E 'test(taker_abort::)'  # one file
+cargo nextest run --features integration-test -E 'test(/^recovery::/)'  # one area
 ```
 
 Use nextest, not `cargo test`: the logger is process-wide, so with every test
@@ -29,12 +29,12 @@ What a run needs:
 `ELECTRS_LOG=1` prints electrs' stderr. Logs go to the test's `debug.log` and
 to stdout at debug level (`OPENSWAP_TEST_LOG=warn`, or `off`, lowers it), less
 the lock WAIT/GOT traces, which `OPENSWAP_TEST_LOG_LOCKS=debug` brings back.
-Each stdout line names its test, e.g. `[electrum_swap::taproot_openswap]`, so
+Each stdout line names its test, e.g. `[swap::electrum::taproot_swap_completes]`, so
 interleaved CI output can be traced back.
 
-The three Tor tests (`electrum_recovery::tor_taproot_taker_drops_after_funding`,
-`electrum_recovery::tor_legacy_taker_drops_after_funding`,
-`contract_breach::tor_maker_broadcasts_contract`) run their
+The three Tor tests (`recovery::electrum::tor_taproot_taker_drops_after_funding`,
+`recovery::electrum::tor_legacy_taker_drops_after_funding`,
+`recovery::contract_breach::tor_maker_broadcasts_contract`) run their
 scenario's body over `TorElectrumBackend` and assert the same balances as the
 clearnet rows, so a Tor-specific divergence in a watchtower path fails loudly.
 An onion service must upload its descriptor and the client fetch it back, so
@@ -66,8 +66,15 @@ test_framework/   the harness; nothing in here is a test
   expect.rs       BalanceExpect: which balance fields a test asserts
   macros.rs       world_test, assert_logged!, wait_logged!
   actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
-*.rs              the tests, one file per scenario family
+swap/             swaps that complete
+recovery/         a party drops or breaches; everyone recovers on-chain
+restart/          processes die and come back
 rejection/        everything either side must refuse, one file per theme
+fidelity/         fidelity bonds
+wallet/           the wallet and its backends
+offerbook/        the taker's offerbook
+cli/              the makerd RPC server and the taker CLI
+lightning/        Lightning swaps, behind the `lightning` feature
 ../macros/        the #[world_test] proc-macro crate (attribute macros need their own crate)
 ```
 
@@ -261,12 +268,12 @@ first, say) keeps plain `assert_eq!`s.
 ## Sharing a body
 
 When several tests run the same steps and differ only in data, they are rows
-of one `cases` block in one file (`maker_abort.rs`, `spare_maker.rs`,
-`taker_abort.rs`, `multi_taker.rs`): the body once, then each test's name,
+of one `cases` block in one file (`recovery/maker_abort.rs`, `swap/spare_maker.rs`,
+`recovery/taker_abort.rs`, `swap/multi_taker.rs`): the body once, then each test's name,
 docs and data:
 
 ```rust
-// maker_abort.rs
+// recovery/maker_abort.rs
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal, behavior],
@@ -287,11 +294,11 @@ fn run_maker_abort_recovery(world: &mut World, protocol: ProtocolVersion, ..) { 
 
 A test with extra checks can run a body's stages itself and put its checks
 between them (`MakerAbort::fail_swap`, `recover`, `assert_recovered`; see
-`taproot_drop_at_contract_sigs_exchange` in `maker_abort.rs`). Do not add flags to a body to cover a test
+`taproot_drop_at_contract_sigs_exchange` in `recovery/maker_abort.rs`). Do not add flags to a body to cover a test
 that runs different steps; give that test its own body.
 
 To run one body over several backends, give each row its own `backend = ..`
-(see `electrum_recovery.rs`, whose Tor rows also carry `#[ignore]` and
+(see `recovery/electrum.rs`, whose Tor rows also carry `#[ignore]` and
 `skip_unless = tor_it_enabled()`).
 
 ## Rules
@@ -322,6 +329,6 @@ fn reconnects_after_the_connection_drops(node: &mut Node) {
 }
 ```
 
-`electrum_transport.rs`, `wallet_backup.rs`, `taker_cli.rs`, the
-`lightning_swap_*.rs` chain tests and `fidelity::mempool_only_spend_reads_as_spent`
+`wallet/electrum_transport.rs`, `wallet/backup.rs`, `cli/taker.rs`, the
+`lightning/swap_*.rs` chain tests and `fidelity::creation::mempool_only_spend_reads_as_spent`
 use it. Tests that touch no chain at all stay plain `#[test]`s.
