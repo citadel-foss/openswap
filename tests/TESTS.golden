@@ -65,6 +65,9 @@ openswap protocol::lightning_messages::tests::new_top_level_variants_round_trip
 openswap security::tests::decrypts_legacy_ciphertext_using_material_nonce
 openswap security::tests::encryption_rotates_nonce_for_same_key_material
 openswap taker::api::tests::init_taker_config_persists_lightning_settings
+openswap taker::background_services::tests::dead_keepalive_socket_is_dropped_and_retried_immediately
+openswap taker::background_services::tests::stalled_handshake_is_bounded_by_the_dial_timeout
+openswap taker::background_services::tests::unreachable_peer_backs_off_instead_of_being_dropped
 openswap taker::config::tests::lightning_settings_absent_by_default
 openswap taker::config::tests::lightning_settings_round_trip_through_the_config_file
 openswap taker::config::tests::test_different_data
