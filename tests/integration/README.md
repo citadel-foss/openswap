@@ -58,24 +58,28 @@ lines name the test. CI uploads the kept directories of a failed job.
 ## Layout
 
 ```text
-test_framework/   the harness; nothing in here is a test
-  procs/          bitcoind, electrs, nostr relay, tor
-  world.rs        TestFramework::init: starts the processes, builds takers/makers
-  harness.rs      World, WorldBuilder, MakerHandle, TakerHandle, the steps
-  node.rs         Node: a bare regtest bitcoind (+ electrs) for chain-only tests
-  expect.rs       BalanceExpect: which balance fields a test asserts
-  macros.rs       world_test, assert_logged!, wait_logged!
-  actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
-swap/             swaps that complete
-recovery/         a party drops or breaches; everyone recovers on-chain
-restart/          processes die and come back
-rejection/        everything either side must refuse, one file per theme
-fidelity/         fidelity bonds
-wallet/           the wallet and its backends
-offerbook/        the taker's offerbook
-cli/              the makerd RPC server and the taker CLI
-lightning/        Lightning swaps, behind the `lightning` feature
-../macros/        the #[world_test] proc-macro crate (attribute macros need their own crate)
+tests/
+  integration/        the test binary: main.rs and one folder per area
+    swap/             swaps that complete
+    recovery/         a party drops or breaches; everyone recovers on-chain
+    restart/          processes die and come back
+    rejection/        everything either side must refuse, one file per theme
+    fidelity/         fidelity bonds
+    wallet/           the wallet and its backends
+    offerbook/        the taker's offerbook
+    cli/              the makerd RPC server and the taker CLI
+    lightning/        Lightning swaps, behind the `lightning` feature
+  test_framework/     the harness; nothing in here is a test. A module of the
+                      integration binary, which main.rs pulls in with #[path]
+    procs/            bitcoind, electrs, nostr relay, tor
+    world.rs          TestFramework::init: starts the processes, builds takers/makers
+    harness.rs        World, WorldBuilder, MakerHandle, TakerHandle, the steps
+    node.rs           Node: a bare regtest bitcoind (+ electrs) for chain-only tests
+    expect.rs         BalanceExpect: which balance fields a test asserts
+    macros.rs         world_test, assert_logged!, wait_logged!
+    actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
+  macros/             the #[world_test] proc-macro crate (attribute macros need their own crate)
+  TESTS.golden        every test name; check_test_names.sh diffs against it
 ```
 
 ## Writing a test
