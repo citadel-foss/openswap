@@ -880,7 +880,8 @@ impl Taker {
             )),
             shutdown.clone(),
         );
-        let watch_service = WatchService::spawn(tx_requests, shutdown, move || {
+        let tip = watcher.tip.clone();
+        let watch_service = WatchService::spawn(tx_requests, shutdown, tip, move || {
             watcher.run(initial_sync_clone)
         })
         .map_err(|e| TakerError::General(format!("failed to spawn watcher thread: {e}")))?;

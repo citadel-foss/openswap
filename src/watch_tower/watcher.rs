@@ -6,7 +6,7 @@
 use std::{
     marker::PhantomData,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver as StdReceiver, RecvTimeoutError},
         Arc,
     },
@@ -51,6 +51,9 @@ pub struct Watcher<R: Role> {
     /// Set by `WatchService::shutdown`; long scans check it per iteration so a
     /// deep rescan cannot stall the join.
     shutdown: Arc<AtomicBool>,
+    /// Latest block height from the backend's block events, 0 while unknown.
+    /// Shared with `WatchService`, so recovery need not ask the server each pass.
+    pub(crate) tip: Arc<AtomicU64>,
     _role: PhantomData<R>,
 }
 
@@ -128,6 +131,7 @@ impl<R: Role> Watcher<R> {
             pending_subscribes: Vec::new(),
             pending_block_discovery: Vec::new(),
             shutdown,
+            tip: Arc::new(AtomicU64::new(0)),
             _role: PhantomData,
         }
     }
@@ -377,6 +381,11 @@ impl<R: Role> Watcher<R> {
                 if let Err(e) = self.blockchain.unsubscribe_script(&script_pubkey, outpoint) {
                     log::warn!("electrum script-unsubscribe failed for {outpoint}: {e}");
                 }
+                // With nothing watched the backend stops reading new blocks, so the
+                // height would go stale while still looking current.
+                if self.registry.list_watches().is_ok_and(|w| w.is_empty()) {
+                    self.tip.store(0, Ordering::Release);
+                }
             }
             WatcherCommand::Shutdown => return false,
         }
@@ -563,6 +572,11 @@ impl<R: Role> Watcher<R> {
                 }
             }
             WatchEvent::BlockConnected(b) => {
+                // Core's ZMQ events carry no height, so Core never publishes one. With
+                // nothing watched no later block would be read, so publish nothing.
+                if b.height > 0 && self.registry.list_watches().is_ok_and(|w| !w.is_empty()) {
+                    self.tip.store(b.height, Ordering::Release);
+                }
                 // ZMQ ships full block bytes; Electrum ships just the 32-byte hash.
                 // No block body means no tx scan, so chain-based fidelity-bond
                 // discovery does not exist on Electrum — it is nostr-only there.
@@ -812,5 +826,54 @@ mod tests {
 
         assert!(watcher.pending_block_discovery.is_empty());
         server.join().unwrap();
+    }
+
+    /// Recovery trusts this height instead of asking the server, so it must vanish
+    /// once nothing is watched and the backend stops reading new blocks.
+    #[test]
+    fn block_heights_are_published_until_nothing_is_watched() {
+        let config = CoreRpcConfig {
+            url: "127.0.0.1:0".to_string(),
+            ..CoreRpcConfig::default()
+        };
+        let backend = AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = Watcher::<DiscoveryRole>::new(
+            backend,
+            FileRegistry::new(),
+            rx,
+            Vec::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let block = |height| {
+            WatchEvent::BlockConnected(BlockRef {
+                height,
+                hash: vec![0; 32],
+            })
+        };
+        let (outpoint, script_pubkey) = (OutPoint::null(), ScriptBuf::new());
+
+        watcher.handle_command(WatcherCommand::RegisterWatchRequest {
+            outpoint,
+            script_pubkey: script_pubkey.clone(),
+        });
+        watcher.handle_event(block(0));
+        assert_eq!(
+            watcher.tip.load(Ordering::Acquire),
+            0,
+            "no height, nothing published"
+        );
+        watcher.handle_event(block(7));
+        assert_eq!(watcher.tip.load(Ordering::Acquire), 7);
+
+        watcher.handle_command(WatcherCommand::Unwatch {
+            outpoint,
+            script_pubkey,
+        });
+        assert_eq!(watcher.tip.load(Ordering::Acquire), 0);
+        // A reconnect replays the tip after the last unwatch; it must stay withdrawn.
+        watcher.handle_event(block(8));
+        assert_eq!(watcher.tip.load(Ordering::Acquire), 0);
     }
 }
