@@ -116,6 +116,8 @@ impl RecoveryLoop {
                             Ok(chain) => chain,
                             Err(e) => {
                                 log::warn!("Recovery loop: no connection: {:?}", e);
+                                // A dropped circuit is passing; retry on the next interval.
+                                last_tip = None;
                                 thread::park_timeout(RECOVERY_LOOP_INTERVAL);
                                 continue;
                             }
@@ -228,6 +230,7 @@ impl RecoveryLoop {
                         // Finished only once the removal is on disk: a restart
                         // skips a CleanedUp swap and would keep its stale coins.
                         if !saved {
+                            last_tip = None;
                             thread::park_timeout(RECOVERY_LOOP_INTERVAL);
                             continue;
                         }

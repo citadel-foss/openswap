@@ -286,11 +286,13 @@ impl<R: Role> Watcher<R> {
                 {
                     log::error!("registry lock poisoned, watch not stored: {e:?}");
                 }
-                if let Err(e) = self.blockchain.subscribe_script(&script_pubkey, outpoint) {
-                    log::error!("electrum script-subscribe failed for {outpoint}: {e}");
-                    self.pending_subscribes.push((outpoint, script_pubkey));
+                match self.blockchain.subscribe_script(&script_pubkey, outpoint) {
+                    Ok(()) => self.seed_tip(),
+                    Err(e) => {
+                        log::error!("electrum script-subscribe failed for {outpoint}: {e}");
+                        self.pending_subscribes.push((outpoint, script_pubkey));
+                    }
                 }
-                self.seed_tip();
             }
             WatcherCommand::RebuildWatches { watches, reply } => {
                 log::info!("Rebuilding {} watches from the wallet", watches.len());
@@ -303,9 +305,12 @@ impl<R: Role> Watcher<R> {
                     if let Err(e) = self.registry.register_watch(*outpoint, spk.clone()) {
                         log::error!("registry lock poisoned, watch not stored: {e:?}");
                     }
-                    if let Err(e) = self.blockchain.subscribe_script(spk, *outpoint) {
-                        log::error!("electrum script-subscribe failed for {outpoint}: {e}");
-                        self.pending_subscribes.push((*outpoint, spk.clone()));
+                    match self.blockchain.subscribe_script(spk, *outpoint) {
+                        Ok(()) => self.seed_tip(),
+                        Err(e) => {
+                            log::error!("electrum script-subscribe failed for {outpoint}: {e}");
+                            self.pending_subscribes.push((*outpoint, spk.clone()));
+                        }
                     }
                 }
                 // Electrum replays each script's whole history as `TxSeen`.
@@ -319,7 +324,6 @@ impl<R: Role> Watcher<R> {
                         thread::sleep(HEART_BEAT_INTERVAL);
                     }
                 }
-                self.seed_tip();
                 _ = reply.send(Ok(()));
             }
             WatcherCommand::WatchRequest { outpoint, reply } => {
@@ -395,7 +399,8 @@ impl<R: Role> Watcher<R> {
     }
 
     /// Electrum's block events carry the height, so seed it once a watch is armed
-    /// instead of waiting a block. Core's never do, so it publishes none.
+    /// instead of waiting a block. Called only after the server just answered, so a
+    /// down server cannot stall the command loop twice. Core publishes none.
     fn seed_tip(&self) {
         let watching = self.registry.list_watches().is_ok_and(|w| !w.is_empty());
         if watching && self.blockchain.is_electrum() && self.tip.load(Ordering::Acquire) == 0 {
