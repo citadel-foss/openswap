@@ -341,7 +341,7 @@ fn heterogeneous_substitution_aborts_without_cascade() {
 
     // Baseline: hop 1 admitted these exact terms; a replay is still accepted.
     let downstream_details = taker
-        .current_swap_details(1)
+        .test_current_swap_details(1)
         .expect("downstream swap details should rebuild");
     match taker
         .test_resend_swap_details(1)
@@ -410,7 +410,7 @@ fn heterogeneous_substitution_aborts_without_cascade() {
 
     // Hop 1 still honors the originally admitted terms after the abort.
     match taker
-        .resend_swap_details(&summary.makers[1].address, &downstream_details)
+        .test_send_swap_details(&summary.makers[1].address, &downstream_details)
         .expect("post-abort resend should get an answer")
     {
         MakerToTakerMessage::AckSwapDetails(ack) => assert!(

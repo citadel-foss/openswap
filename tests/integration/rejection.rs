@@ -3318,7 +3318,7 @@ fn swap_cap_rejects_before_planning() {
         )
         .expect("the first admission must succeed");
     let template = taker
-        .current_swap_details(0)
+        .test_current_swap_details(0)
         .expect("the negotiated SwapDetails rebuild");
 
     // Admissions 2..=30: the negotiated terms under fresh ids.
@@ -3326,7 +3326,7 @@ fn swap_cap_rejects_before_planning() {
         let mut details = template.clone();
         details.id = format!("{:016x}", n);
         match taker
-            .resend_swap_details(&maker_addr, &details)
+            .test_send_swap_details(&maker_addr, &details)
             .expect("every admission must get an answer")
         {
             openswap::protocol::common_messages::MakerToTakerMessage::AckSwapDetails(ack) => {
@@ -3344,7 +3344,7 @@ fn swap_cap_rejects_before_planning() {
     let mut details = template.clone();
     details.id = format!("{:016x}", 30u64);
     match taker
-        .resend_swap_details(&maker_addr, &details)
+        .test_send_swap_details(&maker_addr, &details)
         .expect("the capped admission must still get an answer")
     {
         openswap::protocol::common_messages::MakerToTakerMessage::AckSwapDetails(ack) => {

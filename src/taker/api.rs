@@ -2086,7 +2086,7 @@ impl Taker {
 
     /// Send `details` to `maker_address` on a fresh connection and return the
     /// maker's raw response, accept or reject.
-    pub fn resend_swap_details(
+    pub(crate) fn resend_swap_details(
         &self,
         maker_address: &str,
         details: &SwapDetails,
@@ -2119,7 +2119,7 @@ impl Taker {
 
     /// Rebuild the SwapDetails this swap negotiated with `maker_idx`, so they can
     /// be resent the way a reconnecting client would.
-    pub fn current_swap_details(&self, maker_idx: usize) -> Result<SwapDetails, TakerError> {
+    pub(crate) fn current_swap_details(&self, maker_idx: usize) -> Result<SwapDetails, TakerError> {
         let swap = self.swap_state()?;
         let refund_locktime_offset = REFUND_LOCKTIME_BASE
             + REFUND_LOCKTIME_STEP * (swap.makers.len() - maker_idx - 1) as u16;
@@ -2173,6 +2173,22 @@ impl Taker {
             }
         }
         Ok(())
+    }
+
+    /// Test hook: the SwapDetails this swap negotiated with `maker_idx`.
+    #[cfg(feature = "integration-test")]
+    pub fn test_current_swap_details(&self, maker_idx: usize) -> Result<SwapDetails, TakerError> {
+        self.current_swap_details(maker_idx)
+    }
+
+    /// Test hook: send `details` to `maker_address` and return the raw answer.
+    #[cfg(feature = "integration-test")]
+    pub fn test_send_swap_details(
+        &self,
+        maker_address: &str,
+        details: &SwapDetails,
+    ) -> Result<MakerToTakerMessage, TakerError> {
+        self.resend_swap_details(maker_address, details)
     }
 
     /// Resend the negotiated SwapDetails to `maker_idx` on a fresh connection

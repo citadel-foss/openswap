@@ -316,7 +316,10 @@ pub fn fit_declared_shape(
         .flat_map(|split| split.utxos.iter().copied())
         .collect();
     let swept: HashSet<OutPoint> = pools[1].iter().map(|(outpoint, _)| *outpoint).collect();
-    let input_fee = funding_fee(2, fee_rate)? - funding_fee(1, fee_rate)?;
+    // Adding an input raises the rounded fee by at most the ceiling of its own
+    // vbytes, so a coin worth that much never shrinks its split.
+    let input_fee = fee_at_rate_sats(funding_tx_vsize(2) - funding_tx_vsize(1), fee_rate)
+        .ok_or_else(|| WalletError::General("input fee arithmetic overflow".to_string()))?;
     let mut spare = pools.map(|mut pool| {
         pool.retain(|(outpoint, amount)| !used.contains(outpoint) && amount.to_sat() >= input_fee);
         pool.sort_by_key(|(_, amount)| *amount);
