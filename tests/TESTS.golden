@@ -180,8 +180,8 @@ openswap wallet::api::recovery_address_tests::retry_reuses_the_stored_recovery_a
 openswap wallet::api::restore_history_probe_tests::interrupted_restore_finishes_before_wallet_is_loaded
 openswap wallet::api::restore_history_probe_tests::restore_probe_bridges_a_long_run_of_emptied_addresses
 openswap wallet::api::restore_history_probe_tests::sync_does_not_enter_the_backend_after_shutdown
-openswap wallet::api::swap_reservation_tests::a_reservation_stops_holding_inputs_once_it_ages_out
 openswap wallet::api::swap_reservation_tests::a_reservation_survives_a_wallet_reload
+openswap wallet::api::swap_reservation_tests::only_a_spendable_coin_no_swap_holds_can_be_claimed
 openswap wallet::api::timelock_reconcile_tests::core_classifies_our_confirmed_recovery_as_recovered
 openswap wallet::api::timelock_reconcile_tests::electrum_classifies_our_confirmed_taproot_recovery_as_recovered
 openswap wallet::api::timelock_reconcile_tests::electrum_keeps_a_contract_the_other_side_claimed
@@ -218,6 +218,10 @@ openswap wallet::fidelity::test::a_stale_advertised_confirmation_height_still_ve
 openswap wallet::fidelity::test::test_fidelity_bond_value_function_behavior
 openswap wallet::fidelity::test::test_fidelity_bond_values
 openswap wallet::fidelity::test_fidleity_redeemscripts
+openswap wallet::funding::tests::a_replan_pairs_each_split_with_a_declared_count_it_covers
+openswap wallet::funding::tests::a_replan_spending_past_its_declared_counts_must_fit_the_swap_fee
+openswap wallet::funding::tests::a_replan_without_spare_coins_in_the_split_pool_is_refused
+openswap wallet::funding::tests::a_short_replanned_split_takes_the_smallest_spare_coin_of_its_pool
 openswap wallet::funding::tests::contract_floor_covers_costliest_spend_and_dust
 openswap wallet::funding::tests::degrades_to_one_split_when_splits_starve_each_other
 openswap wallet::funding::tests::empty_when_pool_cannot_cover_total_and_fee
@@ -231,6 +235,7 @@ openswap wallet::funding::tests::insufficient_when_neither_pool_covers_the_plan
 openswap wallet::funding::tests::manual_selection_caps_the_pool
 openswap wallet::funding::tests::manual_selection_degrades_the_split_count
 openswap wallet::funding::tests::over_budget_guard_weighs_the_spend_against_the_swap_fee
+openswap wallet::funding::tests::padding_skips_a_spare_coin_worth_less_than_its_input_fee
 openswap wallet::funding::tests::planner_is_deterministic
 openswap wallet::funding::tests::policy_fee_netting_ignores_inputs_above_budget_in_price
 openswap wallet::funding::tests::policy_fee_netting_prices_each_split_by_its_inputs
@@ -295,6 +300,7 @@ openswap::integration fidelity::creation::bond_creation_and_redemption
 openswap::integration fidelity::renewal::bond_auto_renewal
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart_electrum
+openswap::integration fidelity::restart::live_bond_is_advertised_while_another_is_pending
 openswap::integration fidelity::restart::unconfirmed_bond_not_duplicated
 openswap::integration fidelity::restart::unconfirmed_bond_not_duplicated_electrum
 openswap::integration fidelity::spending::bond_spending
@@ -339,16 +345,17 @@ openswap::integration recovery::taker_abort::taproot_drop_after_full_setup
 openswap::integration recovery::taker_abort::taproot_drop_after_makers_contract_response
 openswap::integration recovery::taker_abort::taproot_drop_at_ack_response
 openswap::integration recovery::taker_abort::taproot_drop_at_senders_contract
+openswap::integration rejection::admission::admission_reserves_no_liquidity
 openswap::integration rejection::admission::low_swap_liquidity
 openswap::integration rejection::admission::maker_degrades_split_count_when_netting_breaks_the_floor
 openswap::integration rejection::admission::maker_rejects_forged_swap_details_at_admission
 openswap::integration rejection::admission::maker_rejects_forged_swap_details_at_admission_electrum
-openswap::integration rejection::admission::maker_rejects_insufficient_liquidity_from_active_reservation
 openswap::integration rejection::admission::maker_rejects_out_of_bounds_swap_details
 openswap::integration rejection::admission::maker_rejects_taproot_contract_below_floor
 openswap::integration rejection::admission::maker_rejects_underdelivered_taproot_amount
 openswap::integration rejection::admission::maker_rejects_wrong_taproot_incoming_count
 openswap::integration rejection::admission::one_utxo_taker_completes_degraded_swap
+openswap::integration rejection::admission::readmission_with_a_new_shape_fails_before_funding
 openswap::integration rejection::admission::swap_cap_rejects_before_planning
 openswap::integration rejection::admission::taker_rejects_out_of_bounds_params_at_prepare
 openswap::integration rejection::bans::an_unpriceable_offer_sidelines_without_banning
@@ -361,7 +368,9 @@ openswap::integration rejection::blocklist::maker_rejects_taproot_funding_from_b
 openswap::integration rejection::blocklist::taker_rejects_legacy_funding_from_blocked_address
 openswap::integration rejection::blocklist::taker_rejects_taproot_funding_from_blocked_address
 openswap::integration rejection::blocklist::taproot_populated_blocklist_is_ignored_when_disabled
-openswap::integration rejection::contract_response::legacy_rejects_underreported_funding_inputs
+openswap::integration rejection::contract_response::legacy_handed_out_funding_cannot_be_broadcast
+openswap::integration rejection::contract_response::legacy_rejects_overreported_funding_inputs
+openswap::integration rejection::contract_response::legacy_replan_with_extra_inputs_completes
 openswap::integration rejection::contract_response::legacy_taker_rejects_fee_skimming_maker
 openswap::integration rejection::contract_response::legacy_taker_rejects_malformed_maker_funding_output
 openswap::integration rejection::contract_response::taker_rejects_duplicated_legacy_contract_outpoint
@@ -370,8 +379,8 @@ openswap::integration rejection::contract_response::taker_rejects_inflated_tapro
 openswap::integration rejection::contract_response::taker_rejects_overproduced_legacy_contracts
 openswap::integration rejection::contract_response::taker_rejects_overproduced_taproot_contracts
 openswap::integration rejection::contract_response::taproot_rejects_fee_skimming_maker
+openswap::integration rejection::contract_response::taproot_rejects_overreported_funding_inputs
 openswap::integration rejection::contract_response::taproot_rejects_underfunded_maker_contract
-openswap::integration rejection::contract_response::taproot_rejects_underreported_funding_inputs
 openswap::integration rejection::fees::legacy_rejects_funding_fee_underpayment
 openswap::integration rejection::fees::legacy_rejects_funding_fee_underpayment_electrum
 openswap::integration rejection::fees::maker_rejects_over_budget_funding_plan
@@ -389,9 +398,10 @@ openswap::integration rejection::funding_proof::maker_rejects_spent_funding_outp
 openswap::integration rejection::funding_proof::maker_rejects_underdelivered_legacy_amount
 openswap::integration rejection::funding_proof::makers_reject_duplicate_funding_outpoints
 openswap::integration rejection::funding_proof::taproot_maker_rejects_contract_amount_mismatch
+openswap::integration rejection::keepalive::completed_swap_state_is_restored_after_a_failed_sweep
 openswap::integration rejection::keepalive::keepalive_naming_unseen_funding_is_refused
 openswap::integration rejection::keepalive::keepalive_with_mempool_funding_still_refreshes
-openswap::integration rejection::keepalive::unfunded_swap_dies_at_lifetime_despite_keepalives
+openswap::integration rejection::keepalive::slow_taker_is_readmitted_before_funding
 openswap::integration rejection::partial_broadcast::maker_recovers_partial_broadcast_electrum
 openswap::integration rejection::partial_broadcast::maker_recovers_partial_broadcast_legacy
 openswap::integration rejection::partial_broadcast::maker_recovers_partial_broadcast_taproot
@@ -410,6 +420,7 @@ openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract
 openswap::integration restart::legacy_reboot::maker_reboot_preserves_funded_swapcoins
 openswap::integration restart::reboot::legacy_electrum_crash_after_contract_exchange
 openswap::integration restart::reboot::legacy_electrum_restart_rebuilds_watches
+openswap::integration restart::reboot::orphan_reservation_is_released_on_restart
 openswap::integration restart::reboot::reservations_survive_a_maker_restart
 openswap::integration restart::reboot::reservations_survive_a_maker_restart_electrum
 openswap::integration restart::reboot::taproot_crash_after_contract_exchange
@@ -427,7 +438,8 @@ openswap::integration restart::watchtower_liveness::funded_legacy_maker_reaches_
 openswap::integration restart::watchtower_liveness::funded_maker_restarts_recovery_only_without_watcher
 openswap::integration restart::watchtower_liveness::maker_rejects_new_swaps_after_watcher_exit
 openswap::integration restart::watchtower_liveness::taker_refuses_swap_before_funding_after_watcher_exit
-openswap::integration swap::concurrent_takers::admission_reservation_conflict
+openswap::integration swap::concurrent_takers::funding_conflict_replans_onto_free_coins
+openswap::integration swap::concurrent_takers::funding_race_has_one_winner
 openswap::integration swap::concurrent_takers::legacy_limited_liquidity
 openswap::integration swap::concurrent_takers::taproot_limited_liquidity
 openswap::integration swap::electrum::legacy_swap_completes
@@ -448,6 +460,7 @@ openswap::integration swap::payswap::negotiation_guards_abort_before_funding
 openswap::integration swap::payswap::taproot_exact_payment
 openswap::integration swap::spare_maker::legacy_first_maker_drops_before_sender_sigs
 openswap::integration swap::spare_maker::legacy_middle_maker_drops_before_sender_sigs
+openswap::integration swap::spare_maker::rebuild_after_replan_uses_the_claimed_coins
 openswap::integration swap::spare_maker::taproot_middle_maker_drops_after_ack
 openswap::integration swap::spare_pricing::heterogeneous_substitution_aborts_without_cascade
 openswap::integration swap::spare_pricing::last_hop_equal_priced_spare_completes
@@ -464,7 +477,10 @@ openswap::integration wallet::broadcast_idempotency::rebroadcast_mined_bitcoind
 openswap::integration wallet::broadcast_idempotency::rebroadcast_mined_electrum
 openswap::integration wallet::broadcast_idempotency::rebroadcast_unmined_bitcoind
 openswap::integration wallet::broadcast_idempotency::rebroadcast_unmined_electrum
+openswap::integration wallet::electrum_transport::a_refused_subscribe_still_answers_the_sync
 openswap::integration wallet::electrum_transport::a_shared_script_stays_subscribed_until_the_last_watcher_goes
+openswap::integration wallet::electrum_transport::a_sync_asks_only_about_changed_scripts
+openswap::integration wallet::electrum_transport::an_idle_watcher_sends_nothing
 openswap::integration wallet::electrum_transport::confirmed_spend_requires_an_input_consuming_the_outpoint
 openswap::integration wallet::electrum_transport::connect_gives_up_with_unreachable
 openswap::integration wallet::electrum_transport::connect_retries_until_the_server_answers
