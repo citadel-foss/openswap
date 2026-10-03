@@ -1211,9 +1211,8 @@ impl MakerServer {
         // whether a new bond is needed.
         let live_bond = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .get_highest_fidelity_index()
-            .map_err(MakerError::Wallet)?
-            .is_some();
+            .has_live_fidelity_bond()
+            .map_err(MakerError::Wallet)?;
         // A just-redeemed bond must not stay advertised while a new one confirms.
         if !live_bond {
             *lock_debug!(self.highest_fidelity_proof.write())

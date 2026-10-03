@@ -5,7 +5,7 @@ use crate::{
     watch_tower::utils::{extract_op_return_data, parse_fidelity_op_return},
 };
 use bitcoin::{
-    absolute::LockTime,
+    absolute::{Height, LockTime, Time},
     bip32::{ChildNumber, DerivationPath},
     consensus::encode::{serialize, VarInt},
     hashes::{sha256d, Hash},
@@ -435,6 +435,24 @@ impl Wallet {
             .collect::<Result<Vec<serde_json::Value>, _>>()?;
 
         serde_json::to_string_pretty(&serialized).map_err(|e| WalletError::General(e.to_string()))
+    }
+
+    /// Whether a confirmed, unspent bond is still locked at the tip. Read from
+    /// the bond records, so a failed valuation never reads as no live bond.
+    pub(crate) fn has_live_fidelity_bond(&self) -> Result<bool, WalletError> {
+        let mut confirmed = self
+            .store
+            .fidelity_bond
+            .iter()
+            .filter(|bond| !bond.is_spent && bond.conf_height.is_some())
+            .peekable();
+        if confirmed.peek().is_none() {
+            return Ok(false);
+        }
+        let (tip_height, tip_time) = self.chain_tip()?;
+        let height = Height::from_consensus(tip_height as u32)?;
+        let time = Time::from_consensus(tip_time as u32)?;
+        Ok(confirmed.any(|bond| !bond.lock_time.is_satisfied_by(height, time)))
     }
 
     /// Get the highest value fidelity bond. Returns None, if no bond exists.
