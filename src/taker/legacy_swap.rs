@@ -766,13 +766,11 @@ impl Taker {
 
             // The handed-out funding txs carry no signatures, so the feerate,
             // which prices the real size, is checked on the confirmed txs.
-            let confirmed_funding = {
-                let wallet = self.read_wallet()?;
-                maker_funding_txids
-                    .iter()
-                    .map(|txid| wallet.blockchain.get_raw_transaction(txid, None))
-                    .collect::<Result<Vec<_>, _>>()?
-            };
+            let chain = self.read_wallet()?.blockchain.new_connection()?;
+            let confirmed_funding = maker_funding_txids
+                .iter()
+                .map(|txid| chain.get_raw_transaction(txid, None))
+                .collect::<Result<Vec<_>, _>>()?;
             self.verify_maker_funding_feerate(&confirmed_funding, maker_idx)?;
 
             // Verify that the maker's funding confirmed within a few blocks of the

@@ -1030,13 +1030,11 @@ impl MakerServer {
         !self.is_shutdown()
     }
 
-    /// A backend connection of its own for a bond wait, so no poll runs
-    /// under the wallet guard: a slow backend would block every wallet writer.
+    /// A backend connection of its own for a bond wait, built from config so
+    /// neither the connect nor a poll runs under the wallet guard: a slow
+    /// backend would block every wallet writer.
     fn bond_chain(&self) -> Result<AnyBlockchain, MakerError> {
-        lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .blockchain
-            .new_connection()
+        AnyBlockchain::from_config_with_shutdown(&self.config.backend, self.shutdown.backend_flag())
             .map_err(MakerError::Wallet)
     }
 
