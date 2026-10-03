@@ -229,8 +229,8 @@ struct Subscription {
     seen: HashSet<Txid>,
 }
 
-/// Notification state for the watchtower path, mutated through a `Mutex` so the
-/// backend stays `Sync` while exposing `&self` methods.
+/// Notification state for the watchtower and the wallet sync, mutated through a
+/// `Mutex` so the backend stays `Sync` while exposing `&self` methods.
 #[derive(Debug, Default)]
 struct NotifierState {
     /// Highest header height seen, so duplicate tip notifications are ignored.
@@ -251,6 +251,11 @@ struct NotifierState {
     pending: VecDeque<WatchEvent>,
     /// Last time the socket was pumped with a real RPC (see `poll_event`).
     last_ping: Option<std::time::Instant>,
+    /// Wallet scripts subscribed on this connection, with their last `listunspent`
+    /// answer, or `None` once an alert says their coins changed.
+    wallet_scripts: HashMap<ScriptBuf, Option<Vec<UnspentRes>>>,
+    /// `reconnects` when `wallet_scripts` was armed. A rebuilt socket holds none of them.
+    wallet_connection: u64,
 }
 
 /// Electrum-protocol backend. One owned connection serves both the wallet's
@@ -273,7 +278,8 @@ pub struct Electrum {
     /// connection clears electrum-client's unsafe-to-unsubscribe local state.
     subscription_reset_pending: AtomicBool,
     /// Times the transport was rebuilt for failure recovery or subscription cleanup.
-    /// Used by tests to prove ordinary sync and watch calls reuse the connection.
+    /// A change tells `list_unspent` its subscriptions are gone. Tests use it to
+    /// prove ordinary sync and watch calls reuse the connection.
     reconnects: AtomicU64,
     /// Scripts the wallet asked us to track (Core's server-side wallet equivalent).
     watched: Mutex<HashSet<ScriptBuf>>,
@@ -1045,66 +1051,140 @@ impl Blockchain for Electrum {
             .iter()
             .cloned()
             .collect();
+        // Also pulls off the socket every alert the server sent before this reply.
         let tip = self.get_block_count()?;
         let min_conf = minconf.unwrap_or(0) as u32;
         // Mirror Bitcoin Core's `listunspent` default: no upper bound.
         let max_conf = maxconf.map(|c| c as u32).unwrap_or(u32::MAX);
 
+        let mut guard = lock_debug!(self.notifier.lock()).map_err(poisoned)?;
+        let state = &mut *guard;
+        let connection = self.reconnects.load(Ordering::Relaxed);
+        if state.wallet_connection != connection {
+            state.wallet_scripts.clear();
+            state.wallet_connection = connection;
+        }
+
         // Batch the per-script queries so N watched scripts become ~N/BATCH
         // round-trips. Some servers cap batch payload size, so we chunk.
         const LIST_UNSPENT_BATCH: usize = 200;
-        let mut out = Vec::new();
-        for chunk in watched.chunks(LIST_UNSPENT_BATCH) {
-            let results = self.call(|c| batch_list_unspent_signed(c, chunk))?;
-            for (script, entries) in chunk.iter().zip(results) {
-                for e in entries {
-                    // A value past 21M BTC is a server lie; letting it through
-                    // would panic the `Amount` folds in `get_balances` on every sync.
-                    if e.value > bitcoin::Amount::MAX_MONEY.to_sat() {
-                        return Err(electrum_err(format!(
-                            "electrum: utxo {}:{} value {} exceeds max money",
-                            e.tx_hash, e.tx_pos, e.value
-                        )));
+        let mut unarmed = Vec::new();
+        for spk in &watched {
+            // The watcher reads this script's alerts. Taking them here would hide a spend from it.
+            if state.subscriptions.contains_key(spk) {
+                state.wallet_scripts.remove(spk);
+                continue;
+            }
+            let Some(answer) = state.wallet_scripts.get_mut(spk) else {
+                unarmed.push(spk.clone());
+                continue;
+            };
+            // Any queued alert means this script's coins changed.
+            loop {
+                match self.try_call(&|c| c.script_pop(spk)) {
+                    Ok(None) => break,
+                    Ok(Some(_)) => *answer = None,
+                    // The socket was rebuilt after `connection` was read.
+                    Err(_) => {
+                        *answer = None;
+                        break;
                     }
-                    let confirmations = if e.height <= 0 {
-                        0
-                    } else {
-                        // Drop just this entry: one impossible height must not
-                        // stop every other utxo in the wallet from being seen.
-                        match checked_confirmations(tip, e.height as u64) {
-                            Ok(c) => c,
-                            Err(err) => {
-                                log::warn!(
-                                    "skipping utxo {}:{} with bad height: {err:?}",
-                                    e.tx_hash,
-                                    e.tx_pos
-                                );
-                                continue;
-                            }
-                        }
-                    };
-                    if confirmations < min_conf || confirmations > max_conf {
-                        continue;
-                    }
-                    // HD-origin is surfaced out-of-band via `hd_origin_for_script`,
-                    // so `descriptor` is left empty here. Coin locking is handled
-                    // wallet-side (see `Wallet`'s lock set), not by this backend.
-                    out.push(ListUnspentResultEntry {
-                        txid: e.tx_hash,
-                        vout: e.tx_pos,
-                        address: None,
-                        label: None,
-                        redeem_script: None,
-                        witness_script: None,
-                        script_pub_key: script.clone(),
-                        amount: bitcoin::Amount::from_sat(e.value),
-                        confirmations,
-                        spendable: true,
-                        solvable: true,
-                        descriptor: None,
-                        safe: true,
-                    });
                 }
+            }
+        }
+        for chunk in unarmed.chunks(LIST_UNSPENT_BATCH) {
+            let statuses = match self
+                .call(|c| c.batch_script_subscribe(chunk.iter().map(ScriptBuf::as_script)))
+            {
+                Ok(statuses) => statuses,
+                Err(e) => {
+                    // The client records a subscription before the server confirms it and
+                    // refuses to arm it again. Rebuild, and ask unarmed scripts directly.
+                    log::warn!("electrum wallet subscribe failed: {e:?}");
+                    let _ = self.reconnect_client();
+                    break;
+                }
+            };
+            // No status means no history, so there is no coin to ask about.
+            for (spk, status) in chunk.iter().zip(statuses) {
+                state
+                    .wallet_scripts
+                    .insert(spk.clone(), status.is_none().then(Vec::new));
+            }
+        }
+
+        let stale: Vec<ScriptBuf> = watched
+            .iter()
+            .filter(|spk| !matches!(state.wallet_scripts.get(*spk), Some(Some(_))))
+            .cloned()
+            .collect();
+        let mut watcher_answers = HashMap::new();
+        for chunk in stale.chunks(LIST_UNSPENT_BATCH) {
+            let results = self.call(|c| batch_list_unspent_signed(c, chunk))?;
+            for (spk, entries) in chunk.iter().zip(results) {
+                match state.wallet_scripts.get_mut(spk) {
+                    Some(answer) => *answer = Some(entries),
+                    None => {
+                        watcher_answers.insert(spk, entries);
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for script in &watched {
+            let entries = state
+                .wallet_scripts
+                .get(script)
+                .and_then(Option::as_ref)
+                .or_else(|| watcher_answers.get(script));
+            for e in entries.into_iter().flatten() {
+                // A value past 21M BTC is a server lie; letting it through
+                // would panic the `Amount` folds in `get_balances` on every sync.
+                if e.value > bitcoin::Amount::MAX_MONEY.to_sat() {
+                    return Err(electrum_err(format!(
+                        "electrum: utxo {}:{} value {} exceeds max money",
+                        e.tx_hash, e.tx_pos, e.value
+                    )));
+                }
+                let confirmations = if e.height <= 0 {
+                    0
+                } else {
+                    // Drop just this entry: one impossible height must not
+                    // stop every other utxo in the wallet from being seen.
+                    match checked_confirmations(tip, e.height as u64) {
+                        Ok(c) => c,
+                        Err(err) => {
+                            log::warn!(
+                                "skipping utxo {}:{} with bad height: {err:?}",
+                                e.tx_hash,
+                                e.tx_pos
+                            );
+                            continue;
+                        }
+                    }
+                };
+                if confirmations < min_conf || confirmations > max_conf {
+                    continue;
+                }
+                // HD-origin is surfaced out-of-band via `hd_origin_for_script`,
+                // so `descriptor` is left empty here. Coin locking is handled
+                // wallet-side (see `Wallet`'s lock set), not by this backend.
+                out.push(ListUnspentResultEntry {
+                    txid: e.tx_hash,
+                    vout: e.tx_pos,
+                    address: None,
+                    label: None,
+                    redeem_script: None,
+                    witness_script: None,
+                    script_pub_key: script.clone(),
+                    amount: bitcoin::Amount::from_sat(e.value),
+                    confirmations,
+                    spendable: true,
+                    solvable: true,
+                    descriptor: None,
+                    safe: true,
+                });
             }
         }
         Ok(out)
@@ -1437,11 +1517,12 @@ impl Blockchain for Electrum {
 
         // The electrum client only reads from the socket while waiting for a
         // reply to its own request, so notifications never arrive on an idle
-        // connection. Ping periodically to trigger a socket read. The ping also
-        // keeps the held connection alive against server-side idle timeouts.
-        let ping_due = state
-            .last_ping
-            .is_none_or(|at| at.elapsed() >= self.ping_interval);
+        // connection. Ping periodically to trigger a socket read. With no script
+        // subscribed only tip alerts arrive, which the watcher ignores on Electrum.
+        let ping_due = !state.subscriptions.is_empty()
+            && state
+                .last_ping
+                .is_none_or(|at| at.elapsed() >= self.ping_interval);
         if ping_due {
             state.last_ping = Some(std::time::Instant::now());
             if let Err(e) = self.call(|c| c.ping()) {

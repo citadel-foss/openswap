@@ -7,18 +7,21 @@
 //! fixed electrs port, which `electrsd::Conf` does not offer.
 
 use std::{
-    io,
+    io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
     thread,
 };
 
 use bitcoin::hashes::Hash;
-use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
+use bitcoind::{
+    bitcoincore_rpc::{json::ListUnspentResultEntry, RpcApi},
+    BitcoinD,
+};
 use openswap::wallet::{Blockchain, Electrum, ElectrumConfig, WalletError};
 
 use super::test_framework::{
@@ -35,6 +38,8 @@ struct Forwarder {
     /// proxy that is up but cannot reach the far side.
     refuse: Arc<AtomicBool>,
     accepted: Arc<(Mutex<u64>, Condvar)>,
+    /// Requests the client sent. The client ends every request, batched or not, with a newline.
+    requests: Arc<AtomicU64>,
 }
 
 impl Forwarder {
@@ -44,8 +49,14 @@ impl Forwarder {
         let live: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
         let refuse = Arc::new(AtomicBool::new(false));
         let accepted = Arc::new((Mutex::new(0), Condvar::new()));
+        let requests = Arc::new(AtomicU64::new(0));
 
-        let (live_c, refuse_c, accepted_c) = (live.clone(), refuse.clone(), accepted.clone());
+        let (live_c, refuse_c, accepted_c, requests_c) = (
+            live.clone(),
+            refuse.clone(),
+            accepted.clone(),
+            requests.clone(),
+        );
         thread::spawn(move || {
             for incoming in listener.incoming() {
                 let Ok(client) = incoming else { continue };
@@ -69,8 +80,16 @@ impl Forwarder {
                 let mut c_write = client;
                 let mut s_read = server.try_clone().expect("clone server");
                 let mut s_write = server;
+                let requests_c = requests_c.clone();
                 thread::spawn(move || {
-                    let _ = io::copy(&mut c_read, &mut s_write);
+                    let mut buf = [0u8; 8192];
+                    while let Ok(n @ 1..) = c_read.read(&mut buf) {
+                        let lines = buf[..n].iter().filter(|b| **b == b'\n').count();
+                        requests_c.fetch_add(lines as u64, Ordering::SeqCst);
+                        if s_write.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
                 });
                 thread::spawn(move || {
                     let _ = io::copy(&mut s_read, &mut c_write);
@@ -83,6 +102,7 @@ impl Forwarder {
             live,
             refuse,
             accepted,
+            requests,
         }
     }
 
@@ -206,6 +226,151 @@ fn held_connection_is_reused_across_calls() {
         0,
         "held connection was rebuilt during ordinary sync/watch calls"
     );
+
+    drop(electrum);
+    cleanup(&s.root_dir);
+}
+
+/// A sync asks only about scripts the server reported changed, yet still sees a
+/// deposit, its confirmation, and a deposit made while the socket was down.
+#[test]
+fn a_sync_asks_only_about_changed_scripts() {
+    let s = setup("changed");
+    let cfg = ElectrumConfig {
+        url: s.forwarder.url(),
+        ..Default::default()
+    };
+    let electrum = Electrum::new(&cfg).expect("connect via forwarder");
+    let addr = s
+        .bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .require_network(bitcoin::Network::Regtest)
+        .unwrap();
+    electrum.watch_script(&addr.script_pubkey(), None);
+    for i in 0..49u8 {
+        let unused = bitcoin::WPubkeyHash::from_byte_array([i; 20]);
+        electrum.watch_script(&bitcoin::ScriptBuf::new_p2wpkh(&unused), None);
+    }
+
+    let sync = || {
+        let before = s.forwarder.requests.load(Ordering::SeqCst);
+        let utxos = electrum.list_unspent(None, None).expect("utxos");
+        (s.forwarder.requests.load(Ordering::SeqCst) - before, utxos)
+    };
+    let wait_for = |done: &dyn Fn(&[ListUnspentResultEntry]) -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let _ = s._electrsd.trigger();
+            let (requests, utxos) = sync();
+            if done(&utxos) {
+                return requests;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sync never showed the change: {:?}",
+                utxos
+            );
+            thread::sleep(std::time::Duration::from_millis(200));
+        }
+    };
+
+    // The tip, then one subscribe per script. A script with no history has no coin to ask about.
+    assert_eq!(sync().0, 51);
+    assert_eq!(
+        sync().0,
+        1,
+        "an unchanged wallet should cost only the tip read"
+    );
+
+    send_to_address(&s.bitcoind, &addr, bitcoin::Amount::from_sat(10_000));
+    assert_eq!(wait_for(&|u| u.len() == 1), 2, "a deposit costs one query");
+    generate_blocks(&s.bitcoind, 1);
+    assert_eq!(
+        wait_for(&|u| u.len() == 1 && u[0].confirmations == 1),
+        2,
+        "a confirmation costs one query"
+    );
+
+    s.forwarder.drop_connections();
+    send_to_address(&s.bitcoind, &addr, bitcoin::Amount::from_sat(20_000));
+    wait_for(&|u| u.len() == 2);
+
+    drop(electrum);
+    cleanup(&s.root_dir);
+}
+
+/// A watcher with nothing subscribed has nothing to read, so it sends nothing;
+/// the first subscription brings the ping back.
+#[test]
+fn an_idle_watcher_sends_nothing() {
+    let s = setup("idle");
+    let cfg = ElectrumConfig {
+        url: s.forwarder.url(),
+        ..Default::default()
+    };
+    let electrum = Electrum::new(&cfg).expect("connect via forwarder");
+    let requests = || s.forwarder.requests.load(Ordering::SeqCst);
+
+    let before = requests();
+    for _ in 0..3 {
+        assert!(electrum.poll_event().is_none());
+    }
+    assert_eq!(requests(), before, "an idle watcher should not ping");
+
+    let spk = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7u8; 20]));
+    electrum
+        .subscribe_script(&spk, dummy_watch(0))
+        .expect("subscribe");
+    let before = requests();
+    let _ = electrum.poll_event();
+    assert_eq!(requests() - before, 1, "a watching watcher should ping");
+
+    drop(electrum);
+    cleanup(&s.root_dir);
+}
+
+/// A subscribe the client refuses must not fail the sync. Here the watcher left
+/// its subscription behind on a shared connection, so the wallet's own is refused.
+#[test]
+fn a_refused_subscribe_still_answers_the_sync() {
+    let s = setup("refused");
+    let cfg = ElectrumConfig {
+        url: s.forwarder.url(),
+        ..Default::default()
+    };
+    let electrum = Electrum::new(&cfg).expect("connect via forwarder");
+    let addr = s
+        .bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .require_network(bitcoin::Network::Regtest)
+        .unwrap();
+    let spk = addr.script_pubkey();
+    send_to_address(&s.bitcoind, &addr, bitcoin::Amount::from_sat(10_000));
+    generate_blocks(&s.bitcoind, 1);
+    wait_for_tip(&s, &electrum);
+
+    electrum.watch_script(&spk, None);
+    electrum
+        .subscribe_script(&spk, dummy_watch(0))
+        .expect("subscribe");
+    electrum
+        .unsubscribe_script(&spk, dummy_watch(0))
+        .expect("unsubscribe");
+
+    let utxos = electrum.list_unspent(None, None).expect("utxos");
+    assert_eq!(utxos.len(), 1, "the refused script must still be asked");
+    assert_eq!(
+        electrum.reconnect_count(),
+        1,
+        "a refusal rebuilds the socket"
+    );
+    let utxos = electrum.list_unspent(None, None).expect("utxos");
+    assert_eq!(utxos.len(), 1, "the rebuilt socket subscribes cleanly");
+    assert_eq!(electrum.reconnect_count(), 1);
 
     drop(electrum);
     cleanup(&s.root_dir);
