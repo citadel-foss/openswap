@@ -733,6 +733,7 @@ fn discover_wallet_name(data_dir: &Path, role: SwapRole) -> String {
                 || name.ends_with(".lock")
                 || name.ends_with(".partial")
                 || name.ends_with(".tmp")
+                || name.starts_with(".tmp")
             {
                 None
             } else {

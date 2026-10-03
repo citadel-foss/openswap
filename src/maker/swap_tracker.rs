@@ -193,14 +193,8 @@ impl MakerSwapTracker {
         Ok(Self { path, data })
     }
 
-    /// Atomic flush: write to tmp file, then rename over original.
+    /// Atomic flush: durable replace of the tracker file.
     fn flush(&self) -> Result<(), MakerError> {
-        let tmp_path = self.path.with_extension("cbor.tmp");
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let bytes = serde_cbor::to_vec(&self.data).map_err(|e| {
             MakerError::IO(std::io::Error::other(format!(
                 "Failed to serialize maker swap tracker: {}",
@@ -208,9 +202,7 @@ impl MakerSwapTracker {
             )))
         })?;
 
-        std::fs::write(&tmp_path, &bytes)?;
-        std::fs::rename(&tmp_path, &self.path)?;
-
+        crate::atomic_file::write_bytes_atomically(&self.path, &bytes)?;
         Ok(())
     }
 
