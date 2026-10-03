@@ -2727,11 +2727,12 @@ impl MakerTrait for MakerServer {
             }
             return Ok(());
         }
-        // Planning was skipped for a live swap that a drain has since removed:
-        // admit it afresh rather than store this handler's empty plan.
+        // Planning was skipped for a live swap that a drain has since removed.
+        // Nothing is funded yet, so refusing beats storing this handler's empty plan.
         if admission && planned.is_none() {
-            drop(swaps);
-            return self.store_connection_state(swap_id, state, admission);
+            return Err(MakerError::General(
+                "Swap expired while admitting; resend SwapDetails",
+            ));
         }
 
         // The cap read before planning is only a cheap early reject: planning

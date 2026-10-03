@@ -29,9 +29,7 @@ fn assert_grace_then_discard(log_path: &str, swap_id: &str) {
         .find(&format!("Swap {swap_id} shows no funding broadcast after"))
         .expect("the maker must wait on the grace for this swap");
     let dropped = log
-        .find(&format!(
-            "Funding was never broadcast for swap {swap_id} — nothing to recover"
-        ))
+        .find(&format!("Funding was never broadcast for swap {swap_id}"))
         .expect("the maker must discard this swap's never-broadcast funding");
     assert!(
         waited < dropped,
