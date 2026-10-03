@@ -18,6 +18,7 @@ use bitcoind::bitcoincore_rpc::json::GetTransactionResultDetailCategory;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    convert::TryFrom,
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -385,10 +386,10 @@ impl FidelityBond {
             .ok_or(FidelityError::BondTransactionMissing {
                 index: self.bond_index,
             })?;
-        let txid = chain.send_raw_transaction(tx)?;
-        debug_assert_eq!(txid, self.outpoint.txid);
-
-        Ok(txid)
+        // The stored tx is this bond's, so its txid is known: the backend's
+        // answer is never trusted to name what we wait on.
+        chain.send_raw_transaction(tx)?;
+        Ok(self.outpoint.txid)
     }
 }
 
@@ -450,8 +451,11 @@ impl Wallet {
             return Ok(false);
         }
         let (tip_height, tip_time) = self.chain_tip()?;
-        let height = Height::from_consensus(tip_height as u32)?;
-        let time = Time::from_consensus(tip_time as u32)?;
+        let out_of_range = |what| WalletError::General(format!("tip {what} is out of range"));
+        let height =
+            Height::from_consensus(u32::try_from(tip_height).map_err(|_| out_of_range("height"))?)?;
+        let time =
+            Time::from_consensus(u32::try_from(tip_time).map_err(|_| out_of_range("time"))?)?;
         Ok(confirmed.any(|bond| !bond.lock_time.is_satisfied_by(height, time)))
     }
 
