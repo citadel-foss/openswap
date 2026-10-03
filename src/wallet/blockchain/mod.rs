@@ -454,9 +454,35 @@ impl AnyBlockchain {
         }
     }
 
+    /// Feerate in sat/vB a replacement must add: Core's `incrementalrelayfee`,
+    /// or the relay floor when the backend reports none. Never below the
+    /// floor, since the replacement must relay through default peers too.
+    pub(crate) fn replacement_increment_rate(&self) -> f64 {
+        let reported = match self {
+            AnyBlockchain::CoreRPC(b) => b
+                .incremental_relay_feerate()
+                .inspect_err(|e| log::warn!("Cannot read the incremental relay fee: {e:?}"))
+                .ok()
+                .flatten(),
+            AnyBlockchain::Electrum(_) => None,
+        };
+        reported
+            .filter(|rate| rate.is_finite())
+            .map_or(MIN_RELAY_FEE_RATE, |rate| rate.max(MIN_RELAY_FEE_RATE))
+    }
+
     /// Recovery feerates in sat/vB, always including the relay floor. A failed
     /// estimate drops only its rate; a dead Electrum link stops the rest.
     pub(crate) fn recovery_feerates(&self) -> Vec<f64> {
+        // Regtest has no fee estimates, so a test names the rate the market
+        // has reached.
+        #[cfg(feature = "integration-test")]
+        if let Some(rate) = std::env::var("OPENSWAP_RECOVERY_FEERATE")
+            .ok()
+            .and_then(|rate| rate.parse::<f64>().ok())
+        {
+            return vec![rate.max(MIN_RELAY_FEE_RATE), MIN_RELAY_FEE_RATE];
+        }
         let mut rates = Vec::new();
         // Core and every Electrum server we checked accept each of these.
         for priority in [

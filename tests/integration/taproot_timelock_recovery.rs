@@ -287,3 +287,14 @@ fn test_taproot_timelock_recovery() {
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
+
+/// Core finds the pending refund through `gettxspendingprevout`, not through
+/// the script history Electrum reads, so the bump is checked here too.
+#[test]
+fn test_taproot_refund_fee_bump() {
+    super::electrum_abort1::run_refund_fee_bump::<BitcoindBackend>(
+        ProtocolVersion::Taproot,
+        false,
+        854,
+    );
+}
