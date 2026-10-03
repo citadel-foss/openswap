@@ -1101,9 +1101,10 @@ impl Blockchain for Electrum {
                 Ok(statuses) => statuses,
                 Err(e) => {
                     // The client records a subscription before the server confirms it and
-                    // refuses to arm it again. Rebuild, and ask unarmed scripts directly.
+                    // refuses to arm it again. Rebuild, and ask every script directly.
                     log::warn!("electrum wallet subscribe failed: {e:?}");
                     let _ = self.reconnect_client();
+                    state.wallet_scripts.clear();
                     break;
                 }
             };
