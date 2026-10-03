@@ -166,16 +166,10 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
         .unwrap()
         .sync_and_save(&openswap::utill::NO_SHUTDOWN)
         .unwrap();
-    let victim_after = makers[1]
-        .wallet
-        .read()
-        .unwrap()
-        .get_outgoing_swapcoins_count()
-        + makers[1]
-            .wallet
-            .read()
-            .unwrap()
-            .get_incoming_swapcoins_count();
+    let victim_after = {
+        let wallet = makers[1].wallet.read().unwrap();
+        wallet.get_outgoing_swapcoins_count() + wallet.get_incoming_swapcoins_count()
+    };
     assert_eq!(
         victim_after, 0,
         "Maker2 must release its swapcoins once the grace has run out"
@@ -448,16 +442,10 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
         .unwrap()
         .sync_and_save(&openswap::utill::NO_SHUTDOWN)
         .unwrap();
-    let victim_after = makers[1]
-        .wallet
-        .read()
-        .unwrap()
-        .get_outgoing_swapcoins_count()
-        + makers[1]
-            .wallet
-            .read()
-            .unwrap()
-            .get_incoming_swapcoins_count();
+    let victim_after = {
+        let wallet = makers[1].wallet.read().unwrap();
+        wallet.get_outgoing_swapcoins_count() + wallet.get_incoming_swapcoins_count()
+    };
     assert_eq!(
         victim_after, 0,
         "Maker2 must release its swapcoins once the grace has run out"

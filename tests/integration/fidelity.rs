@@ -984,23 +984,26 @@ fn test_live_bond_is_advertised_while_another_is_pending() {
     });
     wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
 
-    assert!(
-        bitcoind.client.get_mempool_entry(&pending_txid).is_ok(),
-        "the second bond must still be unconfirmed when setup completes"
-    );
-    let log = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        log.contains(&format!(
-            "Fidelity bond {pending_txid} still unconfirmed; advertising the live bond meanwhile"
-        )),
-        "restart must advertise the live bond instead of waiting"
-    );
-
+    // Read before stopping, assert after: a failed assert must not leave the
+    // restarted maker running.
+    let still_pending = bitcoind.client.get_mempool_entry(&pending_txid).is_ok();
+    let log = std::fs::read_to_string(&log_path);
     restarted.shutdown.store(true, Relaxed);
     let _ = restarted_thread.join();
     test_framework.set_block_gen_paused(false);
     test_framework.stop();
     block_generation_handle.join().unwrap();
+
+    assert!(
+        still_pending,
+        "the second bond must still be unconfirmed when setup completes"
+    );
+    assert!(
+        log.expect("maker log is readable").contains(&format!(
+            "Fidelity bond {pending_txid} still unconfirmed; advertising the live bond meanwhile"
+        )),
+        "restart must advertise the live bond instead of waiting"
+    );
 }
 
 /// Eviction path: if the unconfirmed bond tx falls out of the mempool while

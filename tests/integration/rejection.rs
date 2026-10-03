@@ -3802,3 +3802,83 @@ fn wrong_handover_key_bans_the_last_maker() {
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
+
+/// A legacy maker whose planned coin is taken re-plans onto two smaller coins
+/// for a split it declared with one. The taker priced that split at one input,
+/// so a split funded with more must still be accepted and the swap completes.
+#[test]
+fn legacy_replan_with_extra_inputs_completes() {
+    warn!("Running Test: a legacy re-plan funds a split with more inputs than declared");
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            2,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::ForceReplan, MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    // The bond takes its exact coin. The 600k coin funds the split alone;
+    // once it is taken, the split needs two 300k coins.
+    fund_makers(
+        &makers,
+        bitcoind,
+        1,
+        Amount::from_sat(5_000_243),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        1,
+        Amount::from_sat(600_000),
+        AddressType::P2TR,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        3,
+        Amount::from_sat(300_000),
+        AddressType::P2TR,
+    );
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let summary = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
+                .with_tx_count(1)
+                .with_required_confirms(1),
+        )
+        .expect("prepare swap");
+    let swap_id = summary.swap_id.clone();
+    taker
+        .start_swap(&swap_id)
+        .expect("a split with extra inputs must be accepted");
+
+    let log = fs::read_to_string(test_framework.taker_log_path()).unwrap();
+    assert!(log.contains(&format!("Re-planned funding for swap {swap_id}")));
+    // Inputs per maker funding tx; the normal maker funds from its 600k coin.
+    let inputs: Vec<usize> = log
+        .lines()
+        .filter_map(|line| line.split("Broadcast Legacy funding tx: ").nth(1))
+        .map(|txid| {
+            let txid = txid.trim().parse().unwrap();
+            bitcoind
+                .client
+                .get_raw_transaction(&txid, None)
+                .unwrap()
+                .input
+                .len()
+        })
+        .collect();
+    assert_eq!(
+        inputs.iter().filter(|&&n| n == 2).count(),
+        1,
+        "only the re-planned split spends two coins against one declared: {inputs:?}"
+    );
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}

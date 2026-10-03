@@ -208,10 +208,8 @@ fn concurrent_takers(
 
     // With limited liquidity, we expect one to succeed and one to fail.
     // Both are admitted; the loser's maker runs out of coins at funding.
-    assert!(success_count >= 1, "At least one taker should succeed");
-    if success_count == 1 {
-        test_framework.assert_log("InsufficientLiquidity", &test_framework.taker_log_path());
-    }
+    assert_eq!(success_count, 1, "Exactly one taker should succeed");
+    test_framework.assert_log("InsufficientLiquidity", &test_framework.taker_log_path());
     assert_eq!(
         completed_count, 2,
         "Both takers should have completed (success or failure)"
