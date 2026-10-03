@@ -1093,8 +1093,10 @@ impl Blockchain for Electrum {
             }
         }
         for chunk in unarmed.chunks(LIST_UNSPENT_BATCH) {
+            // No hidden retry: a reconnect inside `call` would arm these on a socket
+            // newer than `wallet_connection`, and the next sync would be refused them.
             let statuses = match self
-                .call(|c| c.batch_script_subscribe(chunk.iter().map(ScriptBuf::as_script)))
+                .try_call(&|c| c.batch_script_subscribe(chunk.iter().map(ScriptBuf::as_script)))
             {
                 Ok(statuses) => statuses,
                 Err(e) => {
