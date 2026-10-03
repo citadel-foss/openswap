@@ -1523,6 +1523,7 @@ impl Blockchain for Electrum {
                 Err(e) => {
                     log::warn!("re-arm header subscription after reconnect failed: {e:?}");
                     self.needs_rearm.store(true, Ordering::SeqCst);
+                    state.pending.push_back(WatchEvent::Unreachable);
                 }
             }
         }
@@ -1541,7 +1542,7 @@ impl Blockchain for Electrum {
                 // Without the ping the socket is never read and the watcher
                 // goes deaf while looking alive — loud, not a warning.
                 log::error!("electrum notification ping failed: {e:?}");
-                return None;
+                return Some(WatchEvent::Unreachable);
             }
         }
 

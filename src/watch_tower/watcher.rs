@@ -290,6 +290,7 @@ impl<R: Role> Watcher<R> {
                     log::error!("electrum script-subscribe failed for {outpoint}: {e}");
                     self.pending_subscribes.push((outpoint, script_pubkey));
                 }
+                self.seed_tip();
             }
             WatcherCommand::RebuildWatches { watches, reply } => {
                 log::info!("Rebuilding {} watches from the wallet", watches.len());
@@ -318,6 +319,7 @@ impl<R: Role> Watcher<R> {
                         thread::sleep(HEART_BEAT_INTERVAL);
                     }
                 }
+                self.seed_tip();
                 _ = reply.send(Ok(()));
             }
             WatcherCommand::WatchRequest { outpoint, reply } => {
@@ -383,13 +385,24 @@ impl<R: Role> Watcher<R> {
                 }
                 // With nothing watched the backend stops reading new blocks, so the
                 // height would go stale while still looking current.
-                if self.registry.list_watches().is_ok_and(|w| w.is_empty()) {
+                if !self.registry.list_watches().is_ok_and(|w| !w.is_empty()) {
                     self.tip.store(0, Ordering::Release);
                 }
             }
             WatcherCommand::Shutdown => return false,
         }
         true
+    }
+
+    /// Electrum's block events carry the height, so seed it once a watch is armed
+    /// instead of waiting a block. Core's never do, so it publishes none.
+    fn seed_tip(&self) {
+        let watching = self.registry.list_watches().is_ok_and(|w| !w.is_empty());
+        if watching && self.blockchain.is_electrum() && self.tip.load(Ordering::Acquire) == 0 {
+            if let Ok(height) = self.blockchain.get_block_count() {
+                self.tip.store(height, Ordering::Release);
+            }
+        }
     }
 
     /// Whether a recorded confirmed spend is still on chain. A failed query
@@ -564,6 +577,8 @@ impl<R: Role> Watcher<R> {
     /// Handles a backend event, updating registry state and checkpoints.
     pub fn handle_event(&mut self, ev: WatchEvent) {
         match ev {
+            // Blocks are going unheard, so the height can no longer be trusted.
+            WatchEvent::Unreachable => self.tip.store(0, Ordering::Release),
             WatchEvent::TxSeen { raw_tx } => {
                 if let Ok(tx) = deserialize::<Transaction>(&raw_tx) {
                     if let Err(e) = process_transaction(&tx, &mut self.registry, false) {
@@ -866,6 +881,10 @@ mod tests {
         );
         watcher.handle_event(block(7));
         assert_eq!(watcher.tip.load(Ordering::Acquire), 7);
+        // A deaf backend misses blocks, so its last height is withdrawn.
+        watcher.handle_event(WatchEvent::Unreachable);
+        assert_eq!(watcher.tip.load(Ordering::Acquire), 0);
+        watcher.handle_event(block(7));
 
         watcher.handle_command(WatcherCommand::Unwatch {
             outpoint,

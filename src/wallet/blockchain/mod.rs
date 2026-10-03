@@ -100,6 +100,8 @@ pub enum WatchEvent {
     },
     /// The chain tip advanced; carries the new block reference.
     BlockConnected(BlockRef),
+    /// The server stopped answering, so block events may go missing until it does.
+    Unreachable,
 }
 
 /// Resolved backend selector. Built from the user's init config (the single
