@@ -60,6 +60,7 @@ impl RecoveryLoop {
     pub(crate) fn start(
         wallet: Arc<RwLock<Wallet>>,
         swap_tracker: Arc<Mutex<SwapTracker>>,
+        watch_service: WatchService,
         data_dir: PathBuf,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -72,6 +73,7 @@ impl RecoveryLoop {
             .name("Recovery loop".to_string())
             .spawn(move || {
                 log::info!("Recovery loop started");
+                let mut last_tip = None;
                 while !shutdown_clone.load(Relaxed) {
                     let scope = lock_debug!(swap_tracker.lock())
                         .ok()
@@ -90,6 +92,21 @@ impl RecoveryLoop {
                         log::info!("Recovery loop: no failed swaps remain");
                         complete_clone.store(true, Relaxed);
                         return;
+                    }
+
+                    // The chain only moves with a block, so a pass waits for one. The
+                    // watcher hears each block; asking the server is the fallback.
+                    let tip = watch_service.tip().or_else(|| {
+                        lock_debug!(wallet.read())
+                            .ok()?
+                            .blockchain
+                            .get_block_count()
+                            .inspect_err(|e| log::warn!("Recovery loop: block height: {:?}", e))
+                            .ok()
+                    });
+                    if tip.is_none_or(|tip| last_tip.replace(tip) == Some(tip)) {
+                        thread::park_timeout(RECOVERY_LOOP_INTERVAL);
+                        continue;
                     }
 
                     // One connection per pass, shared by both steps below:
@@ -179,8 +196,7 @@ impl RecoveryLoop {
 
                     if !all_resolved {
                         log::info!(
-                            "Recovery loop: contracts still unresolved, retrying in {}s",
-                            RECOVERY_LOOP_INTERVAL.as_secs()
+                            "Recovery loop: contracts still unresolved, retrying on the next block"
                         );
                     } else {
                         log::info!("Recovery loop: all contracts resolved");
