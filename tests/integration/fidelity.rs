@@ -945,7 +945,7 @@ fn test_unconfirmed_fidelity_bond_not_duplicated() {
 ///
 /// Anchored to `test_unconfirmed_fidelity_bond_not_duplicated`, which covers
 /// the mempool-present early return; this test covers the rebroadcast branch
-/// of `ensure_fidelity_bond_broadcast`.
+/// of `FidelityBond::ensure_broadcast`.
 #[test]
 fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
     // ---- Setup ----

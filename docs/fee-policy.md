@@ -139,7 +139,9 @@ The planner works like this:
   swap may take one of those coins first. The maker then plans again from
   its free coins. The new plan keeps the same number of splits and sends
   the same total. Each new split spends at least as many coins as the old
-  one. If the maker cannot meet that, the swap fails.
+  one. If the maker cannot meet that, the swap fails. You still pay only
+  for the old coin count. The swap also fails if the extra coins cost the
+  maker more than the hop earns.
 - Accepting a swap locks nothing. That way, nobody can lock up a maker's
   coins just by asking. The cost lands on you if you lose a race for the
   maker's last coins. By then your coins already sit in your contract.

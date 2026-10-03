@@ -252,17 +252,6 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     #[cfg(feature = "lightning")]
     spawn_lightning_threads(&maker)?;
 
-    if let Some(maker_address) = maker_address.as_ref() {
-        log::info!(
-            "[{}] Setting up fidelity bond...",
-            maker.config.network_port
-        );
-        maker.setup_fidelity_bond(maker_address)?;
-        spawn_nostr_broadcast_thread(&maker)?;
-        log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
-        maker.check_swap_liquidity()?;
-    }
-
     // A crash between a finish's wallet save and its tracker save leaves a
     // recovering record with no coins behind. Close it as the finish would have.
     let recovering: Vec<_> = lock_debug!(maker.swap_tracker.lock())
@@ -358,6 +347,19 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                 maker.thread_pool.add_thread(handle)?;
             }
         }
+    }
+
+    // Only after recovery has started: the bond wait has no deadline, and
+    // contracts left from a previous run must not wait on it.
+    if let Some(maker_address) = maker_address.as_ref() {
+        log::info!(
+            "[{}] Setting up fidelity bond...",
+            maker.config.network_port
+        );
+        maker.setup_fidelity_bond(maker_address)?;
+        spawn_nostr_broadcast_thread(&maker)?;
+        log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
+        maker.check_swap_liquidity()?;
     }
 
     {

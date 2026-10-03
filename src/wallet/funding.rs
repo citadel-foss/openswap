@@ -213,18 +213,21 @@ fn funding_fee(inputs: usize, fee_rate: f64) -> Result<u64, WalletError> {
 }
 
 /// Rejects when the plan costs the maker more above the taker's input budget
-/// than the hop earns. Extra inputs are real fees the taker never reimburses,
-/// so a swap that costs more than it earns is a drain on the maker.
+/// than the hop earns. A split is reimbursed for its own input count, or its
+/// `declared` one on a re-plan, capped at the budget; the rest is the maker's.
 fn check_over_budget_spend(
     plan: &[SplitPlan],
+    declared: Option<&[usize]>,
     max_input_budget: u32,
     fee_rate: f64,
     swap_fee_sats: u64,
 ) -> Result<(), WalletError> {
     let mut over_budget = 0u64;
-    for split in plan {
+    for (i, split) in plan.iter().enumerate() {
         let inputs = split.utxos.len();
-        let priced = inputs.clamp(1, (max_input_budget as usize).max(1));
+        let priced = declared
+            .map_or(inputs, |declared| declared[i])
+            .clamp(1, (max_input_budget as usize).max(1));
         let extra = funding_fee(inputs, fee_rate)?
             .checked_sub(funding_fee(priced, fee_rate)?)
             .ok_or_else(|| WalletError::General("funding fee arithmetic underflow".to_string()))?;
@@ -286,6 +289,7 @@ pub fn fit_declared_shape(
     pools: [Vec<(OutPoint, Amount)>; 2],
     max_input_budget: u32,
     fee_rate: f64,
+    swap_fee_sats: u64,
     protocol: ProtocolVersion,
 ) -> Result<Vec<SplitPlan>, WalletError> {
     if fresh.len() != declared.len() {
@@ -326,6 +330,15 @@ pub fn fit_declared_shape(
         }
         split.utxos.extend(pool.drain(..short));
     }
+    // The taker pays for the declared counts only, so a split that came back
+    // with more inputs spends the difference out of this hop's fee.
+    check_over_budget_spend(
+        &fitted,
+        Some(declared),
+        max_input_budget,
+        fee_rate,
+        swap_fee_sats,
+    )?;
     net_policy_fees(&mut fitted, declared, max_input_budget, fee_rate, protocol)?;
     Ok(fitted)
 }
@@ -363,7 +376,7 @@ fn plan_from_pools(
             }
             if let Some(swap_fee_sats) = swap_fee_sats {
                 if let Err(e) =
-                    check_over_budget_spend(&plan, max_input_budget, fee_rate, swap_fee_sats)
+                    check_over_budget_spend(&plan, None, max_input_budget, fee_rate, swap_fee_sats)
                 {
                     guard_error = guard_error.or(Some(e));
                     continue;
@@ -403,13 +416,14 @@ impl Wallet {
         ]
     }
 
-    /// What funding can draw on now, both pools together.
+    /// What funding can draw on now: the larger pool, since a plan never
+    /// mixes the two.
     pub(crate) fn plannable_balance(&self) -> Amount {
         self.plannable_pools()
             .iter()
-            .flatten()
-            .map(|(_, amount)| *amount)
-            .sum()
+            .map(|pool| pool.iter().map(|(_, amount)| *amount).sum())
+            .max()
+            .unwrap_or(Amount::ZERO)
     }
 
     /// Funds `total` from the regular pool, or the swept-swap pool when the
@@ -509,7 +523,7 @@ impl Wallet {
             // reimburses; manual selection has no fallback pool, so the guard
             // fails the swap here. The 68 vB model upper-bounds that cost.
             if let Some(swap_fee_sats) = swap_fee_sats {
-                check_over_budget_spend(&plan, max_input_budget, fee_rate, swap_fee_sats)?;
+                check_over_budget_spend(&plan, None, max_input_budget, fee_rate, swap_fee_sats)?;
             }
             plan
         };
@@ -1029,8 +1043,16 @@ mod tests {
         // prices: 233 sats for two inputs, 165 for one, at 1 sat/vB.
         let fresh = vec![split(&[1], 40_000), split(&[2, 3], 60_000)];
         let coins = pools(&[(1, 50_000), (2, 30_000), (3, 40_000)], &[]);
-        let fitted =
-            fit_declared_shape(fresh, &[2, 1], coins, 2, 1.0, ProtocolVersion::Taproot).unwrap();
+        let fitted = fit_declared_shape(
+            fresh,
+            &[2, 1],
+            coins,
+            2,
+            1.0,
+            u64::MAX,
+            ProtocolVersion::Taproot,
+        )
+        .unwrap();
         assert_eq!(fitted[0].utxos.len(), 2);
         assert_eq!(fitted[0].value.to_sat(), 60_000 - 233);
         assert_eq!(fitted[1].utxos.len(), 1);
@@ -1043,8 +1065,16 @@ mod tests {
         // pays for two inputs, so the smallest spare regular coin joins it.
         let fresh = vec![split(&[1], 150_000)];
         let coins = pools(&[(1, 300_000), (2, 20_000), (3, 10_000)], &[(4, 1_000)]);
-        let fitted =
-            fit_declared_shape(fresh, &[2], coins, 2, 1.0, ProtocolVersion::Taproot).unwrap();
+        let fitted = fit_declared_shape(
+            fresh,
+            &[2],
+            coins,
+            2,
+            1.0,
+            u64::MAX,
+            ProtocolVersion::Taproot,
+        )
+        .unwrap();
         assert_eq!(fitted[0].utxos, vec![utxo(1, 0).0, utxo(3, 0).0]);
         assert_eq!(fitted[0].value.to_sat(), 150_000 - 233);
     }
@@ -1055,8 +1085,16 @@ mod tests {
         // split's funds, so the next smallest spare is taken instead.
         let fresh = vec![split(&[1], 150_000)];
         let coins = pools(&[(1, 300_000), (2, 50), (3, 10_000)], &[]);
-        let fitted =
-            fit_declared_shape(fresh, &[2], coins, 2, 1.0, ProtocolVersion::Taproot).unwrap();
+        let fitted = fit_declared_shape(
+            fresh,
+            &[2],
+            coins,
+            2,
+            1.0,
+            u64::MAX,
+            ProtocolVersion::Taproot,
+        )
+        .unwrap();
         assert_eq!(fitted[0].utxos, vec![utxo(1, 0).0, utxo(3, 0).0]);
     }
 
@@ -1065,13 +1103,60 @@ mod tests {
         // The only spare coin sits in the swept-swap pool; pools never mix.
         let fresh = vec![split(&[1], 150_000)];
         let coins = pools(&[(1, 300_000)], &[(4, 1_000)]);
-        assert!(fit_declared_shape(fresh, &[2], coins, 2, 1.0, ProtocolVersion::Taproot).is_err());
+        assert!(fit_declared_shape(
+            fresh,
+            &[2],
+            coins,
+            2,
+            1.0,
+            u64::MAX,
+            ProtocolVersion::Taproot
+        )
+        .is_err());
         let short = vec![split(&[1, 2], 100_000)];
         let coins = pools(&[(1, 60_000), (2, 60_000)], &[]);
         assert!(
-            fit_declared_shape(short, &[1, 1], coins, 2, 1.0, ProtocolVersion::Taproot).is_err(),
+            fit_declared_shape(
+                short,
+                &[1, 1],
+                coins,
+                2,
+                1.0,
+                u64::MAX,
+                ProtocolVersion::Taproot
+            )
+            .is_err(),
             "a different split count is refused"
         );
+    }
+
+    #[test]
+    fn a_replan_spending_past_its_declared_counts_must_fit_the_swap_fee() {
+        // Declared [1]; the re-plan needs three inputs. The taker pays for
+        // one, so the maker covers 2 x 68 = 136 sats out of its fee.
+        let fresh = || vec![split(&[1, 2, 3], 100_000)];
+        let coins = || pools(&[(1, 40_000), (2, 40_000), (3, 40_000)], &[]);
+        let declared = &[1];
+        assert!(fit_declared_shape(
+            fresh(),
+            declared,
+            coins(),
+            2,
+            1.0,
+            135,
+            ProtocolVersion::Taproot
+        )
+        .is_err());
+        assert!(fit_declared_shape(
+            fresh(),
+            declared,
+            coins(),
+            2,
+            1.0,
+            136,
+            ProtocolVersion::Taproot
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1091,9 +1176,9 @@ mod tests {
         let over_budget = fee_at_rate_sats(funding_tx_vsize(6), 10.0).unwrap()
             - fee_at_rate_sats(funding_tx_vsize(1), 10.0).unwrap();
         assert_eq!(over_budget, 5 * 68 * 10);
-        let result = check_over_budget_spend(&plan, 1, 10.0, 1_000);
+        let result = check_over_budget_spend(&plan, None, 1, 10.0, 1_000);
         assert!(matches!(result, Err(WalletError::General(_))));
         // A swap fee comfortably above that 3400 sat spend passes instead.
-        assert!(check_over_budget_spend(&plan, 1, 10.0, 10_000).is_ok());
+        assert!(check_over_budget_spend(&plan, None, 1, 10.0, 10_000).is_ok());
     }
 }

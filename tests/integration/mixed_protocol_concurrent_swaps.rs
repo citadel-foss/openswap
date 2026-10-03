@@ -41,10 +41,10 @@ fn test_concurrent_legacy_and_taproot_swaps() {
         .iter()
         .map(|taker| fund_taker_default(taker, bitcoind, 3))
         .collect::<Vec<_>>();
-    // Both admissions plan over the same pool, and identical needs plan onto
-    // identical coins — so the two plans must be disjoint by construction. Legacy splits (~167k) fit the 200k coins,
-    // taproot splits (~233k) need the 300k ones; the bond takes its exact
-    // UTXO and leaves no change in the pool.
+    // Both admissions plan over the same pool, so the protocols' split sizes
+    // keep the plans apart: legacy splits (~167k) fit the 200k coins, taproot
+    // splits (~233k) need the 300k ones. The bond takes its exact UTXO and
+    // leaves no change in the pool.
     fund_makers(
         &makers,
         bitcoind,

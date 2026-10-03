@@ -97,6 +97,7 @@ fn replan_funding(
         wallet.plannable_pools(),
         terms.max_input_budget,
         terms.swap_feerate,
+        service_fee,
         terms.protocol,
     )
     .map_err(|_| out_of_coins())
@@ -1025,15 +1026,33 @@ impl MakerServer {
         !self.is_shutdown()
     }
 
-    /// Checks once whether the bond at `index` confirmed, rebroadcasting it if
-    /// the backend has lost it. A backend error reads as "not yet".
-    fn check_bond_confirmation(&self, index: u32) -> Result<Option<u32>, MakerError> {
-        // Lock per check only: holding it across a wait blocks every wallet writer.
-        let wallet = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-        let checked = wallet
-            .ensure_fidelity_bond_broadcast(index)
-            .and_then(|txid| wallet.blockchain.tx_block_height(&txid))
+    /// A backend connection of its own for a bond wait, so no poll runs
+    /// under the wallet guard: a slow backend would block every wallet writer.
+    fn bond_chain(&self) -> Result<AnyBlockchain, MakerError> {
+        lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .new_connection()
+            .map_err(MakerError::Wallet)
+    }
+
+    /// Checks once on `chain` whether the bond at `index` confirmed,
+    /// rebroadcasting it if the backend has lost it. A backend error reads as "not yet".
+    fn check_bond_confirmation(
+        &self,
+        index: u32,
+        chain: &AnyBlockchain,
+    ) -> Result<Option<u32>, MakerError> {
+        let bond = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .store
+            .fidelity_bond
+            .get(index as usize)
+            .cloned();
+        let checked = bond
+            .ok_or(WalletError::Fidelity(FidelityError::BondDoesNotExist))
+            .and_then(|bond| bond.ensure_broadcast(chain))
+            .and_then(|txid| chain.tx_block_height(&txid))
             .and_then(|height| {
                 height
                     .map(|h| {
@@ -1061,8 +1080,9 @@ impl MakerServer {
 
     /// Waits for the bond at `index` to confirm, with no deadline, and returns its height.
     fn wait_for_bond_confirmation(&self, index: u32) -> Result<u32, MakerError> {
+        let chain = self.bond_chain()?;
         loop {
-            if let Some(height) = self.check_bond_confirmation(index)? {
+            if let Some(height) = self.check_bond_confirmation(index, &chain)? {
                 return Ok(height);
             }
             log::info!(
@@ -1110,10 +1130,14 @@ impl MakerServer {
             }
         }
 
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let chain = self.bond_chain()?;
         while !pending.is_empty() {
             let mut unconfirmed = Vec::new();
             for (index, txid) in pending {
-                match self.check_bond_confirmation(index) {
+                match self.check_bond_confirmation(index, &chain) {
                     Ok(Some(conf_height)) => {
                         lock_debug!(self.wallet.write())
                             .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -1355,7 +1379,6 @@ impl MakerServer {
                         }
                     }
                     Ok((index, txid)) => {
-                        // Wait for confirmation without holding the write lock.
                         log::info!(
                             "[{}] Fidelity bond broadcast, waiting for confirmation: {}",
                             self.config.network_port,
