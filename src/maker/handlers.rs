@@ -1169,6 +1169,15 @@ fn restore_state_if_needed<M: Maker>(
 ) -> Result<(), MakerError> {
     if state.swap_amount == Amount::ZERO || state.outgoing_swapcoins.is_empty() {
         if let Some(stored) = maker.get_connection_state(swap_id)? {
+            // A connection already holding this swap keeps its own admission:
+            // a newer admission of a reused id is not its to drive.
+            if state.swap_id.as_deref() == Some(swap_id)
+                && state.swap_start_time != stored.swap_start_time
+            {
+                return Err(MakerError::General(
+                    "Swap plan expired; the taker must send new SwapDetails",
+                ));
+            }
             log::info!(
                 "[{}] Restored state for {}: amount={}, timelock={}, phase={:?}, outgoing_count={}",
                 maker.network_port(),

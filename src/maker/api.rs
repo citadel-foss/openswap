@@ -1031,11 +1031,25 @@ impl MakerServer {
     }
 
     /// A backend connection of its own for a bond wait, built from config so
-    /// neither the connect nor a poll runs under the wallet guard: a slow
-    /// backend would block every wallet writer.
+    /// no connect or poll holds the wallet guard. A failed connect is retried
+    /// like a failed poll.
     fn bond_chain(&self) -> Result<AnyBlockchain, MakerError> {
-        AnyBlockchain::from_config_with_shutdown(&self.config.backend, self.shutdown.backend_flag())
-            .map_err(MakerError::Wallet)
+        loop {
+            match AnyBlockchain::from_config_with_shutdown(
+                &self.config.backend,
+                self.shutdown.backend_flag(),
+            ) {
+                Ok(chain) => return Ok(chain),
+                Err(e) => log::warn!(
+                    "[{}] Could not connect to the backend for the bond wait: {:?}",
+                    self.config.network_port,
+                    e
+                ),
+            }
+            if !self.wait_for_shutdown(BOND_POLL_INTERVAL) {
+                return Err(MakerError::General("Shutdown requested"));
+            }
+        }
     }
 
     /// Checks once on `chain` whether the bond at `index` confirmed,
@@ -2709,6 +2723,12 @@ impl MakerTrait for MakerServer {
                 return Err(MakerError::SwapParamMismatch);
             }
             return Ok(());
+        }
+        // Planning was skipped for a live swap that a drain has since removed:
+        // admit it afresh rather than store this handler's empty plan.
+        if admission && planned.is_none() {
+            drop(swaps);
+            return self.store_connection_state(swap_id, state, admission);
         }
 
         // The cap read before planning is only a cheap early reject: planning
