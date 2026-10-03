@@ -1,0 +1,15 @@
+[package]
+name = "openswap-test-macros"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The #[world_test] attribute for openswap's integration tests"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = { version = "2.0.117", features = ["full"] }

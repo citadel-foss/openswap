@@ -1,7 +1,8 @@
 name: Start tor with a control port
 description: >-
   Stops Ubuntu's own tor so ours owns the ports, writes a torrc with an empty
-  control password, and waits for bootstrap.
+  control password, and waits for bootstrap, restarting tor with a fresh data
+  dir up to twice when a bootstrap stalls.
 inputs:
   data-dir:
     description: Directory for the torrc, data and log.
@@ -34,15 +35,26 @@ runs:
         DataDirectory $TOR_DATA_DIR/data
         Log notice file $TOR_DATA_DIR/tor.log
         EOF
-        tor -f "$TOR_DATA_DIR/torrc" &
-        echo "waiting for tor to bootstrap..."
-        for _ in $(seq 1 60); do
-          if grep -q "Bootstrapped 100%" "$TOR_DATA_DIR/tor.log" 2>/dev/null; then
-            echo "tor bootstrapped"
-            exit 0
-          fi
-          sleep 5
+        # A bootstrap can stall for minutes loading relay descriptors from a slow
+        # directory mirror. A restart with a fresh data dir picks other mirrors
+        # and guards, which gets past it far sooner than waiting longer.
+        for attempt in 1 2 3; do
+          : > "$TOR_DATA_DIR/tor.log"
+          tor -f "$TOR_DATA_DIR/torrc" &
+          tor_pid=$!
+          echo "waiting for tor to bootstrap (attempt $attempt/3)..."
+          for _ in $(seq 1 48); do
+            if grep -q "Bootstrapped 100%" "$TOR_DATA_DIR/tor.log" 2>/dev/null; then
+              echo "tor bootstrapped"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "tor did not bootstrap within 240s on attempt $attempt/3" >&2
+          cat "$TOR_DATA_DIR/tor.log" >&2 2>/dev/null || true
+          kill "$tor_pid" 2>/dev/null || true
+          wait "$tor_pid" 2>/dev/null || true
+          rm -rf -- "$TOR_DATA_DIR/data"
         done
-        echo "tor failed to bootstrap within 300s" >&2
-        cat "$TOR_DATA_DIR/tor.log" 2>/dev/null || true
+        echo "tor failed to bootstrap in 3 attempts" >&2
         exit 1
