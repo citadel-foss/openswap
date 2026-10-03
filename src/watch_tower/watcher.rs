@@ -296,6 +296,7 @@ impl<R: Role> Watcher<R> {
             }
             WatcherCommand::RebuildWatches { watches, reply } => {
                 log::info!("Rebuilding {} watches from the wallet", watches.len());
+                let mut armed = false;
                 for (outpoint, spk) in &watches {
                     if self.shutdown.load(Ordering::Relaxed) {
                         // Reply before bailing out: the caller blocks on it.
@@ -306,7 +307,7 @@ impl<R: Role> Watcher<R> {
                         log::error!("registry lock poisoned, watch not stored: {e:?}");
                     }
                     match self.blockchain.subscribe_script(spk, *outpoint) {
-                        Ok(()) => self.seed_tip(),
+                        Ok(()) => armed = true,
                         Err(e) => {
                             log::error!("electrum script-subscribe failed for {outpoint}: {e}");
                             self.pending_subscribes.push((*outpoint, spk.clone()));
@@ -323,6 +324,9 @@ impl<R: Role> Watcher<R> {
                     {
                         thread::sleep(HEART_BEAT_INTERVAL);
                     }
+                }
+                if armed {
+                    self.seed_tip();
                 }
                 _ = reply.send(Ok(()));
             }
