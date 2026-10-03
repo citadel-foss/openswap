@@ -2742,31 +2742,31 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
 }
 
 /// A maker that funds at the relay floor against a negotiated 3 sat/vB swap:
-/// the taker's real-fee check rejects the funding and the proven shortfall
-/// steps the maker Good -> Unresponsive in the offerbook.
+/// the taker's real-fee check bans the maker for the proven shortfall, and the
+/// swap still completes, since by then the fee is paid and every hop has funded.
 #[test]
-fn test_taproot_rejects_funding_fee_underpayment() {
-    run_rejects_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Taproot);
+fn test_taproot_bans_funding_fee_underpayment() {
+    run_bans_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Taproot);
 }
 
 #[test]
-fn test_legacy_rejects_funding_fee_underpayment() {
-    run_rejects_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Legacy);
+fn test_legacy_bans_funding_fee_underpayment() {
+    run_bans_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Legacy);
 }
 
 /// Same underpayment on Electrum: the real-fee check reads the funding
 /// inputs' prev txs from the indexer.
 #[test]
-fn test_taproot_rejects_funding_fee_underpayment_electrum() {
-    run_rejects_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Taproot);
+fn test_taproot_bans_funding_fee_underpayment_electrum() {
+    run_bans_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Taproot);
 }
 
 #[test]
-fn test_legacy_rejects_funding_fee_underpayment_electrum() {
-    run_rejects_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Legacy);
+fn test_legacy_bans_funding_fee_underpayment_electrum() {
+    run_bans_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Legacy);
 }
 
-fn run_rejects_funding_fee_underpayment<B: TestBackend>(protocol: ProtocolVersion) {
+fn run_bans_funding_fee_underpayment<B: TestBackend>(protocol: ProtocolVersion) {
     let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
         1,
         vec![TakerBehavior::Normal],
@@ -2788,14 +2788,9 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(protocol: ProtocolVersio
                 .with_required_confirms(1),
         )
         .expect("prepare swap");
-    let error = taker
+    taker
         .start_swap(&summary.swap_id)
-        .expect_err("the underpaying maker's funding must be rejected");
-    assert!(
-        format!("{error:?}").contains("the agreed feerate requires"),
-        "unexpected error: {:?}",
-        error
-    );
+        .expect("a fee shortfall must not abort a funded route");
 
     // The shortfall is arithmetically proven, so the maker's standing steps
     // off Good.

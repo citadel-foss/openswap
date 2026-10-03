@@ -423,8 +423,17 @@ impl Taker {
             }
         }
 
-        // Taproot's contract txs are the maker's funding txs.
-        self.verify_maker_funding_feerate(&contract.contract_txs, maker_idx)?;
+        // Taproot's contract txs are the maker's funding txs, already broadcast
+        // before the maker answers, and every earlier hop has funded: a fee
+        // shortfall costs the maker a ban, never the route, since aborting here
+        // would only send every funded hop into timelock recovery.
+        if let Err(e) = self.verify_maker_funding_feerate(&contract.contract_txs, maker_idx) {
+            log::warn!(
+                "Maker {} funding fee check failed; continuing: {:?}",
+                maker_idx,
+                e
+            );
+        }
 
         log::info!(
             "Verified Taproot contract data from maker {}: {} contract txs (hash, timelock, structure, amounts)",

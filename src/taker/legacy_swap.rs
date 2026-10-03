@@ -766,13 +766,33 @@ impl Taker {
                 .inspect_err(|e| self.note_withheld_funding(maker_idx, e))?;
 
             // The handed-out funding txs carry no signatures, so the feerate,
-            // which prices the real size, is checked on the confirmed txs.
-            let chain = self.read_wallet()?.blockchain.new_connection()?;
-            let confirmed_funding = maker_funding_txids
-                .iter()
-                .map(|txid| fetch_tx_with_retry(&chain, txid))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.verify_maker_funding_feerate(&confirmed_funding, maker_idx)?;
+            // which prices the real size, is checked on the confirmed txs. By
+            // now the fee is paid and every earlier hop has funded: a shortfall
+            // costs the maker a ban, never the route, since aborting here would
+            // only send every funded hop into timelock recovery.
+            let chain = self.read_wallet()?.blockchain.new_connection();
+            let confirmed_funding = chain.and_then(|chain| {
+                maker_funding_txids
+                    .iter()
+                    .map(|txid| fetch_tx_with_retry(&chain, txid))
+                    .collect::<Result<Vec<_>, _>>()
+            });
+            match confirmed_funding {
+                Ok(confirmed) => {
+                    if let Err(e) = self.verify_maker_funding_feerate(&confirmed, maker_idx) {
+                        log::warn!(
+                            "Maker {} funding fee check failed after confirmation; continuing: {:?}",
+                            maker_idx,
+                            e
+                        );
+                    }
+                }
+                Err(e) => log::warn!(
+                    "Could not fetch maker {}'s confirmed funding for the fee check; continuing: {:?}",
+                    maker_idx,
+                    e
+                ),
+            }
 
             // Verify that the maker's funding confirmed within a few blocks of the
             // previous hop. For legacy (CSV relative locktime), a large gap between
