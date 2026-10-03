@@ -3,17 +3,19 @@
 //! This test demonstrates a taproot-based openswap between a Taker and 2 Makers using
 //! the Taproot protocol with MuSig2 signatures.
 
-use bitcoin::Amount;
+use bitcoin::{Amount, OutPoint};
+use bitcoind::bitcoincore_rpc::{json::ListUnspentResultEntry, RpcApi};
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
+    taker::{MakerFeeInfo, SwapParams, TakerBehavior},
+    utill::{funding_fee_policy_sats, sweep_fee_policy_sats, MIN_RELAY_FEE_RATE},
 };
 
 use super::test_framework::*;
 
 use log::{info, warn};
-use std::thread;
+use std::{collections::HashSet, thread};
 
 /// Test taproot openswap
 #[test]
@@ -221,4 +223,140 @@ fn test_taproot_openswap() {
     shutdown_makers(&makers, maker_threads);
     test_framework.stop();
     block_generation_handle.join().unwrap();
+}
+
+/// An uneven `[1, 3, 2]` route through 2 makers prices each hop on its own
+/// maximum and lands exactly that shape on chain. Every hop differs, so the
+/// ceiling cannot match a uniform count or a sweep/forward index mix-up.
+///
+/// The cheapest maker takes hop 0 and refuses `SwapDetails`, so the spare
+/// replaces it mid-negotiation and must still be asked to forward 3 splits.
+#[test]
+fn test_taproot_per_hop_splits_1_3_2() {
+    warn!("Running Test: Taproot per-hop split maximums on a [1, 3, 2] route with a spare");
+
+    // Fees order the selection: maker0 and maker1 form the route, maker2 is
+    // the only spare.
+    let fee = |base_fee, amount_relative_fee_pct| {
+        Some(MakerFeeOverride {
+            base_fee,
+            amount_relative_fee_pct,
+        })
+    };
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init_with_fee_overrides::<BitcoindBackend>(
+            vec![(0, None); 3],
+            vec![fee(500, 0.0025), fee(800, 0.005), fee(1200, 0.0075)],
+            vec![TakerBehavior::Normal],
+            vec![
+                MakerBehavior::RefuseSwapDetails,
+                MakerBehavior::Normal,
+                MakerBehavior::Normal,
+            ],
+        );
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    // Any one 0.05 BTC coin covers the swap, so hop 0 plans a single input.
+    fund_taker_default(taker, bitcoind, 3);
+    // Three coins beside the fidelity bond let the first maker forward 3 splits.
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+    generate_blocks(bitcoind, 1);
+    let swap_start_height = chain_tip(bitcoind) + 1;
+
+    let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 2)
+        .with_tx_counts(vec![1, 3, 2])
+        .with_required_confirms(1);
+    let max_input_budget = params.max_input_budget;
+    let summary = taker
+        .prepare_swap(params)
+        .expect("prepare_swap should accept a [1, 3, 2] Taproot route");
+
+    // The summary is built after negotiation, so hop 0 is already the spare.
+    let route_maker = |hop: &MakerFeeInfo| {
+        makers
+            .iter()
+            .position(|m| {
+                hop.address
+                    .ends_with(&format!(":{}", m.config.network_port))
+            })
+            .expect("every route maker is a test maker")
+    };
+    assert_eq!(
+        summary.makers.iter().map(route_maker).collect::<Vec<_>>(),
+        vec![2, 1],
+        "the spare must replace the refusing maker at hop 0"
+    );
+
+    // The ceiling prices maker i's sweeps on hop i's maximum and its
+    // forwarding on hop i + 1's: maker 0 sweeps 1 and forwards 3, maker 1
+    // sweeps 3 and forwards 2.
+    let feerate = MIN_RELAY_FEE_RATE;
+    let split_funding =
+        funding_fee_policy_sats(max_input_budget as usize, max_input_budget, feerate).unwrap();
+    let sweep = sweep_fee_policy_sats(ProtocolVersion::Taproot, feerate).unwrap();
+    let hop0_funding = funding_fee_policy_sats(1, u32::MAX, feerate).unwrap();
+    let service_fees: u64 = summary.makers.iter().map(|m| m.estimated_fee_sats).sum();
+    let expected_ceiling =
+        service_fees + (sweep + 3 * split_funding) + (3 * sweep + 2 * split_funding) + hop0_funding;
+    assert_eq!(
+        summary.total_estimated_fee,
+        Amount::from_sat(expected_ceiling),
+        "the cost ceiling must price every hop on its own maximum"
+    );
+
+    // Pre-swap coins of each hop's funder in route order: the taker funds hop
+    // 0, the maker at route position i funds hop i + 1.
+    let outpoints = |utxos: Vec<ListUnspentResultEntry>| -> HashSet<OutPoint> {
+        utxos
+            .iter()
+            .map(|u| OutPoint::new(u.txid, u.vout))
+            .collect()
+    };
+    let mut hop_funders = vec![outpoints(
+        taker.get_wallet().read().unwrap().list_all_utxo(),
+    )];
+    for hop in &summary.makers {
+        let maker = &makers[route_maker(hop)];
+        hop_funders.push(outpoints(maker.wallet.read().unwrap().list_all_utxo()));
+    }
+
+    taker
+        .start_swap(&summary.swap_id)
+        .expect("a [1, 3, 2] Taproot swap should complete");
+
+    // 1 + 3 + 2 is the most the route can fund, so exactly 6 funding txs
+    // proves every hop reached its maximum; each contract is swept once.
+    let by_depth = wait_for_tx_depths(bitcoind, swap_start_height, &[6, 6]);
+
+    // A uniform [2, 2, 2] also lands 6 + 6, so attribute each funding tx to
+    // the hop whose funder owned its inputs and check the shape per hop.
+    let mut hop_funding_txs = vec![0; hop_funders.len()];
+    for txid in &by_depth[0] {
+        let tx = bitcoind.client.get_raw_transaction(txid, None).unwrap();
+        let hop = hop_funders
+            .iter()
+            .position(|coins| coins.contains(&tx.input[0].previous_output))
+            .unwrap_or_else(|| panic!("funding tx {} spends no funder's pre-swap coin", txid));
+        assert!(
+            tx.input
+                .iter()
+                .all(|input| hop_funders[hop].contains(&input.previous_output)),
+            "funding tx {} mixes coins of different funders",
+            txid
+        );
+        hop_funding_txs[hop] += 1;
+    }
+    assert_eq!(
+        hop_funding_txs,
+        vec![1, 3, 2],
+        "each hop must fund exactly its own maximum"
+    );
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.finish(takers, block_generation_handle);
 }

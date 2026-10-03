@@ -241,6 +241,11 @@ pub struct SwapParams {
     /// that cannot cover this many splits forwards fewer — the exact count it
     /// commits to arrives per hop as `incoming_count`. Defaults to 2.
     pub tx_count: u32,
+    /// Optional per-hop maximums (Taproot only) overriding `tx_count`, one per
+    /// funding hop (`maker_count + 1`): index 0 caps the taker's own funding,
+    /// index `i + 1` caps maker `i`'s forwarding, so `[1, 3, 1]` lets the first
+    /// maker fan out to 3 splits. Empty means `tx_count` on every hop.
+    pub tx_counts: Vec<u32>,
     /// Maximum inputs per forwarding tx whose fee the taker covers.
     /// The maker may use more inputs; that is not a violation —
     /// the taker simply does not pay for the excess.
@@ -270,6 +275,7 @@ impl SwapParams {
             send_amount,
             maker_count,
             tx_count: 2,
+            tx_counts: Vec::new(),
             max_input_budget: 2,
             feerate: MIN_RELAY_FEE_RATE as u64,
             required_confirms: 1,
@@ -283,6 +289,57 @@ impl SwapParams {
     pub fn with_tx_count(mut self, tx_count: u32) -> Self {
         self.tx_count = tx_count;
         self
+    }
+
+    /// Set a separate maximum for each funding hop; see [`SwapParams::tx_counts`].
+    /// Validated at prepare time, not here.
+    pub fn with_tx_counts(mut self, tx_counts: Vec<u32>) -> Self {
+        self.tx_counts = tx_counts;
+        self
+    }
+
+    /// The split ceiling of every funding hop, `maker_count + 1` entries:
+    /// `tx_counts` when it has that length, else `tx_count` on every hop.
+    /// `prepare_swap` rejects any other length, so the fallback never hides one.
+    pub(crate) fn hop_tx_counts(&self) -> Vec<u32> {
+        if self.tx_counts.len() == self.maker_count + 1 {
+            self.tx_counts.clone()
+        } else {
+            vec![self.tx_count; self.maker_count + 1]
+        }
+    }
+
+    /// Checks the split ceilings before any swap state exists: every hop in
+    /// `1..=MAX_TX_COUNT`, and a uniform route on Legacy, where per-hop
+    /// maximums are out of scope.
+    fn validate_tx_counts(&self) -> Result<(), TakerError> {
+        if !self.tx_counts.is_empty() && self.tx_counts.len() != self.maker_count + 1 {
+            return Err(TakerError::General(format!(
+                "Per-hop transaction counts need {} entries (makers + 1), got {}",
+                self.maker_count + 1,
+                self.tx_counts.len()
+            )));
+        }
+        // Zero splits fund nothing; above the cap the per-split messages grow
+        // unbounded. The maker refuses both too — failing here is clearer.
+        let hop_tx_counts = self.hop_tx_counts();
+        if let Some(&count) = hop_tx_counts
+            .iter()
+            .find(|&&count| count == 0 || count > MAX_TX_COUNT)
+        {
+            return Err(TakerError::General(format!(
+                "Transaction count {} is outside the protocol bounds 1..={}",
+                count, MAX_TX_COUNT
+            )));
+        }
+        if self.protocol == ProtocolVersion::Legacy
+            && hop_tx_counts.iter().any(|&count| count != hop_tx_counts[0])
+        {
+            return Err(TakerError::General(format!(
+                "Per-hop transaction counts are Taproot only; Legacy needs one count for every hop, got {hop_tx_counts:?}"
+            )));
+        }
+        Ok(())
     }
 
     /// Set the maximum inputs per forwarding tx whose fee the taker covers.
@@ -1034,14 +1091,7 @@ impl Taker {
             ));
         }
 
-        // Zero splits fund nothing; above the cap the per-split messages grow
-        // unbounded. The maker refuses both too — failing here is clearer.
-        if params.tx_count == 0 || params.tx_count > MAX_TX_COUNT {
-            return Err(TakerError::General(format!(
-                "Transaction count {} is outside the protocol bounds 1..={}",
-                params.tx_count, MAX_TX_COUNT
-            )));
-        }
+        params.validate_tx_counts()?;
 
         // The maker enforces the same bound on the input budget; an
         // out-of-range value would otherwise only fail mid-negotiation.
@@ -1196,14 +1246,17 @@ impl Taker {
             swap_feerate,
         )
         .ok_or_else(policy_err)?;
-        let tx_count = swap.params.tx_count as u64;
+        // Maker `i` sweeps at most `hop_tx_counts[i]` incoming contracts and
+        // forwards at most `hop_tx_counts[i + 1]` splits.
+        let hop_tx_counts = swap.params.hop_tx_counts();
         let mut ceiling_sats = service_fee_sats;
-        for mc in &swap.makers {
+        for (i, mc) in swap.makers.iter().enumerate() {
             let sweep_sats =
                 sweep_fee_policy_sats(mc.protocol, swap_feerate).ok_or_else(policy_err)?;
-            let hop_sats = split_funding_sats
-                .checked_add(sweep_sats)
-                .and_then(|per_split| tx_count.checked_mul(per_split))
+            let hop_sats = sweep_sats
+                .checked_mul(u64::from(hop_tx_counts[i]))
+                .zip(split_funding_sats.checked_mul(u64::from(hop_tx_counts[i + 1])))
+                .and_then(|(sweeps, funding)| sweeps.checked_add(funding))
                 .ok_or_else(policy_err)?;
             ceiling_sats = ceiling_sats.checked_add(hop_sats).ok_or_else(policy_err)?;
         }
@@ -1722,7 +1775,7 @@ impl Taker {
         let maker_count = swap.params.maker_count;
         let swap_id = swap.id.clone();
         let send_amount = swap.params.send_amount;
-        let tx_count = swap.params.tx_count;
+        let hop_tx_counts = swap.params.hop_tx_counts();
         let protocol = swap.params.protocol;
 
         // Get reference height once for consistent absolute timelocks (Taproot).
@@ -1744,7 +1797,7 @@ impl Taker {
             let wallet = self.read_wallet()?;
             wallet.plan_funding(
                 send_amount,
-                tx_count,
+                hop_tx_counts[0],
                 swap.params.swap_feerate(),
                 // Our own hop pays the fee on top: no input budget, no
                 // over-budget guard, mirroring the funding call sites.
@@ -1766,12 +1819,12 @@ impl Taker {
 
         #[cfg(debug_assertions)]
         log::debug!(
-            "[SWAP_ROUTE] Source: taker::api::negotiate_swap_details | SwapID: {} | NegotiatedMakers: {} | Protocol: {:?} | ReferenceHeight: {} | TxCount: {}",
+            "[SWAP_ROUTE] Source: taker::api::negotiate_swap_details | SwapID: {} | NegotiatedMakers: {} | Protocol: {:?} | ReferenceHeight: {} | TxCounts: {:?}",
             swap_id,
             maker_count,
             protocol,
             reference_height,
-            tx_count
+            hop_tx_counts
         );
         Ok(())
     }
@@ -1820,19 +1873,20 @@ impl Taker {
         let swap = self.swap_state()?;
         let maker_count = swap.params.maker_count;
         let swap_id = swap.id.clone();
-        let tx_count = swap.params.tx_count;
+        let hop_tx_counts = swap.params.hop_tx_counts();
         let protocol = swap.params.protocol;
 
         let mut next_amount = start_amount;
         let mut next_count = start_count;
         let mut i = start_idx;
         while i < maker_count {
+            // Maker `i` forwards on hop `i + 1`, so that hop's maximum caps its plan.
             let result = self.negotiate_with_maker(
                 i,
                 &swap_id,
                 next_amount,
                 next_count,
-                tx_count,
+                hop_tx_counts[i + 1],
                 maker_count,
                 reference_height,
             );
@@ -2146,7 +2200,7 @@ impl Taker {
             id: swap.id.clone(),
             protocol_version: swap.params.protocol,
             amount: swap.makers[maker_idx].amount,
-            tx_count: swap.params.tx_count,
+            tx_count: swap.params.hop_tx_counts()[maker_idx + 1],
             incoming_count: swap.makers[maker_idx].incoming_count,
             max_input_budget: swap.params.max_input_budget,
             feerate: swap.params.swap_feerate() as u64,
@@ -2284,7 +2338,7 @@ impl Taker {
                 old.amount,
                 old.incoming_count,
                 swap.id.clone(),
-                swap.params.tx_count,
+                swap.params.hop_tx_counts()[target_idx + 1],
                 swap.params.maker_count,
             )
         };
