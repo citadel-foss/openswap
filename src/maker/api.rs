@@ -100,7 +100,11 @@ fn replan_funding(
         service_fee,
         terms.protocol,
     )
-    .map_err(|_| out_of_coins())
+    .map_err(|e| {
+        // The taker only sees the liquidity refusal; keep the cause for the operator.
+        log::warn!("Re-plan could not fit the declared funding shape: {e:?}");
+        out_of_coins()
+    })
 }
 
 /// What a hop must keep after its own fee: the incoming sweeps plus one
