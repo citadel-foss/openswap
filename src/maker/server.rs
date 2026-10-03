@@ -1299,11 +1299,48 @@ fn recover_from_swap(
     incoming_swapcoins: Vec<crate::wallet::swapcoin::IncomingSwapCoin>,
     outgoing_swapcoins: Vec<crate::wallet::swapcoin::OutgoingSwapCoin>,
 ) -> Result<(), MakerError> {
+    // The watcher hears each new block, so asking the server every pass is waste.
+    let tip = || match maker.watch_service.tip() {
+        Some(height) => Ok(height as u32),
+        None => lock_debug!(maker.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .get_block_count()
+            .map(|height| height as u32)
+            .map_err(MakerError::Wallet),
+    };
+
     // Timelock recovery may already have removed every outgoing coin before a
     // crash. Any claim-ready incoming coins still need an idempotent sweep, but
     // there is no outgoing timelock left to monitor.
     if outgoing_swapcoins.is_empty() {
-        maker.sweep_incoming_swapcoins(&incoming_swapcoins)?;
+        // Nothing respawns this thread, so a failed sweep retries on the next block.
+        let mut tried_at = None;
+        while !maker.is_shutdown() {
+            let height = tip()
+                .inspect_err(|e| {
+                    log::warn!(
+                        "[{}] Could not read the block height: {:?}",
+                        maker.config.network_port,
+                        e
+                    )
+                })
+                .ok();
+            if height.is_some() && tried_at != height {
+                tried_at = height;
+                match maker.sweep_incoming_swapcoins(&incoming_swapcoins) {
+                    Ok(_) => return Ok(()),
+                    Err(e) => log::warn!(
+                        "[{}] Incoming sweep failed: {:?}; retrying on the next block",
+                        maker.config.network_port,
+                        e
+                    ),
+                }
+            }
+            if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                break;
+            }
+        }
         return Ok(());
     }
 
@@ -1316,16 +1353,9 @@ fn recover_from_swap(
         .and_then(|o| o.get_timelock())
         .ok_or(MakerError::General("missing timelock on outgoing swapcoin"))?;
 
-    let start_height = lock_debug!(maker.wallet.read())
-        .map_err(|_| MakerError::General("Failed to lock wallet"))?
-        .blockchain
-        .get_block_count()
-        .map_err(MakerError::Wallet)? as u32;
-
     log::info!(
-        "[{}] recover_from_swap started | height={} timelock_expiry={} | incoming={} outgoing={}",
+        "[{}] recover_from_swap started | timelock_expiry={} | incoming={} outgoing={}",
         maker.config.network_port,
-        start_height,
         timelock_expiry,
         incoming_swapcoins.len(),
         outgoing_swapcoins.len()
@@ -1482,7 +1512,26 @@ fn recover_from_swap(
 
     let mut watchtower_down_logged = false;
     let mut discard_deferred_logged = false;
+    let mut last_block = None;
+    let mut last_preimages_known = None;
     while !maker.is_shutdown() {
+        let current_height = match tip() {
+            Ok(height) => height,
+            Err(e) => {
+                log::warn!(
+                    "[{}] Could not read the block height: {:?}; retrying recovery",
+                    maker.config.network_port,
+                    e
+                );
+                if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                    break;
+                }
+                continue;
+            }
+        };
+        // The chain only moves with a block, so server work waits for one. A failed
+        // pass therefore retries on the next block, not every heartbeat.
+        let new_block = last_block.replace(current_height) != Some(current_height);
         let handover_persisted = !incoming_swapcoins.is_empty()
             && incoming_swapcoins
                 .iter()
@@ -1491,6 +1540,7 @@ fn recover_from_swap(
         // A confirmed cooperative or hashlock spend proves the taker claimed the
         // contract. A timelock refund is recovery, not successful settlement.
         let outgoing_spent = completed_candidate
+            && new_block
             && match all_outgoing_confirmed_settled() {
                 Ok(spent) => spent,
                 Err(error) => {
@@ -1505,7 +1555,13 @@ fn recover_from_swap(
             };
         if outgoing_spent {
             if handover_persisted {
-                maker.sweep_incoming_swapcoins(&incoming_swapcoins)?;
+                if let Err(e) = maker.sweep_incoming_swapcoins(&incoming_swapcoins) {
+                    log::warn!(
+                        "[{}] Completed swap sweep failed: {:?}; retrying on the next block",
+                        maker.config.network_port,
+                        e
+                    );
+                }
                 let fully_swept = {
                     let wallet = lock_debug!(maker.wallet.read())
                         .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -1600,7 +1656,7 @@ fn recover_from_swap(
                 }
             }
 
-            if never_recorded {
+            if never_recorded && new_block {
                 // The maker's own sends: Legacy's funding txs (each outgoing
                 // contract spends one) or Taproot's contract txs. `None` when a
                 // Legacy contract tx has no input, so it proves nothing.
@@ -1623,7 +1679,7 @@ fn recover_from_swap(
                     for txid in txids {
                         // Nothing re-spawns this thread, so a failed query must not
                         // end recovery. Keep the records and let the monitoring
-                        // loop below retry every heartbeat.
+                        // loop below retry on the next block.
                         match wallet.blockchain.is_tx_unknown(txid) {
                             Ok(true) => {}
                             Ok(false) => {
@@ -1686,7 +1742,10 @@ fn recover_from_swap(
         }
 
         // --- Hashlock path: check if preimages are available ---
-        if let Err(e) = check_for_preimage(&maker, &outgoing_swapcoins, &incoming_swapcoins) {
+        // Asking the watcher is local. Without it the check is a server round trip.
+        let preimage_check = (maker.watch_service.is_alive() || new_block)
+            .then(|| check_for_preimage(&maker, &outgoing_swapcoins, &incoming_swapcoins));
+        if let Some(Err(e)) = preimage_check {
             log::warn!(
                 "[{}] Could not refresh contract spends: {:?}; retrying recovery",
                 maker.config.network_port,
@@ -1723,11 +1782,14 @@ fn recover_from_swap(
             })
         };
 
-        let current_height = lock_debug!(maker.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .blockchain
-            .get_block_count()
-            .map_err(MakerError::Wallet)? as u32;
+        let preimages_changed =
+            last_preimages_known.replace(all_preimages_known) != Some(all_preimages_known);
+        if !new_block && !preimages_changed {
+            if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                break;
+            }
+            continue;
+        }
 
         // One connection per pass, shared by both recovery paths below: on Tor
         // Electrum each fresh connection costs a circuit handshake. Idle passes
@@ -1782,11 +1844,6 @@ fn recover_from_swap(
                 "[{}] All preimages known, recovering via hashlock path",
                 maker.config.network_port
             );
-
-            lock_debug!(maker.wallet.write())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .sync_and_save(&maker.shutdown)
-                .map_err(MakerError::Wallet)?;
 
             let chain = chain.as_ref().expect("connection created for this branch");
 

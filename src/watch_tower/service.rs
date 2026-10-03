@@ -5,7 +5,7 @@ use crossbeam_channel::{unbounded, RecvTimeoutError};
 use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SendError, Sender as StdSender},
         Arc, Mutex,
     },
@@ -51,6 +51,8 @@ pub struct WatchService {
     watcher_shutdown: Arc<AtomicBool>,
     /// Set while the watcher runs, then left false after any terminal exit.
     alive: Arc<AtomicBool>,
+    /// The watcher's latest block height, 0 while unknown.
+    tip: Arc<AtomicU64>,
 }
 
 impl WatchService {
@@ -59,12 +61,14 @@ impl WatchService {
         handle: JoinHandle<Result<(), WatcherError>>,
         watcher_shutdown: Arc<AtomicBool>,
         alive: Arc<AtomicBool>,
+        tip: Arc<AtomicU64>,
     ) -> Self {
         Self {
             tx,
             handle: Arc::new(Mutex::new(Some(handle))),
             watcher_shutdown,
             alive,
+            tip,
         }
     }
 
@@ -72,6 +76,7 @@ impl WatchService {
     pub(crate) fn spawn(
         tx: StdSender<WatcherCommand>,
         watcher_shutdown: Arc<AtomicBool>,
+        tip: Arc<AtomicU64>,
         run: impl FnOnce() -> Result<(), WatcherError> + Send + 'static,
     ) -> std::io::Result<Self> {
         let alive = Arc::new(AtomicBool::new(true));
@@ -79,7 +84,7 @@ impl WatchService {
         let handle = thread::Builder::new()
             .name("Watcher thread".to_string())
             .spawn(move || run_with_liveness(thread_alive, run))?;
-        Ok(Self::from_parts(tx, handle, watcher_shutdown, alive))
+        Ok(Self::from_parts(tx, handle, watcher_shutdown, alive, tip))
     }
 
     /// Sticky watcher availability; false only after channel-level death:
@@ -88,6 +93,12 @@ impl WatchService {
     /// progress or individual registrations.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// Latest block height the watcher has seen, while it runs and knows one.
+    pub(crate) fn tip(&self) -> Option<u64> {
+        let tip = self.tip.load(Ordering::Acquire);
+        (tip > 0 && self.is_alive()).then_some(tip)
     }
 
     fn send_command(&self, command: WatcherCommand) -> Result<(), SendError<WatcherCommand>> {
@@ -282,7 +293,8 @@ pub fn start_maker_watch_service(
         shutdown.clone(),
     );
     // Makers don't run discovery, so pass an already-complete flag.
-    WatchService::spawn(tx_requests, shutdown, move || {
+    let tip = watcher.tip.clone();
+    WatchService::spawn(tx_requests, shutdown, tip, move || {
         watcher.run(Arc::new(AtomicBool::new(true)))
     })
     .map_err(WatcherError::from)
@@ -306,6 +318,7 @@ mod tests {
             handle,
             Arc::new(AtomicBool::new(watcher_shutdown)),
             Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicU64::new(0)),
         )
     }
 

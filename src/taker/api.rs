@@ -843,7 +843,12 @@ impl Taker {
                 return;
             }
         };
-        match RecoveryLoop::start(self.wallet.clone(), self.swap_tracker.clone(), data_dir) {
+        match RecoveryLoop::start(
+            self.wallet.clone(),
+            self.swap_tracker.clone(),
+            self.watch_service.clone(),
+            data_dir,
+        ) {
             Ok(rl) => self.recovery_loop = Some(rl),
             // Without the loop, remaining contracts are never swept.
             Err(e) => log::error!("Failed to spawn recovery loop: {e}"),
@@ -880,7 +885,8 @@ impl Taker {
             )),
             shutdown.clone(),
         );
-        let watch_service = WatchService::spawn(tx_requests, shutdown, move || {
+        let tip = watcher.tip.clone();
+        let watch_service = WatchService::spawn(tx_requests, shutdown, tip, move || {
             watcher.run(initial_sync_clone)
         })
         .map_err(|e| TakerError::General(format!("failed to spawn watcher thread: {e}")))?;
@@ -3492,6 +3498,7 @@ impl Taker {
         self.recovery_loop = Some(RecoveryLoop::start(
             self.wallet.clone(),
             self.swap_tracker.clone(),
+            self.watch_service.clone(),
             data_dir,
         )?);
 

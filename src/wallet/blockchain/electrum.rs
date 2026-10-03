@@ -1511,10 +1511,20 @@ impl Blockchain for Electrum {
                 state.dirty.insert(spk);
             }
             // The rebuilt socket lost the header subscription too; without it
-            // `block_headers_pop` stays empty and tip updates silently stop.
-            if let Err(e) = self.call(|c| c.block_headers_subscribe().map(|_| ())) {
-                log::warn!("re-arm header subscription after reconnect failed: {e:?}");
-                self.needs_rearm.store(true, Ordering::SeqCst);
+            // `block_headers_pop` stays empty and tip updates silently stop. The
+            // reply is the tip, which covers blocks mined while we were deaf.
+            match self.call(|c| c.block_headers_subscribe()) {
+                Ok(tip) => state
+                    .pending
+                    .push_back(WatchEvent::BlockConnected(BlockRef {
+                        height: tip.height as u64,
+                        hash: serialize(&tip.header.block_hash()),
+                    })),
+                Err(e) => {
+                    log::warn!("re-arm header subscription after reconnect failed: {e:?}");
+                    self.needs_rearm.store(true, Ordering::SeqCst);
+                    state.pending.push_back(WatchEvent::Unreachable);
+                }
             }
         }
 
@@ -1532,7 +1542,7 @@ impl Blockchain for Electrum {
                 // Without the ping the socket is never read and the watcher
                 // goes deaf while looking alive — loud, not a warning.
                 log::error!("electrum notification ping failed: {e:?}");
-                return None;
+                return Some(WatchEvent::Unreachable);
             }
         }
 
