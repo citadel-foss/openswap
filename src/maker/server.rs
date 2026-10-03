@@ -1879,6 +1879,8 @@ fn recover_from_swap(
                         let key = outgoing.contract_tx.compute_txid().to_string();
                         wallet.remove_outgoing_swapcoin(&key);
                     }
+                    // A partly broadcast batch still holds its unsent inputs.
+                    wallet.release_swap_locks(&swap_id, None);
                     wallet.save_to_disk().map_err(MakerError::Wallet)?;
                 }
                 // An incoming the sender took back is a loss, not a recovery.
@@ -1965,6 +1967,8 @@ fn recover_from_swap(
                         let key = incoming.contract_tx.compute_txid().to_string();
                         wallet.remove_incoming_swapcoin(&key);
                     }
+                    // A partly broadcast batch still holds its unsent inputs.
+                    wallet.release_swap_locks(&swap_id, None);
                     wallet.save_to_disk().map_err(MakerError::Wallet)?;
                 }
                 finish_swap(

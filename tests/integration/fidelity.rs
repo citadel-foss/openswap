@@ -935,6 +935,74 @@ fn test_unconfirmed_fidelity_bond_not_duplicated() {
     log::info!("Unconfirmed fidelity bond restart test completed successfully");
 }
 
+/// A maker restarting with a live bond and a pending one advertises the live
+/// bond at once: the pending bond gets one check, not an endless wait.
+#[test]
+fn test_live_bond_is_advertised_while_another_is_pending() {
+    // ---- Setup ----
+    let (test_framework, _takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(1, vec![], vec![]);
+
+    log::info!("Running Test: Live Bond Advertised While Another Is Pending");
+
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers.first().unwrap();
+    let log_path = test_framework.taker_log_path();
+
+    fund_makers(&makers, bitcoind, 2, Amount::ONE_BTC, AddressType::P2TR);
+
+    // ----- Run 1: the maker confirms its first bond -----
+    let maker_clone = maker.clone();
+    let maker_thread = thread::spawn(move || {
+        let _ = start_server(maker_clone);
+    });
+    wait_for_makers_setup(std::slice::from_ref(maker), 120);
+    maker.shutdown.store(true, Relaxed);
+    let _ = maker_thread.join();
+
+    // ----- A second bond is broadcast and kept unconfirmed -----
+    test_framework.set_block_gen_paused(true);
+    let locktime = bitcoind.client.get_block_count().unwrap() as u32 + 950;
+    let (_, pending_txid) = maker
+        .wallet
+        .write()
+        .unwrap()
+        .create_fidelity(
+            Amount::from_sat(5_000_000),
+            LockTime::from_height(locktime).unwrap(),
+            None,
+            MIN_RELAY_FEE_RATE,
+            AddressType::P2TR,
+        )
+        .unwrap();
+
+    // ----- Run 2: setup completes while the second bond is still pending -----
+    let restarted = Arc::new(MakerServer::init(maker_restart_config(maker)).unwrap());
+    let restarted_clone = restarted.clone();
+    let restarted_thread = thread::spawn(move || {
+        let _ = start_server(restarted_clone);
+    });
+    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+
+    assert!(
+        bitcoind.client.get_mempool_entry(&pending_txid).is_ok(),
+        "the second bond must still be unconfirmed when setup completes"
+    );
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains(&format!(
+            "Fidelity bond {pending_txid} still unconfirmed; advertising the live bond meanwhile"
+        )),
+        "restart must advertise the live bond instead of waiting"
+    );
+
+    restarted.shutdown.store(true, Relaxed);
+    let _ = restarted_thread.join();
+    test_framework.set_block_gen_paused(false);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
 /// Eviction path: if the unconfirmed bond tx falls out of the mempool while
 /// the maker is offline, the restart must rebroadcast the stored raw
 /// transaction — keeping the original txid and creating no second bond.

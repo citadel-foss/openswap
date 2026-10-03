@@ -1869,38 +1869,42 @@ impl MakerServer {
             if let Some(key) = &stand_in {
                 wallet.reserve_swap_locks(key, &inputs(plan));
             }
-            let plan = if let Some(claimed) = claimed {
+            let selected = if let Some(claimed) = claimed {
                 let held = wallet.store.swap_locks.get(swap_id).is_some_and(|locks| {
                     inputs(&claimed)
                         .iter()
                         .all(|input| locks.outpoints.contains(input))
                 });
-                if !held {
-                    return Err(MakerError::General(
+                if held {
+                    Ok(claimed)
+                } else {
+                    Err(MakerError::General(
                         "Funding was already built; refusing to fund from other coins",
-                    ));
+                    ))
                 }
-                claimed
             } else if wallet.claim_swap_inputs(swap_id, &inputs(plan)) {
-                plan.to_vec()
+                Ok(plan.to_vec())
             } else {
-                let replanned = replan_funding(&wallet, &terms, service_fee, plan, gross)?;
-                if !wallet.claim_swap_inputs(swap_id, &inputs(&replanned)) {
-                    return Err(MakerError::General(
-                        "Re-planned funding inputs are not free",
-                    ));
-                }
-                log::info!(
-                    "[{}] Re-planned funding for swap {}: a planned coin went to another swap",
-                    self.config.network_port,
-                    swap_id
-                );
-                replanned
+                replan_funding(&wallet, &terms, service_fee, plan, gross).and_then(|replanned| {
+                    if !wallet.claim_swap_inputs(swap_id, &inputs(&replanned)) {
+                        return Err(MakerError::General(
+                            "Re-planned funding inputs are not free",
+                        ));
+                    }
+                    log::info!(
+                        "[{}] Re-planned funding for swap {}: a planned coin went to another swap",
+                        self.config.network_port,
+                        swap_id
+                    );
+                    Ok(replanned)
+                })
             };
+            // Released before any error returns, or the stand-in leaks its coins.
             #[cfg(feature = "integration-test")]
             if let Some(key) = &stand_in {
                 wallet.release_swap_locks(key, None);
             }
+            let plan = selected?;
             if fresh {
                 if let Err(e) = wallet.save_to_disk() {
                     wallet.release_swap_locks(swap_id, None);

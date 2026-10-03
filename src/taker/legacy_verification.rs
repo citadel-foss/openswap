@@ -36,12 +36,35 @@ use super::{
     offers::{BanReason, MakerAddress},
 };
 
-/// Prevout lookups before the funding-fee check gives up. A backend blip must
-/// not abort a swap the taker has already funded.
-const MAX_PREVOUT_LOOKUP_ATTEMPTS: u32 = 3;
+/// Lookups before the funding-fee check gives up. A backend blip must not
+/// abort a swap the taker has already funded.
+const MAX_TX_LOOKUP_ATTEMPTS: u32 = 3;
 
-/// Delay between prevout lookup attempts.
-const PREVOUT_LOOKUP_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Delay between lookup attempts.
+const TX_LOOKUP_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Fetches `txid` for the funding-fee check. Fails closed, since an
+/// unverifiable tx must never skip the check, but retries first: a backend
+/// error is not the maker's fault.
+pub(crate) fn fetch_tx_with_retry(
+    chain: &impl Blockchain,
+    txid: &Txid,
+) -> Result<Transaction, WalletError> {
+    let mut attempt = 1;
+    loop {
+        match chain.get_raw_transaction(txid, None) {
+            Ok(tx) => return Ok(tx),
+            Err(err) if attempt < MAX_TX_LOOKUP_ATTEMPTS => {
+                log::warn!(
+                    "Lookup {attempt}/{MAX_TX_LOOKUP_ATTEMPTS} of tx {txid} failed: {err:?}"
+                );
+                sleep(TX_LOOKUP_RETRY_DELAY);
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
 
 impl Taker {
     /// Record a proven maker violation in the offerbook. A persistence
@@ -107,34 +130,14 @@ impl Taker {
             for input in &tx.input {
                 let prev_outpoint = input.previous_output;
                 if let Entry::Vacant(e) = prev_txs.entry(prev_outpoint.txid) {
-                    // Fail closed: an unverifiable prevout must never skip the
-                    // fee check, but a transient backend error is not the
-                    // maker's fault, so retry before giving up.
-                    let mut fetched = None;
-                    for attempt in 1..=MAX_PREVOUT_LOOKUP_ATTEMPTS {
-                        match chain.get_raw_transaction(&prev_outpoint.txid, None) {
-                            Ok(prev_tx) => {
-                                fetched = Some(prev_tx);
-                                break;
-                            }
-                            Err(err) => {
-                                log::warn!(
-                                    "Maker {maker_idx} funding tx {i} prevout {} lookup {attempt}/{MAX_PREVOUT_LOOKUP_ATTEMPTS} failed: {err:?}",
-                                    prev_outpoint.txid
-                                );
-                                if attempt < MAX_PREVOUT_LOOKUP_ATTEMPTS {
-                                    sleep(PREVOUT_LOOKUP_RETRY_DELAY);
-                                }
-                            }
-                        }
-                    }
-                    let prev_tx = fetched.ok_or_else(|| {
-                        TakerError::General(format!(
-                            "Maker {maker_idx} funding tx {i} prevout {} is unavailable; \
-                             cannot verify its funding fee",
-                            prev_outpoint.txid
-                        ))
-                    })?;
+                    let prev_tx =
+                        fetch_tx_with_retry(&chain, &prev_outpoint.txid).map_err(|err| {
+                            TakerError::General(format!(
+                                "Maker {maker_idx} funding tx {i} prevout {} is unavailable; \
+                                 cannot verify its funding fee: {err:?}",
+                                prev_outpoint.txid
+                            ))
+                        })?;
                     e.insert(prev_tx);
                 }
                 let prevout = prev_txs[&prev_outpoint.txid]

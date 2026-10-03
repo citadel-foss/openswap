@@ -25,13 +25,14 @@ use crate::{
     utill::{generate_keypair, generate_maker_keys, read_message, send_message},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
-        Blockchain, Wallet,
+        Wallet,
     },
 };
 
 use super::{
     api::{fund_all_or_nothing, Taker},
     error::{breach_or_wallet_error, TakerError},
+    legacy_verification::fetch_tx_with_retry,
 };
 
 #[cfg(feature = "integration-test")]
@@ -769,7 +770,7 @@ impl Taker {
             let chain = self.read_wallet()?.blockchain.new_connection()?;
             let confirmed_funding = maker_funding_txids
                 .iter()
-                .map(|txid| chain.get_raw_transaction(txid, None))
+                .map(|txid| fetch_tx_with_retry(&chain, txid))
                 .collect::<Result<Vec<_>, _>>()?;
             self.verify_maker_funding_feerate(&confirmed_funding, maker_idx)?;
 

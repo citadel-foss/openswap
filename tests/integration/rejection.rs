@@ -1816,9 +1816,6 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
 
     // The 30s idle timeout starts recovery; the timelock path then needs the
     // maker's outgoing timelock (150 CSV blocks from the contract broadcast).
-    // The record never reaches a terminal phase here: the recovery loop only
-    // re-checks contract resolution on passes that recover something, and once
-    // the maker's own coins are reclaimed every pass returns empty.
     let record = wait_for_maker_timelock_recovery(
         &makers[0].data_dir,
         &swap_id,
@@ -1843,6 +1840,16 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
         !log_contents.contains("nothing to recover. Discarding swapcoins"),
         "a partial batch must never be discarded as never broadcast"
     );
+
+    // The unsent split's inputs must return to the pool without a restart.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while makers[0].reserved_inputs().unwrap() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "recovery left the unsent split's inputs reserved"
+        );
+        thread::sleep(Duration::from_secs(2));
+    }
 
     generate_blocks(bitcoind, 1);
     test_framework.wait_for_electrs_tip();
