@@ -81,6 +81,19 @@ cargo nextest run --features integration-test
 
 The [Test Framework](./tests/test_framework/) spawns toy marketplaces in Bitcoin regtest to test swap scenarios. The tests in [tests/integration](./tests/integration/) are grouped by topic; its [README](./tests/integration/README.md) explains how to write and run them. Start with [swap/standard](./tests/integration/swap/standard.rs) to understand programmatic simulation.
 
+Windows CI retains the Windows build check and runs only the standard Legacy
+and Taproot swap scenarios, each against both Bitcoind and Electrum. This keeps
+representative backend coverage without running the full, slower integration
+suite on Windows; the full suite remains in Linux CI.
+
+For the same focused Windows tests locally, run
+`./scripts/test-integration-windows.ps1` in PowerShell. The helper builds
+libzmq without its unused IPC transport, which avoids a crash in the bundled
+Windows libzmq 4.3.4 poller. It keeps Cargo offline and requires local Bitcoin
+Core files plus `ELECTRS_EXEC` pointing to a local electrs executable. Pass
+`-Filter '<test-name>'` to run a filtered integration test or `-FullSuite` to
+opt into the full suite.
+
 ## Contributing
 
 - Browse [issues](https://github.com/citadel-foss/openswap/issues), especially [`good first issue`](https://github.com/citadel-foss/openswap/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22)

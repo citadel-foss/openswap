@@ -77,14 +77,13 @@ jobs:
           if-no-files-found: error
 
   test:
-    name: Windows tests (Partition ${{ matrix.partition }}/${{ strategy.job-total }})
+    # .github/workflows/build.yaml retains the Windows cargo build check.
+    # Here, exercise only the standard legacy and Taproot swaps on both
+    # Bitcoind and Electrum; the full integration suite runs on Linux.
+    name: Focused Windows integration tests
     needs: tools
     runs-on: windows-latest
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3, 4, 5, 6, 7, 8]
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -100,9 +99,6 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-windows-test-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
 
       - name: Download test daemons
         uses: actions/download-artifact@v4
@@ -120,27 +116,25 @@ jobs:
           if ($actual -ne $expected) { throw "Bitcoin Core checksum mismatch: $actual" }
           Add-Content -Path $env:GITHUB_ENV -Value "BITCOIND_TARBALL_FILE=$pwd\bitcoin-28.1-win64.zip"
 
-      - name: Setup nextest config
-        shell: bash
-        run: |
-          mkdir -p .config
-          cat <<'EOF' > .config/nextest.toml
-          [profile.default]
-          global-timeout = "1h"
-          slow-timeout = "3m"
-          EOF
-
-      # `--no-capture` would force each partition to run tests one at a time.
-      # `--test-threads=2` still caps how many bitcoind processes a 4-core
-      # runner starts. Ignored Tor tests are not included.
-      - name: Run tests
+      - name: Run standard swap scenarios on Bitcoind and Electrum
         shell: bash
         env:
           ELECTRS_EXEC: ${{ github.workspace }}\tools-bin\electrs.exe
+          OPENSWAP_TEST_LOG: info
+          # libzmq 4.3.4's Windows IPC transport can crash in its poller even
+          # though OpenSwap only uses TCP endpoints. Disable IPC for this build.
+          CXXFLAGS: /FI${{ github.workspace }}\scripts\zmq-windows-no-ipc.h
         run: |
-          cargo nextest run --features integration-test \
-            --lib --bins --tests \
-            --retries 1 \
-            --max-fail 2:immediate \
-            --partition hash:${{ matrix.partition }}/${{ strategy.job-total }} \
-            --test-threads=2
+          set -euo pipefail
+          cargo test --features integration-test --test integration \
+            standard_swap::test_standard_openswap -- \
+            --exact --nocapture --test-threads=1
+          cargo test --features integration-test --test integration \
+            taproot_swap::test_taproot_openswap -- \
+            --exact --nocapture --test-threads=1
+          cargo test --features integration-test --test integration \
+            electrum_swap::test_legacy_openswap_electrum -- \
+            --exact --nocapture --test-threads=1
+          cargo test --features integration-test --test integration \
+            electrum_swap::test_taproot_openswap_electrum -- \
+            --exact --nocapture --test-threads=1
