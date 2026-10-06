@@ -909,6 +909,8 @@ impl Taker {
             taker_config.tor_auth_password = tor_auth_password.clone();
         }
 
+        taker_config.socks_port = config.socks_port;
+
         if let Some(check_blocklist) = config.check_blocklist {
             taker_config.check_blocklist = check_blocklist;
         }
@@ -3917,6 +3919,7 @@ mod tests {
             ldk_server_url: Some("127.0.0.1:3537".to_string()),
             ldk_api_key_path: Some("/tmp/ldk2/api_key".to_string()),
             ldk_tls_cert_path: Some("/tmp/ldk2/tls.crt".to_string()),
+            socks_port: 19050,
             ..TakerInitConfig::default()
         };
 
@@ -3933,6 +3936,7 @@ mod tests {
             reloaded.ldk_tls_cert_path.as_deref(),
             Some("/tmp/ldk2/tls.crt")
         );
+        assert_eq!(reloaded.socks_port, 19050);
 
         std::fs::remove_dir_all(&dir).ok();
     }
