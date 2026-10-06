@@ -258,10 +258,12 @@ openswap wallet::swapcoin::timelock_spend_tests::taproot_hashlock_claim_is_not_o
 openswap wallet::swapcoin::timelock_spend_tests::taproot_key_path_spend_is_not_ours
 openswap wallet::swapcoin::timelock_spend_tests::taproot_timelock_recovery_is_ours
 openswap wallet::swapcoin::timelock_spend_tests::timelock_witness_on_another_outpoint_is_not_ours
+openswap watch_tower::nostr::tests::closing_the_relay_socket_stops_a_parked_read
 openswap watch_tower::nostr::tests::duplicate_event_across_relays_skips_blockchain_and_advances_cursor
 openswap watch_tower::nostr::tests::eose_message_returns_true
 openswap watch_tower::nostr::tests::future_dated_event_never_moves_the_cursor
 openswap watch_tower::nostr::tests::garbage_frame_is_skipped_not_fatal
+openswap watch_tower::nostr::tests::shutdown_stops_discovery_without_waiting_for_a_silent_relay
 openswap watch_tower::nostr::tests::tampered_event_is_rejected_before_claiming_txid
 openswap watch_tower::nostr::tests::worker_handles_eose_and_exits_on_disconnect
 openswap watch_tower::registry_storage::tests::test_fidelity_insert_and_remove
@@ -290,6 +292,7 @@ openswap watch_tower::utils::tests::test_process_fidelity_uses_confirmation_heig
 openswap watch_tower::utils::tests::test_process_fidelity_valid
 openswap watch_tower::utils::tests::test_process_transaction_in_block_false
 openswap watch_tower::utils::tests::test_seentxid_insert
+openswap watch_tower::watcher::tests::block_heights_are_published_until_nothing_is_watched
 openswap watch_tower::watcher::tests::core_height_failure_queues_and_retries_block_discovery
 openswap watch_tower::watcher::tests::core_retry_removes_block_orphaned_by_reorg
 openswap watch_tower::watcher::tests::successful_core_retry_processes_and_removes_pending_block
@@ -381,12 +384,12 @@ openswap::integration rejection::contract_response::taker_rejects_overproduced_t
 openswap::integration rejection::contract_response::taproot_rejects_fee_skimming_maker
 openswap::integration rejection::contract_response::taproot_rejects_overreported_funding_inputs
 openswap::integration rejection::contract_response::taproot_rejects_underfunded_maker_contract
-openswap::integration rejection::fees::legacy_rejects_funding_fee_underpayment
-openswap::integration rejection::fees::legacy_rejects_funding_fee_underpayment_electrum
+openswap::integration rejection::fees::legacy_bans_funding_fee_underpayment
+openswap::integration rejection::fees::legacy_bans_funding_fee_underpayment_electrum
 openswap::integration rejection::fees::maker_rejects_over_budget_funding_plan
 openswap::integration rejection::fees::maker_without_fee_headroom_fails_before_any_broadcast
-openswap::integration rejection::fees::taproot_rejects_funding_fee_underpayment
-openswap::integration rejection::fees::taproot_rejects_funding_fee_underpayment_electrum
+openswap::integration rejection::fees::taproot_bans_funding_fee_underpayment
+openswap::integration rejection::fees::taproot_bans_funding_fee_underpayment_electrum
 openswap::integration rejection::funding_proof::maker_errors_when_seen_funding_tx_is_evicted
 openswap::integration rejection::funding_proof::maker_rejects_duplicated_funding_outpoint
 openswap::integration rejection::funding_proof::maker_rejects_legacy_funding_output_below_floor
