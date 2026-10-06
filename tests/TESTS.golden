@@ -474,6 +474,7 @@ openswap::integration swap::standard::taproot_swap_at_custom_feerate
 openswap::integration swap::standard::taproot_swap_survives_unconfirmed_confirmation_wait
 openswap::integration swap::taproot::taproot_two_maker_swap_completes
 openswap::integration swap::too_few_makers::taproot_swap_fails_before_funding
+openswap::integration test_framework::logs::tests::each_fixture_gets_its_own_log
 openswap::integration wallet::backup::encwallet_encbackup_encrestore
 openswap::integration wallet::backup::encwallet_encbackup_encrestore_electrum
 openswap::integration wallet::broadcast_idempotency::rebroadcast_mined_bitcoind

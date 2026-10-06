@@ -13,53 +13,68 @@ use log4rs::{
     append::{console::ConsoleAppender, file::FileAppender},
     config::{Appender, Config, Logger, Root},
     encode::pattern::PatternEncoder,
+    Handle,
 };
 
-/// Installs the process's logger once: everything goes to `taker/debug.log`
-/// under `temp_dir` and to stdout, where each line names the test, e.g.
-/// `2026-10-02T17:39:47Z [swap::electrum::taproot_swap_completes] INFO ...`, so
-/// output from interleaved tests can be told apart in CI.
+/// Points the process's logger at this fixture: everything goes to
+/// `taker/debug.log` under `temp_dir` and to stdout, where each line names the
+/// test, e.g. `2026-10-02T17:39:47Z [swap::electrum::taproot_swap_completes]
+/// INFO ...`, so output from interleaved tests can be told apart in CI.
 ///
 /// The level is debug unless `OPENSWAP_TEST_LOG` sets one (e.g. `warn`, `off`).
 /// The `lock` target's WAIT/GOT traces stay at info at most, since they would
 /// otherwise be most of the output; `OPENSWAP_TEST_LOG_LOCKS=debug` brings them
-/// back. nextest gives each test its own process; under `cargo test` the first
-/// test of the process names every line.
+/// back.
+///
+/// The logger is installed once per process and reconfigured for each later
+/// fixture, so fixtures that run one after another in a process each get
+/// their own log. Fixtures running at the same time in one process share
+/// whichever configured it last; nextest gives each test its own process.
 pub(crate) fn setup_test_logger(temp_dir: &Path) {
-    static LOGGER: OnceLock<()> = OnceLock::new();
-    LOGGER.get_or_init(|| {
-        let level_from = |var: &str| env::var(var).ok().and_then(|level| level.parse().ok());
-        let level = level_from("OPENSWAP_TEST_LOG").unwrap_or(LevelFilter::Debug);
-        let lock_level =
-            level_from("OPENSWAP_TEST_LOG_LOCKS").unwrap_or_else(|| level.min(LevelFilter::Info));
-        let name = thread::current().name().unwrap_or("<unnamed>").to_string();
-        // Opens the block `end_test_log_group` closes; see there.
-        if in_github_actions() {
-            println!("::group::{name}");
-        }
-        let test = name.replace('{', "{{").replace('}', "}}");
-        let stdout = ConsoleAppender::builder()
-            .encoder(Box::new(PatternEncoder::new(&format!(
-                "{{d}} [{test}] {{l}} {{t}} - {{m}}{{n}}"
-            ))))
-            .build();
-        let file = FileAppender::builder()
-            .build(temp_dir.join("taker").join("debug.log"))
-            .expect("the test's debug.log opens");
-        let config = Config::builder()
-            .appender(Appender::builder().build("stdout", Box::new(stdout)))
-            .appender(Appender::builder().build("file", Box::new(file)))
-            .logger(Logger::builder().build("bitcoincore_rpc", LevelFilter::Off))
-            .logger(Logger::builder().build("lock", lock_level))
-            .build(
-                Root::builder()
-                    .appender("stdout")
-                    .appender("file")
-                    .build(level),
-            )
-            .expect("the test logger config is valid");
-        log4rs::init_config(config).expect("no other logger is installed");
+    static LOGGER: OnceLock<Handle> = OnceLock::new();
+    let name = thread::current().name().unwrap_or("<unnamed>").to_string();
+    // Opens the block `end_test_log_group` closes; see there.
+    if in_github_actions() {
+        println!("::group::{name}");
+    }
+    let mut config = Some(test_log_config(&name, temp_dir));
+    let handle = LOGGER.get_or_init(|| {
+        log4rs::init_config(config.take().expect("the config is unused"))
+            .expect("no other logger is installed")
     });
+    // Another fixture installed the logger first: switch it to this one.
+    if let Some(config) = config {
+        handle.set_config(config);
+    }
+}
+
+/// The logger configuration for the fixture of test `name` under `temp_dir`.
+fn test_log_config(name: &str, temp_dir: &Path) -> Config {
+    let level_from = |var: &str| env::var(var).ok().and_then(|level| level.parse().ok());
+    let level = level_from("OPENSWAP_TEST_LOG").unwrap_or(LevelFilter::Debug);
+    let lock_level =
+        level_from("OPENSWAP_TEST_LOG_LOCKS").unwrap_or_else(|| level.min(LevelFilter::Info));
+    let test = name.replace('{', "{{").replace('}', "}}");
+    let stdout = ConsoleAppender::builder()
+        .encoder(Box::new(PatternEncoder::new(&format!(
+            "{{d}} [{test}] {{l}} {{t}} - {{m}}{{n}}"
+        ))))
+        .build();
+    let file = FileAppender::builder()
+        .build(temp_dir.join("taker").join("debug.log"))
+        .expect("the test's debug.log opens");
+    Config::builder()
+        .appender(Appender::builder().build("stdout", Box::new(stdout)))
+        .appender(Appender::builder().build("file", Box::new(file)))
+        .logger(Logger::builder().build("bitcoincore_rpc", LevelFilter::Off))
+        .logger(Logger::builder().build("lock", lock_level))
+        .build(
+            Root::builder()
+                .appender("stdout")
+                .appender("file")
+                .build(level),
+        )
+        .expect("the test logger config is valid")
 }
 
 /// Closes the GitHub Actions group `setup_test_logger` opened. nextest prints a
@@ -124,5 +139,31 @@ pub(crate) fn wait_for_new_log(log_path: &str, expected: &str, timeout: Duration
             log_path
         );
         thread::sleep(Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use crate::test_framework::{BitcoindBackend, Node};
+
+    /// Two fixtures in one process, one after the other: the second still logs
+    /// to its own `debug.log` after the first one's directory is gone.
+    #[test]
+    fn each_fixture_gets_its_own_log() {
+        for run in 0..2 {
+            let node = Node::builder::<BitcoindBackend>().build();
+            let needle = format!("logger probe {run}");
+            log::info!("{needle}");
+            log::logger().flush();
+            let log = fs::read_to_string(node.temp_dir().join("taker").join("debug.log"))
+                .expect("this fixture's debug.log exists");
+            assert!(
+                log.contains(&needle),
+                "run {} did not reach its own log",
+                run
+            );
+        }
     }
 }

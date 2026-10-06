@@ -12,10 +12,11 @@ cargo nextest run --features integration-test                 # everything
 cargo nextest run --features integration-test -E 'test(/^recovery::/)'  # one area
 ```
 
-Use nextest, not `cargo test`: the logger is process-wide, so with every test
-in one process all of them log into the first test's `debug.log` and the log
-assertions fail. `.config/nextest.toml` holds the profiles; CI uses the `ci`
-one (`NEXTEST_PROFILE=ci`).
+Use nextest, not `cargo test`: the logger is process-wide. It moves to each new
+test's `debug.log`, but `cargo test` runs tests at the same time in one process,
+so they all log into whichever test started last and the log assertions fail.
+`.config/nextest.toml` holds the profiles; CI uses the `ci` one
+(`NEXTEST_PROFILE=ci`).
 
 What a run needs:
 
