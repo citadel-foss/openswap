@@ -26,7 +26,7 @@ use openswap::{
     maker::{MakerBehavior, MakerServer, MakerServerConfig},
     protocol::common_messages::ProtocolVersion,
     taker::{Taker, TakerBehavior, TakerInitConfig},
-    wallet::{CoreRpcConfig, ElectrumConfig},
+    wallet::{BackendConfig, CoreRpcConfig, ElectrumConfig},
 };
 
 use super::{
@@ -55,6 +55,10 @@ pub struct TestFramework {
     /// Kept so [`TestFramework::taker_init_config`] can rebuild the same backend
     /// config the takers were started with.
     zmq_addr: String,
+    /// The backend config every taker and maker was started with, built once
+    /// per run: on Tor each build publishes and warms a new onion service.
+    /// `None` when the run started no taker or maker.
+    backend_config: Option<BackendConfig>,
     /// Kept for the same reason as `zmq_addr`: a taker rebuilt by
     /// [`TestFramework::taker_init_config`] must screen as the original did.
     check_blocklist: bool,
@@ -177,6 +181,7 @@ impl TestFramework {
         let mut nostr_relay = RelayGuard(Some(nostr_relay));
         let nostr_relay_url = format!("ws://127.0.0.1:{nostr_port}");
         let mut electrsd: Option<ElectrsD> = None;
+        let mut backend_config: Option<BackendConfig> = None;
         let (takers, makers) = {
             let mut electrum_url: Option<String> = None;
             let mut ensure_electrum_url = || -> String {
@@ -193,13 +198,19 @@ impl TestFramework {
                 electrum_url = Some(url.clone());
                 url
             };
+            let mut backend = || {
+                backend_config
+                    .get_or_insert_with(|| {
+                        B::make_backend_config(&rpc_config, &zmq_addr, &mut ensure_electrum_url)
+                    })
+                    .clone()
+            };
             let takers: Vec<Taker> = taker_behavior
                 .into_iter()
                 .enumerate()
                 .map(|(i, behavior)| {
                     let taker_id = format!("taker{}", i + 1);
-                    let backend =
-                        B::make_backend_config(&rpc_config, &zmq_addr, &mut ensure_electrum_url);
+                    let backend = backend();
                     let mut config = TakerInitConfig::default()
                         .with_data_dir(temp_dir.join(&taker_id))
                         .with_backend(backend)
@@ -230,8 +241,7 @@ impl TestFramework {
                     let network_port = network_listener.local_addr().unwrap().port();
                     let maker_id = format!("maker{network_port}");
                     thread::sleep(Duration::from_secs(5)); // Avoid resource unavailable error
-                    let backend =
-                        B::make_backend_config(&rpc_config, &zmq_addr, &mut ensure_electrum_url);
+                    let backend = backend();
                     let fee = fee_overrides.get(i).copied().flatten();
                     let config = MakerServerConfig {
                         data_dir: temp_dir.join(network_port.to_string()),
@@ -280,6 +290,7 @@ impl TestFramework {
             temp_dir: temp_dir.clone(),
             nostr_relay_url: nostr_relay_url.clone(),
             zmq_addr,
+            backend_config,
             check_blocklist,
             shutdown: AtomicBool::new(false),
             torn_down: AtomicBool::new(false),
@@ -347,7 +358,9 @@ impl TestFramework {
                     .electrum_url
             )
         };
-        let backend = B::make_backend_config(&rpc_config, &self.zmq_addr, &mut ensure_electrum_url);
+        let backend = self.backend_config.clone().unwrap_or_else(|| {
+            B::make_backend_config(&rpc_config, &self.zmq_addr, &mut ensure_electrum_url)
+        });
         let mut config = TakerInitConfig::default()
             .with_data_dir(self.temp_dir.join(&taker_id))
             .with_backend(backend)
