@@ -47,8 +47,12 @@ use crate::{
 use crate::utill::socks5_connect;
 
 /// Maximum number of attempts to connect to a maker.
-const FIRST_CONNECT_ATTEMPTS: u32 = 3;
-/// Timeout in seconds for each connection attempt.
+const FIRST_CONNECT_ATTEMPTS: u32 = 2;
+/// Tor's default `SocksTimeout`. Cutting the onion setup off sooner marks
+/// healthy makers unresponsive; this way Tor decides when it is unreachable.
+#[cfg(not(feature = "integration-test"))]
+const TOR_CONNECT_TIMEOUT_SEC: u64 = 120;
+/// Timeout in seconds for each read and write once connected.
 const FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC: u64 = 30;
 /// Sleep delay in milliseconds between connection retry attempts.
 const FIRST_CONNECT_SLEEP_DELAY_SEC: u64 = 1000;
@@ -1926,7 +1930,7 @@ impl MakerAddress {
                 &self.0,
                 OPENSWAP_PORT,
                 None,
-                Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC),
+                Duration::from_secs(TOR_CONNECT_TIMEOUT_SEC),
             )?
         };
 
