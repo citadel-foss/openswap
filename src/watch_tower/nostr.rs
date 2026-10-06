@@ -6,11 +6,11 @@
 
 use std::{
     borrow::Cow,
-    net::TcpStream,
+    net::{Shutdown, TcpStream},
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -22,9 +22,11 @@ use nostr::{
     types::Timestamp,
     util::JsonUtil,
 };
+use rustls::StreamOwned;
 use tungstenite::{stream::MaybeTlsStream, Message};
 
 use crate::{
+    lock_debug,
     maker::nostr::{connect_nostr_websocket, swap_kind, EXPIRATION_SECS},
     wallet::{AnyBlockchain, Blockchain},
     watch_tower::{
@@ -88,12 +90,15 @@ pub fn run_discovery(
     };
 
     let mut sessions = Vec::with_capacity(relays.len() + 1);
+    let mut tcp_slots = Vec::with_capacity(relays.len());
     for relay in relays {
         let relay = relay.to_string();
         let session_shutdown = shutdown.clone();
         let registry = Arc::clone(&registry);
         let nostr_tor_config = nostr_tor_config.clone();
         let session_tx = event_tx.clone();
+        let tcp_slot = Arc::new(Mutex::new(None));
+        tcp_slots.push(Arc::clone(&tcp_slot));
 
         let handle = match std::thread::Builder::new()
             .name(format!("nostr-session-{}", relay))
@@ -104,6 +109,7 @@ pub fn run_discovery(
                     &registry,
                     session_shutdown,
                     session_tx,
+                    &tcp_slot,
                     (nostr_tor_config.0, nostr_tor_config.1.as_str()),
                 );
             }) {
@@ -122,8 +128,14 @@ pub fn run_discovery(
     // Drop original sender so the channel disconnects when all relay sessions exit
     drop(event_tx);
 
-    // Also track the processor worker handle so it is joined at shutdown
-    sessions.push(worker_handle);
+    // The processor stops at shutdown. Closing the relay sockets then wakes
+    // sessions parked in `read()`, instead of waiting out the 30 s read timeout.
+    join_relay_sessions(vec![worker_handle]);
+    for tcp_slot in &tcp_slots {
+        if let Ok(Some(tcp)) = lock_debug!(tcp_slot.lock()).as_deref() {
+            let _ = tcp.shutdown(Shutdown::Both);
+        }
+    }
 
     // Joining here surfaces a panicked session to the watcher's join,
     // instead of losing it in a detached thread.
@@ -221,20 +233,27 @@ fn run_nostr_session_for_relay(
     registry: &Arc<FileRegistry>,
     shutdown: Arc<AtomicBool>,
     event_tx: crossbeam_channel::Sender<(Arc<str>, RelayMessage<'static>)>,
+    tcp_slot: &Mutex<Option<TcpStream>>,
     nostr_tor_config: (u16, &str),
 ) {
     let relay_url_arc: Arc<str> = Arc::from(relay_url);
     log::info!("Starting Nostr session | relay={relay_url}");
 
     while !shutdown.load(Ordering::SeqCst) {
-        match connect_and_run_once(
+        let result = connect_and_run_once(
             &relay_url_arc,
             kind,
             registry,
             shutdown.clone(),
             &event_tx,
+            tcp_slot,
             nostr_tor_config,
-        ) {
+        );
+        // A finished connection's clone would otherwise keep its socket open.
+        if let Ok(mut tcp) = lock_debug!(tcp_slot.lock()) {
+            tcp.take();
+        }
+        match result {
             Ok(()) => {
                 // Likely exited due to shutdown
                 break;
@@ -263,6 +282,7 @@ fn connect_and_run_once(
     registry: &Arc<FileRegistry>,
     shutdown: Arc<AtomicBool>,
     event_tx: &crossbeam_channel::Sender<(Arc<str>, RelayMessage<'static>)>,
+    tcp_slot: &Mutex<Option<TcpStream>>,
     nostr_tor_config: (u16, &str),
 ) -> Result<(), WatcherError> {
     let mut socket = connect_nostr_websocket(relay_url, nostr_tor_config.0, nostr_tor_config.1)?;
@@ -294,7 +314,7 @@ fn connect_and_run_once(
         req.as_json()
     );
 
-    read_event_loop(socket, shutdown, relay_url.clone(), event_tx)
+    read_event_loop(socket, shutdown, relay_url.clone(), event_tx, tcp_slot)
 }
 
 /// Stream all the events from the Nostr relay and send decoded messages into the channel until shutdown.
@@ -303,7 +323,15 @@ fn read_event_loop(
     shutdown: Arc<AtomicBool>,
     relay_url: Arc<str>,
     event_tx: &crossbeam_channel::Sender<(Arc<str>, RelayMessage<'static>)>,
+    tcp_slot: &Mutex<Option<TcpStream>>,
 ) -> Result<(), WatcherError> {
+    // Stored before the shutdown check below, so a shutdown racing this
+    // connect either closes the clone or is seen by the loop.
+    if let MaybeTlsStream::Plain(tcp) | MaybeTlsStream::Rustls(StreamOwned { sock: tcp, .. }) =
+        socket.get_ref()
+    {
+        *lock_debug!(tcp_slot.lock())? = Some(tcp.try_clone()?);
+    }
     while !shutdown.load(Ordering::SeqCst) {
         let msg = match socket.read() {
             Ok(msg) => msg,
@@ -317,12 +345,8 @@ fn read_event_loop(
             {
                 continue;
             }
-            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
-                if shutdown.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                return Err(tungstenite::Error::ConnectionClosed.into());
-            }
+            // Shutdown closes the socket under us, so a read error then is a clean stop.
+            Err(_) if shutdown.load(Ordering::SeqCst) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
 
@@ -574,7 +598,7 @@ mod tests {
         event::{EventBuilder, Tag, TagStandard},
         key::Keys,
     };
-    use std::str::FromStr;
+    use std::{net::TcpListener, str::FromStr, time::Duration};
 
     #[test]
     fn future_dated_event_never_moves_the_cursor() {
@@ -724,6 +748,46 @@ mod tests {
         )
         .unwrap();
         assert!(is_eose_matching);
+    }
+
+    #[test]
+    fn closing_the_relay_socket_stops_a_parked_read() {
+        // A silent relay, and a client with no read timeout: only the close can wake it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let relay =
+            std::thread::spawn(move || tungstenite::accept(listener.accept().unwrap().0).unwrap());
+        let (socket, _) = tungstenite::connect(url).unwrap();
+        let _relay = relay.join().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let tcp_slot = Arc::new(Mutex::new(None));
+        let (event_tx, _event_rx) = crossbeam_channel::bounded(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let (session_shutdown, session_slot) = (shutdown.clone(), tcp_slot.clone());
+        std::thread::spawn(move || {
+            let result = read_event_loop(
+                socket,
+                session_shutdown,
+                Arc::from("ws://relay.example"),
+                &event_tx,
+                &session_slot,
+            );
+            done_tx.send(result.is_ok()).unwrap();
+        });
+
+        let stored = (0..500).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            tcp_slot.lock().unwrap().is_some()
+        });
+        assert!(stored, "session never stored its socket");
+        // Let the session park in `read()`.
+        std::thread::sleep(Duration::from_millis(100));
+        shutdown.store(true, Ordering::SeqCst);
+        let tcp = tcp_slot.lock().unwrap().take().unwrap();
+        tcp.shutdown(Shutdown::Both).unwrap();
+
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
     }
 
     #[test]
