@@ -143,6 +143,22 @@ impl<B: TestBackend> WorldBuilder<B> {
             self.maker_behaviors.len(),
             self.maker_count
         );
+        // Lightning nodes past the actor count would be dropped the same way.
+        #[cfg(feature = "lightning")]
+        {
+            assert!(
+                self.maker_lightning.len() <= self.maker_count,
+                "{} maker Lightning nodes for {} makers",
+                self.maker_lightning.len(),
+                self.maker_count
+            );
+            assert!(
+                self.taker_lightning.len() <= self.taker_behaviors.len(),
+                "{} taker Lightning nodes for {} takers",
+                self.taker_lightning.len(),
+                self.taker_behaviors.len()
+            );
+        }
         let maker_count = self.maker_count;
         #[cfg_attr(not(feature = "lightning"), allow(unused_mut))]
         let (framework, mut takers, makers, block_generation) = TestFramework::init::<B>(
