@@ -62,18 +62,18 @@ struct TakerAbortExpect {
                 taker_loss: 882,
             },
         ),
-        /// Taker aborts after receiving maker's contract response (Taproot).
+        /// Taker drops after full setup, before the private-key handover (Taproot).
         ///
-        /// The taker drops the connection after receiving the maker's contract data
-        /// response. Funding transactions are already on-chain, so timelock recovery
-        /// is required.
+        /// Recovery starts from the complete outgoing + incoming coin set: both
+        /// makers timelock-refund whole, and the taker absorbs the swap amount plus
+        /// every funding fee.
         taproot_drop_after_full_setup(
-            behavior = TakerBehavior::CloseAtSendersContractFromMaker,
+            behavior = TakerBehavior::BroadcastContractAfterFullSetup,
             expected = &TakerAbortExpect {
-                maker_regular: [14998875, 14999757],
-                maker_loss: Some([882, 0]),
-                taker_regular: 14999118,
-                taker_loss: 882,
+                maker_regular: [14998875, 14998875],
+                maker_loss: Some([882, 882]),
+                taker_regular: 14499538,
+                taker_loss: 500462,
             },
         ),
     ],
