@@ -117,6 +117,7 @@ pub fn run_discovery(
             Err(e) => {
                 shutdown.store(true, Ordering::SeqCst);
                 drop(event_tx);
+                close_relay_sockets(&tcp_slots);
                 sessions.push(worker_handle);
                 join_relay_sessions(sessions);
                 return Err(e.into());
@@ -131,14 +132,7 @@ pub fn run_discovery(
     // The processor stops at shutdown. Closing the relay sockets then wakes
     // sessions parked in `read()`, instead of waiting out the 30 s read timeout.
     join_relay_sessions(vec![worker_handle]);
-    for tcp_slot in &tcp_slots {
-        if let Some(tcp) = lock_debug!(tcp_slot.lock())
-            .ok()
-            .and_then(|mut tcp| tcp.take())
-        {
-            let _ = tcp.shutdown(Shutdown::Both);
-        }
-    }
+    close_relay_sockets(&tcp_slots);
 
     // Joining here surfaces a panicked session to the watcher's join,
     // instead of losing it in a detached thread.
@@ -150,6 +144,19 @@ pub fn run_discovery(
     log::info!("Nostr discovery: all relay sessions joined");
 
     Ok(())
+}
+
+/// Wakes relay sessions parked in `read()`. Call only once shutdown is set,
+/// so a session that has not stored its socket yet sees the flag instead.
+fn close_relay_sockets(tcp_slots: &[Arc<Mutex<Option<TcpStream>>>]) {
+    for tcp_slot in tcp_slots {
+        if let Some(tcp) = lock_debug!(tcp_slot.lock())
+            .ok()
+            .and_then(|mut tcp| tcp.take())
+        {
+            let _ = tcp.shutdown(Shutdown::Both);
+        }
+    }
 }
 
 /// Joins every spawned relay, including sessions created before a partial-start failure.
