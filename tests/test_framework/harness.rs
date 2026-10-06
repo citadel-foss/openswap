@@ -40,9 +40,9 @@ use openswap::{
 
 use super::{
     actors::{
-        fund_makers, fund_makers_default, fund_taker, fund_taker_default, shutdown_makers,
-        spawn_makers, spawn_ready_makers_and_mine, sync_maker_wallets,
-        verify_maker_pre_swap_balances, wait_for_makers_setup,
+        fund_makers, fund_makers_default, fund_taker, fund_taker_default, spawn_makers,
+        spawn_ready_makers_and_mine, sync_maker_wallets, verify_maker_pre_swap_balances,
+        wait_for_makers_setup,
     },
     backend::TestBackend,
     logs::end_test_log_group,
@@ -446,16 +446,20 @@ impl World {
         spawn_tracker_logger(self.temp_dir().join("taker1"), interval)
     }
 
-    /// [`shutdown_makers`] on every started maker: signal all, then join all,
-    /// propagating a maker thread's panic. For tests that stop the makers
+    /// Stops every started maker: signal all, then join each, propagating a
+    /// maker thread's panic. For tests that stop the makers
     /// before the end; [`World::finish`] then skips them.
     pub fn shutdown_makers(&mut self) {
-        let (servers, threads): (Vec<_>, Vec<_>) = self
-            .makers
-            .iter_mut()
-            .filter_map(|maker| Some((maker.server.clone(), maker.thread.take()?)))
-            .unzip();
-        shutdown_makers(&servers, threads);
+        for maker in self.makers.iter().filter(|maker| maker.thread.is_some()) {
+            maker.server.shutdown.store(true, Relaxed);
+        }
+        // A handle leaves its maker only when joined, so a maker thread's panic
+        // leaves the rest for the `Drop` teardown instead of detaching them.
+        for maker in &mut self.makers {
+            if let Some(thread) = maker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
     }
 
     /// Joins every started maker's thread without signalling shutdown, for a
@@ -549,7 +553,9 @@ impl World {
     /// With `propagate` false (unwinding from a failed test) no thread's panic
     /// is re-raised, since a second panic would abort the test binary.
     fn teardown(&mut self, propagate: bool) {
-        if mem::replace(&mut self.torn_down, true) {
+        // Set only once cleanup is done: if this panics partway, `Drop` runs
+        // it again, and every step skips what already finished.
+        if self.torn_down {
             return;
         }
         drop(mem::take(&mut self.takers));
@@ -578,6 +584,7 @@ impl World {
             }
         }
         end_test_log_group();
+        self.torn_down = true;
     }
 }
 
