@@ -214,7 +214,14 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         builder_calls.insert(0, quote!(.makers(#count)));
     }
 
-    if let Some(test) = body.attrs.iter().find(|attr| attr.path().is_ident("test")) {
+    // By last segment, so `#[core::prelude::v1::test]` is caught as well.
+    let is_test = |attr: &&syn::Attribute| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "test")
+    };
+    if let Some(test) = body.attrs.iter().find(is_test) {
         return Err(Error::new(
             test.span(),
             "#[world_test] adds #[test] itself; remove this one",
@@ -775,6 +782,14 @@ mod tests {
                 quote!(backend = BitcoindBackend),
                 quote!(
                     #[test]
+                    fn scenario(world: &mut World) {}
+                ),
+                "adds #[test] itself",
+            ),
+            (
+                quote!(backend = BitcoindBackend),
+                quote!(
+                    #[core::prelude::v1::test]
                     fn scenario(world: &mut World) {}
                 ),
                 "adds #[test] itself",
