@@ -82,8 +82,8 @@ impl TestBackend for TorElectrumBackend {
         _zmq_addr: &str,
         ensure_electrum_url: &mut dyn FnMut() -> String,
     ) -> BackendConfig {
-        // `ensure_electrum_url` yields "host:port" for the local electrsd; we only
-        // need its port, since the onion service maps to 127.0.0.1.
+        // `ensure_electrum_url` yields "tcp://host:port" for the local electrsd; we
+        // only need its port, since the onion service maps to 127.0.0.1.
         let local = ensure_electrum_url();
         let local_port: u16 = local
             .rsplit_once(':')
