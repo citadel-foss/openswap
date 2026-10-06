@@ -14,6 +14,8 @@ use crate::test_framework::*;
 
 use std::{thread, time::Duration};
 
+use super::wait_for_log_after;
+
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal, Normal],
@@ -177,10 +179,19 @@ fn maker_errors_when_seen_funding_tx_is_evicted(world: &mut World, params: SwapP
     // on the framework.
     let framework = world.framework().clone();
     let taker = world.taker_mut();
+    // Taken before the swap starts, so a "seen in mempool" logged before the
+    // wait below begins still counts.
+    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
     let swap_result = thread::scope(|s| {
         let swap_handle = s.spawn(|| taker.start(&summary.swap_id));
 
-        wait_for_new_log(&log_path, "seen in mempool", Duration::from_secs(120));
+        wait_for_log_after(
+            &log_path,
+            log_offset,
+            "seen in mempool",
+            1,
+            Duration::from_secs(120),
+        );
         // Sent through bitcoind, not the taker's wallet, whose lock the swap
         // thread holds for long stretches.
         framework
