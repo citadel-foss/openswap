@@ -342,11 +342,10 @@ pub fn setup_maker_logger(filter: LevelFilter, data_dir: Option<PathBuf>) {
 ///
 /// [`setup_taker_logger`] and [`setup_maker_logger`] share one process-wide
 /// guard: whichever runs first in the process installs the logger, and every
-/// later call to either is a no-op.
+/// later call to either is a no-op. This installs the taker logger, so maker
+/// lines go to the same `taker/debug.log`.
 pub fn setup_logger(filter: LevelFilter, data_dir: Option<PathBuf>) {
-    // env::set_var("RUST_LOG", "openswap=info");
     setup_taker_logger(filter, true, data_dir.as_ref().map(|d| d.join("taker")));
-    setup_maker_logger(filter, data_dir.as_ref().map(|d| d.join("maker")));
 }
 
 /// Logs the stable identity used to find a join without a matching completion.
