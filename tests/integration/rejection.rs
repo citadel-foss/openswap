@@ -1851,6 +1851,11 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
         thread::sleep(Duration::from_secs(2));
     }
 
+    // Finished recovery stops the maker, and the Electrum wallet backend shares
+    // that flag. Clear it once the maker has exited so our own sync can run.
+    shutdown_makers(&makers, maker_threads);
+    makers[0].shutdown.store(false, Relaxed);
+
     generate_blocks(bitcoind, 1);
     test_framework.wait_for_electrs_tip();
     let maker = &makers[0];
@@ -1874,9 +1879,6 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
         "maker spendable after reclaiming the on-chain split"
     );
 
-    // The recovery loop keeps polling until shutdown; the maker does not exit
-    // on its own in this scenario.
-    shutdown_makers(&makers, maker_threads);
     test_framework.finish(takers, block_generation_handle);
 }
 
