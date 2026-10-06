@@ -118,11 +118,11 @@ cargo nextest run --features integration-test
 
 Run the integration suite with [cargo-nextest](https://nexte.st), which gives
 each test its own process. Plain `cargo test --features integration-test` runs
-every test in one process, where the process-wide logger sends all of them to
-the first test's log and the log assertions fail. Each test also starts its own
-bitcoind, nostr relay and (on Electrum) electrs; see
-[tests/integration/README.md](tests/integration/README.md) for what it needs
-and how to write one.
+the tests at the same time in one process, where the process-wide logger sends
+them all to the log of whichever test started last and the log assertions fail.
+Each test also starts its own bitcoind, nostr relay and (on Electrum) electrs;
+see [tests/integration/README.md](tests/integration/README.md) for what it
+needs and how to write one.
 
 If you add, rename or remove a test, run `tests/check_test_names.sh --update`
 and commit the updated `tests/TESTS.golden`. CI fails when the two disagree.
