@@ -132,7 +132,10 @@ pub fn run_discovery(
     // sessions parked in `read()`, instead of waiting out the 30 s read timeout.
     join_relay_sessions(vec![worker_handle]);
     for tcp_slot in &tcp_slots {
-        if let Ok(Some(tcp)) = lock_debug!(tcp_slot.lock()).as_deref() {
+        if let Some(tcp) = lock_debug!(tcp_slot.lock())
+            .ok()
+            .and_then(|mut tcp| tcp.take())
+        {
             let _ = tcp.shutdown(Shutdown::Both);
         }
     }
@@ -787,6 +790,47 @@ mod tests {
         let tcp = tcp_slot.lock().unwrap().take().unwrap();
         tcp.shutdown(Shutdown::Both).unwrap();
 
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+
+    #[cfg(feature = "integration-test")]
+    #[test]
+    fn shutdown_stops_discovery_without_waiting_for_a_silent_relay() {
+        // The relay takes the subscription, then stays silent until we close.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (subscribed_tx, subscribed_rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let mut relay = tungstenite::accept(listener.accept().unwrap().0).unwrap();
+            relay.read().unwrap();
+            subscribed_tx.send(()).unwrap();
+            let _ = relay.read();
+        });
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let discovery_shutdown = shutdown.clone();
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let blockchain =
+                AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default()))
+                    .unwrap();
+            let result = run_discovery(
+                blockchain,
+                Network::Regtest,
+                FileRegistry::new(),
+                discovery_shutdown,
+                Arc::new(AtomicBool::new(false)),
+                &[relay_url],
+                (0, String::new()),
+            );
+            done_tx.send(result.is_ok()).unwrap();
+        });
+
+        subscribed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Let the session park in `read()`.
+        std::thread::sleep(Duration::from_millis(100));
+        shutdown.store(true, Ordering::SeqCst);
+        // Well under the 30 s read timeout a silent relay would otherwise cost.
         assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
     }
 
