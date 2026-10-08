@@ -30,18 +30,16 @@ use std::time::Duration;
     setup = [
         // 4 UTXOs, not the usual 3: the above-maximum cases need the taker to hold
         // more than the maker is willing to swap.
-        fund_taker_default(4) as taker_original_balance,
+        fund_taker_default(4),
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
         mine(1),
     ],
 )]
-fn maker_rejects_out_of_bounds_swap_details(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-) {
+fn maker_rejects_out_of_bounds_swap_details(world: &mut World) {
+    let before = world.balances();
+
     // The maker advertises min = the smallest swap it accepts, and max = its
     // spendable liquidity. One sat under one relay-floor contract is below both.
     let maker_offer_max = world.makers()[0].balances().regular;
@@ -210,87 +208,28 @@ fn maker_rejects_out_of_bounds_swap_details(
     // no single field — feerate included — can drift between connections.
     assert_logged!(world, "parameters differ from stored swap");
 
-    // Nothing was funded, so nothing may have moved.
-    world.taker().sync();
-    let taker_balances = world.taker().balances();
-    info!(
-        "Taker balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-    assert_eq!(
-        taker_balances.spendable, taker_original_balance,
-        "Taker spendable balance must be untouched after rejected requests"
-    );
-    // 4 UTXOs of 0.05 BTC, none of them spent.
-    assert_eq!(
-        taker_balances.regular.to_sat(),
-        20000000,
-        "Taker regular balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.spendable.to_sat(),
-        20000000,
-        "Taker spendable balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.contract.to_sat(),
-        0,
-        "Taker must hold no contract funds"
-    );
-    assert_eq!(
-        taker_balances.swap.to_sat(),
-        0,
-        "Taker must hold no swap funds"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        maker.sync();
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i, balances.regular, balances.swap, balances.contract, balances.spendable,
-        );
-        assert_eq!(
-            balances.spendable, original,
-            "Maker {} spendable balance must be untouched",
-            i
-        );
-        // 4 UTXOs of 0.05 BTC minus the fidelity bond and its fee.
-        assert_eq!(
-            balances.regular.to_sat(),
-            14999757,
-            "Maker {} regular balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.spendable.to_sat(),
-            14999757,
-            "Maker {} spendable balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.swap.to_sat(),
-            0,
-            "Maker {} must hold no swap funds",
-            i
-        );
-        assert_eq!(
-            balances.contract.to_sat(),
-            0,
-            "Maker {} must hold no contract funds",
-            i
-        );
-        assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-    }
+    // Nothing was funded, so nothing may have moved. Taker: 4 UTXOs of 0.05
+    // BTC, none of them spent. Makers: 4 UTXOs of 0.05 BTC minus the fidelity
+    // bond and its fee.
+    world.sync_all();
+    assert_balances!(world, since before; {
+        taker: {
+            regular: 20_000_000,
+            swap: 0,
+            contract: 0,
+            fidelity: 0,
+            spendable: 20_000_000,
+            loss: 0,
+        },
+        makers: {
+            regular: 14_999_757,
+            swap: 0,
+            contract: 0,
+            fidelity: BOND,
+            spendable: 14_999_757,
+            gain: 0,
+        },
+    });
 
     info!("Maker SwapDetails rejection test completed successfully!");
 }
@@ -498,12 +437,10 @@ fn admission_reserves_no_liquidity(world: &mut World) {
     backend = BitcoindBackend,
     makers = 0,
     takers = [Normal],
-    setup = [fund_taker_default(3) as taker_original_balance],
+    setup = [fund_taker_default(3)],
 )]
-fn taker_rejects_out_of_bounds_params_at_prepare(
-    world: &mut World,
-    taker_original_balance: Amount,
-) {
+fn taker_rejects_out_of_bounds_params_at_prepare(world: &mut World) {
+    let before = world.balances();
     let params = || SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1);
     let cases: Vec<(SwapParams, String)> = vec![
         (
@@ -552,11 +489,8 @@ fn taker_rejects_out_of_bounds_params_at_prepare(
             error
         );
     }
-    let balance = world.taker().balances();
-    assert_eq!(
-        balance.spendable, taker_original_balance,
-        "prepare-time rejections must not spend anything"
-    );
+    // Prepare-time rejections must not spend anything.
+    assert_balances!(world, since before; { taker: { loss: 0 } });
 }
 
 /// Honest parameters pass the taker's own guards; the behavior hook rewrites
@@ -567,7 +501,7 @@ fn taker_rejects_out_of_bounds_params_at_prepare(
     maker_behaviors = [Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         spawn_ready_makers_and_mine(),
     ],
@@ -578,10 +512,8 @@ fn taker_rejects_out_of_bounds_params_at_prepare(
         maker_rejects_forged_swap_details_at_admission_electrum(backend = ElectrumBackend),
     ],
 )]
-fn run_maker_rejects_forged_swap_details_at_admission(
-    world: &mut World,
-    taker_original_balance: Amount,
-) {
+fn run_maker_rejects_forged_swap_details_at_admission(world: &mut World) {
+    let before = world.balances();
     let preferred = vec![world.makers()[0].address()];
     let params = || {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
@@ -646,25 +578,15 @@ fn run_maker_rejects_forged_swap_details_at_admission(
     }
     world.taker_mut().set_behavior(TakerBehavior::Normal);
 
-    // Nothing was funded: the taker's balance is untouched.
-    let balance = world.taker().balances();
-    assert_eq!(
-        balance.spendable, taker_original_balance,
-        "admission rejections must not spend anything"
-    );
-
     world.shutdown_makers();
 
-    // The maker never reserved or spent anything either.
+    // Nothing was funded: the taker's balance is untouched, and the maker
+    // never reserved or spent anything either.
     world.makers()[0].sync();
-    let maker_balances = world.makers()[0].balances();
-    assert_eq!(
-        maker_balances.spendable.to_sat(),
-        14999757,
-        "maker spendable must be untouched after rejected admissions"
-    );
-    assert_eq!(maker_balances.swap, Amount::ZERO);
-    assert_eq!(maker_balances.contract, Amount::ZERO);
+    assert_balances!(world, since before; {
+        taker: { loss: 0 },
+        maker: { swap: 0, contract: 0, spendable: 14_999_757 },
+    });
 }
 
 /// The concurrency cap rejects before any admission planning runs: the
@@ -803,7 +725,7 @@ fn readmission_with_a_new_shape_fails_before_funding(world: &mut World) {
         "Released idle unfunded swap",
         Duration::from_secs(400)
     );
-    let before = world.taker().balances();
+    let before = world.balances();
     let error = world
         .taker_mut()
         .start(&summary.swap_id)
@@ -813,10 +735,6 @@ fn readmission_with_a_new_shape_fails_before_funding(world: &mut World) {
         "unexpected error: {:?}",
         error
     );
-    let after = world.taker().balances();
-    assert_eq!(
-        after.spendable, before.spendable,
-        "the taker funded nothing"
-    );
-    assert_eq!(after.contract, Amount::ZERO);
+    // The taker funded nothing.
+    assert_balances!(world, since before; { taker: { contract: 0, loss: 0 } });
 }

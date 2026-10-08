@@ -129,10 +129,7 @@ fn run_maker_rejection(world: &mut World, protocol: ProtocolVersion) {
     }
     world.mine(1);
     world.taker().sync();
-    assert_eq!(
-        world.taker().balances().regular,
-        Amount::from_btc(0.15).unwrap()
-    );
+    assert_balances!(world; { taker: { regular: 15_000_000 } });
 
     let outcome = world
         .taker()
@@ -148,7 +145,8 @@ fn run_maker_rejection(world: &mut World, protocol: ProtocolVersion) {
     world.fund_makers_default();
 
     world.start_makers(120);
-    let maker_spendable_before = world.verify_maker_pre_swap_balances();
+    world.verify_maker_pre_swap_balances();
+    let before = world.balances();
 
     let params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
         .with_tx_count(1)
@@ -158,14 +156,9 @@ fn run_maker_rejection(world: &mut World, protocol: ProtocolVersion) {
         "the first maker must reject funding from the blocked source address",
     );
 
-    for (maker, spendable_before) in world.makers().iter().zip(maker_spendable_before) {
-        maker.sync();
-        assert_eq!(
-            maker.balances().spendable,
-            spendable_before,
-            "blocklist rejection must happen before maker liquidity is spent"
-        );
-    }
+    // Blocklist rejection must happen before maker liquidity is spent.
+    world.sync_makers();
+    assert_balances!(world, since before; { makers: { gain: 0 } });
 }
 
 #[world_test(
@@ -198,10 +191,7 @@ fn run_taker_rejection(world: &mut World, protocol: ProtocolVersion) {
     }
     world.mine(1);
     world.makers()[0].sync();
-    assert_eq!(
-        world.makers()[0].balances().regular,
-        Amount::from_btc(0.20).unwrap()
-    );
+    assert_balances!(world; { maker: { regular: 20_000_000 } });
 
     world.start_makers_without_sync(120);
     world.makers()[0].sync();
@@ -251,29 +241,6 @@ fn run_taker_rejection(world: &mut World, protocol: ProtocolVersion) {
     // sweeps them back. Rejecting must not strand maker funds.
     thread::sleep(timelock_recovery_wait::<BitcoindBackend>());
 
-    for (i, maker) in world.makers().iter().enumerate() {
-        maker.sync();
-        let maker_balances = maker.balances();
-        println!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i,
-            maker_balances.regular,
-            maker_balances.swap,
-            maker_balances.contract,
-            maker_balances.spendable,
-        );
-        assert_eq!(
-            maker_balances.contract.to_sat(),
-            0,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(
-            maker_balances.swap.to_sat(),
-            0,
-            "Maker {} swap balance mismatch",
-            i
-        );
-        assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
-    }
+    world.sync_makers();
+    assert_balances!(world; { makers: { swap: 0, contract: 0, fidelity: BOND } });
 }

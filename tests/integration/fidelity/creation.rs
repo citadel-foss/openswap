@@ -19,7 +19,6 @@ use openswap::{
 
 use crate::test_framework::*;
 
-use log::info;
 use std::{
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
@@ -196,27 +195,8 @@ fn bond_creation_and_redemption(world: &mut World) {
     };
 
     log::info!("Verifying balances with both fidelity bonds");
-    // Verify balances
-    {
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let wallet_read = maker.wallet.read().unwrap();
-
-        let balances = wallet_read.get_balances().unwrap();
-        info!("Maker balances after creating fidelity bonds: Regular: {}, Swap: {}, Contract: {}, Spendable: {}, Fidelity: {}",
-            balances.regular,
-            balances.swap,
-            balances.contract,
-            balances.spendable,
-            balances.fidelity
-        );
-        assert_eq!(balances.fidelity.to_sat(), 13000000);
-        assert_eq!(balances.regular.to_sat(), 92001512);
-    }
+    world.makers()[0].sync();
+    assert_balances!(world; { maker: { regular: 92_001_512, fidelity: 13_000_000 } });
 
     log::info!("Waiting for fidelity bonds to mature and testing redemption");
     // Wait for the bonds to mature, redeem them, and validate the process.
@@ -324,13 +304,7 @@ fn bond_creation_and_redemption(world: &mut World) {
 
     log::info!("Verifying final balances after all bonds redeemed");
     // Verify the balances again after all bonds are redeemed.
-    {
-        let wallet_read = maker.wallet.read().unwrap();
-        let balances = wallet_read.get_balances().unwrap();
-
-        assert_eq!(balances.fidelity.to_sat(), 0);
-        assert_eq!(balances.regular.to_sat(), 105001016);
-    }
+    assert_balances!(world; { maker: { regular: 105_001_016, fidelity: 0 } });
 
     thread::sleep(Duration::from_secs(10));
 }
