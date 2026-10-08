@@ -474,6 +474,12 @@ openswap::integration swap::standard::taproot_swap_at_custom_feerate
 openswap::integration swap::standard::taproot_swap_survives_unconfirmed_confirmation_wait
 openswap::integration swap::taproot::taproot_two_maker_swap_completes
 openswap::integration swap::too_few_makers::taproot_swap_fails_before_funding
+openswap::integration test_framework::expect::tests::a_later_row_overrides_only_what_it_sets
+openswap::integration test_framework::expect::tests::a_list_must_cover_every_wallet
+openswap::integration test_framework::expect::tests::columns_give_one_value_per_wallet_or_skip
+openswap::integration test_framework::expect::tests::every_wrong_field_is_reported_and_unset_ones_are_not
+openswap::integration test_framework::expect::tests::loss_and_gain_are_signed
+openswap::integration test_framework::expect::tests::loss_without_a_snapshot_is_refused
 openswap::integration test_framework::logs::tests::each_fixture_gets_its_own_log
 openswap::integration wallet::backup::encwallet_encbackup_encrestore
 openswap::integration wallet::backup::encwallet_encbackup_encrestore_electrum

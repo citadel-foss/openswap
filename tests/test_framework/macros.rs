@@ -32,3 +32,73 @@ macro_rules! wait_logged {
         $crate::test_framework::wait_for_log(&world.taker_log_path(), $needle, $timeout);
     }};
 }
+
+/// `assert_balances!(world, since before; { rows })`: asserts every wallet's
+/// balances in one go and reports every mismatch in one failure. Without
+/// `since before;` the rows cannot use `loss` or `gain`.
+///
+/// ```ignore
+/// let before = world.balances();
+/// // .. the swap ..
+/// world.sync_all();
+/// assert_balances!(world, since before; {
+///     taker:   { regular: 14_499_538, swap: 496_447, contract: 0, fidelity: 0, loss: 4_015 },
+///     makers:  { regular: [14_500_865, 14_502_398], contract: 0, fidelity: BOND, gain: [658, 621] },
+///     maker 1: { swap: 497_980 },
+/// });
+/// ```
+///
+/// A row is `taker`/`maker` (wallet 0), `taker N`/`maker N`, or `takers`/
+/// `makers` (every wallet of that kind). Its fields are `regular`, `swap`,
+/// `contract`, `fidelity`, `spendable`, and `loss`/`gain` (the change in
+/// `spendable` since the snapshot). A value is sats or an `Amount`, a list
+/// with one per wallet in a `takers`/`makers` row, or an `Option` of either,
+/// where `None` asserts nothing. A later row overrides the fields it sets.
+macro_rules! assert_balances {
+    ($world:expr, since $before:expr; { $($rows:tt)* }) => {{
+        let mut table = $crate::test_framework::BalanceTable::new(&$world, Some(&$before));
+        assert_balances!(@rows table; $($rows)*);
+        table.assert();
+    }};
+    ($world:expr; { $($rows:tt)* }) => {{
+        let mut table = $crate::test_framework::BalanceTable::new(&$world, None);
+        assert_balances!(@rows table; $($rows)*);
+        table.assert();
+    }};
+
+    (@rows $t:ident; $(,)?) => {};
+    (@rows $t:ident; takers : { $($f:ident : $v:expr),* $(,)? } $(, $($rest:tt)*)?) => {
+        let count = $t.taker_count();
+        for i in 0..count {
+            $t.taker(i, assert_balances!(@expect i, Some(count), "takers"; $($f : $v),*));
+        }
+        assert_balances!(@rows $t; $($($rest)*)?);
+    };
+    (@rows $t:ident; makers : { $($f:ident : $v:expr),* $(,)? } $(, $($rest:tt)*)?) => {
+        let count = $t.maker_count();
+        for i in 0..count {
+            $t.maker(i, assert_balances!(@expect i, Some(count), "makers"; $($f : $v),*));
+        }
+        assert_balances!(@rows $t; $($($rest)*)?);
+    };
+    (@rows $t:ident; taker $($i:literal)? : { $($f:ident : $v:expr),* $(,)? } $(, $($rest:tt)*)?) => {
+        let i = 0 $(+ $i)?;
+        $t.taker(i, assert_balances!(@expect i, None, "taker"; $($f : $v),*));
+        assert_balances!(@rows $t; $($($rest)*)?);
+    };
+    (@rows $t:ident; maker $($i:literal)? : { $($f:ident : $v:expr),* $(,)? } $(, $($rest:tt)*)?) => {
+        let i = 0 $(+ $i)?;
+        $t.maker(i, assert_balances!(@expect i, None, "maker"; $($f : $v),*));
+        assert_balances!(@rows $t; $($($rest)*)?);
+    };
+
+    (@expect $i:expr, $wallets:expr, $row:literal; $($f:ident : $v:expr),*) => {
+        $crate::test_framework::WalletExpect::default()
+            $(.$f($crate::test_framework::column(
+                &$v,
+                $i,
+                $wallets,
+                concat!($row, ".", stringify!($f)),
+            )))*
+    };
+}
