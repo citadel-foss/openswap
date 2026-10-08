@@ -77,7 +77,7 @@ tests/
     world.rs          TestFramework::init: starts the processes, builds takers/makers
     harness.rs        World, WorldBuilder, MakerHandle, TakerHandle, the steps
     node.rs           Node: a bare regtest bitcoind (+ electrs) for chain-only tests
-    expect.rs         BalanceExpect: which balance fields a test asserts
+    expect.rs         assert_balances! rows: which balance fields a test asserts
     macros.rs         world_test, assert_logged!, wait_logged!
     actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
   macros/             the #[world_test] proc-macro crate (attribute macros need their own crate)
@@ -99,10 +99,11 @@ fn legacy_drop_at_contract_sigs_for_recvr() {
         .takers([TakerBehavior::Normal])
         .build();
 
-    let taker_original_balance = world.fund_taker_default(3); // 3 x 0.05 BTC
-    world.fund_makers_default();                               // 4 x 0.05 BTC each
-    world.start_makers(120);                                   // spawn, wait, sync
+    world.fund_taker_default(3);  // 3 x 0.05 BTC
+    world.fund_makers_default();  // 4 x 0.05 BTC each
+    world.start_makers(120);      // spawn, wait, sync
     world.mine(1);
+    let before = world.balances();
 
     let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -112,19 +113,9 @@ fn legacy_drop_at_contract_sigs_for_recvr() {
 
     // ... wait, recover, sync ...
 
-    BalanceExpect {
-        regular: Some(Is::Sats(14499538)),
-        swap: Some(Is::Sats(495997)),
-        contract: Some(Is::Sats(0)),
-        fidelity: Some(Is::Amount(Amount::ZERO)),
-        spendable: None, // not asserted by this test
-        delta: Some(Delta::Loss {
-            baseline: taker_original_balance,
-            style: DiffStyle::UnwrapOrZero,
-            sats: 4465,
-        }),
-    }
-    .assert("Taker", &world.taker().balances());
+    assert_balances!(world, since before; {
+        taker: { regular: 14_499_538, swap: 495_997, contract: 0, fidelity: 0, loss: 4_465 },
+    });
 
     world.finish();
 }
@@ -257,19 +248,43 @@ The pieces:
 
 ## Balance expectations
 
-`BalanceExpect` asserts each `Some` field and skips each `None`, in the order
-regular, swap, contract, fidelity, spendable, then the delta. Converting a test
-to it must not add or drop an assertion, so a field the test did not check stays
-`None`. `DiffStyle` keeps how the test subtracted: `CheckedUnwrap` panics on a
-negative difference, `UnwrapOrZero` reads it as zero.
+`assert_balances!` checks every wallet of the world in one go, and one failure
+lists every field that does not match:
+
+```rust
+let before = world.balances(); // the baseline for `loss` and `gain`
+// ... the swap ...
+world.sync_all();
+assert_balances!(world, since before; {
+    taker:   { regular: 14_499_538, swap: 496_447, contract: 0, fidelity: 0, loss: 4_015 },
+    makers:  { regular: [14_500_865, 14_502_398], contract: 0, fidelity: BOND, gain: [658, 621] },
+    maker 1: { swap: 497_980 },
+});
+```
+
+```text
+balances do not match:
+  taker 0  loss       expected 4000, got 4015 (spendable 15000000 -> 14995985)
+  maker 1  gain       expected 600, got 621 (spendable 14999757 -> 15000378)
+```
+
+A row names `taker`/`maker` (wallet 0), `taker N`/`maker N`, or
+`takers`/`makers` (every wallet of that kind); a later row overrides the fields
+it sets. A field it leaves out is not asserted. The fields are `regular`,
+`swap`, `contract`, `fidelity`, `spendable`, and `loss`/`gain`: the exact
+change in `spendable` since the snapshot. A value is sats, an `Amount` (`BOND`
+is the default 0.05 BTC fidelity bond), a list with one value per wallet of a
+`takers`/`makers` row, or an `Option` of either, where `None` skips the field.
+The macro reads each wallet as of its last sync, and logs every wallet's
+balances.
 
 The numbers are literals pinned from real runs. Never compute them from the fee
 schedule at runtime: a test that derives its expectation from the code it tests
 asserts nothing. When the fee schedule changes, re-pin the literals and say so
 in the pull request.
 
-A test whose assertions are not in `BalanceExpect`'s order (spendable checked
-first, say) keeps plain `assert_eq!`s.
+Balances of a wallet the world does not own (a maker restarted by hand) and
+inequalities stay plain `assert!`s.
 
 ## Sharing a body
 
