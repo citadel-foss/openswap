@@ -332,23 +332,18 @@ fn a_refused_subscribe_still_answers_the_sync(node: &mut Node) {
 /// we already hold. A fresh connect fails outright while electrs is mid-index.
 fn wait_for_tip(node: &Node, electrum: &Electrum) {
     let expected = node.bitcoind().client.get_block_count().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
-        let _ = node.electrsd().trigger();
-        if electrum
-            .get_block_count()
-            .map(|tip| tip >= expected)
-            .unwrap_or(false)
+    wait_until!(
+        std::time::Duration::from_secs(60),
+        every std::time::Duration::from_millis(200),
+        format!("electrs to reach tip {}", expected),
         {
-            return;
+            let _ = node.electrsd().trigger();
+            electrum
+                .get_block_count()
+                .map(|tip| tip >= expected)
+                .unwrap_or(false)
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "electrs did not reach tip {} within 60s",
-            expected
-        );
-        thread::sleep(std::time::Duration::from_millis(200));
-    }
+    );
 }
 
 /// A second confirmed deposit to the same script must not read as a spend of

@@ -686,7 +686,7 @@ fn run_degraded_split_swap(world: &mut World, protocol: ProtocolVersion, params:
     let bitcoind = world.bitcoind();
     match protocol {
         ProtocolVersion::Legacy => {
-            assert_logged!(world, "3 receivers, 1 senders");
+            assert_log!(world; { has "3 receivers, 1 senders" });
         }
         ProtocolVersion::Taproot => {
             // The "receivers, senders" line is Legacy-only, so the degradation

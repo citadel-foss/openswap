@@ -15,11 +15,7 @@ use openswap::{
 
 use crate::test_framework::*;
 
-use std::{
-    sync::Arc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 #[world_test(
     backend = BitcoindBackend,
@@ -45,18 +41,17 @@ fn run_successful_swap_restart(world: &mut World, protocol: ProtocolVersion) {
 
     // The taker can return just before the maker handler finishes its durable
     // cleanup. Wait for that cleanup, not for an arbitrary sleep.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while world.makers().iter().any(|maker| {
-        let wallet = maker.inner().wallet.read().unwrap();
-        wallet.get_incoming_swapcoins_count() != 0 || wallet.get_outgoing_swapcoins_count() != 0
-    }) {
-        assert!(
-            Instant::now() < deadline,
-            "successful {:?} swap left maker swapcoins on disk",
+    wait_until!(
+        Duration::from_secs(120),
+        format!(
+            "the successful {:?} swap to clear the maker swapcoins on disk",
             protocol
-        );
-        thread::sleep(Duration::from_millis(250));
-    }
+        ),
+        world.makers().iter().all(|maker| {
+            let wallet = maker.inner().wallet.read().unwrap();
+            wallet.get_incoming_swapcoins_count() == 0 && wallet.get_outgoing_swapcoins_count() == 0
+        })
+    );
 
     let configs = world
         .makers()
@@ -126,18 +121,15 @@ fn run_interrupted_restart(world: &mut World, incoming_remains: bool, params: Sw
         .start(&summary.swap_id)
         .expect("handover must complete before maker interruption");
 
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while world.makers().iter().any(|maker| {
-        let wallet = maker.inner().wallet.read().unwrap();
-        wallet.get_outgoing_swapcoins_count() == 0
-            || incoming_remains != (wallet.get_incoming_swapcoins_count() != 0)
-    }) {
-        assert!(
-            Instant::now() < deadline,
-            "test hook did not leave the expected persisted swapcoins"
-        );
-        thread::sleep(Duration::from_millis(250));
-    }
+    wait_until!(
+        Duration::from_secs(120),
+        "the test hook to leave the expected persisted swapcoins",
+        !world.makers().iter().any(|maker| {
+            let wallet = maker.inner().wallet.read().unwrap();
+            wallet.get_outgoing_swapcoins_count() == 0
+                || incoming_remains != (wallet.get_incoming_swapcoins_count() != 0)
+        })
+    );
 
     let configs = world
         .makers()
@@ -159,15 +151,12 @@ fn run_interrupted_restart(world: &mut World, incoming_remains: bool, params: Sw
     );
     world.start_makers_without_sync(120);
 
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while world.makers().iter().any(|maker| {
-        let wallet = maker.inner().wallet.read().unwrap();
-        wallet.get_incoming_swapcoins_count() != 0 || wallet.get_outgoing_swapcoins_count() != 0
-    }) {
-        assert!(
-            Instant::now() < deadline,
-            "restart did not finish the interrupted successful swap"
-        );
-        thread::sleep(Duration::from_millis(250));
-    }
+    wait_until!(
+        Duration::from_secs(120),
+        "the restart to finish the interrupted successful swap",
+        world.makers().iter().all(|maker| {
+            let wallet = maker.inner().wallet.read().unwrap();
+            wallet.get_incoming_swapcoins_count() == 0 && wallet.get_outgoing_swapcoins_count() == 0
+        })
+    );
 }
