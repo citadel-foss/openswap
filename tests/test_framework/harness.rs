@@ -45,6 +45,7 @@ use super::{
         wait_for_makers_setup,
     },
     backend::TestBackend,
+    expect::WorldBalances,
     logs::end_test_log_group,
     procs::bitcoind::generate_blocks,
     tracker::{spawn_tracker_logger, TrackerLoggerHandle},
@@ -410,6 +411,23 @@ impl World {
     /// [`sync_maker_wallets`] on every maker.
     pub fn sync_makers(&self) {
         sync_maker_wallets(&self.servers());
+    }
+
+    /// Syncs every taker's and every maker's wallet.
+    pub fn sync_all(&self) {
+        for taker in &self.takers {
+            taker.sync();
+        }
+        self.sync_makers();
+    }
+
+    /// Every wallet's balances as of its last sync, as the baseline for
+    /// `assert_balances!(world, since snapshot; ..)`'s `loss` and `gain`.
+    pub fn balances(&self) -> WorldBalances {
+        WorldBalances {
+            takers: self.takers.iter().map(TakerHandle::balances).collect(),
+            makers: self.makers.iter().map(MakerHandle::balances).collect(),
+        }
     }
 
     /// Syncs each maker in turn and asserts its contract balance is zero: it
