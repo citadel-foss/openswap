@@ -102,3 +102,93 @@ macro_rules! assert_balances {
             )))*
     };
 }
+
+/// `assert_log!(world; { checks })`: reads the log once and fails with every
+/// check it does not satisfy. `world` is anything with a log: a `World` (its
+/// shared taker log, where every taker and maker writes) or a log path.
+/// `assert_log!(world, since mark; { .. })` checks only what was written after
+/// `mark = log_mark(&world)`.
+///
+/// ```ignore
+/// assert_log!(world; {
+///     has "Successfully created fidelity bond",
+///     lacks "SECURITY: Broadcasting",
+///     count("No active Fidelity Bonds found. Creating one.") == 1,
+///     order ["shows no funding broadcast after", "Funding was never broadcast"],
+/// });
+/// ```
+///
+/// It never writes to the log it reads, so a needle it checked cannot show up
+/// in a later count or absence check.
+macro_rules! assert_log {
+    ($source:expr, since $mark:expr; { $($rows:tt)* }) => {
+        $crate::test_framework::assert_log(&$source, Some($mark), &assert_log!(@rows []; $($rows)*))
+    };
+    ($source:expr; { $($rows:tt)* }) => {
+        $crate::test_framework::assert_log(&$source, None, &assert_log!(@rows []; $($rows)*))
+    };
+
+    (@rows [$($acc:expr),*]; $(,)?) => {
+        [$($acc),*]
+    };
+    (@rows [$($acc:expr),*]; has $needle:expr $(, $($rest:tt)*)?) => {
+        assert_log!(@rows [$($acc,)* $crate::test_framework::LogCheck::Has($needle.to_string())];
+            $($($rest)*)?)
+    };
+    (@rows [$($acc:expr),*]; lacks $needle:expr $(, $($rest:tt)*)?) => {
+        assert_log!(@rows [$($acc,)* $crate::test_framework::LogCheck::Lacks($needle.to_string())];
+            $($($rest)*)?)
+    };
+    (@rows [$($acc:expr),*]; count($needle:expr) == $n:expr $(, $($rest:tt)*)?) => {
+        assert_log!(@rows [$($acc,)* $crate::test_framework::LogCheck::Count($needle.to_string(), $n)];
+            $($($rest)*)?)
+    };
+    (@rows [$($acc:expr),*]; order [$($needle:expr),+ $(,)?] $(, $($rest:tt)*)?) => {
+        assert_log!(@rows [$($acc,)* $crate::test_framework::LogCheck::Order(vec![$($needle.to_string()),+])];
+            $($($rest)*)?)
+    };
+}
+
+/// `wait_until!(timeout, "what", condition)`: re-checks `condition` every
+/// 250ms (or `every interval`) until it holds; fails after `timeout`, naming
+/// what it waited for. The condition may be a block with side effects.
+///
+/// ```ignore
+/// wait_until!(Duration::from_secs(60), "the maker shut down",
+///     world.makers()[0].inner().shutdown.load(Relaxed));
+/// wait_until!(Duration::from_secs(180), every Duration::from_secs(2),
+///     "recovery to release the inputs",
+///     world.makers()[0].inner().reserved_inputs().unwrap() == 0);
+/// ```
+macro_rules! wait_until {
+    ($timeout:expr, every $every:expr, $what:expr, $cond:expr $(,)?) => {
+        $crate::test_framework::wait_for($timeout, $every, &$what, || {
+            if $cond {
+                Some(())
+            } else {
+                None
+            }
+        })
+    };
+    ($timeout:expr, $what:expr, $cond:expr $(,)?) => {
+        wait_until!($timeout, every $crate::test_framework::POLL, $what, $cond)
+    };
+}
+
+/// `wait_for!(timeout, "what", option)`: like [`wait_until!`], but the
+/// expression yields an `Option` and the macro returns the first `Some` value.
+///
+/// ```ignore
+/// let txids = wait_for!(Duration::from_secs(120), "the 3 funding txs in the mempool", {
+///     let new = new_mempool_txids();
+///     (new.len() == 3).then_some(new)
+/// });
+/// ```
+macro_rules! wait_for {
+    ($timeout:expr, every $every:expr, $what:expr, $value:expr $(,)?) => {
+        $crate::test_framework::wait_for($timeout, $every, &$what, || $value)
+    };
+    ($timeout:expr, $what:expr, $value:expr $(,)?) => {
+        wait_for!($timeout, every $crate::test_framework::POLL, $what, $value)
+    };
+}

@@ -33,6 +33,7 @@ mod procs;
 mod reports;
 mod timing;
 mod tracker;
+mod wait;
 mod world;
 
 #[cfg(feature = "lightning")]
@@ -48,6 +49,7 @@ pub use self::{
     procs::{electrs::*, tor::*},
     reports::*,
     tracker::*,
+    wait::*,
     world::*,
 };
 pub(crate) use self::{logs::*, procs::bitcoind::*, timing::*};
