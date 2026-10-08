@@ -130,25 +130,9 @@ pub(crate) fn run_legacy_timelock_only_recovery(
         "Maker2 must release its swapcoins once the grace has run out"
     );
 
-    // Verify maker balances after recovery
-    for (i, maker) in world.makers().iter().enumerate() {
-        maker.sync();
-        let maker_balances = maker.balances();
-        info!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i,
-            maker_balances.regular,
-            maker_balances.swap,
-            maker_balances.contract,
-            maker_balances.spendable,
-        );
-        assert_eq!(
-            maker_balances.contract,
-            Amount::ZERO,
-            "Maker {} should have no contract balance after recovery",
-            i
-        );
-    }
+    // Every maker recovered its contracts
+    world.sync_makers();
+    assert_balances!(world; { makers: { contract: 0 } });
 
     info!("Makers shut down. Waiting for background recovery loop to complete...");
 
@@ -169,23 +153,9 @@ pub(crate) fn run_legacy_timelock_only_recovery(
     world.framework().wait_for_electrs_tip();
     world.taker().sync();
 
-    // Verify taker balance
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
     // Contract balance should be 0
-    assert_eq!(
-        taker_balances.contract,
-        Amount::ZERO,
-        "Taker should have no contract balance after recovery"
-    );
+    assert_balances!(world; { taker: { contract: 0 } });
+    let taker_balances = world.taker().balances();
 
     // Balance diff should be small (timelock recovery fees only)
     let balance_diff = taker_original_balance
@@ -364,25 +334,9 @@ fn run_taproot_timelock_only_recovery(
         "Maker2 must release its swapcoins once the grace has run out"
     );
 
-    // Verify maker balances after recovery
-    for (i, maker) in world.makers().iter().enumerate() {
-        maker.sync();
-        let maker_balances = maker.balances();
-        info!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i,
-            maker_balances.regular,
-            maker_balances.swap,
-            maker_balances.contract,
-            maker_balances.spendable,
-        );
-        assert_eq!(
-            maker_balances.contract,
-            Amount::ZERO,
-            "Maker {} should have no contract balance after recovery",
-            i
-        );
-    }
+    // Every maker recovered its contracts
+    world.sync_makers();
+    assert_balances!(world; { makers: { contract: 0 } });
 
     info!("Makers shut down. Waiting for background recovery loop to complete...");
 
@@ -404,23 +358,9 @@ fn run_taproot_timelock_only_recovery(
     world.framework().wait_for_electrs_tip();
     world.taker().sync();
 
-    // Verify taker balance
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
     // Contract balance should be 0
-    assert_eq!(
-        taker_balances.contract,
-        Amount::ZERO,
-        "Taker should have no contract balance after recovery"
-    );
+    assert_balances!(world; { taker: { contract: 0 } });
+    let taker_balances = world.taker().balances();
 
     // Balance diff should be small (timelock recovery fees only)
     let balance_diff = taker_original_balance

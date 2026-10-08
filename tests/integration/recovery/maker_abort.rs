@@ -125,7 +125,8 @@ fn run_maker_abort_recovery(
 /// A world whose swap Maker2 has just broken off.
 struct MakerAbort<'w> {
     world: &'w mut World,
-    taker_original_balance: Amount,
+    /// Every wallet's balances right after the taker was funded.
+    before: WorldBalances,
     tracker_logger: TrackerLoggerHandle,
 }
 
@@ -134,7 +135,8 @@ impl<'w> MakerAbort<'w> {
     /// Maker2 breaks off, and asserts it fails, with `failure` as the message.
     fn fail_swap(world: &'w mut World, protocol: ProtocolVersion, failure: &str) -> Self {
         // Fund the taker with 3 UTXOs of 0.05 BTC each
-        let taker_original_balance = world.fund_taker_default(3);
+        world.fund_taker_default(3);
+        let before = world.balances();
 
         // Fund the makers with 4 UTXOs of 0.05 BTC each
         world.fund_makers_default();
@@ -165,7 +167,7 @@ impl<'w> MakerAbort<'w> {
 
         MakerAbort {
             world,
-            taker_original_balance,
+            before,
             tracker_logger,
         }
     }
@@ -195,65 +197,36 @@ impl<'w> MakerAbort<'w> {
         info!("Background recovery loop completed.");
     }
 
-    /// Mines the recovery txs, asserts the taker's and then each maker's
-    /// balances, and shuts the makers down.
+    /// Mines the recovery txs, asserts every wallet's balances, and shuts the
+    /// makers down.
     fn assert_recovered(self, expected: &MakerAbortExpect) {
         let MakerAbort {
             world,
-            taker_original_balance,
+            before,
             tracker_logger,
         } = self;
 
-        // Mine a block to confirm recovery txs, then sync wallet
+        // Mine a block to confirm recovery txs, then sync the wallets
         world.mine(1);
         world.taker().sync();
+        world.sync_makers();
 
-        let taker_balances = world.taker().balances();
-        info!(
-            "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            taker_balances.regular,
-            taker_balances.swap,
-            taker_balances.contract,
-            taker_balances.spendable,
-        );
-        BalanceExpect {
-            regular: Some(Is::Sats(expected.taker_regular)),
-            swap: Some(Is::Sats(expected.taker_swap)),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::ZERO)),
-            spendable: None,
-            delta: Some(Delta::Loss {
-                baseline: taker_original_balance,
-                style: DiffStyle::UnwrapOrZero,
-                sats: expected.taker_loss,
-            }),
-        }
-        .assert("Taker", &taker_balances);
-
-        for (i, maker) in world.makers().iter().enumerate() {
-            maker.sync();
-            let balances = maker.balances();
-            info!(
-                "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-                i,
-                balances.regular,
-                balances.swap,
-                balances.contract,
-                balances.fidelity,
-                balances.spendable,
-            );
-            BalanceExpect {
-                regular: Some(Is::Sats(expected.maker_regular[i])),
-                swap: Some(Is::Sats(expected.maker_swap[i])),
-                contract: Some(Is::Sats(0)),
-                fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-                spendable: expected
-                    .maker_spendable
-                    .map(|spendable| Is::Sats(spendable[i])),
-                delta: None,
-            }
-            .assert(&format!("Maker {i}"), &balances);
-        }
+        assert_balances!(world, since before; {
+            taker: {
+                regular: expected.taker_regular,
+                swap: expected.taker_swap,
+                contract: 0,
+                fidelity: 0,
+                loss: expected.taker_loss,
+            },
+            makers: {
+                regular: expected.maker_regular,
+                swap: expected.maker_swap,
+                contract: 0,
+                fidelity: BOND,
+                spendable: expected.maker_spendable,
+            },
+        });
 
         world.taker().log_tracker_state();
 

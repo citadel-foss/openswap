@@ -144,7 +144,7 @@ fn run_contract_breach<B: TestBackend>(
     let last = maker_count - 1;
 
     // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-    let taker_original_balance = world.fund_taker_default(3);
+    world.fund_taker_default(3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
     world.fund_makers_default();
@@ -264,7 +264,7 @@ fn run_contract_breach<B: TestBackend>(
     // (regular, swap) per live maker, then the taker's (regular, swap, spendable).
     // Settled by hashlock, the taker paid its outgoing as in a completed swap;
     // dangling, it refunded it on top of its claim.
-    let (expected_makers, expected_taker) = match ending {
+    let (expected_makers, (taker_regular, taker_swap, taker_spendable)) = match ending {
         Ending::FaultyReturns | Ending::FirstMakerLate => (
             vec![(14500543, 499700), (14501446, 498760)],
             (14499846, 497857, 14997703),
@@ -295,7 +295,7 @@ fn run_contract_breach<B: TestBackend>(
             "Maker {} contract balance",
             i
         );
-        assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
+        assert_eq!(balances.fidelity, BOND);
         maker_balances.push((balances.regular.to_sat(), balances.swap.to_sat()));
     }
     assert_eq!(maker_balances, expected_makers, "maker balances mismatch");
@@ -303,22 +303,15 @@ fn run_contract_breach<B: TestBackend>(
     // Mine a block to confirm recovery txs, then sync wallet
     world.mine(1);
     world.taker().sync();
-    let balances = world.taker().balances();
-    info!(
-        "Taker balances after recovery: {:?} (original: {})",
-        balances, taker_original_balance
-    );
-    assert_eq!(balances.contract, Amount::ZERO, "Taker contract balance");
-    assert_eq!(balances.fidelity, Amount::ZERO);
-    assert_eq!(
-        (
-            balances.regular.to_sat(),
-            balances.swap.to_sat(),
-            balances.spendable.to_sat()
-        ),
-        expected_taker,
-        "taker balances mismatch"
-    );
+    assert_balances!(world; {
+        taker: {
+            regular: taker_regular,
+            swap: taker_swap,
+            contract: 0,
+            fidelity: 0,
+            spendable: taker_spendable,
+        },
+    });
 
     world.taker().log_tracker_state();
     info!("Malice2 test completed successfully!");
@@ -339,18 +332,14 @@ fn run_contract_breach<B: TestBackend>(
     takers = [BroadcastContractAfterFullSetup],
     setup = [
         // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Legacy)
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         // Fund the makers with 4 UTXOs of 0.05 BTC each
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
     ],
 )]
-fn taker_broadcasts_contract_after_full_setup(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-) {
+fn taker_broadcasts_contract_after_full_setup(world: &mut World) {
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -377,42 +366,12 @@ fn taker_broadcasts_contract_after_full_setup(
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
 
-    // Verify maker balances -- makers should have recovered their outgoing funds via timelock
-    let expected_regular = [14998419, 14998419];
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        maker.sync();
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i, balances.regular, balances.swap, balances.contract, balances.spendable,
-        );
-        BalanceExpect {
-            regular: Some(Is::Sats(expected_regular[i])),
-            swap: Some(Is::Sats(0)),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: None,
-            delta: None,
-        }
-        .assert(&format!("Maker {i}"), &balances);
-
-        // Makers lost some funds due to taker maliciously broadcasting contracts
-        let maker_diff = original
-            .checked_sub(balances.spendable)
-            .unwrap_or(Amount::ZERO);
-        info!(
-            "Maker {} lost {} sats (pre-swap: {}, current: {})",
-            i,
-            maker_diff.to_sat(),
-            original,
-            balances.spendable,
-        );
-    }
+    // Verify maker balances -- makers should have recovered their outgoing funds via timelock,
+    // losing some to the taker maliciously broadcasting contracts.
+    world.sync_makers();
+    assert_balances!(world; {
+        makers: { regular: [14998419, 14998419], swap: 0, contract: 0, fidelity: BOND },
+    });
 
     // Wait for taker's background recovery loop to finish
     info!("Waiting for background recovery loop to complete...");
@@ -423,38 +382,8 @@ fn taker_broadcasts_contract_after_full_setup(
     world.mine(1);
     world.taker().sync();
 
-    // Verify taker balance
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
     // Only the contract and fidelity balances are asserted here.
-    BalanceExpect {
-        regular: None,
-        swap: None,
-        contract: Some(Is::Sats(0)),
-        fidelity: Some(Is::Amount(Amount::ZERO)),
-        spendable: None,
-        delta: None,
-    }
-    .assert("Taker", &taker_balances);
-
-    let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
-        .unwrap_or(Amount::ZERO);
-
-    info!(
-        "Taker balance diff: {} sats (original: {}, current: {})",
-        balance_diff.to_sat(),
-        taker_original_balance,
-        taker_balances.spendable,
-    );
+    assert_balances!(world; { taker: { contract: 0, fidelity: 0 } });
 
     world.taker().log_tracker_state();
     info!("Malice1 test completed successfully!");
@@ -471,18 +400,16 @@ fn taker_broadcasts_contract_after_full_setup(
     takers = [Normal],
     setup = [
         // Fund the taker with 3 UTXOs of 0.05 BTC each
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         // Fund the makers with 4 UTXOs of 0.05 BTC each
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
     ],
 )]
-fn taproot_maker_broadcasts_contract(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-) {
+fn taproot_maker_broadcasts_contract(world: &mut World) {
+    let before = world.balances();
+
     // Start periodic swap tracker logging (every 10s)
     let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
@@ -515,21 +442,7 @@ fn taproot_maker_broadcasts_contract(
     // Shut down makers
     world.shutdown_makers();
 
-    // Log all maker balances before asserting so one run reports every value.
-    let mut maker_balances_all = Vec::new();
-    for (i, maker) in world.makers().iter().enumerate() {
-        maker.sync();
-        let maker_balances = maker.balances();
-        info!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i,
-            maker_balances.regular,
-            maker_balances.swap,
-            maker_balances.contract,
-            maker_balances.spendable,
-        );
-        maker_balances_all.push(maker_balances);
-    }
+    world.sync_makers();
 
     info!("Makers shut down. Waiting for background recovery loop to complete...");
 
@@ -542,54 +455,13 @@ fn taproot_maker_broadcasts_contract(
     world.mine(1);
     world.taker().sync();
 
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
-    // Verify maker balances -- makers should have recovered their outgoing funds via timelock.
-    // Nobody earns a fee here; each maker only pays for its own recovery.
-    let expected_regular = [14999463, 14999463];
-    for (i, (maker_balances, original)) in maker_balances_all
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        BalanceExpect {
-            regular: Some(Is::Sats(expected_regular[i])),
-            swap: Some(Is::Sats(0)),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: None,
-            delta: Some(Delta::Loss {
-                baseline: original,
-                style: DiffStyle::UnwrapOrZero,
-                sats: 294,
-            }),
-        }
-        .assert(&format!("Maker {i}"), maker_balances);
-    }
-
-    // Verify taker balance. The taker recovered its own funding, so it only
-    // pays the recovery fees.
-    BalanceExpect {
-        regular: Some(Is::Sats(14999706)),
-        swap: Some(Is::Sats(0)),
-        contract: Some(Is::Sats(0)),
-        fidelity: Some(Is::Amount(Amount::ZERO)),
-        spendable: None,
-        delta: Some(Delta::Loss {
-            baseline: taker_original_balance,
-            style: DiffStyle::UnwrapOrZero,
-            sats: 294,
-        }),
-    }
-    .assert("Taker", &taker_balances);
+    // Makers should have recovered their outgoing funds via timelock. Nobody
+    // earns a fee here; each maker only pays for its own recovery. The taker
+    // recovered its own funding, so it only pays the recovery fees too.
+    assert_balances!(world, since before; {
+        taker: { regular: 14999706, swap: 0, contract: 0, fidelity: 0, loss: 294 },
+        makers: { regular: [14999463, 14999463], swap: 0, contract: 0, fidelity: BOND, loss: 294 },
+    });
 
     // TODO: the maker that broadcasts its contract is never banned. The swap
     // aborts on the transport error before the ContractsBroadcasted ban site, and
@@ -648,20 +520,12 @@ fn taker_broadcasts_contract_before_maker_funding(world: &mut World, params: Swa
     world.sync_makers();
     assert_breach_refused(world);
 
+    assert_balances!(world; { makers: { contract: 0 } });
     for (i, maker) in world.makers().iter().enumerate() {
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i, balances.regular, balances.swap, balances.contract, balances.spendable
-        );
         assert_eq!(
-            balances.regular, regular_before[i],
+            maker.balances().regular,
+            regular_before[i],
             "Maker {i} regular balance changed: its funding must not have been broadcast"
-        );
-        assert_eq!(
-            balances.contract,
-            Amount::ZERO,
-            "Maker {i} contract balance"
         );
     }
 }
@@ -700,24 +564,9 @@ fn taker_broadcasts_contract_before_handover(world: &mut World, params: SwapPara
 
     // Observed in a real run: each maker swept its incoming contract via the
     // hashlock. A maker that had handed over its outgoing leg would be ~500k short.
-    let expected_regular = [14500865, 14502398];
-    let expected_swap = [499100, 497530];
-    for (i, maker) in world.makers().iter().enumerate() {
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i, balances.regular, balances.swap, balances.contract, balances.spendable
-        );
-        BalanceExpect {
-            regular: Some(Is::Sats(expected_regular[i])),
-            swap: Some(Is::Sats(expected_swap[i])),
-            contract: Some(Is::Amount(Amount::ZERO)),
-            fidelity: None,
-            spendable: None,
-            delta: None,
-        }
-        .assert(&format!("Maker {i}"), &balances);
-    }
+    assert_balances!(world; {
+        makers: { regular: [14500865, 14502398], swap: [499100, 497530], contract: 0 },
+    });
 }
 
 /// The maker refused because of the breach, not for any other reason.

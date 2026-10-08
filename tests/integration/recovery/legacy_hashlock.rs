@@ -11,17 +11,14 @@ use std::{thread, time::Duration};
     maker_behaviors = [Normal, CloseAfterSweep],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
     ],
 )]
-fn maker_drops_after_sweep(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-) {
+fn maker_drops_after_sweep(world: &mut World) {
+    let before = world.balances();
     let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
@@ -59,66 +56,26 @@ fn maker_drops_after_sweep(
     world.mine(1);
     world.taker().sync();
 
-    let taker_balances = world.taker().balances();
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
     // The point of the test: the preimage was on-chain, so recovery must have
     // gone through the hashlock branch, not the timelock one.
     assert_logged!(world, "Signing legacy hashlock spend with preimage");
 
     // The hashlock sweep is a separate tx per contract, so the taker pays more
     // than the 4339 sats a clean legacy swap costs.
-    BalanceExpect {
-        regular: Some(Is::Sats(14499538)),
-        swap: Some(Is::Sats(495997)),
-        contract: Some(Is::Sats(0)),
-        fidelity: Some(Is::Amount(Amount::ZERO)),
-        spendable: None,
-        delta: Some(Delta::Loss {
-            baseline: taker_original_balance,
-            style: DiffStyle::UnwrapOrZero,
-            sats: 4465,
-        }),
-    }
-    .assert("Taker", &taker_balances);
-
+    //
     // Both makers still earn their full fee: maker 1 completed the swap and
     // maker 2 swept before dropping. Their wallets were synced after the
     // shutdown above and are read as they stand.
-    let expected_regular = [14500865, 14502398];
-    let expected_swap = [499550, 497980];
-    let expected_fee = [658, 621];
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        let balances = maker.balances();
-        info!(
-            "Maker {} balance diff: pre-swap: {}, current: {}",
-            i, original, balances.spendable,
-        );
-        BalanceExpect {
-            regular: Some(Is::Sats(expected_regular[i])),
-            swap: Some(Is::Sats(expected_swap[i])),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: None,
-            delta: Some(Delta::Gain {
-                baseline: original,
-                style: DiffStyle::UnwrapOrZero,
-                sats: expected_fee[i],
-            }),
-        }
-        .assert(&format!("Maker {i}"), &balances);
-    }
+    assert_balances!(world, since before; {
+        taker: { regular: 14_499_538, swap: 495_997, contract: 0, fidelity: 0, loss: 4_465 },
+        makers: {
+            regular: [14_500_865, 14_502_398],
+            swap: [499_550, 497_980],
+            contract: 0,
+            fidelity: BOND,
+            gain: [658, 621],
+        },
+    });
 
     world.taker().log_tracker_state();
     info!("Legacy hashlock recovery test completed successfully!");
