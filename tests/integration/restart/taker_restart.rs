@@ -29,10 +29,7 @@ use openswap::{
 use crate::test_framework::*;
 
 use log::info;
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use std::{thread, time::Duration};
 
 #[world_test(
     backend = BitcoindBackend,
@@ -109,21 +106,17 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
     std::fs::copy(&tracker_path, &tracker_snapshot).unwrap();
 
     world.framework().set_block_gen_paused(false);
-    let sweep_deadline = Instant::now() + Duration::from_secs(120);
-    while taker
-        .inner()
-        .get_wallet()
-        .read()
-        .unwrap()
-        .get_incoming_swapcoins_count()
-        != 0
-    {
-        assert!(
-            Instant::now() < sweep_deadline,
-            "post-snapshot recovery sweep did not clear incoming swapcoins within 120s"
-        );
-        thread::sleep(Duration::from_millis(250));
-    }
+    wait_until!(
+        Duration::from_secs(120),
+        "the post-snapshot recovery sweep to clear incoming swapcoins",
+        taker
+            .inner()
+            .get_wallet()
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count()
+            == 0
+    );
 
     info!("Restoring the pre-sweep state to simulate a crash before cleanup");
     drop(taker);
@@ -145,14 +138,12 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
     world.shutdown_makers();
 
     info!("Waiting for the restarted taker's recovery loop to finish...");
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while !world.taker().inner().is_recovery_complete() {
-        assert!(
-            Instant::now() < deadline,
-            "recovery after restart did not complete within 120s"
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_until!(
+        Duration::from_secs(120),
+        every Duration::from_secs(5),
+        "recovery after restart to complete",
+        world.taker().inner().is_recovery_complete()
+    );
 
     world.mine(1);
     world.taker().sync();
@@ -201,12 +192,10 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
 
     // If the cross-session lookup had come up empty, recover_active_swap would
     // have bailed with this instead of recovering.
-    let log_path = world.taker_log_path();
-    let log_contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !log_contents.contains("No persisted swapcoins found for recovery"),
-        "restarted taker failed to read the swap back off disk"
-    );
+    assert_log!(world; {
+        // Present means the restarted taker failed to read the swap back off disk.
+        lacks "No persisted swapcoins found for recovery",
+    });
 
     // Crash again before the tracker saw the cleanup: the chain and wallet are
     // settled, so startup has nothing to recover but must still finish the swap.
@@ -216,11 +205,12 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
         Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0))
             .expect("settled taker should open the same wallet"),
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !world.taker().inner().is_recovery_complete() {
-        assert!(Instant::now() < deadline, "settled swap was not finished");
-        thread::sleep(Duration::from_secs(1));
-    }
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(1),
+        "the settled swap to be finished",
+        world.taker().inner().is_recovery_complete()
+    );
     let tracker = SwapTracker::load_or_create(&taker_dir).unwrap();
     assert_eq!(
         tracker.get_record(&summary.swap_id).unwrap().recovery.phase,

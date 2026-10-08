@@ -17,11 +17,7 @@ use openswap::{maker::MakerServer, protocol::common_messages::ProtocolVersion, t
 use crate::test_framework::*;
 
 use log::info;
-use std::{
-    sync::Arc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 /// Test: maker reboot recovery should preserve Legacy swapcoins when funding
 /// was broadcast but the maker has not yet persisted an idle-recovery tracker
@@ -97,17 +93,14 @@ fn maker_reboot_preserves_funded_swapcoins(world: &mut World, taker_original_bal
     // it can sweep, so the swapcoins clear much later than in Taproot, where the
     // funding tx already is the contract tx.
     let log_path = world.taker_log_path();
-    let deadline = Instant::now() + Duration::from_secs(300);
-    while !std::fs::read_to_string(&log_path)
-        .unwrap()
-        .contains("Removed outgoing swapcoin")
-    {
-        assert!(
-            Instant::now() < deadline,
-            "reboot recovery did not clear the outgoing swapcoins within 300s"
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_until!(
+        Duration::from_secs(300),
+        every Duration::from_secs(5),
+        "reboot recovery to clear the outgoing swapcoins",
+        std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("Removed outgoing swapcoin")
+    );
 
     let after_incoming = world.makers()[0]
         .inner()
@@ -115,15 +108,16 @@ fn maker_reboot_preserves_funded_swapcoins(world: &mut World, taker_original_bal
         .read()
         .unwrap()
         .get_incoming_swapcoins_count();
-    assert_logged!(world, "Incomplete swaps detected on startup");
-    assert_logged!(world, "recover_from_swap started");
-    assert_logged!(world, "Removed outgoing swapcoin");
-    let log_contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !log_contents.contains("Funding was never broadcast for swap"),
-        "reboot recovery took the unsafe discard path"
-    );
-    let recovered_via_hashlock = log_contents.contains("incoming swapcoins via hashlock");
+    assert_log!(world; {
+        has "Incomplete swaps detected on startup",
+        has "recover_from_swap started",
+        has "Removed outgoing swapcoin",
+        // Present means reboot recovery took the unsafe discard path.
+        lacks "Funding was never broadcast for swap",
+    });
+    let recovered_via_hashlock = std::fs::read_to_string(&log_path)
+        .unwrap()
+        .contains("incoming swapcoins via hashlock");
 
     world.shutdown_makers();
 
@@ -143,14 +137,12 @@ fn maker_reboot_preserves_funded_swapcoins(world: &mut World, taker_original_bal
     });
 
     info!("Waiting for the taker's recovery loop to finish...");
-    let deadline = Instant::now() + Duration::from_secs(300);
-    while !world.taker().inner().is_recovery_complete() {
-        assert!(
-            Instant::now() < deadline,
-            "taker recovery did not complete within 300s"
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_until!(
+        Duration::from_secs(300),
+        every Duration::from_secs(5),
+        "the taker recovery to complete",
+        world.taker().inner().is_recovery_complete()
+    );
 
     world.mine(1);
     world.taker().sync();

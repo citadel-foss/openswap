@@ -32,7 +32,7 @@ use std::{
     net::TcpStream,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Test: maker reboot recovery preserves funded Taproot swapcoins. Maker2 funds
@@ -124,12 +124,13 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, watcher
         );
         wait_logged!(world, "recover_from_swap started", Duration::from_secs(120));
         wait_logged!(world, "Removed outgoing swapcoin", Duration::from_secs(120));
-        let log_contents = std::fs::read_to_string(&log_path).unwrap();
-        assert!(
-            !log_contents.contains("Funding was never broadcast for swap"),
-            "reboot recovery took the unsafe discard path"
-        );
-        let recovered_via_hashlock = log_contents.contains("incoming swapcoins via hashlock");
+        assert_log!(world; {
+            // Present means reboot recovery took the unsafe discard path.
+            lacks "Funding was never broadcast for swap",
+        });
+        let recovered_via_hashlock = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("incoming swapcoins via hashlock");
 
         world.shutdown_makers();
         assert!(
@@ -326,11 +327,6 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
     };
 
     let log_path = world.taker_log_path();
-    let log_len = || std::fs::read_to_string(&log_path).unwrap_or_default().len();
-    let since = |offset: usize| {
-        let all = std::fs::read_to_string(&log_path).unwrap_or_default();
-        all[offset.min(all.len())..].to_string()
-    };
 
     // A crash can save the incoming coins before the tracker lists them. The
     // restart must still find them from the wallet and claim them.
@@ -342,7 +338,7 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
     drop(tracker);
 
     // ---- The taker restarts first: its sweep is what puts the preimage on chain.
-    let taker_offset = log_len();
+    let taker_offset = log_mark(&world);
     info!("Restarting the taker with an empty watcher...");
     world.adopt_taker(Taker::init(taker_config).expect("taker restart should succeed"));
 
@@ -350,16 +346,13 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
         // Core has no per-script history, so it must read the blocks back.
         wait_for_log(&log_path, "Rescanning blocks", Duration::from_secs(120));
     }
-    assert!(
-        since(taker_offset).contains("Rebuilding"),
-        "restarted taker never rebuilt its watches from the wallet"
-    );
-    // Startup recovery finishes inside `Taker::init`, so there is nothing to wait
-    // for. Its hashlock spend is what first puts the preimage on chain.
-    assert!(
-        since(taker_offset).contains("hashlock"),
-        "restarted taker did not claim via hashlock, so no preimage reached the chain"
-    );
+    assert_log!(world, since taker_offset; {
+        // The restarted taker rebuilt its watches from the wallet.
+        has "Rebuilding",
+        // Startup recovery finishes inside `Taker::init`, so there is nothing to
+        // wait for. Its hashlock spend is what first puts the preimage on chain.
+        has "hashlock",
+    });
 
     world.taker().sync();
     assert_eq!(
@@ -378,7 +371,7 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
 
     // ---- Now both makers. The preimage is on chain; only a rebuilt watch sees
     // it, and each maker's own claim reveals it to the one upstream.
-    let maker_offset = log_len();
+    let maker_offset = log_mark(&world);
     info!("Restarting both makers with empty watchers...");
     world.adopt_makers(
         maker_configs
@@ -392,27 +385,23 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
     for maker in world.makers() {
         let port = maker.inner().config.network_port;
         let claimed = format!("[{port}] Recovered");
-        let deadline = std::time::Instant::now() + Duration::from_secs(300);
-        loop {
-            let hit = std::fs::read_to_string(&log_path)
+        wait_until!(
+            Duration::from_secs(300),
+            every Duration::from_secs(5),
+            format!(
+                "maker {} to claim its incoming contract with the preimage",
+                port
+            ),
+            std::fs::read_to_string(&log_path)
                 .unwrap_or_default()
                 .lines()
-                .any(|l| l.contains(&claimed) && l.contains("incoming swapcoins via hashlock"));
-            if hit {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "maker {} never claimed its incoming contract with the preimage",
-                port
-            );
-            thread::sleep(Duration::from_secs(5));
-        }
+                .any(|l| l.contains(&claimed) && l.contains("incoming swapcoins via hashlock"))
+        );
     }
-    assert!(
-        since(maker_offset).contains("Rebuilding"),
-        "restarted makers never rebuilt their watches from the wallet"
-    );
+    assert_log!(world, since maker_offset; {
+        // The restarted makers rebuilt their watches from the wallet.
+        has "Rebuilding",
+    });
 
     // Every claim is in. Let the chain run again so the spends bury.
     mining.store(false, Relaxed);
@@ -483,41 +472,35 @@ fn taproot_maker_finishes_when_its_incoming_was_refunded(world: &mut World, para
     taker_config.password = Some("integration-test".to_string());
 
     info!("Waiting for Maker1 to refund Maker2's incoming...");
-    let deadline = Instant::now() + Duration::from_secs(400);
-    while world.makers()[0]
-        .inner()
-        .wallet
-        .read()
-        .unwrap()
-        .get_outgoing_swapcoins_count()
-        != 0
-    {
-        assert!(
-            Instant::now() < deadline,
-            "Maker1 did not refund its outgoing"
-        );
-        thread::sleep(Duration::from_secs(2));
-    }
+    wait_until!(
+        Duration::from_secs(400),
+        every Duration::from_secs(2),
+        "Maker1 to refund its outgoing",
+        world.makers()[0]
+            .inner()
+            .wallet
+            .read()
+            .unwrap()
+            .get_outgoing_swapcoins_count()
+            == 0
+    );
 
     // The taker's claim is what first puts the preimage on chain.
     world.drop_takers();
     world.adopt_taker(Taker::init(taker_config).expect("taker restart should succeed"));
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while world
-        .taker()
-        .inner()
-        .get_wallet()
-        .read()
-        .unwrap()
-        .get_incoming_swapcoins_count()
-        != 0
-    {
-        assert!(
-            Instant::now() < deadline,
-            "restarted taker did not claim its incoming by hashlock"
-        );
-        thread::sleep(Duration::from_secs(2));
-    }
+    wait_until!(
+        Duration::from_secs(120),
+        every Duration::from_secs(2),
+        "the restarted taker to claim its incoming by hashlock",
+        world
+            .taker()
+            .inner()
+            .get_wallet()
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count()
+            == 0
+    );
 
     let mut victim_config = world.makers()[1].inner().config.clone();
     victim_config.password = Some("integration-test".to_string());
@@ -567,14 +550,14 @@ fn taproot_maker_finishes_when_its_incoming_was_refunded(world: &mut World, para
         "startup left a finished record open"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(180);
-    while phase(&summary.swap_id) != Some(MakerRecoveryPhase::CleanedUp) {
-        assert!(
-            Instant::now() < deadline,
-            "Maker2 kept retrying a sweep of an incoming its sender refunded"
-        );
-        thread::sleep(Duration::from_secs(2));
-    }
+    // Not cleaned up in time means Maker2 kept retrying a sweep of an incoming
+    // its sender refunded.
+    wait_until!(
+        Duration::from_secs(180),
+        every Duration::from_secs(2),
+        "Maker2 to finish the swap whose incoming its sender refunded",
+        phase(&summary.swap_id) == Some(MakerRecoveryPhase::CleanedUp)
+    );
     let wallet = restarted.wallet.read().unwrap();
     assert_eq!(wallet.get_incoming_swapcoins_count(), 0);
     assert_eq!(wallet.get_outgoing_swapcoins_count(), 0);
@@ -640,7 +623,7 @@ fn run_reservations_survive_restart(world: &mut World, params: SwapParams) {
     // The marker must come from the restarted maker: the first Maker2's idle
     // recovery can log it before the restart, so only scan past this offset.
     let log_path = world.taker_log_path();
-    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    let log_offset = log_mark(&log_path);
 
     // Init only reloads state; `start_server` is what runs startup recovery.
     // The reservation has to survive that too, or a maker could reuse an input
@@ -650,21 +633,15 @@ fn run_reservations_survive_restart(world: &mut World, params: SwapParams) {
     // Startup recovery runs on its own thread, past is_setup_complete: wait
     // until it has started on the unfinished swap before reading the
     // reservation count, or the assertion can pass without recovery running.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-        if contents
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_millis(500),
+        "restart recovery to start on the unfinished swap",
+        std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
             .get(log_offset as usize..)
             .is_some_and(|tail| tail.contains("recover_from_swap started"))
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "restart recovery never started on the unfinished swap"
-        );
-        thread::sleep(Duration::from_millis(500));
-    }
+    );
 
     let after = world.makers()[0].inner().reserved_inputs().unwrap();
     assert_eq!(
@@ -674,23 +651,15 @@ fn run_reservations_survive_restart(world: &mut World, params: SwapParams) {
 
     // The grace ages from the reservation, not the restart: past it, the swap
     // is provably never funded and the reservation is released with it.
-    let deadline = std::time::Instant::now()
-        + openswap::utill::UNBROADCAST_DISCARD_GRACE
-        + Duration::from_secs(60);
-    loop {
-        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-        if contents
+    wait_until!(
+        openswap::utill::UNBROADCAST_DISCARD_GRACE + Duration::from_secs(60),
+        every Duration::from_secs(2),
+        "the restarted maker to discard the unbroadcast funding",
+        std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
             .get(log_offset as usize..)
             .is_some_and(|tail| tail.contains("nothing to recover. Discarding swapcoins."))
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the restarted maker never discarded the unbroadcast funding"
-        );
-        thread::sleep(Duration::from_secs(2));
-    }
+    );
     let released = world.makers()[0].inner().reserved_inputs().unwrap();
     assert_eq!(
         released, 0,
@@ -734,7 +703,7 @@ fn orphan_reservation_is_released_on_restart(world: &mut World, params: SwapPara
     world.drop_makers();
     world.adopt_makers([Arc::new(MakerServer::init(victim_config).unwrap())]);
     world.start_makers_without_sync(120);
-    assert_logged!(world, "nothing left owns it");
+    assert_log!(world; { has "nothing left owns it" });
     assert_eq!(
         world.makers()[0].inner().reserved_inputs().unwrap(),
         0,
