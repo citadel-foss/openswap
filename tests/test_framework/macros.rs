@@ -10,19 +10,6 @@
 /// the keys and the expansion.
 pub use openswap_test_macros::world_test;
 
-/// `assert_logged!(world, "needle")`: asserts the taker log (every taker and
-/// maker writes there) holds `needle`, i.e.
-/// `world.framework().assert_log(needle, &world.taker_log_path())`. A miss
-/// panics at the macro's line.
-macro_rules! assert_logged {
-    ($world:expr, $needle:expr $(,)?) => {{
-        let world = &$world;
-        world
-            .framework()
-            .assert_log($needle, &world.taker_log_path());
-    }};
-}
-
 /// `wait_logged!(world, "needle", timeout)`: polls the taker log until it
 /// holds `needle`, i.e. `wait_for_log(&world.taker_log_path(), needle,
 /// timeout)`. A timeout panics at the macro's line.

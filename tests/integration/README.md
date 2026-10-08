@@ -78,7 +78,7 @@ tests/
     harness.rs        World, WorldBuilder, MakerHandle, TakerHandle, the steps
     node.rs           Node: a bare regtest bitcoind (+ electrs) for chain-only tests
     expect.rs         assert_balances! rows: which balance fields a test asserts
-    macros.rs         world_test, assert_logged!, wait_logged!
+    macros.rs         world_test, assert_balances!, assert_log!, wait_until!, wait_for!
     actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
   macros/             the #[world_test] proc-macro crate (attribute macros need their own crate)
   TESTS.golden        every test name; check_test_names.sh diffs against it
@@ -181,7 +181,7 @@ the body takes the ones it needs by name:
 )]
 fn run_taproot_declaration_guard(world: &mut World, expected: &str, params: SwapParams) {
     world.taker_mut().swap_fails(params, "maker must reject ...");
-    assert_logged!(world, expected);
+    assert_log!(world; { has expected });
 }
 ```
 
@@ -286,6 +286,36 @@ in the pull request.
 Balances of a wallet the world does not own (a maker restarted by hand) and
 inequalities stay plain `assert!`s.
 
+## Logs and waits
+
+`assert_log!` reads the shared log (every taker and maker writes to
+`taker/debug.log`) once and reports every failed check together:
+
+```rust
+let mark = log_mark(&world);
+// ... the step whose log lines matter ...
+assert_log!(world, since mark; {
+    has "Successfully created fidelity bond",
+    lacks "SECURITY: Broadcasting",
+    count("No active Fidelity Bonds found. Creating one.") == 1,
+    order ["shows no funding broadcast after", "Funding was never broadcast"],
+});
+```
+
+`since mark` checks only what was written after `mark`; without it the whole
+log is read. A log path works in place of `world`.
+
+`wait_until!` re-checks a condition until it holds and `wait_for!` until an
+`Option` expression yields a value, which it returns. Both poll every 250ms
+unless given `every`, and fail after the timeout naming what they waited for:
+
+```rust
+wait_until!(Duration::from_secs(60), "the maker to shut down",
+    world.makers()[0].inner().shutdown.load(Relaxed));
+let txids = wait_for!(Duration::from_secs(120), every Duration::from_millis(100),
+    "the 3 funding txs in the mempool", { let new = new_txids(); (new.len() == 3).then_some(new) });
+```
+
 ## Sharing a body
 
 When several tests run the same steps and differ only in data, they are rows
@@ -331,9 +361,10 @@ To run one body over several backends, give each row its own `backend = ..`
 - **Waits stay what they are.** A test that sleeps 300s keeps 300s;
   `timelock_recovery_wait::<B>()` is for tests that already scale with the
   backend.
-- **Log needles are exact.** `assert_log` reads the log once; `wait_for_log`
-  polls. Both echo the needle into the same log, so count a needle from one raw
-  `fs::read_to_string` taken before any of them.
+- **Log needles are exact.** `assert_log!` reads the log once and writes
+  nothing to it. `wait_for_log` and `wait_logged!` poll, and log the needle
+  when they find it, so a `count` or `lacks` check of a needle a wait already
+  found sees that echo.
 - **Log messages are ASCII.**
 
 Tests that need a chain but no takers, makers or relay take a bare `Node`

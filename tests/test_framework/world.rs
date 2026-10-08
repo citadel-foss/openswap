@@ -92,25 +92,6 @@ impl TestFramework {
         format!("{}/taker/debug.log", self.temp_dir.display())
     }
 
-    /// Assert that a log message exists in the debug.log file
-    #[track_caller]
-    pub fn assert_log(&self, expected_message: &str, log_path: &str) {
-        match std::fs::read_to_string(log_path) {
-            Ok(log_contents) => {
-                assert!(
-                    log_contents.contains(expected_message),
-                    "Expected log message '{}' not found in log file: {}",
-                    expected_message,
-                    log_path
-                );
-                log::info!("Found expected log message: '{expected_message}'");
-            }
-            Err(e) => {
-                panic!("Could not read log file at {}: {}", log_path, e);
-            }
-        }
-    }
-
     /// Initialize test framework over backend `B`. `B` builds the wallet backend
     /// config of every taker and maker (and so decides whether electrs is spawned),
     /// and sets the background miner's cadence.
