@@ -40,25 +40,19 @@ fn run_last_maker_survives_finalization_idle_window(
 
     assert_balances!(world; { makers: { contract: 0 } });
 
-    let log = std::fs::read_to_string(world.taker_log_path()).unwrap();
-    assert!(log.contains("Test behavior: stalling"));
-    assert!(log.contains("Test behavior: dropping completed handover response"));
-    assert!(
-        !log.contains(&format!("Swap {} idle", summary.swap_id)),
-        "the last maker timed out while the taker was still finalizing"
-    );
+    assert_log!(world; {
+        has "Test behavior: stalling",
+        has "Test behavior: dropping completed handover response",
+        // The last maker did not time out while the taker was still finalizing.
+        lacks format!("Swap {} idle", summary.swap_id),
+        // Each maker processed exactly one private-key handover.
+        count(format!("Processing {protocol:?} private key handover")) == 3,
+    });
     if protocol == ProtocolVersion::Taproot {
-        assert!(
-            !log.contains(
-                "UnexpectedMessage { expected: \"Legacy protocol message\", got: \"Taproot protocol message\" }"
-            ),
-            "a completed/missing Taproot swap fell back to the connection's Legacy default"
-        );
+        // A completed/missing Taproot swap did not fall back to the
+        // connection's Legacy default.
+        assert_log!(world; {
+            lacks "UnexpectedMessage { expected: \"Legacy protocol message\", got: \"Taproot protocol message\" }",
+        });
     }
-    assert_eq!(
-        log.matches(&format!("Processing {protocol:?} private key handover"))
-            .count(),
-        3,
-        "each maker should process exactly one private-key handover"
-    );
 }

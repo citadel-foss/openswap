@@ -163,15 +163,11 @@ fn rebuild_after_replan_uses_the_claimed_coins(world: &mut World, params: SwapPa
         .swap(params)
         .expect("the rebuild must reuse the re-planned coins");
 
-    let contents = std::fs::read_to_string(world.taker_log_path()).unwrap();
-    assert_eq!(
-        contents.matches("Re-planned funding for swap").count(),
-        1,
-        "only the first pass re-plans; the rebuild reuses its claim"
-    );
-    assert!(
-        contents.contains("Substituting maker 1 with spare"),
-        "maker 0 must rebuild its funding for the spare"
-    );
+    assert_log!(world; {
+        // Only the first pass re-plans; the rebuild reuses its claim.
+        count("Re-planned funding for swap") == 1,
+        // Maker 0 rebuilt its funding for the spare.
+        has "Substituting maker 1 with spare",
+    });
     assert_eq!(world.makers()[0].inner().reserved_inputs().unwrap(), 0);
 }
