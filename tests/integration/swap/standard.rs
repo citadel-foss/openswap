@@ -11,7 +11,7 @@ use openswap::{
 use crate::test_framework::*;
 
 use log::info;
-use std::{fs, thread, time::Duration};
+use std::{thread, time::Duration};
 
 /// This test demonstrates a standard openswap round between a Taker and 2 Makers. Nothing goes wrong
 /// and the openswap completes successfully.
@@ -231,8 +231,7 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait(world: &mut World) {
     let mut taker = world.take_taker();
     let summary = taker.prepare(swap_params).expect("prepare swap");
 
-    let log_path = world.taker_log_path();
-    let log_offset = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    let log_offset = log_mark(&world);
 
     // Hold every contract tx unconfirmed: the maker claims them and blocks in
     // the confirmation wait instead of answering.
@@ -257,18 +256,12 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait(world: &mut World) {
     result.expect("the swap must complete across the idle timeout");
 
     // The waiting handler kept the swap alive: no idle drain fired.
-    let log_contents = fs::read_to_string(&log_path).unwrap();
-    let tail = log_contents
-        .get(log_offset as usize..)
-        .unwrap_or(log_contents.as_str());
-    assert!(
-        !tail.contains("Released idle unfunded swap"),
-        "the waiting swap must not be drained as an idle unfunded swap"
-    );
-    assert!(
-        !tail.contains("Potential dropped connection from taker"),
-        "the waiting swap must not be drained into recovery"
-    );
+    assert_log!(world, since log_offset; {
+        // Not drained as an idle unfunded swap ...
+        lacks "Released idle unfunded swap",
+        // ... nor into recovery.
+        lacks "Potential dropped connection from taker",
+    });
 
     world.mine(1);
     taker.sync();

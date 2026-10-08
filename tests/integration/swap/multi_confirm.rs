@@ -14,10 +14,7 @@ use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 use crate::test_framework::*;
 
 use log::info;
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use std::{thread, time::Duration};
 
 /// Confirmations to wait for on every funding tx.
 ///
@@ -76,7 +73,6 @@ fn run_multi_confirm_swap(
         .taker_mut()
         .prepare(swap_params)
         .expect("Failed to prepare openswap");
-    let log_path = world.taker_log_path();
     let swap_result = if delay_first_confirmation {
         // The miner thread holds its own handle on the framework, so the swap
         // below can borrow the taker mutably.
@@ -97,24 +93,21 @@ fn run_multi_confirm_swap(
                     }
                 }
                 let _resume = ResumeMining(&test_framework);
-                let deadline = Instant::now() + Duration::from_secs(120);
-                let funding_txids = loop {
-                    let new_txids: Vec<_> = bitcoind
-                        .client
-                        .get_raw_mempool()
-                        .unwrap()
-                        .into_iter()
-                        .filter(|txid| !mempool_before.contains(txid))
-                        .collect();
-                    if new_txids.len() == 3 {
-                        break new_txids;
+                let funding_txids = wait_for!(
+                    Duration::from_secs(120),
+                    every Duration::from_millis(100),
+                    "the 3 funding txs in the mempool",
+                    {
+                        let new_txids: Vec<_> = bitcoind
+                            .client
+                            .get_raw_mempool()
+                            .unwrap()
+                            .into_iter()
+                            .filter(|txid| !mempool_before.contains(txid))
+                            .collect();
+                        (new_txids.len() == 3).then_some(new_txids)
                     }
-                    assert!(
-                        Instant::now() < deadline,
-                        "funding never reached the mempool"
-                    );
-                    thread::sleep(Duration::from_millis(100));
-                };
+                );
                 let height = bitcoind.client.get_block_count().unwrap();
                 info!("Holding taker funding unconfirmed for 30 seconds at height {height}");
                 // The maker's pending connection deadline is 20 seconds in
@@ -142,13 +135,10 @@ fn run_multi_confirm_swap(
     world.sync_makers();
 
     // Verify the requested confirmation count and that route heartbeats ran.
-    world.framework().assert_log(
-        &format!("Waiting for {required_confirms} confirmation(s)"),
-        &log_path,
-    );
-    world
-        .framework()
-        .assert_log("Taker is waiting for funding confirmation", &log_path);
+    assert_log!(world; {
+        has format!("Waiting for {required_confirms} confirmation(s)"),
+        has "Taker is waiting for funding confirmation",
+    });
 
     // Waiting longer must not change what the swap costs.
     let (taker_swap, taker_loss, maker_regular, maker_swap) = match protocol {

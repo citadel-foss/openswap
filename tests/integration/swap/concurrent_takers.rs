@@ -156,9 +156,7 @@ fn concurrent_takers(
     // With limited liquidity, we expect one to succeed and one to fail.
     // Both are admitted; the loser's maker runs out of coins at funding.
     assert_eq!(success_count, 1, "Exactly one taker should succeed");
-    world
-        .framework()
-        .assert_log("InsufficientLiquidity", &world.taker_log_path());
+    assert_log!(world; { has "InsufficientLiquidity" });
     assert_eq!(
         completed_count, 2,
         "Both takers should have completed (success or failure)"
@@ -277,9 +275,7 @@ fn funding_race_has_one_winner(world: &mut World) {
 
     // Maker-side: the loser's planned coin was taken and no free coin could
     // replace it, proving both swaps raced on identical plans.
-    world
-        .framework()
-        .assert_log("InsufficientLiquidity", &world.taker_log_path());
+    assert_log!(world; { has "InsufficientLiquidity" });
 
     // No reservation may leak from the lost funding race: the same maker
     // still serves the losing taker's later swap. The amount must fit the
@@ -371,7 +367,7 @@ fn funding_conflict_replans_onto_free_coins(world: &mut World) {
         results.iter().all(|r| r.load(Relaxed) == RESULT_SUCCESS),
         "both swaps must complete: the second maker re-plans onto its free coin"
     );
-    assert_logged!(world, "a planned coin went to another swap");
+    assert_log!(world; { has "a planned coin went to another swap" });
     assert_eq!(
         world.makers()[0].inner().reserved_inputs().unwrap(),
         0,

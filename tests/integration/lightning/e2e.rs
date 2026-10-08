@@ -4,7 +4,7 @@
 //! paired `MockLightningBackend` whose two handles behave like two separate
 //! nodes sharing a payment network.
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
@@ -69,9 +69,11 @@ fn lightning_submarine_swaps_e2e(world: &mut World) {
 
     // The maker learned the preimage and swept the HTLC: its claim spends
     // the funding outpoint. Give the sweep a moment to reach the chain.
-    let mut swept = false;
-    for _ in 0..60 {
-        let outpoint_unspent = bitcoind
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(1),
+        "the maker to sweep the swap-in HTLC via the hashlock",
+        bitcoind
             .client
             .get_tx_out(
                 &swap_in.funding_outpoint.txid,
@@ -79,14 +81,8 @@ fn lightning_submarine_swaps_e2e(world: &mut World) {
                 Some(false),
             )
             .unwrap()
-            .is_some();
-        if !outpoint_unspent {
-            swept = true;
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    assert!(swept, "maker must sweep the swap-in HTLC via the hashlock");
+            .is_none()
+    );
 
     // ---- Swap-out: taker pays Lightning, gains on-chain BTC ----
     let swap_out = taker
@@ -101,21 +97,18 @@ fn lightning_submarine_swaps_e2e(world: &mut World) {
     let claim_txid = swap_out.claim_txid.expect("swap-out produces a claim tx");
 
     // The taker's claim must confirm (the framework mines continuously).
-    let mut confirmed = false;
-    for _ in 0..60 {
-        let confs = bitcoind
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(1),
+        "the taker's swap-out claim to confirm",
+        bitcoind
             .client
             .get_raw_transaction_info(&claim_txid, None)
             .ok()
             .and_then(|info| info.confirmations)
-            .unwrap_or(0);
-        if confs >= 1 {
-            confirmed = true;
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    assert!(confirmed, "taker's swap-out claim must confirm");
+            .unwrap_or(0)
+            >= 1
+    );
 
     // Both swaps fully resolved: no taker-side recovery records remain.
     let outcomes = taker.recover_lightning_swaps().unwrap();

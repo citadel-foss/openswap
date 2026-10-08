@@ -8,7 +8,7 @@ use openswap::{protocol::common_messages::MakerToTakerMessage, taker::SwapParams
 use crate::test_framework::*;
 
 use log::info;
-use std::{fs, thread, time::Duration};
+use std::{thread, time::Duration};
 
 /// One fee override per maker, as `(base_fee, amount_relative_fee_pct)`.
 fn fees(overrides: &[(u64, f64)]) -> Vec<Option<MakerFeeOverride>> {
@@ -99,52 +99,22 @@ fn heterogeneous_substitution_aborts_without_cascade(world: &mut World, params: 
         .expect_err("swap must abort on the spare shape mismatch");
     info!("Swap aborted as expected: {:?}", err);
 
-    // Snapshot once: assert_log echoes its needle into the same file, which
-    // would poison the substitution count.
-    let taker_log = world.taker_log_path();
-    let taker_log_contents = fs::read_to_string(&taker_log).unwrap();
-    assert!(
-        taker_log_contents
-            .contains("forwards a different shape than the failed maker; aborting swap"),
-        "the swap must abort on the spare shape mismatch"
-    );
-
-    // Exactly one spare is popped; the second stays unused. The pre-fix cascade
-    // re-negotiated downstream and burned spares until none were left.
-    assert_eq!(
-        taker_log_contents
-            .matches("Pre-funding exchange failure, substituting maker 0 with spare")
-            .count(),
-        1,
-        "exactly one spare substitution must be attempted"
-    );
-    assert!(
-        !taker_log_contents.contains("no spare makers available"),
-        "the swap must not cascade into exhausting the spare pool"
-    );
-
-    // No downstream maker was re-negotiated: no param-mismatch rejection
-    // logged. All process logs (maker modules included) land in this one file;
-    // the maker-side admission line proves they are captured here.
-    assert!(
-        taker_log_contents.contains("Accepting swap"),
-        "maker admission logs should be captured in this file"
-    );
-    assert!(
-        taker_log_contents.contains(&format!(
-            "[{}] Accepting swap",
-            world.makers()[3].inner().config.network_port
-        )),
-        "the cheaper maker3 spare must be selected first"
-    );
-    assert!(
-        !taker_log_contents.contains("parameters differ from stored swap"),
-        "a downstream maker was re-negotiated with different terms"
-    );
-    assert!(
-        !taker_log_contents.contains("SwapParamMismatch"),
-        "a downstream maker rejected re-negotiated terms"
-    );
+    let spare_port = world.makers()[3].inner().config.network_port;
+    assert_log!(world; {
+        has "forwards a different shape than the failed maker; aborting swap",
+        // Exactly one spare is popped; the second stays unused. The pre-fix
+        // cascade re-negotiated downstream and burned spares until none were left.
+        count("Pre-funding exchange failure, substituting maker 0 with spare") == 1,
+        lacks "no spare makers available",
+        // All process logs (maker modules included) land in this one file; the
+        // maker-side admission line proves they are captured here.
+        has "Accepting swap",
+        // The cheaper maker3 spare is selected first.
+        has format!("[{}] Accepting swap", spare_port),
+        // No downstream maker was re-negotiated: no param-mismatch rejection.
+        lacks "parameters differ from stored swap",
+        lacks "SwapParamMismatch",
+    });
 
     // Hop 1 still honors the originally admitted terms after the abort.
     match world
@@ -219,20 +189,11 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing(world: &mut World, param
         .expect_err("swap must abort on the last-hop price guard");
     info!("Swap aborted as expected: {:?}", err);
 
-    // Snapshot once: assert_log echoes its needle into the same file.
-    let taker_log = world.taker_log_path();
-    let taker_log_contents = fs::read_to_string(&taker_log).unwrap();
-    assert!(
-        taker_log_contents.contains("sats where the failed maker forwarded"),
-        "the last-hop price guard must abort the swap"
-    );
-    assert_eq!(
-        taker_log_contents
-            .matches("Substituting maker 1 with spare")
-            .count(),
-        1,
-        "exactly one spare substitution must be attempted"
-    );
+    assert_log!(world; {
+        // The last-hop price guard aborted the swap.
+        has "sats where the failed maker forwarded",
+        count("Substituting maker 1 with spare") == 1,
+    });
 
     // The taker broadcast its funding before the drop, so it recovers via
     // timelock: 225-block outer hop plus scheduling margin, mirroring
@@ -290,19 +251,11 @@ fn last_hop_equal_priced_spare_completes(world: &mut World, params: SwapParams) 
         .start(&summary.swap_id)
         .expect("Swap with an equally priced spare must complete");
 
-    let taker_log = world.taker_log_path();
-    let taker_log_contents = fs::read_to_string(&taker_log).unwrap();
-    assert_eq!(
-        taker_log_contents
-            .matches("Substituting maker 1 with spare")
-            .count(),
-        1,
-        "the spare must be substituted exactly once"
-    );
-    assert!(
-        !taker_log_contents.contains("sats where the failed maker forwarded"),
-        "the price guard must not fire for an equally priced spare"
-    );
+    assert_log!(world; {
+        count("Substituting maker 1 with spare") == 1,
+        // The price guard does not fire for an equally priced spare.
+        lacks "sats where the failed maker forwarded",
+    });
 
     world.taker().sync();
 

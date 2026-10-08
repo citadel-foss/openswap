@@ -8,7 +8,7 @@
 //! `MockLightningBackend`, so maker 1's payment really parks at maker 2 and
 //! its settlement really releases the preimage back to maker 1.
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
@@ -72,28 +72,27 @@ fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) 
     assert!(report.first_fee.to_sat() >= 500 && report.second_fee.to_sat() >= 500);
 
     // The taker's claim of hop 2 must confirm.
-    let mut confirmed = false;
-    for _ in 0..60 {
-        let confs = bitcoind
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(1),
+        "the taker's hop-2 claim to confirm",
+        bitcoind
             .client
             .get_raw_transaction_info(&report.claim_txid, None)
             .ok()
             .and_then(|info| info.confirmations)
-            .unwrap_or(0);
-        if confs >= 1 {
-            confirmed = true;
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    assert!(confirmed, "taker's hop-2 claim must confirm");
+            .unwrap_or(0)
+            >= 1
+    );
 
     // Maker 1 learned the preimage over Lightning and swept hop 1: its
     // funding outpoint stops being spendable. This is the proof the three
     // legs shared one preimage.
-    let mut swept = false;
-    for _ in 0..90 {
-        let unspent = bitcoind
+    wait_until!(
+        Duration::from_secs(90),
+        every Duration::from_secs(1),
+        "the first maker to sweep hop 1 with the learned preimage",
+        bitcoind
             .client
             .get_tx_out(
                 &report.funding_outpoint.txid,
@@ -101,16 +100,7 @@ fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) 
                 Some(false),
             )
             .unwrap()
-            .is_some();
-        if !unspent {
-            swept = true;
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    assert!(
-        swept,
-        "first maker must sweep hop 1 with the learned preimage"
+            .is_none()
     );
 
     // Maker 1 must have bounded the Lightning route's CLTV budget rather
