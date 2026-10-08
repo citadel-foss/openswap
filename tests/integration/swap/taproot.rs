@@ -1,4 +1,3 @@
-use bitcoin::Amount;
 use openswap::taker::SwapParams;
 
 use crate::test_framework::*;
@@ -12,20 +11,17 @@ use log::info;
     takers = [Normal],
     setup = [
         // 3 x 0.05 BTC P2TR for the taker, 4 x 0.05 BTC for each maker.
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         // Spawn, wait for setup, then sync so the fidelity bonds count.
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
     ],
     swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn taproot_two_maker_swap_completes(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-    params: SwapParams,
-) {
+fn taproot_two_maker_swap_completes(world: &mut World, params: SwapParams) {
+    let before = world.balances();
+
     log::info!("Starting end-to-end taproot swap test...");
 
     // Mine some blocks before the swap to ensure wallet is ready
@@ -45,66 +41,18 @@ fn taproot_two_maker_swap_completes(
     // Mine a block to confirm the sweep transactions
     world.mine(1);
 
-    for maker in world.makers() {
-        maker.sync();
-    }
+    world.sync_makers();
 
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taproot Taker balance after swap: Regular: {}, Contract: {}, Spendable: {}, Swap: {}",
-        taker_balances.regular,
-        taker_balances.contract,
-        taker_balances.spendable,
-        taker_balances.swap,
-    );
-
-    BalanceExpect {
-        regular: Some(Is::Sats(14499538)),
-        swap: Some(Is::Sats(496789)),
-        contract: Some(Is::Sats(0)),
-        fidelity: Some(Is::Amount(Amount::ZERO)),
-        spendable: None,
-        delta: Some(Delta::Loss {
-            baseline: taker_original_balance,
-            style: DiffStyle::CheckedUnwrap,
-            sats: 3673,
-        }),
-    }
-    .assert("Taker", &taker_balances);
-
-    // Verify makers earned fees. Their wallets were synced above and are read
-    // as they stand.
-    let expected_regular = [14500751, 14502170];
-    let expected_swap = [499664, 498208];
-    let expected_fee = [658, 621];
-    for (i, (maker, original_spendable)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        let balances = maker.balances();
-
-        info!(
-            "Taproot Maker {} final balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i, balances.regular, balances.swap, balances.contract, balances.fidelity, balances.spendable,
-        );
-
-        BalanceExpect {
-            regular: Some(Is::Sats(expected_regular[i])),
-            swap: Some(Is::Sats(expected_swap[i])),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: None,
-            delta: Some(Delta::Gain {
-                baseline: original_spendable,
-                style: DiffStyle::UnwrapOrZero,
-                sats: expected_fee[i],
-            }),
-        }
-        .assert(&format!("Maker {i}"), &balances);
-    }
+    assert_balances!(world, since before; {
+        taker: { regular: 14_499_538, swap: 496_789, contract: 0, fidelity: 0, loss: 3_673 },
+        makers: {
+            regular: [14_500_751, 14_502_170],
+            swap: [499_664, 498_208],
+            contract: 0,
+            fidelity: BOND,
+            gain: [658, 621],
+        },
+    });
 
     // Every swap tx must pay the negotiated 1 sat/vB: funding txs price their
     // real vsize; sweeps pay the 112 vB taproot key-path model they were built

@@ -52,11 +52,9 @@ fn concurrent_takers(
 ) {
     // Fund each taker thrice with one 0.05 BTC UTXO (0.15 total), one per call so
     // each lands on a distinct address.
-    let mut taker1_original_balance = Amount::ZERO;
-    let mut taker2_original_balance = Amount::ZERO;
     for _ in 0..3 {
-        taker1_original_balance = world.fund_nth_taker_default(0, 1);
-        taker2_original_balance = world.fund_nth_taker_default(1, 1);
+        world.fund_nth_taker_default(0, 1);
+        world.fund_nth_taker_default(1, 1);
     }
     world.fund_makers(1, Amount::from_sat(5_500_000), AddressType::P2TR);
     for _ in 0..3 {
@@ -67,21 +65,6 @@ fn concurrent_takers(
     // fidelity bonds are accounted for
     log::info!("Starting Maker servers...");
     world.start_makers(120);
-
-    // Collect pre-swap spendable balances (skip standard assertions since we use limited liquidity)
-    let maker_spendable_balance: Vec<Amount> = world
-        .makers()
-        .iter()
-        .enumerate()
-        .map(|(i, maker)| {
-            let balances = maker.balances();
-            info!(
-                "Maker {} pre-swap: Regular: {}, Fidelity: {}, Spendable: {}",
-                i, balances.regular, balances.fidelity, balances.spendable
-            );
-            balances.spendable
-        })
-        .collect();
 
     // ---- Concurrent Swaps ----
     log::info!(
@@ -190,80 +173,19 @@ fn concurrent_takers(
 
     world.mine(1);
 
-    for maker in world.makers() {
-        maker.sync();
-    }
+    world.sync_makers();
 
     // ---- Verify balances ----
-    let results = [r1, r2];
-    for (i, taker) in world.takers().iter().enumerate() {
-        let taker_balances = taker.balances();
-        let original = if i == 0 {
-            taker1_original_balance
-        } else {
-            taker2_original_balance
-        };
-        info!(
-            "Taker {} balance: Original: {}, After: {}, Contract: {}",
-            i, original, taker_balances.spendable, taker_balances.contract
-        );
-
-        if results[i] == RESULT_SUCCESS {
-            assert_eq!(
-                taker_balances.contract,
-                Amount::ZERO,
-                "Taker {}: Successful swap should have no contract balance",
-                i
-            );
-        } else {
-            // Failed taker may have outgoing contract UTXOs on-chain if the
-            // failure occurred after contract broadcast. These are the taker's
-            // own funds, recoverable via timelock.
-            info!(
-                "Taker {}: Failed swap has {} contract balance (recoverable via timelock)",
-                i, taker_balances.contract
-            );
-        }
-    }
-
-    // Verify maker balances
-    for (i, (maker, original_spendable)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        let balances = maker.balances();
-
-        info!(
-            "Maker {} final balances - Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i, balances.regular, balances.swap, balances.contract, balances.fidelity, balances.spendable,
-        );
-
-        assert_eq!(
-            balances.contract,
-            Amount::ZERO,
-            "Maker {}: Contract balance should be zero after swaps",
-            i
-        );
-
-        // With the lower fee schedule, the earned maker fee does not fully
-        // offset on-chain spend costs in this limited-liquidity scenario.
-        if success_count > 0 {
-            assert_eq!(
-                balances.spendable.to_sat(),
-                expected_maker_spendable[i],
-                "Maker {}: Unexpected spendable balance",
-                i
-            );
-        } else {
-            assert_eq!(
-                balances.spendable, original_spendable,
-                "Maker {}: Spendable balance should be unchanged",
-                i
-            );
-        }
-    }
+    // A failed taker may have outgoing contract UTXOs on-chain if the failure
+    // occurred after contract broadcast. These are the taker's own funds,
+    // recoverable via timelock, so only the winner's contract is checked.
+    // With the lower fee schedule, the earned maker fee does not fully offset
+    // on-chain spend costs in this limited-liquidity scenario.
+    let winner_contract = [r1, r2].map(|r| (r == RESULT_SUCCESS).then_some(0u64));
+    assert_balances!(world; {
+        takers: { contract: winner_contract },
+        makers: { contract: 0, spendable: expected_maker_spendable },
+    });
 
     info!(
         "All concurrent taker swap tests ({:?}) completed successfully!",
@@ -382,18 +304,9 @@ fn funding_race_has_one_winner(world: &mut World) {
         retry_report.swap_id
     );
 
+    world.sync_makers();
+    assert_balances!(world; { makers: { contract: 0 } });
     for maker in world.makers() {
-        maker.sync();
-        let balances = maker.balances();
-        info!(
-            "Maker final balances - Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            balances.regular, balances.swap, balances.contract, balances.spendable
-        );
-        assert_eq!(
-            balances.contract,
-            Amount::ZERO,
-            "Maker must hold no contract balance after both swaps settle"
-        );
         // The retry only proves the maker can serve again. A reservation that
         // leaked on inputs the retry never needed would still let it through.
         assert_eq!(

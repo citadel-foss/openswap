@@ -3,7 +3,6 @@
 //! maker's terms, must abort the swap rather than renegotiate or re-price; an
 //! equally priced spare completes it.
 
-use bitcoin::Amount;
 use openswap::{protocol::common_messages::MakerToTakerMessage, taker::SwapParams};
 
 use crate::test_framework::*;
@@ -37,20 +36,17 @@ fn fees(overrides: &[(u64, f64)]) -> Vec<Option<MakerFeeOverride>> {
     maker_behaviors = [CloseAtReqContractSigsForSender, Normal, Normal, Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
         mine(1),
     ],
     swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn heterogeneous_substitution_aborts_without_cascade(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-    params: SwapParams,
-) {
+fn heterogeneous_substitution_aborts_without_cascade(world: &mut World, params: SwapParams) {
+    let before = world.balances();
+
     let summary = world
         .taker_mut()
         .prepare(params)
@@ -166,37 +162,11 @@ fn heterogeneous_substitution_aborts_without_cascade(
 
     // Nothing reached the chain: every maker keeps its pre-swap balance.
     world.mine(1);
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        maker.sync();
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances: original={}, after={}",
-            i, original, balances.spendable
-        );
-        assert_eq!(
-            balances.spendable, original,
-            "Maker {} balance moved though nothing was broadcast",
-            i
-        );
-        assert_eq!(balances.contract, Amount::ZERO);
-    }
-
-    world.taker().sync();
-    let taker_balances = world.taker().balances();
-    info!(
-        "Taker balance: original={}, after={}",
-        taker_original_balance, taker_balances.spendable
-    );
-    assert_eq!(
-        taker_balances.spendable, taker_original_balance,
-        "Taker balance moved though nothing was broadcast"
-    );
-    assert_eq!(taker_balances.contract, Amount::ZERO);
+    world.sync_all();
+    assert_balances!(world, since before; {
+        taker: { contract: 0, loss: 0 },
+        makers: { contract: 0, gain: 0 },
+    });
 
     info!("heterogeneous_substitution_aborts_without_cascade completed successfully!");
 }
@@ -215,20 +185,17 @@ fn heterogeneous_substitution_aborts_without_cascade(
     maker_behaviors = [Normal, CloseAtReqContractSigsForSender, Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
         mine(1),
     ],
     swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn last_hop_expensive_spare_aborts_instead_of_repricing(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-    params: SwapParams,
-) {
+fn last_hop_expensive_spare_aborts_instead_of_repricing(world: &mut World, params: SwapParams) {
+    let before = world.balances();
+
     let summary = world
         .taker_mut()
         .prepare(params)
@@ -278,49 +245,18 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing(
     world.mine(1);
     world.taker().sync();
 
-    let taker_balances = world.taker().balances();
-    let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
-        .unwrap_or(Amount::ZERO);
-    info!(
-        "Taker after recovery: spendable={}, contract={}, lost to miner fees={}",
-        taker_balances.spendable, taker_balances.contract, balance_diff
-    );
-    // Recovery returns everything but the miner fees of the funding and
-    // refund transactions; no maker fee was earned by anyone.
-    assert_eq!(taker_balances.contract, Amount::ZERO);
-    assert_eq!(taker_balances.swap, Amount::ZERO);
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-    // Pinned from a real run: 3 funding txs + 3 timelock refunds at 1 sat/vB.
-    assert_eq!(
-        taker_balances.spendable.to_sat(),
-        14998662,
-        "Taker spendable after recovery mismatch"
-    );
-
     // No maker broadcast anything: the drop fired before the taker relayed
     // combined sigs, so every maker returns to its pre-swap balance.
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        maker.sync();
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances after recovery: original={}, after={}",
-            i, original, balances.spendable
-        );
-        assert_eq!(
-            balances.spendable, original,
-            "Maker {} balance moved though it never funded",
-            i
-        );
-        assert_eq!(balances.contract, Amount::ZERO);
-        assert_eq!(balances.swap, Amount::ZERO);
-        assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-    }
+    world.sync_makers();
+
+    // Recovery returns everything but the miner fees of the funding and
+    // refund transactions; no maker fee was earned by anyone. The taker's
+    // spendable is pinned from a real run: 3 funding txs + 3 timelock refunds
+    // at 1 sat/vB.
+    assert_balances!(world, since before; {
+        taker: { spendable: 14_998_662, swap: 0, contract: 0, fidelity: 0 },
+        makers: { swap: 0, contract: 0, fidelity: BOND, gain: 0 },
+    });
 
     info!("last_hop_expensive_spare_aborts_instead_of_repricing completed successfully!");
 }
@@ -335,20 +271,15 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing(
     maker_behaviors = [Normal, CloseAtReqContractSigsForSender, Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
         mine(1),
     ],
     swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn last_hop_equal_priced_spare_completes(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-    params: SwapParams,
-) {
+fn last_hop_equal_priced_spare_completes(world: &mut World, params: SwapParams) {
     let summary = world
         .taker_mut()
         .prepare(params)
@@ -379,44 +310,14 @@ fn last_hop_equal_priced_spare_completes(
 
     world.sync_makers();
 
-    let taker_balances = world.taker().balances();
-    info!(
-        "Taker balance: original={}, after={}",
-        taker_original_balance, taker_balances.spendable
-    );
-    // Pinned from a real run: both selected hops use the cheap fee schedule.
-    assert_eq!(
-        taker_balances.spendable.to_sat(),
-        14996805,
-        "Taker spendable balance mismatch"
-    );
-    assert_eq!(taker_balances.contract, Amount::ZERO);
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-
     // maker0 and maker2 (the spare) ran the route; maker1 dropped before
     // funding anything and keeps its pre-swap balance. Pinned from a real run:
-    // hop 0 earns the default schedule, the spare earns the cheap one.
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances: original={}, after={}",
-            i, original, balances.spendable
-        );
-        let expected_spendable = [15000005u64, 14999757, 14999968][i];
-        assert_eq!(
-            balances.spendable.to_sat(),
-            expected_spendable,
-            "Maker {} spendable balance mismatch",
-            i
-        );
-        assert_eq!(balances.contract, Amount::ZERO);
-        assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-    }
+    // both selected hops use the cheap fee schedule for the taker; hop 0 earns
+    // the default schedule, the spare earns the cheap one.
+    assert_balances!(world; {
+        taker: { spendable: 14_996_805, contract: 0, fidelity: 0 },
+        makers: { spendable: [15_000_005, 14_999_757, 14_999_968], contract: 0, fidelity: BOND },
+    });
 
     info!("last_hop_equal_priced_spare_completes completed successfully!");
 }

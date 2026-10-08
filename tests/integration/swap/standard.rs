@@ -20,17 +20,15 @@ use std::{fs, thread, time::Duration};
     maker_behaviors = [Normal, Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
     ],
 )]
-fn legacy_two_maker_swap_completes(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-) {
+fn legacy_two_maker_swap_completes(world: &mut World) {
+    let before = world.balances();
+
     // Only 2 makers are running, so a 3-hop route must fail at discovery
     // before any funds are committed.
     let too_many_hops = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 3)
@@ -63,78 +61,20 @@ fn legacy_two_maker_swap_completes(
 
     info!("All openswaps processed successfully. Transaction complete.");
 
-    // Sync wallets
     world.taker().sync();
-
     world.mine(1);
+    world.sync_makers();
 
-    for maker in world.makers() {
-        maker.sync();
-    }
-
-    // Verify taker balances
-    info!("Verifying swap results");
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taker balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
-    BalanceExpect {
-        regular: Some(Is::Sats(14499538)),
-        swap: Some(Is::Sats(496447)),
-        contract: Some(Is::Sats(0)),
-        fidelity: Some(Is::Amount(Amount::ZERO)),
-        spendable: None,
-        delta: Some(Delta::Loss {
-            baseline: taker_original_balance,
-            style: DiffStyle::CheckedUnwrap,
-            sats: 4015,
-        }),
-    }
-    .assert("Taker", &taker_balances);
-
-    // Verify maker balances
-    let expected_regular = [14500865u64, 14502398];
-    let expected_swap = [499550u64, 497980];
-    let expected_fee = [658u64, 621];
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        maker.sync();
-        let balances = maker.balances();
-
-        info!(
-            "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i,
-            balances.regular,
-            balances.swap,
-            balances.contract,
-            balances.fidelity,
-            balances.spendable,
-        );
-
-        BalanceExpect {
-            regular: Some(Is::Sats(expected_regular[i])),
-            swap: Some(Is::Sats(expected_swap[i])),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: None,
-            delta: Some(Delta::Gain {
-                baseline: original,
-                style: DiffStyle::UnwrapOrZero,
-                sats: expected_fee[i],
-            }),
-        }
-        .assert(&format!("Maker {i}"), &balances);
-    }
+    assert_balances!(world, since before; {
+        taker: { regular: 14_499_538, swap: 496_447, contract: 0, fidelity: 0, loss: 4_015 },
+        makers: {
+            regular: [14_500_865, 14_502_398],
+            swap: [499_550, 497_980],
+            contract: 0,
+            fidelity: BOND,
+            gain: [658, 621],
+        },
+    });
 
     // Every swap tx must pay the negotiated 1 sat/vB: funding txs price their
     // real vsize; sweeps pay the 150 vB legacy spend model they were built at.
@@ -181,7 +121,7 @@ fn legacy_two_maker_swap_completes(
     maker_behaviors = [Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         spawn_ready_makers_and_mine(),
     ],
@@ -202,11 +142,11 @@ fn legacy_two_maker_swap_completes(
 )]
 fn run_swap_with_custom_feerate(
     world: &mut World,
-    taker_original_balance: Amount,
     protocol: ProtocolVersion,
     expected_fee_paid: u64,
     sweep_vsize_model: u64,
 ) {
+    let before = world.balances();
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
@@ -220,18 +160,14 @@ fn run_swap_with_custom_feerate(
 
     world.mine(1);
     world.taker().sync();
-    let balances = world.taker().balances();
-    let fee_paid = taker_original_balance
-        .checked_sub(balances.spendable)
-        .unwrap();
-    info!("Taker fee at 3 sats/vB: {} sats", fee_paid.to_sat());
     // Pinned from a real run: the two cooperative sweeps pay the bare sweep
     // vsize model at the negotiated 3 sats/vB rate.
-    assert_eq!(
-        fee_paid.to_sat(),
-        expected_fee_paid,
-        "custom feerate cost mismatch"
-    );
+    assert_balances!(world, since before; { taker: { loss: expected_fee_paid } });
+    let fee_paid = before.takers[0]
+        .spendable
+        .checked_sub(world.taker().balances().spendable)
+        .unwrap();
+    info!("Taker fee at 3 sats/vB: {} sats", fee_paid.to_sat());
     assert!(
         fee_paid.to_sat() > 2_000,
         "a 3 sat/vB swap must cost clearly more than the floor rate"
@@ -277,18 +213,16 @@ fn run_swap_with_custom_feerate(
     maker_behaviors = [Normal],
     takers = [SkipFundingConfirmWait],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
         mine(1),
     ],
 )]
-fn taproot_swap_survives_unconfirmed_confirmation_wait(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-) {
+fn taproot_swap_survives_unconfirmed_confirmation_wait(world: &mut World) {
+    let before = world.balances();
+
     // The taker skips its own confirmation wait, so its contract data reaches
     // the maker unconfirmed and parks the maker in its wait.
     let swap_params =
@@ -339,7 +273,8 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait(
     world.mine(1);
     taker.sync();
     let taker_balances = taker.balances();
-    let fee_paid = taker_original_balance
+    let fee_paid = before.takers[0]
+        .spendable
         .checked_sub(taker_balances.spendable)
         .unwrap();
     info!(
@@ -347,8 +282,8 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait(
         taker_balances.spendable, fee_paid
     );
     // Pinned from a real run: one maker, two splits, all at the 1 sat/vB floor.
-    // Spendable is checked ahead of contract and fidelity here, which is not
-    // BalanceExpect's field order, so these stay plain asserts.
+    // The taker left the world for the swap thread, so `assert_balances!`
+    // cannot see it and these stay plain asserts.
     assert_eq!(
         taker_balances.spendable.to_sat(),
         14998326,
@@ -367,28 +302,14 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait(
 
     let maker = &world.makers()[0];
     maker.sync();
-    let maker_balances = maker.balances();
-    let maker_fee = maker_balances
+    let maker_fee = maker
+        .balances()
         .spendable
-        .checked_sub(maker_spendable_balance[0])
+        .checked_sub(before.makers[0].spendable)
         .unwrap_or(Amount::ZERO);
     info!("Maker fee earned across the pause: {} sats", maker_fee);
     // Pinned from a real run: pre-swap 14999757 + the 610 sats hop fee.
-    assert_eq!(
-        maker_balances.spendable.to_sat(),
-        15000367,
-        "Maker spendable balance mismatch"
-    );
-    assert_eq!(
-        maker_balances.contract,
-        Amount::ZERO,
-        "Maker contract balance mismatch"
-    );
-    assert_eq!(
-        maker_balances.fidelity,
-        Amount::from_btc(0.05).unwrap(),
-        "Maker fidelity balance mismatch"
-    );
+    assert_balances!(world; { maker: { spendable: 15_000_367, contract: 0, fidelity: BOND } });
 
     info!("taproot_swap_survives_unconfirmed_confirmation_wait completed successfully!");
 

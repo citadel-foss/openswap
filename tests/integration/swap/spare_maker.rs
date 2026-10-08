@@ -13,8 +13,6 @@ use openswap::{
 
 use crate::test_framework::*;
 
-use log::info;
-
 /// The balances one spare-maker test asserts after the swap.
 struct SpareMakerExpect {
     taker_spendable: u64,
@@ -74,7 +72,7 @@ fn complete_with_spare(
     expected: &SpareMakerExpect,
 ) {
     // Fund the taker with 3 UTXOs of 0.05 BTC each
-    let taker_original_balance = world.fund_taker_default(3);
+    world.fund_taker_default(3);
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
     world.fund_makers_default();
@@ -84,7 +82,7 @@ fn complete_with_spare(
     log::info!("Starting Maker servers...");
     world.start_makers(120);
 
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
+    world.verify_maker_pre_swap_balances();
 
     let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -109,54 +107,10 @@ fn complete_with_spare(
 
     world.sync_makers();
 
-    // Verify taker balance. Spendable is checked ahead of contract and
-    // fidelity in this family, which is not BalanceExpect's field order, so
-    // these stay plain asserts.
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taker balance: original={}, after={}",
-        taker_original_balance, taker_balances.spendable
-    );
-
-    assert_eq!(
-        taker_balances.spendable.to_sat(),
-        expected.taker_spendable,
-        "Taker spendable balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.contract.to_sat(),
-        0,
-        "Taker contract balance mismatch"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-
-    // Verify makers earned fees (only the two that participated)
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances: original={}, after={}",
-            i, original, balances.spendable
-        );
-        assert_eq!(
-            balances.spendable.to_sat(),
-            expected.maker_spendable[i],
-            "Maker {} spendable balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.contract.to_sat(),
-            0,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-    }
+    assert_balances!(world; {
+        taker: { spendable: expected.taker_spendable, contract: 0, fidelity: 0 },
+        makers: { spendable: expected.maker_spendable, contract: 0, fidelity: BOND },
+    });
 }
 
 /// The middle maker drops before sending the sender's sigs; the taker

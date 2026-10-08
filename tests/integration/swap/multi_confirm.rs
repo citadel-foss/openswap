@@ -31,10 +31,10 @@ const REQUIRED_CONFIRMS: u32 = 15;
     maker_behaviors = [Normal, Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
     ],
     cases = [
         legacy_multi_confirm_swap(
@@ -57,11 +57,10 @@ const REQUIRED_CONFIRMS: u32 = 15;
 )]
 fn run_multi_confirm_swap(
     world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
     protocol: ProtocolVersion,
     delay_first_confirmation: bool,
 ) {
+    let before = world.balances();
     let required_confirms = if delay_first_confirmation {
         1
     } else {
@@ -151,80 +150,21 @@ fn run_multi_confirm_swap(
         .framework()
         .assert_log("Taker is waiting for funding confirmation", &log_path);
 
-    let taker_balances = world.taker().balances();
-    info!(
-        "Taker balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
     // Waiting longer must not change what the swap costs.
-    let expected_taker_regular = 14499538;
-    let expected_taker_swap = match protocol {
-        ProtocolVersion::Legacy => 496447,
-        ProtocolVersion::Taproot => 496789,
+    let (taker_swap, taker_loss, maker_regular, maker_swap) = match protocol {
+        ProtocolVersion::Legacy => (496_447, 4_015, [14_500_865, 14_502_398], [499_550, 497_980]),
+        ProtocolVersion::Taproot => (496_789, 3_673, [14_500_751, 14_502_170], [499_664, 498_208]),
     };
-    let expected_diff = match protocol {
-        ProtocolVersion::Legacy => 4015,
-        ProtocolVersion::Taproot => 3673,
-    };
-    BalanceExpect {
-        regular: Some(Is::Sats(expected_taker_regular)),
-        swap: Some(Is::Sats(expected_taker_swap)),
-        contract: Some(Is::Sats(0)),
-        fidelity: Some(Is::Amount(Amount::ZERO)),
-        spendable: None,
-        delta: Some(Delta::Loss {
-            baseline: taker_original_balance,
-            style: DiffStyle::CheckedUnwrap,
-            sats: expected_diff,
-        }),
-    }
-    .assert("Taker", &taker_balances);
-
-    let expected_regular = match protocol {
-        ProtocolVersion::Legacy => [14500865, 14502398],
-        ProtocolVersion::Taproot => [14500751, 14502170],
-    };
-    let expected_swap = match protocol {
-        ProtocolVersion::Legacy => [499550, 497980],
-        ProtocolVersion::Taproot => [499664, 498208],
-    };
-    let expected_fee = [658, 621];
-
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i,
-            balances.regular,
-            balances.swap,
-            balances.contract,
-            balances.fidelity,
-            balances.spendable,
-        );
-
-        BalanceExpect {
-            regular: Some(Is::Sats(expected_regular[i])),
-            swap: Some(Is::Sats(expected_swap[i])),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: None,
-            delta: Some(Delta::Gain {
-                baseline: original,
-                style: DiffStyle::UnwrapOrZero,
-                sats: expected_fee[i],
-            }),
-        }
-        .assert(&format!("Maker {i}"), &balances);
-    }
+    assert_balances!(world, since before; {
+        taker: { regular: 14_499_538, swap: taker_swap, contract: 0, fidelity: 0, loss: taker_loss },
+        makers: {
+            regular: maker_regular,
+            swap: maker_swap,
+            contract: 0,
+            fidelity: BOND,
+            gain: [658, 621],
+        },
+    });
 
     info!("Multi-confirmation swap test completed successfully!");
 }

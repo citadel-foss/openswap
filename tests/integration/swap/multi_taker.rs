@@ -56,11 +56,9 @@ fn run_sequential_multi_taker(
 ) {
     // Fund each taker thrice with one 0.05 BTC UTXO (0.15 total), one per call so
     // each lands on a distinct address and coin_select doesn't group them.
-    let mut taker1_original_balance = Amount::ZERO;
-    let mut taker2_original_balance = Amount::ZERO;
     for _ in 0..3 {
-        taker1_original_balance = world.fund_nth_taker_default(0, 1);
-        taker2_original_balance = world.fund_nth_taker_default(1, 1);
+        world.fund_nth_taker_default(0, 1);
+        world.fund_nth_taker_default(1, 1);
     }
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each, one per call (distinct addresses).
@@ -73,7 +71,8 @@ fn run_sequential_multi_taker(
     log::info!("Starting Maker servers...");
     world.start_makers(120);
 
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
+    world.verify_maker_pre_swap_balances();
+    let before = world.balances();
 
     // ---- Swap 1: First taker ----
     log::info!("Starting swap for Taker 1 ({:?} protocol)...", protocol);
@@ -146,78 +145,23 @@ fn run_sequential_multi_taker(
 
     world.mine(1);
 
-    for maker in world.makers() {
-        maker.sync();
-    }
+    world.sync_makers();
 
-    // ---- Verify both takers ----
-    // Spendable is checked ahead of contract and fidelity here, which is not
-    // BalanceExpect's field order, so these stay plain asserts.
-    for (i, (taker, original)) in world
-        .takers()
-        .iter()
-        .zip([taker1_original_balance, taker2_original_balance])
-        .enumerate()
-    {
-        let n = i + 1;
-        let balances = taker.balances();
-        info!("Taker {} balance after swap ({:?}):", n, protocol);
-
-        let balance_diff = original - balances.spendable;
-        info!(
-            "Taker {} balance verification passed. Original: {}, After: {} (fees paid: {})",
-            n, original, balances.spendable, balance_diff
-        );
-
-        assert_eq!(
-            balances.spendable.to_sat(),
-            expected.taker_spendable[i],
-            "Taker {} spendable balance mismatch",
-            n
-        );
-        assert_eq!(
-            balances.contract.to_sat(),
-            0,
-            "Taker {} contract balance mismatch",
-            n
-        );
-        assert_eq!(balances.fidelity, Amount::ZERO);
-        assert_eq!(
-            balance_diff.to_sat(),
-            expected.taker_fee[i],
-            "Taker {} fee paid mismatch",
-            n
-        );
-    }
-
-    // ---- Verify Makers earned fees ----
-    for (i, (maker, original_spendable)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        let balances = maker.balances();
-
-        info!(
-            "Maker {} final balances - Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i, balances.regular, balances.swap, balances.contract, balances.fidelity, balances.spendable,
-        );
-
-        BalanceExpect {
-            regular: Some(Is::Sats(expected.maker_regular[i])),
-            swap: Some(Is::Sats(expected.maker_swap[i])),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: None,
-            delta: Some(Delta::Gain {
-                baseline: original_spendable,
-                style: DiffStyle::UnwrapOrZero,
-                sats: expected.maker_fee[i],
-            }),
-        }
-        .assert(&format!("Maker {i}"), &balances);
-    }
+    assert_balances!(world, since before; {
+        takers: {
+            spendable: expected.taker_spendable,
+            contract: 0,
+            fidelity: 0,
+            loss: expected.taker_fee,
+        },
+        makers: {
+            regular: expected.maker_regular,
+            swap: expected.maker_swap,
+            contract: 0,
+            fidelity: BOND,
+            gain: expected.maker_fee,
+        },
+    });
 
     info!(
         "All multi-taker swap tests ({:?}) completed successfully!",
