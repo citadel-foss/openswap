@@ -5,7 +5,7 @@ use openswap::{
     blocklist::BlocklistError,
     maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
-    taker::{error::TakerError, SwapParams, TakerBehavior},
+    taker::{error::TakerError, MakerState, SwapParams, TakerBehavior},
     wallet::AddressType,
 };
 
@@ -25,12 +25,22 @@ fn maker_rejects_taproot_funding_from_blocked_address() {
 
 #[test]
 fn taker_rejects_legacy_funding_from_blocked_address() {
-    run_taker_rejection(ProtocolVersion::Legacy);
+    run_taker_rejection(ProtocolVersion::Legacy, 1, 0);
 }
 
 #[test]
 fn taker_rejects_taproot_funding_from_blocked_address() {
-    run_taker_rejection(ProtocolVersion::Taproot);
+    run_taker_rejection(ProtocolVersion::Taproot, 1, 0);
+}
+
+#[test]
+fn taker_rejects_legacy_intermediate_funding_from_blocked_address() {
+    run_taker_rejection(ProtocolVersion::Legacy, 2, 0);
+}
+
+#[test]
+fn taker_rejects_taproot_intermediate_funding_from_blocked_address() {
+    run_taker_rejection(ProtocolVersion::Taproot, 2, 0);
 }
 
 #[test]
@@ -249,10 +259,12 @@ fn run_maker_rejection(protocol: ProtocolVersion) {
     block_generation_handle.join().unwrap();
 }
 
-fn run_taker_rejection(protocol: ProtocolVersion) {
-    let maker_count = 1;
+/// Route `maker_count` makers and list the funding source of the maker at
+/// route position `blocked_maker`. The taker sees every maker's funding while
+/// verifying it, so it must refuse whichever hop is listed, final or not.
+fn run_taker_rejection(protocol: ProtocolVersion, maker_count: usize, blocked_maker: usize) {
     let taker_behaviors = vec![TakerBehavior::Normal];
-    let maker_behaviors = vec![MakerBehavior::Normal];
+    let maker_behaviors = vec![MakerBehavior::Normal; maker_count];
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init_with_blocklist::<BitcoindBackend>(
             maker_count,
@@ -264,61 +276,27 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
 
     fund_taker_default(taker, bitcoind, 3);
 
-    // Reuse one maker address for the initial deposits. Fidelity setup later
-    // consolidates them into the regular UTXO used for swap funding.
-    let maker_deposit_address = makers[0]
-        .wallet
-        .write()
-        .unwrap()
-        .get_next_external_address(AddressType::P2TR)
-        .unwrap();
-    for _ in 0..4 {
-        send_to_address(
+    // Reuse one address per maker for the initial deposits. Fidelity setup
+    // later consolidates them into the regular UTXO used for swap funding.
+    for maker in &makers {
+        fund_maker_from_one_address(
+            maker,
             bitcoind,
-            &maker_deposit_address,
+            4,
             Amount::from_btc(0.05).unwrap(),
+            AddressType::P2TR,
         );
     }
-    generate_blocks(bitcoind, 1);
-    makers[0]
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
-    assert_eq!(
-        makers[0]
-            .wallet
-            .read()
-            .unwrap()
-            .get_balances()
-            .unwrap()
-            .regular,
-        Amount::from_btc(0.20).unwrap()
-    );
 
     let maker_threads = spawn_makers(&makers);
     wait_for_makers_setup(&makers, 120);
-    makers[0]
-        .wallet
-        .write()
-        .unwrap()
-        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-        .unwrap();
+    sync_maker_wallets(&makers);
 
     // Fidelity creation spends the deposits above. Block the resulting
     // regular change UTXO, which is the actual input to maker swap funding.
-    let maker_regular_utxos = makers[0]
-        .wallet
-        .read()
-        .unwrap()
-        .list_descriptor_utxo_spend_info();
-    assert_eq!(maker_regular_utxos.len(), 1);
-    let blocked_address = bitcoin::Address::from_script(
-        maker_regular_utxos[0].0.script_pub_key.as_script(),
-        Network::Regtest,
-    )
-    .unwrap();
+    // With every role screening the same list, a later maker would refuse an
+    // intermediate hop too, but the taker sees each hop's funding first.
+    let blocked_address = sole_regular_utxo_address(&makers[blocked_maker]);
     let outcome = taker
         .add_blocklist_entry(
             blocked_address.to_string(),
@@ -328,7 +306,7 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
     assert_eq!(outcome.added, 1);
     assert_eq!(outcome.updated, 0);
 
-    let params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
+    let params = SwapParams::new(protocol, Amount::from_sat(500_000), maker_count)
         .with_tx_count(1)
         .with_required_confirms(1);
     let summary = taker
@@ -342,9 +320,9 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
         Ok(_) => panic!("the taker accepted funding from the maker's blocked source address"),
     }
 
-    // The maker broadcast its funding before the taker rejected it, so those
-    // coins stay locked in a contract until the timelock matures and the maker
-    // sweeps them back. Rejecting must not strand maker funds.
+    // Every hop funded before the rejection stays locked in a contract until
+    // its timelock matures and its funder sweeps it back. Rejecting must not
+    // strand anyone's funds.
     thread::sleep(timelock_recovery_wait::<BitcoindBackend>());
 
     for (i, maker) in makers.iter().enumerate() {
@@ -376,6 +354,40 @@ fn run_taker_rejection(protocol: ProtocolVersion) {
             i
         );
         assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
+    }
+
+    assert!(
+        taker.wait_for_recovery(),
+        "the taker must recover its own funding after the rejection"
+    );
+    taker
+        .get_wallet()
+        .write()
+        .unwrap()
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    let taker_balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    assert_eq!(
+        taker_balances.contract,
+        Amount::ZERO,
+        "Taker contract balance mismatch"
+    );
+
+    // A listed source is local policy, never proof of misbehaviour: no maker
+    // on the route may be banned for it.
+    let offerbook = taker.fetch_offers().unwrap().all_makers();
+    for maker in &makers {
+        let address = format!("127.0.0.1:{}", maker.config.network_port);
+        let standing = offerbook
+            .iter()
+            .find(|m| m.address.to_string() == address)
+            .expect("every route maker must be in the offerbook");
+        assert!(
+            !matches!(standing.state, MakerState::Banned(_)),
+            "maker {} was banned for a blocklist refusal: {:?}",
+            address,
+            standing.state
+        );
     }
 
     drop(takers);

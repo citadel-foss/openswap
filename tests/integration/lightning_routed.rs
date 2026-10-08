@@ -8,14 +8,19 @@
 //! `MockLightningBackend`, so maker 1's payment really parks at maker 2 and
 //! its settlement really releases the preimage back to maker 1.
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
+    blocklist::BlocklistError,
     lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest},
     maker::{start_server, MakerBehavior},
-    taker::{lightning_swap::LnRoutedSwapParams, TakerBehavior},
+    taker::{error::TakerError, lightning_swap::LnRoutedSwapParams, TakerBehavior},
     wallet::AddressType,
 };
 
@@ -194,6 +199,117 @@ fn lightning_routed_swap_e2e() {
     maker_threads
         .into_iter()
         .for_each(|thread| thread.join().unwrap());
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// With screening on, the taker must refuse to claim hop 2 when the second
+/// maker funds it from a listed address. Not claiming keeps the preimage
+/// private, so hop 1 can only come back to the taker through its refund.
+#[test]
+fn lightning_routed_swap_refuses_blocklisted_second_hop() {
+    let (ln1, ln2) = MockLightningBackend::new_pair();
+    with_ready_channel(&ln1, &ln2);
+    with_ready_channel(&ln2, &ln1);
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning_and_blocklist::<BitcoindBackend>(
+            2,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal, MakerBehavior::Normal],
+            vec![
+                ln1.clone() as Arc<dyn LightningBackend>,
+                ln2.clone() as Arc<dyn LightningBackend>,
+            ],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker(
+        taker,
+        bitcoind,
+        3,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2WPKH,
+    );
+    fund_makers(
+        &makers[..1],
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2WPKH,
+    );
+    fund_maker_from_one_address(
+        &makers[1],
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2WPKH,
+    );
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+
+    let blocked_address = sole_regular_utxo_address(&makers[1]);
+    taker
+        .add_blocklist_entry(
+            blocked_address.to_string(),
+            Some("second hop source".to_string()),
+        )
+        .unwrap();
+
+    let first_maker = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let second_maker = format!("127.0.0.1:{}", makers[1].config.network_port);
+    match taker.lightning_swap_routed(LnRoutedSwapParams {
+        amount: Amount::from_sat(40_000),
+        first_maker: Some(first_maker),
+        second_maker: Some(second_maker),
+        locktime: Some(60),
+        min_confirmations: 1,
+    }) {
+        Err(TakerError::Blocklist(BlocklistError::BlockedAddress { entry, .. })) => {
+            assert_eq!(entry.address, blocked_address.to_string());
+        }
+        Err(other) => panic!("expected blocked-address error, got {:?}", other),
+        Ok(report) => panic!(
+            "the taker claimed hop 2 funded from a blocked address: {:?}",
+            report
+        ),
+    }
+
+    // Hop 2 was refused before its outpoint was recorded, so recovery drops
+    // it unclaimed. Hop 1 refunds once its timelock matures.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut history = Vec::new();
+    loop {
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        if outcomes.is_empty() {
+            break;
+        }
+        history.extend(outcomes);
+        assert!(
+            Instant::now() < deadline,
+            "routed swap records still pending: {:?}",
+            history
+        );
+        thread::sleep(Duration::from_secs(5));
+    }
+    assert!(
+        history
+            .iter()
+            .any(|line| line.ends_with("-out: no on-chain commitment; forgotten")),
+        "hop 2 must be dropped unclaimed, got: {:?}",
+        history
+    );
+    assert!(
+        history.iter().any(|line| line.contains("-in: ")
+            && (line.contains("recovered via") || line.contains("already resolved"))),
+        "hop 1 must be refunded, got: {:?}",
+        history
+    );
+
+    drop(takers);
+    shutdown_makers(&makers, maker_threads);
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

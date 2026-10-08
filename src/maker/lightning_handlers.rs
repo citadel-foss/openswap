@@ -664,6 +664,16 @@ fn handle_swap_in_funded<M: Maker>(
     if let Err(e) = swap.htlc.validate_funding_output(output, expected) {
         return Ok(reject(&funded.swap_id, format!("bad funding output: {e}")));
     }
+    // Our blocklist is local policy, not taker misbehaviour: refuse without
+    // paying, and keep the matched entry out of the reply.
+    if let Err(e) = maker.screen_funding_tx(&funding_tx) {
+        log::warn!(
+            "[{}] Swap-in {}: funding refused: {e:?}",
+            maker.network_port(),
+            funded.swap_id
+        );
+        return Ok(reject(&funded.swap_id, "funding refused"));
+    }
     // Value and script are not enough. The taker chose this outpoint, so it
     // may be one whose refund is already spendable — or already spent. Paying
     // against either loses the Lightning amount outright.

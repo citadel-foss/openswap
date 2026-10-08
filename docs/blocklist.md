@@ -1,7 +1,7 @@
 # Funding-Source Blocklist
 
-The blocklist allows a participant to refuse a swap when the counterparty's coins originate from a listed address.
-It applies to both the Legacy (v1) and Taproot (v2) protocols, and is disabled by default.
+The blocklist allows a participant to refuse a swap when coins funding it originate from a listed address.
+It applies to the Legacy (v1) and Taproot (v2) protocols and to Lightning submarine swaps, and is disabled by default.
 
 ## Turning screening on
 
@@ -13,8 +13,9 @@ With screening on, your node reads the file at startup. If your node cannot read
 
 ## Matching
 
-Screening examines the transaction by which the counterparty pays into the swap.
-In Legacy that is its funding transaction; in Taproot, which has no separate funding transaction, it is the contract transaction that pays the taproot output.
+Screening examines a funding transaction: one that pays into a swap contract.
+In Legacy that is a funding transaction; in Taproot, which has no separate funding transaction, it is the contract transaction that pays the taproot output.
+In a Lightning swap it is the transaction that funds the on-chain HTLC, fetched from the chain by its txid once it confirms, so the check applies to the coins that actually confirmed.
 
 For each input of that transaction, the previous output it spends is looked up on-chain and its `scriptPubKey` is compared against the scripts derived from the listed addresses.
 A match refuses the swap.
@@ -30,27 +31,41 @@ Two properties follow from this definition:
 
 ## Screening points
 
-Each participant screens only the funding it directly receives.
-Intermediate maker-to-maker hops are not screened by the taker.
+Each participant screens every funding transaction it is shown, not only the one that pays it.
 
 ```text
 Taker → Maker 1 → Maker 2 → Taker
 
 Maker 1 screens the Taker's funding
 Maker 2 screens Maker 1's funding
-Taker   screens Maker 2's funding
+Taker   screens Maker 1's and Maker 2's funding
 ```
 
-| Protocol | Role  | Screened at | Counterparty funded | Cost to refuse |
-|----------|-------|-------------|---------------------|----------------|
-| Legacy   | Maker | `ProofOfFunding`, before constructing its own funding | yes | reserved UTXOs released |
-| Legacy   | Taker | `ReqContractSigsAsRecvrAndSender` | not yet broadcast | timelock recovery |
-| Taproot  | Maker | contract data, after confirmation, before constructing its own funding | yes | reserved UTXOs released |
-| Taproot  | Taker | contract data returned by the final maker | yes | timelock recovery |
+The taker verifies each maker's contracts before passing them to the next hop, and that maker's funding arrives with them, so the taker screens every hop, intermediate ones included.
+A maker is only ever shown its own incoming funding.
+
+| Swap | Role | Screens | Screened at | Counterparty funded | Cost to refuse |
+|------|------|---------|-------------|---------------------|----------------|
+| Legacy | Maker | its incoming funding | `ProofOfFunding`, before constructing its own funding | yes | reserved UTXOs released |
+| Legacy | Taker | each maker's funding | `ReqContractSigsAsRecvrAndSender` from that maker | not yet broadcast | timelock recovery |
+| Taproot | Maker | its incoming contract | contract data, after confirmation, before constructing its own funding | yes | reserved UTXOs released |
+| Taproot | Taker | each maker's contract | contract data returned by that maker | yes | timelock recovery |
+| Lightning swap-in | Maker | the taker's HTLC funding | `SwapInFunded`, after confirmation, before paying the invoice | yes | nothing; the taker refunds its HTLC |
+| Lightning swap-out | Taker | the maker's HTLC funding | `SwapOutFunded`, after confirmation, before claiming | yes | Lightning payment stays held until the maker cancels it |
+| Lightning routed | Taker | the second maker's HTLC funding | `SwapOutFunded`, after confirmation, before claiming | yes | first-hop timelock refund |
 
 A maker screens before broadcasting its own funding transaction, so refusal releases its reserved UTXOs and costs nothing further.
-A taker has already funded the swap when the counterparty's funding transaction becomes visible, so refusal means abandoning it and reclaiming its coins through timelock recovery.
+A taker has already funded the swap when a maker's funding transaction becomes visible, so refusal means abandoning it and reclaiming its coins through timelock recovery.
 The taker always funds first, so this asymmetry follows from the protocol rather than from the blocklist.
+
+Refusing an intermediate hop aborts the whole route.
+Every hop funded before that point waits out its timelock, the same cost as refusing the final maker.
+In Legacy the taker screens a maker's funding before that maker broadcasts it; in Taproot, just after.
+
+In a Lightning swap-in the maker answers with a rejection and never pays the invoice.
+The rejection does not name the list or the entry.
+In a swap-out or routed swap the taker screens before it records the HTLC for recovery, so recovery never claims refused coins either.
+Not claiming keeps the preimage private, so the maker can never settle the Lightning payment.
 
 ## Constraints
 
@@ -63,6 +78,9 @@ The taker always funds first, so this asymmetry follows from the protocol rather
 | All entries skipped | List behaves as empty |
 
 The input bound exists because each input costs one query against the participant's own node, and the transaction originates with the counterparty.
+Inputs spending the same parent share one query.
+Because the taker screens every hop, a route costs it up to 25 queries per maker funding transaction rather than only the final maker's.
+None of these queries happen while screening is off or the list is empty.
 
 Addresses encode their network, so a list compiled for one network loads as empty on another.
 The scripts are network-independent — the same key hash yields the same `scriptPubKey` across networks, and only the address encoding differs — so this is a property of the stored representation, not of the underlying data.
@@ -93,6 +111,8 @@ Rules:
 The blocklist is local policy and does not appear in any message.
 A peer cannot determine whether a counterparty applies one, and a refusal is indistinguishable from any other abandoned swap.
 This prevents peers from probing which addresses a participant considers unacceptable.
+
+A match aborts the swap but is never recorded against the peer and never bans it: the peer cannot know what the list contains, so funding from a listed address is not misbehaviour.
 
 Two participants may hold different lists, or none, without affecting the protocol.
 

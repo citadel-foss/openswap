@@ -543,6 +543,48 @@ pub fn fund_makers(
     spendable_balances
 }
 
+/// Fund an empty maker wallet with `utxo_count` UTXOs that all pay one fresh
+/// address, so every coin the maker later spends traces back to one script.
+#[allow(dead_code)]
+pub fn fund_maker_from_one_address(
+    maker: &MakerServer,
+    bitcoind: &bitcoind::BitcoinD,
+    utxo_count: u32,
+    utxo_value: Amount,
+    address_type: AddressType,
+) {
+    let address = maker
+        .wallet
+        .write()
+        .unwrap()
+        .get_next_external_address(address_type)
+        .unwrap();
+    for _ in 0..utxo_count {
+        send_to_address(bitcoind, &address, utxo_value);
+    }
+    generate_blocks(bitcoind, 1);
+    let expected_regular = utxo_value * utxo_count.into();
+    let balances = wait_for_balance(&maker.wallet, expected_regular, 30);
+    assert_eq!(balances.regular, expected_regular);
+}
+
+/// Address of the maker's only regular UTXO. Fidelity setup consolidates the
+/// deposits into it, so it is the source of the maker's swap funding.
+#[allow(dead_code)]
+pub fn sole_regular_utxo_address(maker: &MakerServer) -> bitcoin::Address {
+    let utxos = maker
+        .wallet
+        .read()
+        .unwrap()
+        .list_descriptor_utxo_spend_info();
+    assert_eq!(utxos.len(), 1, "maker should hold exactly one regular UTXO");
+    bitcoin::Address::from_script(
+        utxos[0].0.script_pub_key.as_script(),
+        bitcoin::Network::Regtest,
+    )
+    .unwrap()
+}
+
 /// Fund makers with the usual four 0.05 BTC P2TR UTXOs each.
 #[allow(dead_code)]
 pub fn fund_makers_default(
@@ -1290,6 +1332,26 @@ impl TestFramework {
             taker_behavior,
             maker_behaviors,
             false,
+            maker_lightning,
+        )
+    }
+
+    /// [`TestFramework::init_with_lightning`] with runtime blocklist screening
+    /// enabled for every role.
+    #[allow(clippy::type_complexity)]
+    #[cfg(feature = "lightning")]
+    pub fn init_with_lightning_and_blocklist<B: TestBackend>(
+        maker_count: usize,
+        taker_behavior: Vec<TakerBehavior>,
+        maker_behaviors: Vec<MakerBehavior>,
+        maker_lightning: Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>,
+    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
+        Self::init_with_settings::<B>(
+            vec![(0, None); maker_count],
+            vec![None; maker_count],
+            taker_behavior,
+            maker_behaviors,
+            true,
             maker_lightning,
         )
     }
