@@ -19,17 +19,15 @@ use crate::test_framework::*;
     maker_behaviors = [Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         // Bond: exactly 5,000,000 + its 243 sat fee, leaving zero change.
         fund_makers(1, Amount::from_sat(5_000_243), AddressType::P2TR),
         fund_makers(1, Amount::from_sat(499_000), AddressType::P2TR),
         spawn_ready_makers_and_mine(),
     ],
 )]
-fn maker_without_fee_headroom_fails_before_any_broadcast(
-    world: &mut World,
-    taker_original_balance: Amount,
-) {
+fn maker_without_fee_headroom_fails_before_any_broadcast(world: &mut World) {
+    let before = world.balances();
     let maker_addr = world.makers()[0].address();
     let error = world
         .taker_mut()
@@ -45,11 +43,8 @@ fn maker_without_fee_headroom_fails_before_any_broadcast(
         "unexpected error: {:?}",
         error
     );
-    let balance = world.taker().balances();
-    assert_eq!(
-        balance.spendable, taker_original_balance,
-        "a negotiation rejection must not spend anything"
-    );
+    // A negotiation rejection must not spend anything.
+    assert_balances!(world, since before; { taker: { loss: 0 } });
 
     world.shutdown_makers();
     let log_path = world.taker_log_path();
@@ -69,7 +64,7 @@ fn maker_without_fee_headroom_fails_before_any_broadcast(
     maker_behaviors = [Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         // The fidelity bond needs one large UTXO (5,000,000 sats + its 243 sat
         // fee, leaving no change); the swap liquidity is eight small ones, so
         // funding 500k sats can only pack six of them into a single split.
@@ -78,7 +73,8 @@ fn maker_without_fee_headroom_fails_before_any_broadcast(
         spawn_ready_makers_and_mine(),
     ],
 )]
-fn maker_rejects_over_budget_funding_plan(world: &mut World, taker_original_balance: Amount) {
+fn maker_rejects_over_budget_funding_plan(world: &mut World) {
+    let before = world.balances();
     // The pool sum covers the amount, but the admission-time plan prices the
     // real input cost: six unreimbursed inputs at 100 sats/vB cost more than
     // the hop earns, so negotiation fails and nothing is locked.
@@ -97,11 +93,8 @@ fn maker_rejects_over_budget_funding_plan(world: &mut World, taker_original_bala
         "unexpected error: {:?}",
         error
     );
-    let balance = world.taker().balances();
-    assert_eq!(
-        balance.spendable, taker_original_balance,
-        "an admission rejection must not spend anything"
-    );
+    // An admission rejection must not spend anything.
+    assert_balances!(world, since before; { taker: { loss: 0 } });
 
     world.shutdown_makers();
     assert_logged!(world, "above the taker's input budget");

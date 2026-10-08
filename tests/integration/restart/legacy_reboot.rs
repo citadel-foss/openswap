@@ -129,38 +129,18 @@ fn maker_reboot_preserves_funded_swapcoins(world: &mut World, taker_original_bal
 
     world.mine(1);
     world.makers()[0].sync();
-    let maker_balances = world.makers()[0].balances();
-    info!(
-        "Restarted maker balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-        maker_balances.regular,
-        maker_balances.swap,
-        maker_balances.contract,
-        maker_balances.fidelity,
-        maker_balances.spendable,
-    );
-    // Reboot recovery kept the swapcoins, so the maker still ends up with the
-    // swept incoming funds rather than only its own refunded funding.
-    assert_eq!(
-        maker_balances.regular.to_sat(),
-        14502398,
-        "Restarted maker regular balance mismatch"
-    );
-    assert_eq!(
-        maker_balances.swap.to_sat(),
-        497530,
-        "Restarted maker swap balance mismatch"
-    );
-    assert_eq!(
-        maker_balances.contract.to_sat(),
-        0,
-        "Restarted maker contract balance mismatch"
-    );
-    assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
-    assert_eq!(
-        maker_balances.spendable.to_sat(),
-        14999928,
-        "Restarted maker spendable balance mismatch"
-    );
+    // Reboot recovery kept the swapcoins, so the restarted maker (the world's
+    // only maker now) still ends up with the swept incoming funds rather than
+    // only its own refunded funding.
+    assert_balances!(world; {
+        maker: {
+            regular: 14_502_398,
+            swap: 497_530,
+            contract: 0,
+            fidelity: BOND,
+            spendable: 14_999_928,
+        },
+    });
 
     info!("Waiting for the taker's recovery loop to finish...");
     let deadline = Instant::now() + Duration::from_secs(300);
@@ -174,29 +154,17 @@ fn maker_reboot_preserves_funded_swapcoins(world: &mut World, taker_original_bal
 
     world.mine(1);
     world.taker().sync();
-    let taker_balances = world.taker().balances();
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
+    let taker_spendable = world.taker().balances().spendable;
     let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
+        .checked_sub(taker_spendable)
         .unwrap_or(Amount::ZERO);
     info!(
         "Taker balance diff: {} sats (original: {}, current: {})",
         balance_diff.to_sat(),
         taker_original_balance,
-        taker_balances.spendable,
+        taker_spendable,
     );
-    assert_eq!(
-        taker_balances.contract.to_sat(),
-        0,
-        "Taker contract balance mismatch"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
+    assert_balances!(world; { taker: { contract: 0, fidelity: 0 } });
     let wallet = world.taker().inner().get_wallet().read().unwrap();
     assert_eq!(wallet.get_incoming_swapcoins_count(), 0);
     assert_eq!(wallet.get_outgoing_swapcoins_count(), 0);

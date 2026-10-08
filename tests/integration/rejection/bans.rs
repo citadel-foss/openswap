@@ -282,14 +282,7 @@ fn wrong_handover_key_bans_the_last_maker(world: &mut World, params: SwapParams)
     }
     world.mine(1);
     world.taker().sync();
-    let balances = world.taker().balances();
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        balances.regular, balances.swap, balances.contract, balances.spendable,
-    );
-    assert_eq!(balances.regular.to_sat(), 14499692, "Taker regular balance");
-    assert_eq!(balances.swap.to_sat(), 497369, "Taker swap balance");
-    assert_eq!(balances.contract, Amount::ZERO, "Taker contract balance");
+    assert_balances!(world; { taker: { regular: 14_499_692, swap: 497_369, contract: 0 } });
 
     info!("Wrong handover key test completed successfully!");
 }

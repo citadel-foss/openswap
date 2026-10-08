@@ -158,10 +158,6 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
     world.taker().sync();
 
     let balances = world.taker().balances();
-    info!(
-        "Taker balances after restart recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        balances.regular, balances.swap, balances.contract, balances.spendable,
-    );
     let balance_diff = taker_original_balance
         .checked_sub(balances.spendable)
         .unwrap_or(Amount::ZERO);
@@ -185,21 +181,9 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
         "taker did not get its funds back after restart recovery"
     );
 
-    for (i, maker) in world.makers().iter().enumerate() {
-        maker.sync();
-        let mb = maker.balances();
-        info!(
-            "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i, mb.regular, mb.swap, mb.contract, mb.spendable,
-        );
-    }
-
-    assert_eq!(
-        balances.contract.to_sat(),
-        0,
-        "Taker contract balance must be cleared after recovery"
-    );
-    assert_eq!(balances.fidelity, Amount::ZERO);
+    // The taker's contract balance must be cleared after recovery.
+    world.sync_makers();
+    assert_balances!(world; { taker: { contract: 0, fidelity: 0 } });
 
     let wallet = world.taker().inner().get_wallet();
     let wallet = wallet.read().unwrap();

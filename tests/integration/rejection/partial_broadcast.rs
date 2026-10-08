@@ -18,7 +18,6 @@ use openswap::{
 
 use crate::test_framework::*;
 
-use log::info;
 use std::{
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
@@ -140,21 +139,11 @@ fn run_maker_partial_broadcast<B: TestBackend>(
 
     world.mine(1);
     world.framework().wait_for_electrs_tip();
-    let maker = &world.makers()[0];
-    maker.sync();
-    let balances = maker.balances();
-    info!(
-        "Maker balances after partial-broadcast recovery: regular={}, swap={}, contract={}, spendable={}",
-        balances.regular, balances.swap, balances.contract, balances.spendable
-    );
-    assert_eq!(balances.contract, Amount::ZERO);
-    assert_eq!(balances.swap, Amount::ZERO);
-    assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-    assert_eq!(
-        balances.spendable.to_sat(),
-        expected_spendable,
-        "maker spendable after reclaiming the on-chain split"
-    );
+    world.makers()[0].sync();
+    // Spendable after reclaiming the on-chain split.
+    assert_balances!(world; {
+        maker: { swap: 0, contract: 0, fidelity: BOND, spendable: expected_spendable },
+    });
 }
 
 /// The taker's second funding broadcast fails with the first split already in
@@ -165,7 +154,7 @@ fn run_maker_partial_broadcast<B: TestBackend>(
     maker_behaviors = [Normal, Normal],
     takers = [FailSecondFundingBroadcast],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         spawn_ready_makers_and_mine(),
     ],
@@ -186,7 +175,6 @@ fn run_maker_partial_broadcast<B: TestBackend>(
 )]
 fn run_taker_recovers_partial_broadcast_with_spare_maker(
     world: &mut World,
-    taker_original_balance: Amount,
     expected_spendable: u64,
     params: SwapParams,
 ) {
@@ -261,22 +249,8 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker(
     world.mine(1);
     world.framework().wait_for_electrs_tip();
     world.taker().sync();
-    let balances = world.taker().balances();
-    info!(
-        "Taker balances after partial-broadcast recovery: original={}, regular={}, swap={}, contract={}, spendable={}",
-        taker_original_balance,
-        balances.regular,
-        balances.swap,
-        balances.contract,
-        balances.spendable
-    );
-    assert_eq!(balances.contract, Amount::ZERO);
-    assert_eq!(balances.swap, Amount::ZERO);
-    assert_eq!(
-        balances.spendable.to_sat(),
-        expected_spendable,
-        "taker spendable after recovering the partial batch"
-    );
+    // Spendable after recovering the partial batch.
+    assert_balances!(world; { taker: { swap: 0, contract: 0, spendable: expected_spendable } });
 }
 
 /// After a partial broadcast, the taker re-admits the same swap; the maker

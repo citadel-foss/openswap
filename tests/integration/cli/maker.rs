@@ -56,17 +56,15 @@ fn rpc_call(rpc_port: u16, cookie: &str, request: RpcMsgReq) -> RpcMsgResp {
     maker_behaviors = [Normal, Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
-        verify_maker_pre_swap_balances() as maker_spendable_balance,
+        verify_maker_pre_swap_balances(),
     ],
 )]
-fn rpc_server(
-    world: &mut World,
-    taker_original_balance: Amount,
-    maker_spendable_balance: Vec<Amount>,
-) {
+fn rpc_server(world: &mut World) {
+    let before = world.balances();
+
     // A completed swap gives the maker incoming swap coins and a swap id.
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -89,88 +87,18 @@ fn rpc_server(
     world.mine(1);
     world.sync_makers();
 
-    let taker_balances = world.taker().balances();
-    info!(
-        "Taker balances: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-    assert_eq!(
-        taker_balances.regular.to_sat(),
-        14499538,
-        "Taker regular balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.swap.to_sat(),
-        496789,
-        "Taker swap balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.contract.to_sat(),
-        0,
-        "Taker contract balance mismatch"
-    );
-    assert_eq!(taker_balances.fidelity, Amount::ZERO);
-    assert_eq!(
-        taker_original_balance
-            .checked_sub(taker_balances.spendable)
-            .unwrap()
-            .to_sat(),
-        3673,
-        "Taker spendable balance change mismatch"
-    );
-
     let expected_regular = [14500751u64, 14502170];
     let expected_swap = [499664u64, 498208];
-    let expected_fee = [658u64, 621];
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(&maker_spendable_balance)
-        .enumerate()
-    {
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i,
-            balances.regular,
-            balances.swap,
-            balances.contract,
-            balances.fidelity,
-            balances.spendable,
-        );
-        assert_eq!(
-            balances.regular.to_sat(),
-            expected_regular[i],
-            "Maker {} regular balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.swap.to_sat(),
-            expected_swap[i],
-            "Maker {} swap balance mismatch",
-            i
-        );
-        assert_eq!(
-            balances.contract.to_sat(),
-            0,
-            "Maker {} contract balance mismatch",
-            i
-        );
-        assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-        assert_eq!(
-            balances
-                .spendable
-                .checked_sub(*original)
-                .unwrap_or(Amount::ZERO)
-                .to_sat(),
-            expected_fee[i],
-            "Maker {} fee earned mismatch",
-            i
-        );
-    }
+    assert_balances!(world, since before; {
+        taker: { regular: 14_499_538, swap: 496_789, contract: 0, fidelity: 0, loss: 3_673 },
+        makers: {
+            regular: expected_regular,
+            swap: expected_swap,
+            contract: 0,
+            fidelity: BOND,
+            gain: [658, 621],
+        },
+    });
 
     let target = &world.makers()[0].inner();
     let rpc_port = target.config.rpc_port;

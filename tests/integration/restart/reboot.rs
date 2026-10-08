@@ -12,7 +12,6 @@
 //! tracker record. Startup recovery must not discard the persisted swapcoins
 //! merely because it cannot find a matching tracker record.
 
-use bitcoin::Amount;
 use openswap::{
     maker::{
         start_server,
@@ -443,18 +442,10 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
     }
 
     // Maker1 took the taker's outgoing contract with the preimage, so nothing is
-    // left locked on the taker's side either.
+    // left locked on the taker's side either: the restarted taker (adopted
+    // into the world) left no contract unresolved.
     world.taker().sync();
-    let taker_balances = world.taker().balances();
-    info!(
-        "Restarted taker balances: regular: {}, swap: {}, contract: {}",
-        taker_balances.regular, taker_balances.swap, taker_balances.contract,
-    );
-    assert_eq!(
-        taker_balances.contract,
-        Amount::ZERO,
-        "restarted taker left a contract unresolved"
-    );
+    assert_balances!(world; { taker: { contract: 0 } });
 }
 
 /// Test: a maker learns the preimage only after its sender refunded it.
