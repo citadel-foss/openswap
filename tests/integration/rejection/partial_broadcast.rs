@@ -21,7 +21,7 @@ use crate::test_framework::*;
 use std::{
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 /// Poll the maker's swap tracker until the swap's timelock recovery has
@@ -33,22 +33,15 @@ fn wait_for_maker_timelock_recovery(
     swap_id: &str,
     timeout: Duration,
 ) -> MakerSwapRecord {
-    let start = Instant::now();
-    loop {
-        if let Ok(tracker) = MakerSwapTracker::load_or_create(data_dir) {
-            if let Some(record) = tracker.get_record(swap_id) {
-                if !record.recovery.outgoing_recovered.is_empty() {
-                    return record.clone();
-                }
-            }
-        }
-        assert!(
-            start.elapsed() <= timeout,
-            "timed out waiting for maker timelock recovery of {}",
-            swap_id
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_for!(
+        timeout,
+        every Duration::from_secs(5),
+        format!("maker timelock recovery of {}", swap_id),
+        MakerSwapTracker::load_or_create(data_dir)
+            .ok()
+            .and_then(|tracker| tracker.get_record(swap_id).cloned())
+            .filter(|record| !record.recovery.outgoing_recovered.is_empty())
+    )
 }
 
 /// The maker's second funding broadcast fails with the first tx already sent.
@@ -93,8 +86,7 @@ fn run_maker_partial_broadcast<B: TestBackend>(
         "the swap must fail when the maker's second broadcast fails"
     );
 
-    let log_path = world.taker_log_path();
-    assert_logged!(world, "Test behavior: failing the second");
+    assert_log!(world; { has "Test behavior: failing the second" });
 
     // The 30s idle timeout starts recovery; the timelock path then needs the
     // maker's outgoing timelock (150 CSV blocks from the contract broadcast).
@@ -117,21 +109,16 @@ fn run_maker_partial_broadcast<B: TestBackend>(
         "the on-chain split must be timelock-recovered"
     );
 
-    let log_contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !log_contents.contains("nothing to recover. Discarding swapcoins"),
-        "a partial batch must never be discarded as never broadcast"
-    );
+    // A partial batch must never be discarded as never broadcast.
+    assert_log!(world; { lacks "nothing to recover. Discarding swapcoins" });
 
     // The unsent split's inputs must return to the pool without a restart.
-    let deadline = Instant::now() + Duration::from_secs(180);
-    while world.makers()[0].inner().reserved_inputs().unwrap() != 0 {
-        assert!(
-            Instant::now() < deadline,
-            "recovery left the unsent split's inputs reserved"
-        );
-        thread::sleep(Duration::from_secs(2));
-    }
+    wait_until!(
+        Duration::from_secs(180),
+        every Duration::from_secs(2),
+        "recovery to release the unsent split's inputs",
+        world.makers()[0].inner().reserved_inputs().unwrap() == 0
+    );
 
     // Finished recovery stops the maker, and its exit rearms the wallet backend.
     // Join without sending another stop, which would cancel our sync again.
@@ -189,20 +176,15 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker(
         "the swap must fail at the taker's second funding broadcast"
     );
 
-    let log_path = world.taker_log_path();
-    assert_logged!(world, "Test behavior: failing the second funding broadcast");
-
-    // The chain check found split 1 in the mempool, so the spare maker must
-    // stay unused and the recovery material must survive.
-    let log_contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !log_contents.contains("substituting maker 0 with spare"),
-        "substitution would delete the on-chain split's recovery material"
-    );
-    assert!(
-        !log_contents.contains("Re-initializing funding after maker substitution"),
-        "funding reinitialize destroys the on-chain split's swapcoins"
-    );
+    assert_log!(world; {
+        has "Test behavior: failing the second funding broadcast",
+        // The chain check found split 1 in the mempool, so the spare maker must
+        // stay unused and the recovery material must survive: substitution
+        // would delete the on-chain split's recovery material ...
+        lacks "substituting maker 0 with spare",
+        // ... and a funding reinitialize destroys its swapcoins.
+        lacks "Re-initializing funding after maker substitution",
+    });
 
     let tracker = SwapTracker::load_or_create(&world.temp_dir().join("taker1")).unwrap();
     let record = tracker
@@ -237,14 +219,12 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker(
     );
 
     // Recovery reclaims the on-chain split once its timelock matures.
-    let recovery_start = Instant::now();
-    while !world.taker().inner().is_recovery_complete() {
-        assert!(
-            recovery_start.elapsed() <= Duration::from_secs(360),
-            "taker recovery did not complete in time"
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_until!(
+        Duration::from_secs(360),
+        every Duration::from_secs(5),
+        "taker recovery to complete",
+        world.taker().inner().is_recovery_complete()
+    );
 
     world.mine(1);
     world.framework().wait_for_electrs_tip();
@@ -280,41 +260,19 @@ fn maker_reprocesses_own_contracts_after_partial_broadcast(world: &mut World) {
         "the swap must fail: the resumed pass cannot re-fund the frozen plan"
     );
 
-    let log_path = world.taker_log_path();
-    assert_logged!(world, "Test behavior: maker 0 dropped mid-exchange");
-
-    let contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !contents.contains("already in use"),
-        "the maker's own persisted contracts must not read as a replay"
-    );
-    // Two passes over the same contract data: the resume re-entered contract
-    // processing and crossed the replay check (the fee log sits behind it).
-    assert_eq!(
-        contents
-            .matches(&format!(
-                "Processing Taproot contract data for swap {swap_id}"
-            ))
-            .count(),
-        2,
-        "the resumed pass must re-enter contract processing"
-    );
-    assert_eq!(
-        contents.matches("Fee calculation: incoming_total").count(),
-        2,
-        "the resumed pass must cross the same-swap replay check"
-    );
-    // Only the first pass's first tx made it on the wire; the resumed pass
-    // funds nothing.
-    assert_eq!(
-        contents.matches("Broadcast Taproot contract tx").count(),
-        1,
-        "the resumed pass must not broadcast new funding"
-    );
-    assert!(
-        !contents.contains("completed successfully"),
-        "the swap must not complete"
-    );
+    assert_log!(world; {
+        has "Test behavior: maker 0 dropped mid-exchange",
+        // The maker's own persisted contracts must not read as a replay.
+        lacks "already in use",
+        // Two passes over the same contract data: the resume re-entered contract
+        // processing and crossed the replay check (the fee log sits behind it).
+        count(format!("Processing Taproot contract data for swap {swap_id}")) == 2,
+        count("Fee calculation: incoming_total") == 2,
+        // Only the first pass's first tx made it on the wire; the resumed pass
+        // funds nothing.
+        count("Broadcast Taproot contract tx") == 1,
+        lacks "completed successfully",
+    });
 }
 
 /// A maker restarted mid-swap must refuse a SwapDetails whose id belongs
@@ -394,7 +352,7 @@ fn maker_refuses_unfinished_swap_id_after_restart(world: &mut World) {
         other => panic!("expected AckSwapDetails, got {:?}", other),
     }
 
-    assert_logged!(world, "Swap id belongs to an unfinished swap");
+    assert_log!(world; { has "Swap id belongs to an unfinished swap" });
 
     world.framework().set_block_gen_paused(false);
 

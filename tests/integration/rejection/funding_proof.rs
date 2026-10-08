@@ -32,18 +32,12 @@ fn makers_reject_duplicate_funding_outpoints(world: &mut World, params: SwapPara
     );
 
     // Assert both the taker side duplicate contract passing and the maker-side rejection.
-    let log_path = world.taker_log_path();
-    assert_logged!(
-        world,
-        "Test behavior: duplicating Taproot contract outpoint"
-    );
-    assert_logged!(world, "Duplicate Taproot contract outpoint");
-
-    let log_contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !log_contents.contains("Broadcast Taproot contract tx"),
-        "Taproot maker must reject before broadcasting outgoing funding"
-    );
+    assert_log!(world; {
+        has "Test behavior: duplicating Taproot contract outpoint",
+        has "Duplicate Taproot contract outpoint",
+        // The Taproot maker must reject before broadcasting outgoing funding.
+        lacks "Broadcast Taproot contract tx",
+    });
 }
 
 /// The maker guards a Legacy funding proof in order — entry count, declared
@@ -93,7 +87,7 @@ fn run_legacy_proof_guard(world: &mut World, expected: &str, params: SwapParams)
         .taker_mut()
         .swap_fails(params, "maker must reject the crafted ProofOfFunding");
 
-    assert_logged!(world, expected);
+    assert_log!(world; { has expected });
 }
 
 /// A confirmed funding txid proves nothing about its outputs. Here the taker claims
@@ -121,18 +115,12 @@ fn run_rejects_spent_funding_outpoint(world: &mut World, params: SwapParams) {
         "Legacy maker must reject an already spent funding outpoint",
     );
 
-    let log_path = world.taker_log_path();
-    assert_logged!(
-        world,
-        "Test behavior: spending the funding outpoint before ProofOfFunding"
-    );
-    assert_logged!(world, "Funding output already spent");
-
-    let log_contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !log_contents.contains("SECURITY: Broadcasting"),
-        "Maker must reject before broadcasting outgoing funding"
-    );
+    assert_log!(world; {
+        has "Test behavior: spending the funding outpoint before ProofOfFunding",
+        has "Funding output already spent",
+        // The maker must reject before broadcasting outgoing funding.
+        lacks "SECURITY: Broadcasting",
+    });
 }
 
 /// A funding tx the maker has already seen can still vanish from the mempool
@@ -234,20 +222,13 @@ fn maker_rejects_proof_of_funding_with_missing_contract_cache(
     );
 
     // Assert both the adversarial action and the maker's fail-closed reason.
-    let log_path = world.taker_log_path();
-    assert_logged!(
-        world,
-        "Test behavior: skipping sender contract signature request before funding"
-    );
-    assert_logged!(world, "No cached sender contract for funding prevout");
-
-    // Rejection must happen before the maker reaches the outgoing broadcast
-    // boundary in process_resp_contract_sigs_for_recvr_and_sender.
-    let log_contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !log_contents.contains("SECURITY: Broadcasting"),
-        "maker must reject before broadcasting outgoing funding transactions"
-    );
+    assert_log!(world; {
+        has "Test behavior: skipping sender contract signature request before funding",
+        has "No cached sender contract for funding prevout",
+        // Rejection must happen before the maker reaches the outgoing broadcast
+        // boundary in process_resp_contract_sigs_for_recvr_and_sender.
+        lacks "SECURITY: Broadcasting",
+    });
 
     world.makers()[0].sync();
     let maker_spendable_after = world.makers()[0].balances().spendable;
@@ -270,5 +251,5 @@ fn taproot_maker_rejects_contract_amount_mismatch(world: &mut World, params: Swa
         "Taproot swap should fail when taker lies about contract amount",
     );
 
-    assert_logged!(world, "does not match output value");
+    assert_log!(world; { has "does not match output value" });
 }

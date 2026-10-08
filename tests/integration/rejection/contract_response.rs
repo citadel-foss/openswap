@@ -39,7 +39,7 @@ fn legacy_taker_rejects_malformed_maker_funding_output(world: &mut World, params
     );
 
     // Pin the operator-visible rejection, not just the returned Rust error.
-    assert_logged!(world, "funding output does not pay to advertised multisig");
+    assert_log!(world; { has "funding output does not pay to advertised multisig" });
 }
 
 #[world_test(
@@ -74,7 +74,7 @@ fn taproot_rejects_underfunded_maker_contract(world: &mut World, params: SwapPar
     }
 
     // Assert the rejection came from the exact-amount check.
-    assert_logged!(world, "does not match the negotiated hop total");
+    assert_log!(world; { has "does not match the negotiated hop total" });
 }
 
 /// A maker whose contract response contradicts what the taker can check —
@@ -196,7 +196,7 @@ fn legacy_handed_out_funding_cannot_be_broadcast(world: &mut World, params: Swap
         .taker_mut()
         .swap_fails(params, "a taker broadcasting handed-out funding must fail");
 
-    assert_logged!(world, "handed-out funding tx");
+    assert_log!(world; { has "handed-out funding tx" });
     let contents = std::fs::read_to_string(world.taker_log_path()).unwrap();
     assert!(
         !contents
@@ -238,8 +238,8 @@ fn legacy_replan_with_extra_inputs_completes(world: &mut World) {
         .start(&swap_id)
         .expect("a split with extra inputs must be accepted");
 
+    assert_log!(world; { has format!("Re-planned funding for swap {swap_id}") });
     let log = std::fs::read_to_string(world.taker_log_path()).unwrap();
-    assert!(log.contains(&format!("Re-planned funding for swap {swap_id}")));
     // Inputs per maker funding tx; the normal maker funds from its 600k coin.
     let inputs: Vec<usize> = log
         .lines()
