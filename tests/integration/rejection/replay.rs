@@ -10,10 +10,7 @@ use openswap::{
 
 use crate::test_framework::*;
 
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use std::{thread, time::Duration};
 
 use super::wait_for_log_after;
 
@@ -31,7 +28,8 @@ struct ReplayScenario {
     swap2_reject_msg: &'static str,
     needle: &'static str,
     needle_timeout_secs: u64,
-    forbidden_in_tail: &'static [(&'static str, &'static str)],
+    /// Needles that must not appear in the log once swap 2 starts.
+    forbidden_in_tail: &'static [&'static str],
     swapcoins_after: Option<(usize, &'static str)>,
 }
 
@@ -46,10 +44,8 @@ const REPLAYED_TAPROOT_AFTER_COMPLETION: ReplayScenario = ReplayScenario {
     swap2_reject_msg: "the maker must reject replayed contract data",
     needle: "Taproot contract output already spent",
     needle_timeout_secs: 120,
-    forbidden_in_tail: &[(
-        "Broadcast Taproot contract tx",
-        "the maker must not fund the replayed swap",
-    )],
+    // The maker must not fund the replayed swap.
+    forbidden_in_tail: &["Broadcast Taproot contract tx"],
     swapcoins_after: Some((0, "the replay must not leave new incoming swapcoins behind")),
 };
 
@@ -64,10 +60,8 @@ const REPLAYED_LEGACY_POF_IN_FLIGHT: ReplayScenario = ReplayScenario {
     swap2_reject_msg: "the maker must reject the replayed proof of funding",
     needle: "Legacy contract txid already in use",
     needle_timeout_secs: 60,
-    forbidden_in_tail: &[(
-        "SECURITY: Broadcasting",
-        "the maker must not fund the replayed swap",
-    )],
+    // The maker must not fund the replayed swap.
+    forbidden_in_tail: &["SECURITY: Broadcasting"],
     swapcoins_after: None,
 };
 
@@ -83,14 +77,10 @@ const REPLAYED_TAPROOT_IN_FLIGHT: ReplayScenario = ReplayScenario {
     needle: "Contract txid already in use",
     needle_timeout_secs: 60,
     forbidden_in_tail: &[
-        (
-            "Taproot contract txid already in use",
-            "the atomic claim must fire before the per-contract seen-check",
-        ),
-        (
-            "Broadcast Taproot contract tx",
-            "the maker must not fund the replayed swap",
-        ),
+        // The atomic claim must fire before the per-contract seen-check ...
+        "Taproot contract txid already in use",
+        // ... and the maker must not fund the replayed swap.
+        "Broadcast Taproot contract tx",
     ],
     swapcoins_after: Some((1, "the replay must not add incoming swapcoins")),
 };
@@ -171,23 +161,18 @@ fn run_replay_guard(world: &mut World, s: ReplayScenario) {
 
         // Wait until the maker's sweep is confirmed and the swap-1 swapcoin
         // has left the store, so only the chain can answer the replay.
-        let sweep_wait = Instant::now();
-        loop {
-            let count = world.makers()[0]
+        wait_until!(
+            Duration::from_secs(120),
+            every Duration::from_secs(2),
+            "the maker to sweep and drop the swap-1 incoming swapcoin",
+            world.makers()[0]
                 .inner()
                 .wallet
                 .read()
                 .unwrap()
-                .get_incoming_swapcoins_count();
-            if count == 0 {
-                break;
-            }
-            assert!(
-                sweep_wait.elapsed() <= Duration::from_secs(120),
-                "maker did not sweep and drop the swap-1 incoming swapcoin in time"
-            );
-            thread::sleep(Duration::from_secs(2));
-        }
+                .get_incoming_swapcoins_count()
+                == 0
+        );
     } else {
         // Swap 1 dies right after the maker processed its funding, so the
         // maker's claim on the incoming contracts is still live.
@@ -233,13 +218,13 @@ fn run_replay_guard(world: &mut World, s: ReplayScenario) {
 
     wait_logged!(world, s.needle, Duration::from_secs(s.needle_timeout_secs));
 
-    let contents = std::fs::read_to_string(&log_path).unwrap();
-    let tail = contents
-        .get(log_offset as usize..)
-        .unwrap_or(contents.as_str());
-    for (forbidden, msg) in s.forbidden_in_tail {
-        assert!(!tail.contains(forbidden), "{}", msg);
-    }
+    // The scenario's needle list is data, so build the rows `assert_log!` would.
+    let forbidden: Vec<LogCheck> = s
+        .forbidden_in_tail
+        .iter()
+        .map(|needle| LogCheck::Lacks(needle.to_string()))
+        .collect();
+    assert_log(&log_path, Some(log_offset), &forbidden);
     if let Some((count, msg)) = s.swapcoins_after {
         assert_eq!(
             world.makers()[0]
@@ -341,18 +326,12 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data(world: &mut World) {
         1,
         Duration::from_secs(60),
     );
-    let contents = std::fs::read_to_string(&log_path).unwrap();
-    let tail = contents
-        .get(log_offset as usize..)
-        .unwrap_or(contents.as_str());
-    assert!(
-        !tail.contains("Taproot contract txid already in use"),
-        "the per-contract seen-check has nothing to see while swap 1 is unconfirmed"
-    );
-    assert!(
-        !tail.contains("Broadcast Taproot contract tx"),
-        "the maker must not fund anything while both swaps wait"
-    );
+    assert_log!(log_path, since log_offset; {
+        // The per-contract seen-check has nothing to see while swap 1 is unconfirmed.
+        lacks "Taproot contract txid already in use",
+        // The maker must not fund anything while both swaps wait.
+        lacks "Broadcast Taproot contract tx",
+    });
 
     // Mining resumes: swap 1's handler wakes and funds exactly one hop.
     world.framework().set_block_gen_paused(false);
@@ -363,16 +342,8 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data(world: &mut World) {
         1,
         Duration::from_secs(240),
     );
-    let contents = std::fs::read_to_string(&log_path).unwrap();
-    assert_eq!(
-        contents
-            .get(log_offset as usize..)
-            .unwrap_or(contents.as_str())
-            .matches("Broadcast Taproot contract tx")
-            .count(),
-        1,
-        "the maker must fund exactly one hop across both swaps"
-    );
+    // The maker must fund exactly one hop across both swaps.
+    assert_log!(log_path, since log_offset; { count("Broadcast Taproot contract tx") == 1 });
 
     let _ = swap1.join().expect("swap 1 thread panicked");
 
@@ -444,16 +415,10 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding(world: &mut World) 
         1,
         Duration::from_secs(180),
     );
-    let contents = std::fs::read_to_string(&log_path).unwrap();
-    let tail = contents
-        .get(log_offset as usize..)
-        .unwrap_or(contents.as_str());
-    assert_eq!(
-        tail.matches("outgoing swapcoins, requesting signatures")
-            .count(),
-        1,
-        "the maker must fund exactly one hop across both swaps"
-    );
+    // The maker must fund exactly one hop across both swaps.
+    assert_log!(log_path, since log_offset; {
+        count("outgoing swapcoins, requesting signatures") == 1,
+    });
 
     let swap1_result = swap1.join().expect("swap 1 thread panicked");
     let swap2_result = swap2.join().expect("swap 2 thread panicked");

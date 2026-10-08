@@ -199,14 +199,16 @@ fn maker_rejects_out_of_bounds_swap_details(world: &mut World) {
 
     world.shutdown_makers();
 
-    assert_logged!(world, "closing early after maker selection");
-    // The forged amounts got past both taker-side layers, so the refusal must
-    // come from the maker's own guard, logged as a handler error on drop.
-    assert_logged!(world, "Swap amount below the incoming contract floor");
-    assert_logged!(world, "Swap amount above maximum");
-    // The mutated resend dies on the whole-agreement compare: one value, so
-    // no single field — feerate included — can drift between connections.
-    assert_logged!(world, "parameters differ from stored swap");
+    assert_log!(world; {
+        has "closing early after maker selection",
+        // The forged amounts got past both taker-side layers, so the refusal must
+        // come from the maker's own guard, logged as a handler error on drop.
+        has "Swap amount below the incoming contract floor",
+        has "Swap amount above maximum",
+        // The mutated resend dies on the whole-agreement compare: one value, so
+        // no single field — feerate included — can drift between connections.
+        has "parameters differ from stored swap",
+    });
 
     // Nothing was funded, so nothing may have moved. Taker: 4 UTXOs of 0.05
     // BTC, none of them spent. Makers: 4 UTXOs of 0.05 BTC minus the fidelity
@@ -331,7 +333,7 @@ fn run_taproot_declaration_guard(world: &mut World, expected: &str, params: Swap
         "maker must reject contract data that breaks the declaration",
     );
 
-    assert_logged!(world, expected);
+    assert_log!(world; { has expected });
 }
 
 /// A taker holding a single UTXO cannot fund 2 splits, so negotiation plans
@@ -358,7 +360,7 @@ fn one_utxo_taker_completes_degraded_swap(world: &mut World) {
         .swap(params)
         .expect("a degraded one-split swap must complete");
 
-    assert_logged!(world, "with 1 funding txs");
+    assert_log!(world; { has "with 1 funding txs" });
 }
 
 /// The maker forwards 1,075 sats. Two splits net to 372 each, under the 485
@@ -377,9 +379,7 @@ fn maker_degrades_split_count_when_netting_breaks_the_floor(world: &mut World) {
         .taker_mut()
         .prepare(params)
         .expect("admission must fall back to one split");
-    world
-        .framework()
-        .assert_log("with 1 funding split(s)", &world.taker_log_path());
+    assert_log!(world; { has "with 1 funding split(s)" });
 }
 
 /// Admission plans but reserves nothing: coins are claimed only at funding, so a
@@ -662,13 +662,11 @@ fn swap_cap_rejects_before_planning(world: &mut World) {
         other => panic!("the capped admission got unexpected response: {:?}", other),
     }
 
-    let log_path = world.taker_log_path();
-    assert_logged!(world, "30 active swaps at the 30 cap");
-    let contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !contents.contains("Rejecting swap at admission"),
-        "the cap must fire before the planner runs"
-    );
+    assert_log!(world; {
+        has "30 active swaps at the 30 cap",
+        // The cap must fire before the planner runs.
+        lacks "Rejecting swap at admission",
+    });
 }
 
 /// A maker that re-admits a drained swap with a different plan shape fails
@@ -688,7 +686,7 @@ fn readmission_with_a_new_shape_fails_before_funding(world: &mut World) {
                 .with_required_confirms(1),
         )
         .expect("the maker must admit the swap");
-    assert_logged!(world, "with 2 funding split(s)");
+    assert_log!(world; { has "with 2 funding split(s)" });
 
     // Leave the maker one coin, so a fresh plan can have only one split.
     let maker = world.makers()[0].inner();

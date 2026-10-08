@@ -12,10 +12,7 @@ use openswap::{
 use crate::test_framework::*;
 
 use log::info;
-use std::{
-    fs, thread,
-    time::{Duration, Instant},
-};
+use std::{fs, time::Duration};
 
 /// An offer whose minimum exceeds its maximum cannot price any amount. That is
 /// also what a maker low on liquidity publishes, so it must sideline the maker
@@ -134,19 +131,16 @@ fn wrong_key_sender_signatures_ban_their_signer(world: &mut World, params: SwapP
         remaining -= batch;
     }
 
-    let renewal_start = Instant::now();
-    while world
-        .makers()
-        .iter()
-        .zip(&old_bonds)
-        .any(|(maker, old)| latest_bond(maker.inner()).outpoint() == old.outpoint())
-    {
-        assert!(
-            renewal_start.elapsed() < Duration::from_secs(180),
-            "both makers must renew their expired bonds"
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_until!(
+        Duration::from_secs(180),
+        every Duration::from_secs(5),
+        "both makers to renew their expired bonds",
+        !world
+            .makers()
+            .iter()
+            .zip(&old_bonds)
+            .any(|(maker, old)| latest_bond(maker.inner()).outpoint() == old.outpoint())
+    );
 
     // Only the taker runs discovery, so this line is its registry taking the
     // banned maker's new bond.
@@ -155,16 +149,14 @@ fn wrong_key_sender_signatures_ban_their_signer(world: &mut World, params: SwapP
         .txid
         .to_string();
     let log_path = world.temp_dir().join("taker/debug.log");
-    let discovery_start = Instant::now();
-    while !fs::read_to_string(&log_path).unwrap().lines().any(|line| {
-        line.contains("Stored validated fidelity candidate") && line.contains(&rebond_txid)
-    }) {
-        assert!(
-            discovery_start.elapsed() < Duration::from_secs(180),
-            "the taker must discover the banned maker's new bond"
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_until!(
+        Duration::from_secs(180),
+        every Duration::from_secs(5),
+        "the taker to discover the banned maker's new bond",
+        fs::read_to_string(&log_path).unwrap().lines().any(|line| {
+            line.contains("Stored validated fidelity candidate") && line.contains(&rebond_txid)
+        })
+    );
 
     // The sync now meets the expired bond and the new one for the same
     // address. Neither may lift the ban.
@@ -272,14 +264,12 @@ fn wrong_handover_key_bans_the_last_maker(world: &mut World, params: SwapParams)
 
     // The taker holds the preimage, so the background recovery claims the
     // last maker's contract by hashlock without waiting on any timelock.
-    let recovery_start = Instant::now();
-    while !world.taker().inner().is_recovery_complete() {
-        assert!(
-            recovery_start.elapsed() < Duration::from_secs(300),
-            "background recovery did not complete within timeout"
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_until!(
+        Duration::from_secs(300),
+        every Duration::from_secs(5),
+        "background recovery to complete",
+        world.taker().inner().is_recovery_complete()
+    );
     world.mine(1);
     world.taker().sync();
     assert_balances!(world; { taker: { regular: 14_499_692, swap: 497_369, contract: 0 } });

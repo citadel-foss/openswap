@@ -47,12 +47,8 @@ fn maker_without_fee_headroom_fails_before_any_broadcast(world: &mut World) {
     assert_balances!(world, since before; { taker: { loss: 0 } });
 
     world.shutdown_makers();
-    let log_path = world.taker_log_path();
-    let log_contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !log_contents.contains("SECURITY: Broadcasting"),
-        "an unfundable swap must never reach a funding broadcast"
-    );
+    // An unfundable swap must never reach a funding broadcast.
+    assert_log!(world; { lacks "SECURITY: Broadcasting" });
 }
 
 /// A fragmented maker wallet at a high negotiated feerate can only fund the
@@ -97,7 +93,7 @@ fn maker_rejects_over_budget_funding_plan(world: &mut World) {
     assert_balances!(world, since before; { taker: { loss: 0 } });
 
     world.shutdown_makers();
-    assert_logged!(world, "above the taker's input budget");
+    assert_log!(world; { has "above the taker's input budget" });
 }
 
 /// A maker that funds at the relay floor against a negotiated 3 sat/vB swap:

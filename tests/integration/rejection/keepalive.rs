@@ -9,10 +9,7 @@ use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use crate::test_framework::*;
 
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use std::{thread, time::Duration};
 
 use super::wait_for_log_after;
 
@@ -78,15 +75,12 @@ fn keepalive_with_mempool_funding_still_refreshes(world: &mut World) {
         .unwrap()
         .expect("the swap must complete once mining resumes");
 
-    let contents = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        !contents.contains("names funding the backend cannot see"),
-        "no keepalive may be refused while the funding is mempool-visible"
-    );
-    assert!(
-        !contents.contains("Released idle unfunded swap"),
-        "a swap with mempool-visible funding must never be drained"
-    );
+    assert_log!(log_path; {
+        // No keepalive may be refused while the funding is mempool-visible ...
+        lacks "names funding the backend cannot see",
+        // ... and a swap with mempool-visible funding must never be drained.
+        lacks "Released idle unfunded swap",
+    });
 }
 
 /// A keepalive naming funding the backend cannot see must not refresh:
@@ -126,18 +120,12 @@ fn keepalive_naming_unseen_funding_is_refused(world: &mut World) {
         .unwrap()
         .expect_err("the swap must fail: the maker never answers withheld funding");
 
-    let contents = std::fs::read_to_string(&log_path).unwrap();
-    let post_claim = contents
-        .get(claim_offset as usize..)
-        .unwrap_or(contents.as_str());
-    assert!(
-        post_claim.contains("names funding the backend cannot see"),
-        "a post-claim keepalive must be refused"
-    );
-    assert!(
-        !post_claim.contains("Resetting timer"),
-        "a refused keepalive must not refresh the idle timer"
-    );
+    assert_log!(log_path, since claim_offset; {
+        // A post-claim keepalive was refused ...
+        has "names funding the backend cannot see",
+        // ... and a refused keepalive must not refresh the idle timer.
+        lacks "Resetting timer",
+    });
 
     // With every keepalive refused, the swap goes idle and is drained: the
     // withheld funding is not on-chain evidence.
@@ -196,17 +184,12 @@ fn completed_swap_state_is_restored_after_a_failed_sweep(world: &mut World, para
         "Failed to sweep incoming swapcoins",
         Duration::from_secs(60)
     );
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !world.makers()[0].inner().has_ongoing_swaps().unwrap() {
-        assert!(
-            Instant::now() < deadline,
-            "the completed swap's state must be put back"
-        );
-        thread::sleep(Duration::from_millis(500));
-    }
-    let contents = std::fs::read_to_string(world.taker_log_path()).unwrap();
-    assert!(
-        !contents.contains("Rejecting late message"),
-        "restoring a completed swap is not a late message"
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(500),
+        "the completed swap's state to be put back",
+        world.makers()[0].inner().has_ongoing_swaps().unwrap()
     );
+    // Restoring a completed swap is not a late message.
+    assert_log!(world; { lacks "Rejecting late message" });
 }
