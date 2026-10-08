@@ -253,25 +253,14 @@ fn taproot_drop_at_private_key_handover(world: &mut World) {
     // completed prefix sends a duplicate handover to Maker1 after it has
     // removed its live state, which then produces the misleading
     // Legacy-vs-Taproot error seen in the original failure.
-    let log = std::fs::read_to_string(abort.world().taker_log_path()).unwrap();
-    assert_eq!(
-        log.matches("Sending privkey to maker 0 and awaiting response")
-            .count(),
-        1,
-        "a completed maker must not receive finalization again"
-    );
-    assert_eq!(
-        log.matches("Sending privkey to maker 1 and awaiting response")
-            .count(),
-        2,
-        "only the failing maker should consume both integration-test attempts"
-    );
-    assert!(
-        !log.contains(
-            "UnexpectedMessage { expected: \"Legacy protocol message\", got: \"Taproot protocol message\" }"
-        ),
-        "retry replayed a Taproot handover into a completed maker's default Legacy state"
-    );
+    assert_log!(abort.world(); {
+        // A completed maker must not receive finalization again ...
+        count("Sending privkey to maker 0 and awaiting response") == 1,
+        // ... only the failing maker consumes both integration-test attempts.
+        count("Sending privkey to maker 1 and awaiting response") == 2,
+        // A replayed Taproot handover into a completed maker's default Legacy state.
+        lacks "UnexpectedMessage { expected: \"Legacy protocol message\", got: \"Taproot protocol message\" }",
+    });
 
     abort.recover();
     abort.assert_recovered(&MakerAbortExpect {

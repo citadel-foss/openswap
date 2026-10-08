@@ -27,10 +27,7 @@ use openswap::{
 use crate::test_framework::*;
 
 use log::info;
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use std::{thread, time::Duration};
 
 /// Exact post-recovery balances for one protocol run. Fees differ between the
 /// Legacy and Taproot transaction shapes (and locktime values), so each
@@ -339,16 +336,10 @@ fn discards_only_on_confirmed_spend(world: &mut World, params: SwapParams) {
 
     // Let the sweep confirm; the next recovery cycles must discard the coins.
     world.framework().set_block_gen_paused(false);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        let remaining = outgoing_swapcoins();
-        if remaining == 0 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Outgoing swapcoins were not discarded after the spend confirmed"
-        );
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_until!(
+        Duration::from_secs(120),
+        every Duration::from_secs(5),
+        "the outgoing swapcoins to be discarded after the spend confirmed",
+        outgoing_swapcoins() == 0
+    );
 }

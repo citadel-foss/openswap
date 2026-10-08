@@ -109,59 +109,44 @@ fn bond_auto_renewal(world: &mut World) {
 
     log::info!("Waiting for automatic fidelity bond renewal (up to 90 seconds)...");
 
-    let mut renewal_detected = false;
-    for i in 0..18 {
-        thread::sleep(Duration::from_secs(5));
+    wait_until!(
+        Duration::from_secs(90),
+        every Duration::from_secs(5),
+        "the maker to renew its expired fidelity bond",
+        {
+            maker
+                .wallet
+                .write()
+                .unwrap()
+                .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+                .unwrap();
+            let wallet_read = maker.wallet.read().unwrap();
 
-        maker
-            .wallet
-            .write()
-            .unwrap()
-            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-            .unwrap();
-        let wallet_read = maker.wallet.read().unwrap();
+            // The original bond was redeemed (marked as spent) ...
+            let original_spent = wallet_read
+                .get_fidelity_bonds()
+                .get(initial_bond_index as usize)
+                .unwrap()
+                .is_spent();
 
-        // Check if original bond was redeemed (marked as spent)
-        let original_bond = wallet_read
-            .get_fidelity_bonds()
-            .get(initial_bond_index as usize)
-            .unwrap();
-        let original_spent = original_bond.is_spent();
+            // ... and a new highest bond with a different index exists.
+            let new_bond_created = wallet_read
+                .get_highest_fidelity_index()
+                .unwrap()
+                .map(|idx| idx == initial_bond_index + 1)
+                .unwrap_or(false);
 
-        // Check if there's a new highest bond with different index
-        let highest_index = wallet_read.get_highest_fidelity_index().unwrap();
-        let new_bond_created = highest_index
-            .map(|idx| idx == initial_bond_index + 1)
-            .unwrap_or(false);
-
-        if original_spent && new_bond_created {
-            log::info!(
-                "Fidelity bond renewal detected at iteration {}! Original spent: {}, New bond index: {:?}",
-                i,
-                original_spent,
-                highest_index
-            );
-            renewal_detected = true;
-            break;
+            original_spent && new_bond_created
         }
-
-        log::info!("Check {}/18 - Bond not yet renewed", i + 1);
-    }
-
-    assert!(
-        renewal_detected,
-        "Fidelity bond should have been automatically renewed"
     );
+    log::info!("Fidelity bond renewal detected");
 
     let log_file = world.temp_dir().join("taker/debug.log");
     let log_path = log_file.to_str().unwrap();
-    world.framework().assert_log(
-        "Fidelity Bond at index: 0 expired | Redeeming it.",
-        log_path,
-    );
-    world
-        .framework()
-        .assert_log("Successfully created fidelity bond", log_path);
+    assert_log!(log_path; {
+        has "Fidelity Bond at index: 0 expired | Redeeming it.",
+        has "Successfully created fidelity bond",
+    });
 
     // ---- Regression check for issue #702 (fixed in #769, regressed in #758) ----
     // The nostr broadcast thread must pick up the renewed bond instead of
@@ -188,21 +173,20 @@ fn bond_auto_renewal(world: &mut World) {
         new_bond_outpoint
     );
 
-    let mut rebroadcast_detected = false;
-    for i in 0..18 {
-        thread::sleep(Duration::from_secs(5));
-        let log_contents = std::fs::read_to_string(log_path).unwrap();
-        if log_contents.contains(&expected_broadcast_log) {
-            log::info!("Nostr re-broadcast of renewed bond detected at check {}", i);
-            rebroadcast_detected = true;
-            break;
-        }
-    }
-    assert!(
-        rebroadcast_detected,
-        "Nostr thread kept broadcasting a stale fidelity bond — renewed bond {} was never announced (issue #702 regression)",
-        new_bond_outpoint
+    // A stale announcement means the nostr thread kept the bond it captured
+    // at startup (issue #702 regression).
+    wait_until!(
+        Duration::from_secs(90),
+        every Duration::from_secs(5),
+        format!(
+            "the nostr re-broadcast of renewed bond {}",
+            new_bond_outpoint
+        ),
+        std::fs::read_to_string(log_path)
+            .unwrap()
+            .contains(&expected_broadcast_log)
     );
+    log::info!("Nostr re-broadcast of renewed bond detected");
 
     // Shutdown
     maker.shutdown.store(true, Relaxed);

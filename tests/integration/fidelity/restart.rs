@@ -123,14 +123,7 @@ fn run_unconfirmed_fidelity_bond_not_duplicated(world: &mut World) {
     );
 
     // ... and the create branch ran exactly once.
-    assert_eq!(
-        std::fs::read_to_string(&log_path)
-            .unwrap()
-            .matches("No active Fidelity Bonds found. Creating one.")
-            .count(),
-        1,
-        "run 1 should have created exactly one bond candidate"
-    );
+    assert_log!(world; { count("No active Fidelity Bonds found. Creating one.") == 1 });
 
     // Stop the maker while the bond is still unconfirmed.
     maker.shutdown.store(true, Relaxed);
@@ -155,30 +148,16 @@ fn run_unconfirmed_fidelity_bond_not_duplicated(world: &mut World) {
     let _ = restarted_thread.join();
 
     // ----- Assertions on the log of both runs -----
-    let log = std::fs::read_to_string(&log_path).unwrap();
-
-    assert!(
-        log.contains("waiting for confirmation instead of creating a new one"),
-        "restart must detect the pending bond and wait for it"
-    );
-    assert!(
-        log.contains("confirmed at height"),
-        "restart must record the pending bond's confirmation"
-    );
-    assert!(
-        log.contains("Highest bond at outpoint"),
-        "restart must take the existing-bond branch with the adopted bond"
-    );
-    assert_eq!(
-        log.matches("No active Fidelity Bonds found. Creating one.")
-            .count(),
-        1,
-        "restart must not take the create-new-bond branch (would doubly lock funds)"
-    );
-    assert!(
-        !log.contains("Successfully created fidelity bond"),
-        "restart must not create a second fidelity bond"
-    );
+    assert_log!(world; {
+        // The restart detected the pending bond and waited for it ...
+        has "waiting for confirmation instead of creating a new one",
+        has "confirmed at height",
+        // ... then took the existing-bond branch with the adopted bond.
+        has "Highest bond at outpoint",
+        // Never the create branch again: that would lock funds twice.
+        count("No active Fidelity Bonds found. Creating one.") == 1,
+        lacks "Successfully created fidelity bond",
+    });
 }
 
 /// A maker restarting with a live bond and a pending one advertises the live
@@ -190,7 +169,6 @@ fn run_unconfirmed_fidelity_bond_not_duplicated(world: &mut World) {
 fn live_bond_is_advertised_while_another_is_pending(world: &mut World) {
     let bitcoind = world.bitcoind();
     let maker = world.makers()[0].inner();
-    let log_path = world.taker_log_path();
 
     world.fund_makers(2, Amount::ONE_BTC, AddressType::P2TR);
 
@@ -230,7 +208,6 @@ fn live_bond_is_advertised_while_another_is_pending(world: &mut World) {
     // Read before stopping, assert after: a failed assert must not leave the
     // restarted maker running.
     let still_pending = bitcoind.client.get_mempool_entry(&pending_txid).is_ok();
-    let log = std::fs::read_to_string(&log_path);
     restarted.shutdown.store(true, Relaxed);
     let _ = restarted_thread.join();
     world.framework().set_block_gen_paused(false);
@@ -239,12 +216,12 @@ fn live_bond_is_advertised_while_another_is_pending(world: &mut World) {
         still_pending,
         "the second bond must still be unconfirmed when setup completes"
     );
-    assert!(
-        log.expect("maker log is readable").contains(&format!(
+    // The restart advertised the live bond instead of waiting.
+    assert_log!(world; {
+        has format!(
             "Fidelity bond {pending_txid} still unconfirmed; advertising the live bond meanwhile"
-        )),
-        "restart must advertise the live bond instead of waiting"
-    );
+        ),
+    });
 }
 
 /// Eviction path: if the unconfirmed bond tx falls out of the mempool while
@@ -365,26 +342,14 @@ fn evicted_bond_rebroadcast_on_restart(world: &mut World) {
     let _ = restarted_thread.join();
 
     // ----- Assertions on the log of both runs -----
-    let log = std::fs::read_to_string(&log_path).unwrap();
-
-    assert!(
-        log.contains("not visible to the backend (evicted from mempool?); rebroadcasting"),
-        "restart must take the rebroadcast branch for the evicted bond"
-    );
-    assert!(
-        log.contains("confirmed at height"),
-        "restart must record the rebroadcast bond's confirmation"
-    );
-    assert_eq!(
-        log.matches("No active Fidelity Bonds found. Creating one.")
-            .count(),
-        1,
-        "restart must not take the create-new-bond branch (would doubly lock funds)"
-    );
-    assert!(
-        !log.contains("Successfully created fidelity bond"),
-        "restart must not create a second fidelity bond"
-    );
+    assert_log!(world; {
+        // The restart took the rebroadcast branch for the evicted bond ...
+        has "not visible to the backend (evicted from mempool?); rebroadcasting",
+        has "confirmed at height",
+        // ... and never the create branch again: that would lock funds twice.
+        count("No active Fidelity Bonds found. Creating one.") == 1,
+        lacks "Successfully created fidelity bond",
+    });
 
     // Teardown: stop the replacement node first; the framework's original
     // node is already down (TestFramework::stop tolerates that).
@@ -499,25 +464,14 @@ fn evicted_bond_rebroadcast_on_restart_electrum(world: &mut World) {
     restarted.shutdown.store(true, Relaxed);
     let _ = restarted_thread.join();
 
-    let log = std::fs::read_to_string(&log_path).unwrap();
-    assert!(
-        log.contains("not visible to the backend (evicted from mempool?); rebroadcasting"),
-        "restart must take the rebroadcast branch for the evicted bond"
-    );
-    assert!(
-        log.contains("confirmed at height"),
-        "restart must record the rebroadcast bond's confirmation"
-    );
-    assert_eq!(
-        log.matches("No active Fidelity Bonds found. Creating one.")
-            .count(),
-        1,
-        "restart must not take the create-new-bond branch (would doubly lock funds)"
-    );
-    assert!(
-        !log.contains("Successfully created fidelity bond"),
-        "restart must not create a second fidelity bond"
-    );
+    assert_log!(world; {
+        // The restart took the rebroadcast branch for the evicted bond ...
+        has "not visible to the backend (evicted from mempool?); rebroadcasting",
+        has "confirmed at height",
+        // ... and never the create branch again: that would lock funds twice.
+        count("No active Fidelity Bonds found. Creating one.") == 1,
+        lacks "Successfully created fidelity bond",
+    });
 
     // Teardown: electrs first (its datadir sits inside temp_dir), then the
     // replacement node; the framework's original node is already down.

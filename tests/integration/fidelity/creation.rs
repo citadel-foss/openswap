@@ -51,11 +51,10 @@ fn bond_creation_and_redemption(world: &mut World) {
 
     thread::sleep(Duration::from_secs(6));
 
-    assert_logged!(world, "Send at least 0.01001909 BTC to");
-    assert_logged!(
-        world,
-        "(fidelity bond + fees + minimum swap liquidity) to be visible in the market"
-    );
+    assert_log!(world; {
+        has "Send at least 0.01001909 BTC to",
+        has "(fidelity bond + fees + minimum swap liquidity) to be visible in the market",
+    });
 
     log::info!("Sending exactly the quoted amount");
     // Setup completes only after the bond is made and the leftover passes the
@@ -69,7 +68,7 @@ fn bond_creation_and_redemption(world: &mut World) {
     let _ = maker_thread.join().unwrap();
 
     // Assert that successful fidelity bond creation is logged
-    assert_logged!(world, "Successfully created fidelity bond");
+    assert_log!(world; { has "Successfully created fidelity bond" });
 
     log::info!("Verifying first fidelity bond creation");
     // Verify that the fidelity bond is created correctly.
@@ -138,14 +137,8 @@ fn bond_creation_and_redemption(world: &mut World) {
     assert_single_adopted_bond(&restarted, bond_txid);
     restarted.shutdown.store(true, Relaxed);
     let _ = restarted_thread.join().unwrap();
-    assert_eq!(
-        std::fs::read_to_string(world.taker_log_path())
-            .unwrap()
-            .matches("No active Fidelity Bonds found. Creating one.")
-            .count(),
-        1,
-        "the restored maker must not create a second bond"
-    );
+    // The restored maker must not create a second bond.
+    assert_log!(world; { count("No active Fidelity Bonds found. Creating one.") == 1 });
 
     log::info!("Creating second fidelity bond with higher amount");
     world.fund_makers(1, Amount::ONE_BTC, AddressType::P2TR);
