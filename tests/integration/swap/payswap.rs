@@ -27,13 +27,15 @@ use log::info;
     maker_behaviors = [Normal, Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
         verify_maker_pre_swap_balances(),
     ],
 )]
-fn taproot_exact_payment(world: &mut World, taker_original_balance: Amount) {
+fn taproot_exact_payment(world: &mut World) {
+    let before = world.balances();
+
     let receiver_address = world
         .bitcoind()
         .client
@@ -147,23 +149,14 @@ fn taproot_exact_payment(world: &mut World, taker_original_balance: Amount) {
 
     // The taker must own no output of the settlement.
     world.taker().sync();
-    let taker_balances = world.taker().balances();
-    info!(
-        "Taker balances after payment swap: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-    assert_eq!(
-        taker_balances.swap,
-        Amount::ZERO,
-        "Taker must not own any swap output after a payment swap"
-    );
-    assert_eq!(taker_balances.contract, Amount::ZERO);
+    assert_balances!(world, since before; {
+        // The wallet cost is the delivered payment plus the reported fees.
+        taker: { swap: 0, contract: 0, loss: payment_result.delivered_amount + report.fee_paid },
+    });
 
-    let spendable_decrease = taker_original_balance
-        .checked_sub(taker_balances.spendable)
+    let spendable_decrease = before.takers[0]
+        .spendable
+        .checked_sub(world.taker().balances().spendable)
         .expect("payment swap must cost the taker its route amount");
     info!(
         "Taker wallet cost: {} sats (route amount {} sats)",
@@ -173,11 +166,6 @@ fn taproot_exact_payment(world: &mut World, taker_original_balance: Amount) {
     assert!(
         spendable_decrease >= summary.send_amount,
         "wallet cost must cover the gross route amount"
-    );
-    assert_eq!(
-        spendable_decrease.to_sat(),
-        payment_result.delivered_amount + report.fee_paid,
-        "wallet cost must equal the delivered payment plus reported fees"
     );
 
     info!("Taproot PaySwap test completed successfully!");
@@ -191,13 +179,15 @@ fn taproot_exact_payment(world: &mut World, taker_original_balance: Amount) {
     maker_behaviors = [Normal, Normal],
     takers = [Normal],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
         verify_maker_pre_swap_balances(),
     ],
 )]
-fn legacy_exact_payment(world: &mut World, taker_original_balance: Amount) {
+fn legacy_exact_payment(world: &mut World) {
+    let before = world.balances();
+
     let receiver_address = world
         .bitcoind()
         .client
@@ -283,25 +273,18 @@ fn legacy_exact_payment(world: &mut World, taker_original_balance: Amount) {
     );
 
     world.taker().sync();
-    let taker_balances = world.taker().balances();
-    assert_eq!(
-        taker_balances.swap,
-        Amount::ZERO,
-        "Taker must not own any swap output after a payment swap"
-    );
-    assert_eq!(taker_balances.contract, Amount::ZERO);
+    assert_balances!(world, since before; {
+        // The wallet cost is the delivered payment plus the reported fees.
+        taker: { swap: 0, contract: 0, loss: payment_result.delivered_amount + report.fee_paid },
+    });
 
-    let spendable_decrease = taker_original_balance
-        .checked_sub(taker_balances.spendable)
+    let spendable_decrease = before.takers[0]
+        .spendable
+        .checked_sub(world.taker().balances().spendable)
         .expect("payment swap must cost the taker its route amount");
     assert!(
         spendable_decrease >= summary.send_amount,
         "wallet cost must cover the gross route amount"
-    );
-    assert_eq!(
-        spendable_decrease.to_sat(),
-        payment_result.delivered_amount + report.fee_paid,
-        "wallet cost must equal the delivered payment plus reported fees"
     );
 
     info!("Legacy PaySwap test completed successfully!");
@@ -320,12 +303,14 @@ fn legacy_exact_payment(world: &mut World, taker_original_balance: Amount) {
     maker_behaviors = [RefuseSwapDetails],
     takers = [Normal],
     setup = [
-        fund_taker_default(1) as taker_original_balance,
+        fund_taker_default(1),
         fund_makers(2, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
         start_makers_without_sync(120),
     ],
 )]
-fn dust_floor_rejects_before_funding(world: &mut World, taker_original_balance: Amount) {
+fn dust_floor_rejects_before_funding(world: &mut World) {
+    let before = world.balances();
+
     let receiver_address = world
         .bitcoind()
         .client
@@ -371,11 +356,8 @@ fn dust_floor_rejects_before_funding(world: &mut World, taker_original_balance: 
         "a refused quote must not broadcast any funding transaction"
     );
     world.taker().sync();
-    let taker_balances = world.taker().balances();
-    assert_eq!(
-        taker_balances.spendable, taker_original_balance,
-        "a refused quote must not cost the taker anything"
-    );
+    // A refused quote must not cost the taker anything.
+    assert_balances!(world, since before; { taker: { loss: 0 } });
 
     info!("PaySwap dust-floor refusal test completed successfully!");
 }

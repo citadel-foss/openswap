@@ -28,9 +28,9 @@ use std::{
     takers = [Normal, Normal],
 )]
 fn legacy_and_taproot_swaps_run_together(world: &mut World) {
-    let taker_original_balances = (0..world.takers().len())
-        .map(|i| world.fund_nth_taker_default(i, 3))
-        .collect::<Vec<_>>();
+    for i in 0..world.takers().len() {
+        world.fund_nth_taker_default(i, 3);
+    }
     // Both admissions plan over the same pool, so the protocols' split sizes
     // keep the plans apart: legacy splits (~167k) fit the 200k coins, taproot
     // splits (~233k) need the 300k ones. The bond takes its exact UTXO and
@@ -42,11 +42,7 @@ fn legacy_and_taproot_swaps_run_together(world: &mut World) {
     world.start_makers(120);
     // Not verify_maker_pre_swap_balances: that helper pins the 4-UTXO funding
     // shape, and this test needs more UTXOs for two concurrent frozen plans.
-    let maker_original_balances: Vec<Amount> = world
-        .makers()
-        .iter()
-        .map(|maker| maker.balances().spendable)
-        .collect();
+    let before = world.balances();
     world.mine(1);
 
     let start = Arc::new(Barrier::new(2));
@@ -112,101 +108,26 @@ fn legacy_and_taproot_swaps_run_together(world: &mut World) {
         "Taproot swap should succeed while the makers also process a Legacy swap"
     );
 
-    let expected_taker_regular = [14_499_538, 14_299_538];
-    let expected_taker_swap = [496_447, 696_704];
-    let expected_taker_fees = [4_015, 3_758];
-    let expected_maker_regular = [302_152, 305_139];
-    let expected_maker_swap = [1_199_214, 1_196_138];
-    let expected_maker_earnings = [1_366, 1_277];
-
-    // Sync and log every party before any assert, so one stale golden value
-    // does not hide the rest.
-    let taker_balances: Vec<_> = world
-        .takers()
-        .iter()
-        .map(|taker| {
-            taker.sync();
-            taker.balances()
-        })
-        .collect();
+    for taker in world.takers() {
+        taker.sync();
+    }
     world.mine(1);
-    let maker_balances: Vec<_> = world
-        .makers()
-        .iter()
-        .map(|maker| {
-            maker.sync();
-            maker.balances()
-        })
-        .collect();
+    world.sync_makers();
 
-    for (i, balances) in taker_balances.iter().enumerate() {
-        info!(
-            "Taker {} final balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i,
-            balances.regular,
-            balances.swap,
-            balances.contract,
-            balances.fidelity,
-            balances.spendable,
-        );
-    }
-    for (i, (balances, original_balance)) in maker_balances
-        .iter()
-        .zip(maker_original_balances.iter())
-        .enumerate()
-    {
-        info!(
-            "Maker {} final balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i,
-            balances.regular,
-            balances.swap,
-            balances.contract,
-            balances.fidelity,
-            balances.spendable,
-        );
-        info!(
-            "Maker {i} earnings: {}",
-            balances.spendable.to_sat() as i64 - original_balance.to_sat() as i64
-        );
-    }
-
-    for (i, (balances, original_balance)) in taker_balances
-        .iter()
-        .zip(taker_original_balances)
-        .enumerate()
-    {
-        BalanceExpect {
-            regular: Some(Is::Sats(expected_taker_regular[i])),
-            swap: Some(Is::Sats(expected_taker_swap[i])),
-            contract: Some(Is::Amount(Amount::ZERO)),
-            fidelity: Some(Is::Amount(Amount::ZERO)),
-            spendable: None,
-            delta: Some(Delta::Loss {
-                baseline: original_balance,
-                style: DiffStyle::CheckedUnwrap,
-                sats: expected_taker_fees[i],
-            }),
-        }
-        .assert(&format!("Taker {i}"), balances);
-    }
-
-    for (i, (balances, original_balance)) in maker_balances
-        .iter()
-        .zip(maker_original_balances)
-        .enumerate()
-    {
-        BalanceExpect {
-            regular: Some(Is::Sats(expected_maker_regular[i])),
-            swap: Some(Is::Sats(expected_maker_swap[i])),
-            contract: Some(Is::Amount(Amount::ZERO)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: None,
-            delta: Some(Delta::Gain {
-                baseline: original_balance,
-                style: DiffStyle::CheckedUnwrap,
-                sats: expected_maker_earnings[i],
-            }),
-        }
-        .assert(&format!("Maker {i}"), balances);
-    }
+    assert_balances!(world, since before; {
+        takers: {
+            regular: [14_499_538, 14_299_538],
+            swap: [496_447, 696_704],
+            contract: 0,
+            fidelity: 0,
+            loss: [4_015, 3_758],
+        },
+        makers: {
+            regular: [302_152, 305_139],
+            swap: [1_199_214, 1_196_138],
+            contract: 0,
+            fidelity: BOND,
+            gain: [1_366, 1_277],
+        },
+    });
 }

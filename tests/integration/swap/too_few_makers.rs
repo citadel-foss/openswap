@@ -24,7 +24,7 @@ use log::info;
     takers = [Normal],
     setup = [
         // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         // Fund the makers with 4 UTXOs of 0.05 BTC each
         fund_makers_default(),
         // Start the maker server threads
@@ -32,7 +32,9 @@ use log::info;
         verify_maker_pre_swap_balances(),
     ],
 )]
-fn taproot_swap_fails_before_funding(world: &mut World, taker_original_balance: Amount) {
+fn taproot_swap_fails_before_funding(world: &mut World) {
+    let before = world.balances();
+
     // Swap params: Taproot, requires 2 makers but only 1 is available
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -54,28 +56,8 @@ fn taproot_swap_fails_before_funding(world: &mut World, taker_original_balance: 
     // Sync taker wallet and verify balance is unchanged
     world.taker().sync();
 
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taker balances after failed prepare: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
     // Balance should be unchanged since no funds were broadcast
-    assert_eq!(
-        taker_balances.spendable, taker_original_balance,
-        "Taker balance should be unchanged. Original: {}, After: {}",
-        taker_original_balance, taker_balances.spendable,
-    );
-
-    assert_eq!(
-        taker_balances.contract,
-        Amount::ZERO,
-        "Taker should have no contract balance"
-    );
+    assert_balances!(world, since before; { taker: { contract: 0, loss: 0 } });
 
     info!("Too-few-makers test completed successfully!");
 }

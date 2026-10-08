@@ -5,7 +5,6 @@
 //! heartbeat spanning finalization, that maker drains its live state into
 //! recovery and rejects the later private-key handover.
 
-use bitcoin::Amount;
 use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 
 use crate::test_framework::*;
@@ -39,14 +38,7 @@ fn run_last_maker_survives_finalization_idle_window(
     world.mine(1);
     world.sync_makers();
 
-    for (index, maker) in world.makers().iter().enumerate() {
-        let balances = maker.balances();
-        assert_eq!(
-            balances.contract,
-            Amount::ZERO,
-            "maker {index} retained contract balance after finalization"
-        );
-    }
+    assert_balances!(world; { makers: { contract: 0 } });
 
     let log = std::fs::read_to_string(world.taker_log_path()).unwrap();
     assert!(log.contains("Test behavior: stalling"));
