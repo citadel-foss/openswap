@@ -23,17 +23,14 @@ use std::{
 /// never-broadcast funding. Lines are matched by swap id, since one log file
 /// can hold several swaps.
 fn assert_grace_then_discard(log_path: &str, swap_id: &str) {
-    let log = std::fs::read_to_string(log_path).unwrap();
-    let waited = log
-        .find(&format!("Swap {swap_id} shows no funding broadcast after"))
-        .expect("the maker must wait on the grace for this swap");
-    let dropped = log
-        .find(&format!("Funding was never broadcast for swap {swap_id}"))
-        .expect("the maker must discard this swap's never-broadcast funding");
-    assert!(
-        waited < dropped,
-        "the maker must wait out the grace before dropping the swapcoins"
-    );
+    assert_log!(log_path; {
+        // The maker waits on the grace for this swap, and only then discards
+        // its never-broadcast funding and drops the swapcoins.
+        order [
+            format!("Swap {swap_id} shows no funding broadcast after"),
+            format!("Funding was never broadcast for swap {swap_id}"),
+        ],
+    });
 }
 
 /// Test: Timelock-only recovery when last maker skips funding broadcast.
@@ -138,14 +135,12 @@ pub(crate) fn run_legacy_timelock_only_recovery(
 
     // The background recovery loop (spawned by recover_active_swap) periodically
     // retries timelock recovery. Wait for it to finish.
-    let recovery_timeout = Duration::from_secs(120);
-    let recovery_start = Instant::now();
-    while !world.taker().inner().is_recovery_complete() {
-        if recovery_start.elapsed() > recovery_timeout {
-            panic!("Background recovery did not complete within timeout");
-        }
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_until!(
+        Duration::from_secs(120),
+        every Duration::from_secs(5),
+        "the background recovery to complete",
+        world.taker().inner().is_recovery_complete()
+    );
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet
@@ -343,14 +338,12 @@ fn run_taproot_timelock_only_recovery(
     // The background recovery loop (spawned by recover_active_swap) periodically
     // retries timelock recovery; the sleep above already matured the timelocks,
     // so this only waits for the loop to notice and broadcast.
-    let recovery_timeout = Duration::from_secs(120);
-    let recovery_start = Instant::now();
-    while !world.taker().inner().is_recovery_complete() {
-        if recovery_start.elapsed() > recovery_timeout {
-            panic!("Background recovery did not complete within timeout");
-        }
-        thread::sleep(Duration::from_secs(5));
-    }
+    wait_until!(
+        Duration::from_secs(120),
+        every Duration::from_secs(5),
+        "the background recovery to complete",
+        world.taker().inner().is_recovery_complete()
+    );
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet
@@ -506,22 +499,19 @@ fn late_incoming_after_refund_is_never_swept(world: &mut World, params: SwapPara
     );
 
     // The taker drops an outgoing coin once its timelock refund is mined.
-    let deadline = Instant::now() + Duration::from_secs(400);
-    while world
-        .taker()
-        .inner()
-        .get_wallet()
-        .read()
-        .unwrap()
-        .get_outgoing_swapcoins_count()
-        != 0
-    {
-        assert!(
-            Instant::now() < deadline,
-            "taker did not refund its outgoing within 400s"
-        );
-        thread::sleep(Duration::from_secs(2));
-    }
+    wait_until!(
+        Duration::from_secs(400),
+        every Duration::from_secs(2),
+        "the taker to refund its outgoing",
+        world
+            .taker()
+            .inner()
+            .get_wallet()
+            .read()
+            .unwrap()
+            .get_outgoing_swapcoins_count()
+            == 0
+    );
 
     info!("Taker refunded; publishing the withheld incoming contracts");
     for tx in &withheld {
@@ -548,14 +538,13 @@ fn late_incoming_after_refund_is_never_swept(world: &mut World, params: SwapPara
         }
     }
 
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !world.taker().inner().is_recovery_complete() {
-        assert!(
-            Instant::now() < deadline,
-            "recovery kept waiting on an incoming it gave up"
-        );
-        thread::sleep(Duration::from_secs(2));
-    }
+    // Recovery must not keep waiting on an incoming it gave up.
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(2),
+        "recovery to complete without the given-up incoming",
+        world.taker().inner().is_recovery_complete()
+    );
     assert_eq!(
         world
             .taker()

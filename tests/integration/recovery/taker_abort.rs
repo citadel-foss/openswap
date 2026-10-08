@@ -245,16 +245,13 @@ fn maker_recovers_swap_past_refund_deadline(world: &mut World, params: SwapParam
         .taker_mut()
         .swap_fails(params, "The swap must fail once the maker gives up on it");
 
-    let log_path = world.taker_log_path();
-    let framework = world.framework();
-    framework.assert_log(
-        "Test behavior: stalling 180s so the maker's refund deadline passes",
-        &log_path,
-    );
-    // The deadline, not a dropped connection, is what ended this swap. Keepalives were
-    // still arriving every 5s, so the idle timeout could not have drained it.
-    framework.assert_log("reached its refund deadline; recovering now", &log_path);
-    framework.assert_log("Recovering from swap", &log_path);
+    assert_log!(world; {
+        has "Test behavior: stalling 180s so the maker's refund deadline passes",
+        // The deadline, not a dropped connection, is what ended this swap. Keepalives
+        // were still arriving every 5s, so the idle timeout could not have drained it.
+        has "reached its refund deadline; recovering now",
+        has "Recovering from swap",
+    });
 }
 
 /// Test: Taker aborts at AckSwapDetails response (Taproot).
@@ -305,18 +302,15 @@ fn taproot_drop_at_ack_response(world: &mut World) {
         "Released idle unfunded swap",
         Duration::from_secs(60)
     );
-    let release_deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while world
-        .makers()
-        .iter()
-        .any(|maker| maker.inner().has_ongoing_swaps().unwrap())
-    {
-        assert!(
-            std::time::Instant::now() < release_deadline,
-            "Early-abort reservations should be released after the idle timeout"
-        );
-        thread::sleep(Duration::from_secs(1));
-    }
+    wait_until!(
+        Duration::from_secs(15),
+        every Duration::from_secs(1),
+        "the early-abort reservations to be released after the idle timeout",
+        !world
+            .makers()
+            .iter()
+            .any(|maker| maker.inner().has_ongoing_swaps().unwrap())
+    );
 
     // With the stale reservation gone, the makers must be back at full capacity:
     // a fresh swap request has to be accepted again. The maker only sends

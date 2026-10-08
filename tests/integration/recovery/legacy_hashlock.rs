@@ -58,7 +58,7 @@ fn maker_drops_after_sweep(world: &mut World) {
 
     // The point of the test: the preimage was on-chain, so recovery must have
     // gone through the hashlock branch, not the timelock one.
-    assert_logged!(world, "Signing legacy hashlock spend with preimage");
+    assert_log!(world; { has "Signing legacy hashlock spend with preimage" });
 
     // The hashlock sweep is a separate tx per contract, so the taker pays more
     // than the 4339 sats a clean legacy swap costs.

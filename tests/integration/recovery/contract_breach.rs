@@ -34,10 +34,7 @@ use openswap::{
 use crate::test_framework::*;
 
 use log::info;
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use std::{thread, time::Duration};
 
 /// How the swap ends after the last maker broadcasts and drops out.
 #[derive(Clone, Copy, PartialEq)]
@@ -224,26 +221,21 @@ fn run_contract_breach<B: TestBackend>(
 
         // Every live maker settles and drops its swapcoins.
         info!("Waiting for the live makers to settle...");
-        let settle_start = Instant::now();
-        while world.makers().iter().enumerate().any(|(i, maker)| {
-            let wallet = maker.inner().wallet.read().unwrap();
-            Some(i) != dead
-                && wallet.get_incoming_swapcoins_count() + wallet.get_outgoing_swapcoins_count() > 0
-        }) {
-            assert!(
-                settle_start.elapsed() < timelock_recovery_wait::<B>(),
-                "makers did not settle"
-            );
-            thread::sleep(Duration::from_secs(5));
-        }
+        wait_until!(
+            timelock_recovery_wait::<B>(),
+            every Duration::from_secs(5),
+            "the live makers to settle",
+            !world.makers().iter().enumerate().any(|(i, maker)| {
+                let wallet = maker.inner().wallet.read().unwrap();
+                Some(i) != dead
+                    && wallet.get_incoming_swapcoins_count() + wallet.get_outgoing_swapcoins_count()
+                        > 0
+            })
+        );
         // A hashlock claim and a timelock refund never both happen: no refund at all.
         if ending != Ending::MiddleMakerDies {
-            assert!(
-                !std::fs::read_to_string(&log_path)
-                    .unwrap()
-                    .contains("Timelock recovery tx "),
-                "nobody may refund a swap that settled by hashlock"
-            );
+            // Nobody may refund a swap that settled by hashlock.
+            assert_log!(log_path; { lacks "Timelock recovery tx " });
         }
     }
 
@@ -571,5 +563,5 @@ fn taker_broadcasts_contract_before_handover(world: &mut World, params: SwapPara
 
 /// The maker refused because of the breach, not for any other reason.
 fn assert_breach_refused(world: &World) {
-    assert_logged!(world, "ContractBroadcast");
+    assert_log!(world; { has "ContractBroadcast" });
 }
