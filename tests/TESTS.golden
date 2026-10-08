@@ -480,7 +480,11 @@ openswap::integration test_framework::expect::tests::columns_give_one_value_per_
 openswap::integration test_framework::expect::tests::every_wrong_field_is_reported_and_unset_ones_are_not
 openswap::integration test_framework::expect::tests::loss_and_gain_are_signed
 openswap::integration test_framework::expect::tests::loss_without_a_snapshot_is_refused
+openswap::integration test_framework::logs::check_tests::every_failing_check_is_reported
+openswap::integration test_framework::logs::check_tests::passing_checks_report_nothing
 openswap::integration test_framework::logs::tests::each_fixture_gets_its_own_log
+openswap::integration test_framework::wait::tests::fails_after_the_timeout_naming_what_it_waited_for
+openswap::integration test_framework::wait::tests::returns_the_first_value_the_check_yields
 openswap::integration wallet::backup::encwallet_encbackup_encrestore
 openswap::integration wallet::backup::encwallet_encbackup_encrestore_electrum
 openswap::integration wallet::broadcast_idempotency::rebroadcast_mined_bitcoind

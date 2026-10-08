@@ -167,3 +167,148 @@ mod tests {
         }
     }
 }
+
+/// One check of [`assert_log!`] against a log.
+#[derive(Debug)]
+pub enum LogCheck {
+    /// The log holds the needle.
+    Has(String),
+    /// The log does not hold the needle.
+    Lacks(String),
+    /// The log holds the needle exactly this many times.
+    Count(String, usize),
+    /// Each needle appears, and each first appears after the one before it.
+    Order(Vec<String>),
+}
+
+/// The failure line of every check in `checks` that `log` does not satisfy.
+pub fn check_log(log: &str, checks: &[LogCheck]) -> Vec<String> {
+    checks
+        .iter()
+        .filter_map(|check| match check {
+            LogCheck::Has(needle) => {
+                (!log.contains(needle.as_str())).then(|| format!("has    {:?}: not found", needle))
+            }
+            LogCheck::Lacks(needle) => log
+                .contains(needle.as_str())
+                .then(|| format!("lacks  {:?}: found", needle)),
+            LogCheck::Count(needle, expected) => {
+                let got = log.matches(needle.as_str()).count();
+                (got != *expected)
+                    .then(|| format!("count  {:?}: expected {}, got {}", needle, expected, got))
+            }
+            LogCheck::Order(needles) => {
+                let positions: Vec<Option<usize>> =
+                    needles.iter().map(|n| log.find(n.as_str())).collect();
+                if let Some(i) = positions.iter().position(Option::is_none) {
+                    return Some(format!("order  {:?}: not found", needles[i]));
+                }
+                let positions: Vec<usize> = positions.into_iter().flatten().collect();
+                positions
+                    .windows(2)
+                    .position(|pair| pair[0] >= pair[1])
+                    .map(|i| format!("order  {:?} is not before {:?}", needles[i], needles[i + 1]))
+            }
+        })
+        .collect()
+}
+
+/// What [`assert_log!`] reads: a world's shared taker log, or a log file path.
+pub trait LogSource {
+    fn log_path(&self) -> String;
+}
+
+impl LogSource for super::World {
+    fn log_path(&self) -> String {
+        self.taker_log_path()
+    }
+}
+
+impl LogSource for str {
+    fn log_path(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl LogSource for String {
+    fn log_path(&self) -> String {
+        self.clone()
+    }
+}
+
+impl<T: LogSource + ?Sized> LogSource for &T {
+    fn log_path(&self) -> String {
+        (**self).log_path()
+    }
+}
+
+impl<T: LogSource + ?Sized> LogSource for &mut T {
+    fn log_path(&self) -> String {
+        (**self).log_path()
+    }
+}
+
+/// The log's current length, for `assert_log!(.., since mark; ..)` to check
+/// only what is written after it.
+#[allow(dead_code)]
+pub fn log_mark(source: &impl LogSource) -> u64 {
+    fs::metadata(source.log_path())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Reads `source`'s log once, past `since` when given, and fails with every
+/// check it does not satisfy. Never writes to the log it reads.
+#[track_caller]
+pub fn assert_log(source: &impl LogSource, since: Option<u64>, checks: &[LogCheck]) {
+    let path = source.log_path();
+    let log = fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {}", path, e));
+    let from = since.map_or(0, |mark| mark as usize).min(log.len());
+    // A mark can fall inside a multi-byte character; start at the next boundary.
+    let from = (from..=log.len())
+        .find(|&i| log.is_char_boundary(i))
+        .unwrap_or(log.len());
+    let failures = check_log(&log[from..], checks);
+    assert!(
+        failures.is_empty(),
+        "log checks failed ({}{}):\n  {}",
+        path,
+        since.map_or(String::new(), |mark| format!(", past byte {}", mark)),
+        failures.join("\n  ")
+    );
+}
+
+#[cfg(test)]
+mod check_tests {
+    use super::{check_log, LogCheck::*};
+
+    const LOG: &str =
+        "start\nShows no funding broadcast\nFunding was never broadcast\ndone\ndone\n";
+
+    #[test]
+    fn passing_checks_report_nothing() {
+        let checks = [
+            Has("start".into()),
+            Lacks("SECURITY".into()),
+            Count("done".into(), 2),
+            Order(vec!["Shows no funding".into(), "never broadcast".into()]),
+        ];
+        assert!(check_log(LOG, &checks).is_empty());
+    }
+
+    #[test]
+    fn every_failing_check_is_reported() {
+        let checks = [
+            Has("missing".into()),
+            Lacks("start".into()),
+            Count("done".into(), 1),
+            Order(vec!["never broadcast".into(), "Shows no funding".into()]),
+            Order(vec!["start".into(), "absent".into()]),
+        ];
+        let failures = check_log(LOG, &checks);
+        assert_eq!(failures.len(), 5, "{:?}", failures);
+        assert!(failures[2].contains("expected 1, got 2"));
+        assert!(failures[3].contains("is not before"));
+        assert!(failures[4].contains("\"absent\": not found"));
+    }
+}
