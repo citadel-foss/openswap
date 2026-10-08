@@ -275,6 +275,11 @@ fn lightning_swap_in_refuses_blocklisted_funding() {
     wait_for_makers_setup(&makers, 120);
     sync_maker_wallets(&makers);
 
+    // Maker and taker share the process logger, so the maker's lines land in
+    // the taker's debug.log. Only lines past this offset belong to the swap.
+    let log_path = test_framework.taker_log_path();
+    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+
     let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
     let result = taker.lightning_swap_in(LnSwapParams {
         amount: Amount::from_sat(50_000),
@@ -302,6 +307,33 @@ fn lightning_swap_in_refuses_blocklisted_funding() {
             .any(|line| line.contains("recovered via") || line.contains("already resolved")),
         "the taker must refund its swap-in HTLC, got: {:?}",
         history
+    );
+
+    // The swap failing is not enough: the maker must have refused this swap's
+    // funding because its blocklist matched the listed address. Recovery
+    // outcomes start with the swap id, which the maker logs too.
+    let swap_id = history
+        .iter()
+        .find_map(|line| line.split_once(": ").map(|(id, _)| id.to_string()))
+        .expect("recovery reports the swap id");
+    let needle = format!("Swap-in {swap_id}: funding refused: Blocklist(BlockedAddress");
+    let listed = blocked_address.to_string();
+    wait_for_log(&log_path, &needle, Duration::from_secs(30));
+    // wait_for_log echoes the needle into the log, but not the address, so
+    // requiring both skips the echo.
+    let contents = std::fs::read_to_string(&log_path).unwrap();
+    let refusals: Vec<&str> = contents
+        .get(log_offset as usize..)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(&needle) && line.contains(&listed))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the maker must refuse swap-in {} once, for the listed address {}",
+        swap_id,
+        blocked_address
     );
 
     drop(takers);
