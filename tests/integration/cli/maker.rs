@@ -10,7 +10,7 @@
 
 use bitcoin::{Address, Amount};
 use openswap::{
-    maker::{AuthenticatedRpcRequest, RpcMsgReq, RpcMsgResp},
+    maker::{AuthenticatedRpcRequest, RpcMsgReq as Req, RpcMsgResp as Resp},
     protocol::common_messages::ProtocolVersion,
     taker::SwapParams,
     utill::{read_message, send_message},
@@ -20,35 +20,73 @@ use crate::test_framework::*;
 
 use log::info;
 use std::{
-    fs,
-    net::TcpStream,
-    process::Command,
-    str::FromStr,
-    sync::atomic::Ordering::Relaxed,
-    thread,
-    time::{Duration, Instant},
+    fs, net::TcpStream, process::Command, str::FromStr, sync::atomic::Ordering::Relaxed,
+    time::Duration,
 };
 
-/// One RPC round trip: connect, send an authenticated request, read the reply.
-fn rpc_call(rpc_port: u16, cookie: &str, request: RpcMsgReq) -> RpcMsgResp {
-    let mut stream =
-        TcpStream::connect(("127.0.0.1", rpc_port)).expect("maker RPC server should be listening");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
-    send_message(
-        &mut stream,
-        &AuthenticatedRpcRequest {
-            token: cookie.to_owned(),
-            request,
-        },
-    )
-    .expect("failed to send RPC request");
-    let bytes = read_message(&mut stream).expect("failed to read RPC response");
-    serde_cbor::from_slice(&bytes).expect("failed to decode RPC response")
+/// The maker's RPC server as `maker-cli` reaches it: one connection per request.
+struct Rpc {
+    port: u16,
+    cookie: String,
+}
+
+impl Rpc {
+    /// One RPC round trip: connect, send an authenticated request, read the reply.
+    fn call(&self, request: Req) -> Resp {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port))
+            .expect("maker RPC server should be listening");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        send_message(
+            &mut stream,
+            &AuthenticatedRpcRequest {
+                token: self.cookie.clone(),
+                request,
+            },
+        )
+        .expect("failed to send RPC request");
+        let bytes = read_message(&mut stream).expect("failed to read RPC response");
+        serde_cbor::from_slice(&bytes).expect("failed to decode RPC response")
+    }
+}
+
+/// `assert_rpc!(rpc, { request => reply pattern [if guard], .. })`: sends every
+/// request in order, then fails once, listing every reply that did not match.
+macro_rules! assert_rpc {
+    ($rpc:expr, { $($req:expr => $pat:pat $(if $guard:expr)?),+ $(,)? }) => {{
+        let rpc = &$rpc;
+        let mut mismatches: Vec<String> = Vec::new();
+        $(
+            match rpc.call($req) {
+                $pat $(if $guard)? => {}
+                other => mismatches.push(format!(
+                    "{}\n      expected `{}`\n      got {:?}",
+                    stringify!($req),
+                    stringify!($pat $(if $guard)?),
+                    other
+                )),
+            }
+        )+
+        assert!(
+            mismatches.is_empty(),
+            "RPC replies do not match:\n  {}",
+            mismatches.join("\n  ")
+        );
+    }};
+}
+
+/// The value inside the expected reply variant; any other reply panics with it.
+macro_rules! expect_resp {
+    ($resp:expr, $pat:pat => $value:expr) => {
+        match $resp {
+            $pat => $value,
+            other => panic!("expected `{}`, got {:?}", stringify!($pat), other),
+        }
+    };
 }
 
 #[world_test(
@@ -87,187 +125,79 @@ fn rpc_server(world: &mut World) {
     world.mine(1);
     world.sync_makers();
 
-    let expected_regular = [14500751u64, 14502170];
-    let expected_swap = [499664u64, 498208];
     assert_balances!(world, since before; {
         taker: { regular: 14_499_538, swap: 496_789, contract: 0, fidelity: 0, loss: 3_673 },
         makers: {
-            regular: expected_regular,
-            swap: expected_swap,
+            regular: [14_500_751, 14_502_170],
+            swap: [499_664, 498_208],
             contract: 0,
             fidelity: BOND,
             gain: [658, 621],
         },
     });
 
-    let target = &world.makers()[0].inner();
-    let rpc_port = target.config.rpc_port;
+    let target = world.makers()[0].inner();
     let data_dir = target.config.data_dir.clone();
-    let cookie = fs::read_to_string(data_dir.join("rpc_cookie"))
-        .expect("makerd should have written an RPC cookie");
-
-    // ---- Ping ----
-    assert!(
-        matches!(
-            rpc_call(rpc_port, &cookie, RpcMsgReq::Ping),
-            RpcMsgResp::Pong
-        ),
-        "Ping must answer Pong"
-    );
-
-    // ---- Wallet queries ----
-    match rpc_call(rpc_port, &cookie, RpcMsgReq::Utxo) {
-        RpcMsgResp::UtxoResp { utxos } => {
-            info!("Utxo: {} entries", utxos.len());
-            assert!(!utxos.is_empty(), "a funded maker must report utxos");
-        }
-        other => panic!("Utxo returned {:?}", other),
-    }
-
-    // Unswept incoming swapcoins only. The swap completed, so the maker already
-    // swept them; the proceeds show up under `Balances.swap`, asserted above.
-    match rpc_call(rpc_port, &cookie, RpcMsgReq::SwapUtxo) {
-        RpcMsgResp::SwapUtxoResp { utxos } => {
-            info!("SwapUtxo: {} entries", utxos.len());
-            assert!(
-                utxos.is_empty(),
-                "a swept swap leaves no incoming swapcoin utxos"
-            );
-        }
-        other => panic!("SwapUtxo returned {:?}", other),
-    }
-
-    match rpc_call(rpc_port, &cookie, RpcMsgReq::ContractUtxo) {
-        RpcMsgResp::ContractUtxoResp { utxos } => {
-            info!("ContractUtxo: {} entries", utxos.len());
-            assert!(
-                utxos.is_empty(),
-                "a swap that completed leaves no live contracts"
-            );
-        }
-        other => panic!("ContractUtxo returned {:?}", other),
-    }
-
-    match rpc_call(rpc_port, &cookie, RpcMsgReq::FidelityUtxo) {
-        RpcMsgResp::FidelityUtxoResp { utxos } => {
-            info!("FidelityUtxo: {} entries", utxos.len());
-            assert_eq!(utxos.len(), 1, "the maker holds exactly one fidelity bond");
-        }
-        other => panic!("FidelityUtxo returned {:?}", other),
-    }
-
-    match rpc_call(rpc_port, &cookie, RpcMsgReq::Balances) {
-        RpcMsgResp::TotalBalanceResp(balances) => {
-            info!(
-                "Balances: regular {}, swap {}, contract {}, fidelity {}",
-                balances.regular, balances.swap, balances.contract, balances.fidelity
-            );
-            // Must match what the wallet reports directly, asserted above.
-            assert_eq!(balances.regular.to_sat(), expected_regular[0]);
-            assert_eq!(balances.swap.to_sat(), expected_swap[0]);
-            assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
-            assert_eq!(balances.contract, Amount::ZERO);
-        }
-        other => panic!("Balances returned {:?}", other),
-    }
-
-    let new_address = match rpc_call(rpc_port, &cookie, RpcMsgReq::NewAddress) {
-        RpcMsgResp::NewAddressResp(addr) => {
-            info!("NewAddress: {}", addr);
-            Address::from_str(&addr)
-                .expect("NewAddress must return a parseable address")
-                .assume_checked()
-        }
-        other => panic!("NewAddress returned {:?}", other),
+    let rpc = Rpc {
+        port: target.config.rpc_port,
+        cookie: fs::read_to_string(data_dir.join("rpc_cookie"))
+            .expect("makerd should have written an RPC cookie"),
     };
+    // What the RPC reports must match what the wallet reports directly.
+    let wallet = world.makers()[0].balances();
 
-    match rpc_call(rpc_port, &cookie, RpcMsgReq::GetDataDir) {
-        RpcMsgResp::GetDataDirResp(dir) => assert_eq!(dir, data_dir, "GetDataDir mismatch"),
-        other => panic!("GetDataDir returned {:?}", other),
-    }
-
-    match rpc_call(rpc_port, &cookie, RpcMsgReq::GetTorAddress) {
-        RpcMsgResp::GetTorAddressResp(addr) => {
-            assert_eq!(
-                addr, "Maker is not running on TOR",
-                "GetTorAddress mismatch"
-            );
-        }
-        other => panic!("GetTorAddress returned {:?}", other),
-    }
-
-    match rpc_call(rpc_port, &cookie, RpcMsgReq::ListFidelity) {
-        RpcMsgResp::ListBonds(list) => {
-            info!("ListFidelity: {}", list);
-            assert!(!list.is_empty(), "ListFidelity must describe the bond");
-        }
-        other => panic!("ListFidelity returned {:?}", other),
-    }
-
-    assert!(
-        matches!(
-            rpc_call(rpc_port, &cookie, RpcMsgReq::SyncWallet),
-            RpcMsgResp::Pong
-        ),
-        "SyncWallet must answer Pong on success"
-    );
-
-    match rpc_call(
-        rpc_port,
-        &cookie,
-        RpcMsgReq::VerifyDeniability {
-            swap_id: swap_id.clone(),
-        },
-    ) {
-        RpcMsgResp::VerifyDeniabilityResp(valid) => {
-            assert!(valid, "the completed swap must be deniable");
-        }
-        other => panic!("VerifyDeniability returned {:?}", other),
-    }
-
-    // An unknown swap id must come back as an error, not as `false`.
-    match rpc_call(
-        rpc_port,
-        &cookie,
-        RpcMsgReq::VerifyDeniability {
-            swap_id: "no-such-swap".to_string(),
-        },
-    ) {
-        RpcMsgResp::ServerError(e) => info!("VerifyDeniability on unknown swap: {}", e),
-        other => panic!("VerifyDeniability on unknown swap returned {:?}", other),
-    }
+    // ---- Queries ----
+    assert_rpc!(rpc, {
+        Req::Ping => Resp::Pong,
+        Req::Utxo => Resp::UtxoResp { utxos } if !utxos.is_empty(),
+        // Unswept incoming swapcoins only: the completed swap swept them, and
+        // the proceeds show up under `Balances.swap`.
+        Req::SwapUtxo => Resp::SwapUtxoResp { utxos } if utxos.is_empty(),
+        // A swap that completed leaves no live contracts.
+        Req::ContractUtxo => Resp::ContractUtxoResp { utxos } if utxos.is_empty(),
+        Req::FidelityUtxo => Resp::FidelityUtxoResp { utxos } if utxos.len() == 1,
+        Req::Balances => Resp::TotalBalanceResp(b)
+            if (b.regular, b.swap, b.contract, b.fidelity)
+                == (wallet.regular, wallet.swap, wallet.contract, wallet.fidelity),
+        Req::GetDataDir => Resp::GetDataDirResp(dir) if dir == data_dir,
+        Req::GetTorAddress => Resp::GetTorAddressResp(addr)
+            if addr == "Maker is not running on TOR",
+        Req::ListFidelity => Resp::ListBonds(list) if !list.is_empty(),
+        Req::SyncWallet => Resp::Pong,
+        Req::VerifyDeniability { swap_id: swap_id.clone() } => Resp::VerifyDeniabilityResp(true),
+        // An unknown swap id is an error, not `false`.
+        Req::VerifyDeniability { swap_id: "no-such-swap".to_string() } => Resp::ServerError(_),
+    });
 
     // ---- Mutating ----
-    match rpc_call(
-        rpc_port,
-        &cookie,
-        RpcMsgReq::SendToAddress {
+    let new_address = expect_resp!(
+        rpc.call(Req::NewAddress),
+        Resp::NewAddressResp(addr) => Address::from_str(&addr)
+            .expect("NewAddress must return a parseable address")
+            .assume_checked()
+    );
+    assert_rpc!(rpc, {
+        Req::SendToAddress {
             address: new_address.to_string(),
             amount: 100_000,
             feerate: 2.0,
-        },
-    ) {
-        RpcMsgResp::SendToAddressResp(txid) => {
-            info!("SendToAddress: {}", txid);
-            assert!(!txid.is_empty(), "SendToAddress must return a txid");
-        }
-        other => panic!("SendToAddress returned {:?}", other),
-    }
+        } => Resp::SendToAddressResp(txid) if !txid.is_empty(),
+    });
 
     // ---- The cookie is actually checked ----
-    match rpc_call(rpc_port, "not-the-cookie", RpcMsgReq::Ping) {
-        RpcMsgResp::ServerError(e) => {
-            assert_eq!(e, "unauthorized", "wrong token must be rejected");
-            info!("Unauthenticated request rejected");
-        }
-        other => panic!("A bad token was accepted: {:?}", other),
-    }
+    let intruder = Rpc {
+        cookie: "not-the-cookie".to_string(),
+        ..rpc
+    };
+    assert_rpc!(intruder, {
+        Req::Ping => Resp::ServerError(e) if e == "unauthorized",
+    });
 
     // ---- The binary itself, so argument parsing is covered too ----
     let output = Command::new(env!("CARGO_BIN_EXE_maker-cli"))
         .args([
             "-p",
-            &format!("127.0.0.1:{rpc_port}"),
+            &format!("127.0.0.1:{}", rpc.port),
             "-d",
             data_dir.to_str().unwrap(),
             "send-ping",
@@ -290,21 +220,12 @@ fn rpc_server(world: &mut World) {
     );
 
     // ---- Stop, last: it shuts the server down ----
-    assert!(
-        matches!(
-            rpc_call(rpc_port, &cookie, RpcMsgReq::Stop),
-            RpcMsgResp::Shutdown
-        ),
-        "Stop must answer Shutdown"
+    assert_rpc!(rpc, { Req::Stop => Resp::Shutdown });
+    wait_until!(
+        Duration::from_secs(60),
+        "Stop to shut the maker down",
+        world.makers()[0].inner().shutdown.load(Relaxed)
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !world.makers()[0].inner().shutdown.load(Relaxed) {
-        assert!(
-            Instant::now() < deadline,
-            "Stop did not shut the maker down within 60s"
-        );
-        thread::sleep(Duration::from_secs(1));
-    }
     info!("Maker 0 shut down via RPC Stop");
 
     world.shutdown_makers();
