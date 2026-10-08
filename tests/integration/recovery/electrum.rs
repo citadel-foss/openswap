@@ -109,7 +109,8 @@ fn run_taker_drops_after_funding<B: TestBackend>(
     expected: &ExpectedBalances,
 ) {
     // Fund the taker with 3 UTXOs of 0.05 BTC each
-    let taker_original_balance = world.fund_taker_default(3);
+    world.fund_taker_default(3);
+    let before = world.balances();
 
     // Fund the makers with 4 UTXOs of 0.05 BTC each
     world.fund_makers_default();
@@ -169,56 +170,24 @@ fn run_taker_drops_after_funding<B: TestBackend>(
     world.framework().wait_for_electrs_tip();
     world.taker().sync();
 
-    // Verify taker balance
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
-    BalanceExpect {
-        regular: Some(Is::Sats(expected.taker_regular)),
-        swap: Some(Is::Sats(expected.taker_swap)),
-        contract: Some(Is::Sats(0)),
-        fidelity: Some(Is::Amount(Amount::ZERO)),
-        spendable: None,
-        delta: Some(Delta::Loss {
-            baseline: taker_original_balance,
-            style: DiffStyle::CheckedUnwrap,
-            sats: expected.taker_spendable_diff,
-        }),
-    }
-    .assert("Taker", &taker_balances);
-
-    // Verify maker balances - makers should have recovered via timelock
-    for (i, maker) in world.makers().iter().enumerate() {
-        maker.sync();
-        let balances = maker.balances();
-
-        info!(
-            "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i,
-            balances.regular,
-            balances.swap,
-            balances.contract,
-            balances.fidelity,
-            balances.spendable,
-        );
-
-        BalanceExpect {
-            regular: Some(Is::Sats(expected.maker_regular[i])),
-            swap: Some(Is::Sats(expected.maker_swap[i])),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: Some(Is::Sats(expected.maker_spendable[i])),
-            delta: None,
-        }
-        .assert(&format!("Maker {i}"), &balances);
-    }
+    // Makers should have recovered via timelock
+    world.sync_makers();
+    assert_balances!(world, since before; {
+        taker: {
+            regular: expected.taker_regular,
+            swap: expected.taker_swap,
+            contract: 0,
+            fidelity: 0,
+            loss: expected.taker_spendable_diff,
+        },
+        makers: {
+            regular: expected.maker_regular,
+            swap: expected.maker_swap,
+            contract: 0,
+            fidelity: BOND,
+            spendable: expected.maker_spendable,
+        },
+    });
 
     world.taker().log_tracker_state();
     info!("Electrum taker-drop test ({protocol:?}) completed successfully!");
@@ -268,7 +237,6 @@ fn sweeps_after_breach(world: &mut World, params: SwapParams) {
     world.mine(1);
     world.framework().wait_for_electrs_tip();
     world.taker().sync();
-    let taker_balances = world.taker().balances();
     let swapcoins_left = world
         .taker()
         .inner()
@@ -277,29 +245,14 @@ fn sweeps_after_breach(world: &mut World, params: SwapParams) {
         .unwrap()
         .get_incoming_swapcoins_count();
     info!(
-        "Sweeps-after-breach taker: regular {}, swap {}, contract {}, spendable {}, incoming swapcoins {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-        swapcoins_left,
+        "Sweeps-after-breach taker: incoming swapcoins {}",
+        swapcoins_left
     );
-    // Swap is checked ahead of regular here, which is not BalanceExpect's
-    // field order, so these stay plain asserts.
     assert_eq!(
         swapcoins_left, 0,
         "Every incoming swapcoin should be swept out of the wallet"
     );
-    assert_eq!(
-        taker_balances.swap.to_sat(),
-        495_997,
-        "Swept swap balance mismatch"
-    );
-    assert_eq!(
-        taker_balances.regular.to_sat(),
-        14_499_538,
-        "Taker regular balance mismatch"
-    );
+    assert_balances!(world; { taker: { regular: 14_499_538, swap: 495_997 } });
 
     // Recovery sweeps sit at depth 2 (they spend the broadcast contract txs).
     // Each pays the relay floor at the 150 vB legacy spend model — the

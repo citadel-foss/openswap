@@ -79,13 +79,14 @@ struct TakerAbortExpect {
     ],
 )]
 fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
-    let taker_original_balance = world.fund_taker_default(3);
+    world.fund_taker_default(3);
     world.fund_makers_default();
 
     info!("Starting Maker servers...");
     world.start_makers(120);
 
-    let maker_spendable_balance = world.verify_maker_pre_swap_balances();
+    world.verify_maker_pre_swap_balances();
+    let before = world.balances();
 
     let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
@@ -117,32 +118,16 @@ fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
 
     // Verify maker balances -- makers should have recovered their outgoing
     // funds via timelock.
-    for (i, (maker, original)) in world
-        .makers()
-        .iter()
-        .zip(maker_spendable_balance)
-        .enumerate()
-    {
-        maker.sync();
-        let balances = maker.balances();
-        info!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-            i, balances.regular, balances.swap, balances.contract, balances.spendable,
-        );
-        BalanceExpect {
-            regular: Some(Is::Sats(expected.maker_regular[i])),
-            swap: Some(Is::Sats(0)),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: None,
-            delta: expected.maker_loss.map(|loss| Delta::Loss {
-                baseline: original,
-                style: DiffStyle::UnwrapOrZero,
-                sats: loss[i],
-            }),
-        }
-        .assert(&format!("Maker {i}"), &balances);
-    }
+    world.sync_makers();
+    assert_balances!(world, since before; {
+        makers: {
+            regular: expected.maker_regular,
+            swap: 0,
+            contract: 0,
+            fidelity: BOND,
+            loss: expected.maker_loss,
+        },
+    });
 
     // The background recovery loop (spawned by recover_active_swap) periodically
     // retries hashlock sweeps and timelock recovery. Wait for it to finish.
@@ -153,27 +138,15 @@ fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
     world.mine(1);
     world.taker().sync();
 
-    let taker_balances = world.taker().balances();
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-    BalanceExpect {
-        regular: Some(Is::Sats(expected.taker_regular)),
-        swap: Some(Is::Sats(0)),
-        contract: Some(Is::Sats(0)),
-        fidelity: Some(Is::Amount(Amount::ZERO)),
-        spendable: None,
-        delta: Some(Delta::Loss {
-            baseline: taker_original_balance,
-            style: DiffStyle::UnwrapOrZero,
-            sats: expected.taker_loss,
-        }),
-    }
-    .assert("Taker", &taker_balances);
+    assert_balances!(world, since before; {
+        taker: {
+            regular: expected.taker_regular,
+            swap: 0,
+            contract: 0,
+            fidelity: 0,
+            loss: expected.taker_loss,
+        },
+    });
 
     world.taker().log_tracker_state();
 
@@ -188,18 +161,15 @@ fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
     maker_behaviors = [Normal, Normal],
     takers = [DropAfterFundsBroadcast],
     setup = [
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         fund_makers_default(),
         start_makers(120),
         verify_maker_pre_swap_balances(),
     ],
     swap(protocol = Legacy, sats = 500_000, makers = 2, tx_count = 3),
 )]
-fn legacy_drop_after_funding(
-    world: &mut World,
-    taker_original_balance: Amount,
-    params: SwapParams,
-) {
+fn legacy_drop_after_funding(world: &mut World, params: SwapParams) {
+    let before = world.balances();
     world.mine(1);
 
     // Start periodic swap tracker logging
@@ -234,59 +204,18 @@ fn legacy_drop_after_funding(
     world.mine(1);
     world.taker().sync();
 
-    // Verify taker balance
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
-    BalanceExpect {
-        regular: Some(Is::Sats(14499538)),
-        swap: Some(Is::Sats(495997)),
-        contract: Some(Is::Sats(0)),
-        fidelity: Some(Is::Amount(Amount::ZERO)),
-        spendable: None,
-        delta: Some(Delta::Loss {
-            baseline: taker_original_balance,
-            style: DiffStyle::CheckedUnwrap,
-            sats: 4465,
-        }),
-    }
-    .assert("Taker", &taker_balances);
-
-    // Verify maker balances - makers should have recovered via timelock
-    let expected_regular = [14500865, 14502398];
-    let expected_swap = [499100, 497530];
-    let expected_spendable = [14999965, 14999928];
-    for (i, maker) in world.makers().iter().enumerate() {
-        maker.sync();
-        let balances = maker.balances();
-
-        info!(
-            "Maker {} balances: Regular: {}, Swap: {}, Contract: {}, Fidelity: {}, Spendable: {}",
-            i,
-            balances.regular,
-            balances.swap,
-            balances.contract,
-            balances.fidelity,
-            balances.spendable,
-        );
-
-        BalanceExpect {
-            regular: Some(Is::Sats(expected_regular[i])),
-            swap: Some(Is::Sats(expected_swap[i])),
-            contract: Some(Is::Sats(0)),
-            fidelity: Some(Is::Amount(Amount::from_btc(0.05).unwrap())),
-            spendable: Some(Is::Sats(expected_spendable[i])),
-            delta: None,
-        }
-        .assert(&format!("Maker {i}"), &balances);
-    }
+    // Makers should have recovered via timelock
+    world.sync_makers();
+    assert_balances!(world, since before; {
+        taker: { regular: 14_499_538, swap: 495_997, contract: 0, fidelity: 0, loss: 4_465 },
+        makers: {
+            regular: [14_500_865, 14_502_398],
+            swap: [499_100, 497_530],
+            contract: 0,
+            fidelity: BOND,
+            spendable: [14_999_965, 14_999_928],
+        },
+    });
 
     world.taker().log_tracker_state();
     info!("Abort1 test completed successfully!");
@@ -339,7 +268,7 @@ fn maker_recovers_swap_past_refund_deadline(world: &mut World, params: SwapParam
     takers = [CloseAtAckResponse],
     setup = [
         // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
-        fund_taker_default(3) as taker_original_balance,
+        fund_taker_default(3),
         // Fund the makers with 4 UTXOs of 0.05 BTC each
         fund_makers_default(),
         // Start the maker server threads
@@ -347,7 +276,9 @@ fn maker_recovers_swap_past_refund_deadline(world: &mut World, params: SwapParam
         verify_maker_pre_swap_balances(),
     ],
 )]
-fn taproot_drop_at_ack_response(world: &mut World, taker_original_balance: Amount) {
+fn taproot_drop_at_ack_response(world: &mut World) {
+    let before = world.balances();
+
     // Swap params for openswap (Taproot)
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -413,42 +344,9 @@ fn taproot_drop_at_ack_response(world: &mut World, taker_original_balance: Amoun
     // Sync taker wallet and verify balance
     world.taker().sync();
 
-    let taker_balances = world.taker().balances();
-
-    info!(
-        "Taker balances after abort: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-        taker_balances.regular,
-        taker_balances.swap,
-        taker_balances.contract,
-        taker_balances.spendable,
-    );
-
-    // Contract balance should be 0 (no contracts were created on-chain)
-    assert_eq!(
-        taker_balances.contract,
-        Amount::ZERO,
-        "Taker should have no contract balance after early abort"
-    );
-
-    // Balance diff should be 0 or very small (no funds were spent on-chain)
-    let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
-        .unwrap_or(Amount::ZERO);
-
-    info!(
-        "Taker balance diff: {} sats (original: {}, current: {})",
-        balance_diff.to_sat(),
-        taker_original_balance,
-        taker_balances.spendable,
-    );
-
-    // No funds should have been lost since no transactions were broadcast
-    assert_eq!(
-        balance_diff.to_sat(),
-        0,
-        "Taker should not have lost funds on early abort. Lost {} sats",
-        balance_diff.to_sat(),
-    );
+    // No contracts were created on-chain and no funds were lost, since no
+    // transactions were broadcast.
+    assert_balances!(world, since before; { taker: { contract: 0, loss: 0 } });
 
     world.taker().inner().log_tracker_state();
     info!("Taproot drop-at-ack-response test completed successfully!");
