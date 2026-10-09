@@ -106,6 +106,6 @@ pub fn wait_for_tx_depths(
             expected,
             by_depth.iter().map(Vec::len).collect::<Vec<_>>()
         );
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(500));
     }
 }

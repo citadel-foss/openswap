@@ -34,7 +34,7 @@ use super::{
     logs::setup_test_logger,
     ports::{free_ports, reserve_listeners},
     procs::{
-        bitcoind::{init_bitcoind, try_generate_blocks},
+        bitcoind::{init_bitcoind, try_generate_blocks, wait_for_bitcoind_exit},
         electrs::{init_electrsd, wait_for_electrs_tip},
         nostr::{spawn_nostr_relay, wait_for_relay_healthy},
     },
@@ -170,11 +170,16 @@ impl TestFramework {
                     return url.clone();
                 }
                 let e = init_electrsd(&bitcoind, &temp_dir);
-                // Give electrs a moment to index the 101 blocks bitcoind has already mined.
-                thread::sleep(Duration::from_secs(2));
-                let _ = e.trigger();
-                thread::sleep(Duration::from_secs(1));
                 let url = format!("tcp://{}", e.electrum_url);
+                // Wait until electrs has indexed the blocks bitcoind already mined.
+                wait_for_electrs_tip(
+                    &bitcoind,
+                    &e,
+                    &ElectrumConfig {
+                        url: url.clone(),
+                        ..Default::default()
+                    },
+                );
                 electrsd = Some(e);
                 electrum_url = Some(url.clone());
                 url
@@ -221,7 +226,6 @@ impl TestFramework {
                     let rpc_listener = rpc_listeners.next().expect("one port per maker");
                     let network_port = network_listener.local_addr().unwrap().port();
                     let maker_id = format!("maker{network_port}");
-                    thread::sleep(Duration::from_secs(5)); // Avoid resource unavailable error
                     let backend = backend();
                     let fee = fee_overrides.get(i).copied().flatten();
                     let config = MakerServerConfig {
@@ -405,7 +409,7 @@ impl TestFramework {
         // mid-run (e.g. to reset the mempool) and stop the framework's
         // original node itself.
         let _ = self.bitcoind.client.stop();
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        wait_for_bitcoind_exit(&self.bitcoind.workdir(), Duration::from_secs(30));
         self.remove_temp_dir();
     }
 

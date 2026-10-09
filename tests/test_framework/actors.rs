@@ -17,6 +17,8 @@ use openswap::{
 
 use super::procs::bitcoind::{generate_blocks, send_to_address};
 
+use super::wait::POLL;
+
 /// Wait for all makers to complete setup, with a timeout.
 ///
 /// Panics if any maker's `is_setup_complete` flag doesn't become true within `timeout_secs`.
@@ -25,6 +27,9 @@ pub fn wait_for_makers_setup(makers: &[Arc<MakerServer>], timeout_secs: u64) {
     let start = Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
     for (i, maker) in makers.iter().enumerate() {
+        if !maker.is_setup_complete.load(Relaxed) {
+            log::info!("Waiting for maker {} setup completion", i);
+        }
         while !maker.is_setup_complete.load(Relaxed) {
             if start.elapsed() > timeout {
                 panic!(
@@ -32,8 +37,7 @@ pub fn wait_for_makers_setup(makers: &[Arc<MakerServer>], timeout_secs: u64) {
                     i, timeout_secs
                 );
             }
-            log::info!("Waiting for maker {} setup completion", i);
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(POLL);
         }
     }
 }

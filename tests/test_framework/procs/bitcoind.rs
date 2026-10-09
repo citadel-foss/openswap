@@ -306,3 +306,19 @@ pub(crate) fn send_to_address(
         .send_to_address(addrs, amount, None, None, None, None, None, None)
         .unwrap()
 }
+
+/// Waits for a bitcoind that was sent `stop` to exit, so its datadir can be
+/// deleted without the shutdown writing it back. Bitcoin Core deletes
+/// `<datadir>/regtest/bitcoind.pid` as one of its last shutdown steps.
+pub(crate) fn wait_for_bitcoind_exit(datadir: &Path, timeout: std::time::Duration) {
+    let pid_file = datadir.join("regtest").join("bitcoind.pid");
+    let start = std::time::Instant::now();
+    while pid_file.exists() {
+        if start.elapsed() > timeout {
+            log::warn!("bitcoind still running {:?} after stop", timeout);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    log::info!("bitcoind exited {:?} after stop", start.elapsed());
+}
