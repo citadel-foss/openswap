@@ -20,9 +20,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Tests run in parallel within a partition (one per core), so a
-        # partition takes about as long as its slowest test; 8 keep each near
-        # that floor without holding more runners than that buys.
+        # Tests run in parallel within a partition (8 at a time, see the ci
+        # profile in .config/nextest.toml), so a partition takes about as long
+        # as its slowest test; 8 keep each near that floor without holding more
+        # runners than that buys.
         partition: [1,2,3,4,5,6,7,8]
     steps:
       - name: Checkout
