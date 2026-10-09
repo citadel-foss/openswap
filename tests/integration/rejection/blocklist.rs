@@ -10,8 +10,6 @@ use openswap::{
 
 use crate::test_framework::*;
 
-use std::thread;
-
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal],
@@ -239,8 +237,9 @@ fn run_taker_rejection(world: &mut World, protocol: ProtocolVersion) {
     // The maker broadcast its funding before the taker rejected it, so those
     // coins stay locked in a contract until the timelock matures and the maker
     // sweeps them back. Rejecting must not strand maker funds.
-    thread::sleep(timelock_recovery_wait::<BitcoindBackend>());
-
+    world.wait_makers_settled(timelock_recovery_wait::<BitcoindBackend>());
     world.sync_makers();
-    assert_balances!(world; { makers: { swap: 0, contract: 0, fidelity: BOND } });
+    assert_balances!(world; {
+        makers: { swap: 0, contract: 0, fidelity: BOND },
+    });
 }

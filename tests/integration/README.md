@@ -230,7 +230,7 @@ The pieces:
   Nothing is defaulted: no takers or makers unless named. `.fee_overrides(..)`
   and `.check_blocklist()` select the other init variants.
 - **Steps** (`fund_taker_default`, `start_makers`, `mine`, `sync_makers`,
-  `spawn_tracker_logger`, `assert_makers_contract_zero`, ...) each call the
+  `spawn_tracker_logger`, ...) each call the
   framework helper of the same name, so a step does exactly what the helper does.
   `world.framework()` reaches anything the world does not wrap.
 - **Handles**: `world.taker()` / `world.makers()[i]` wrap one taker or maker
@@ -358,8 +358,10 @@ To run one body over several backends, give each row its own `backend = ..`
   them by name hash. `tests/TESTS.golden` lists every name; after adding,
   renaming or removing a test run `tests/check_test_names.sh --update` and
   commit the result.
-- **Waits stay what they are.** A test that sleeps 300s keeps 300s;
-  `timelock_recovery_wait::<B>()` is for tests that already scale with the
+- **Wait for outcomes, not time.** Wait for what the test checks next:
+  `world.wait_makers_settled(..)` before checking recovered balances,
+  `wait_until!` or a log wait, bounded by a timeout. A fixed sleep is only for holding a state on purpose, e.g. past a
+  deadline. `timelock_recovery_wait::<B>()` bounds waits that scale with the
   backend.
 - **Log needles are exact.** `assert_log!` reads the log once and writes
   nothing to it. `wait_for_log` and `wait_logged!` poll, and log the needle

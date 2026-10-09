@@ -182,18 +182,25 @@ impl<'w> MakerAbort<'w> {
         let world = &*self.world;
         world.taker().log_tracker_state();
 
-        // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-        // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-        // 5 blocks/3s; remaining ~105s is scheduling margin.
-        info!("Waiting for makers to timeout and blocks to mature timelocks...");
-        thread::sleep(Duration::from_secs(300));
-
-        world.assert_makers_contract_zero();
+        // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+        // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
+        // 135s at 5 blocks/3s; 300s bounds the wait.
+        info!("Waiting for makers to recover their contracts...");
+        if world.makers()[1].inner().behavior == MakerBehavior::CloseAfterSweep {
+            // This maker's recovery never concludes: its own hashlock sweep spent
+            // the contracts before cleanup, and recovery only accepts a timelock
+            // refund as settling them. Wait out the timelocks instead.
+            thread::sleep(Duration::from_secs(300));
+        } else {
+            world.wait_makers_settled(Duration::from_secs(300));
+        }
+        world.sync_makers();
+        assert_balances!(world; { makers: { contract: 0 } });
 
         // The background recovery loop (spawned by recover_active_swap) periodically
         // retries hashlock sweeps and timelock recovery. Wait for it to finish.
         info!("Waiting for background recovery loop to complete...");
-        world.taker().await_recovery(Duration::from_secs(120));
+        world.taker().await_recovery(Duration::from_secs(420));
         info!("Background recovery loop completed.");
     }
 

@@ -8,7 +8,7 @@ use openswap::{protocol::common_messages::MakerToTakerMessage, taker::SwapParams
 use crate::test_framework::*;
 
 use log::info;
-use std::{thread, time::Duration};
+use std::time::Duration;
 
 /// One fee override per maker, as `(base_fee, amount_relative_fee_pct)`.
 fn fees(overrides: &[(u64, f64)]) -> Vec<Option<MakerFeeOverride>> {
@@ -196,12 +196,10 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing(world: &mut World, param
     });
 
     // The taker broadcast its funding before the drop, so it recovers via
-    // timelock: 225-block outer hop plus scheduling margin, mirroring
-    // `recovery::maker_abort::legacy_drop_at_proof_of_funding`.
+    // timelock: the 225-block outer hop, bounded at the 300s budget plus the
+    // 120s the recovery loop used to get afterwards.
     info!("Waiting for the taker's timelock recovery...");
-    thread::sleep(Duration::from_secs(300));
-
-    world.taker().await_recovery(Duration::from_secs(120));
+    world.taker().await_recovery(Duration::from_secs(420));
 
     world.mine(1);
     world.taker().sync();

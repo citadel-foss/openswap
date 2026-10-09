@@ -151,13 +151,13 @@ fn run_taker_drops_after_funding<B: TestBackend>(
 
     // Wait for makers to detect the drop and the outer timelock to mature;
     // slower-cadence backends (Tor) wait proportionally longer.
-    info!("Waiting for makers to timeout and blocks to mature timelocks...");
-    thread::sleep(timelock_recovery_wait::<B>());
-
-    world.assert_makers_contract_zero();
+    info!("Waiting for makers to recover their contracts...");
+    world.wait_makers_settled(timelock_recovery_wait::<B>());
+    world.sync_makers();
+    assert_balances!(world; { makers: { contract: 0 } });
 
     // Wait for taker's background recovery loop to finish
-    world.taker().await_recovery(Duration::from_secs(120));
+    world.taker().await_recovery(Duration::from_secs(420));
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet

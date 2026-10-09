@@ -14,7 +14,7 @@ use openswap::{
 use crate::test_framework::*;
 
 use log::info;
-use std::{thread, time::Duration};
+use std::time::Duration;
 
 /// The balances one taker-abort test asserts once recovery is done.
 struct TakerAbortExpect {
@@ -110,14 +110,11 @@ fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     world.taker().log_tracker_state();
 
-    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-    // 5 blocks/3s; remaining ~105s is scheduling margin.
-    info!("Waiting for makers to timeout and blocks to mature timelocks...");
-    thread::sleep(Duration::from_secs(300));
-
-    // Verify maker balances -- makers should have recovered their outgoing
-    // funds via timelock.
+    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
+    // 135s at 5 blocks/3s; 300s bounds the wait.
+    info!("Waiting for makers to recover their outgoing funds via timelock...");
+    world.wait_makers_settled(Duration::from_secs(300));
     world.sync_makers();
     assert_balances!(world, since before; {
         makers: {
@@ -131,7 +128,7 @@ fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
 
     // The background recovery loop (spawned by recover_active_swap) periodically
     // retries hashlock sweeps and timelock recovery. Wait for it to finish.
-    world.taker().await_recovery(Duration::from_secs(120));
+    world.taker().await_recovery(Duration::from_secs(420));
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet
@@ -188,16 +185,16 @@ fn legacy_drop_after_funding(world: &mut World, params: SwapParams) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     world.taker().log_tracker_state();
 
-    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-    // 5 blocks/3s; remaining ~105s is scheduling margin.
-    info!("Waiting for makers to timeout and blocks to mature timelocks...");
-    thread::sleep(Duration::from_secs(300));
-
-    world.assert_makers_contract_zero();
+    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
+    // 135s at 5 blocks/3s; 300s bounds the wait.
+    info!("Waiting for makers to recover their contracts...");
+    world.wait_makers_settled(Duration::from_secs(300));
+    world.sync_makers();
+    assert_balances!(world; { makers: { contract: 0 } });
 
     // Wait for taker's background recovery loop to finish
-    world.taker().await_recovery(Duration::from_secs(120));
+    world.taker().await_recovery(Duration::from_secs(420));
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet

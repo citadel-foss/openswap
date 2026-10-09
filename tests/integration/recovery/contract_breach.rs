@@ -192,8 +192,12 @@ fn run_contract_breach<B: TestBackend>(
     let dead = (ending == Ending::MiddleMakerDies).then_some(1);
     if ending == Ending::FaultyGone {
         // Maker[0] never learns the preimage: its outgoing matures and it refunds.
-        info!("Waiting for makers to timeout and blocks to mature timelocks...");
-        thread::sleep(timelock_recovery_wait::<B>());
+        info!("Waiting for maker 0 to refund its outgoing by timelock...");
+        wait_for_log(
+            &log_path,
+            "First maker refunded its outgoing by timelock",
+            timelock_recovery_wait::<B>(),
+        );
     } else {
         if let Some(i) = dead {
             world.shutdown_maker(i);
@@ -352,14 +356,13 @@ fn taker_broadcasts_contract_after_full_setup(world: &mut World) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     world.taker().log_tracker_state();
 
-    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-    // 5 blocks/3s; remaining ~105s is scheduling margin.
-    info!("Waiting for makers to timeout and blocks to mature timelocks...");
-    thread::sleep(Duration::from_secs(300));
-
-    // Verify maker balances -- makers should have recovered their outgoing funds via timelock,
-    // losing some to the taker maliciously broadcasting contracts.
+    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
+    // 135s at 5 blocks/3s; 300s bounds the wait.
+    // Makers recover their outgoing funds via timelock, losing some to the taker
+    // maliciously broadcasting contracts.
+    info!("Waiting for makers to recover their outgoing funds via timelock...");
+    world.wait_makers_settled(Duration::from_secs(300));
     world.sync_makers();
     assert_balances!(world; {
         makers: { regular: [14998419, 14998419], swap: 0, contract: 0, fidelity: BOND },
@@ -367,7 +370,7 @@ fn taker_broadcasts_contract_after_full_setup(world: &mut World) {
 
     // Wait for taker's background recovery loop to finish
     info!("Waiting for background recovery loop to complete...");
-    world.taker().await_recovery(Duration::from_secs(120));
+    world.taker().await_recovery(Duration::from_secs(420));
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet
@@ -425,11 +428,13 @@ fn taproot_maker_broadcasts_contract(world: &mut World) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     world.taker().log_tracker_state();
 
-    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-    // 5 blocks/3s; remaining ~105s is scheduling margin.
-    info!("Waiting for makers to timeout and blocks to mature timelocks...");
-    thread::sleep(Duration::from_secs(300));
+    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
+    // 135s at 5 blocks/3s; 300s bounds the wait.
+    info!("Waiting for makers to recover their contracts...");
+    world.wait_makers_settled(Duration::from_secs(300));
+    world.sync_makers();
+    assert_balances!(world; { makers: { contract: 0 } });
 
     // Shut down makers
     world.shutdown_makers();
@@ -440,7 +445,7 @@ fn taproot_maker_broadcasts_contract(world: &mut World) {
 
     // The background recovery loop (spawned by recover_active_swap) periodically
     // retries hashlock sweeps and timelock recovery. Wait for it to finish.
-    world.taker().await_recovery(Duration::from_secs(120));
+    world.taker().await_recovery(Duration::from_secs(420));
     info!("Background recovery loop completed.");
 
     // Mine a block to confirm recovery txs, then sync wallet
@@ -549,13 +554,13 @@ fn taker_broadcasts_contract_before_handover(world: &mut World, params: SwapPara
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
 
-    info!("Waiting for makers to recover on-chain...");
-    thread::sleep(timelock_recovery_wait::<BitcoindBackend>());
-    world.sync_makers();
     assert_breach_refused(world);
 
     // Observed in a real run: each maker swept its incoming contract via the
     // hashlock. A maker that had handed over its outgoing leg would be ~500k short.
+    info!("Waiting for makers to recover on-chain...");
+    world.wait_makers_settled(timelock_recovery_wait::<BitcoindBackend>());
+    world.sync_makers();
     assert_balances!(world; {
         makers: { regular: [14500865, 14502398], swap: [499100, 497530], contract: 0 },
     });
