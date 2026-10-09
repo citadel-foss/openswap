@@ -755,6 +755,30 @@ impl TakerHandle {
         self.taker.prepare_swap(params)
     }
 
+    /// Waits until the taker's offerbook holds at least `count` makers in good
+    /// standing, syncing it between checks. On Tor a maker's fidelity bond can
+    /// still be under verification when its server reports setup complete, and
+    /// `prepare` refuses a route it cannot fill yet.
+    #[track_caller]
+    pub fn wait_for_good_makers(&self, count: usize, timeout: Duration) {
+        wait_for(timeout, POLL, "enough makers in good standing", || {
+            let good = self
+                .taker
+                .fetch_offers()
+                .ok()?
+                .all_makers()
+                .into_iter()
+                .filter(|maker| maker.state == MakerState::Good)
+                .count();
+            if good >= count {
+                return Some(());
+            }
+            // Drive the pending verifications instead of waiting on the timer.
+            let _ = self.taker.sync_offerbook_and_wait();
+            None
+        })
+    }
+
     /// [`Taker::start_swap`].
     pub fn start(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
         self.taker.start_swap(swap_id)

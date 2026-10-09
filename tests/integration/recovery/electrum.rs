@@ -130,6 +130,11 @@ fn run_taker_drops_after_funding<B: TestBackend>(
     // Start periodic swap tracker logging
     let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
+    // Over Tor the offers can still be under verification here.
+    world
+        .taker()
+        .wait_for_good_makers(2, Duration::from_secs(300));
+
     // Prepare should succeed; execution should fail with DropAfterFundsBroadcast
     let summary = world
         .taker_mut()

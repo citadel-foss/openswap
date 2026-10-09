@@ -166,6 +166,10 @@ fn run_contract_breach<B: TestBackend>(
     .with_required_confirms(1);
 
     world.mine(1);
+    // Over Tor the offers can still be under verification here.
+    world
+        .taker()
+        .wait_for_good_makers(maker_count, Duration::from_secs(300));
 
     // Prepare should succeed; execution should fail because maker broadcasts contracts
     let summary = world
