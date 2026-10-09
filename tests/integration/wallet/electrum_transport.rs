@@ -471,7 +471,6 @@ fn a_shared_script_stays_subscribed_until_the_last_watcher_goes(node: &mut Node)
     );
 
     drop(electrum);
-    let _ = node.bitcoind();
 }
 
 #[world_test(backend = ElectrumBackend, setup = [mine(101)])]
@@ -525,7 +524,6 @@ fn reconnects_after_the_connection_drops(node: &mut Node) {
     assert!(saw_tip, "header subscription was not re-armed");
 
     drop(electrum);
-    let _ = node.bitcoind();
 }
 
 /// The opening connect retries too, so a circuit that is still settling does not

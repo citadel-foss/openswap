@@ -1,3 +1,7 @@
+//! Taproot swap between a taker and 2 makers, with MuSig2 signatures.
+//!
+//! Also pins the fee every swap tx pays at the negotiated 1 sat/vB.
+
 use openswap::taker::SwapParams;
 
 use crate::test_framework::*;
