@@ -1,0 +1,63 @@
+//! Too few makers: only one maker answers a swap that needs two.
+//!
+//! Only 1 maker is available, but the swap requires 2 makers (maker_count: 2).
+//! prepare_swap should FAIL because there are not enough makers.
+//! No recovery is needed - balances should remain unchanged.
+
+use bitcoin::Amount;
+use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
+
+use crate::test_framework::*;
+
+use log::info;
+
+/// Test: Not enough makers for Taproot swap.
+///
+/// Scenario:
+/// 1. Only 1 maker is available but swap requires 2 (maker_count: 2).
+/// 2. prepare_swap should fail because it cannot find enough makers.
+/// 3. No funds are broadcast, so no recovery is needed.
+/// 4. Verify balances are unchanged.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        // Fund the taker with 3 UTXOs of 0.05 BTC each (P2TR for Taproot)
+        fund_taker_default(3),
+        // Fund the makers with 4 UTXOs of 0.05 BTC each
+        fund_makers_default(),
+        // Start the maker server threads
+        start_makers(120),
+        verify_maker_pre_swap_balances(),
+    ],
+)]
+fn taproot_swap_fails_before_funding(world: &mut World) {
+    let before = world.balances();
+
+    // Swap params: Taproot, requires 2 makers but only 1 is available
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+
+    world.mine(1);
+
+    // prepare_swap should FAIL because only 1 maker is available for a 2-maker swap
+    let prepare_result = world.taker_mut().prepare(swap_params);
+    assert!(
+        prepare_result.is_err(),
+        "prepare_swap should fail because only 1 maker is available for a 2-maker swap"
+    );
+    info!(
+        "Prepare failed as expected: {:?}",
+        prepare_result.err().unwrap()
+    );
+
+    // Sync taker wallet and verify balance is unchanged
+    world.taker().sync();
+
+    // Balance should be unchanged since no funds were broadcast
+    assert_balances!(world, since before; { taker: { contract: 0, loss: 0 } });
+
+    info!("Too-few-makers test completed successfully!");
+}

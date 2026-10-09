@@ -108,13 +108,24 @@ Full documentation is in the [`docs/`](docs/) folder:
 
 All PRs **must** pass:
 ```bash
-# Basic tests
+# Unit tests
 cargo test
 
 # Full integration tests (required for most changes)
 # needs nostr-rs-relay on PATH (cargo install nostr-rs-relay)
-cargo test --features integration-test -- --nocapture
+cargo nextest run --features integration-test
 ```
+
+Run the integration suite with [cargo-nextest](https://nexte.st), which gives
+each test its own process. Plain `cargo test --features integration-test` runs
+the tests at the same time in one process, where the process-wide logger sends
+them all to the log of whichever test started last and the log assertions fail.
+Each test also starts its own bitcoind, nostr relay and (on Electrum) electrs;
+see [tests/integration/README.md](tests/integration/README.md) for what it
+needs and how to write one.
+
+If you add, rename or remove a test, run `tests/check_test_names.sh --update`
+and commit the updated `tests/TESTS.golden`. CI fails when the two disagree.
 
 We also strongly recommend manually testing affected flows on **regtest** (e.g. standard_swap, multi-hop, failure cases).
 
