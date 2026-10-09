@@ -129,21 +129,18 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
             .expect("restarted taker should open the same wallet"),
     );
 
-    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-    // 5 blocks/3s; remaining ~105s is scheduling margin.
-    info!("Waiting for timelocks to mature...");
-    thread::sleep(Duration::from_secs(300));
-
-    world.shutdown_makers();
-
+    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
+    // 135s at 5 blocks/3s; 300s bounds the wait.
+    // The makers stay up meanwhile, as they did through the old fixed wait.
     info!("Waiting for the restarted taker's recovery loop to finish...");
     wait_until!(
-        Duration::from_secs(120),
+        Duration::from_secs(420),
         every Duration::from_secs(5),
         "recovery after restart to complete",
         world.taker().inner().is_recovery_complete()
     );
+    world.shutdown_makers();
 
     world.mine(1);
     world.taker().sync();

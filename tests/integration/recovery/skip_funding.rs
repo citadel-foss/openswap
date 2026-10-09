@@ -108,15 +108,22 @@ pub(crate) fn run_legacy_timelock_only_recovery(
         assert!(!world.makers()[0].inner().watch_service.is_alive());
     }
 
-    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-    // 5 blocks/3s; remaining ~105s is scheduling margin.
-    info!("Waiting for makers to timeout and blocks to mature timelocks...");
-    thread::sleep(Duration::from_secs(300));
+    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
+    // 135s at 5 blocks/3s; 300s bounds the wait.
+    info!("Waiting for the grace discard and the makers' timelock recovery...");
+    wait_logged!(
+        world,
+        &format!("Funding was never broadcast for swap {}", summary.swap_id),
+        Duration::from_secs(300)
+    );
 
     // Recovery waits out the grace before dropping the never-broadcast
     // funding, then releases the swapcoins, exactly as for Taproot.
     assert_grace_then_discard(&world.taker_log_path(), &summary.swap_id);
+    // Maker2 stops itself once it has discarded the swap; let every maker
+    // finish before syncing one, or the sync races that shutdown.
+    world.wait_makers_settled(Duration::from_secs(300));
     world.makers()[1].sync();
     let victim_after = {
         let wallet = world.makers()[1].inner().wallet.read().unwrap();
@@ -136,7 +143,7 @@ pub(crate) fn run_legacy_timelock_only_recovery(
     // The background recovery loop (spawned by recover_active_swap) periodically
     // retries timelock recovery. Wait for it to finish.
     wait_until!(
-        Duration::from_secs(120),
+        Duration::from_secs(420),
         every Duration::from_secs(5),
         "the background recovery to complete",
         world.taker().inner().is_recovery_complete()
@@ -309,16 +316,23 @@ fn run_taproot_timelock_only_recovery(
         "Maker2 must keep its swapcoins when the swap fails"
     );
 
-    // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
-    // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
-    // 5 blocks/3s; remaining ~105s is scheduling margin.
-    info!("Waiting for makers to timeout and blocks to mature timelocks...");
-    thread::sleep(Duration::from_secs(300));
+    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
+    // 135s at 5 blocks/3s; 300s bounds the wait.
+    info!("Waiting for the grace discard and the makers' timelock recovery...");
+    wait_logged!(
+        world,
+        &format!("Funding was never broadcast for swap {}", summary.swap_id),
+        Duration::from_secs(300)
+    );
 
     // Maker2 left its broadcast unrecorded, so recovery must wait out the
     // grace before dropping the swapcoins rather than trusting one backend
     // answer. Both lines must appear, in that order.
     assert_grace_then_discard(&world.taker_log_path(), &summary.swap_id);
+    // Maker2 stops itself once it has discarded the swap; let every maker
+    // finish before syncing one, or the sync races that shutdown.
+    world.wait_makers_settled(Duration::from_secs(300));
     world.makers()[1].sync();
     let victim_after = {
         let wallet = world.makers()[1].inner().wallet.read().unwrap();
@@ -336,10 +350,9 @@ fn run_taproot_timelock_only_recovery(
     info!("Makers shut down. Waiting for background recovery loop to complete...");
 
     // The background recovery loop (spawned by recover_active_swap) periodically
-    // retries timelock recovery; the sleep above already matured the timelocks,
-    // so this only waits for the loop to notice and broadcast.
+    // retries timelock recovery until it has refunded everything it can.
     wait_until!(
-        Duration::from_secs(120),
+        Duration::from_secs(420),
         every Duration::from_secs(5),
         "the background recovery to complete",
         world.taker().inner().is_recovery_complete()

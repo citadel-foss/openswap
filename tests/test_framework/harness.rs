@@ -24,8 +24,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::wait::POLL;
-
 use bitcoin::Amount;
 use bitcoind::BitcoinD;
 #[cfg(feature = "lightning")]
@@ -53,6 +51,8 @@ use super::{
     tracker::{spawn_tracker_logger, TrackerLoggerHandle},
     world::{MakerFeeOverride, TestFramework},
 };
+
+use super::wait::{wait_for, POLL};
 
 /// Collects what [`TestFramework::init`] takes. Nothing is defaulted on the
 /// test's behalf: no takers and no makers unless named.
@@ -432,28 +432,37 @@ impl World {
         }
     }
 
-    /// Syncs each maker in turn and asserts its contract balance is zero: it
-    /// recovered every contract it held.
+    /// Waits until every maker is done with its swaps: it holds no swapcoins
+    /// and no ongoing swap, or it stopped itself after recovering (test builds
+    /// do) and its thread has exited. Sync afterwards to check balances.
+    ///
+    /// It only reads, so it never holds a maker's wallet lock while the maker
+    /// works, and it waits for two settled polls in a row: a maker drops its
+    /// swapcoins just before it stops, and a sync must not race its last save.
     #[track_caller]
-    pub fn assert_makers_contract_zero(&self) {
-        for (i, maker) in self.makers.iter().enumerate() {
-            maker.sync();
-            let balances = maker.balances();
-            log::info!(
-                "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
-                i,
-                balances.regular,
-                balances.swap,
-                balances.contract,
-                balances.spendable,
-            );
-            assert_eq!(
-                balances.contract,
-                Amount::ZERO,
-                "Maker {} should have no contract balance after recovery",
-                i
-            );
-        }
+    pub fn wait_makers_settled(&self, timeout: Duration) {
+        let mut settled_before = false;
+        wait_for(
+            timeout,
+            Duration::from_secs(2),
+            "every maker to settle its swaps",
+            || {
+                let settled = self.makers.iter().all(|maker| {
+                    let server = &maker.server;
+                    if server.shutdown.load(Relaxed) {
+                        return maker.thread.as_ref().is_none_or(|t| t.is_finished());
+                    }
+                    let wallet = server.wallet.read().unwrap();
+                    !server.has_ongoing_swaps().unwrap_or(true)
+                        && wallet.get_incoming_swapcoins_count()
+                            + wallet.get_outgoing_swapcoins_count()
+                            == 0
+                });
+                let done = settled && settled_before;
+                settled_before = settled;
+                done.then_some(())
+            },
+        )
     }
 
     /// Mines `n` blocks.
