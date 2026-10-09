@@ -1885,7 +1885,10 @@ fn recover_from_swap(
             }
 
             // A contract still in the mempool is swept on a later pass. A contract
-            // the sender took back by timelock never will be, so it is settled too.
+            // the sender took back by timelock never will be, so it is settled too,
+            // and so is one an earlier hashlock sweep of ours already spent: a
+            // crash between that sweep and its cleanup leaves the coin on record
+            // with nothing left to sweep.
             let remaining: Vec<_> = {
                 let wallet = lock_debug!(maker.wallet.read())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -1897,6 +1900,7 @@ fn recover_from_swap(
                     })
                     .collect()
             };
+            let mut earlier_sweeps = Vec::new();
             let fully_swept = remaining.iter().all(|incoming| {
                 let outpoint = OutPoint::new(
                     incoming.contract_tx.compute_txid(),
@@ -1911,16 +1915,27 @@ fn recover_from_swap(
                             .confirmed_spending_transaction(&outpoint, &output.script_pubkey)
                             .inspect_err(|e| {
                                 log::warn!(
-                                    "[{}] Could not check {} for a sender refund: {:?}",
+                                    "[{}] Could not check {} for a settling spend: {:?}",
                                     maker.config.network_port,
                                     outpoint,
                                     e
                                 )
                             })
-                            .is_ok_and(|tx| tx.is_some_and(|tx| incoming.is_timelock_spend(&tx)))
+                            .is_ok_and(|tx| match tx {
+                                // The contract pays only our hashlock or the
+                                // sender's timelock: any confirmed spend settles it.
+                                Some(tx) => {
+                                    if !incoming.is_timelock_spend(&tx) {
+                                        earlier_sweeps.push(tx.compute_txid());
+                                    }
+                                    true
+                                }
+                                None => false,
+                            })
                     })
             });
             if fully_swept {
+                incoming_swept_txids.extend(earlier_sweeps);
                 // With the preimage known the outgoing coins are the next hop's
                 // to claim, never ours to refund, so drop them with the incoming.
                 {

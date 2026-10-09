@@ -126,6 +126,18 @@ fn test_taproot_hashlock_recovery() {
         );
     }
 
+    // Maker2's own hashlock sweep spent its incoming contracts before it could
+    // clean up. Its recovery must still conclude and drop the swap's coins,
+    // not retry a sweep with nothing left to spend on every pass.
+    let maker2_swapcoins = {
+        let wallet = makers[1].wallet.read().unwrap();
+        wallet.get_incoming_swapcoins_count() + wallet.get_outgoing_swapcoins_count()
+    };
+    assert_eq!(
+        maker2_swapcoins, 0,
+        "Maker2's recovery must conclude once its incoming contracts are spent"
+    );
+
     info!("Makers shut down. Waiting for background recovery loop to complete...");
 
     // The background recovery loop (spawned by recover_active_swap) periodically
