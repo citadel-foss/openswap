@@ -578,7 +578,12 @@ impl Wallet {
 
                 tip_time + (height_diff * 10 * 60)
             }
-            LockTime::Seconds(sec) => sec.to_consensus_u32() as u64,
+            // A fidelity locktime is height-based. `encode_fidelity_op_return`
+            // refuses to build a bond any other way, and `verify_fidelity_checks`
+            // rejects one whose locktime is not a height. Valuing a seconds-based
+            // locktime here would subtract a confirmation time from a timestamp
+            // with no guard, so refuse it for the same reason the other two do.
+            LockTime::Seconds(_) => return Err(FidelityError::InvalidBondLocktime.into()),
         };
 
         let bond_value =
