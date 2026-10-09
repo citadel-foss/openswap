@@ -41,8 +41,7 @@ use openswap::{
 use super::{
     actors::{
         fund_makers, fund_makers_default, fund_taker, fund_taker_default, spawn_makers,
-        spawn_ready_makers_and_mine, sync_maker_wallets, verify_maker_pre_swap_balances,
-        wait_for_makers_setup,
+        sync_maker_wallets, verify_maker_pre_swap_balances, wait_for_makers_setup,
     },
     backend::TestBackend,
     expect::WorldBalances,
@@ -396,12 +395,15 @@ impl World {
         wait_for_makers_setup(&servers, setup_timeout_secs);
     }
 
-    /// [`spawn_ready_makers_and_mine`]: start every maker server, wait for
-    /// their setup, mine one block. No wallet sync.
+    /// Starts every maker server, waits for their setup and mines one block;
+    /// no wallet sync. The threads are attached before the wait, so a setup
+    /// that panics still has them shut down.
     pub fn spawn_ready_makers_and_mine(&mut self) {
         let servers = self.servers();
-        let threads = spawn_ready_makers_and_mine(&servers, self.bitcoind());
+        let threads = spawn_makers(&servers);
         self.attach_threads(threads);
+        wait_for_makers_setup(&servers, 120);
+        generate_blocks(self.bitcoind(), 1);
     }
 
     /// [`verify_maker_pre_swap_balances`]: asserts each maker's post-bond
@@ -625,6 +627,18 @@ impl Drop for World {
     }
 }
 
+/// Why [`TakerHandle::swap`] failed: the stage, then the taker's error.
+pub struct SwapError {
+    pub stage: &'static str,
+    pub error: TakerError,
+}
+
+impl std::fmt::Debug for SwapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed: {:?}", self.stage, self.error)
+    }
+}
+
 /// One maker: its server and, once started, the thread running it.
 pub struct MakerHandle {
     server: Arc<MakerServer>,
@@ -747,14 +761,21 @@ impl TakerHandle {
     }
 
     /// [`prepare`](Self::prepare) then [`start`](Self::start) the prepared
-    /// swap; an error from either stage is returned.
-    pub fn swap(&mut self, params: SwapParams) -> Result<TakerReport, TakerError> {
-        let summary = self.prepare(params)?;
-        self.start(&summary.swap_id)
+    /// swap; an error names the stage that failed.
+    pub fn swap(&mut self, params: SwapParams) -> Result<TakerReport, SwapError> {
+        let summary = self.prepare(params).map_err(|error| SwapError {
+            stage: "prepare",
+            error,
+        })?;
+        self.start(&summary.swap_id).map_err(|error| SwapError {
+            stage: "start",
+            error,
+        })
     }
 
-    /// Prepares a swap, which must succeed, and starts it, which must fail
-    /// for the stated `reason`; returns the start error.
+    /// Prepares a swap, which must succeed, and starts it, which must fail;
+    /// `reason` is the panic message if it succeeds instead. Returns the start
+    /// error for the caller to check.
     #[track_caller]
     pub fn swap_fails(&mut self, params: SwapParams, reason: &str) -> TakerError {
         let summary = self.prepare(params).expect("prepare_swap should succeed");
