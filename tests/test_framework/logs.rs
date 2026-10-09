@@ -16,6 +16,8 @@ use log4rs::{
     Handle,
 };
 
+use super::wait::POLL;
+
 /// Points the process's logger at this fixture: everything goes to
 /// `taker/debug.log` under `temp_dir` and to stdout, where each line names the
 /// test, e.g. `2026-10-02T17:39:47Z [swap::electrum::taproot_swap_completes]
@@ -110,7 +112,7 @@ pub(crate) fn wait_for_log(log_path: &str, expected: &str, timeout: Duration) {
             expected,
             log_path
         );
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(POLL);
     }
 }
 
@@ -138,7 +140,7 @@ pub(crate) fn wait_for_new_log(log_path: &str, expected: &str, timeout: Duration
             expected,
             log_path
         );
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(POLL);
     }
 }
 

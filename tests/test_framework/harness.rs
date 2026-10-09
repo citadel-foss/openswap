@@ -24,6 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::wait::POLL;
+
 use bitcoin::Amount;
 use bitcoind::BitcoinD;
 #[cfg(feature = "lightning")]
@@ -699,7 +701,7 @@ impl TakerHandle {
             if start.elapsed() > timeout {
                 panic!("Background recovery did not complete within timeout");
             }
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(POLL);
         }
     }
 
