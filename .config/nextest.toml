@@ -13,6 +13,10 @@ slow-timeout = "3m"
 # llvm-cov keeps --profile for itself).
 [profile.ci]
 global-timeout = "1h"
+# GitHub's runners have 4 cores, but these tests mostly wait on bitcoind,
+# electrs and timelocks rather than compute, so two per core keep the runner
+# busy. Lower it if tests start timing out under load.
+test-threads = 8
 # Kill a test after six slow periods (18m) so a hang fails that test with its
 # output instead of the whole partition at the global timeout. The longest test,
 # fidelity::creation::bond_creation_and_redemption, takes about 11m.
