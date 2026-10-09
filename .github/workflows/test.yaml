@@ -102,6 +102,7 @@ jobs:
 
   # Every test name is pinned in tests/TESTS.golden: CI selects tests by name
   # and nextest partitions them by name hash, so a rename must be reviewed.
+  # This job also runs the world_test macro's unit tests.
   test_names:
     name: Test names match tests/TESTS.golden
     runs-on: ubuntu-latest
@@ -129,6 +130,11 @@ jobs:
 
       - name: Check test names
         run: tests/check_test_names.sh
+
+      # The world_test macro's own unit tests; the crate is a path dependency,
+      # so the suite's runs never build its tests.
+      - name: Test the world_test macro
+        run: cargo test -p openswap-test-macros
 
   # Electrum over a real Tor SOCKS proxy. These publish an ephemeral onion
   # service, so they need live network access to reach the HSDir ring.
