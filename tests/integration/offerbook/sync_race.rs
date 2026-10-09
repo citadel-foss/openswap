@@ -72,6 +72,4 @@ fn repeated_manual_sync_is_bounded(world: &mut World) {
         good, expected_makers,
         "expected {expected_makers} good makers after staged syncs, got {good}"
     );
-
-    // Shutdown
 }

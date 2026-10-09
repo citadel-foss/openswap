@@ -4,8 +4,8 @@
 //! the maker admission deadline. Route heartbeats must preserve swap activity
 //! throughout these waits, and protocol sockets must not expire before use.
 //!
-//! Both protocols are covered: the wait sites differ (`legacy_swap.rs` vs
-//! `swap/taproot.rs`) even though the keepalive message is shared.
+//! Both protocols are covered: the wait sites differ (`src/taker/legacy_swap.rs`
+//! vs `src/taker/taproot_swap.rs`) even though the keepalive message is shared.
 
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;

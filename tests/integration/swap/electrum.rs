@@ -1,3 +1,13 @@
+//! Swaps over the Electrum backend, once per protocol.
+//!
+//! - The watch-tower uses `ElectrumNotifier` with `electrum_chain_name` and
+//!   `electrum_block_count` instead of ZMQ and Bitcoin Core REST.
+//! - Offer sync and Nostr discovery use `electrum_block_count` and
+//!   `electrum_get_raw_tx`.
+//!
+//! bitcoind still runs, as the source of regtest funds and blocks, but the
+//! swap code talks only to electrs.
+
 use crate::test_framework::*;
 use bitcoin::Amount;
 use log::info;

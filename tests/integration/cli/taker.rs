@@ -171,7 +171,6 @@ fn wallet_commands(node: &mut Node) {
 #[world_test(backend = BitcoindBackend)]
 fn taker_cli_shows_maker_states(node: &mut Node) {
     let taker_cli = TakerCli::new(node);
-    let _bitcoind = node.bitcoind();
 
     // Creating the wallet also creates the directory the offerbook lives in.
     taker_cli.execute(&["get-new-address"]);

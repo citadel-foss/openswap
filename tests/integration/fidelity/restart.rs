@@ -7,6 +7,7 @@ use bitcoin::{absolute::LockTime, Amount, Txid};
 use bitcoind::bitcoincore_rpc::{Auth, RpcApi};
 use openswap::{
     maker::{start_server, MakerServer},
+    taker::TakerBehavior,
     utill::MIN_RELAY_FEE_RATE,
     wallet::{AddressType, CoreRpcConfig, ElectrumConfig},
 };
@@ -86,12 +87,20 @@ fn spawn_replacement_bitcoind(staticdir: PathBuf, extra_args: &[&str]) -> bitcoi
 ///   (it only logs when a new bond is created, which the restart must not do).
 #[world_test(
     makers = 1,
+    takers = taker_behaviors,
     cases = [
-        unconfirmed_bond_not_duplicated(backend = BitcoindBackend),
+        // A taker runs alongside, as in the original Core test; nothing reads it.
+        unconfirmed_bond_not_duplicated(
+            backend = BitcoindBackend,
+            taker_behaviors = [TakerBehavior::Normal],
+        ),
         /// Electrum variant: a maker that shuts down with an unconfirmed bond must
         /// adopt it on restart instead of creating a second one, this time over the
         /// Electrum backend.
-        unconfirmed_bond_not_duplicated_electrum(backend = ElectrumBackend),
+        unconfirmed_bond_not_duplicated_electrum(
+            backend = ElectrumBackend,
+            taker_behaviors = [],
+        ),
     ],
 )]
 fn run_unconfirmed_fidelity_bond_not_duplicated(world: &mut World) {

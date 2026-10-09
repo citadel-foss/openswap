@@ -1,3 +1,12 @@
+//! Legacy counterpart of `recovery::maker_abort::taproot_drop_after_sweep`:
+//! the maker sweeps, then drops.
+//!
+//! Route: Taker -> Maker1 (Normal) -> Maker2 (CloseAfterSweep) -> Taker
+//!
+//! Maker2 completes the handover, which reveals the preimage, and then drops
+//! instead of replying. The taker must follow that preimage and sweep via the
+//! hashlock branch rather than sit out the much longer timelock.
+
 use bitcoin::Amount;
 use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 

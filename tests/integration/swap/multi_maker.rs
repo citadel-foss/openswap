@@ -1,3 +1,8 @@
+//! Multi-maker swap over Taproot.
+//!
+//! Setup: 1 taker and 4 makers, all Normal; Taproot (MuSig2), P2TR.
+//! The taker routes one swap through all 4 makers.
+
 use bitcoin::Amount;
 use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
 

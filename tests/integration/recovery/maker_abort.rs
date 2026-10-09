@@ -172,10 +172,6 @@ impl<'w> MakerAbort<'w> {
         }
     }
 
-    fn world(&self) -> &World {
-        self.world
-    }
-
     /// Waits out the timelocks, asserts both makers recovered their
     /// contracts, then waits for the taker's recovery loop.
     fn recover(&self) {
@@ -243,7 +239,6 @@ impl<'w> MakerAbort<'w> {
 }
 
 /// Test: Maker drops at private key handover phase (Taproot). Recovery via timelock.
-/// Test: Maker drops at private key handover phase (Taproot). Recovery via timelock.
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal, CloseAtPrivateKeyHandover],
@@ -260,7 +255,7 @@ fn taproot_drop_at_private_key_handover(world: &mut World) {
     // completed prefix sends a duplicate handover to Maker1 after it has
     // removed its live state, which then produces the misleading
     // Legacy-vs-Taproot error seen in the original failure.
-    assert_log!(abort.world(); {
+    assert_log!(abort.world; {
         // A completed maker must not receive finalization again ...
         count("Sending privkey to maker 0 and awaiting response") == 1,
         // ... only the failing maker consumes both integration-test attempts.
@@ -281,7 +276,6 @@ fn taproot_drop_at_private_key_handover(world: &mut World) {
 }
 
 /// Test: Maker drops at taproot contract sigs exchange. Recovery via timelock.
-/// Test: Maker drops at taproot contract sigs exchange. Recovery via timelock.
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal, CloseAtContractSigsExchange],
@@ -294,7 +288,7 @@ fn taproot_drop_at_contract_sigs_exchange(world: &mut World) {
         "Swap should fail due to Maker2 closing at contract sigs exchange",
     );
     let outgoing_coins = abort
-        .world()
+        .world
         .taker()
         .inner()
         .get_wallet()
@@ -305,7 +299,7 @@ fn taproot_drop_at_contract_sigs_exchange(world: &mut World) {
     abort.recover();
 
     // An underpriced recovery must stay replaceable, so it has to signal RBF.
-    let world = abort.world();
+    let world = &*abort.world;
     let taker_log = fs::read_to_string(world.taker_log_path()).unwrap();
     let recovery_txids: Vec<Txid> = taker_log
         .lines()
