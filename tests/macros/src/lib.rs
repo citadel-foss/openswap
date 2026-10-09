@@ -86,7 +86,7 @@
 //! Keys can use them (`maker_lightning = [node.clone()]`), and the body takes
 //! the ones it needs by name.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -245,6 +245,15 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
             "a #[world_test] body is not async",
         ));
     }
+    if let syn::ReturnType::Type(_, ty) = &body.sig.output {
+        if !matches!(&**ty, Type::Tuple(unit) if unit.elems.is_empty()) {
+            return Err(Error::new(
+                ty.span(),
+                "a #[world_test] body returns nothing: a returned error would be \
+                 dropped, so assert or panic inside it",
+            ));
+        }
+    }
 
     // The first parameter takes the world; the rest are bindings or case args.
     let mut inputs = body.sig.inputs.iter();
@@ -257,15 +266,16 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
             ))
         }
     };
-    let mut bound: HashSet<String> = steps
-        .iter()
-        .filter_map(|step| step.binding.as_ref().map(Ident::to_string))
-        .collect();
+    // Each name the body can take is bound by exactly one of these.
+    let mut bound = HashMap::new();
+    for binding in steps.iter().filter_map(|step| step.binding.as_ref()) {
+        bind_once(&mut bound, binding, "a setup step")?;
+    }
     if swap.is_some() {
-        bound.insert(params.to_string());
+        bind_once(&mut bound, &params, "`swap(..)`")?;
     }
     // Every case names the same arguments; they bind like setup results.
-    let case_names: Vec<String> = match cases.as_deref() {
+    match cases.as_deref() {
         Some([first, rest @ ..]) => {
             let names: Vec<String> = first.args.iter().map(|(n, _)| n.to_string()).collect();
             for case in rest {
@@ -281,13 +291,16 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
                     ));
                 }
             }
-            names
+            for (name, _) in &first.args {
+                bind_once(&mut bound, name, "every case")?;
+            }
         }
         Some([]) => return Err(Error::new(Span::call_site(), "`cases` is empty")),
-        None => Vec::new(),
-    };
-    bound.extend(case_names.iter().cloned());
-    bound.extend(bind_names.iter().map(Ident::to_string));
+        None => {}
+    }
+    for name in &bind_names {
+        bind_once(&mut bound, name, "`bind`")?;
+    }
     let mut call_args = Vec::new();
     for input in inputs {
         let name = match input {
@@ -299,7 +312,7 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
                 return Err(Error::new(receiver.span(), "a body cannot take `self`"))
             }
         };
-        if !bound.contains(&name.to_string()) {
+        if !bound.contains_key(&name.to_string()) {
             return Err(Error::new(
                 name.span(),
                 format!(
@@ -375,19 +388,20 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         });
     };
 
-    // Docs stay on the shared body; every other attribute goes to each case,
-    // and a `cfg` also stays on the body so both compile out together.
+    // Docs stay on the shared body; every other attribute goes to each case.
+    // A `cfg` also stays on the body so both compile out together, and a lint
+    // attribute (`allow`, `deny`, ...) too, since it is about the body's code.
     let body_name = body.sig.ident.clone();
     let (docs, shared): (Vec<_>, Vec<_>) = std::mem::take(&mut body.attrs)
         .into_iter()
         .partition(|attr| attr.path().is_ident("doc"));
     body.attrs = docs.clone();
-    body.attrs.extend(
-        shared
+    let on_body = |attr: &&Attribute| {
+        ["cfg", "allow", "warn", "deny", "forbid", "expect"]
             .iter()
-            .filter(|attr| attr.path().is_ident("cfg"))
-            .cloned(),
-    );
+            .any(|name| attr.path().is_ident(name))
+    };
+    body.attrs.extend(shared.iter().filter(on_body).cloned());
     let mut tests = Vec::new();
     for case in cases {
         if case.name == body_name {
@@ -632,6 +646,22 @@ fn bindings(value: Expr) -> Result<(Vec<Ident>, TokenStream2)> {
     Ok((names, quote!(#(#stmts)*)))
 }
 
+/// Records that `by` binds `name`; a name bound twice would shadow one value
+/// with another, so it is refused.
+fn bind_once(
+    bound: &mut HashMap<String, &'static str>,
+    name: &Ident,
+    by: &'static str,
+) -> Result<()> {
+    match bound.insert(name.to_string(), by) {
+        Some(earlier) => Err(Error::new(
+            name.span(),
+            format!("`{name}` is bound twice, by {earlier} and by {by}"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// `cases = [/// docs \n test_name(arg = value, ...), ...]`.
 fn case_rows(value: Expr) -> Result<Vec<Case>> {
     let Expr::Array(list) = value else {
@@ -815,6 +845,35 @@ mod tests {
                 ),
                 "the body takes its fixture first",
             ),
+            (
+                quote!(backend = BitcoindBackend),
+                quote!(
+                    fn scenario(world: &mut World) -> Result<(), String> {}
+                ),
+                "a #[world_test] body returns nothing",
+            ),
+            (
+                quote!(
+                    backend = BitcoindBackend,
+                    setup = [fund_taker_default(3) as funded],
+                    bind = [funded = Amount::ZERO],
+                ),
+                quote!(
+                    fn scenario(world: &mut World, funded: Amount) {}
+                ),
+                "`funded` is bound twice, by a setup step and by `bind`",
+            ),
+            (
+                quote!(
+                    backend = BitcoindBackend,
+                    swap(protocol = Legacy, sats = 1, makers = 1),
+                    cases = [a(params = 1)],
+                ),
+                quote!(
+                    fn scenario(world: &mut World, params: SwapParams) {}
+                ),
+                "`params` is bound twice, by `swap(..)` and by every case",
+            ),
         ];
         for (args, item, expected) in cases {
             let err = expand_err(args, item);
@@ -866,6 +925,31 @@ mod tests {
         .to_string();
         assert!(tokens.contains("SwapParams :: new (protocol ,"), "{tokens}");
         assert!(tokens.contains(". with_tx_count (tx_count)"), "{tokens}");
+    }
+
+    #[test]
+    fn a_lint_attribute_stays_on_the_shared_body() {
+        let tokens = expand(
+            quote!(backend = BitcoindBackend, cases = [a(n = 1), b(n = 2)],),
+            quote!(
+                #[allow(clippy::too_many_arguments)]
+                #[ignore]
+                fn run_guard(world: &mut World, n: u32) {}
+            ),
+        )
+        .unwrap()
+        .to_string();
+        let body = tokens
+            .find("fn run_guard (world")
+            .expect("the shared body is emitted");
+        assert!(
+            tokens[..body].ends_with("# [allow (clippy :: too_many_arguments)] "),
+            "the lint must stay on the body: {tokens}"
+        );
+        assert!(
+            !tokens[..body].contains("# [ignore]"),
+            "`ignore` belongs to the generated tests: {tokens}"
+        );
     }
 
     #[test]
