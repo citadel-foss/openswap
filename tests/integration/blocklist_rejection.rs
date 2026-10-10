@@ -5,7 +5,7 @@ use openswap::{
     blocklist::BlocklistError,
     maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
-    taker::{error::TakerError, MakerState, SwapParams, TakerBehavior},
+    taker::{error::TakerError, BanReason, BanRecord, MakerState, SwapParams, TakerBehavior},
     wallet::AddressType,
 };
 
@@ -41,6 +41,16 @@ fn taker_rejects_legacy_intermediate_funding_from_blocked_address() {
 #[test]
 fn taker_rejects_taproot_intermediate_funding_from_blocked_address() {
     run_taker_rejection(ProtocolVersion::Taproot, 2, 0);
+}
+
+#[test]
+fn legacy_proven_violation_precedes_blocklist_screen() {
+    run_violation_with_blocked_funding(ProtocolVersion::Legacy);
+}
+
+#[test]
+fn taproot_proven_violation_precedes_blocklist_screen() {
+    run_violation_with_blocked_funding(ProtocolVersion::Taproot);
 }
 
 #[test]
@@ -247,6 +257,105 @@ fn run_maker_rejection(protocol: ProtocolVersion) {
             "blocklist rejection must happen before maker liquidity is spent"
         );
     }
+
+    drop(takers);
+    makers
+        .iter()
+        .for_each(|maker| maker.shutdown.store(true, Relaxed));
+    maker_threads
+        .into_iter()
+        .for_each(|handle| handle.join().unwrap());
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// The maker skims a sat from its funding, which the taker can prove, and
+/// funds from a listed address. The taker must reject on the violation and
+/// ban the maker before it spends any backend queries screening that funding.
+fn run_violation_with_blocked_funding(protocol: ProtocolVersion) {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init_with_blocklist::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::FeeSkimming],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_maker_from_one_address(
+        &makers[0],
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2TR,
+    );
+
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+
+    // The same funding source the blocklist-only tests refuse.
+    let blocked_address = sole_regular_utxo_address(&makers[0]);
+    let outcome = taker
+        .add_blocklist_entry(
+            blocked_address.to_string(),
+            Some("integration test maker source".to_string()),
+        )
+        .unwrap();
+    assert_eq!(outcome.added, 1);
+
+    let log_path = test_framework.taker_log_path();
+    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+
+    let params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    let summary = taker
+        .prepare_swap(params)
+        .expect("prepare_swap should succeed");
+    match taker.start_swap(&summary.swap_id) {
+        Err(TakerError::General(message)) => assert!(
+            message.contains("does not match the negotiated hop total"),
+            "unexpected taker error: {}",
+            message
+        ),
+        Err(other) => panic!("expected the proven fee skim, got {:?}", other),
+        Ok(_) => panic!("the taker accepted a fee-skimming maker's funding"),
+    }
+
+    // The screen logs every match. Its funding input is listed, so a screen
+    // that ran would have logged this one.
+    let contents = std::fs::read_to_string(&log_path).unwrap();
+    let screened = contents
+        .get(log_offset as usize..)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.contains(&format!("uses blocked address {}", blocked_address)));
+    assert!(
+        !screened,
+        "the taker screened funding it had already proven invalid"
+    );
+
+    let address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let standing = taker
+        .fetch_offers()
+        .unwrap()
+        .all_makers()
+        .into_iter()
+        .find(|m| m.address.to_string() == address)
+        .expect("the maker must be in the offerbook");
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a proven contract violation must ban the maker, got {:?}",
+        standing.state
+    );
 
     drop(takers);
     makers
