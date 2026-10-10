@@ -23,7 +23,7 @@ use bitcoin::{
         rand::{rngs::OsRng, RngCore},
         SecretKey,
     },
-    Amount, OutPoint, PublicKey,
+    Amount, OutPoint, PublicKey, Transaction,
 };
 use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 
@@ -3640,6 +3640,24 @@ impl Taker {
 
         blocklist
             .remove(vec![address])
+            .map_err(TakerError::Blocklist)
+    }
+
+    /// Screen a maker's funding transaction against the blocklist when
+    /// `check_blocklist` is on. A match is local policy: the caller aborts the
+    /// swap, and nothing is recorded against the maker.
+    pub(crate) fn screen_funding_tx(&self, tx: &Transaction) -> Result<(), TakerError> {
+        if !self.config.check_blocklist.unwrap_or(false) {
+            return Ok(());
+        }
+        let data_dir = self
+            .config
+            .data_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(get_taker_dir)?;
+        let wallet = self.read_wallet()?;
+        crate::blocklist::screen_funding_tx(&data_dir, wallet.store.network, &wallet, tx)
             .map_err(TakerError::Blocklist)
     }
 

@@ -780,6 +780,10 @@ impl Taker {
         }
         htlc.validate_funding_output(&output, params.amount)
             .map_err(|e| general(format!("bad funding output: {e}")))?;
+        // Screen the transaction that confirmed, before recording its outpoint:
+        // recovery claims any recorded outpoint, so a refused one must never
+        // reach the record.
+        self.screen_funding_tx(&funding_tx)?;
         {
             let mut wallet = self.write_wallet()?;
             if let Some(record) = wallet.store.ln_pending_swaps.get_mut(&swap_id) {
@@ -1031,6 +1035,9 @@ impl Taker {
         htlc2
             .validate_funding_output(&output2, params.amount)
             .map_err(|e| general(format!("bad funding output: {e}")))?;
+        // As in a swap-out: screen before recording, so recovery never claims
+        // a refused hop 2. Not claiming keeps the preimage from maker 1.
+        self.screen_funding_tx(&funding_tx)?;
         {
             let mut wallet = self.write_wallet()?;
             if let Some(record) = wallet.store.ln_pending_swaps.get_mut(&out_key) {

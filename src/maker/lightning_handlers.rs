@@ -659,27 +659,58 @@ fn handle_swap_in_funded<M: Maker>(
         .ok_or(MakerError::General("funding vout out of range"))?;
     let expected = swap.amount + swap.fee;
     if funded.value != output.value {
-        return Ok(reject(&funded.swap_id, "announced value mismatch"));
+        return refuse_swap_in(
+            maker,
+            ctx,
+            &swap,
+            &funded.swap_id,
+            "announced value mismatch",
+        );
     }
     if let Err(e) = swap.htlc.validate_funding_output(output, expected) {
-        return Ok(reject(&funded.swap_id, format!("bad funding output: {e}")));
+        return refuse_swap_in(
+            maker,
+            ctx,
+            &swap,
+            &funded.swap_id,
+            format!("bad funding output: {e}"),
+        );
+    }
+    // Our blocklist is local policy, not taker misbehaviour: refuse without
+    // paying, and keep the matched entry out of the reply.
+    if let Err(e) = maker.screen_funding_tx(&funding_tx) {
+        log::warn!(
+            "[{}] Swap-in {}: funding refused: {e:?}",
+            maker.network_port(),
+            funded.swap_id
+        );
+        return refuse_swap_in(maker, ctx, &swap, &funded.swap_id, "funding refused");
     }
     // Value and script are not enough. The taker chose this outpoint, so it
     // may be one whose refund is already spendable — or already spent. Paying
     // against either loses the Lightning amount outright.
     let (unspent, age) = maker.htlc_unspent_and_age(&funded.outpoint)?;
     if !unspent {
-        return Ok(reject(&funded.swap_id, "funding output is already spent"));
+        return refuse_swap_in(
+            maker,
+            ctx,
+            &swap,
+            &funded.swap_id,
+            "funding output is already spent",
+        );
     }
     let remaining = (swap.locktime as u32).saturating_sub(age);
     if remaining < MIN_REMAINING_LOCKTIME {
-        return Ok(reject(
+        return refuse_swap_in(
+            maker,
+            ctx,
+            &swap,
             &funded.swap_id,
             format!(
                 "only {remaining} of {} locktime blocks remain after {age} elapsed",
                 swap.locktime
             ),
-        ));
+        );
     }
     // The route budget derived below is `remaining - margin`. If that falls
     // under the invoice's own final delta no route can satisfy it, so the
@@ -694,13 +725,16 @@ fn handle_swap_in_funded<M: Maker>(
     // Saturate: a truncated delta could wrap to 0 and pass the check below.
     .map_or(0u32, |delta| u32::try_from(delta).unwrap_or(u32::MAX));
     if remaining < invoice_delta.saturating_add(CLTV_SAFETY_MARGIN as u32) {
-        return Ok(reject(
+        return refuse_swap_in(
+            maker,
+            ctx,
+            &swap,
             &funded.swap_id,
             format!(
                 "{remaining} blocks left after {age} elapsed cannot cover the invoice's \
                  {invoice_delta}-block final delta plus the {CLTV_SAFETY_MARGIN}-block margin"
             ),
-        ));
+        );
     }
 
     let htlc_spk = swap.htlc.script_pubkey().map_err(|e| {
@@ -743,6 +777,33 @@ fn handle_swap_in_funded<M: Maker>(
             swap_id: funded.swap_id,
         }),
     ))))
+}
+
+/// Refuses a funded swap-in. Every refusal comes before the maker pays the
+/// invoice or watches the HTLC, so it holds nothing it would need to resolve
+/// later: the taker refunds its HTLC on its own. Forget the swap now, so it
+/// does not hold one of the concurrent swap slots until the watchdog expires
+/// it.
+fn refuse_swap_in<M: Maker>(
+    maker: &Arc<M>,
+    ctx: &LnContext,
+    swap: &LnMakerSwap,
+    swap_id: &str,
+    reason: impl Into<String>,
+) -> Result<Option<MakerToTakerMessage>, MakerError> {
+    ctx.router.unsubscribe(&swap.payment_hash);
+    if let Err(e) = maker.remove_ln_swap(swap_id) {
+        // The refusal stands either way. remove_ln_swap drops the in-memory
+        // record first, so a later wallet or disk failure has already freed
+        // the slot, and the watchdog will not see the swap again in this run.
+        // A record left on disk is restored at the next start, where the
+        // watchdog expires it like any swap-in that never got past acceptance.
+        log::warn!(
+            "[{}] Swap-in {swap_id}: could not forget the refused swap: {e:?}",
+            maker.network_port()
+        );
+    }
+    Ok(reject(swap_id, reason))
 }
 
 /// Blocks until the settlement for `payment_hash` reveals the preimage, the
