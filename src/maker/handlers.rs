@@ -585,6 +585,31 @@ pub trait Maker: Send + Sync {
         Ok(())
     }
 
+    /// Store per-swap Lightning state, but only while the stored swap is still
+    /// in `expected`. Returns whether it was stored. A handler that acts on a
+    /// snapshot uses this so it cannot overwrite a state another connection
+    /// has already moved the swap past.
+    #[cfg(feature = "lightning")]
+    fn store_ln_swap_if_phase(
+        &self,
+        _swap_id: &str,
+        _expected: super::lightning_handlers::LnMakerPhase,
+        _swap: super::lightning_handlers::LnMakerSwap,
+    ) -> Result<bool, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Remove per-swap Lightning state and its event mailbox, but only while
+    /// the stored swap is still in `expected`. Returns whether it was removed.
+    #[cfg(feature = "lightning")]
+    fn remove_ln_swap_if_phase(
+        &self,
+        _swap_id: &str,
+        _expected: super::lightning_handlers::LnMakerPhase,
+    ) -> Result<bool, MakerError> {
+        Ok(false)
+    }
+
     /// How many Lightning swaps are currently in flight.
     #[cfg(feature = "lightning")]
     fn ln_swap_count(&self) -> usize {

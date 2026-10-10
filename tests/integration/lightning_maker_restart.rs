@@ -7,17 +7,24 @@
 //! so the restart happens at a precisely controlled point: right after the
 //! maker has funded the on-chain HTLC.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use bitcoin::{
     secp256k1::{Secp256k1, SecretKey},
-    Amount, PublicKey,
+    Amount, OutPoint, PublicKey,
 };
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
-    lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest, Preimage},
+    lightning::{
+        InvoiceParams, LightningBackend, LnEvent, MockLightningBackend, OpenChannelRequest,
+        Preimage, SwapHtlc,
+    },
     maker::{
-        handlers::{handle_message, ConnectionState},
+        handlers::{handle_message, ConnectionState, Maker},
+        lightning_handlers::{
+            refuse_swap_in_after_wait, watchdog_expire_swap_in_snapshot, LnDirection, LnMakerPhase,
+            LnMakerSwap,
+        },
         MakerBehavior, MakerServer,
     },
     protocol::{
@@ -217,6 +224,234 @@ fn lightning_maker_restart_recovers_funded_swap() {
     drop(takers);
     restarted.shutdown.store(true, Relaxed);
     restarted.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// An unfunded swap-in as the maker stores it on acceptance.
+fn accepted_swap_in(preimage: &Preimage) -> LnMakerSwap {
+    let secp = Secp256k1::new();
+    let hashlock_privkey = SecretKey::from_slice(&[0x41; 32]).unwrap();
+    let hashlock_pubkey = PublicKey::new(hashlock_privkey.public_key(&secp));
+    let timelock_pubkey = PublicKey::new(
+        SecretKey::from_slice(&[0x42; 32])
+            .unwrap()
+            .public_key(&secp),
+    );
+    let payment_hash = preimage.payment_hash();
+    LnMakerSwap {
+        direction: LnDirection::SwapIn,
+        phase: LnMakerPhase::InAccepted,
+        payment_hash,
+        amount: Amount::from_sat(40_000),
+        fee: Amount::from_sat(500),
+        locktime: 144,
+        min_confirmations: 1,
+        htlc: SwapHtlc::new(&hashlock_pubkey, &timelock_pubkey, &payment_hash, 144),
+        privkey: hashlock_privkey,
+        invoice: "lnbcrt-test".to_string(),
+        preimage: None,
+        refund_txid: None,
+        accepted_height: None,
+        payout_script: None,
+        funding: None,
+        funding_height: None,
+        updated_at: Instant::now(),
+    }
+}
+
+/// Whether the maker's mailbox for `payment_hash` is still open: an event
+/// for it reaches the mailbox only if it is.
+fn mailbox_open(maker: &MakerServer, ln: &MockLightningBackend, preimage: &Preimage) -> bool {
+    let payment_hash = preimage.payment_hash();
+    ln.create_hold_invoice(
+        payment_hash,
+        InvoiceParams {
+            amount_msat: Some(40_000_000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    ln.simulate_htlc_arrival(payment_hash, 40_000_000);
+    let router = maker.ln_router.as_ref().unwrap();
+    router.pump_once();
+    matches!(
+        router.take_event(&payment_hash),
+        Some(LnEvent::PaymentClaimable { .. })
+    )
+}
+
+/// A swap-in refusal is decided on a copy of the swap read before the
+/// confirmation wait. If another connection paid the swap during that wait,
+/// the refusal must keep the paid record, which holds the HTLC key, and the
+/// mailbox the preimage arrives in. A swap still awaiting funding is
+/// forgotten as before.
+#[test]
+fn stale_swap_in_refusal_keeps_paid_swap() {
+    log::warn!("Running Test: stale swap-in refusal keeps a paid swap");
+
+    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let maker = makers[0].clone();
+    let router = maker.ln_router.clone().unwrap();
+
+    // Both swaps are accepted, so both hold a record and a mailbox.
+    let paid_preimage = Preimage([0x51; 32]);
+    let paid_id = paid_preimage.payment_hash().to_string();
+    let unfunded_preimage = Preimage([0x52; 32]);
+    let unfunded_id = unfunded_preimage.payment_hash().to_string();
+    for preimage in [&paid_preimage, &unfunded_preimage] {
+        router.subscribe(preimage.payment_hash());
+        maker
+            .store_ln_swap(
+                &preimage.payment_hash().to_string(),
+                accepted_swap_in(preimage),
+            )
+            .unwrap();
+    }
+
+    // While the refusing handler waited, another connection funded and paid
+    // the first swap.
+    let mut paid = accepted_swap_in(&paid_preimage);
+    let funding = (OutPoint::default(), Amount::from_sat(40_500));
+    paid.phase = LnMakerPhase::InPaid;
+    paid.funding = Some(funding);
+    paid.funding_height = Some(101);
+    maker.store_ln_swap(&paid_id, paid).unwrap();
+
+    for swap_id in [&paid_id, &unfunded_id] {
+        let reply = refuse_swap_in_after_wait(&maker, swap_id, "announced value mismatch")
+            .expect("the refusal still answers the taker");
+        match expect_ln(reply) {
+            LightningMakerMessage::Reject(reject) => assert_eq!(&reject.swap_id, swap_id),
+            other => panic!("expected a Reject, got {}", other),
+        }
+    }
+
+    let kept = maker
+        .get_ln_swap(&paid_id)
+        .unwrap()
+        .expect("the stale refusal deleted a paid swap");
+    assert_eq!(kept.phase, LnMakerPhase::InPaid);
+    assert_eq!(kept.funding, Some(funding));
+    assert!(
+        mailbox_open(&maker, &ln, &paid_preimage),
+        "the stale refusal closed the mailbox of a paid swap"
+    );
+
+    assert!(
+        maker.get_ln_swap(&unfunded_id).unwrap().is_none(),
+        "the refused unfunded swap still holds a maker swap slot"
+    );
+    assert!(
+        !mailbox_open(&maker, &ln, &unfunded_preimage),
+        "the refused unfunded swap kept its mailbox"
+    );
+
+    // Restart: only what reached the wallet store comes back.
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(router);
+    drop(maker);
+    drop(makers);
+
+    let restarted = MakerServer::init(config).expect("maker restarts");
+    let restored = restarted.ln_swaps.lock().unwrap().clone();
+    let restored_paid = restored
+        .get(&paid_id)
+        .expect("the paid swap's durable record was lost");
+    assert_eq!(restored_paid.phase, LnMakerPhase::InPaid);
+    assert_eq!(restored_paid.funding, Some(funding));
+    assert!(
+        !restored.contains_key(&unfunded_id),
+        "the refused unfunded swap came back after a restart"
+    );
+
+    drop(takers);
+    restarted.shutdown.store(true, Relaxed);
+    restarted.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// The watchdog expires an unfunded swap-in from a snapshot taken before it
+/// acts. If a handler paid the swap after that snapshot, the expiry must keep
+/// the paid record and its mailbox. A swap still awaiting funding is
+/// forgotten as before.
+#[test]
+fn stale_watchdog_expiry_keeps_paid_swap() {
+    log::warn!("Running Test: stale watchdog expiry keeps a paid swap");
+
+    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let maker = makers[0].clone();
+    let router = maker.ln_router.clone().unwrap();
+
+    // Accepted at height 0, so on a regtest chain past 100 blocks both are
+    // long past their funding budget when the watchdog looks.
+    let paid_preimage = Preimage([0x61; 32]);
+    let paid_id = paid_preimage.payment_hash().to_string();
+    let unfunded_preimage = Preimage([0x62; 32]);
+    let unfunded_id = unfunded_preimage.payment_hash().to_string();
+    let mut snapshots = Vec::new();
+    for preimage in [&paid_preimage, &unfunded_preimage] {
+        let mut accepted = accepted_swap_in(preimage);
+        accepted.accepted_height = Some(0);
+        router.subscribe(preimage.payment_hash());
+        maker
+            .store_ln_swap(&preimage.payment_hash().to_string(), accepted.clone())
+            .unwrap();
+        snapshots.push(accepted);
+    }
+
+    // After the watchdog's snapshot, a handler funded and paid the first swap.
+    let mut paid = snapshots[0].clone();
+    let funding = (OutPoint::default(), Amount::from_sat(40_500));
+    paid.phase = LnMakerPhase::InPaid;
+    paid.funding = Some(funding);
+    paid.funding_height = Some(101);
+    maker.store_ln_swap(&paid_id, paid).unwrap();
+
+    watchdog_expire_swap_in_snapshot(&maker, &paid_id, &snapshots[0]).unwrap();
+    watchdog_expire_swap_in_snapshot(&maker, &unfunded_id, &snapshots[1]).unwrap();
+
+    let kept = maker
+        .get_ln_swap(&paid_id)
+        .unwrap()
+        .expect("the stale watchdog expiry deleted a paid swap");
+    assert_eq!(kept.phase, LnMakerPhase::InPaid);
+    assert_eq!(kept.funding, Some(funding));
+    assert!(
+        mailbox_open(&maker, &ln, &paid_preimage),
+        "the stale watchdog expiry closed the mailbox of a paid swap"
+    );
+
+    assert!(
+        maker.get_ln_swap(&unfunded_id).unwrap().is_none(),
+        "the watchdog kept an expired unfunded swap"
+    );
+    assert!(
+        !mailbox_open(&maker, &ln, &unfunded_preimage),
+        "the expired unfunded swap kept its mailbox"
+    );
+
+    drop(takers);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

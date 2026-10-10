@@ -2096,6 +2096,24 @@ fn live_swap_holds(
     })
 }
 
+/// True when Lightning swap `swap_id` is in `phase` both in memory and in the
+/// wallet store. store_ln_swap writes the wallet before the map, so a stored
+/// record in another phase is a newer state that has not reached memory yet.
+#[cfg(feature = "lightning")]
+fn ln_swap_in_phase(
+    wallet: &Wallet,
+    swaps: &HashMap<String, super::lightning_handlers::LnMakerSwap>,
+    swap_id: &str,
+    phase: super::lightning_handlers::LnMakerPhase,
+) -> bool {
+    swaps.get(swap_id).is_some_and(|swap| swap.phase == phase)
+        && wallet
+            .store
+            .ln_maker_swaps
+            .get(swap_id)
+            .is_some_and(|record| record.phase == phase)
+}
+
 impl MakerTrait for MakerServer {
     fn network_port(&self) -> u16 {
         self.config.network_port
@@ -3445,6 +3463,72 @@ impl MakerTrait for MakerServer {
             wallet.save_to_disk().map_err(MakerError::Wallet)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "lightning")]
+    fn store_ln_swap_if_phase(
+        &self,
+        swap_id: &str,
+        expected: super::lightning_handlers::LnMakerPhase,
+        swap: super::lightning_handlers::LnMakerSwap,
+    ) -> Result<bool, MakerError> {
+        // Wallet first, then the swap map: the order store_ln_swap takes them
+        // in, and nothing takes them the other way round. Holding both makes
+        // the check and the write one step for every other writer.
+        let mut wallet = lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let mut swaps = lock_debug!(self.ln_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        if !ln_swap_in_phase(&wallet, &swaps, swap_id, expected) {
+            return Ok(false);
+        }
+        // Persist first, as store_ln_swap does: the caller's next step may be
+        // a payment, and a crash after it must still find this record.
+        let previous = wallet
+            .store
+            .ln_maker_swaps
+            .insert(swap_id.to_string(), swap.to_record());
+        if let Err(e) = wallet.save_to_disk() {
+            // Put the old record back, so the wallet store still matches the
+            // map and the disk, and the swap can still be refused or expired.
+            if let Some(previous) = previous {
+                wallet
+                    .store
+                    .ln_maker_swaps
+                    .insert(swap_id.to_string(), previous);
+            }
+            return Err(MakerError::Wallet(e));
+        }
+        swaps.insert(swap_id.to_string(), swap);
+        Ok(true)
+    }
+
+    #[cfg(feature = "lightning")]
+    fn remove_ln_swap_if_phase(
+        &self,
+        swap_id: &str,
+        expected: super::lightning_handlers::LnMakerPhase,
+    ) -> Result<bool, MakerError> {
+        // Same lock order as store_ln_swap_if_phase.
+        let mut wallet = lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let mut swaps = lock_debug!(self.ln_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        if !ln_swap_in_phase(&wallet, &swaps, swap_id, expected) {
+            return Ok(false);
+        }
+        if let Some(swap) = swaps.remove(swap_id) {
+            // Dropped while the swap map is still locked. A new swap under the
+            // same payment hash opens its mailbox only after it finds this id
+            // free, so this cannot close a mailbox that belongs to it.
+            if let Some(router) = &self.ln_router {
+                router.unsubscribe(&swap.payment_hash);
+            }
+        }
+        let removed = wallet.store.ln_maker_swaps.remove(swap_id).is_some();
+        let released = wallet.release_swap_locks(swap_id, None);
+        if removed || released {
+            wallet.save_to_disk().map_err(MakerError::Wallet)?;
+        }
+        Ok(true)
     }
 
     #[cfg(feature = "lightning")]
