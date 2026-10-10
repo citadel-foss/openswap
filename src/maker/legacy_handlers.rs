@@ -420,6 +420,12 @@ fn process_proof_of_funding<M: Maker>(
         forwardable
     );
 
+    // Held through the stored state: a reconnect resending ProofOfFunding at
+    // the same time would build a second batch for this swap.
+    let _funding = maker.begin_funding(&pof.id)?;
+    #[cfg(feature = "integration-test")]
+    super::handlers::pause_in_funding_step(maker.as_ref());
+
     // Sync wallet before creating outgoing swaps to get fresh UTXO state.
     log::info!(
         "[{}] Sync at:----process_proof_of_funding----",
@@ -609,6 +615,11 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
     if resp.senders_sigs.len() != state.outgoing_swapcoins.len() {
         return Err(MakerError::General("Invalid number of sender signatures"));
     }
+
+    // The broadcast below must not race a resent ProofOfFunding rebuilding the batch.
+    let _funding = maker.begin_funding(&resp.id)?;
+    #[cfg(feature = "integration-test")]
+    super::handlers::pause_in_funding_step(maker.as_ref());
 
     // The sync, persistence and broadcast loop below can outlive the idle
     // timeout; refresh the stored activity so the idle checker does not drain

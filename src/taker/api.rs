@@ -2093,6 +2093,31 @@ impl Taker {
 
     /// Send `details` to `maker_address` on a fresh connection and return the
     /// maker's raw response, accept or reject.
+    /// Whether this funding-step message should also be raced to `maker_address`.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn races_funding_step(&self, maker_address: &str) -> Result<bool, TakerError> {
+        Ok(self.behavior == TakerBehavior::RaceFundingStep
+            && self.swap_state()?.makers[0].address.to_string() == maker_address)
+    }
+
+    /// Sends a Legacy funding-step message again on a second connection, once
+    /// the maker is inside the first copy's funding step.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn race_legacy_funding_step(
+        &self,
+        maker_address: &str,
+        msg: &TakerToMakerMessage,
+    ) -> Result<(), TakerError> {
+        if !self.races_funding_step(maker_address)? {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        log::warn!("Test behavior: racing a duplicate funding-step message to {maker_address}");
+        let mut stream = self.net_connect(maker_address)?;
+        send_message(&mut stream, msg)?;
+        Ok(())
+    }
+
     pub(crate) fn resend_swap_details(
         &self,
         maker_address: &str,
@@ -3802,6 +3827,9 @@ pub enum TakerBehavior {
     ForgeIncomingCount(u32),
     /// Re-send identical then mutated SwapDetails after admission.
     ResendMutatedDetails,
+    /// Send each funding-step message to the route's first maker a second
+    /// time, on another connection, while the first is still being handled.
+    RaceFundingStep,
     /// Close connection early (after maker selection).
     CloseEarly,
     /// Drop after funds/contracts are broadcast but before finalization.

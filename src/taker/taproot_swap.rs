@@ -399,6 +399,20 @@ impl Taker {
                 .taproot_exchange_mut()?
                 .contract_data_sent = true;
 
+            #[cfg(feature = "integration-test")]
+            if self.races_funding_step(&maker_address)? {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                log::warn!("Test behavior: racing duplicate contract data to maker {i}");
+                if self
+                    .resume_contract_data_exchange(&maker_address, i, &contract_data)
+                    .is_ok()
+                {
+                    return Err(TakerError::General(
+                        "Maker answered a duplicate contract data mid-funding".to_string(),
+                    ));
+                }
+            }
+
             let msg_bytes = read_message(&mut stream).map_err(TakerError::from);
             #[cfg(feature = "integration-test")]
             let msg_bytes = match msg_bytes {

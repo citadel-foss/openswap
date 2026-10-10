@@ -703,6 +703,59 @@ fn one_utxo_taker_completes_degraded_swap() {
     test_framework.finish(takers, block_generation_handle);
 }
 
+/// The maker holds each funding step open while the taker sends the same
+/// message again on a second connection. Each duplicate must be refused and
+/// the first handler's swap must still complete: Legacy refuses a duplicate
+/// proof of funding and contract sigs, Taproot a duplicate contract data.
+#[test]
+fn maker_refuses_a_concurrent_funding_step() {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::RaceFundingStep],
+            vec![MakerBehavior::PauseInFundingStep],
+        );
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 4);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+    generate_blocks(bitcoind, 1);
+
+    let log_path = test_framework.taker_log_path();
+    let refusals = || {
+        std::fs::read_to_string(&log_path)
+            .unwrap()
+            .matches("Funding for this swap is already in progress")
+            .count()
+    };
+
+    for (protocol, expected) in [(ProtocolVersion::Legacy, 2), (ProtocolVersion::Taproot, 3)] {
+        let params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
+            .with_tx_count(1)
+            .with_required_confirms(1);
+        let summary = taker
+            .prepare_swap(params)
+            .expect("prepare_swap should succeed");
+        taker
+            .start_swap(&summary.swap_id)
+            .expect("the first handler's swap must complete");
+        assert_eq!(
+            refusals(),
+            expected,
+            "every duplicate {protocol:?} funding step must be refused"
+        );
+    }
+
+    shutdown_makers(&makers, maker_threads);
+
+    test_framework.finish(takers, block_generation_handle);
+}
+
 /// The maker forwards 1,075 sats. Two splits net to 372 each, under the 485
 /// taproot floor, but one split nets to 910, so admission must re-plan with one.
 #[test]

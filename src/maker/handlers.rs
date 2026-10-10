@@ -1,6 +1,10 @@
 //! Message handlers for the Maker.
 
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex, PoisonError},
+    time::Instant,
+};
 
 use bitcoin::{bip32::ChainCode, Amount, OutPoint, PublicKey, Transaction, Txid};
 
@@ -78,6 +82,9 @@ pub enum MakerBehavior {
     CloseAtReqContractSigsForSender,
     /// Close connection when receiving ProofOfFunding (abort2 scenario).
     CloseAtProofOfFunding,
+    /// Hold each funding step open long enough for a test to race a
+    /// duplicate of its message in on a second connection.
+    PauseInFundingStep,
     /// Close connection when receiving RespContractSigsForRecvrAndSender (abort3 scenario).
     CloseAtContractSigsForRecvrAndSender,
     /// Close connection when receiving ReqContractSigsForRecvr (abort3 scenario).
@@ -332,6 +339,51 @@ impl ConnectionState {
     }
 }
 
+/// Called beside, not inside, each funding guard, so a test that drops the
+/// guard still has the window open for the duplicate to slip through.
+#[cfg(feature = "integration-test")]
+pub(crate) fn pause_in_funding_step<M: Maker>(maker: &M) {
+    if maker.behavior() == MakerBehavior::PauseInFundingStep {
+        log::warn!("Test behavior: holding the funding step open");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+}
+
+/// Marks one swap's funding step as running, from claiming the coins through
+/// the last persisted state. A second handler for the same swap is refused while
+/// it is held, so two handlers never build different batches for one swap.
+pub struct FundingGuard<'a> {
+    running: &'a Mutex<HashSet<String>>,
+    swap_id: String,
+}
+
+impl<'a> FundingGuard<'a> {
+    /// Takes the mark for `swap_id`, or refuses if another handler holds it.
+    pub fn acquire(running: &'a Mutex<HashSet<String>>, swap_id: &str) -> Result<Self, MakerError> {
+        let mut swaps = running.lock().map_err(|_| MakerError::MutexPossion)?;
+        if !swaps.insert(swap_id.to_string()) {
+            return Err(MakerError::General(
+                "Funding for this swap is already in progress",
+            ));
+        }
+        Ok(Self {
+            running,
+            swap_id: swap_id.to_string(),
+        })
+    }
+}
+
+impl Drop for FundingGuard<'_> {
+    fn drop(&mut self) {
+        // Released on every path, a poisoned lock included, or the swap stays
+        // refused for good.
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.swap_id);
+    }
+}
+
 /// Trait for maker operations.
 pub trait Maker: Send + Sync {
     /// Get the network port for logging.
@@ -380,6 +432,10 @@ pub trait Maker: Send + Sync {
         addresses: &[bitcoin::Address],
         feerate: f64,
     ) -> Result<(Vec<Transaction>, Vec<u32>), MakerError>;
+
+    /// Mark `swap_id`'s funding step as running for as long as the guard lives.
+    /// Refuses while another handler holds it for the same swap.
+    fn begin_funding(&self, swap_id: &str) -> Result<FundingGuard<'_>, MakerError>;
 
     /// Broadcast a transaction.
     fn broadcast_transaction(&self, tx: &Transaction) -> Result<bitcoin::Txid, MakerError>;
@@ -1277,6 +1333,34 @@ fn handle_taproot_dispatch<M: Maker>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second handler for a swap whose funding is running is refused; the
+    /// swap is free again once the first handler is done, on any exit path.
+    #[test]
+    fn funding_guard_admits_one_handler_per_swap() {
+        let running = Mutex::new(HashSet::new());
+        let first = FundingGuard::acquire(&running, "swap").unwrap();
+        assert!(matches!(
+            FundingGuard::acquire(&running, "swap"),
+            Err(MakerError::General(_))
+        ));
+        // Other swaps fund independently.
+        let other = FundingGuard::acquire(&running, "other").unwrap();
+        drop(first);
+        drop(FundingGuard::acquire(&running, "swap").unwrap());
+
+        // A handler that panics mid-funding still frees its swap.
+        let shared = Arc::new(Mutex::new(HashSet::new()));
+        let held = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let _funding = FundingGuard::acquire(&held, "swap").unwrap();
+            panic!("handler failed mid-funding");
+        })
+        .join()
+        .unwrap_err();
+        assert!(FundingGuard::acquire(&shared, "swap").is_ok());
+        drop(other);
+    }
 
     #[test]
     fn offset_below_reaction_time_is_rejected() {

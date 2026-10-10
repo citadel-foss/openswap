@@ -49,8 +49,8 @@ pub use super::handlers::MakerBehavior;
 use super::{
     error::MakerError,
     handlers::{
-        past_refund_deadline, ConnectionState, Maker as MakerTrait, MakerConfig, SwapPhase,
-        MAX_CONCURRENT_SWAPS, MIN_CONTRACT_REACTION_TIME,
+        past_refund_deadline, ConnectionState, FundingGuard, Maker as MakerTrait, MakerConfig,
+        SwapPhase, MAX_CONCURRENT_SWAPS, MIN_CONTRACT_REACTION_TIME,
     },
     rpc::server::MakerRpc,
     swap_tracker::{now_secs, MakerRecoveryPhase, MakerSwapPhase, MakerSwapTracker},
@@ -736,6 +736,8 @@ pub struct MakerServer {
     ongoing_swaps: Mutex<HashMap<String, SwapState>>,
     /// Serializes funding claims, so two passes for one swap cannot both claim.
     funding_claims: Mutex<()>,
+    /// Swaps whose funding step a handler is running.
+    funding_in_progress: Mutex<HashSet<String>>,
     /// Recently completed handovers, retained for exact retry replay.
     completed_handovers: Mutex<HashMap<String, CompletedHandover>>,
     /// Watch service for contract monitoring.
@@ -946,6 +948,7 @@ impl MakerServer {
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
             funding_claims: Mutex::new(()),
+            funding_in_progress: Mutex::new(HashSet::new()),
             watch_service,
             completed_handovers: Mutex::new(HashMap::new()),
             thread_pool: Arc::new(ThreadPool::new(config.network_port)),
@@ -2344,6 +2347,10 @@ impl MakerTrait for MakerServer {
         )
         .map_err(MakerError::Wallet)?;
         Ok(())
+    }
+
+    fn begin_funding(&self, swap_id: &str) -> Result<FundingGuard<'_>, MakerError> {
+        FundingGuard::acquire(&self.funding_in_progress, swap_id)
     }
 
     fn broadcast_transaction(&self, tx: &Transaction) -> Result<bitcoin::Txid, MakerError> {
