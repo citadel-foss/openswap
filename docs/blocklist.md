@@ -109,11 +109,15 @@ Rules:
 
 ## Relationship to the protocol
 
-The blocklist is local policy and does not appear in any message.
-A peer cannot determine whether a counterparty applies one, and a refusal is indistinguishable from any other abandoned swap.
-This prevents peers from probing which addresses a participant considers unacceptable.
+The blocklist is local policy and no message carries the list or a matched entry.
+Most refusals look like any other abandoned swap, so a peer cannot tell whether its counterparty applies a list.
+The exception is a Lightning swap-in, where the maker answers the taker's funding message.
+Its `funding refused` reply is used for no other refusal, so it tells the taker that the funding screen did not pass.
+That covers a matched input and a screen that could not complete: an input that could not be resolved, more than 25 inputs, or a list file that could not be read.
+The reply does not say which of these happened or which address matched; the maker records that only in its own log.
+A taker could still use the reply to test whether a funding source is listed, but each test costs a confirmed HTLC and the wait for its refund.
 
-A match aborts the swap but is never recorded against the peer and never bans it: the peer cannot know what the list contains, so funding from a listed address is not misbehaviour.
+A match aborts the swap but is never recorded against the peer and never bans it: the peer is never shown the list, so funding from a listed address is not misbehaviour.
 
 Two participants may hold different lists, or none, without affecting the protocol.
 
