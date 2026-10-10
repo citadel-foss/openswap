@@ -5,12 +5,12 @@ use std::time::Duration;
 use bitcoin::{
     hashes::{hash160::Hash as Hash160, Hash},
     secp256k1::{self, rand::rngs::OsRng, Secp256k1, SecretKey},
-    Amount, Network, OutPoint, PublicKey, ScriptBuf, Transaction, Txid,
+    Network, OutPoint, PublicKey, ScriptBuf, Transaction, Txid,
 };
 
 use crate::{
     protocol::{
-        common_messages::{MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage},
+        common_messages::{MakerToTakerMessage, TakerToMakerMessage},
         contract::{
             create_contract_redeemscript, create_multisig_redeemscript, create_senders_contract_tx,
             read_pubkeys_from_multisig_redeemscript, sign_contract_tx,
@@ -30,13 +30,10 @@ use crate::{
 };
 
 use super::{
-    api::{fund_all_or_nothing, Taker},
+    api::{fund_all_or_nothing, spent_inputs, Hop0Plan, Taker},
     error::{breach_or_wallet_error, TakerError},
     legacy_verification::fetch_tx_with_retry,
 };
-
-#[cfg(feature = "integration-test")]
-use super::api::TakerBehavior;
 
 /// Delay to allow the Maker to broadcast its funding transactions before we poll.
 const MAKER_BROADCAST_DELAY: Duration = Duration::from_secs(2);
@@ -50,12 +47,10 @@ impl Taker {
         hashlock_pubkeys: &[PublicKey],
         hashvalue: Hash160,
         locktime: u16,
-        send_amount: Amount,
+        hop0_plan: &Hop0Plan,
         swap_id: &str,
         network: Network,
-        manually_selected_outpoints: Option<Vec<OutPoint>>,
         feerate: f64,
-        #[cfg(feature = "integration-test")] behavior: TakerBehavior,
     ) -> Result<Vec<OutgoingSwapCoin>, TakerError> {
         let secp = Secp256k1::new();
         let mut swapcoins = Vec::new();
@@ -92,16 +87,7 @@ impl Taker {
             ));
         }
 
-        let funding_result = fund_all_or_nothing(
-            wallet,
-            send_amount,
-            &openswap_addresses,
-            feerate,
-            manually_selected_outpoints,
-            ProtocolVersion::Legacy,
-            #[cfg(feature = "integration-test")]
-            behavior,
-        )?;
+        let funding_result = fund_all_or_nothing(wallet, hop0_plan, &openswap_addresses, feerate)?;
 
         for (
             (funding_tx, &output_pos),
@@ -349,7 +335,7 @@ impl Taker {
                 let fail_second_broadcast = false;
 
                 {
-                    let wallet = self.write_wallet()?;
+                    let mut wallet = self.write_wallet()?;
                     for (index, swapcoin) in
                         self.swap_state()?.outgoing_swapcoins.iter().enumerate()
                     {
@@ -366,6 +352,11 @@ impl Taker {
                         wallet.send_tx(funding_tx).map_err(|e| {
                             TakerError::General(format!("Failed to broadcast funding tx: {:?}", e))
                         })?;
+                        // Its inputs are spent now, but the coin cache only learns
+                        // that at the next sync; until then a new swap must not
+                        // plan them. The lock is in memory only: once synced the
+                        // coins are gone anyway.
+                        wallet.lock_utxos(&spent_inputs(funding_tx));
                     }
                     wallet.save_to_disk()?;
                 }
@@ -1233,7 +1224,7 @@ impl Taker {
                             .find(|o| o.script_pubkey == spk)
                             .map(|o| o.value)
                     })
-                    .unwrap_or(Amount::ZERO)
+                    .unwrap_or(bitcoin::Amount::ZERO)
             };
             match self.behavior {
                 TakerBehavior::ExtraFundingTxEntry => {

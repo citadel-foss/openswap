@@ -254,16 +254,16 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     // dangling, it refunded it on top of its claim.
     let (expected_makers, expected_taker) = match ending {
         Ending::FaultyReturns | Ending::FirstMakerLate => (
-            vec![(14500543, 499700), (14501446, 498760)],
-            (14499846, 497857, 14997703),
+            vec![(14500708, 499535), (14501611, 498595)],
+            (14500000, 497692, 14997692),
         ),
         Ending::FaultyGone => (
-            vec![(14999311, 0), (14501446, 0)],
-            (14999554, 497857, 15497411),
+            vec![(14999311, 0), (14501611, 0)],
+            (14999543, 497692, 15497235),
         ),
         Ending::MiddleMakerDies => (
-            vec![(14999311, 0), (14502424, 497782)],
-            (14999554, 496879, 15496433),
+            vec![(14999311, 0), (14502589, 497617)],
+            (14999543, 496714, 15496257),
         ),
     };
 

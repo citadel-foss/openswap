@@ -228,7 +228,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
     // Verify taker balance
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14999706,
+        14999695,
         "Taker regular balance mismatch"
     );
     assert_eq!(
@@ -246,7 +246,7 @@ fn test_taproot_malice_maker_broadcast_contract() {
     // The taker recovered its own funding, so it only pays the recovery fees.
     assert_eq!(
         balance_diff.to_sat(),
-        294,
+        305,
         "Taker spendable balance change mismatch"
     );
 

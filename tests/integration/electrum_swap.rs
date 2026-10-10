@@ -26,20 +26,20 @@ struct ExpectedBalances {
 }
 
 const TAPROOT_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14_499_538,
-    taker_swap: 496_789,
-    taker_fee: 3_673,
-    maker_regular: [14_500_751, 14_502_170],
-    maker_swap: [499_664, 498_208],
+    taker_regular: 14_500_000,
+    taker_swap: 496_294,
+    taker_fee: 3_706,
+    maker_regular: [14_501_246, 14_502_665],
+    maker_swap: [499_169, 497_713],
     maker_earnings: [658, 621],
 };
 
 const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14_499_538,
-    taker_swap: 496_447,
-    taker_fee: 4_015,
-    maker_regular: [14_500_865, 14_502_398],
-    maker_swap: [499_550, 497_980],
+    taker_regular: 14_500_000,
+    taker_swap: 495_952,
+    taker_fee: 4_048,
+    maker_regular: [14_501_360, 14_502_893],
+    maker_swap: [499_055, 497_485],
     maker_earnings: [658, 621],
 };
 

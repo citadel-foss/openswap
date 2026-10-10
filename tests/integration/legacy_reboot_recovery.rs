@@ -175,12 +175,12 @@ fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
     // swept incoming funds rather than only its own refunded funding.
     assert_eq!(
         maker_balances.regular.to_sat(),
-        14502398,
+        14502893,
         "Restarted maker regular balance mismatch"
     );
     assert_eq!(
         maker_balances.swap.to_sat(),
-        497530,
+        497035,
         "Restarted maker swap balance mismatch"
     );
     assert_eq!(

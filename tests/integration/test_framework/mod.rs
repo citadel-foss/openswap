@@ -45,7 +45,7 @@ use openswap::{
     utill::{check_tor_status, get_ephemeral_address, setup_logger, NO_SHUTDOWN},
     wallet::{
         verify_deniability, AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRPC,
-        CoreRpcConfig, Electrum, ElectrumConfig,
+        CoreRpcConfig, Electrum, ElectrumConfig, TakerReport,
     },
 };
 
@@ -611,6 +611,27 @@ pub fn verify_maker_pre_swap_balances(makers: &[Arc<MakerServer>]) -> Vec<Amount
 /// Current chain tip height.
 pub fn chain_tip(bitcoind: &BitcoinD) -> u64 {
     bitcoind.client.get_block_count().unwrap()
+}
+
+/// A regular swap's taker report: the wallet sent exactly `send_amount`, the
+/// report adds up, and its fee is what the wallet actually lost. The last
+/// check keeps the second honest: `fee_paid` derives from the same sums.
+pub fn assert_taker_report_exact(report: &TakerReport, send_amount: Amount, wallet_cost: Amount) {
+    assert_eq!(
+        report.outgoing_amount,
+        send_amount.to_sat(),
+        "report must send exactly the send amount"
+    );
+    assert_eq!(
+        report.outgoing_amount - report.incoming_amount,
+        report.fee_paid,
+        "report must add up: outgoing - incoming == fee_paid"
+    );
+    assert_eq!(
+        report.fee_paid,
+        wallet_cost.to_sat(),
+        "report fee must equal the taker's balance change"
+    );
 }
 
 /// Fee and vsize of a transaction the node knows, derived from the chain:

@@ -85,7 +85,7 @@ fn test_standard_openswap() {
     let summary = taker
         .prepare_swap(swap_params)
         .expect("Failed to prepare openswap");
-    taker
+    let report = taker
         .start_swap(&summary.swap_id)
         .expect("OpenSwap should complete successfully");
 
@@ -117,12 +117,12 @@ fn test_standard_openswap() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499538,
+        14500000,
         "Taker regular balance mismatch"
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        496447,
+        495952,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -140,9 +140,10 @@ fn test_standard_openswap() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        4015,
+        4048,
         "Taker spendable balance change mismatch"
     );
+    assert_taker_report_exact(&report, Amount::from_sat(500000), balance_diff);
 
     // Verify maker balances
     for (i, (maker, original)) in makers.iter().zip(maker_spendable_balance).enumerate() {
@@ -164,8 +165,8 @@ fn test_standard_openswap() {
             balances.spendable,
         );
 
-        let expected_regular = [14500865u64, 14502398][i];
-        let expected_swap = [499550u64, 497980][i];
+        let expected_regular = [14501360u64, 14502893][i];
+        let expected_swap = [499055u64, 497485][i];
         assert_eq!(
             balances.regular.to_sat(),
             expected_regular,
@@ -202,17 +203,33 @@ fn test_standard_openswap() {
         );
     }
 
-    // Every swap tx must pay the negotiated 1 sat/vB: funding txs price their
-    // real vsize; sweeps pay the 150 vB legacy spend model they were built at.
+    // Every swap tx must pay the negotiated 1 sat/vB: maker funding txs price
+    // their real vsize; the taker's own pay the 165 vB one-input model out of
+    // the send amount, at or above their real vsize; sweeps pay the 150 vB
+    // legacy spend model they were built at.
     // A completed swap mines 9 funding txs (3 splits x 3 parties) and 9 sweeps.
     let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[9, 9]);
+    let mut taker_funding = 0;
     for txid in &depths[0] {
         let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
+        if fee == vsize as u64 {
+            continue;
+        }
         assert_eq!(
-            fee, vsize as u64,
-            "funding tx {txid} must pay exactly 1 sat/vB"
+            fee, 165,
+            "funding tx {txid} must pay 1 sat/vB or the 165 vB model"
         );
+        assert!(
+            vsize <= 165,
+            "taker funding tx {} exceeds its 165 vB model",
+            txid
+        );
+        taker_funding += 1;
     }
+    assert_eq!(
+        taker_funding, 3,
+        "only the taker's 3 funding txs pay the model"
+    );
     for txid in &depths[1] {
         let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
         assert_eq!(fee, 150, "sweep tx {txid} must pay the 150 vB model");
@@ -256,14 +273,14 @@ fn test_standard_openswap() {
 /// swap still completes.
 #[test]
 fn test_swap_with_custom_feerate() {
-    run_swap_with_custom_feerate(ProtocolVersion::Taproot, 3846, 112);
+    run_swap_with_custom_feerate(ProtocolVersion::Taproot, 3912, 112);
 }
 
 /// Same 3 sats/vB swap on Legacy: funding txs price their real vsize and the
 /// multisig contract sweeps pay the 150 vB model at the negotiated rate.
 #[test]
 fn test_legacy_swap_with_custom_feerate() {
-    run_swap_with_custom_feerate(ProtocolVersion::Legacy, 4302, 150);
+    run_swap_with_custom_feerate(ProtocolVersion::Legacy, 4368, 150);
 }
 
 fn run_swap_with_custom_feerate(
@@ -320,18 +337,33 @@ fn run_swap_with_custom_feerate(
         "a 3 sat/vB swap must cost clearly more than the floor rate"
     );
 
-    // Same per-kind check at the negotiated 3 sat/vB: funding txs price their
-    // real vsize; the sweeps pay the protocol's fixed vsize model.
+    // Same per-kind check at the negotiated 3 sat/vB: maker funding txs price
+    // their real vsize; the taker's own pay the 165 vB one-input model; the
+    // sweeps pay the protocol's fixed vsize model.
     // 1 maker x 2 splits: 4 funding txs (2 taker + 2 maker), 4 sweeps.
     let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[4, 4]);
+    let mut taker_funding = 0;
     for txid in &depths[0] {
         let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
+        if fee == vsize as u64 * 3 {
+            continue;
+        }
         assert_eq!(
             fee,
-            vsize as u64 * 3,
-            "funding tx {txid} must pay exactly 3 sat/vB"
+            165 * 3,
+            "funding tx {txid} must pay 3 sat/vB or the 165 vB model at 3"
         );
+        assert!(
+            vsize <= 165,
+            "taker funding tx {} exceeds its 165 vB model",
+            txid
+        );
+        taker_funding += 1;
     }
+    assert_eq!(
+        taker_funding, 2,
+        "only the taker's 2 funding txs pay the model"
+    );
     for txid in &depths[1] {
         let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
         assert_eq!(
@@ -442,7 +474,7 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     // Pinned from a real run: one maker, two splits, all at the 1 sat/vB floor.
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14998326,
+        14998304,
         "Taker spendable balance mismatch"
     );
     assert_eq!(taker_balances.contract, Amount::ZERO);

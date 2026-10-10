@@ -45,20 +45,20 @@ pub(crate) struct ExpectedBalances {
 }
 
 pub(crate) const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14499538,
-    taker_swap: 495997,
-    taker_spendable_diff: 4465,
-    maker_regular: [14500865, 14502398],
-    maker_swap: [499100, 497530],
+    taker_regular: 14500000,
+    taker_swap: 495502,
+    taker_spendable_diff: 4498,
+    maker_regular: [14501360, 14502893],
+    maker_swap: [498605, 497035],
     maker_spendable: [14999965, 14999928],
 };
 
 pub(crate) const TAPROOT_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14499538,
-    taker_swap: 496660,
-    taker_spendable_diff: 3802,
-    maker_regular: [14500751, 14502170],
-    maker_swap: [499535, 498079],
+    taker_regular: 14500000,
+    taker_swap: 496165,
+    taker_spendable_diff: 3835,
+    maker_regular: [14501246, 14502665],
+    maker_swap: [499040, 497584],
     maker_spendable: [15000286, 15000249],
 };
 
@@ -391,12 +391,12 @@ fn electrum_sweeps_after_breach() {
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        495_997,
+        495_502,
         "Swept swap balance mismatch"
     );
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14_499_538,
+        14_500_000,
         "Taker regular balance mismatch"
     );
 

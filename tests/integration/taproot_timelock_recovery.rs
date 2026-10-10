@@ -208,7 +208,7 @@ fn test_taproot_timelock_recovery() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14999118,
+        14999085,
         "Taker regular balance mismatch"
     );
     assert_eq!(
@@ -236,7 +236,7 @@ fn test_taproot_timelock_recovery() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        882,
+        915,
         "Taker spendable balance change mismatch"
     );
 

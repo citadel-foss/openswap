@@ -108,7 +108,7 @@ fn test_taproot_maker_abort3() {
 
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14996327,
+        14996294,
         "Taker spendable balance mismatch"
     );
     assert_eq!(

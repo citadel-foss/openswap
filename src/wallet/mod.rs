@@ -14,8 +14,8 @@ mod storage;
 pub(crate) mod swapcoin;
 
 pub(crate) use api::{
-    contract_and_timelock_vsize, infer_address_type, payment_settlement_budget_sats,
-    wait_for_tx_confirmation, SpendKind,
+    contract_and_timelock_vsize, infer_address_type, p2tr_min_non_dust_sats,
+    payment_settlement_budget_sats, wait_for_tx_confirmation, SpendKind,
 };
 pub use api::{
     min_contract_value_sats, Balances, RecoveryOutcome, SecretMnemonic, UTXOSpendInfo, Wallet,

@@ -10,7 +10,7 @@ use bitcoin::{
 
 use crate::{
     protocol::{
-        common_messages::{MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage},
+        common_messages::{MakerToTakerMessage, TakerToMakerMessage},
         contract2::{
             check_taproot_hashlock_has_pubkey, create_hashlock_script, create_timelock_script,
         },
@@ -24,13 +24,11 @@ use crate::{
 };
 
 use super::{
-    api::{fund_all_or_nothing, Taker},
+    api::{fund_all_or_nothing, spent_inputs, Hop0Plan, Taker},
     error::{breach_or_wallet_error, TakerError},
     swap_tracker::SwapPhase,
 };
 
-#[cfg(feature = "integration-test")]
-use super::api::TakerBehavior;
 #[cfg(feature = "integration-test")]
 use crate::protocol::common_messages::GetOffer;
 
@@ -66,13 +64,11 @@ impl Taker {
         hashlock_pubkeys: &[PublicKey],
         preimage: [u8; 32],
         locktime: u16,
-        send_amount: Amount,
+        hop0_plan: &Hop0Plan,
         swap_id: &str,
         network: Network,
-        manually_selected_outpoints: Option<Vec<OutPoint>>,
         reference_height: Option<u32>,
         feerate: f64,
-        #[cfg(feature = "integration-test")] behavior: TakerBehavior,
     ) -> Result<Vec<OutgoingSwapCoin>, TakerError> {
         let secp = Secp256k1::new();
         let mut swapcoins = Vec::new();
@@ -158,16 +154,7 @@ impl Taker {
             ));
         }
 
-        let funding_result = fund_all_or_nothing(
-            wallet,
-            send_amount,
-            &taproot_addresses,
-            feerate,
-            manually_selected_outpoints,
-            ProtocolVersion::Taproot,
-            #[cfg(feature = "integration-test")]
-            behavior,
-        )?;
+        let funding_result = fund_all_or_nothing(wallet, hop0_plan, &taproot_addresses, feerate)?;
 
         for (
             (contract_tx, &output_pos),
@@ -786,7 +773,7 @@ impl Taker {
     fn funding_broadcast(&mut self) -> Result<(), TakerError> {
         log::info!("Broadcasting contract transactions...");
 
-        let wallet = self.write_wallet()?;
+        let mut wallet = self.write_wallet()?;
 
         for swapcoin in &self.swap_state()?.outgoing_swapcoins {
             // Test hook: withhold the broadcast so the maker claims a funding
@@ -801,6 +788,10 @@ impl Taker {
             })?;
 
             log::info!("Broadcast contract tx: {}", txid);
+            // Its inputs are spent now, but the coin cache only learns that
+            // at the next sync; until then a new swap must not plan them. The
+            // lock is in memory only: once synced the coins are gone anyway.
+            wallet.lock_utxos(&spent_inputs(&swapcoin.contract_tx));
 
             let vout = swapcoin
                 .contract_tx

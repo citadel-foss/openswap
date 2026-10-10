@@ -12,7 +12,7 @@ use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 
 use crate::{
     utill::{fee_at_rate_sats, is_unusable_fee_rate},
-    wallet::{api::UTXOSpendInfo, FidelityError},
+    wallet::{api::UTXOSpendInfo, p2tr_min_non_dust_sats, FidelityError},
 };
 
 use super::{error::WalletError, AddressType, Blockchain, Wallet};
@@ -29,6 +29,19 @@ pub enum Destination {
         /// OP_RETURN data, used to create a OP_RETURN TxOut
         op_return_data: Option<Box<[u8]>>,
         /// Address type for change output (defaults to P2WPKH if None)
+        change_address_type: AddressType,
+    },
+}
+
+/// What a spend pays: a public [`Destination`], or a crate-only exact spend.
+pub(crate) enum SpendTarget {
+    Destination(Destination),
+    /// Spend exactly `spend` of the inputs: `outputs` are paid, the miner gets
+    /// `spend` less the outputs, and the rest of the inputs returns as change.
+    /// The fee must still meet the feerate on the tx's real size.
+    ExactSpend {
+        outputs: Vec<(Address, Amount)>,
+        spend: Amount,
         change_address_type: AddressType,
     },
 }
@@ -160,6 +173,16 @@ impl Wallet {
         destination: Destination,
         feerate: f64,
     ) -> Result<Transaction, WalletError> {
+        self.spend_coins_to(coins, SpendTarget::Destination(destination), feerate)
+    }
+
+    /// [`Self::spend_coins`] to any [`SpendTarget`], including an exact spend.
+    pub(crate) fn spend_coins_to(
+        &mut self,
+        coins: &[(ListUnspentResultEntry, UTXOSpendInfo)],
+        target: SpendTarget,
+        feerate: f64,
+    ) -> Result<Transaction, WalletError> {
         // Set the Anti-Fee-Snipping locktime
         let current_height = self.blockchain.get_block_count()?;
         let lock_time = LockTime::from_height(current_height as u32)?;
@@ -274,8 +297,9 @@ impl Wallet {
             )));
         }
 
-        match destination {
-            Destination::Sweep(addr) => {
+        let exact_spend = matches!(target, SpendTarget::ExactSpend { .. });
+        match target {
+            SpendTarget::Destination(Destination::Sweep(addr)) => {
                 // Send Max Amount case
                 let txout = TxOut {
                     script_pubkey: addr.script_pubkey(),
@@ -304,11 +328,11 @@ impl Wallet {
                 }
                 tx.output[0].value = total_input_value - fee;
             }
-            Destination::Multi {
+            SpendTarget::Destination(Destination::Multi {
                 outputs,
                 op_return_data,
                 change_address_type,
-            } => {
+            }) => {
                 let mut total_output_value = Amount::ZERO;
                 for (address, amount) in outputs {
                     total_output_value += amount;
@@ -387,6 +411,32 @@ impl Wallet {
                     );
                 }
             }
+            SpendTarget::ExactSpend {
+                outputs,
+                spend,
+                change_address_type,
+            } => {
+                let mut total_output_value = Amount::ZERO;
+                for (address, amount) in outputs {
+                    total_output_value =
+                        total_output_value.checked_add(amount).ok_or_else(|| {
+                            WalletError::General("output amount overflow".to_string())
+                        })?;
+                    tx.output.push(TxOut {
+                        script_pubkey: address.script_pubkey(),
+                        value: amount,
+                    });
+                }
+                let change = exact_spend_change(total_input_value, total_output_value, spend)?;
+                if change > Amount::ZERO {
+                    let internal_spk = self.get_next_internal_addresses(1, change_address_type)?[0]
+                        .script_pubkey();
+                    tx.output.push(TxOut {
+                        script_pubkey: internal_spk,
+                        value: change,
+                    });
+                }
+            }
         }
 
         self.sign_transaction(&mut tx, coins.iter().map(|(_, usi)| usi.clone()))?;
@@ -410,6 +460,10 @@ impl Wallet {
             actual_feerate
         );
 
+        if exact_spend {
+            check_exact_spend_fee(actual_fee, tx_size, feerate)?;
+        }
+
         if actual_feerate < feerate as f32 {
             log::warn!(
                 "Actual feerate {:.2} sat/vB is below requested {:.2} sat/vB",
@@ -419,5 +473,100 @@ impl Wallet {
         }
 
         Ok(tx)
+    }
+}
+
+/// The change an exact spend returns. Refuses outputs above `spend`, inputs
+/// below it, and dust change, which cannot go to the miner without spending
+/// more than `spend`. Dust is checked against P2TR, the highest-dust change
+/// type, so the caller can refuse before deriving a change address.
+fn exact_spend_change(
+    total_input: Amount,
+    total_output: Amount,
+    spend: Amount,
+) -> Result<Amount, WalletError> {
+    if total_output > spend {
+        return Err(WalletError::General(format!(
+            "outputs of {} sats exceed the exact spend of {} sats",
+            total_output.to_sat(),
+            spend.to_sat()
+        )));
+    }
+    let change = total_input
+        .checked_sub(spend)
+        .ok_or(WalletError::InsufficientFund {
+            available: total_input.to_sat(),
+            required: spend.to_sat(),
+        })?;
+    if change > Amount::ZERO && change.to_sat() < p2tr_min_non_dust_sats() {
+        return Err(WalletError::General(format!(
+            "exact spend leaves {} sats of change, below the dust limit",
+            change.to_sat()
+        )));
+    }
+    Ok(change)
+}
+
+/// An exact spend fixes its fee up front, so a fee model below the real size
+/// would underpay; refuse it rather than broadcast it.
+fn check_exact_spend_fee(fee: Amount, tx_size: u64, feerate: f64) -> Result<(), WalletError> {
+    let required = fee_at_rate_sats(tx_size, feerate).ok_or_else(|| {
+        WalletError::General(format!(
+            "fee at {feerate} sat/vB overflows for a {tx_size} vB transaction"
+        ))
+    })?;
+    if fee.to_sat() < required {
+        return Err(WalletError::General(format!(
+            "exact spend pays {} sats, below the {required} sats a {tx_size} vB tx needs at {feerate} sat/vB",
+            fee.to_sat()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const fn sats(n: u64) -> Amount {
+        Amount::from_sat(n)
+    }
+
+    #[test]
+    fn exact_spend_refuses_outputs_above_the_spend() {
+        let result = exact_spend_change(sats(10_000), sats(9_001), sats(9_000));
+        assert!(matches!(result, Err(WalletError::General(e)) if e.contains("exceed")));
+    }
+
+    #[test]
+    fn exact_spend_refuses_inputs_below_the_spend() {
+        let result = exact_spend_change(sats(8_999), sats(8_800), sats(9_000));
+        assert!(matches!(result, Err(WalletError::InsufficientFund { .. })));
+    }
+
+    #[test]
+    fn exact_spend_refuses_dust_change() {
+        // 329 sats is one below the P2TR dust limit.
+        let result = exact_spend_change(sats(9_329), sats(8_800), sats(9_000));
+        assert!(matches!(result, Err(WalletError::General(e)) if e.contains("dust")));
+    }
+
+    #[test]
+    fn exact_spend_with_no_change() {
+        let change = exact_spend_change(sats(9_000), sats(8_800), sats(9_000)).unwrap();
+        assert_eq!(change, Amount::ZERO);
+    }
+
+    #[test]
+    fn exact_spend_with_the_smallest_change() {
+        let change = exact_spend_change(sats(9_330), sats(8_800), sats(9_000)).unwrap();
+        assert_eq!(change, sats(330));
+    }
+
+    #[test]
+    fn exact_spend_refuses_a_fee_below_the_real_size() {
+        // A 154 vB tx at 2 sat/vB needs 308 sats.
+        assert!(check_exact_spend_fee(sats(307), 154, 2.0).is_err());
+        assert!(check_exact_spend_fee(sats(308), 154, 2.0).is_ok());
     }
 }

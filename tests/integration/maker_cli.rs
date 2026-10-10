@@ -120,12 +120,12 @@ fn test_maker_rpc_server() {
     );
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499538,
+        14500000,
         "Taker regular balance mismatch"
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        496789,
+        496294,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -139,12 +139,12 @@ fn test_maker_rpc_server() {
             .checked_sub(taker_balances.spendable)
             .unwrap()
             .to_sat(),
-        3673,
+        3706,
         "Taker spendable balance change mismatch"
     );
 
-    let expected_regular = [14500751u64, 14502170];
-    let expected_swap = [499664u64, 498208];
+    let expected_regular = [14501246u64, 14502665];
+    let expected_swap = [499169u64, 497713];
     let expected_fee = [658u64, 621];
     for (i, (maker, original)) in makers.iter().zip(&maker_spendable_balance).enumerate() {
         let balances = maker.wallet.read().unwrap().get_balances().unwrap();

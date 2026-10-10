@@ -157,12 +157,12 @@ fn test_legacy_hashlock_recovery() {
     // than the 4339 sats a clean legacy swap costs.
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499538,
+        14500000,
         "Taker regular balance mismatch"
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        495997,
+        495502,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -173,14 +173,14 @@ fn test_legacy_hashlock_recovery() {
     assert_eq!(taker_balances.fidelity, Amount::ZERO);
     assert_eq!(
         balance_diff.to_sat(),
-        4465,
+        4498,
         "Taker spendable balance change mismatch"
     );
 
     // Both makers still earn their full fee: maker 1 completed the swap and
     // maker 2 swept before dropping.
-    let expected_regular = [14500865u64, 14502398];
-    let expected_swap = [499550u64, 497980];
+    let expected_regular = [14501360u64, 14502893];
+    let expected_swap = [499055u64, 497485];
     let expected_fee = [658u64, 621];
     for (i, maker) in makers.iter().enumerate() {
         let mb = maker.wallet.read().unwrap().get_balances().unwrap();

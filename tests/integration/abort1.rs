@@ -9,6 +9,7 @@
 //! It can reclaim funds via broadcasting contract transactions and claiming via timelock.
 
 use bitcoin::Amount;
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
@@ -158,12 +159,12 @@ fn taker_abort_1_legacy_corerpc() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499538,
+        14500000,
         "Taker regular balance mismatch"
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        495997,
+        495502,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -186,7 +187,7 @@ fn taker_abort_1_legacy_corerpc() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        4465,
+        4498,
         "Taker spendable balance change mismatch"
     );
 
@@ -210,8 +211,8 @@ fn taker_abort_1_legacy_corerpc() {
             maker_balances.spendable,
         );
 
-        let expected_regular = [14500865u64, 14502398][i];
-        let expected_swap = [499100u64, 497530][i];
+        let expected_regular = [14501360u64, 14502893][i];
+        let expected_swap = [498605u64, 497035][i];
         assert_eq!(
             maker_balances.regular.to_sat(),
             expected_regular,
@@ -310,4 +311,63 @@ fn maker_recovers_swap_past_refund_deadline() {
     shutdown_makers(&makers, maker_threads);
 
     test_framework.finish(takers, block_generation_handle);
+}
+
+/// A dropped swap's funding inputs are spent, but the wallet's coin cache only
+/// learns that at the next sync. Until then, a new plan must skip them.
+fn new_plan_skips_inputs_of_a_dropped_swap(protocol: ProtocolVersion) {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            2,
+            vec![TakerBehavior::DropAfterFundsBroadcast],
+            vec![MakerBehavior::Normal, MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    // One split, so the dropped swap spends one coin and leaves two.
+    let amount = Amount::from_sat(500_000);
+    let params = SwapParams::new(protocol, amount, 2)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    let summary = taker.prepare_swap(params).expect("prepare");
+    taker
+        .start_swap(&summary.swap_id)
+        .expect_err("the taker drops after funding");
+
+    // Same planner, same pool: without the lock it picks the coin just spent.
+    let plan = taker
+        .get_wallet()
+        .read()
+        .unwrap()
+        .plan_funding(amount, 1, 1.0, u32::MAX, None, None, None, protocol)
+        .expect("two coins are still unspent");
+    for outpoint in plan.iter().flat_map(|split| &split.utxos) {
+        let unspent = bitcoind
+            .client
+            .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+            .unwrap();
+        assert!(
+            unspent.is_some(),
+            "planned {}, already spent by the dropped swap",
+            outpoint
+        );
+    }
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+#[test]
+fn legacy_new_plan_skips_inputs_of_a_dropped_swap() {
+    new_plan_skips_inputs_of_a_dropped_swap(ProtocolVersion::Legacy);
+}
+
+#[test]
+fn taproot_new_plan_skips_inputs_of_a_dropped_swap() {
+    new_plan_skips_inputs_of_a_dropped_swap(ProtocolVersion::Taproot);
 }

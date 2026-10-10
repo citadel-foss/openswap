@@ -165,12 +165,12 @@ fn maker_abort3_case3() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499538,
+        14500000,
         "Taker regular balance mismatch"
     );
     assert_eq!(
         taker_balances.swap.to_sat(),
-        495997,
+        495502,
         "Taker swap balance mismatch"
     );
     assert_eq!(
@@ -193,7 +193,7 @@ fn maker_abort3_case3() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        4465,
+        4498,
         "Taker spendable balance change mismatch"
     );
 
@@ -206,8 +206,8 @@ fn maker_abort3_case3() {
             .sync_and_save(&openswap::utill::NO_SHUTDOWN)
             .unwrap();
         let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
-        let expected_regular = [14500865u64, 14502398][i];
-        let expected_swap = [499550u64, 497530][i];
+        let expected_regular = [14501360u64, 14502893][i];
+        let expected_swap = [499055u64, 497035][i];
         assert_eq!(
             maker_balances.regular.to_sat(),
             expected_regular,

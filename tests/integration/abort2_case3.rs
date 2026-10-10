@@ -164,7 +164,7 @@ fn maker_abort2_case3() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14998662,
+        14998629,
         "Taker regular balance mismatch"
     );
     assert_eq!(
@@ -192,7 +192,7 @@ fn maker_abort2_case3() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        1338,
+        1371,
         "Taker spendable balance change mismatch"
     );
 

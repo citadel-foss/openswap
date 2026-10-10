@@ -42,16 +42,16 @@ fn test_taproot_taker_abort3() {
         2,
         [14998875, 14999757],
         [882, 0],
-        14999118,
-        882,
+        14999085,
+        915,
     );
 }
 
 /// Test: Taker drops after full setup, before the private-key handover.
 ///
 /// Recovery starts from the complete outgoing + incoming coin set: both
-/// makers timelock-refund whole, and the taker absorbs the swap amount plus
-/// every funding fee.
+/// makers timelock-refund whole, and the taker absorbs the swap amount, its
+/// own funding fees included.
 #[test]
 fn test_taproot_taker_abort_after_full_setup() {
     run_taproot_taker_abort(
@@ -60,8 +60,8 @@ fn test_taproot_taker_abort_after_full_setup() {
         2,
         [14998875, 14998875],
         [882, 882],
-        14499538,
-        500462,
+        14500000,
+        500000,
     );
 }
 

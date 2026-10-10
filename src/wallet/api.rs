@@ -317,12 +317,19 @@ pub(crate) fn payment_settlement_budget_sats(
     }
 }
 
+/// Smallest P2TR output value that is not dust: P2TR is the wallet's
+/// highest-dust script and its change type.
+pub(crate) fn p2tr_min_non_dust_sats() -> u64 {
+    let p2tr = ScriptBuf::new_witness_program(
+        &WitnessProgram::new(WitnessVersion::V1, &[0; 32]).expect("a 32-byte v1 program is valid"),
+    );
+    p2tr.minimal_non_dust().to_sat()
+}
+
 /// Smallest contract worth creating: it pays the costliest spend path at `feerate`
 /// and still leaves a P2TR output, the wallet's highest-dust script, above dust.
 pub fn min_contract_value_sats(protocol: ProtocolVersion, feerate: f64) -> Option<u64> {
-    let p2tr =
-        ScriptBuf::new_witness_program(&WitnessProgram::new(WitnessVersion::V1, &[0; 32]).ok()?);
-    payment_settlement_budget_sats(protocol, feerate)?.checked_add(p2tr.minimal_non_dust().to_sat())
+    payment_settlement_budget_sats(protocol, feerate)?.checked_add(p2tr_min_non_dust_sats())
 }
 
 /// Returns the estimated vsize (virtual bytes) for cooperative keypath, preimage (hashlock),
