@@ -6,14 +6,14 @@ use std::{
 use bip39::rand;
 use bitcoin::{absolute::LockTime, Address, Amount};
 use bitcoind::{
-    bitcoincore_rpc::{self, Auth},
+    bitcoincore_rpc::{self, Auth, RpcApi},
     BitcoinD,
 };
 use electrsd::ElectrsD;
 
 use openswap::wallet::{
-    AddressType, AnyBlockchain, BackendConfig, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
-    Wallet, WalletBackup,
+    AddressType, AnyBlockchain, BackendConfig, CoreRPC, CoreRpcConfig, Destination, Electrum,
+    ElectrumConfig, Wallet, WalletBackup,
 };
 
 use openswap::{
@@ -204,6 +204,78 @@ fn encwallet_encbackup_encrestore() {
     )
     .unwrap();
     assert_wallet_file_encrypted(&nameless_dir.join("original-wallet"), "integration-test");
+
+    cleanup(&mut bitcoind, &root_dir);
+}
+
+/// Every used address, receive and change, both types, is spent to empty, so the
+/// restore finds no coins. It must still resume past them from their history.
+#[test]
+fn core_restore_skips_emptied_receive_addresses() {
+    let (original_wallet, rpc_config, backup_file, mut bitcoind, restored_wallet_file, root_dir) =
+        setup("core_restore_skips_emptied_receive_addresses".to_string());
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+
+    let mut wallet = Wallet::init(
+        &original_wallet,
+        AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap()),
+        km.clone(),
+    )
+    .unwrap();
+    wallet.backup(&backup_file, km.clone()).unwrap();
+
+    for address_type in [
+        AddressType::P2WPKH,
+        AddressType::P2WPKH,
+        AddressType::P2TR,
+        AddressType::P2TR,
+    ] {
+        let addr = wallet.get_next_external_address(address_type).unwrap();
+        send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
+    }
+    let change = wallet
+        .get_next_internal_addresses(1, AddressType::P2TR)
+        .unwrap()
+        .remove(0);
+    send_and_mine(&mut bitcoind, &change, 0.05, 1).unwrap();
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+
+    let coins = wallet.list_descriptor_utxo_spend_info();
+    assert_eq!(coins.len(), 5);
+    let sink = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+    let tx = wallet
+        .spend_from_wallet(MIN_RELAY_FEE_RATE, Destination::Sweep(sink), &coins)
+        .unwrap();
+    bitcoind.client.send_raw_transaction(&tx).unwrap();
+    generate_blocks(&bitcoind, 1);
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    assert!(wallet.list_descriptor_utxo_spend_info().is_empty());
+    assert_eq!(*wallet.get_external_index(), 4);
+
+    let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
+        &backup_file,
+        Some("integration-test".into()),
+    )
+    .unwrap();
+    let mut restored = Wallet::restore(
+        &backup,
+        &restored_wallet_file,
+        &BackendConfig::CoreRpc(rpc_config.clone()),
+        km,
+    )
+    .unwrap();
+
+    assert_eq!(*restored.get_external_index(), 4);
+    let next_change = |w: &mut Wallet| {
+        w.get_next_internal_addresses(1, AddressType::P2TR)
+            .unwrap()
+            .remove(0)
+    };
+    assert_eq!(next_change(&mut restored), next_change(&mut wallet));
 
     cleanup(&mut bitcoind, &root_dir);
 }

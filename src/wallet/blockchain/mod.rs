@@ -327,7 +327,7 @@ pub trait Blockchain: Send + Sync + 'static {
     }
     /// True when the backend's history for `script` is non-empty, spent outputs
     /// included. Restore probing uses this to bridge runs of emptied addresses;
-    /// the default `false` keeps Bitcoin Core on the UTXO-based path.
+    /// the default `false` leaves a backend without an override on the UTXO-based path.
     fn script_has_history(&self, _script: &Script) -> Result<bool, WalletError> {
         Ok(false)
     }

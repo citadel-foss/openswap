@@ -2426,7 +2426,7 @@ impl Wallet {
         // A backup carries no hand-out counters, and an emptied address leaves no
         // UTXO to find, so the loop above stops at the first spent-out run. Script
         // history still remembers those addresses, so probe forward on it.
-        if self.restore_scan && self.blockchain.is_electrum() {
+        if self.restore_scan {
             let secp = crate::utill::global_secp();
             let mut accounts = Vec::with_capacity(2);
             for address_type in [AddressType::P2WPKH, AddressType::P2TR] {

@@ -3,13 +3,13 @@
 
 use std::{
     net::{TcpStream, ToSocketAddrs},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
 use bitcoin::{
-    address::NetworkUnchecked, block::Header, Address, Block, BlockHash, OutPoint, Script,
-    Transaction, Txid,
+    address::NetworkUnchecked, block::Header, Address, Amount, Block, BlockHash, Network, OutPoint,
+    Script, Transaction, Txid,
 };
 use bitcoind::bitcoincore_rpc::{
     json::{
@@ -165,6 +165,8 @@ pub struct CoreRPC {
     config: CoreRpcConfig,
     /// `rawtx`/`rawblock` subscriber, established lazily by the watchtower.
     zmq: ZmqSubscriber,
+    /// Node's chain, fetched on first need to encode addresses for RPCs.
+    network: OnceLock<Network>,
 }
 
 #[derive(Deserialize)]
@@ -193,7 +195,16 @@ impl CoreRPC {
             rpc,
             config: config.clone(),
             zmq: ZmqSubscriber::new(config.zmq_addr.clone()),
+            network: OnceLock::new(),
         })
+    }
+
+    fn network(&self) -> Result<Network, WalletError> {
+        if let Some(network) = self.network.get() {
+            return Ok(*network);
+        }
+        let network = self.rpc.get_blockchain_info()?.chain;
+        Ok(*self.network.get_or_init(|| network))
     }
 
     /// Open a fresh, independent Bitcoin Core RPC connection with the same config.
@@ -422,6 +433,20 @@ impl Blockchain for CoreRPC {
         maxconf: Option<usize>,
     ) -> Result<Vec<ListUnspentResultEntry>, WalletError> {
         Ok(self.rpc.list_unspent(minconf, maxconf, None, None, None)?)
+    }
+
+    fn script_has_history(&self, script: &Script) -> Result<bool, WalletError> {
+        let Ok(address) = Address::from_script(script, self.network()?) else {
+            return Ok(false);
+        };
+        // Counts received amounts even after they are spent, so an emptied
+        // address still shows up. Requires the address's descriptor imported.
+        match self.rpc.get_received_by_address(&address, Some(0)) {
+            Ok(amount) => Ok(amount > Amount::ZERO),
+            // -4 (RPC_WALLET_ERROR): "Address not found in wallet".
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -4 => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn send_raw_transaction(&self, tx: &Transaction) -> Result<Txid, WalletError> {
