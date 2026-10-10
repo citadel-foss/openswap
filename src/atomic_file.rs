@@ -67,5 +67,30 @@ pub(crate) fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> io:
         temporary_file.sync_all()?;
     }
 
-    std::fs::rename(&temporary_path, path)
+    std::fs::rename(&temporary_path, path)?;
+
+    // The rename is atomic for anyone reading the file, but it is only durable
+    // once the directory entry itself reaches disk. Without this, a power loss
+    // or kernel panic can leave the previous file in place and lose a write that
+    // already returned `Ok`, which for the offerbook means losing the bans it
+    // just recorded. Writing the contents with `sync_all` above does not cover
+    // the entry that points at them.
+    //
+    // Unix only: Windows cannot open a directory as a file, and needs a handle
+    // opened with backup semantics instead. Windows support is not in the tree
+    // yet, so this is left for whoever adds it.
+    #[cfg(unix)]
+    {
+        // `parent` is `Some("")` for a bare file name, which cannot be opened,
+        // so fall back to the working directory the name is relative to.
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let directory = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        File::open(directory)?.sync_all()?;
+    }
+
+    Ok(())
 }
