@@ -637,10 +637,19 @@ impl Taker {
         let (outpoint, actual_value) =
             self.fund_htlc_output(&htlc, funding_value, params.min_confirmations, &swap_id)?;
 
+        #[cfg(feature = "integration-test")]
+        let announced_value = if self.behavior == super::api::TakerBehavior::ForgeSwapInFundedValue
+        {
+            actual_value + Amount::from_sat(1)
+        } else {
+            actual_value
+        };
+        #[cfg(not(feature = "integration-test"))]
+        let announced_value = actual_value;
         conn.send(LightningTakerMessage::SwapInFunded(LnHtlcFunded {
             swap_id: swap_id.clone(),
             outpoint,
-            value: actual_value,
+            value: announced_value,
         }))?;
 
         // The maker verifies and pays our hold invoice; claim it with the

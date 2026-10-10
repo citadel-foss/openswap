@@ -348,6 +348,89 @@ fn lightning_swap_in_refuses_blocklisted_funding() {
     block_generation_handle.join().unwrap();
 }
 
+/// A maker must refuse a swap-in whose funding message announces a value the
+/// funded output does not hold, and must forget the swap when it does.
+#[test]
+fn lightning_swap_in_refuses_announced_value_mismatch() {
+    let (maker_ln, taker_ln) = ready_channel_pair();
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::ForgeSwapInFundedValue],
+            vec![MakerBehavior::Normal],
+            vec![maker_ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    taker.set_lightning_backend(taker_ln.clone() as Arc<dyn LightningBackend>);
+
+    fund_taker(
+        taker,
+        bitcoind,
+        3,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2WPKH,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2WPKH,
+    );
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+
+    // Maker and taker share the process logger, so the maker's lines land in
+    // the taker's debug.log. Only lines past this offset belong to the swap.
+    let log_path = test_framework.taker_log_path();
+    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+
+    // The funding itself is honest: only the announced value is one sat off,
+    // so the value check is the one that refuses.
+    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let result = taker.lightning_swap_in(LnSwapParams {
+        amount: Amount::from_sat(50_000),
+        maker_address: Some(maker_address),
+        locktime: None,
+        min_confirmations: 1,
+    });
+    assert!(
+        result.is_err(),
+        "the maker completed a swap-in with a misannounced value: {:?}",
+        result
+    );
+    assert_eq!(
+        maker_ln.last_pay_cltv_bound(),
+        None,
+        "the maker paid the invoice of a refused swap-in"
+    );
+    assert!(
+        makers[0].ln_swaps.lock().unwrap().is_empty(),
+        "the refused swap-in still holds a maker swap slot"
+    );
+    // The refusal came minutes before the taker gave up waiting, so its log
+    // line is already written.
+    let contents = std::fs::read_to_string(&log_path).unwrap();
+    let refusals = contents
+        .get(log_offset as usize..)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(": refused: "))
+        .collect::<Vec<_>>();
+    assert!(
+        refusals.len() == 1 && refusals[0].ends_with(": refused: announced value mismatch"),
+        "the maker must refuse once, for the announced value: {:?}",
+        refusals
+    );
+
+    drop(takers);
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
 /// With screening on, a taker must refuse to claim a swap-out HTLC whose
 /// funding spends from a listed address, and keep nothing that could claim
 /// it later.

@@ -3913,6 +3913,9 @@ pub enum TakerBehavior {
     /// Skew one funding split a sat below the contract floor while keeping the
     /// count and total exact (maker per-contract floor rejection tests).
     SkewSplitBelowFloor,
+    /// Announce a swap-in HTLC value one sat above the funded output, so the
+    /// maker must refuse the funding message (Lightning swap-in mismatch test).
+    ForgeSwapInFundedValue,
 }
 
 #[cfg(test)]
