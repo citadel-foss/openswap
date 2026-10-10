@@ -51,12 +51,13 @@ A maker is only ever shown its own incoming funding.
 | Taproot | Maker | its incoming contract | contract data, after confirmation, before constructing its own funding | yes | reserved UTXOs released |
 | Taproot | Taker | each maker's contract | contract data returned by that maker | yes | timelock recovery |
 | Lightning swap-in | Maker | the taker's HTLC funding | `SwapInFunded`, after confirmation, before paying the invoice | yes | nothing; the taker refunds its HTLC |
-| Lightning swap-out | Taker | the maker's HTLC funding | `SwapOutFunded`, after confirmation, before claiming | yes | Lightning payment stays held until the maker cancels it |
+| Lightning swap-out | Taker | the maker's HTLC funding | `SwapOutFunded`, after confirmation, before claiming | yes | Lightning payment stays held until it expires or the maker cancels it |
 | Lightning routed | Taker | the second maker's HTLC funding | `SwapOutFunded`, after confirmation, before claiming | yes | first-hop timelock refund |
 
 A maker screens before broadcasting its own funding transaction, so refusal releases its reserved UTXOs and costs nothing further.
-A taker has already funded the swap when a maker's funding transaction becomes visible, so refusal means abandoning it and reclaiming its coins through timelock recovery.
-The taker always funds first, so this asymmetry follows from the protocol rather than from the blocklist.
+In Legacy, Taproot and routed swaps the taker has already funded on-chain when a maker's funding transaction becomes visible, so refusal means abandoning the swap and reclaiming its coins through timelock recovery.
+In a direct Lightning swap-out the taker has only paid a hold invoice and has no on-chain output to refund, so refusal leaves that payment held until it expires or the maker cancels it.
+The taker always commits first, so this asymmetry follows from the protocol rather than from the blocklist.
 
 Refusing an intermediate hop aborts the whole route.
 Every hop funded before that point waits out its timelock, the same cost as refusing the final maker.

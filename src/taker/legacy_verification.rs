@@ -421,10 +421,6 @@ impl Taker {
         let expected_hashvalue = Hash160::hash(&self.swap_state()?.preimage);
 
         for (i, info) in senders_info.iter().enumerate() {
-            // Every maker's funding reaches the taker before the next hop sees
-            // it, so screen each hop, not only the final maker's.
-            self.screen_funding_tx(&info.funding_tx)?;
-
             // Validate 2-of-2 multisig format
             check_reedemscript_is_multisig(&info.multisig_redeemscript).map_err(|e| {
                 TakerError::General(format!(
@@ -579,6 +575,14 @@ impl Taker {
                      match the negotiated hop total {expected}"
                 )));
             }
+        }
+
+        // Every maker's funding reaches the taker before the next hop sees it,
+        // so screen each hop, not only the final maker's. Screening queries the
+        // backend once per input, so it runs after the checks above have
+        // rejected any malformed contract.
+        for info in senders_info {
+            self.screen_funding_tx(&info.funding_tx)?;
         }
 
         log::info!(

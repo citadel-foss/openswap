@@ -189,10 +189,6 @@ impl Taker {
         // Each contract has its own timelock script, internal key and tap tweak,
         // so verify the timelock template, locktime value and P2TR output per contract.
         for (i, tx) in contract.contract_txs.iter().enumerate() {
-            // Every maker's contract reaches the taker before the next hop sees
-            // it, so screen each hop, not only the final maker's.
-            self.screen_funding_tx(tx)?;
-
             let timelock_script = &contract.timelock_scripts[i];
             verify_internal_key(
                 contract.internal_keys[i],
@@ -403,6 +399,14 @@ impl Taker {
                      match the negotiated hop total {expected}"
                 )));
             }
+        }
+
+        // Every maker's contract reaches the taker before the next hop sees it,
+        // so screen each hop, not only the final maker's. Screening queries the
+        // backend once per input, so it runs after the checks above have
+        // rejected any malformed contract.
+        for tx in &contract.contract_txs {
+            self.screen_funding_tx(tx)?;
         }
 
         // Taproot's contract txs are the maker's funding txs, already broadcast
