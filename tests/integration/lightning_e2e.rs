@@ -297,6 +297,12 @@ fn lightning_swap_in_refuses_blocklisted_funding() {
         None,
         "the maker paid the invoice of a refused swap-in"
     );
+    // The maker forgets the swap before it replies. The watchdog only looks
+    // at swaps idle for minutes, so a record left here would still be held.
+    assert!(
+        makers[0].ln_swaps.lock().unwrap().is_empty(),
+        "the refused swap-in still holds a maker swap slot"
+    );
 
     // The maker never paid, so it never learned the preimage: only the
     // taker's refund branch can resolve the HTLC.
