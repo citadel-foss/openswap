@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{BufWriter, Write},
     path::Path,
 };
 
@@ -388,9 +387,7 @@ impl WalletStore {
         };
         store.master_key.seal(store_enc_material)?;
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        std::fs::create_dir_all(crate::atomic_file::parent_dir(path))?;
         // Exclusive create: fails with `AlreadyExists` instead of truncating a
         // wallet that appeared since the caller checked the path.
         File::create_new(path)?;
@@ -411,26 +408,13 @@ impl WalletStore {
         path: &Path,
         store_enc_material: &KeyMaterial,
     ) -> Result<(), WalletError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let encrypted = encrypt_struct(self, store_enc_material)
             .map_err(|e| WalletError::General(format!("wallet store encryption failed: {e:?}")))?;
-
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-        let mut writer = BufWriter::new(&mut tmp);
-        serde_cbor::to_writer(&mut writer, &encrypted)?;
-        // `Drop for BufWriter` discards flush errors, so flush explicitly:
-        // a swallowed error would rename a truncated wallet over the good one.
-        writer.flush()?;
-        drop(writer);
-        tmp.as_file().sync_all()?;
-        tmp.persist(path)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        // Without this the rename itself may not survive a crash.
-        File::open(parent)?.sync_all()?;
+        let bytes = serde_cbor::to_vec(&encrypted)?;
+        // Flush and replace through the shared helper. Opening the parent
+        // directory to sync it fails on Windows, so durability is platform-specific
+        // inside `write_bytes_atomically`.
+        crate::atomic_file::write_bytes_atomically(path, &bytes)?;
         Ok(())
     }
 

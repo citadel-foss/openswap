@@ -3,6 +3,9 @@ name = "openswap"
 version = "0.2.3"
 authors = ["Developers at Citadel FOSS"]
 edition = "2018"
+# Keep the Unix-only electrs download feature off the Windows build. The
+# edition 2018 resolver would otherwise enable it for every target.
+resolver = "2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -50,7 +53,15 @@ lightning-invoice = { version = "0.32", features = ["std"], optional = true }
 minreq = { version = "2.12.0", features = ["https"] }
 flate2 = {version = "1.0.35"}
 tar = {version = "0.4.43"}
+zip = "2"
+
+# `electrs_0_9_11` downloads a Unix binary in the build script, which does not
+# compile on Windows. Windows tests supply `ELECTRS_EXEC` instead.
+[target.'cfg(unix)'.dev-dependencies]
 electrsd = { version = "0.28", features = ["electrs_0_9_11"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+electrsd = { version = "0.28" }
 
 #Empty default feature set, (helpful to generalise in github actions)
 [features]
@@ -63,6 +74,11 @@ lightning = ["dep:ldk-server-client", "dep:tokio", "dep:lightning-invoice"]
 
 [package.metadata.cargo-machete]
 ignored = ["rustls"]
+
+# electrsd 0.28.0 probes its Electrum wildcard bind address as a destination;
+# Windows rejects connections to 0.0.0.0. The local patch uses loopback.
+[patch.crates-io]
+electrsd = { path = "vendor/electrsd" }
 
 # Lightning examples only build with the `lightning` feature enabled.
 [[example]]

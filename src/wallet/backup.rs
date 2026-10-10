@@ -1,4 +1,4 @@
-use std::{env, ffi::OsStr, fs, io::Write, path::PathBuf};
+use std::{env, ffi::OsStr, path::PathBuf};
 
 use crate::{
     security::{encrypt_struct, load_sensitive_struct, KeyMaterial, SecurityError, SerdeJson},
@@ -63,13 +63,7 @@ impl Wallet {
         let backup_file_content = serde_json::to_string_pretty(&encrypted)?;
         // Atomic replace: never truncate an existing backup before the new
         // one is durable on disk.
-        let parent = backup_path.parent().unwrap_or_else(|| Path::new("."));
-        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-        tmp.write_all(backup_file_content.as_bytes())?;
-        tmp.as_file().sync_all()?;
-        tmp.persist(&backup_path)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        fs::File::open(parent)?.sync_all()?;
+        crate::atomic_file::write_bytes_atomically(&backup_path, backup_file_content.as_bytes())?;
 
         Ok(())
     }

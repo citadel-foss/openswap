@@ -76,6 +76,19 @@ Extensive functional testing simulates various protocol edge cases:
 cargo test --features=integration-test -- --nocapture
 ```
 
+Windows CI retains the Windows build check and runs only the standard Legacy
+and Taproot swap scenarios, each against both Bitcoind and Electrum. This keeps
+representative backend coverage without running the full, slower integration
+suite on Windows; the full suite remains in Linux CI.
+
+For the same focused Windows tests locally, run
+`./scripts/test-integration-windows.ps1` in PowerShell. The helper builds
+libzmq without its unused IPC transport, which avoids a crash in the bundled
+Windows libzmq 4.3.4 poller. It keeps Cargo offline and requires local Bitcoin
+Core files plus `ELECTRS_EXEC` pointing to a local electrs executable. Pass
+`-Filter '<test-name>'` to run a filtered integration test or `-FullSuite` to
+opt into the full suite.
+
 The [Test Framework](./tests/integration/test_framework/mod.rs) spawns toy marketplaces in Bitcoin regtest to test swap scenarios. Each test in [tests/integration](./tests/integration/) covers different edge cases. Start with [standard_swap](./tests/integration/standard_swap.rs) to understand programmatic simulation.
 
 ## Contributing

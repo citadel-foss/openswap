@@ -19,7 +19,6 @@ use std::{
     io::{BufReader, Read},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
         Arc, Mutex,
@@ -27,6 +26,9 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+#[cfg(not(windows))]
+use std::process::{Child, Command, Stdio};
 
 use flate2::read::GzDecoder;
 use tar::Archive;
@@ -104,17 +106,81 @@ fn read_tarball_from_file(path: &str) -> Vec<u8> {
     buffer
 }
 
-fn unpack_tarball(tarball_bytes: &[u8], destination: &Path) {
+fn is_bitcoind_executable(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("bitcoind") | Some("bitcoind.exe")
+    )
+}
+
+/// Copy the bitcoind binary out of a `.tar.gz` release into `temporary_exe`.
+fn unpack_tarball(tarball_bytes: &[u8], temporary_exe: &Path) {
     let decoder = GzDecoder::new(tarball_bytes);
     let mut archive = Archive::new(decoder);
     for mut entry in archive.entries().unwrap().flatten() {
-        if let Ok(file) = entry.path() {
-            if file.ends_with("bitcoind") {
-                entry.unpack_in(destination).unwrap();
-            }
+        let is_bitcoind = entry
+            .path()
+            .ok()
+            .is_some_and(|file| is_bitcoind_executable(file.as_ref()));
+        if !is_bitcoind {
+            continue;
         }
+        let mut output = File::create(temporary_exe).unwrap();
+        std::io::copy(&mut entry, &mut output).unwrap();
+        return;
     }
+    panic!("bitcoind executable not found in tarball");
 }
+
+/// Copy the bitcoind binary out of a Windows `.zip` release into `temporary_exe`.
+fn unpack_zip(zip_bytes: &[u8], temporary_exe: &Path) {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).unwrap();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        let Some(name) = entry.enclosed_name() else {
+            continue;
+        };
+        if !is_bitcoind_executable(&name) {
+            continue;
+        }
+        let mut output = File::create(temporary_exe).unwrap();
+        std::io::copy(&mut entry, &mut output).unwrap();
+        return;
+    }
+    panic!("bitcoind executable not found in zip archive");
+}
+
+/// Install `bitcoind` only after the bytes are fully on disk.
+///
+/// A failed copy leaves `bitcoind.tmp` and not the final executable, so the
+/// next run retries extraction instead of launching a partial binary.
+fn install_bitcoind(archive_bytes: &[u8], bitcoind_path: &Path) {
+    if let Some(parent) = bitcoind_path.parent() {
+        create_dir_all(parent).unwrap();
+    }
+    let temporary_path = bitcoind_path.with_extension("tmp");
+    if archive_bytes.starts_with(b"PK") {
+        unpack_zip(archive_bytes, &temporary_path);
+    } else {
+        unpack_tarball(archive_bytes, &temporary_path);
+    }
+    std::fs::rename(&temporary_path, bitcoind_path).unwrap();
+    // `File::create` does not keep the archive mode. Without this, Linux
+    // refuses to spawn the extracted bitcoind (the old `unpack_in` path kept
+    // the tarball's 0755 bit). Windows executes by `.exe` extension.
+    ensure_bitcoind_executable(bitcoind_path);
+}
+
+#[cfg(unix)]
+fn ensure_bitcoind_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(permissions.mode() | 0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(not(unix))]
+fn ensure_bitcoind_executable(_path: &Path) {}
 
 fn get_bitcoind_filename(os: &str, arch: &str) -> String {
     match (os, arch) {
@@ -122,6 +188,7 @@ fn get_bitcoind_filename(os: &str, arch: &str) -> String {
         ("macos", "x86_64") => format!("bitcoin-{BITCOIN_VERSION}-x86_64-apple-darwin.tar.gz"),
         ("linux", "x86_64") => format!("bitcoin-{BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz"),
         ("linux", "aarch64") => format!("bitcoin-{BITCOIN_VERSION}-aarch64-linux-gnu.tar.gz"),
+        ("windows", _) => format!("bitcoin-{BITCOIN_VERSION}-win64.zip"),
         _ => format!("bitcoin-{BITCOIN_VERSION}-x86_64-apple-darwin-unsigned.zip"),
     }
 }
@@ -138,6 +205,15 @@ pub(crate) fn init_bitcoind(
                                   // electrs 0.9.11 (used in the electrum-only test) still expects a string and falls over.
                                   // The deprecation flag restores the legacy single-string format.
     conf.args.push("-deprecatedrpc=warnings");
+    // P2P is needed only for electrs to connect to the regtest node. These
+    // tests run against local daemons, so keep the listener loopback-only and
+    // disable peer/address discovery and automatic port mapping.
+    conf.args.push("-bind=127.0.0.1");
+    conf.args.push("-discover=0");
+    conf.args.push("-dnsseed=0");
+    conf.args.push("-fixedseeds=0");
+    conf.args.push("-listenonion=0");
+    conf.args.push("-upnp=0");
     let raw_tx = format!("-zmqpubrawtx={}", zmq_addr);
     conf.args.push(&raw_tx);
     let block_hash = format!("-zmqpubrawblock={}", zmq_addr);
@@ -160,8 +236,16 @@ pub(crate) fn init_bitcoind(
     let bitcoin_exe_home = bitcoin_bin_dir
         .join(format!("bitcoin-{BITCOIN_VERSION}"))
         .join("bin");
+    let bitcoind_name = if cfg!(windows) {
+        "bitcoind.exe"
+    } else {
+        "bitcoind"
+    };
+    let bitcoind_path = bitcoin_exe_home.join(bitcoind_name);
 
-    if !bitcoin_exe_home.exists() {
+    // The directory can exist from a failed extract. Only a complete executable
+    // is reused; otherwise extraction runs again.
+    if !bitcoind_path.exists() {
         let tarball_bytes = match env::var("BITCOIND_TARBALL_FILE") {
             Ok(path) => read_tarball_from_file(&path),
             Err(_) => {
@@ -172,24 +256,23 @@ pub(crate) fn init_bitcoind(
             }
         };
 
-        if let Some(parent) = bitcoin_exe_home.parent() {
-            create_dir_all(parent).unwrap();
-        }
-
-        unpack_tarball(&tarball_bytes, &bitcoin_bin_dir);
+        install_bitcoind(&tarball_bytes, &bitcoind_path);
 
         if os == "macos" {
-            let bitcoind_binary = bitcoin_exe_home.join("bitcoind");
             std::process::Command::new("codesign")
                 .arg("--sign")
                 .arg("-")
-                .arg(&bitcoind_binary)
+                .arg(&bitcoind_path)
                 .output()
                 .expect("Failed to sign bitcoind binary");
         }
+    } else {
+        // A binary extracted by an older copy may already be on disk without
+        // the execute bit. Re-applying it is a no-op on Windows.
+        ensure_bitcoind_executable(&bitcoind_path);
     }
 
-    env::set_var("BITCOIND_EXE", bitcoin_exe_home.join("bitcoind"));
+    env::set_var("BITCOIND_EXE", &bitcoind_path);
 
     let exe_path = bitcoind::exe_path().unwrap();
 
@@ -877,27 +960,41 @@ fn warm_up_onion(cfg: &ElectrumConfig) {
 /// electrs syncs asynchronously, so a wallet sync right after mining can read
 /// a stale tip and cache UTXOs with outdated confirmation counts — which then
 /// differs from a wallet synced after electrs caught up, failing equality
-/// assertions. `trigger()` (SIGUSR1) nudges electrs to sync on each poll.
+/// assertions. `trigger()` (SIGUSR1) nudges electrs to sync on each poll. On
+/// Windows that signal does not exist, so the poll itself is the wait.
+///
+/// electrs 0.10 accepts TCP before RocksDB can answer and returns
+/// `-32603 unavailable index`. That is a protocol error, so a single
+/// `Electrum::new` must not be fatal here.
 #[allow(dead_code)]
 pub fn wait_for_electrs_tip(bitcoind: &BitcoinD, electrsd: &ElectrsD, cfg: &ElectrumConfig) {
     let expected = bitcoind.client.get_block_count().unwrap();
-    let probe = Electrum::new(cfg).unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut next_log = Instant::now();
     loop {
         let _ = electrsd.trigger();
-        if probe
-            .get_block_count()
-            .map(|tip| tip >= expected)
-            .unwrap_or(false)
-        {
+        let indexed = match Electrum::new(cfg) {
+            Ok(probe) => probe
+                .get_block_count()
+                .map(|tip| tip >= expected)
+                .unwrap_or(false),
+            Err(error) => {
+                if Instant::now() >= next_log {
+                    log::info!("electrs index not ready yet: {error:?}");
+                    next_log = Instant::now() + Duration::from_secs(2);
+                }
+                false
+            }
+        };
+        if indexed {
             return;
         }
         assert!(
-            std::time::Instant::now() < deadline,
-            "electrs did not reach tip {} within 60s",
-            expected
+            Instant::now() < deadline,
+            "electrs did not reach tip {expected} within 120s",
+            expected = expected
         );
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -966,7 +1063,44 @@ pub struct TestFramework {
     check_blocklist: bool,
     shutdown: AtomicBool,
     block_gen_paused: AtomicBool,
-    nostr_relay: Mutex<Option<Child>>,
+    nostr_relay: Mutex<Option<TestNostrRelay>>,
+}
+
+/// External `nostr-rs-relay` on Unix, or the in-process relay on Windows.
+///
+/// `nostr-rs-relay` calls `tokio::signal::unix` and links `cln-rpc`, which
+/// uses Unix sockets. Neither builds on Windows. The tests only need NIP-01
+/// store-and-forward, which the in-process relay provides on Windows.
+enum TestNostrRelay {
+    #[cfg(not(windows))]
+    Process(Child),
+    #[cfg(windows)]
+    Embedded(EmbeddedRelay),
+}
+
+#[cfg(windows)]
+struct EmbeddedRelay {
+    shutdown: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for TestNostrRelay {
+    fn drop(&mut self) {
+        match self {
+            #[cfg(not(windows))]
+            Self::Process(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            #[cfg(windows)]
+            Self::Embedded(relay) => {
+                relay.shutdown.store(true, Relaxed);
+                if let Some(handle) = relay.thread.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+    }
 }
 
 /// Per-maker offer override for [`TestFramework::init_with_fee_overrides`].
@@ -1129,7 +1263,7 @@ impl TestFramework {
                 if wait_for_relay_healthy(port, &mut relay) {
                     Some((port, relay))
                 } else {
-                    let _ = relay.kill().and_then(|_| relay.wait());
+                    drop(relay);
                     None
                 }
             })
@@ -1143,11 +1277,14 @@ impl TestFramework {
                     return url.clone();
                 }
                 let e = init_electrsd(&bitcoind, &temp_dir);
-                // Give electrs a moment to index the 101 blocks bitcoind has already mined.
-                thread::sleep(Duration::from_secs(2));
-                let _ = e.trigger();
-                thread::sleep(Duration::from_secs(1));
                 let url = format!("tcp://{}", e.electrum_url);
+                let cfg = ElectrumConfig {
+                    url: url.clone(),
+                    ..Default::default()
+                };
+                // Wallet init queries electrs immediately. Wait until the
+                // index can actually answer, not just until the port accepts.
+                wait_for_electrs_tip(&bitcoind, &e, &cfg);
                 electrsd = Some(e);
                 electrum_url = Some(url.clone());
                 url
@@ -1349,12 +1486,9 @@ impl TestFramework {
         self.block_gen_paused.store(paused, Relaxed);
     }
 
-    /// Terminate the per-test nostr relay child process, if still running.
+    /// Terminate the per-test nostr relay, if still running.
     pub(crate) fn kill_relay(&self) {
-        if let Some(mut child) = self.nostr_relay.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        drop(self.nostr_relay.lock().unwrap().take());
     }
 
     /// Stop bitcoind, nostr relay, and clean up all test data.
@@ -1508,52 +1642,291 @@ pub fn spawn_tracker_logger(data_dir: PathBuf, interval: Duration) -> TrackerLog
     }
 }
 
-/// Spawns a dedicated `nostr-rs-relay` process for a single test.
+/// Spawns a dedicated relay for a single test.
 ///
-/// Each test gets its own relay on its own OS-assigned port with an in-memory
-/// database, so concurrently running tests never share nostr state. The relay
-/// binary is located via the `OPENSWAP_TEST_NOSTR_RELAY_BIN` env var, falling
-/// back to `nostr-rs-relay` on `PATH`.
-fn spawn_nostr_relay(temp_dir: &Path, port: u16) -> Child {
-    let data_dir = temp_dir.join("nostr-relay");
-    std::fs::create_dir_all(&data_dir).unwrap();
+/// Unix starts `nostr-rs-relay` (`OPENSWAP_TEST_NOSTR_RELAY_BIN`, or that name
+/// on `PATH`). Windows starts an in-process NIP-01 relay because
+/// `nostr-rs-relay` does not compile there. Each test gets its own port, so
+/// concurrently running tests never share nostr state.
+fn spawn_nostr_relay(temp_dir: &Path, port: u16) -> TestNostrRelay {
+    #[cfg(windows)]
+    {
+        let _ = temp_dir;
+        return spawn_embedded_nostr_relay(port);
+    }
+    #[cfg(not(windows))]
+    {
+        let data_dir = temp_dir.join("nostr-relay");
+        std::fs::create_dir_all(&data_dir).unwrap();
 
-    // Minimal per-test relay config: bind the given port and use an in-memory
-    // SQLite DB so nothing persists across or leaks between tests.
-    let config_path = data_dir.join("config.toml");
-    let config = format!(
-        "[network]\naddress = \"127.0.0.1\"\nport = {port}\n\n[database]\ndata_directory = \"{data_dir}\"\nin_memory = true\nmin_conn = 4\nmax_conn = 8\n\n[diagnostics]\ntracing = false\n",
-        data_dir = data_dir.display()
+        // Minimal per-test relay config: bind the given port and use an in-memory
+        // SQLite DB so nothing persists across or leaks between tests.
+        let config_path = data_dir.join("config.toml");
+        // TOML treats `\` as an escape. Windows paths stay valid as forward slashes,
+        // which the relay and the OS both accept.
+        let data_dir_toml = data_dir.to_string_lossy().replace('\\', "/");
+        let config = format!(
+        "[network]\naddress = \"127.0.0.1\"\nport = {port}\n\n[database]\ndata_directory = \"{data_dir_toml}\"\nin_memory = true\nmin_conn = 4\nmax_conn = 8\n\n[diagnostics]\ntracing = false\n"
     );
-    std::fs::write(&config_path, config).unwrap();
+        std::fs::write(&config_path, config).unwrap();
 
-    let bin =
-        env::var("OPENSWAP_TEST_NOSTR_RELAY_BIN").unwrap_or_else(|_| "nostr-rs-relay".to_string());
+        let bin = env::var("OPENSWAP_TEST_NOSTR_RELAY_BIN")
+            .unwrap_or_else(|_| "nostr-rs-relay".to_string());
 
-    Command::new(&bin)
-        .arg("--config")
-        .arg(&config_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to spawn nostr relay binary '{}': {}. Install it with `cargo install nostr-rs-relay` or set OPENSWAP_TEST_NOSTR_RELAY_BIN.",
-                bin, e
-            )
-        })
+        TestNostrRelay::Process(
+        Command::new(&bin)
+            .arg("--config")
+            .arg(&config_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to spawn nostr relay binary '{}': {}. Install it with `cargo install nostr-rs-relay` or set OPENSWAP_TEST_NOSTR_RELAY_BIN.",
+                    bin, e
+                )
+            }),
+    )
+    }
 }
 
-/// Healthy means the child is alive AND a real WebSocket handshake completes:
+/// In-process NIP-01 relay. Stores events in memory and fans them out to
+/// live `REQ` subscriptions.
+#[cfg(windows)]
+fn spawn_embedded_nostr_relay(port: u16) -> TestNostrRelay {
+    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind embedded nostr relay");
+    listener
+        .set_nonblocking(true)
+        .expect("embedded nostr relay accept should not block shutdown");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_thread = Arc::clone(&shutdown);
+    let thread = thread::spawn(move || embedded_nostr_relay_loop(listener, shutdown_thread));
+    TestNostrRelay::Embedded(EmbeddedRelay {
+        shutdown,
+        thread: Some(thread),
+    })
+}
+
+#[cfg(windows)]
+fn embedded_nostr_relay_loop(listener: TcpListener, shutdown: Arc<AtomicBool>) {
+    use std::sync::{atomic::AtomicU64, mpsc};
+
+    use nostr::{filter::MatchEventOptions, ClientMessage, Event, Filter, JsonUtil, RelayMessage};
+
+    struct LiveSub {
+        conn: u64,
+        id: String,
+        filters: Vec<Filter>,
+        tx: mpsc::Sender<String>,
+    }
+
+    struct Hub {
+        events: Vec<Event>,
+        subs: Vec<LiveSub>,
+    }
+
+    let hub = Arc::new(Mutex::new(Hub {
+        events: Vec::new(),
+        subs: Vec::new(),
+    }));
+    let next_conn = Arc::new(AtomicU64::new(1));
+
+    while !shutdown.load(Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let hub = Arc::clone(&hub);
+                let conn = next_conn.fetch_add(1, Relaxed);
+                thread::spawn(move || embedded_nostr_connection(stream, hub, conn));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                log::warn!("Embedded nostr relay stopped accepting: {error}");
+                break;
+            }
+        }
+    }
+
+    fn filters_match(filters: &[Filter], event: &Event) -> bool {
+        filters.is_empty()
+            || filters
+                .iter()
+                .any(|filter| filter.match_event(event, MatchEventOptions::new()))
+    }
+
+    fn embedded_nostr_connection(stream: std::net::TcpStream, hub: Arc<Mutex<Hub>>, conn: u64) {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        let mut socket = match tungstenite::accept(stream) {
+            Ok(socket) => socket,
+            Err(error) => {
+                log::warn!("Embedded nostr handshake failed: {error}");
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::channel::<String>();
+
+        loop {
+            while let Ok(frame) = rx.try_recv() {
+                if socket.send(tungstenite::Message::text(frame)).is_err() {
+                    hub.lock().unwrap().subs.retain(|sub| sub.conn != conn);
+                    return;
+                }
+            }
+
+            let message = match socket.read() {
+                Ok(message) => message,
+                Err(tungstenite::Error::Io(error))
+                    if error.kind() == std::io::ErrorKind::TimedOut
+                        || error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            };
+
+            let tungstenite::Message::Text(text) = message else {
+                if matches!(message, tungstenite::Message::Close(_)) {
+                    break;
+                }
+                continue;
+            };
+
+            let Ok(client_message) = ClientMessage::from_json(&text) else {
+                continue;
+            };
+
+            match client_message {
+                ClientMessage::Event(event) => {
+                    let event = event.into_owned();
+                    let event_id = event.id;
+                    let accepted = event.verify().is_ok();
+                    if accepted {
+                        let frame_targets: Vec<(mpsc::Sender<String>, String)> = {
+                            let mut hub = hub.lock().unwrap();
+                            let frames: Vec<_> = hub
+                                .subs
+                                .iter()
+                                .filter(|sub| filters_match(&sub.filters, &event))
+                                .map(|sub| {
+                                    let frame = RelayMessage::Event {
+                                        subscription_id: std::borrow::Cow::Owned(
+                                            nostr::SubscriptionId::new(sub.id.clone()),
+                                        ),
+                                        event: std::borrow::Cow::Borrowed(&event),
+                                    }
+                                    .as_json();
+                                    (sub.tx.clone(), frame)
+                                })
+                                .collect();
+                            if !hub.events.iter().any(|stored| stored.id == event.id) {
+                                hub.events.push(event);
+                            }
+                            frames
+                        };
+                        for (target, frame) in frame_targets {
+                            let _ = target.send(frame);
+                        }
+                    }
+                    let reply = RelayMessage::Ok {
+                        event_id,
+                        status: accepted,
+                        message: std::borrow::Cow::Borrowed(if accepted {
+                            ""
+                        } else {
+                            "invalid: bad signature"
+                        }),
+                    }
+                    .as_json();
+                    if socket.send(tungstenite::Message::text(reply)).is_err() {
+                        break;
+                    }
+                }
+                ClientMessage::Req {
+                    subscription_id,
+                    filters,
+                } => {
+                    let filters: Vec<Filter> = filters
+                        .into_iter()
+                        .map(|filter| filter.into_owned())
+                        .collect();
+                    let id = subscription_id.to_string();
+                    let stored = {
+                        let mut hub = hub.lock().unwrap();
+                        hub.subs.retain(|sub| !(sub.conn == conn && sub.id == id));
+                        let stored: Vec<Event> = hub
+                            .events
+                            .iter()
+                            .filter(|event| filters_match(&filters, event))
+                            .cloned()
+                            .collect();
+                        hub.subs.push(LiveSub {
+                            conn,
+                            id: id.clone(),
+                            filters,
+                            tx: tx.clone(),
+                        });
+                        stored
+                    };
+                    let mut failed = false;
+                    for event in stored {
+                        let frame = RelayMessage::Event {
+                            subscription_id: std::borrow::Cow::Owned(nostr::SubscriptionId::new(
+                                id.clone(),
+                            )),
+                            event: std::borrow::Cow::Owned(event),
+                        }
+                        .as_json();
+                        if socket.send(tungstenite::Message::text(frame)).is_err() {
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if failed {
+                        break;
+                    }
+                    let eose = RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                        nostr::SubscriptionId::new(id),
+                    ))
+                    .as_json();
+                    if socket.send(tungstenite::Message::text(eose)).is_err() {
+                        break;
+                    }
+                }
+                ClientMessage::Close(subscription_id) => {
+                    let id = subscription_id.to_string();
+                    hub.lock()
+                        .unwrap()
+                        .subs
+                        .retain(|sub| !(sub.conn == conn && sub.id == id));
+                }
+                _ => {}
+            }
+        }
+
+        hub.lock().unwrap().subs.retain(|sub| sub.conn != conn);
+    }
+}
+
+/// Healthy means the relay is alive AND a real WebSocket handshake completes:
 /// a bare TCP connect can answer from an unrelated listener holding the port
 /// after our relay died mid-spawn.
-fn wait_for_relay_healthy(port: u16, child: &mut Child) -> bool {
+fn wait_for_relay_healthy(port: u16, relay: &mut TestNostrRelay) -> bool {
     let url = format!("ws://127.0.0.1:{port}");
     let start = Instant::now();
 
     while start.elapsed() < Duration::from_secs(10) {
-        if let Ok(Some(status)) = child.try_wait() {
-            log::warn!("Nostr relay exited early ({status}) on port {port}");
+        let dead = match relay {
+            #[cfg(not(windows))]
+            TestNostrRelay::Process(child) => matches!(child.try_wait(), Ok(Some(_))),
+            #[cfg(windows)]
+            TestNostrRelay::Embedded(embedded) => embedded
+                .thread
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished()),
+        };
+        if dead {
+            log::warn!("Nostr relay exited early on port {port}");
             return false;
         }
         if tungstenite::connect(&url).is_ok() {
