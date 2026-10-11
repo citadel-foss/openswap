@@ -3928,6 +3928,75 @@ pub enum TakerBehavior {
 mod tests {
     use super::*;
 
+    #[test]
+    fn compat_taker_cli_merge_keeps_unknown_keys_and_requirements() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# keep\r\nfuture_key = [\"future\"]\r\n\
+            require_features = [\"future-v2\", \"taproot\"]\r\n\
+            socks_port = 9050\r\ncontrol_port = 9051\r\n\
+            tor_auth_password = \"secret\"\r\ncheck_blocklist = false\r\n\
+            ldk_server_url = localhost:3537\r\nldk_api_key_path = /tmp/key\r\n\
+            ldk_tls_cert_path = /tmp/cert";
+        std::fs::write(&path, original).unwrap();
+        let config = TakerInitConfig {
+            connection_type: ConnectionType::Clearnet,
+            socks_port: 19050,
+            control_port: Some(19051),
+            check_blocklist: Some(true),
+            ..TakerInitConfig::default()
+        };
+        Taker::init_taker_config(&config, dir.path()).unwrap();
+        let expected = original
+            .replace("socks_port = 9050", "socks_port = 19050")
+            .replace("control_port = 9051", "control_port = 19051")
+            .replace("check_blocklist = false", "check_blocklist = true");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        let loaded = TakerConfig::new(Some(&path)).unwrap();
+        assert_eq!(loaded.require_features, ["future-v2", "taproot"]);
+        assert_eq!(loaded.tor_auth_password, "secret");
+        assert_eq!(loaded.ldk_server_url.as_deref(), Some("localhost:3537"));
+        assert_eq!(loaded.ldk_api_key_path.as_deref(), Some("/tmp/key"));
+        assert_eq!(loaded.ldk_tls_cert_path.as_deref(), Some("/tmp/cert"));
+    }
+
+    #[test]
+    fn compat_taker_cli_merge_skips_unchanged_values() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# keep\n  socks_port  =  9050\n\
+            tor_auth_password = \"secret\"\nrequire_features = [\"taproot\"]\nfuture = keep";
+        std::fs::write(&path, original).unwrap();
+        let written_at = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let config = TakerInitConfig {
+            connection_type: ConnectionType::Clearnet,
+            tor_auth_password: Some("secret".to_string()),
+            ..TakerInitConfig::default()
+        };
+        Taker::init_taker_config(&config, dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written_at
+        );
+        assert!(!path.with_extension("partial").exists());
+    }
+
+    #[test]
+    fn compat_taker_cli_merge_refuses_bad_requirements_before_changes() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "require_features = [\"taproot\",]\nsocks_port = 9050\n";
+        std::fs::write(&path, original).unwrap();
+        let config = TakerInitConfig {
+            connection_type: ConnectionType::Clearnet,
+            socks_port: 19050,
+            ..TakerInitConfig::default()
+        };
+        assert!(Taker::init_taker_config(&config, dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
     /// The CLI rebuilds `TakerInitConfig` from `config.toml` on every launch,
     /// so anything `init_taker_config` fails to write is lost at the next
     /// start. For the Lightning settings that would mean a taker restarting

@@ -65,8 +65,20 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary_path = path.with_extension("partial");
 
     {
-        let mut temporary_file = File::create(&temporary_path)?;
-        // A rename would otherwise reset a file the user made private (chmod 600).
+        // Private from the first byte, and never a stale temp that keeps its old mode.
+        match std::fs::remove_file(&temporary_path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut temporary_file = options.open(&temporary_path)?;
+        // The rename would otherwise change the mode the user gave the file.
         if let Ok(existing) = std::fs::metadata(path) {
             temporary_file.set_permissions(existing.permissions())?;
         }

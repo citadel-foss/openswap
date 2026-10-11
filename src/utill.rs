@@ -1344,7 +1344,11 @@ pub fn interactive_select(
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, thread};
+    use std::{
+        net::TcpListener,
+        os::unix::fs::{symlink, PermissionsExt},
+        thread,
+    };
 
     use bitcoin::{
         blockdata::{opcodes::all, script::Builder},
@@ -1828,17 +1832,77 @@ mod tests {
     }
 
     #[test]
-    fn set_config_key_keeps_a_private_file_private() {
-        use std::os::unix::fs::PermissionsExt;
+    fn compat_set_config_key_preserves_permissions() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "port = 1\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        set_config_key(&path, "port", "2").unwrap();
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        for mode in [0o600, 0o640, 0o400] {
+            fs::write(&path, "port = 1\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            set_config_key(&path, "port", "2").unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "port = 2\n");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            // Restore write access for the next case, including a read-only original.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn compat_atomic_write_creates_private_files() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let partial = path.with_extension("partial");
+        for stale in [false, true] {
+            if stale {
+                fs::remove_file(&path).unwrap();
+                fs::write(&partial, "stale").unwrap();
+                fs::set_permissions(&partial, fs::Permissions::from_mode(0o666)).unwrap();
+            }
+            write_atomically(&path, b"tor_auth_password = secret\n").unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"tor_auth_password = secret\n");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(!partial.exists());
+        }
+    }
+
+    #[test]
+    fn compat_set_config_key_replaces_stale_files_and_symlinks() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let partial = path.with_extension("partial");
+        let other = dir.path().join("other.toml");
+        for linked in [false, true] {
+            fs::write(&path, "port = 1\nfuture_key = keep\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            if linked {
+                fs::write(&other, "unrelated").unwrap();
+                symlink(&other, &partial).unwrap();
+            } else {
+                fs::write(&partial, "stale").unwrap();
+            }
+            let mut stale_handle = fs::File::open(&partial).unwrap();
+            set_config_key(&path, "port", "2").unwrap();
+            let mut previous = String::new();
+            stale_handle.read_to_string(&mut previous).unwrap();
+            assert_eq!(previous, if linked { "unrelated" } else { "stale" });
+            if linked {
+                assert_eq!(fs::read_to_string(&other).unwrap(), "unrelated");
+            }
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "port = 2\nfuture_key = keep\n"
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(!partial.exists());
+        }
     }
 
     #[test]

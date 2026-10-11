@@ -116,6 +116,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compat_registry_keeps_names_flows_and_build_support() {
+        for (name, flow, lightning) in [
+            ("legacy", "legacy", false),
+            ("taproot", "taproot", false),
+            ("ln-swap-in", "ln-swap-in", true),
+            ("ln-swap-out", "ln-swap-out", true),
+        ] {
+            let entries: Vec<_> = KNOWN.iter().filter(|f| f.name == name).collect();
+            assert_eq!(entries.len(), 1, "{name}");
+            assert!(entries[0].flows.contains(&flow), "{}", name);
+            assert_eq!(entries[0].lightning, lightning, "{name}");
+            assert_eq!(
+                supported().contains(&name),
+                !lightning || cfg!(feature = "lightning")
+            );
+        }
+        for (i, feature) in KNOWN.iter().enumerate() {
+            assert!(!feature.flows.is_empty());
+            assert!(!KNOWN[..i].iter().any(|f| f.name == feature.name));
+        }
+    }
+
+    #[test]
+    fn compat_requirement_versions_do_not_cross_families() {
+        for (required, offered, met) in [
+            ("x-v2", "x-v1", false),
+            ("x-v2", "x-v2", true),
+            ("x-v2", "x-v3", true),
+            ("x-v2", "y-v3", false),
+            ("x-v2", "x", false),
+            ("x", "x-v1", true),
+            ("x-v01", "x-v1", false),
+            ("x-v01", "x-v01", true),
+            ("x-v4294967295", "x-v4294967295", true),
+            ("ln-swap-in", "ln-swap-out", false),
+        ] {
+            assert_eq!(
+                check_requires([required], &[offered]).is_ok(),
+                met,
+                "{required}, {offered}"
+            );
+        }
+        assert_eq!(
+            check_requires(["future-v1"], &[] as &[&str]),
+            Err(vec!["future-v1".to_string()])
+        );
+    }
+
+    #[test]
     fn versions_split_only_on_a_canonical_suffix() {
         assert_eq!(family_and_version("taproot"), ("taproot", 0));
         assert_eq!(family_and_version("bip324-v1"), ("bip324", 1));

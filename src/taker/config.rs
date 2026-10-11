@@ -157,14 +157,198 @@ require_features = [{}]",
 #[cfg(test)]
 mod tests {
 
-    use crate::taker::api::REFUND_LOCKTIME_BASE;
+    use crate::{maker::MakerServerConfig, taker::api::REFUND_LOCKTIME_BASE};
 
     use super::*;
     use std::{
+        collections::HashMap,
         fs::{self, File},
         io::Write,
         path::PathBuf,
     };
+
+    #[test]
+    fn compat_v023_configs_keep_values_and_default_to_no_requirements() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Keys and string forms from the v0.2.3 config writers.
+        let original = "control_port = 19051\nsocks_port = 19050\n\
+            tor_auth_password = secret\ncheck_blocklist = true\n\
+            network_port = 16102\nrpc_port = 16103\nbase_fee = 700\n\
+            name = \"old-maker\"\nldk_server_url = localhost:3537\n\
+            ldk_api_key_path = /tmp/ldk/api_key\nldk_tls_cert_path = /tmp/ldk/tls.crt\n";
+        fs::write(&path, original).unwrap();
+        let maker = MakerServerConfig::new(Some(&path)).unwrap();
+        let taker = TakerConfig::new(Some(&path)).unwrap();
+        assert!(maker.require_features.is_empty());
+        assert!(taker.require_features.is_empty());
+        assert_eq!(
+            (maker.network_port, maker.rpc_port, maker.base_fee),
+            (16102, 16103, 700)
+        );
+        assert_eq!(maker.name, "old-maker");
+        assert_eq!((maker.control_port, maker.socks_port), (19051, 19050));
+        assert_eq!((taker.control_port, taker.socks_port), (19051, 19050));
+        assert_eq!(maker.tor_auth_password, "secret");
+        assert_eq!(taker.tor_auth_password, "secret");
+        assert!(maker.check_blocklist && taker.check_blocklist);
+        assert_eq!(maker.ldk_server_url, taker.ldk_server_url);
+        assert_eq!(maker.ldk_api_key_path, taker.ldk_api_key_path);
+        assert_eq!(maker.ldk_tls_cert_path, taker.ldk_tls_cert_path);
+        assert_eq!(taker.ldk_server_url.as_deref(), Some("localhost:3537"));
+        assert_eq!(taker.ldk_api_key_path.as_deref(), Some("/tmp/ldk/api_key"));
+        assert_eq!(taker.ldk_tls_cert_path.as_deref(), Some("/tmp/ldk/tls.crt"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn compat_configs_keep_unknown_requirements_and_keys() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# future config\nfuture_key = { enabled = true }\n\
+            require_features = [\"taproot\", \"future-v2\", \"ln-swap-out\"]\n";
+        fs::write(&path, original).unwrap();
+        let expected = ["taproot", "future-v2", "ln-swap-out"];
+        assert_eq!(
+            MakerServerConfig::new(Some(&path))
+                .unwrap()
+                .require_features,
+            expected
+        );
+        assert_eq!(
+            TakerConfig::new(Some(&path)).unwrap().require_features,
+            expected
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn compat_configs_refuse_malformed_requirements_without_writing() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for value in [
+            "",
+            "taproot",
+            "[taproot]",
+            "[\"taproot\",]",
+            "[\"\"]",
+            "[\"Taproot\"]",
+            "[\"tap_root\"]",
+            "[\"taproot\"] # note",
+            "[\n\"taproot\"\n]",
+            "[\"taproot\",\n\"legacy\"]",
+            r#""["taproot",]""#,
+            r#""["Taproot"]""#,
+        ] {
+            let original = format!("require_features = {value}\nfuture_key = keep\n");
+            fs::write(&path, &original).unwrap();
+            assert!(
+                MakerServerConfig::new(Some(&path)).is_err(),
+                "maker: {:?}",
+                value
+            );
+            assert!(TakerConfig::new(Some(&path)).is_err(), "taker: {:?}", value);
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn compat_configs_parse_quoted_requirement_lists_as_contents() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (value, expected) in [
+            (r#""[]""#, vec![]),
+            (
+                r#""["taproot", "future-v2"]""#,
+                vec!["taproot", "future-v2"],
+            ),
+        ] {
+            let original = format!("require_features = {value}\nfuture_key = keep\n");
+            fs::write(&path, &original).unwrap();
+            let maker = MakerServerConfig::new(Some(&path)).unwrap();
+            let taker = TakerConfig::new(Some(&path)).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(maker.require_features, expected, "maker: {value}");
+            assert_eq!(taker.require_features, expected, "taker: {value}");
+        }
+    }
+
+    #[test]
+    fn compat_v023_readers_ignore_new_requirements() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let requires = vec!["future-v2".to_string(), "taproot".to_string()];
+        let maker = MakerServerConfig {
+            control_port: 19051,
+            socks_port: 19050,
+            tor_auth_password: "secret".to_string(),
+            check_blocklist: true,
+            require_features: requires.clone(),
+            ..MakerServerConfig::default()
+        };
+        let taker = TakerConfig {
+            control_port: 19051,
+            socks_port: 19050,
+            tor_auth_password: "secret".to_string(),
+            check_blocklist: true,
+            require_features: requires,
+            ..TakerConfig::default()
+        };
+        for is_maker in [true, false] {
+            if is_maker {
+                maker.write_to_file(&path).unwrap();
+            } else {
+                taker.write_to_file(&path).unwrap();
+            }
+            // Frozen v0.2.3 line reader: old config constructors select only known keys.
+            let mut old_map = HashMap::new();
+            let content = fs::read_to_string(&path).unwrap();
+            for line in content.lines().filter(|line| !line.is_empty()) {
+                if let Some((key, value)) = line.split_once('=') {
+                    let value = value.trim();
+                    let value = value
+                        .strip_prefix('"')
+                        .and_then(|v| v.strip_suffix('"'))
+                        .unwrap_or(value);
+                    old_map.insert(key.trim().to_string(), value.to_string());
+                }
+            }
+            for (key, expected) in [
+                ("control_port", "19051"),
+                ("socks_port", "19050"),
+                ("tor_auth_password", "secret"),
+                ("check_blocklist", "true"),
+            ] {
+                assert_eq!(old_map.get(key).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn compat_requirements_round_trip_through_both_config_writers() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for names in [vec![], vec!["legacy", "taproot", "future-v12"]] {
+            let requires: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let maker = MakerServerConfig {
+                require_features: requires.clone(),
+                ..MakerServerConfig::default()
+            };
+            maker.write_to_file(&path).unwrap();
+            assert_eq!(
+                MakerServerConfig::new(Some(&path))
+                    .unwrap()
+                    .require_features,
+                requires
+            );
+            let taker = TakerConfig {
+                require_features: requires.clone(),
+                ..TakerConfig::default()
+            };
+            taker.write_to_file(&path).unwrap();
+            assert_eq!(TakerConfig::new(Some(&path)).unwrap(), taker);
+        }
+    }
 
     fn create_temp_config(contents: &str, file_name: &str) -> PathBuf {
         let file_path = PathBuf::from(file_name);
