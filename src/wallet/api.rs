@@ -6046,15 +6046,17 @@ mod mempool_deferral_tests {
             ContractChainState::NotYet
         );
         assert!(chain.lock().unwrap().broadcast.is_empty());
-        chain
-            .lock()
-            .unwrap()
-            .txs
-            .insert(contract.compute_txid(), (contract, TIP));
+        chain.lock().unwrap().reject_broadcast = false;
         assert_eq!(
             Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
             ContractChainState::OnChain
         );
+        {
+            let chain = chain.lock().unwrap();
+            let txid = contract.compute_txid();
+            assert_eq!(chain.broadcast, vec![txid]);
+            assert_eq!(chain.txs[&txid].0, contract);
+        }
         coin.committed = false;
         assert_eq!(
             Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
