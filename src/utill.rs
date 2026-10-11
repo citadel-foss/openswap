@@ -555,6 +555,9 @@ pub(crate) fn parse_list(value: Option<&String>) -> io::Result<Vec<String>> {
             format!("expected a one-line list like [\"a\", \"b\"], got {value}"),
         )
     };
+    if value.contains(['\n', '\r']) {
+        return Err(malformed());
+    }
     let inner = value
         .strip_prefix('[')
         .and_then(|v| v.strip_suffix(']'))
@@ -1764,6 +1767,78 @@ mod tests {
         ] {
             assert!(read(bad).is_err(), "{}", bad);
         }
+    }
+
+    #[test]
+    fn compat_list_rejects_line_breaks() {
+        for value in [
+            "[\n\"taproot\"]",
+            "[\"taproot\"\r\n]",
+            "[\n]",
+            "[\"taproot\",\n\"legacy\"]",
+        ] {
+            assert!(parse_list(Some(&value.to_string())).is_err(), "{:?}", value);
+        }
+    }
+
+    #[test]
+    fn compat_set_config_key_preserves_unchanged_bytes() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# keep\r\n  port  =  1  \r\nfuture_key = [\"x\"]";
+        fs::write(&path, original).unwrap();
+        // An in-place write would change the bytes seen through this handle.
+        let mut handle = fs::File::open(&path).unwrap();
+        set_config_key(&path, "port", "1").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        set_config_key(&path, "port", "2").unwrap();
+        let mut previous = String::new();
+        handle.read_to_string(&mut previous).unwrap();
+        assert_eq!(previous, original);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# keep\r\nport = 2\r\nfuture_key = [\"x\"]"
+        );
+    }
+
+    #[test]
+    fn compat_set_config_key_appends_after_a_missing_final_newline() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (original, expected) in [
+            ("", "port = 2\n"),
+            ("# keep", "# keep\nport = 2\n"),
+            ("# keep\n", "# keep\nport = 2\n"),
+        ] {
+            fs::write(&path, original).unwrap();
+            set_config_key(&path, "port", "2").unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn compat_set_config_key_failed_write_keeps_original() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "port = 1\nfuture_key = keep\n";
+        fs::write(&path, original).unwrap();
+        fs::create_dir(path.with_extension("partial")).unwrap();
+        assert!(set_config_key(&path, "port", "2").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn set_config_key_keeps_a_private_file_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "port = 1\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        set_config_key(&path, "port", "2").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

@@ -66,6 +66,10 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
     {
         let mut temporary_file = File::create(&temporary_path)?;
+        // A rename would otherwise reset a file the user made private (chmod 600).
+        if let Ok(existing) = std::fs::metadata(path) {
+            temporary_file.set_permissions(existing.permissions())?;
+        }
         temporary_file.write_all(bytes)?;
         temporary_file.sync_all()?;
     }
