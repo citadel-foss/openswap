@@ -40,7 +40,7 @@ use crate::{
         min_contract_value_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FeePriority,
-        FidelityError, RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK,
+        FidelityError, MakerReport, RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK,
         MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::service::WatchService,
@@ -2958,12 +2958,8 @@ impl MakerTrait for MakerServer {
         Ok(None)
     }
 
-    fn data_dir(&self) -> &std::path::Path {
-        &self.data_dir
-    }
-
-    fn wallet_name(&self) -> &str {
-        &self.config.wallet_name
+    fn save_report(&self, report: &MakerReport) -> Result<(), MakerError> {
+        Ok(report.save_to_wallet(&mut *lock_debug!(self.wallet.write())?)?)
     }
 
     fn verify_and_sign_sender_contract_txs(

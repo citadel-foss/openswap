@@ -55,6 +55,7 @@ use rust_coinselect::{
 
 use super::{
     blockchain::{AnyBlockchain, Blockchain, HdOrigin},
+    deniability::verify_swap_proof,
     error::WalletError,
     storage::{AddressType, WalletStore},
     swapcoin::{contract_timelock, WatchOnlySwapCoin},
@@ -502,19 +503,13 @@ impl Wallet {
         &self.store.file_name
     }
 
-    /// Verify the deniability proof for a specific swap in this wallet's report file.
+    /// Verify the deniability proof for a specific swap stored in this wallet.
     pub fn verify_deniability(&self, swap_id: &str) -> Result<bool, std::io::Error> {
-        let stem = self
-            .wallet_file_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| std::io::Error::other("wallet path has no valid file stem"))?;
-        let report_path = self
-            .wallet_file_path
-            .parent()
-            .ok_or_else(|| std::io::Error::other("wallet path has no parent directory"))?
-            .join(format!("{stem}_swap_report.json"));
-        crate::wallet::deniability::verify_deniability(&report_path, &self.blockchain, swap_id)
+        verify_swap_proof(
+            self.swap_reports().deniability_proofs,
+            &self.blockchain,
+            swap_id,
+        )
     }
 
     /// Load wallet data from file and connect to a blockchain backend.

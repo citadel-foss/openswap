@@ -264,6 +264,11 @@ pub(crate) struct WalletStore {
     #[serde(default)]
     pub(crate) ln_maker_swaps: HashMap<String, LnMakerSwapRecord>,
 
+    /// Swap reports by kind, as raw values so a report this build can't read
+    /// survives a save. Typed views are decoded on read.
+    #[serde(default)]
+    pub(crate) reports: BTreeMap<String, Vec<Value>>,
+
     /// Fields a newer build wrote that this one doesn't know, written back
     /// unchanged. Never rebuild the store through a conversion that drops them.
     #[serde(flatten)]
@@ -292,6 +297,8 @@ impl Requires for WalletStore {
             swap_locks,
             ln_pending_swaps,
             ln_maker_swaps,
+            // Only informational; an older build that drops one loses no funds.
+            reports: _,
             // Kept for a newer build; this one needs nothing from them.
             extra: _,
         } = self;
@@ -525,6 +532,7 @@ impl WalletStore {
             swap_locks: HashMap::new(),
             ln_pending_swaps: HashMap::new(),
             ln_maker_swaps: HashMap::new(),
+            reports: BTreeMap::new(),
             extra: BTreeMap::new(),
         };
         store.master_key.seal(store_enc_material)?;

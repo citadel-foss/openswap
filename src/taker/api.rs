@@ -848,25 +848,11 @@ impl Taker {
 
         // Always start the loop: with nothing left, its first pass still marks
         // the swaps cleaned up and writes their reports, so restarts stop retrying.
-        let data_dir = match self
-            .config
-            .data_dir
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(get_taker_dir)
-        {
-            Ok(dir) => dir,
-            Err(e) => {
-                log::warn!("Startup recovery: {e}; skipping recovery loop");
-                return;
-            }
-        };
         match RecoveryLoop::start(
             self.wallet.clone(),
             self.backend.clone(),
             self.swap_tracker.clone(),
             self.watch_service.clone(),
-            data_dir,
         ) {
             Ok(rl) => self.recovery_loop = Some(rl),
             // Without the loop, remaining contracts are never swept.
@@ -3190,7 +3176,6 @@ impl Taker {
             .collect();
 
         let network = wallet.store.network;
-        let wallet_file_name = wallet.get_name().to_string();
         let incoming_contract_txids: HashSet<_> = swap
             .incoming_swapcoins
             .iter()
@@ -3218,6 +3203,8 @@ impl Taker {
                 (utxo.amount.to_sat(), address)
             })
             .collect();
+        // Released here: the report is saved through the write lock below.
+        drop(wallet);
 
         let output_swap_amounts: Vec<u64> = output_swap_utxos
             .iter()
@@ -3457,13 +3444,7 @@ impl Taker {
         );
 
         report.print();
-        let data_dir = self
-            .config
-            .data_dir
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(get_taker_dir)?;
-        if let Err(e) = report.save_for_wallet(&data_dir, Some(&wallet_file_name)) {
+        if let Err(e) = report.save_to_wallet(&mut *self.write_wallet()?) {
             log::warn!("Failed to save taker swap report: {:?}", e);
         }
 
@@ -3549,18 +3530,11 @@ impl Taker {
             drop(recovery);
         }
         log::info!("Spawning recovery loop for swap {}", swap_id);
-        let data_dir = self
-            .config
-            .data_dir
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(get_taker_dir)?;
         self.recovery_loop = Some(RecoveryLoop::start(
             self.wallet.clone(),
             self.backend.clone(),
             self.swap_tracker.clone(),
             self.watch_service.clone(),
-            data_dir,
         )?);
 
         Ok(())

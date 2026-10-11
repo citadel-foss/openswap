@@ -1,32 +1,78 @@
 #![allow(clippy::too_many_arguments)]
-//! Per-wallet swap report files for openswap participants.
+//! Swap reports for openswap participants, stored in the encrypted wallet.
 //!
-//! Reports are appended to the swap report file next to the wallet that
-//! participated in the swap:
-//! `{data_dir}/wallets/{wallet_name}_swap_report.json`.
-//!
-//! The file has four sections:
+//! The wallet keeps four kinds, each a list of raw values:
 //! - `taker`   – one entry per taker swap (success or failed)
-//! - `maker`   – one array per maker node, keyed by node name
+//! - `maker`   – one entry per maker swap
 //! - `recovery`– one entry per recovery event (hashlock or timelock)
 //! - `deniability_proofs` – one proof per completed swap
+//!
+//! v0.2.3 wrote them to `{wallet_name}_swap_report.json` next to the wallet;
+//! [`SwapReportFile`] still reads that file.
 
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    time::Instant,
-};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_cbor::value::{from_value, to_value};
+use std::{collections::HashMap, path::Path, time::Instant};
 
-use crate::{
-    atomic_file::{read_json, write_json_atomically, FileLock},
-    utill::now_secs,
-};
+use crate::utill::now_secs;
 
 use super::{
     deniability::{proof_from_swapcoins, DeniabilityProof},
     swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+    Wallet, WalletError,
 };
+
+/// Keys of the wallet's report map. Frozen: renaming one orphans stored reports.
+const TAKER_REPORTS: &str = "taker";
+const MAKER_REPORTS: &str = "maker";
+const RECOVERY_REPORTS: &str = "recovery";
+const DENIABILITY_PROOFS: &str = "deniability_proofs";
+
+impl Wallet {
+    /// Appends `report` under `kind`. The caller saves the wallet.
+    fn push_report(&mut self, kind: &str, report: &impl Serialize) -> Result<(), WalletError> {
+        let value = to_value(report)?;
+        self.store
+            .reports
+            .entry(kind.to_string())
+            .or_default()
+            .push(value);
+        Ok(())
+    }
+
+    /// Decodes the stored reports of one kind. One this build can't read is
+    /// skipped here but stays stored.
+    fn decoded_reports<T: DeserializeOwned>(&self, kind: &str) -> Vec<T> {
+        self.store
+            .reports
+            .get(kind)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| {
+                from_value(value.clone())
+                    .inspect_err(|e| {
+                        log::warn!("Skipping a stored {kind} report this build can't read: {e}")
+                    })
+                    .ok()
+            })
+            .collect()
+    }
+
+    /// This wallet's swap reports. Maker reports are keyed by the wallet name.
+    pub fn swap_reports(&self) -> SwapReportFile {
+        let maker: Vec<MakerReport> = self.decoded_reports(MAKER_REPORTS);
+        SwapReportFile {
+            taker: self.decoded_reports(TAKER_REPORTS),
+            maker: if maker.is_empty() {
+                HashMap::new()
+            } else {
+                HashMap::from([(self.store.file_name.clone(), maker)])
+            },
+            recovery: self.decoded_reports(RECOVERY_REPORTS),
+            deniability_proofs: self.decoded_reports(DENIABILITY_PROOFS),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared enums
@@ -227,20 +273,13 @@ impl TakerReport {
         self
     }
 
-    /// Save to the given wallet's report file, or the discovered/default taker wallet if none is given.
-    pub fn save_for_wallet(
-        &self,
-        data_dir: &Path,
-        wallet_file_name: Option<&str>,
-    ) -> std::io::Result<()> {
-        let report = self.clone();
-        let file_path = report_file_path_for_wallet(data_dir, SwapRole::Taker, wallet_file_name);
-        write_to_path(&file_path, |f| {
-            if let Some(p) = report.deniability_proof.clone() {
-                f.deniability_proofs.push(p);
-            }
-            f.taker.push(report);
-        })
+    /// Stores this report, and its proof if any, in `wallet` and saves it.
+    pub fn save_to_wallet(&self, wallet: &mut Wallet) -> Result<(), WalletError> {
+        if let Some(proof) = &self.deniability_proof {
+            wallet.push_report(DENIABILITY_PROOFS, proof)?;
+        }
+        wallet.push_report(TAKER_REPORTS, self)?;
+        wallet.save_to_disk()
     }
 
     /// Print a human-readable summary to stdout.
@@ -480,25 +519,13 @@ impl MakerReport {
         }
     }
 
-    /// Save to the given wallet's report file, or the discovered/default maker wallet if none is given.
-    pub fn save_for_wallet(
-        &self,
-        data_dir: &Path,
-        wallet_file_name: Option<&str>,
-    ) -> std::io::Result<()> {
-        let node_name = data_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let report = self.clone();
-        let file_path = report_file_path_for_wallet(data_dir, SwapRole::Maker, wallet_file_name);
-        write_to_path(&file_path, |f| {
-            if let Some(p) = report.deniability_proof.clone() {
-                f.deniability_proofs.push(p);
-            }
-            f.maker.entry(node_name).or_default().push(report);
-        })
+    /// Stores this report, and its proof if any, in `wallet` and saves it.
+    pub fn save_to_wallet(&self, wallet: &mut Wallet) -> Result<(), WalletError> {
+        if let Some(proof) = &self.deniability_proof {
+            wallet.push_report(DENIABILITY_PROOFS, proof)?;
+        }
+        wallet.push_report(MAKER_REPORTS, self)?;
+        wallet.save_to_disk()
     }
 
     /// Print a human-readable summary to stdout.
@@ -571,68 +598,57 @@ pub struct RecoveryReport {
 }
 
 impl RecoveryReport {
-    /// Emit a taker recovery report — prints to console and saves to file.
+    /// Emit a taker recovery report — prints to console and saves it in `wallet`.
     pub fn emit_taker(
-        data_dir: &Path,
+        wallet: &mut Wallet,
         swap_id: String,
-        network: String,
         recovery_type: String,
         recovery_txids: Vec<String>,
     ) {
-        let report = Self {
+        Self {
             swap_id,
             role: SwapRole::Taker,
             node: None,
             recovery_type,
             recovery_txids,
-            network,
+            network: wallet.store.network.to_string(),
             timestamp: now_secs(),
-        };
-        report.print();
-        if let Err(e) = report.save_for_wallet(data_dir, None) {
-            log::warn!("Failed to save taker recovery report: {:?}", e);
         }
-        log::info!(
-            "For full details, see: {}",
-            report_file_path(data_dir, SwapRole::Taker).display()
-        );
+        .emit(wallet);
     }
 
-    /// Emit a maker recovery report — prints to console and saves to file.
+    /// Emit a maker recovery report — prints to console and saves it in `wallet`.
+    /// The node is named after the maker's data directory.
     pub fn emit_maker(
+        wallet: &mut Wallet,
         data_dir: &Path,
         swap_id: String,
-        network: String,
         recovery_type: String,
         recovery_txids: Vec<String>,
     ) {
-        let node = data_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string());
-        let report = Self {
+        Self {
             swap_id,
             role: SwapRole::Maker,
-            node,
+            node: data_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string()),
             recovery_type,
             recovery_txids,
-            network,
+            network: wallet.store.network.to_string(),
             timestamp: now_secs(),
-        };
-        report.print();
-        if let Err(e) = report.save_for_wallet(data_dir, None) {
-            log::warn!("Failed to save maker recovery report: {:?}", e);
         }
+        .emit(wallet);
     }
 
-    fn save_for_wallet(
-        &self,
-        data_dir: &Path,
-        wallet_file_name: Option<&str>,
-    ) -> std::io::Result<()> {
-        let report = self.clone();
-        let file_path = report_file_path_for_wallet(data_dir, self.role, wallet_file_name);
-        write_to_path(&file_path, |f| f.recovery.push(report))
+    fn emit(&self, wallet: &mut Wallet) {
+        self.print();
+        if let Err(e) = wallet
+            .push_report(RECOVERY_REPORTS, self)
+            .and_then(|()| wallet.save_to_disk())
+        {
+            log::warn!("Failed to save {} recovery report: {:?}", self.role, e);
+        }
     }
 
     fn print(&self) {
@@ -658,7 +674,7 @@ impl RecoveryReport {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-/// Top-level JSON structure stored in per-wallet swap report files.
+/// All of a wallet's reports. Also the shape of the v0.2.3 report JSON file.
 pub struct SwapReportFile {
     /// Taker-perspective swap reports.
     pub taker: Vec<TakerReport>,
@@ -670,149 +686,12 @@ pub struct SwapReportFile {
     pub deniability_proofs: Vec<DeniabilityProof>,
 }
 
-// ---------------------------------------------------------------------------
-// File I/O helpers
-// ---------------------------------------------------------------------------
-
-const REPORT_SUFFIX: &str = "_swap_report.json";
-
-/// Return the wallet name component used in report filenames, or the role default.
-fn wallet_name_for_report(
-    data_dir: &Path,
-    role: SwapRole,
-    wallet_file_name: Option<&str>,
-) -> String {
-    let wallet_file_name = wallet_file_name
-        .map(str::to_string)
-        .unwrap_or_else(|| match role {
-            SwapRole::Taker => "taker-wallet".to_string(),
-            SwapRole::Maker => data_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|name| !name.is_empty())
-                .unwrap_or("maker-wallet")
-                .to_string(),
-        });
-    let path = Path::new(&wallet_file_name);
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or(&wallet_file_name)
-        .to_string()
-}
-
-/// Build the swap report filename for a wallet file.
-fn wallet_report_file_name(
-    data_dir: &Path,
-    role: SwapRole,
-    wallet_file_name: Option<&str>,
-) -> String {
-    format!(
-        "{}{}",
-        wallet_name_for_report(data_dir, role, wallet_file_name),
-        REPORT_SUFFIX
-    )
-}
-
-/// Discover the only wallet file in the wallets directory, falling back to the default name.
-fn discover_wallet_name(data_dir: &Path, role: SwapRole) -> String {
-    let wallets_dir = data_dir.join("wallets");
-    let Ok(entries) = std::fs::read_dir(&wallets_dir) else {
-        return wallet_name_for_report(data_dir, role, None);
-    };
-
-    let wallet_names: Vec<String> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let file_type = entry.file_type().ok()?;
-            if !file_type.is_file() {
-                return None;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(REPORT_SUFFIX)
-                || name.ends_with(".lock")
-                || name.ends_with(".partial")
-                || name.ends_with(".tmp")
-            {
-                None
-            } else {
-                Some(name)
-            }
-        })
-        .collect();
-
-    if wallet_names.len() == 1 {
-        wallet_name_for_report(data_dir, role, Some(&wallet_names[0]))
-    } else {
-        wallet_name_for_report(data_dir, role, None)
-    }
-}
-
-fn report_file_path(data_dir: &Path, role: SwapRole) -> PathBuf {
-    let wallet_name = discover_wallet_name(data_dir, role);
-    wallet_report_path(data_dir, role, Some(&wallet_name))
-}
-
-/// Build the report path for an explicit wallet, or discover/default one for the role.
-fn report_file_path_for_wallet(
-    data_dir: &Path,
-    role: SwapRole,
-    wallet_file_name: Option<&str>,
-) -> PathBuf {
-    match wallet_file_name {
-        Some(wallet_file_name) => wallet_report_path(data_dir, role, Some(wallet_file_name)),
-        None => report_file_path(data_dir, role),
-    }
-}
-
-fn wallet_report_path(data_dir: &Path, role: SwapRole, wallet_file_name: Option<&str>) -> PathBuf {
-    // TODO: Store swap reports inside the wallet data instead of writing a
-    // separate `{wallet_name}_swap_report.json` file next to the wallet.
-    data_dir
-        .join("wallets")
-        .join(wallet_report_file_name(data_dir, role, wallet_file_name))
-}
-
-fn write_to_path<F>(file_path: &Path, mutate: F) -> std::io::Result<()>
-where
-    F: FnOnce(&mut SwapReportFile),
-{
-    let report_dir = file_path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("swap report path has no parent directory"))?;
-    std::fs::create_dir_all(report_dir)?;
-
-    let lock_path = file_path.with_extension("json.lock");
-
-    let _lock = FileLock::acquire(&lock_path)?;
-
-    let mut report_file: SwapReportFile = read_json(file_path)?;
-
-    mutate(&mut report_file);
-
-    write_json_atomically(file_path, &report_file)?;
-
-    log::info!("Saved swap report to: {}", file_path.display());
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_data_dir(test_name: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "openswap_report_{test_name}_{}_{}",
-            std::process::id(),
-            nonce
-        ));
-        std::fs::create_dir_all(dir.join("wallets")).unwrap();
-        dir
-    }
+    use crate::wallet::{api::test_support::test_wallet, storage::WalletStore};
+    use bitcoind::tempfile::tempdir;
+    use serde_cbor::Value;
 
     fn sample_taker_report() -> TakerReport {
         TakerReport {
@@ -894,23 +773,36 @@ mod tests {
     }
 
     #[test]
-    fn taker_report_is_written_next_to_named_wallet() {
-        let data_dir = test_data_dir("taker_named_wallet");
-        let report = sample_taker_report();
+    fn reports_live_in_the_wallet_and_unreadable_ones_survive_a_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.cbor");
+        let mut wallet = test_wallet(&path);
+        sample_taker_report().save_to_wallet(&mut wallet).unwrap();
 
-        report
-            .save_for_wallet(&data_dir, Some("alice.wallet"))
-            .unwrap();
+        // A newer build's report: a status and a nested field we don't know.
+        let Value::Map(mut fields) = to_value(sample_taker_report()).unwrap() else {
+            panic!("a report encodes as a map");
+        };
+        fields.insert(Value::Text("status".into()), Value::Text("Future".into()));
+        fields.insert(
+            Value::Text("future_detail".into()),
+            Value::Array(vec![Value::Integer(1)]),
+        );
+        let future = Value::Map(fields);
+        wallet
+            .store
+            .reports
+            .entry(TAKER_REPORTS.to_string())
+            .or_default()
+            .push(future.clone());
+        wallet.save_to_disk().unwrap();
 
-        let expected_path = data_dir.join("wallets").join("alice_swap_report.json");
-        assert!(expected_path.exists());
-        assert!(!data_dir.join("swap_reports.json").exists());
-
-        let saved: SwapReportFile =
-            serde_json::from_str(&std::fs::read_to_string(expected_path).unwrap()).unwrap();
-        assert_eq!(saved.taker.len(), 1);
-        assert_eq!(saved.taker[0].swap_id, "swap-1");
-
-        std::fs::remove_dir_all(data_dir).unwrap();
+        let (store, _) =
+            WalletStore::read_from_disk(&path, Some("test-password".to_string())).unwrap();
+        assert_eq!(store.reports[TAKER_REPORTS].get(1), Some(&future));
+        wallet.store = store;
+        let reports = wallet.swap_reports();
+        assert_eq!(reports.taker.len(), 1);
+        assert_eq!(reports.taker[0].swap_id, "swap-1");
     }
 }

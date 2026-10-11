@@ -6,7 +6,6 @@
 use std::{
     collections::HashSet,
     net::TcpStream,
-    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
         mpsc, Arc, Mutex, RwLock,
@@ -62,7 +61,6 @@ impl RecoveryLoop {
         backend: BackendConnector,
         swap_tracker: Arc<Mutex<SwapTracker>>,
         watch_service: WatchService,
-        data_dir: PathBuf,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let complete = Arc::new(AtomicBool::new(false));
@@ -237,9 +235,6 @@ impl RecoveryLoop {
                                 .into_iter()
                                 .filter(|record| swap_ids.contains(&record.swap_id))
                             {
-                                let network = lock_debug!(wallet.read())
-                                    .map(|w| w.store.network.to_string())
-                                    .unwrap_or_default();
                                 let all_outcomes = record
                                     .recovery
                                     .incoming
@@ -260,23 +255,24 @@ impl RecoveryLoop {
                                         }
                                     }
                                 }
-                                if !hashlock_txids.is_empty() {
-                                    RecoveryReport::emit_taker(
-                                        &data_dir,
-                                        record.swap_id.clone(),
-                                        network.clone(),
-                                        "hashlock".to_string(),
-                                        hashlock_txids,
+                                let Ok(mut wallet) = lock_debug!(wallet.write()) else {
+                                    log::error!(
+                                        "Cannot store recovery reports for {}: wallet lock poisoned",
+                                        record.swap_id
                                     );
-                                }
-                                if !timelock_txids.is_empty() {
-                                    RecoveryReport::emit_taker(
-                                        &data_dir,
-                                        record.swap_id.clone(),
-                                        network,
-                                        "timelock".to_string(),
-                                        timelock_txids,
-                                    );
+                                    continue;
+                                };
+                                for (recovery_type, txids) in
+                                    [("hashlock", hashlock_txids), ("timelock", timelock_txids)]
+                                {
+                                    if !txids.is_empty() {
+                                        RecoveryReport::emit_taker(
+                                            &mut wallet,
+                                            record.swap_id.clone(),
+                                            recovery_type.to_string(),
+                                            txids,
+                                        );
+                                    }
                                 }
                             }
 

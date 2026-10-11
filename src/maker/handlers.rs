@@ -473,11 +473,8 @@ pub trait Maker: Send + Sync {
     /// Remove connection state for a completed swap.
     fn remove_connection_state(&self, swap_id: &str) -> Result<(), MakerError>;
 
-    /// Get the data directory path for saving reports.
-    fn data_dir(&self) -> &std::path::Path;
-
-    /// Get the active maker wallet file name.
-    fn wallet_name(&self) -> &str;
+    /// Store a swap report in the wallet and save it.
+    fn save_report(&self, report: &MakerReport) -> Result<(), MakerError>;
 
     /// Get the current block height from the Bitcoin node.
     fn get_current_height(&self) -> Result<u32, MakerError>;
@@ -767,7 +764,7 @@ pub(super) fn emit_maker_success_report<M: Maker>(
         state.outgoing_swapcoins.first(),
     );
     report.print();
-    if let Err(error) = report.save_for_wallet(maker.data_dir(), Some(maker.wallet_name())) {
+    if let Err(error) = maker.save_report(&report) {
         log::warn!("Failed to save maker success report: {error:?}");
     }
 }

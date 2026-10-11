@@ -1303,16 +1303,16 @@ fn finish_swap(
     report: Option<(&str, &[Txid])>,
 ) {
     if let Some((recovery_type, txids)) = report {
-        let network = lock_debug!(maker.wallet.read())
-            .map(|w| w.store.network.to_string())
-            .unwrap_or_default();
-        RecoveryReport::emit_maker(
-            &maker.data_dir,
-            swap_id.to_string(),
-            network,
-            recovery_type.to_string(),
-            txids.iter().map(|txid| txid.to_string()).collect(),
-        );
+        match lock_debug!(maker.wallet.write()) {
+            Ok(mut wallet) => RecoveryReport::emit_maker(
+                &mut wallet,
+                &maker.data_dir,
+                swap_id.to_string(),
+                recovery_type.to_string(),
+                txids.iter().map(|txid| txid.to_string()).collect(),
+            ),
+            Err(e) => log::error!("Cannot store the recovery report for {swap_id}: {e:?}"),
+        }
     }
     update_tracker(maker, swap_id, |r| {
         r.phase = phase;
