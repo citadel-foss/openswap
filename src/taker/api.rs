@@ -979,8 +979,13 @@ impl Taker {
     /// No funds are committed. The caller reviews the summary and then calls
     /// `start_swap` with the returned `swap_id` to execute.
     pub fn prepare_swap(&mut self, params: SwapParams) -> Result<SwapSummary, TakerError> {
+        // A prepared swap that was never started has nothing committed, so a
+        // new prepare replaces it, as it did before the live slot existed.
         if self.ongoing_swap.is_some() {
-            return Err(TakerError::General("A swap is already active".into()));
+            if !self.no_outgoing_funding_on_chain() {
+                return Err(TakerError::General("A swap is already active".into()));
+            }
+            self.abort_unfunded_swap()?;
         }
         let result = self.prepare_swap_inner(params);
         if result.is_err() && self.ongoing_swap.is_some() {
@@ -1246,6 +1251,14 @@ impl Taker {
     /// Commits funds on-chain: creates funding transactions, exchanges
     /// contracts with makers, finalizes, and sweeps.
     pub fn start_swap(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
+        // A wrong id must leave the prepared swap alone, not abort it.
+        let current_id = self.swap_state()?.id.clone();
+        if current_id != swap_id {
+            return Err(TakerError::General(format!(
+                "No prepared swap with id '{}' (current: '{}')",
+                swap_id, current_id
+            )));
+        }
         let result = self.start_swap_inner(swap_id);
         if let Err(error) = &result {
             if let Err(reconcile_error) = self.reconcile_start_failure(error) {
@@ -1276,15 +1289,6 @@ impl Taker {
 
     fn start_swap_inner(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
         let swap_start_time = Instant::now();
-
-        // Verify the swap_id matches the prepared swap.
-        let current_id = self.swap_state()?.id.clone();
-        if current_id != swap_id {
-            return Err(TakerError::General(format!(
-                "No prepared swap with id '{}' (current: '{}')",
-                swap_id, current_id
-            )));
-        }
         #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::StopWatcherBeforeSwap {
             self.watch_service.stop_watcher_for_test();
