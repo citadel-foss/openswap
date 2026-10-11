@@ -12,7 +12,10 @@ use bitcoin::{
     Amount,
 };
 
-use super::messages::{AuthenticatedRpcRequest, RpcMsgReq};
+use serde::Deserialize;
+use serde_cbor::{value::from_value, Value};
+
+use super::messages::RpcMsgReq;
 #[cfg(not(feature = "integration-test"))]
 use crate::utill::TorError;
 use crate::{
@@ -79,13 +82,21 @@ pub trait MakerRpc {
     fn get_tor_hostname(&self) -> Result<String, TorError>;
 }
 
+/// [`super::messages::AuthenticatedRpcRequest`] with the request left undecoded, so the token is
+/// checked first and a request this build doesn't know isn't called "unauthorized".
+#[derive(Deserialize)]
+struct RawRpcRequest {
+    token: String,
+    request: Value,
+}
+
 fn handle_request<M: MakerRpc>(
     maker: &Arc<M>,
     socket: &mut TcpStream,
     rpc_cookie: &str,
 ) -> Result<(), MakerError> {
     let msg_bytes = read_message(socket)?;
-    let envelope = match serde_cbor::from_slice::<AuthenticatedRpcRequest>(&msg_bytes) {
+    let envelope = match serde_cbor::from_slice::<RawRpcRequest>(&msg_bytes) {
         Ok(envelope) if cookie_matches(&envelope.token, rpc_cookie) => envelope,
         _ => {
             log::warn!(
@@ -99,7 +110,17 @@ fn handle_request<M: MakerRpc>(
             return Ok(());
         }
     };
-    let rpc_request = envelope.request;
+    let rpc_request = match from_value::<RpcMsgReq>(envelope.request) {
+        Ok(request) => request,
+        Err(e) => {
+            log::warn!("Rejected unknown RPC request: {e}");
+            send_message(
+                socket,
+                &RpcMsgResp::ServerError(format!("unknown request: {e}")),
+            )?;
+            return Ok(());
+        }
+    };
     log::info!("RPC request received: {rpc_request:?}");
 
     let resp = match rpc_request {
@@ -318,7 +339,9 @@ pub(crate) fn start_rpc_server<M: MakerRpc>(maker: Arc<M>) -> Result<(), MakerEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utill::MIN_RELAY_FEE_RATE;
+    use crate::{maker::rpc::messages::AuthenticatedRpcRequest, utill::MIN_RELAY_FEE_RATE};
+    use serde::Serialize;
+    use std::collections::BTreeMap;
 
     /// A maker double for the fee-rate guard tests; the guard fires before
     /// any wallet access, so `wallet()` is never reached.
@@ -347,7 +370,10 @@ mod tests {
         }
     }
 
-    fn rpc_send_to_address(address: &str, feerate: f64) -> Result<RpcMsgResp, MakerError> {
+    /// Sends `envelope(cookie)` to a fresh handler and returns its reply.
+    fn rpc_round_trip<T: Serialize>(
+        envelope: impl FnOnce(&str) -> T,
+    ) -> Result<RpcMsgResp, MakerError> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
@@ -360,20 +386,45 @@ mod tests {
             shutdown: ShutdownSignal::new(),
         });
 
-        send_message(
-            &mut client,
-            &AuthenticatedRpcRequest {
-                token: cookie.clone(),
-                request: RpcMsgReq::SendToAddress {
-                    address: address.to_string(),
-                    amount: 50_000,
-                    feerate,
-                },
-            },
-        )
-        .unwrap();
+        send_message(&mut client, &envelope(&cookie)).unwrap();
         handle_request(&double, &mut server, &cookie)?;
         Ok(serde_cbor::from_slice(&read_message(&mut client).unwrap()).unwrap())
+    }
+
+    fn rpc_send_to_address(address: &str, feerate: f64) -> Result<RpcMsgResp, MakerError> {
+        rpc_round_trip(|cookie| AuthenticatedRpcRequest {
+            token: cookie.to_string(),
+            request: RpcMsgReq::SendToAddress {
+                address: address.to_string(),
+                amount: 50_000,
+                feerate,
+            },
+        })
+    }
+
+    #[test]
+    fn rpc_checks_the_token_before_the_request() {
+        let envelope = |token: &str| {
+            Value::Map(BTreeMap::from([
+                (Value::Text("token".into()), Value::Text(token.into())),
+                (
+                    Value::Text("request".into()),
+                    Value::Text("FutureRequest".into()),
+                ),
+            ]))
+        };
+        let reply = rpc_round_trip(envelope).unwrap();
+        assert!(
+            matches!(&reply, RpcMsgResp::ServerError(e) if e.contains("unknown request")),
+            "{:?}",
+            reply
+        );
+        let reply = rpc_round_trip(|_| envelope("wrong")).unwrap();
+        assert!(
+            matches!(&reply, RpcMsgResp::ServerError(e) if e == "unauthorized"),
+            "{:?}",
+            reply
+        );
     }
 
     #[test]
