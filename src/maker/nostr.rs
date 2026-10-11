@@ -44,13 +44,15 @@ pub const NOSTR_RELAYS: &[&str] = &["wss://nos.lol", "wss://relay.damus.io"];
 pub const NOSTR_RELAYS: &[&str] = &["ws://127.0.0.1:8000"];
 
 /// Returns the OpenSwap Nostr event kind for the given Bitcoin network.
+/// v0.2.3 used 37778-37782; new kinds keep it from finding makers it can't talk to.
+/// Frozen: content only grows by fields after `txid:vout`.
 pub fn swap_kind(network: Network) -> u16 {
     match network {
-        Network::Bitcoin => 37778,
-        Network::Signet => 37779,
-        Network::Regtest => 37780,
-        Network::Testnet => 37781,
-        Network::Testnet4 => 37782,
+        Network::Bitcoin => 37790,
+        Network::Signet => 37791,
+        Network::Regtest => 37792,
+        Network::Testnet => 37793,
+        Network::Testnet4 => 37794,
     }
 }
 /// Expiration time for noster event (24 hours)
