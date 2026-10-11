@@ -332,6 +332,17 @@ impl Wallet {
 }
 
 #[cfg(test)]
+pub(crate) fn compat_backup() -> WalletBackup {
+    WalletBackup {
+        network: Network::Regtest,
+        master_key: Xpriv::new_master(Network::Regtest, &[42; 32]).unwrap(),
+        wallet_birthday: Some(101),
+        file_name: "fixture.wallet".into(),
+        requires: Vec::new(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{

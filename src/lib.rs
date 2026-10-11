@@ -5,6 +5,8 @@ pub extern crate bitcoind;
 
 pub(crate) mod atomic_file;
 pub mod blocklist;
+#[cfg(test)]
+mod compat_fixtures;
 pub mod error;
 #[cfg(feature = "lightning")]
 pub mod lightning;

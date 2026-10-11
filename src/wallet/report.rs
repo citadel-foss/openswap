@@ -711,6 +711,115 @@ impl SwapReportFile {
 }
 
 #[cfg(test)]
+pub(crate) fn compat_reports() -> SwapReportFile {
+    let proof: SwapReportFile = serde_json::from_slice(include_bytes!(
+        "../../tests/fixtures/compat/v0.2.3/closed_swap_report.json"
+    ))
+    .unwrap();
+    let proof = proof.deniability_proofs[0].clone();
+    let utxo = ReportUtxo {
+        address: "bcrt1-fixture".into(),
+        value: 123_456,
+    };
+    let taker = TakerReport {
+        swap_id: "fixture-swap".into(),
+        status: SwapStatus::Success,
+        network: "regtest".into(),
+        swap_duration_seconds: 2.5,
+        start_timestamp: 100,
+        end_timestamp: 103,
+        error_message: Some("fixture error".into()),
+        outgoing_amount: 123_456,
+        incoming_amount: 120_000,
+        fee_paid: 3_456,
+        mining_fee: 123,
+        fee_percentage: 2.5,
+        total_maker_fees: 3_333,
+        outgoing_utxos: vec![utxo.clone()],
+        incoming_utxos: vec![utxo.clone()],
+        funding_txids: vec![vec!["funding-tx".into()]],
+        makers_count: 1,
+        maker_addresses: vec!["maker-fixture".into()],
+        maker_fee_info: vec![MakerFeeInfo {
+            maker_index: 1,
+            maker_address: "maker-fixture".into(),
+            base_fee: 1.5,
+            amount_relative_fee: 2.5,
+            time_relative_fee: 3.5,
+            total_fee: 7.5,
+        }],
+        input_utxos: vec![123_456],
+        output_change_amounts: vec![20_000],
+        output_swap_amounts: vec![100_000],
+        output_change_utxos: vec![(20_000, "change-address".into())],
+        output_swap_utxos: vec![(100_000, "swap-address".into())],
+        deniability_proof: Some(proof.clone()),
+        payment: Some(PaymentResult {
+            receiver_address: "receiver-address".into(),
+            requested_amount: 120_000,
+            delivered_amount: 120_000,
+            settlement_txids: vec!["settlement-tx".into()],
+            confirmed: true,
+        }),
+    };
+    let maker = MakerReport {
+        swap_id: "fixture-swap".into(),
+        status: SwapStatus::Success,
+        network: "regtest".into(),
+        swap_duration_seconds: 2.5,
+        start_timestamp: 100,
+        end_timestamp: 103,
+        incoming_amount: 123_456,
+        outgoing_amount: 120_000,
+        fee_earned: 3_456,
+        incoming_utxos: vec![utxo.clone()],
+        outgoing_utxos: vec![utxo],
+        timelock: 20,
+        deniability_proof: Some(proof.clone()),
+    };
+    let statuses = [
+        SwapStatus::Success,
+        SwapStatus::RecoveryHashlock,
+        SwapStatus::RecoveryTimelock,
+        SwapStatus::Failed,
+    ];
+    SwapReportFile {
+        taker: statuses
+            .iter()
+            .map(|status| {
+                let mut report = taker.clone();
+                report.status = status.clone();
+                report
+            })
+            .collect(),
+        maker: HashMap::from([(
+            "fixture-maker".into(),
+            statuses
+                .iter()
+                .map(|status| {
+                    let mut report = maker.clone();
+                    report.status = status.clone();
+                    report
+                })
+                .collect(),
+        )]),
+        recovery: [SwapRole::Maker, SwapRole::Taker]
+            .iter()
+            .map(|role| RecoveryReport {
+                swap_id: "fixture-swap".into(),
+                role: *role,
+                node: Some("fixture-node".into()),
+                recovery_type: "timelock".into(),
+                recovery_txids: vec!["recovery-tx".into()],
+                network: "regtest".into(),
+                timestamp: 123,
+            })
+            .collect(),
+        deniability_proofs: vec![proof],
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{

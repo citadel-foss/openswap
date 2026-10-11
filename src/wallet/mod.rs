@@ -40,3 +40,14 @@ pub use report::{
 };
 pub use spend::Destination;
 pub use storage::{AddressType, LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap};
+
+#[cfg(test)]
+pub(crate) use backup::compat_backup;
+#[cfg(test)]
+pub(crate) use report::{compat_reports, SwapReportFile};
+#[cfg(test)]
+pub(crate) use storage::compat_support::{
+    check_envelope, compat_assert_empty_extra, generate_storage,
+};
+#[cfg(test)]
+pub(crate) use storage::{SwapReservation, WalletStore};

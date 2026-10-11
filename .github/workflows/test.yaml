@@ -62,6 +62,12 @@ jobs:
           slow-timeout = "3m"
           EOF
 
+      - name: Check release compatibility fixtures
+        if: matrix.partition == 1
+        run: |
+          cargo test --lib --features lightning compat
+          cargo test --test compat_kdf
+
       - name: Run cargo-llvm-cov
         # Surface electrs stderr in the job log, or a hung electrum test
         # leaves no evidence of what the server was doing.

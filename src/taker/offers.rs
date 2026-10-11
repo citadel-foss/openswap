@@ -2085,7 +2085,7 @@ impl fmt::Display for BanReason {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         wallet::{CoreRPC, CoreRpcConfig},
@@ -2181,10 +2181,36 @@ mod tests {
         LegacyProvenViolation,
     }
 
-    #[test]
-    fn compat_offerbook_round_trips_all_states_through_v023() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("offerbook.json");
+    pub(crate) fn compat_v023_round_trip(bytes: &[u8]) -> Vec<u8> {
+        let old: CompatV023Book = serde_cbor::from_slice(bytes).unwrap();
+        serde_cbor::to_vec(&old).unwrap()
+    }
+
+    pub(crate) fn compat_assert_empty_book_extras(book: &OfferBook) {
+        for maker in &book.makers {
+            if let Some(offer) = &maker.offer {
+                assert!(offer.fidelity.bond.extra.is_empty());
+                assert_eq!(
+                    offer.fidelity.cert_hash,
+                    offer
+                        .fidelity
+                        .bond
+                        .generate_cert_hash(&maker.address.to_string(), &offer.tweakable_point,)
+                );
+                let message =
+                    Message::from_digest_slice(offer.fidelity.cert_hash.as_byte_array()).unwrap();
+                Secp256k1::verification_only()
+                    .verify_ecdsa(
+                        &message,
+                        &offer.fidelity.cert_sig,
+                        &offer.fidelity.bond.pubkey.inner,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    pub(crate) fn compat_sample_offerbook() -> OfferBook {
         let mut book = OfferBook::default();
         let mut states = vec![MakerState::Good];
         states.extend(
@@ -2253,6 +2279,14 @@ mod tests {
             );
             book.makers.push(maker);
         }
+        book
+    }
+
+    #[test]
+    fn compat_offerbook_round_trips_all_states_through_v023() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("offerbook.json");
+        let book = compat_sample_offerbook();
         book.write_to_disk(&path).unwrap();
         let old: CompatV023Book = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(old.makers.len(), 13);

@@ -802,6 +802,393 @@ fn archive_legacy_file(path: &Path, bytes: &[u8]) -> Result<(), WalletError> {
 }
 
 #[cfg(test)]
+pub(crate) mod compat_support {
+    use super::*;
+    use crate::{
+        compat_fixtures::{check, write},
+        protocol::ProtocolVersion,
+        wallet::{compat_reports, deniability::DeniabilityProof, swapcoin::PaymentTarget},
+    };
+    use bitcoin::{
+        absolute::LockTime,
+        hashes::{sha256, Hash},
+        secp256k1::{Message, Scalar, Secp256k1, SecretKey},
+        Amount, CompressedPublicKey, PublicKey, Txid,
+    };
+    use serde_cbor::value::to_value;
+
+    pub(crate) fn compat_store() -> WalletStore {
+        let dir = tempfile::tempdir().unwrap();
+        let key = KeyMaterial::new_from_password(Some("fixture-password".into())).unwrap();
+        let mut store = WalletStore::init(
+            "fixture.wallet".into(),
+            &dir.path().join("fixture.wallet"),
+            Network::Regtest,
+            Xpriv::new_master(Network::Regtest, &[42; 32]).unwrap(),
+            Some(101),
+            &key,
+        )
+        .unwrap();
+        let (old, _) = decrypt_with_password::<WalletStore>(
+            serde_cbor::from_slice(include_bytes!(
+                "../../tests/fixtures/compat/v0.2.3/open.wallet"
+            ))
+            .unwrap(),
+            "compat-v023".into(),
+            &[],
+        )
+        .unwrap();
+        let incoming = old.incoming_swapcoins.into_values().next().unwrap();
+        let tx = incoming.contract_tx.clone();
+        let script = incoming.contract_redeemscript.clone().unwrap();
+        let mine = incoming.my_privkey.unwrap();
+        let other = incoming.other_pubkey.unwrap();
+        let secp = Secp256k1::new();
+        let pubkey = PublicKey::new(mine.public_key(&secp));
+        let point = OutPoint::new(tx.compute_txid(), 0);
+        let signature = bitcoin::ecdsa::Signature::sighash_all(
+            secp.sign_ecdsa(&Message::from_digest([7; 32]), &mine),
+        );
+        store.external_index = 7;
+        store.internal_index = 11;
+        store.offer_maxsize = 123_456;
+        store.wallet_birthday = Some(101);
+        store.last_synced_height = Some(202);
+        store.prevout_to_contract_map.insert(point, script.clone());
+        store.swept_incoming_swapcoins.insert(script.clone());
+        store.fidelity_bond.push(FidelityBond {
+            outpoint: point,
+            amount: Amount::from_sat(100_000),
+            lock_time: LockTime::from_height(900_000).unwrap(),
+            pubkey,
+            conf_height: Some(800_000),
+            is_spent: true,
+            bond_index: 7,
+            tx: Some(tx.clone()),
+            extra: BTreeMap::new(),
+        });
+        store.swap_locks.insert(
+            "fixture-swap".into(),
+            SwapReservation {
+                outpoints: HashSet::from([point]),
+                reserved_at: 123,
+            },
+        );
+        store.reports = IntoIterator::into_iter(compat_reports().into_values().unwrap())
+            .map(|(name, values)| (name.into(), values))
+            .collect();
+        for protocol in [ProtocolVersion::Legacy, ProtocolVersion::Taproot] {
+            let name = format!("{protocol:?}");
+            let mut incoming = incoming.clone();
+            incoming.protocol = protocol;
+            incoming.other_privkey = Some(SecretKey::from_slice(&[2; 32]).unwrap());
+            incoming.contract_txid = Some(tx.compute_txid());
+            incoming.hash_preimage = Some([4; 32]);
+            incoming.swap_id = Some(name.clone());
+            incoming.hashlock_script = Some(script.clone());
+            incoming.timelock_script = Some(script.clone());
+            incoming.others_contract_sig = Some(signature);
+            incoming.tap_tweak = Some(Scalar::ONE);
+            incoming.internal_key = Some(pubkey.inner.x_only_public_key().0);
+            incoming.spending_tx = Some(tx.clone());
+            incoming.payment_target = Some(PaymentTarget {
+                script_pubkey: script.clone(),
+                amount: Amount::from_sat(90_000),
+            });
+            incoming.negotiated_feerate = 3;
+            if protocol == ProtocolVersion::Taproot {
+                let proof = DeniabilityProof::from_incoming_swapcoin(
+                    &incoming,
+                    super::super::SwapRole::Taker,
+                    Some(point),
+                )
+                .unwrap();
+                store
+                    .reports
+                    .get_mut("deniability_proofs")
+                    .unwrap()
+                    .push(to_value(proof).unwrap());
+            }
+            let mut outgoing = OutgoingSwapCoin::new_legacy(
+                mine,
+                other,
+                tx.clone(),
+                script.clone(),
+                mine,
+                Amount::from_sat(100_000),
+                3,
+            );
+            outgoing.protocol = protocol;
+            outgoing.other_privkey = incoming.other_privkey;
+            outgoing.funding_tx = Some(tx.clone());
+            outgoing.hash_preimage = Some([4; 32]);
+            outgoing.swap_id = Some(name.clone());
+            outgoing.hashlock_script = Some(script.clone());
+            outgoing.timelock_script = Some(script.clone());
+            outgoing.others_contract_sig = Some(signature);
+            outgoing.tap_tweak = Some(Scalar::ONE);
+            outgoing.internal_key = incoming.internal_key;
+            outgoing.recovery_address = Some(
+                bitcoin::Address::p2wpkh(&CompressedPublicKey(pubkey.inner), Network::Regtest)
+                    .as_unchecked()
+                    .clone(),
+            );
+            outgoing.committed = true;
+            outgoing.incoming_claimed = true;
+            let mut watchonly = WatchOnlySwapCoin::new_legacy(
+                pubkey,
+                other,
+                tx.clone(),
+                script.clone(),
+                Amount::from_sat(100_000),
+            );
+            watchonly.protocol = protocol;
+            watchonly.hashlock_script = Some(script.clone());
+            watchonly.timelock_script = Some(script.clone());
+            store.incoming_swapcoins.insert(name.clone(), incoming);
+            store.outgoing_swapcoins.insert(name.clone(), outgoing);
+            store.watchonly_swapcoins.insert(name, vec![watchonly]);
+        }
+        for (index, info) in [
+            UTXOSpendInfo::SeedCoin {
+                path: "m/84'/1'/0'/0/7".into(),
+                input_value: Amount::from_sat(100_000),
+                address_type: AddressType::P2WPKH,
+            },
+            UTXOSpendInfo::SeedCoin {
+                path: "m/86'/1'/0'/0/7".into(),
+                input_value: Amount::from_sat(100_000),
+                address_type: AddressType::P2TR,
+            },
+            UTXOSpendInfo::IncomingSwapCoin {
+                multisig_redeemscript: script.clone(),
+            },
+            UTXOSpendInfo::OutgoingSwapCoin {
+                multisig_redeemscript: script.clone(),
+            },
+            UTXOSpendInfo::TimelockContract {
+                swapcoin_multisig_redeemscript: script.clone(),
+                input_value: Amount::from_sat(100_000),
+            },
+            UTXOSpendInfo::HashlockContract {
+                swapcoin_multisig_redeemscript: script.clone(),
+                input_value: Amount::from_sat(100_000),
+            },
+            UTXOSpendInfo::FidelityBondCoin {
+                index: 7,
+                input_value: Amount::from_sat(100_000),
+            },
+            UTXOSpendInfo::SweptCoin {
+                path: "m/84'/1'/0'/0/7".into(),
+                input_value: Amount::from_sat(100_000),
+                address_type: AddressType::P2WPKH,
+            },
+            UTXOSpendInfo::SweptCoin {
+                path: "m/86'/1'/0'/0/7".into(),
+                input_value: Amount::from_sat(100_000),
+                address_type: AddressType::P2TR,
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
+            let point = OutPoint::new(Txid::from_byte_array([5; 32]), index as u32);
+            let entry = ListUnspentResultEntry {
+                txid: point.txid,
+                vout: point.vout,
+                address: Some(
+                    bitcoin::Address::p2wpkh(&CompressedPublicKey(pubkey.inner), Network::Regtest)
+                        .as_unchecked()
+                        .clone(),
+                ),
+                label: Some("fixture".into()),
+                redeem_script: Some(script.clone()),
+                witness_script: Some(script.clone()),
+                script_pub_key: script.clone(),
+                amount: Amount::from_sat(100_000),
+                confirmations: 7,
+                spendable: true,
+                solvable: true,
+                descriptor: Some("fixture-descriptor".into()),
+                safe: true,
+            };
+            store.utxo_cache.insert(point, (entry, info.clone()));
+        }
+        for is_swap_in in [true, false] {
+            store.ln_pending_swaps.insert(
+                format!("pending-{is_swap_in}"),
+                LnPendingSwap {
+                    is_swap_in,
+                    preimage: Some([4; 32]),
+                    redeemscript: script.clone(),
+                    locktime: 20,
+                    privkey: mine,
+                    outpoint: Some(point),
+                    value: Some(Amount::from_sat(100_000)),
+                },
+            );
+        }
+        for (direction, phase) in [
+            (LnMakerDirection::SwapIn, LnMakerPhase::InAccepted),
+            (LnMakerDirection::SwapIn, LnMakerPhase::InPaid),
+            (LnMakerDirection::SwapIn, LnMakerPhase::InSwept),
+            (LnMakerDirection::SwapOut, LnMakerPhase::OutAccepted),
+            (LnMakerDirection::SwapOut, LnMakerPhase::OutFunded),
+        ] {
+            store.ln_maker_swaps.insert(
+                format!("{phase:?}"),
+                LnMakerSwapRecord {
+                    direction,
+                    phase,
+                    payment_hash: sha256::Hash::hash(&[4; 32]),
+                    amount: Amount::from_sat(100_000),
+                    fee: Amount::from_sat(1_000),
+                    locktime: 20,
+                    min_confirmations: 3,
+                    redeemscript: script.clone(),
+                    privkey: mine,
+                    invoice: "fixture-invoice".into(),
+                    preimage: Some([4; 32]),
+                    refund_txid: Some(point.txid),
+                    accepted_height: Some(123),
+                    payout_script: Some(script.clone()),
+                    funding_outpoint: Some(point),
+                    funding_value: Some(Amount::from_sat(101_000)),
+                    funding_height: Some(125),
+                },
+            );
+        }
+        store
+    }
+
+    pub(crate) fn compat_assert_empty_extra(store: &WalletStore) {
+        assert!(
+            store.extra.is_empty(),
+            "a stored wallet field was renamed or removed: {:?}",
+            store.extra.keys()
+        );
+        for bond in &store.fidelity_bond {
+            assert!(
+                bond.extra.is_empty(),
+                "a stored bond field was renamed or removed: {:?}",
+                bond.extra.keys()
+            );
+        }
+    }
+
+    pub(crate) fn generate_storage(release: &Path) {
+        let store = compat_store();
+        write(release, "wallet-store", &store);
+        for (name, coin) in &store.incoming_swapcoins {
+            write(release, &format!("coin-incoming-{name}"), coin);
+        }
+        for (name, coin) in &store.outgoing_swapcoins {
+            write(release, &format!("coin-outgoing-{name}"), coin);
+        }
+        for (name, coins) in &store.watchonly_swapcoins {
+            write(release, &format!("coin-watchonly-{name}"), &coins[0]);
+        }
+        for (name, swap) in &store.ln_maker_swaps {
+            write(release, &format!("storage-ln-maker-{name}"), swap);
+        }
+        for (name, swap) in &store.ln_pending_swaps {
+            write(release, &format!("storage-ln-{name}"), swap);
+        }
+        for (point, cache) in &store.utxo_cache {
+            write(release, &format!("storage-cache-{}", point.vout), cache);
+        }
+        write(
+            release,
+            "storage-reservation",
+            &store.swap_locks["fixture-swap"],
+        );
+        write(release, "bond-fidelity", &store.fidelity_bond[0]);
+        generate_envelope(release, &store);
+    }
+
+    #[test]
+    fn compat_fixtures_wallet_index_rename_cannot_hide_in_extra() {
+        let original = to_value(compat_store()).unwrap();
+        let Value::Map(mut fields) = original.clone() else {
+            panic!()
+        };
+        let index = fields
+            .remove(&Value::Text("internal_index".into()))
+            .unwrap();
+        fields.insert(Value::Text("renamed_index".into()), index);
+        let renamed: WalletStore =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&Value::Map(fields)).unwrap()).unwrap();
+        assert!(std::panic::catch_unwind(|| compat_assert_empty_extra(&renamed)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| crate::compat_fixtures::assert_subset(
+                &original,
+                &to_value(&renamed).unwrap()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn compat_fixtures_nested_bond_rename_cannot_hide_in_extra() {
+        let Value::Map(mut fields) = to_value(compat_store()).unwrap() else {
+            panic!()
+        };
+        let Value::Array(bonds) = fields
+            .get_mut(&Value::Text("fidelity_bond".into()))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let Value::Map(bond) = &mut bonds[0] else {
+            panic!()
+        };
+        let index = bond.remove(&Value::Text("bond_index".into())).unwrap();
+        bond.insert(Value::Text("renamed_bond_index".into()), index);
+        // A flattened old key must never make a renamed required field seem compatible.
+        assert!(serde_cbor::from_slice::<WalletStore>(
+            &serde_cbor::to_vec(&Value::Map(fields)).unwrap()
+        )
+        .is_err());
+    }
+
+    pub(crate) fn generate_envelope(release: &Path, store: &WalletStore) {
+        let MasterKey::Sealed(sealed) = &store.master_key else {
+            panic!()
+        };
+        let (mut master, key) =
+            decrypt_with_password::<Xpriv>(sealed.clone(), "fixture-password".into(), &[]).unwrap();
+        master.private_key.non_secure_erase();
+        let mut names = BTreeSet::new();
+        store.requires(&mut names);
+        let requires: Vec<_> = names.into_iter().map(String::from).collect();
+        let encrypted = encrypt_struct_with_aad(store, &key, &requires_aad(&requires)).unwrap();
+        write(
+            release,
+            "wallet-file",
+            &WalletFile {
+                requires,
+                encrypted,
+            },
+        );
+    }
+
+    pub(crate) fn check_envelope(release: &Path) {
+        let file: WalletFile = check(release, "wallet-file");
+        let (store, key) = decrypt_with_password::<WalletStore>(
+            file.encrypted,
+            "fixture-password".into(),
+            &requires_aad(&file.requires),
+        )
+        .unwrap();
+        compat_assert_empty_extra(&store);
+        assert_eq!(
+            store.master_key.plaintext_with(&key),
+            Some(Xpriv::new_master(Network::Regtest, &[42; 32]).unwrap())
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
