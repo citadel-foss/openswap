@@ -5,6 +5,7 @@
 
 use crate::{
     atomic_file::{read_json, write_json_atomically, FileLock},
+    protocol::features::{check_requires, supported},
     utill::parse_checked_address,
     wallet::{Wallet, WalletError},
 };
@@ -44,8 +45,35 @@ pub struct AddOutcome {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BlocklistFile {
+    /// Feature names a reader needs. A writer adds one when it stores an entry
+    /// an older build would read more loosely, so that build refuses instead
+    /// of blocking less.
+    #[serde(default)]
+    requires: Vec<String>,
     #[serde(default)]
     entries: Vec<BlocklistEntry>,
+}
+
+/// Only the names, read before any entry is decoded.
+#[derive(Default, Deserialize)]
+struct BlocklistHeader {
+    #[serde(default)]
+    requires: Vec<String>,
+}
+
+/// Reads the blocklist, refusing it when it needs a name this build can't serve.
+fn read_blocklist(path: &Path) -> Result<BlocklistFile, BlocklistError> {
+    let header: BlocklistHeader = read_json(path)?;
+    check_requires(&header.requires, &supported()).map_err(|missing| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "blocklist {} needs a newer build: it uses {missing:?}",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(read_json(path)?)
 }
 
 /// Errors produced while storing or applying the funding-source blocklist.
@@ -225,7 +253,7 @@ impl AddressBlocklist {
     /// that cannot be parsed are skipped.
     pub fn load(data_dir: &Path, network: Network) -> Result<Self, BlocklistError> {
         let path = blocklist_path(data_dir);
-        let file = read_json::<BlocklistFile>(&path)?;
+        let file = read_blocklist(&path)?;
 
         Ok(Self {
             inner: index_entries(file.entries, network),
@@ -255,17 +283,21 @@ impl AddressBlocklist {
         }
     }
 
-    fn read_current(&self) -> Result<HashMap<ScriptBuf, BlocklistEntry>, BlocklistError> {
-        let file: BlocklistFile = read_json(&self.path)?;
-        Ok(index_entries(file.entries, self.network))
+    fn read_current(
+        &self,
+    ) -> Result<(Vec<String>, HashMap<ScriptBuf, BlocklistEntry>), BlocklistError> {
+        let file = read_blocklist(&self.path)?;
+        Ok((file.requires, index_entries(file.entries, self.network)))
     }
 
     fn commit(
         &mut self,
         _lock: &FileLock,
+        requires: Vec<String>,
         entries: HashMap<ScriptBuf, BlocklistEntry>,
     ) -> Result<(), BlocklistError> {
         let file = BlocklistFile {
+            requires,
             entries: entries.values().cloned().collect(),
         };
 
@@ -284,7 +316,7 @@ impl AddressBlocklist {
 
         let lock_path = self.path.with_extension("lock");
         let lock = FileLock::acquire(&lock_path)?;
-        let mut current = self.read_current()?;
+        let (requires, mut current) = self.read_current()?;
         let mut outcome = AddOutcome::default();
 
         for (entry, script) in entries.into_iter().zip(scripts) {
@@ -293,7 +325,7 @@ impl AddressBlocklist {
                 None => outcome.added += 1,
             }
         }
-        self.commit(&lock, current)?;
+        self.commit(&lock, requires, current)?;
         Ok(outcome)
     }
 
@@ -306,14 +338,14 @@ impl AddressBlocklist {
 
         let lock_path = self.path.with_extension("lock");
         let lock = FileLock::acquire(&lock_path)?;
-        let mut current = self.read_current()?;
+        let (requires, mut current) = self.read_current()?;
 
         let removed = scripts
             .into_iter()
             .filter(|script| current.remove(script).is_some())
             .count();
 
-        self.commit(&lock, current)?;
+        self.commit(&lock, requires, current)?;
         Ok(removed)
     }
 
@@ -485,5 +517,26 @@ mod tests {
             Err(other) => panic!("unexpected error: {}", other),
             Ok(_) => panic!("malformed blocklist must not be treated as empty"),
         }
+    }
+
+    #[test]
+    fn unserved_requires_refuse_before_entries_and_writes() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("maker");
+        let path = blocklist_path(&data_dir);
+        // The entry shape is newer too; the header alone must decide.
+        let raw = r#"{"requires":["future-v1"],"entries":[{"future":true}]}"#;
+        std::fs::write(&path, raw).unwrap();
+
+        assert!(AddressBlocklist::load(&data_dir, Network::Regtest).is_err());
+
+        let mut blocklist = AddressBlocklist {
+            inner: HashMap::new(),
+            path: path.clone(),
+            network: Network::Regtest,
+        };
+        let entry = BlocklistEntry::new(test_address(1, Network::Regtest).to_string(), None);
+        assert!(blocklist.add(vec![entry]).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
     }
 }
