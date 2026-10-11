@@ -8,8 +8,8 @@
 use crate::{
     protocol::features::{check_requires, supported},
     security::{
-        decrypt_struct, decrypt_with_password, encrypt_struct, requires_aad, EncryptedData,
-        KeyMaterial, SecurityError, FORMAT_NAMES,
+        decrypt_struct, decrypt_with_password, encrypt_struct, encrypt_struct_with_aad,
+        requires_aad, EncryptedData, KeyMaterial, SecurityError, FORMAT_NAMES,
     },
     utill::deserialize_from_cbor,
     wallet::UTXOSpendInfo,
@@ -71,7 +71,7 @@ impl MasterKey {
     /// the key is already sealed.
     pub(crate) fn seal(&mut self, key: &KeyMaterial) -> Result<(), WalletError> {
         if let Self::Plaintext(xpriv) = self {
-            let data = encrypt_struct(xpriv, key, &[])
+            let data = encrypt_struct(xpriv, key)
                 .map_err(|e| WalletError::General(format!("master key sealing failed: {e:?}")))?;
             let mut old = std::mem::replace(self, Self::Sealed(data));
             if let Self::Plaintext(old_xpriv) = &mut old {
@@ -92,7 +92,7 @@ impl MasterKey {
         match self {
             Self::Plaintext(xpriv) => f(xpriv),
             Self::Sealed(data) => {
-                let mut xpriv: Xpriv = decrypt_struct(data.clone(), key, &[])?;
+                let mut xpriv: Xpriv = decrypt_struct(data.clone(), key)?;
                 let result = f(&xpriv);
                 xpriv.private_key.non_secure_erase();
                 result
@@ -107,7 +107,7 @@ impl MasterKey {
     pub(crate) fn plaintext_with(&self, key: &KeyMaterial) -> Option<Xpriv> {
         match self {
             Self::Plaintext(xpriv) => Some(*xpriv),
-            Self::Sealed(data) => decrypt_struct(data.clone(), key, &[]).ok(),
+            Self::Sealed(data) => decrypt_struct(data.clone(), key).ok(),
         }
     }
 }
@@ -567,7 +567,7 @@ impl WalletStore {
         let mut names: BTreeSet<&'static str> = FORMAT_NAMES.iter().copied().collect();
         self.requires(&mut names);
         let requires: Vec<String> = names.into_iter().map(String::from).collect();
-        let encrypted = encrypt_struct(self, store_enc_material, &requires_aad(&requires))
+        let encrypted = encrypt_struct_with_aad(self, store_enc_material, &requires_aad(&requires))
             .map_err(|e| WalletError::General(format!("wallet store encryption failed: {e:?}")))?;
 
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -626,9 +626,14 @@ impl WalletStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::SecurityError;
+    use crate::{security::SecurityError, wallet::Wallet};
     use bip39::rand::{thread_rng, Rng};
-    use bitcoin::{hashes::Hash, Amount, Txid};
+    use bitcoin::{
+        absolute::LockTime,
+        hashes::{sha256, Hash},
+        secp256k1::{Secp256k1, SecretKey},
+        Amount, PublicKey, Txid,
+    };
     use bitcoind::tempfile::tempdir;
     use serde_cbor::value::to_value;
 
@@ -666,6 +671,240 @@ mod tests {
             address_type: AddressType::P2WPKH,
         };
         (outpoint, (entry, info))
+    }
+
+    #[test]
+    fn compat_wallet_requirements_precede_password_and_decryption() {
+        let dir = tempdir().unwrap();
+        let (path, _, material) = stored_wallet(dir.path());
+        for name in ["future-v1", "legacy-v1", "ln-swap-in"] {
+            let file = WalletFile {
+                requires: vec![name.into()],
+                encrypted: serde_json::from_value(serde_json::json!({
+                    "nonce": material.nonce,
+                    "pbkdf2_salt": material.pbkdf2_salt,
+                    "encrypted_payload": [0],
+                }))
+                .unwrap(),
+            };
+            let bytes = serde_cbor::to_vec(&file).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(Wallet::is_wallet_encrypted(&path).unwrap());
+            for password in [None, Some(String::new()), Some("wrong".into())] {
+                let error = WalletStore::read_from_disk(&path, password).unwrap_err();
+                if name == "ln-swap-in" && cfg!(feature = "lightning") {
+                    assert!(!matches!(error, WalletError::NeedsUpgrade(_)));
+                } else {
+                    assert!(matches!(error, WalletError::NeedsUpgrade(names) if names == [name]));
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn compat_wallet_headers_authenticate_and_bare_files_remain_untouched() {
+        let dir = tempdir().unwrap();
+        let (path, store, material) = stored_wallet(dir.path());
+        let encrypted = encrypt_struct_with_aad(&store, &material, b"legacy\ntaproot").unwrap();
+        let file = WalletFile {
+            requires: vec!["taproot".into(), "legacy".into(), "taproot".into()],
+            encrypted: encrypted.clone(),
+        };
+        std::fs::write(&path, serde_cbor::to_vec(&file).unwrap()).unwrap();
+        assert_eq!(
+            WalletStore::read_from_disk(&path, Some(PASSWORD.into()))
+                .unwrap()
+                .0,
+            store
+        );
+        for requires in [vec![], vec!["legacy".into()], vec!["taproot".into()]] {
+            let file = WalletFile {
+                requires,
+                encrypted: encrypted.clone(),
+            };
+            let bytes = serde_cbor::to_vec(&file).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(matches!(
+                WalletStore::read_from_disk(&path, Some(PASSWORD.into())),
+                Err(WalletError::Security(SecurityError::Decryption))
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        let bare = serde_cbor::to_vec(&encrypt_struct(&store, &material).unwrap()).unwrap();
+        std::fs::write(&path, &bare).unwrap();
+        assert!(Wallet::is_wallet_encrypted(&path).unwrap());
+        for password in [None, Some(PASSWORD.into())] {
+            assert!(matches!(
+                WalletStore::read_from_disk(&path, password),
+                Err(WalletError::OldFormat)
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), bare);
+        }
+        std::fs::write(&path, b"garbage").unwrap();
+        assert!(!Wallet::is_wallet_encrypted(&path).unwrap());
+    }
+
+    #[test]
+    fn compat_wallet_and_bond_extra_survive_encrypted_rewrites() {
+        let dir = tempdir().unwrap();
+        let (path, mut store, material) = stored_wallet(dir.path());
+        let future = Value::Map(BTreeMap::from([(
+            Value::Text("nested".into()),
+            Value::Array(vec![Value::Bytes(vec![7, 8]), Value::Bool(true)]),
+        )]));
+        store.extra.insert("future_store".into(), future.clone());
+        store.external_index = 17;
+        store.internal_index = 23;
+        store.utxo_cache.extend([cache_entry(0), cache_entry(1)]);
+        store.fidelity_bond.push(FidelityBond {
+            outpoint: cache_entry(0).0,
+            amount: Amount::from_sat(123_456),
+            lock_time: LockTime::from_height(800_000).unwrap(),
+            pubkey: PublicKey::new(
+                SecretKey::from_slice(&[7; 32])
+                    .unwrap()
+                    .public_key(&Secp256k1::new()),
+            ),
+            conf_height: Some(799_000),
+            is_spent: false,
+            bond_index: 3,
+            tx: None,
+            extra: BTreeMap::from([("future_bond".into(), future)]),
+        });
+        for _ in 0..2 {
+            store.write_to_disk(&path, &material).unwrap();
+            let (read, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+            assert_eq!(read, store);
+            assert_eq!(
+                read.master_key.plaintext_with(&material),
+                store.master_key.plaintext_with(&material)
+            );
+            store = read;
+        }
+    }
+
+    #[test]
+    fn compat_cache_future_spend_info_drops_only_its_entry() {
+        let dir = tempdir().unwrap();
+        let (_, mut store, _) = stored_wallet(dir.path());
+        store.utxo_cache.extend([cache_entry(0), cache_entry(1)]);
+        store
+            .prevout_to_contract_map
+            .insert(cache_entry(0).0, ScriptBuf::from_bytes(vec![0x51]));
+        let mut value = to_value(&store).unwrap();
+        let Value::Map(fields) = &mut value else {
+            panic!()
+        };
+        let Value::Map(cache) = fields.get_mut(&Value::Text("utxo_cache".into())).unwrap() else {
+            panic!()
+        };
+        let mut future = to_value(cache_entry(2).1).unwrap();
+        let Value::Array(pair) = &mut future else {
+            panic!()
+        };
+        pair[1] = Value::Map(BTreeMap::from([(
+            Value::Text("FutureSpendInfo".into()),
+            Value::Map(BTreeMap::new()),
+        )]));
+        cache.insert(to_value(cache_entry(2).0).unwrap(), future);
+        cache.insert(
+            Value::Text("future-outpoint".into()),
+            to_value(cache_entry(3).1).unwrap(),
+        );
+        let decoded: WalletStore =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded.utxo_cache, store.utxo_cache);
+        assert_eq!(
+            decoded.prevout_to_contract_map,
+            store.prevout_to_contract_map
+        );
+        assert_eq!(decoded, store);
+    }
+
+    #[test]
+    fn compat_lightning_records_derive_requirements_in_every_build() {
+        let dir = tempdir().unwrap();
+        let (path, mut store, material) = stored_wallet(dir.path());
+        for (direction, phases, name) in [
+            (
+                LnMakerDirection::SwapIn,
+                vec![
+                    LnMakerPhase::InAccepted,
+                    LnMakerPhase::InPaid,
+                    LnMakerPhase::InSwept,
+                ],
+                "ln-swap-in",
+            ),
+            (
+                LnMakerDirection::SwapOut,
+                vec![LnMakerPhase::OutAccepted, LnMakerPhase::OutFunded],
+                "ln-swap-out",
+            ),
+        ] {
+            for phase in phases {
+                store.ln_pending_swaps.clear();
+                store.ln_maker_swaps.clear();
+                let record = LnMakerSwapRecord {
+                    direction,
+                    phase,
+                    payment_hash: sha256::Hash::hash(b"compat-payment"),
+                    amount: Amount::from_sat(50_000),
+                    fee: Amount::from_sat(500),
+                    locktime: 60,
+                    min_confirmations: 2,
+                    redeemscript: ScriptBuf::from_bytes(vec![0x51]),
+                    privkey: SecretKey::from_slice(&[9; 32]).unwrap(),
+                    invoice: "invoice".into(),
+                    preimage: Some([8; 32]),
+                    refund_txid: Some(Txid::all_zeros()),
+                    accepted_height: Some(42),
+                    payout_script: Some(ScriptBuf::from_bytes(vec![0x52])),
+                    funding_outpoint: Some(cache_entry(0).0),
+                    funding_value: Some(Amount::from_sat(50_000)),
+                    funding_height: Some(43),
+                };
+                let mut names = BTreeSet::new();
+                record.requires(&mut names);
+                assert_eq!(names, BTreeSet::from([name]));
+                store.ln_maker_swaps.insert("maker".into(), record);
+                let pending = LnPendingSwap {
+                    is_swap_in: direction == LnMakerDirection::SwapIn,
+                    preimage: Some([8; 32]),
+                    redeemscript: ScriptBuf::from_bytes(vec![0x51]),
+                    locktime: 60,
+                    privkey: SecretKey::from_slice(&[9; 32]).unwrap(),
+                    outpoint: Some(cache_entry(0).0),
+                    value: Some(Amount::from_sat(50_000)),
+                };
+                let mut pending_names = BTreeSet::new();
+                pending.requires(&mut pending_names);
+                assert_eq!(pending_names, names);
+                store.ln_pending_swaps.insert("taker".into(), pending);
+                store.write_to_disk(&path, &material).unwrap();
+                let bytes = std::fs::read(&path).unwrap();
+                let file: WalletFile = serde_cbor::from_slice(&bytes).unwrap();
+                assert_eq!(file.requires, [name]);
+                let read = WalletStore::read_from_disk(&path, Some(PASSWORD.into()));
+                if cfg!(feature = "lightning") {
+                    assert_eq!(read.unwrap().0, store);
+                } else {
+                    assert!(
+                        matches!(read, Err(WalletError::NeedsUpgrade(names)) if names == [name])
+                    );
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            }
+        }
+        store.ln_pending_swaps.get_mut("taker").unwrap().is_swap_in = true;
+        store.write_to_disk(&path, &material).unwrap();
+        let union: WalletFile = serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(union.requires, ["ln-swap-in", "ln-swap-out"]);
+        store.ln_pending_swaps.clear();
+        store.ln_maker_swaps.clear();
+        store.write_to_disk(&path, &material).unwrap();
+        let file: WalletFile = serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(file.requires.is_empty());
     }
 
     #[test]
@@ -714,7 +953,7 @@ mod tests {
         let write = |requires: &[&str], aad: &[&str]| {
             let file = WalletFile {
                 requires: requires.iter().map(|n| n.to_string()).collect(),
-                encrypted: encrypt_struct(&store, &material, &requires_aad(aad)).unwrap(),
+                encrypted: encrypt_struct_with_aad(&store, &material, &requires_aad(aad)).unwrap(),
             };
             let bytes = serde_cbor::to_vec(&file).unwrap();
             std::fs::write(&path, &bytes).unwrap();
@@ -733,7 +972,7 @@ mod tests {
             WalletError::Security(SecurityError::Decryption)
         ));
 
-        let bare = encrypt_struct(&store, &material, &[]).unwrap();
+        let bare = encrypt_struct(&store, &material).unwrap();
         std::fs::write(&path, serde_cbor::to_vec(&bare).unwrap()).unwrap();
         let error = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap_err();
         assert!(matches!(error, WalletError::OldFormat));

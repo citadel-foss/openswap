@@ -302,10 +302,17 @@ pub struct EncryptedData {
 ///
 /// The resulting `EncryptedData` can be serialized and stored to disk. To decrypt it later,
 /// use [`decrypt_struct`].
-///
-/// `aad` is authenticated but not encrypted: decryption fails unless the same
-/// bytes are supplied. Empty for everything except the wallet envelope.
 pub fn encrypt_struct<T: Serialize>(
+    plain_struct: T,
+    enc_material: &KeyMaterial,
+) -> Result<EncryptedData, EncryptError> {
+    encrypt_struct_with_aad(plain_struct, enc_material, &[])
+}
+
+/// [`encrypt_struct`] with associated data. `aad` is authenticated but not
+/// encrypted: decryption fails unless the same bytes are supplied. Used only
+/// by the wallet envelope.
+pub fn encrypt_struct_with_aad<T: Serialize>(
     plain_struct: T,
     enc_material: &KeyMaterial,
     aad: &[u8],
@@ -351,6 +358,14 @@ pub fn encrypt_struct<T: Serialize>(
 pub fn decrypt_struct<T: DeserializeOwned>(
     encrypted_struct: EncryptedData,
     enc_material: &KeyMaterial,
+) -> Result<T, SecurityError> {
+    decrypt_struct_with_aad(encrypted_struct, enc_material, &[])
+}
+
+/// [`decrypt_struct`] with the associated data the data was encrypted with.
+pub fn decrypt_struct_with_aad<T: DeserializeOwned>(
+    encrypted_struct: EncryptedData,
+    enc_material: &KeyMaterial,
     aad: &[u8],
 ) -> Result<T, SecurityError> {
     // Deserialize the outer EncryptedWalletStore wrapper.
@@ -388,7 +403,7 @@ pub(crate) fn decrypt_with_password<T: DeserializeOwned>(
     aad: &[u8],
 ) -> Result<(T, KeyMaterial), SecurityError> {
     let material = KeyMaterial::existing(password, encrypted.nonce, encrypted.pbkdf2_salt);
-    let decrypted = decrypt_struct(encrypted, &material, aad)?;
+    let decrypted = decrypt_struct_with_aad(encrypted, &material, aad)?;
     Ok((decrypted, material))
 }
 
@@ -443,7 +458,7 @@ pub fn load_sensitive_struct<T: DeserializeOwned, F: SerdeFormat>(
                 encrypted_struct.nonce,
                 encrypted_struct.pbkdf2_salt,
             );
-            let decrypted = decrypt_struct::<T>(encrypted_struct, &enc_material, &[])?;
+            let decrypted = decrypt_struct::<T>(encrypted_struct, &enc_material)?;
 
             return Ok((decrypted, Some(enc_material)));
         }
@@ -464,7 +479,7 @@ pub fn load_sensitive_struct<T: DeserializeOwned, F: SerdeFormat>(
                     encrypted_struct.pbkdf2_salt,
                 );
 
-                let decrypted = decrypt_struct::<T>(encrypted_struct, &enc_material, &[])?;
+                let decrypted = decrypt_struct::<T>(encrypted_struct, &enc_material)?;
 
                 (decrypted, Some(enc_material))
             }
@@ -484,18 +499,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compat_aad_vectors_and_legacy_ciphertext_are_frozen() {
+        assert_eq!(requires_aad::<&str>(&[]), b"");
+        assert_eq!(
+            requires_aad(&["taproot", "legacy", "taproot"]),
+            b"legacy\ntaproot"
+        );
+        assert_eq!(
+            requires_aad(&["x-v2", "x-v10", "x-v1"]),
+            b"x-v1\nx-v10\nx-v2"
+        );
+        let material = KeyMaterial::new_from_password(Some("compat-password".into())).unwrap();
+        let aad = requires_aad(&["taproot", "legacy"]);
+        let encrypted = encrypt_struct_with_aad("known payload", &material, &aad).unwrap();
+        assert_eq!(
+            decrypt_struct_with_aad::<String>(encrypted.clone(), &material, &aad).unwrap(),
+            "known payload"
+        );
+        for wrong in [
+            Vec::new(),
+            b"taproot".to_vec(),
+            b"legacy\ntaproot\n".to_vec(),
+        ] {
+            assert!(matches!(
+                decrypt_struct_with_aad::<String>(encrypted.clone(), &material, &wrong),
+                Err(SecurityError::Decryption)
+            ));
+        }
+        let old_compatible = encrypt_struct("old payload", &material).unwrap();
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(material.key));
+        let plain = cipher
+            .decrypt(
+                &aes_gcm::Nonce::from(old_compatible.nonce),
+                old_compatible.encrypted_payload.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_cbor::from_slice::<String>(&plain).unwrap(),
+            "old payload"
+        );
+    }
+
+    #[test]
     fn encryption_rotates_nonce_for_same_key_material() {
         let material = KeyMaterial::new_from_password(Some("test password".to_string())).unwrap();
-        let first = encrypt_struct("wallet state", &material, &[]).unwrap();
-        let second = encrypt_struct("wallet state", &material, &[]).unwrap();
+        let first = encrypt_struct("wallet state", &material).unwrap();
+        let second = encrypt_struct("wallet state", &material).unwrap();
 
         assert_ne!(first.nonce, second.nonce);
         assert_eq!(
-            decrypt_struct::<String>(first, &material, &[]).unwrap(),
+            decrypt_struct::<String>(first, &material).unwrap(),
             "wallet state"
         );
         assert_eq!(
-            decrypt_struct::<String>(second, &material, &[]).unwrap(),
+            decrypt_struct::<String>(second, &material).unwrap(),
             "wallet state"
         );
     }
@@ -516,7 +573,7 @@ mod tests {
         };
 
         assert_eq!(
-            decrypt_struct::<String>(encrypted, &material, &[]).unwrap(),
+            decrypt_struct::<String>(encrypted, &material).unwrap(),
             "legacy wallet state"
         );
     }
