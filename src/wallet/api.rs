@@ -973,6 +973,13 @@ impl Wallet {
             }
             return Err(error);
         }
+        for (key, _) in &outgoing {
+            log::info!(
+                "Removed outgoing swapcoin: {} (remaining: {})",
+                key,
+                self.store.outgoing_swapcoins.len()
+            );
+        }
         Ok(())
     }
 
