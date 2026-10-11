@@ -4,7 +4,7 @@
 //! and comparing its script pubkey with the scripts derived from listed addresses.
 
 use crate::{
-    atomic_file::{read_json, write_json_atomically, FileLock},
+    atomic_file::{write_json_atomically, FileLock},
     protocol::features::{check_requires, supported},
     utill::parse_checked_address,
     wallet::{Wallet, WalletError},
@@ -63,7 +63,12 @@ struct BlocklistHeader {
 
 /// Reads the blocklist, refusing it when it needs a name this build can't serve.
 fn read_blocklist(path: &Path) -> Result<BlocklistFile, BlocklistError> {
-    let header: BlocklistHeader = read_json(path)?;
+    if !path.exists() {
+        return Ok(BlocklistFile::default());
+    }
+    // One read: the header check and the entries must see the same bytes.
+    let content = std::fs::read_to_string(path)?;
+    let header: BlocklistHeader = serde_json::from_str(&content).map_err(io::Error::other)?;
     check_requires(&header.requires, &supported()).map_err(|missing| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -73,7 +78,7 @@ fn read_blocklist(path: &Path) -> Result<BlocklistFile, BlocklistError> {
             ),
         )
     })?;
-    Ok(read_json(path)?)
+    Ok(serde_json::from_str(&content).map_err(io::Error::other)?)
 }
 
 /// Errors produced while storing or applying the funding-source blocklist.
@@ -375,12 +380,138 @@ mod tests {
     use bitcoind::tempfile::tempdir;
 
     use super::*;
+    use crate::atomic_file::read_json;
+    #[cfg(unix)]
+    use std::{fs::OpenOptions, io::Write, process::Command, thread};
+
+    #[derive(Deserialize)]
+    struct CompatV023Blocklist {
+        entries: Vec<BlocklistEntry>,
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compat_blocklist_header_and_entries_use_one_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("blocklist.json");
+        assert!(Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        let replacement = path.clone();
+        // Opening the writer proves the first read holds the pipe. Replace
+        // its pathname before releasing EOF, so any second read sees new bytes.
+        let writer = thread::spawn(move || {
+            let mut first = OpenOptions::new().write(true).open(&replacement).unwrap();
+            std::fs::rename(&replacement, replacement.with_extension("first")).unwrap();
+            std::fs::write(&replacement, br#"{"requires":["future-v1"],"entries":[]}"#).unwrap();
+            first.write_all(br#"{"requires":[],"entries":[]}"#).unwrap();
+        });
+        let read = read_blocklist(&path);
+        writer.join().unwrap();
+        let file = read.unwrap();
+        assert!(
+            file.requires.is_empty(),
+            "entry snapshot escaped its header check: {:?}",
+            file.requires
+        );
+    }
 
     fn test_address(secret_byte: u8, network: Network) -> Address {
         let secp = Secp256k1::new();
         let secret = SecretKey::from_slice(&[secret_byte; 32]).unwrap();
         let keypair = Keypair::from_secret_key(&secp, &secret);
         Address::p2tr(&secp, keypair.x_only_public_key().0, None, network)
+    }
+
+    #[test]
+    fn compat_blocklist_requirements_are_checked_before_entry_shapes() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("maker");
+        let path = blocklist_path(&data_dir);
+        for entries in ["true", "[{}]", "[\"future entry\"]"] {
+            let raw = format!(r#"{{"requires":["future-v1"],"entries":{}}}"#, entries);
+            std::fs::write(&path, &raw).unwrap();
+            let error = AddressBlocklist::load(&data_dir, Network::Regtest)
+                .err()
+                .expect("unknown requirement must refuse");
+            assert!(
+                error.to_string().contains("needs a newer build"),
+                "{}",
+                error
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn compat_blocklist_mutations_recheck_requirements_without_data_loss() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("maker");
+        let address = test_address(1, Network::Regtest).to_string();
+        let mut book = AddressBlocklist::load(&data_dir, Network::Regtest).unwrap();
+        let entry = BlocklistEntry::new(address.clone(), Some("keep".into()));
+        book.add(vec![entry.clone()]).unwrap();
+        let raw = format!(
+            r#"{{"requires":["future-v1"],"entries":[{}]}}"#,
+            serde_json::to_string(&entry).unwrap()
+        );
+        std::fs::write(book.path(), &raw).unwrap();
+        assert!(book
+            .add(vec![entry.clone()])
+            .unwrap_err()
+            .to_string()
+            .contains("needs a newer build"));
+        assert!(book
+            .remove(vec![address])
+            .unwrap_err()
+            .to_string()
+            .contains("needs a newer build"));
+        assert_eq!(std::fs::read_to_string(book.path()).unwrap(), raw);
+        assert_eq!(book.inner.values().collect::<Vec<_>>(), [&entry]);
+    }
+
+    #[test]
+    fn compat_blocklist_old_files_and_known_headers_survive_writes() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("maker");
+        let path = blocklist_path(&data_dir);
+        let entry = BlocklistEntry::new(
+            test_address(1, Network::Regtest).to_string(),
+            Some("old".into()),
+        );
+        let entries = vec![entry.clone()];
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"entries": entries})).unwrap(),
+        )
+        .unwrap();
+        let mut book = AddressBlocklist::load(&data_dir, Network::Regtest).unwrap();
+        assert_eq!(book.inner.values().collect::<Vec<_>>(), [&entry]);
+        let requires = vec!["taproot".to_string(), "legacy".into(), "taproot".into()];
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&BlocklistFile {
+                requires: requires.clone(),
+                entries,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let added = BlocklistEntry::new(test_address(2, Network::Regtest).to_string(), None);
+        book.add(vec![added.clone()]).unwrap();
+        let saved: BlocklistFile = read_json(&path).unwrap();
+        assert_eq!(saved.requires, requires);
+        // v0.2.3 ignores the header and reads the same address list.
+        let old: CompatV023Blocklist =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(old.entries.len(), 2);
+        assert!(old.entries.contains(&entry));
+        book.remove(vec![added.address]).unwrap();
+        let saved: BlocklistFile = read_json(&path).unwrap();
+        assert_eq!(saved.requires, requires);
+        assert_eq!(saved.entries, [entry]);
     }
 
     #[test]
