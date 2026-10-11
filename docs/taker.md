@@ -616,8 +616,8 @@ v0.2.3 cannot open the new wallet. The `.v023` copies are only a snapshot from t
 
 Go back only like this:
 
-1. Stop every daemon that uses this data directory.
-2. Wait until every swap you started after the upgrade has finished and is gone from the wallet.
+1. Keep your daemons running until every swap you started after the upgrade has finished and is gone from the wallet. Pending refunds need them.
+2. Stop every daemon that uses this data directory.
 3. Make a fresh copy of the whole new wallet file and keep it.
 4. Restore the `.v023` copies.
 
@@ -632,4 +632,4 @@ Go back only like this:
 Before your node sends funding, it saves the coin as committed. Your node then keeps that coin until a timelock refund, or until a confirmed transaction spends its inputs elsewhere. A crash between the save and the send can leave a coin held this way.
 
 - **If the funding reached the chain**, leave your node running. The refund frees the coin when its timelock matures.
-- **If the funding never left your node**, nothing is on the chain and your original coins are untouched. No refund happens in this case. Older legacy swaps cannot clear the held record by themselves. Do not edit the wallet file. Ask for help in the [community forum](https://matrix.to/#/#citadel-foss:matrix.org) or open an issue.
+- **If the funding never left your node**, nothing is on the chain and your original coins are untouched. A Taproot swap still sends its saved funding and then refunds, so keep recovery running. A legacy swap cannot clear the held record by itself. Do not edit the wallet file. Ask for help in the [community forum](https://matrix.to/#/#citadel-foss:matrix.org) or open an issue.
