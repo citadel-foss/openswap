@@ -5,17 +5,17 @@
 //! nodes sharing a payment network.
 
 use std::{
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
     thread,
     time::{Duration, Instant},
 };
 
-use bitcoin::Amount;
+use bitcoin::{Amount, OutPoint};
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     blocklist::BlocklistError,
     lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest},
-    maker::{start_server, MakerBehavior},
+    maker::{lightning_handlers::LnMakerPhase, start_server, MakerBehavior},
     taker::{error::TakerError, lightning_swap::LnSwapParams, Taker, TakerBehavior},
     wallet::AddressType,
 };
@@ -349,7 +349,9 @@ fn lightning_swap_in_refuses_blocklisted_funding() {
 }
 
 /// A maker must refuse a swap-in whose funding message announces a value the
-/// funded output does not hold, and must forget the swap when it does.
+/// funded output does not hold. Until the output is validated the message
+/// could come from anyone who knows the swap id, so the maker must keep the
+/// accepted swap rather than forget it.
 #[test]
 fn lightning_swap_in_refuses_announced_value_mismatch() {
     let (maker_ln, taker_ln) = ready_channel_pair();
@@ -389,13 +391,40 @@ fn lightning_swap_in_refuses_announced_value_mismatch() {
 
     // The funding itself is honest: only the announced value is one sat off,
     // so the value check is the one that refuses.
+    //
+    // The taker announces only once its funding has confirmed, so the maker
+    // checks the value as soon as the message arrives. The taker then waits
+    // minutes for a payment that never comes, long enough for the watchdog
+    // to expire the swap the maker kept. Stop the blocks once the message
+    // is in, so the record checked below is the one the refusal left.
     let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
-    let result = taker.lightning_swap_in(LnSwapParams {
-        amount: Amount::from_sat(50_000),
-        maker_address: Some(maker_address),
-        locktime: None,
-        min_confirmations: 1,
+    let dispatched = "Dispatching Lightning message: SwapInFunded";
+    let swap_done = AtomicBool::new(false);
+    let (result, paused) = thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            while !swap_done.load(Relaxed) {
+                let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if contents
+                    .get(log_offset as usize..)
+                    .is_some_and(|new| new.contains(dispatched))
+                {
+                    test_framework.set_block_gen_paused(true);
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            false
+        });
+        let result = taker.lightning_swap_in(LnSwapParams {
+            amount: Amount::from_sat(50_000),
+            maker_address: Some(maker_address),
+            locktime: None,
+            min_confirmations: 1,
+        });
+        swap_done.store(true, Relaxed);
+        (result, watcher.join().unwrap())
     });
+    assert!(paused, "the maker never received the funding message");
     assert!(
         result.is_err(),
         "the maker completed a swap-in with a misannounced value: {:?}",
@@ -406,25 +435,54 @@ fn lightning_swap_in_refuses_announced_value_mismatch() {
         None,
         "the maker paid the invoice of a refused swap-in"
     );
-    assert!(
-        makers[0].ln_swaps.lock().unwrap().is_empty(),
-        "the refused swap-in still holds a maker swap slot"
+    let kept: Vec<_> = makers[0]
+        .ln_swaps
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    assert_eq!(
+        kept.len(),
+        1,
+        "the refusal of an unvalidated announcement deleted the accepted swap"
     );
-    // The refusal came minutes before the taker gave up waiting, so its log
-    // line is already written.
+    let kept = &kept[0];
+    assert_eq!(kept.phase, LnMakerPhase::InAccepted);
+    assert_eq!(kept.funding, None);
+
+    // Only the value check can have refused: the funding the taker
+    // broadcast passes the maker's own output check for this swap, and no
+    // check after it refused.
     let contents = std::fs::read_to_string(&log_path).unwrap();
-    let refusals = contents
-        .get(log_offset as usize..)
-        .unwrap_or_default()
+    let new_lines = contents.get(log_offset as usize..).unwrap_or_default();
+    let outpoint: OutPoint = new_lines
+        .lines()
+        .find_map(|line| line.split_once("HTLC funding broadcast: "))
+        .and_then(|(_, rest)| rest.split_once(','))
+        .and_then(|(outpoint, _)| outpoint.parse().ok())
+        .expect("the taker logs its funding outpoint");
+    let funding_tx = bitcoind
+        .client
+        .get_raw_transaction(&outpoint.txid, None)
+        .unwrap();
+    kept.htlc
+        .validate_funding_output(
+            &funding_tx.output[outpoint.vout as usize],
+            kept.amount + kept.fee,
+        )
+        .expect("the taker's funding is valid for this swap");
+    let refusals: Vec<&str> = new_lines
         .lines()
         .filter(|line| line.contains(": refused: "))
-        .collect::<Vec<_>>();
+        .collect();
     assert!(
-        refusals.len() == 1 && refusals[0].ends_with(": refused: announced value mismatch"),
-        "the maker must refuse once, for the announced value: {:?}",
+        refusals.is_empty(),
+        "a check after the value check refused: {:?}",
         refusals
     );
 
+    test_framework.set_block_gen_paused(false);
     drop(takers);
     shutdown_makers(&makers, maker_threads);
     test_framework.stop();

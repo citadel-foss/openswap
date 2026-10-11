@@ -331,7 +331,7 @@ fn stale_swap_in_refusal_keeps_paid_swap() {
     maker.store_ln_swap(&paid_id, paid).unwrap();
 
     for swap_id in [&paid_id, &unfunded_id] {
-        let reply = refuse_swap_in_after_wait(&maker, swap_id, "announced value mismatch")
+        let reply = refuse_swap_in_after_wait(&maker, swap_id, "funding refused")
             .expect("the refusal still answers the taker");
         match expect_ln(reply) {
             LightningMakerMessage::Reject(reject) => assert_eq!(&reject.swap_id, swap_id),
@@ -383,6 +383,115 @@ fn stale_swap_in_refusal_keeps_paid_swap() {
     drop(takers);
     restarted.shutdown.store(true, Relaxed);
     restarted.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// Until the announced output is shown to pay the swap's HTLC, a funded
+/// message could come from anyone who knows the swap id, such as the next
+/// maker on a routed swap. A forged announcement must be rejected without
+/// forgetting the swap, so the honest taker's funding can still complete it.
+#[test]
+fn forged_swap_in_funding_keeps_accepted_swap() {
+    log::warn!("Running Test: forged swap-in funding keeps the accepted swap");
+
+    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers[0].clone();
+    let router = maker.ln_router.clone().unwrap();
+
+    let preimage = Preimage([0x71; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    router.subscribe(preimage.payment_hash());
+    maker
+        .store_ln_swap(&swap_id, accepted_swap_in(&preimage))
+        .unwrap();
+
+    // The forger's own confirmed transaction, which pays an address of its
+    // own rather than the swap's HTLC.
+    let forger_address = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap();
+    let forged_txid = send_to_address(bitcoind, &forger_address, Amount::from_sat(40_500));
+    generate_blocks(bitcoind, 1);
+    let forged_tx = bitcoind
+        .client
+        .get_raw_transaction(&forged_txid, None)
+        .unwrap();
+    let vout = forged_tx
+        .output
+        .iter()
+        .position(|output| output.script_pubkey == forger_address.script_pubkey())
+        .unwrap();
+    let outpoint = OutPoint {
+        txid: forged_txid,
+        vout: vout as u32,
+    };
+    let value = forged_tx.output[vout].value;
+
+    // A wrong value trips the value check, the right one the output check.
+    for (announced, reason) in [
+        (value + Amount::from_sat(1), "announced value mismatch"),
+        (value, "bad funding output"),
+    ] {
+        let mut state = ConnectionState::default();
+        handle_message(
+            &maker,
+            &mut state,
+            TakerToMakerMessage::TakerHello(TakerHello),
+        )
+        .unwrap();
+        let reply = handle_message(
+            &maker,
+            &mut state,
+            ln_message(LightningTakerMessage::SwapInFunded(LnHtlcFunded {
+                swap_id: swap_id.clone(),
+                outpoint,
+                value: announced,
+            })),
+        )
+        .unwrap();
+        match expect_ln(reply) {
+            LightningMakerMessage::Reject(reject) => {
+                assert_eq!(reject.swap_id, swap_id);
+                assert!(
+                    reject.reason.starts_with(reason),
+                    "expected a refusal for {reason}, got {}",
+                    reject.reason
+                );
+            }
+            other => panic!("expected a Reject, got {}", other),
+        }
+        let kept = maker
+            .get_ln_swap(&swap_id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("a forged announcement ({}) deleted the swap", reason));
+        assert_eq!(kept.phase, LnMakerPhase::InAccepted);
+        assert_eq!(kept.funding, None);
+    }
+    assert!(
+        mailbox_open(&maker, &ln, &preimage),
+        "a forged announcement closed the swap's mailbox"
+    );
+    assert_eq!(
+        ln.last_pay_cltv_bound(),
+        None,
+        "the maker paid against a forged announcement"
+    );
+
+    drop(takers);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

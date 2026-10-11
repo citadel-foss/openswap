@@ -658,11 +658,15 @@ fn handle_swap_in_funded<M: Maker>(
         .get(funded.outpoint.vout as usize)
         .ok_or(MakerError::General("funding vout out of range"))?;
     let expected = swap.amount + swap.fee;
+    // Until the output is shown to pay this swap's HTLC, the announcement
+    // could come from anyone who knows the swap id, such as the next maker
+    // on a routed swap. Reject without forgetting the swap, so a forged
+    // announcement cannot drop the honest taker's swap.
     if funded.value != output.value {
-        return refuse_swap_in(maker, &funded.swap_id, "announced value mismatch");
+        return Ok(reject(&funded.swap_id, "announced value mismatch"));
     }
     if let Err(e) = swap.htlc.validate_funding_output(output, expected) {
-        return refuse_swap_in(maker, &funded.swap_id, format!("bad funding output: {e}"));
+        return Ok(reject(&funded.swap_id, format!("bad funding output: {e}")));
     }
     // Our blocklist is local policy, not taker misbehaviour: refuse without
     // paying, and keep the matched entry out of the reply.
