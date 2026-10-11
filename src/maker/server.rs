@@ -1259,15 +1259,20 @@ fn recover_from_swap(
                                         coin.other_privkey.is_none() && !coin.is_preimage_known()
                                     })
                                 }));
-                        if settled {
-                            let saved = wallet.remove_swap_coins_and_save(&swap_id, true, true);
-                            drop(wallet);
-                            match saved {
-                                Ok(()) => return Ok(()),
-                                Err(error) => {
-                                    log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
-                                    tried_at = None;
-                                }
+                        // An unsettled swap keeps its coins for the next restart,
+                        // as before; only a failed cleanup save retries here.
+                        if !settled {
+                            return Ok(());
+                        }
+                        let saved = wallet.remove_swap_coins_and_save(&swap_id, true, true);
+                        drop(wallet);
+                        match saved {
+                            Ok(()) => return Ok(()),
+                            Err(error) => {
+                                log::warn!(
+                                    "Cannot save cleanup for swap {swap_id}: {error:?}; retrying"
+                                );
+                                tried_at = None;
                             }
                         }
                     }
