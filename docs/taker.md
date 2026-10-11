@@ -564,7 +564,7 @@ The data directory contains the following files:
 2. `debug.log` - The log file for the taker.
 3. `wallets` directory - Contains the wallet files for the taker.
 4. `offerbook.json` - The locally cached offerbook of known makers, updated by `fetch-offers` and `poll-maker`.
-5. `swap_tracker.cbor` - The saved state of your swaps, used to resume recovery after a restart.
+5. `swap_tracker.cbor` - Only present if you used v0.2.3. This release does not read or write it. Delete it after every wallet is upgraded.
 
 **Default Taker Configuration (`~/.openswap/taker/config.toml`):**
 
@@ -584,3 +584,42 @@ check_blocklist = false
 ### Wallets
 
 The taker uses wallet files to store the wallet data. The wallet files are stored in the `wallets` directory. These wallet files should be safely backed up as they contain the private keys to the wallet.
+
+## Upgrading and downgrading
+
+This release is a one-time break. After it, later releases stay compatible with each other.
+
+### Before you upgrade
+
+1. **Stop every v0.2.3 process** that uses this data directory. This includes `makerd` and any `taker` on the same wallet.
+2. Do not skip step 1. An old process that keeps running can overwrite the new swap keys. That can lose funds.
+3. Finish every open swap on v0.2.3. Start v0.2.3 once if a swap is half done. The new version refuses to upgrade a wallet with open work. It changes nothing and tells you why.
+
+### What the upgrade does
+
+1. The first start loads your old wallet and checks that nothing is open.
+2. It saves private copies of your old wallet and old swap report. They end in `.v023`. Only you can read them.
+3. It writes the new wallet file. Your swap reports move into it.
+4. It deletes the old report file.
+
+The new wallet file also keeps the swap state that older versions kept in tracker files.
+
+### After you upgrade
+
+1. Upgrade every wallet in this data directory.
+2. Then delete `maker_swap_tracker.cbor` and `swap_tracker.cbor` by hand. The software never deletes them. They hold swap secrets in clear text.
+3. Keep the `.v023` copies for as long as you may go back.
+
+### Going back
+
+v0.2.3 cannot open the new wallet. To go back, restore the `.v023` copies over the new files.
+
+### Later releases
+
+- A newer wallet may need a feature your build does not have. Your build then refuses to open it and names the missing feature. Upgrade and try again.
+- The `require_features` setting lists features you insist on in every swap. It must sit on one line. That line takes no comment.
+- Changing the default of `require_features` in a later release counts as a break.
+
+### A coin that stays locked
+
+Before your node sends funding, it saves the coin as committed. Your node then keeps that coin until a timelock refund, or until a confirmed transaction spends its inputs elsewhere. A crash between the save and the send can leave a coin held this way. The funds stay in your wallet. Leave your node running. The refund frees the coin when its timelock matures.

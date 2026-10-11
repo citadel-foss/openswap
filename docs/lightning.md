@@ -216,6 +216,10 @@ node running — or re-run `recover` later — until it reports the swap as
 resolved. A maker restarting mid-swap recovers the same way: its records are
 restored into the live swap map on startup so it can still sweep or refund.
 
+## Upgrading and downgrading
+
+Lightning swap state lives in your wallet file. A build without the `lightning` feature refuses a wallet that holds Lightning swaps and names the missing feature. Build with `--features lightning` to open it. The upgrade steps for the wallet itself are in the [maker doc](makerd.md#upgrading-and-downgrading) and the [taker doc](taker.md#upgrading-and-downgrading).
+
 ## Current limitations
 
 - `ln-swap-out` needs a maker whose `ldk-server` is patched to allow a larger
