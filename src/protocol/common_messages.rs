@@ -41,15 +41,22 @@ pub enum ProtocolVersion {
     Taproot,
 }
 
-/// Initial handshake from Taker to Maker.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct TakerHello;
+impl ProtocolVersion {
+    /// The feature name of this protocol's flow.
+    pub fn feature_name(self) -> &'static str {
+        match self {
+            ProtocolVersion::Legacy => "legacy",
+            ProtocolVersion::Taproot => "taproot",
+        }
+    }
+}
 
-/// Handshake response from Maker to Taker.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MakerHello {
-    /// Protocol versions this maker supports.
-    pub supported_protocols: Vec<ProtocolVersion>,
+/// First message on every connection, both ways. Frozen: it only ever gains
+/// defaulted fields, because it is how peers learn what changed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct Hello {
+    /// Feature names the sender supports.
+    pub features: Vec<String>,
 }
 
 /// Request for offer from Taker to Maker.
@@ -226,8 +233,8 @@ pub struct PrivateKeyHandover {
 /// All messages sent from Taker to Maker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TakerToMakerMessage {
-    /// Initial handshake with version negotiation.
-    TakerHello(TakerHello),
+    /// Handshake; must be the first message on every connection.
+    Hello(Hello),
     /// Request maker's offer.
     GetOffer(GetOffer),
     /// Propose swap parameters (determines protocol path).
@@ -262,8 +269,8 @@ pub enum TakerToMakerMessage {
 /// All messages sent from Maker to Taker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MakerToTakerMessage {
-    /// Handshake response with version negotiation.
-    MakerHello(MakerHello),
+    /// Handshake reply, sent once the taker's Hello meets our requirements.
+    Hello(Hello),
     /// Maker's offer (fees, limits, fidelity bond).
     Offer(Box<Offer>),
     /// Acknowledgment of swap parameters.
@@ -287,11 +294,8 @@ pub enum MakerToTakerMessage {
     Unsupported(UnsupportedMessage),
 }
 
-/// Graceful rejection of a message family the receiver does not handle.
-///
-/// Both sides understand this variant from the release that introduced the
-/// Lightning family onward, so a capable-but-unconfigured peer can decline a
-/// request with a reason instead of a dropped connection.
+/// Graceful rejection of a message the receiver does not handle. Frozen like
+/// [`Hello`]. The sender closes the connection after it, and it is never answered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnsupportedMessage {
     /// Name of the message (family) that was rejected.

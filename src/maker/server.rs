@@ -740,6 +740,8 @@ fn handle_connection(
                 maker.config.network_port
             );
         }
+        // We close after a refusal, so the taker never has to count them.
+        let refused = matches!(response, Some(MakerToTakerMessage::Unsupported(_)));
         if let Some(response) = response.filter(|_| send_response) {
             log::debug!(
                 "[{}] Sending response: {:?}",
@@ -757,6 +759,9 @@ fn handle_connection(
                     break;
                 }
             }
+        }
+        if refused {
+            break;
         }
 
         #[cfg(feature = "integration-test")]

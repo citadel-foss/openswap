@@ -33,10 +33,11 @@ use crate::{
     maker::nostr::NOSTR_RELAYS,
     protocol::{
         common_messages::{
-            GetOffer, MakerToTakerMessage, Offer, PrivateKeyHandover, ProtocolVersion, SwapDetails,
-            SwapPrivkey, TakerHello, TakerToMakerMessage,
+            GetOffer, Hello, MakerToTakerMessage, Offer, PrivateKeyHandover, ProtocolVersion,
+            SwapDetails, SwapPrivkey, TakerToMakerMessage,
         },
         contract::calculate_pubkey_from_nonce,
+        features::{supported, KNOWN},
     },
     utill::{
         funding_fee_policy_sats, generate_maker_keys, get_taker_dir, read_message, send_message,
@@ -1930,8 +1931,7 @@ impl Taker {
         log::info!("Connecting to maker {} at {}", maker_idx, maker_address);
 
         let mut stream = self.net_connect(&maker_address)?;
-
-        let negotiated_protocol = self.net_handshake(&mut stream)?;
+        let negotiated_protocol = self.swap_state()?.params.protocol;
         log::info!("Handshake complete, protocol: {:?}", negotiated_protocol);
 
         // Fetch the maker's offer before proposing swap details.
@@ -2125,23 +2125,10 @@ impl Taker {
         maker_address: &str,
         details: &SwapDetails,
     ) -> Result<MakerToTakerMessage, TakerError> {
-        let mut stream = self.net_connect(maker_address)?;
-        // net_handshake reads the live swap state, but a replay can target a
-        // swap that already aborted and cleared it; take the protocol from the
-        // details being replayed instead.
-        send_message(&mut stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(&mut stream)?)?;
-        match msg {
-            MakerToTakerMessage::MakerHello(hello)
-                if hello
-                    .supported_protocols
-                    .contains(&details.protocol_version) => {}
-            _ => {
-                return Err(TakerError::General(
-                    "Expected MakerHello supporting the replayed protocol".to_string(),
-                ))
-            }
-        }
+        // A replay can target a swap that already aborted and cleared the live
+        // state, so the maker must list what the replayed details use.
+        let needed = [details.protocol_version.feature_name().to_string()];
+        let (mut stream, _) = self.net_connect_with(maker_address, &needed)?;
         send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
         read_message(&mut stream)?;
         send_message(
@@ -2247,14 +2234,7 @@ impl Taker {
         maker_address: &str,
         swap_id: &str,
     ) -> Result<(), TakerError> {
-        let mut stream = self.net_connect(maker_address)?;
-        send_message(&mut stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(&mut stream)?)?;
-        if !matches!(msg, MakerToTakerMessage::MakerHello(_)) {
-            return Err(TakerError::General(
-                "Expected MakerHello before a keepalive".to_string(),
-            ));
-        }
+        let (mut stream, _) = self.net_connect_with(maker_address, &[])?;
         send_message(
             &mut stream,
             &TakerToMakerMessage::WaitingFundingConfirmation(swap_id.to_string()),
@@ -2604,51 +2584,70 @@ impl Taker {
         Ok(())
     }
 
-    /// Perform handshake with a maker and verify protocol support.
-    pub(crate) fn net_handshake(
-        &self,
-        stream: &mut TcpStream,
-    ) -> Result<ProtocolVersion, TakerError> {
-        handshake_with_maker(stream, self.swap_state()?.params.protocol)
+    /// Connect to a maker on the live swap and exchange Hellos.
+    pub(crate) fn net_connect(&self, address: &str) -> Result<TcpStream, TakerError> {
+        let needed = [self
+            .swap_state()?
+            .params
+            .protocol
+            .feature_name()
+            .to_string()];
+        Ok(self.net_connect_with(address, &needed)?.0)
     }
 
-    /// Connect to a maker using either direct connection or Tor proxy.
-    pub(crate) fn net_connect(&self, address: &str) -> Result<TcpStream, TakerError> {
-        connect_to_maker(
+    /// Connect to a maker directly or through Tor and exchange Hellos. The
+    /// maker must list every name in `needed`; returns the names it listed.
+    pub(crate) fn net_connect_with(
+        &self,
+        address: &str,
+        needed: &[String],
+    ) -> Result<(TcpStream, Vec<String>), TakerError> {
+        let mut stream = connect_to_maker(
             address,
             self.config.connection_type,
             self.config.socks_port,
             Duration::from_secs(MAKER_RESPONSE_TIMEOUT_SECS),
-        )
+        )?;
+        let features = handshake_with_maker(&mut stream, needed)?;
+        Ok((stream, features))
     }
 }
 
-/// Handshake over an already-connected stream, asserting the maker supports
-/// `desired`. Free of `Taker` so background threads can reconnect on their own.
+/// Exchange Hellos over a connected stream. The maker must list every name in
+/// `needed`. Returns the names it listed that this build recognizes; the rest
+/// mean nothing here. Free of `Taker` so background threads can reconnect.
 pub(crate) fn handshake_with_maker(
     stream: &mut TcpStream,
-    desired: ProtocolVersion,
-) -> Result<ProtocolVersion, TakerError> {
-    send_message(stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
+    needed: &[String],
+) -> Result<Vec<String>, TakerError> {
+    let hello = Hello {
+        features: supported().into_iter().map(String::from).collect(),
+    };
+    send_message(stream, &TakerToMakerMessage::Hello(hello))?;
 
-    let msg_bytes = read_message(stream)?;
-    let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
-
-    match msg {
-        MakerToTakerMessage::MakerHello(maker_hello) => {
-            if maker_hello.supported_protocols.contains(&desired) {
-                Ok(desired)
-            } else {
-                Err(TakerError::General(format!(
-                    "Maker does not support {:?}. Supported: {:?}",
-                    desired, maker_hello.supported_protocols
-                )))
-            }
+    let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(stream)?)?;
+    let mut features = match msg {
+        MakerToTakerMessage::Hello(hello) => hello.features,
+        MakerToTakerMessage::Unsupported(refusal) => {
+            return Err(TakerError::General(format!(
+                "Maker refused our Hello: {}",
+                refusal.reason
+            )))
         }
-        _ => Err(TakerError::General(
-            "Expected MakerHello response".to_string(),
-        )),
+        other => {
+            return Err(TakerError::General(format!(
+                "Expected Hello, got {other:?}"
+            )))
+        }
+    };
+    features.retain(|name| KNOWN.iter().any(|f| f.name == name));
+    let missing: Vec<&String> = needed.iter().filter(|n| !features.contains(n)).collect();
+    if !missing.is_empty() {
+        return Err(TakerError::General(format!(
+            "Maker does not list {missing:?}"
+        )));
     }
+    Ok(features)
 }
 
 /// Connect to a maker directly or through Tor. Free of `Taker` so background
@@ -2704,17 +2703,17 @@ impl Taker {
         swap_id: &str,
     ) -> Option<super::background_services::RouteHeartbeat> {
         let state = self.swap_state().ok()?;
-        let addresses: Vec<String> = state
+        let needed = vec![state.params.protocol.feature_name().to_string()];
+        let peers: Vec<(String, Vec<String>)> = state
             .makers
             .iter()
-            .map(|maker| maker.address.to_string())
+            .map(|maker| (maker.address.to_string(), needed.clone()))
             .collect();
         let dial = super::background_services::PeerDial {
             connection_type: self.config.connection_type,
             socks_port: self.config.socks_port,
-            protocol: state.params.protocol,
         };
-        match super::background_services::RouteHeartbeat::start(swap_id, addresses, dial) {
+        match super::background_services::RouteHeartbeat::start(swap_id, peers, dial) {
             Ok(heartbeat) => Some(heartbeat),
             Err(e) => {
                 log::warn!("route heartbeat failed to start: {e:?}");
@@ -2774,8 +2773,6 @@ impl Taker {
                     let result = (|| -> Result<Vec<SecretKey>, TakerError> {
                         let maker_address = self.swap_state()?.makers[i].address.to_string();
                         let mut stream = self.net_connect(&maker_address)?;
-
-                        self.net_handshake(&mut stream)?;
 
                         log::info!("Sending privkey to maker {} and awaiting response", i);
 

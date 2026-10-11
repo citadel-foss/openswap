@@ -179,8 +179,7 @@ impl Taker {
             );
 
             // Connect to this maker
-            let mut stream = self.net_connect(&maker_address)?;
-            self.net_handshake(&mut stream)?;
+            let stream = self.net_connect(&maker_address)?;
             self.swap_state_mut()?.makers[maker_idx]
                 .legacy_exchange_mut()?
                 .connected = true;

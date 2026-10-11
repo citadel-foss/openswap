@@ -241,7 +241,6 @@ impl Taker {
             // during confirmation can expire under the maker's admission deadline.
             // The separate route heartbeat keeps swap activity alive while waiting.
             let mut stream = self.net_connect(&maker_address)?;
-            self.net_handshake(&mut stream)?;
             self.swap_state_mut()?.makers[i]
                 .taproot_exchange_mut()?
                 .connected = true;
@@ -640,7 +639,6 @@ impl Taker {
         contract_data: &TaprootContractData,
     ) -> Result<Vec<u8>, TakerError> {
         let mut stream = self.net_connect(maker_address)?;
-        self.net_handshake(&mut stream)?;
         send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
         read_message(&mut stream)?;
         let details = self.current_swap_details(maker_idx)?;

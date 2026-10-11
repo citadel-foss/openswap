@@ -129,14 +129,13 @@ fn swap_cost_floor(
 /// round number that still passes.
 const MIN_SWAP_STEP_SATS: u64 = 500;
 
-/// Smallest swap every supported protocol accepts: one coin in, one coin out,
+/// Smallest swap every protocol accepts: one coin in, one coin out,
 /// at the relay floor and a one-maker lock, rounded up to `MIN_SWAP_STEP_SATS`.
 fn min_swap_amount(config: &MakerServerConfig) -> u64 {
     let rel = (config.amount_relative_fee_pct
         + f64::from(REFUND_LOCKTIME_BASE) * config.time_relative_fee_pct)
         / 100.0;
-    config
-        .supported_protocols
+    [ProtocolVersion::Legacy, ProtocolVersion::Taproot]
         .iter()
         .filter_map(|p| swap_cost_floor(*p, MIN_RELAY_FEE_RATE, 1, 1))
         .max()
@@ -286,8 +285,6 @@ pub struct MakerServerConfig {
     pub check_blocklist: bool,
     /// Feature names a taker must support to swap with this maker.
     pub require_features: Vec<String>,
-    /// Supported protocol versions.
-    pub supported_protocols: Vec<ProtocolVersion>,
     /// Fidelity bond amount in satoshis.
     pub fidelity_amount: u64,
     /// Fidelity bond timelock in blocks.
@@ -336,7 +333,6 @@ impl Default for MakerServerConfig {
             required_confirms: 1,
             check_blocklist: false,
             require_features: Vec::new(),
-            supported_protocols: vec![ProtocolVersion::Legacy, ProtocolVersion::Taproot],
             fidelity_amount: 10_000,   // 0.0001 BTC
             fidelity_timelock: 15_000, // ~6 months (MAX_FIDELITY_TIMELOCK)
             fidelity_feerate: MIN_RELAY_FEE_RATE,
@@ -481,7 +477,6 @@ impl MakerServerConfig {
             backend: default_config.backend,
             wallet_name: default_config.wallet_name,
             password: default_config.password,
-            supported_protocols: default_config.supported_protocols,
             nostr_relays: default_config.nostr_relays,
         })
     }
@@ -2141,7 +2136,7 @@ impl MakerTrait for MakerServer {
                 .map(|w| w.store.offer_maxsize)
                 .unwrap_or(u64::MAX),
             required_confirms: self.config.required_confirms,
-            supported_protocols: self.config.supported_protocols.clone(),
+            require_features: self.config.require_features.clone(),
             name: self.config.name.clone(),
         }
     }
@@ -2197,15 +2192,6 @@ impl MakerTrait for MakerServer {
         }
         if amount_sat > config.max_swap_amount {
             return Err(MakerError::General("Swap amount above maximum"));
-        }
-
-        // Check protocol is supported
-        if !self
-            .config
-            .supported_protocols
-            .contains(&details.protocol_version)
-        {
-            return Err(MakerError::General("Protocol version not supported"));
         }
 
         // Check timelock bounds and work out how long the funds stay locked.

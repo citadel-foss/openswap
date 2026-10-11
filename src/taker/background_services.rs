@@ -19,7 +19,7 @@ use bitcoin::{OutPoint, ScriptBuf, Txid};
 
 use crate::{
     lock_debug,
-    protocol::{common_messages::TakerToMakerMessage, ProtocolVersion},
+    protocol::common_messages::TakerToMakerMessage,
     taker::{
         api::{connect_to_maker, handshake_with_maker, ConnectionType},
         error::TakerError,
@@ -648,7 +648,7 @@ const RECONNECT_BACKOFF_MAX_TICKS: u32 = 8;
 /// Deadline for a heartbeat's own connect and hello exchange. Deliberately far
 /// below the maker's idle budget and unrelated to `MAKER_RESPONSE_TIMEOUT_SECS`,
 /// which is sized for block-bound contract replies: reconnects run on the shared
-/// heartbeat thread, so a maker that accepts TCP and then withholds `MakerHello`
+/// heartbeat thread, so a maker that accepts TCP and then withholds its `Hello`
 /// would otherwise stall the keepalives every other maker on the route depends on.
 #[cfg(not(feature = "integration-test"))]
 const HEARTBEAT_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -662,13 +662,13 @@ pub(crate) struct PeerDial {
     pub(crate) connection_type: ConnectionType,
     /// Tor SOCKS port, ignored for clearnet.
     pub(crate) socks_port: u16,
-    /// Protocol the maker must support for this swap.
-    pub(crate) protocol: ProtocolVersion,
 }
 
 /// One maker in the route, with its keepalive stream and reconnect state.
 struct HeartbeatPeer {
     address: String,
+    /// Names the maker's Hello must list for this swap.
+    needed: Vec<String>,
     /// `None` while disconnected and waiting to retry.
     stream: Option<TcpStream>,
     /// Ticks still to wait before the next connect attempt.
@@ -678,9 +678,10 @@ struct HeartbeatPeer {
 }
 
 impl HeartbeatPeer {
-    fn new(address: String) -> Self {
+    fn new((address, needed): (String, Vec<String>)) -> Self {
         Self {
             address,
+            needed,
             stream: None,
             retry_in: 0,
             backoff: RECONNECT_BACKOFF_MIN_TICKS,
@@ -701,7 +702,7 @@ impl HeartbeatPeer {
                 dial.socks_port,
                 dial_timeout,
             )
-            .and_then(|mut stream| handshake_with_maker(&mut stream, dial.protocol).map(|_| stream))
+            .and_then(|mut stream| handshake_with_maker(&mut stream, &self.needed).map(|_| stream))
             {
                 Ok(stream) => {
                     log::debug!("route heartbeat: connected to {}", self.address);
@@ -760,7 +761,7 @@ impl RouteHeartbeat {
     /// that is unreachable at start is retried instead of dropped from the route.
     pub(crate) fn start(
         swap_id: &str,
-        addresses: Vec<String>,
+        peers: Vec<(String, Vec<String>)>,
         dial: PeerDial,
     ) -> std::io::Result<Self> {
         let (stop, stop_rx) = mpsc::channel();
@@ -772,7 +773,7 @@ impl RouteHeartbeat {
             .name("Route heartbeat".to_string())
             .spawn(move || {
                 let mut peers: Vec<HeartbeatPeer> =
-                    addresses.into_iter().map(HeartbeatPeer::new).collect();
+                    peers.into_iter().map(HeartbeatPeer::new).collect();
                 loop {
                     for peer in peers.iter_mut() {
                         if stop_rx.try_recv().is_ok() {
@@ -815,14 +816,13 @@ mod tests {
     use std::net::{Shutdown, TcpListener};
 
     fn peer_on(address: &str) -> HeartbeatPeer {
-        HeartbeatPeer::new(address.to_string())
+        HeartbeatPeer::new((address.to_string(), Vec::new()))
     }
 
     fn test_dial() -> PeerDial {
         PeerDial {
             connection_type: ConnectionType::Clearnet,
             socks_port: 0,
-            protocol: ProtocolVersion::Taproot,
         }
     }
 
@@ -869,7 +869,7 @@ mod tests {
     /// the route is waiting its turn and its own idle budget is running.
     #[test]
     fn stalled_handshake_is_bounded_by_the_dial_timeout() {
-        // Accept connections but never answer MakerHello.
+        // Accept connections but never answer the Hello.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let _silent = thread::spawn(move || {
@@ -909,6 +909,7 @@ mod tests {
 
         let mut peer = HeartbeatPeer {
             address,
+            needed: Vec::new(),
             stream: Some(stream),
             retry_in: 0,
             backoff: RECONNECT_BACKOFF_MAX_TICKS,

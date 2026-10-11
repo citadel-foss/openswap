@@ -31,7 +31,7 @@ use crate::{
         common_messages::{
             FidelityProof, GetOffer as RouterGetOffer,
             MakerToTakerMessage as RouterMakerToTakerMessage, Offer,
-            TakerHello as RouterTakerHello, TakerToMakerMessage as RouterTakerToMakerMessage,
+            TakerToMakerMessage as RouterTakerToMakerMessage,
         },
         contract::calculate_swap_fee,
         error::ProtocolError,
@@ -57,7 +57,7 @@ const FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC: u64 = 30;
 /// Sleep delay in milliseconds between connection retry attempts.
 const FIRST_CONNECT_SLEEP_DELAY_SEC: u64 = 1000;
 
-use super::error::TakerError;
+use super::{api::handshake_with_maker, error::TakerError};
 
 enum SyncCommand {
     SyncNow(mpsc::Sender<()>),
@@ -1937,26 +1937,7 @@ impl MakerAddress {
         socket.set_read_timeout(Some(Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC)))?;
         socket.set_write_timeout(Some(Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC)))?;
 
-        // Send TakerHello
-        let taker_hello = RouterTakerToMakerMessage::TakerHello(RouterTakerHello);
-        send_message(&mut socket, &taker_hello)?;
-
-        // Read MakerHello
-        let msg_bytes = read_message(&mut socket)?;
-        let msg: RouterMakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
-
-        match msg {
-            RouterMakerToTakerMessage::MakerHello(_hello) => {
-                // Maker - supports both Legacy and Taproot
-            }
-            msg => {
-                return Err(ProtocolError::WrongMessage {
-                    expected: "MakerHello".to_string(),
-                    received: format!("{msg:?}"),
-                }
-                .into());
-            }
-        };
+        handshake_with_maker(&mut socket, &[])?;
 
         // Send GetOffer
         let get_offer = RouterTakerToMakerMessage::GetOffer(RouterGetOffer);

@@ -40,7 +40,7 @@ use electrsd::ElectrsD;
 use log::info;
 use openswap::{
     maker::{start_server, MakerBehavior, MakerServer, MakerServerConfig},
-    protocol::common_messages::{ProtocolVersion, OPENSWAP_PORT},
+    protocol::common_messages::OPENSWAP_PORT,
     taker::{Taker, TakerBehavior, TakerInitConfig},
     utill::{check_tor_status, get_ephemeral_address, setup_logger, NO_SHUTDOWN},
     wallet::{
@@ -1205,10 +1205,6 @@ impl TestFramework {
                         time_relative_fee_pct: 0.0001,
                         required_confirms: 1,
                         check_blocklist,
-                        supported_protocols: vec![
-                            ProtocolVersion::Legacy,
-                            ProtocolVersion::Taproot,
-                        ],
                         fidelity_amount: 5_000_000, // 0.05 BTC
                         fidelity_timelock: 950,     // ~950 blocks for test
                         network: bitcoin::Network::Regtest,

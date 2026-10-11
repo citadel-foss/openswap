@@ -10,9 +10,10 @@ use super::error::MakerError;
 use crate::{
     protocol::{
         common_messages::{
-            AckSwapDetails, FidelityProof, GetOffer, MakerHello, MakerToTakerMessage, Offer,
-            ProtocolVersion, SwapDetails, TakerHello, TakerToMakerMessage,
+            AckSwapDetails, FidelityProof, GetOffer, Hello, MakerToTakerMessage, Offer,
+            ProtocolVersion, SwapDetails, TakerToMakerMessage, UnsupportedMessage,
         },
+        features::{check_requires, supported},
         legacy_messages::LegacyTakerMessage,
         taproot_messages::TaprootTakerMessage,
     },
@@ -797,8 +798,8 @@ pub struct MakerConfig {
     pub max_swap_amount: u64,
     /// Required confirmations.
     pub required_confirms: u32,
-    /// Supported protocol versions.
-    pub supported_protocols: Vec<ProtocolVersion>,
+    /// Feature names a taker must support.
+    pub require_features: Vec<String>,
     /// Public name sent in the offer.
     pub name: String,
 }
@@ -820,7 +821,7 @@ pub fn handle_message<M: Maker>(
     );
 
     match message {
-        TakerToMakerMessage::TakerHello(hello) => handle_taker_hello(maker, state, hello),
+        TakerToMakerMessage::Hello(hello) => handle_hello(maker, state, hello),
         TakerToMakerMessage::GetOffer(get_offer) => handle_get_offer(maker, state, get_offer),
         TakerToMakerMessage::SwapDetails(details) => handle_swap_details(maker, state, details),
 
@@ -908,12 +909,10 @@ pub fn handle_message<M: Maker>(
                     maker.network_port(),
                     ln_msg
                 );
-                Ok(Some(MakerToTakerMessage::Unsupported(
-                    crate::protocol::common_messages::UnsupportedMessage {
-                        what: "Lightning".to_string(),
-                        reason: "maker built without lightning support".to_string(),
-                    },
-                )))
+                Ok(Some(MakerToTakerMessage::Unsupported(UnsupportedMessage {
+                    what: "Lightning".to_string(),
+                    reason: "maker built without lightning support".to_string(),
+                })))
             }
         }
         TakerToMakerMessage::Unsupported(unsupported) => {
@@ -928,30 +927,30 @@ pub fn handle_message<M: Maker>(
     }
 }
 
-/// Handle TakerHello message.
-fn handle_taker_hello<M: Maker>(
+/// Handle the taker's Hello: it must list every feature we require.
+fn handle_hello<M: Maker>(
     maker: &Arc<M>,
     state: &mut ConnectionState,
-    _hello: TakerHello,
+    hello: Hello,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     state.expect_phase(&[SwapPhase::AwaitingHello])?;
 
-    log::info!(
-        "[{}] Received TakerHello",
-        Maker::network_port(maker.as_ref()),
-    );
-
     let config = maker.get_config();
+    if let Err(missing) = check_requires(&config.require_features, &hello.features) {
+        log::info!(
+            "[{}] Refusing a taker without required features {:?}",
+            Maker::network_port(maker.as_ref()),
+            missing
+        );
+        return Ok(Some(MakerToTakerMessage::Unsupported(UnsupportedMessage {
+            what: "Hello".to_string(),
+            reason: format!("missing required features: {missing:?}"),
+        })));
+    }
+
     state.phase = SwapPhase::AwaitingOfferRequest;
-
-    log::info!(
-        "[{}] Supported protocols: {:?}",
-        Maker::network_port(maker.as_ref()),
-        config.supported_protocols
-    );
-
-    Ok(Some(MakerToTakerMessage::MakerHello(MakerHello {
-        supported_protocols: config.supported_protocols,
+    Ok(Some(MakerToTakerMessage::Hello(Hello {
+        features: supported().into_iter().map(String::from).collect(),
     })))
 }
 

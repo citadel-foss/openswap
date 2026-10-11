@@ -34,7 +34,7 @@ use crate::{
         invoice::verify_invoice, swap::SwapHtlc, InvoiceParams, LightningBackend, LnEvent, Preimage,
     },
     protocol::{
-        common_messages::{GetOffer, MakerToTakerMessage, Offer, TakerHello, TakerToMakerMessage},
+        common_messages::{GetOffer, MakerToTakerMessage, Offer, TakerToMakerMessage},
         lightning_messages::{
             LightningMakerMessage, LightningOffer, LightningTakerMessage, LnHtlcFunded,
             LnSwapInRequest, LnSwapOutClaimed, LnSwapOutPaid, LnSwapOutRequest,
@@ -362,16 +362,9 @@ impl Taker {
         swap_in: bool,
         amount: Amount,
     ) -> Result<LnMakerConn, TakerError> {
-        let mut socket = self.net_connect(address)?;
-        send_message(&mut socket, &TakerToMakerMessage::TakerHello(TakerHello))
+        let (mut socket, _) = self
+            .net_connect_with(address, &[])
             .map_err(|e| general(format!("hello failed: {e:?}")))?;
-        let bytes =
-            read_message(&mut socket).map_err(|e| general(format!("hello reply: {e:?}")))?;
-        let msg: MakerToTakerMessage =
-            serde_cbor::from_slice(&bytes).map_err(|e| general(format!("bad hello: {e:?}")))?;
-        if !matches!(msg, MakerToTakerMessage::MakerHello(_)) {
-            return Err(general("expected MakerHello"));
-        }
 
         send_message(&mut socket, &TakerToMakerMessage::GetOffer(GetOffer))
             .map_err(|e| general(format!("get offer failed: {e:?}")))?;

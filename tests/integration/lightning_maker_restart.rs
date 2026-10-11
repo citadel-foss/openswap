@@ -21,7 +21,7 @@ use openswap::{
         MakerBehavior, MakerServer,
     },
     protocol::{
-        common_messages::{MakerToTakerMessage, TakerHello, TakerToMakerMessage},
+        common_messages::{Hello, MakerToTakerMessage, TakerToMakerMessage},
         lightning_messages::{
             LightningMakerMessage, LightningTakerMessage, LnSwapOutPaid, LnSwapOutRequest,
         },
@@ -106,7 +106,7 @@ fn lightning_maker_restart_recovers_funded_swap() {
     handle_message(
         &maker,
         &mut state,
-        TakerToMakerMessage::TakerHello(TakerHello),
+        TakerToMakerMessage::Hello(Hello::default()),
     )
     .unwrap();
 

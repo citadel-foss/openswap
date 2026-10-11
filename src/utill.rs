@@ -1356,7 +1356,7 @@ mod tests {
         PubkeyHash,
     };
 
-    use crate::protocol::common_messages::{MakerHello, MakerToTakerMessage, ProtocolVersion};
+    use crate::protocol::common_messages::{Hello, MakerToTakerMessage};
 
     use super::*;
 
@@ -1397,8 +1397,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
 
-        let message = MakerToTakerMessage::MakerHello(MakerHello {
-            supported_protocols: vec![ProtocolVersion::Legacy, ProtocolVersion::Taproot],
+        let message = MakerToTakerMessage::Hello(Hello {
+            features: vec!["legacy".to_string(), "taproot".to_string()],
         });
 
         thread::spawn(move || {
@@ -1406,15 +1406,11 @@ mod tests {
             let msg_bytes = read_message(&mut socket).unwrap();
             let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes).unwrap();
 
-            if let MakerToTakerMessage::MakerHello(hello) = msg {
-                assert_eq!(hello.supported_protocols.len(), 2);
-                assert!(hello.supported_protocols.contains(&ProtocolVersion::Legacy));
-                assert!(hello
-                    .supported_protocols
-                    .contains(&ProtocolVersion::Taproot));
+            if let MakerToTakerMessage::Hello(hello) = msg {
+                assert_eq!(hello.features, ["legacy", "taproot"]);
             } else {
                 panic!(
-                    "Received Wrong Message: Expected MakerHello variant, Got: {:?}",
+                    "Received Wrong Message: Expected Hello variant, Got: {:?}",
                     msg,
                 );
             }
