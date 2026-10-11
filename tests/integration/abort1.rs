@@ -75,10 +75,6 @@ fn taker_abort_1_legacy_corerpc() {
     generate_blocks(bitcoind, 1);
 
     // Start periodic swap tracker logging
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
 
     // Prepare should succeed; execution should fail with DropAfterFundsBroadcast
     let summary = taker
@@ -90,7 +86,6 @@ fn taker_abort_1_legacy_corerpc() {
         "Swap should fail due to DropAfterFundsBroadcast behavior"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -241,12 +236,10 @@ fn taker_abort_1_legacy_corerpc() {
         );
     }
 
-    taker.log_tracker_state();
     info!("Abort1 test completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
 
-    tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

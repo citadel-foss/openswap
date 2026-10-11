@@ -13,17 +13,13 @@
 //!    timelocks to mature, so there is a wide window to die in.
 //! 3. A fresh `Taker` is built from the same data dir, with nothing in memory.
 //! 4. `recover_active_swap` must find the swap on disk and finish the job.
-//! 5. A crash before the tracker records the cleanup leaves nothing to recover;
-//!    the next startup must still finish the swap instead of retrying it forever.
+//! 5. A second restart reads the settled wallet with no tracker to reconcile.
 
 use bitcoin::Amount;
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
-    taker::{
-        swap_tracker::{RecoveryPhase, SwapTracker},
-        SwapParams, Taker, TakerBehavior,
-    },
+    taker::{SwapParams, Taker, TakerBehavior},
     utill::NO_SHUTDOWN,
 };
 
@@ -130,9 +126,11 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     let wallet_path = taker_dir.join("wallets").join("taker1");
     let tracker_path = taker_dir.join("swap_tracker.cbor");
     let wallet_snapshot = taker_dir.join("wallet.snapshot");
-    let tracker_snapshot = taker_dir.join("tracker.snapshot");
     std::fs::copy(&wallet_path, &wallet_snapshot).unwrap();
-    std::fs::copy(&tracker_path, &tracker_snapshot).unwrap();
+    assert!(
+        !tracker_path.exists(),
+        "a new taker must never write a tracker"
+    );
 
     test_framework.set_block_gen_paused(false);
     let sweep_deadline = Instant::now() + Duration::from_secs(120);
@@ -153,7 +151,6 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
     info!("Restoring the pre-sweep state to simulate a crash before cleanup");
     drop(taker);
     std::fs::copy(wallet_snapshot, wallet_path).unwrap();
-    std::fs::copy(&tracker_snapshot, &tracker_path).unwrap();
     thread::sleep(Duration::from_secs(5));
 
     let restarted = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
@@ -262,10 +259,8 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
         "restarted taker failed to read the swap back off disk"
     );
 
-    // Crash again before the tracker saw the cleanup: the chain and wallet are
-    // settled, so startup has nothing to recover but must still finish the swap.
+    // The settled wallet is sufficient on every subsequent restart.
     drop(restarted);
-    std::fs::copy(&tracker_snapshot, &tracker_path).unwrap();
     let settled = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
         .expect("settled taker should open the same wallet");
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -273,11 +268,25 @@ fn run_taker_restart_recovery(protocol: ProtocolVersion, last_maker: MakerBehavi
         assert!(Instant::now() < deadline, "settled swap was not finished");
         thread::sleep(Duration::from_secs(1));
     }
-    let tracker = SwapTracker::load_or_create(&taker_dir).unwrap();
+    assert!(
+        !tracker_path.exists(),
+        "recovery must never recreate a tracker"
+    );
     assert_eq!(
-        tracker.get_record(&summary.swap_id).unwrap().recovery.phase,
-        RecoveryPhase::CleanedUp,
-        "startup left a settled swap for every restart to retry"
+        settled
+            .get_wallet()
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count(),
+        0
+    );
+    assert_eq!(
+        settled
+            .get_wallet()
+            .read()
+            .unwrap()
+            .get_outgoing_swapcoins_count(),
+        0
     );
 
     info!("Taker restart recovery test completed successfully!");

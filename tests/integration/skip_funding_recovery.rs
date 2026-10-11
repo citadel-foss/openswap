@@ -20,21 +20,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// This swap's recovery must wait out the grace before discarding its
-/// never-broadcast funding. Lines are matched by swap id, since one log file
-/// can hold several swaps.
-fn assert_grace_then_discard(log_path: &str, swap_id: &str) {
+/// An uncommitted swap can be discarded without an absence-based grace period.
+fn assert_uncommitted_discard(log_path: &str, swap_id: &str) {
     let log = std::fs::read_to_string(log_path).unwrap();
-    let waited = log
-        .find(&format!("Swap {swap_id} shows no funding broadcast after"))
-        .expect("the maker must wait on the grace for this swap");
-    let dropped = log
-        .find(&format!("Funding was never broadcast for swap {swap_id}"))
-        .expect("the maker must discard this swap's never-broadcast funding");
-    assert!(
-        waited < dropped,
-        "the maker must wait out the grace before dropping the swapcoins"
-    );
+    assert!(log.contains(&format!("Funding was never committed for swap {swap_id}")));
+    assert!(!log.contains(&format!("Swap {swap_id} shows no funding broadcast after")));
 }
 
 /// Test: Timelock-only recovery when last maker skips funding broadcast.
@@ -94,12 +84,6 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting Legacy timelock-only recovery test...");
 
-    // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
-
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -118,25 +102,6 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
         "Swap should fail due to Maker2 skipping funding broadcast"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
-
-    // Maker2 planned a funding it never sent, and handed it out unsigned, so
-    // only it could broadcast. Its swapcoins must still be there: only the
-    // grace may release them, never the failure itself.
-    let victim_held = makers[1]
-        .wallet
-        .read()
-        .unwrap()
-        .get_outgoing_swapcoins_count()
-        + makers[1]
-            .wallet
-            .read()
-            .unwrap()
-            .get_incoming_swapcoins_count();
-    assert!(
-        victim_held > 0,
-        "Maker2 must keep its swapcoins when the swap fails"
-    );
 
     if stop_watcher {
         assert!(
@@ -155,9 +120,8 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
 
-    // Recovery waits out the grace before dropping the never-broadcast
-    // funding, then releases the swapcoins, exactly as for Taproot.
-    assert_grace_then_discard(&test_framework.taker_log_path(), &summary.swap_id);
+    // The deliberately uncommitted funding is discarded immediately.
+    assert_uncommitted_discard(&test_framework.taker_log_path(), &summary.swap_id);
     makers[1]
         .wallet
         .write()
@@ -170,7 +134,7 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
     };
     assert_eq!(
         victim_after, 0,
-        "Maker2 must release its swapcoins once the grace has run out"
+        "Maker2 must release its uncommitted swapcoins"
     );
 
     // Verify maker balances after recovery
@@ -290,12 +254,10 @@ fn run_legacy_timelock_only_recovery(stop_watcher: bool) {
         );
     }
 
-    taker.log_tracker_state();
     info!("Legacy timelock-only recovery test completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
 
-    tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
@@ -328,8 +290,7 @@ fn test_taproot_timelock_only_recovery() {
     run_taproot_timelock_only_recovery::<BitcoindBackend>();
 }
 
-/// Same timelock-only recovery on Electrum: the grace and discard decisions
-/// read the indexer rather than the maker's own node.
+/// Same timelock-only recovery on Electrum: recovery reads the indexer.
 #[test]
 fn test_taproot_timelock_only_recovery_electrum() {
     run_taproot_timelock_only_recovery::<ElectrumBackend>();
@@ -381,12 +342,6 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting Taproot timelock-only recovery test...");
 
-    // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
-
     // Swap params for openswap (Taproot)
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -405,24 +360,6 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
         "Swap should fail due to Maker2 skipping funding broadcast"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
-
-    // Maker2 planned a funding it never sent. Its swapcoins must still be
-    // there: only the grace may release them, never the failure itself.
-    let victim_held = makers[1]
-        .wallet
-        .read()
-        .unwrap()
-        .get_outgoing_swapcoins_count()
-        + makers[1]
-            .wallet
-            .read()
-            .unwrap()
-            .get_incoming_swapcoins_count();
-    assert!(
-        victim_held > 0,
-        "Maker2 must keep its swapcoins when the swap fails"
-    );
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -430,10 +367,8 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     info!("Waiting for makers to timeout and blocks to mature timelocks...");
     thread::sleep(Duration::from_secs(300));
 
-    // Maker2 left its broadcast unrecorded, so recovery must wait out the
-    // grace before dropping the swapcoins rather than trusting one backend
-    // answer. Both lines must appear, in that order.
-    assert_grace_then_discard(&test_framework.taker_log_path(), &summary.swap_id);
+    // The skipped batch is uncommitted and can be discarded immediately.
+    assert_uncommitted_discard(&test_framework.taker_log_path(), &summary.swap_id);
     makers[1]
         .wallet
         .write()
@@ -446,7 +381,7 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
     };
     assert_eq!(
         victim_after, 0,
-        "Maker2 must release its swapcoins once the grace has run out"
+        "Maker2 must release its uncommitted swapcoins"
     );
 
     // Verify maker balances after recovery
@@ -567,12 +502,10 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
         );
     }
 
-    taker.log_tracker_state();
     info!("Taproot timelock-only recovery test completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
 
-    tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

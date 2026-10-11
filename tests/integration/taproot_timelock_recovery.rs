@@ -75,10 +75,6 @@ fn test_taproot_timelock_recovery() {
     log::info!("Starting Taproot timelock recovery test...");
 
     // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
 
     // Swap params for openswap (Taproot)
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
@@ -97,7 +93,6 @@ fn test_taproot_timelock_recovery() {
         "Swap should fail due to Maker2 closing at contract sigs exchange"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
     let outgoing_coins = taker
         .get_wallet()
         .read()
@@ -278,12 +273,10 @@ fn test_taproot_timelock_recovery() {
         assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
     }
 
-    taker.log_tracker_state();
     info!("Taproot timelock recovery test completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
 
-    tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

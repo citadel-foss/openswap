@@ -86,7 +86,6 @@ fn test_taproot_taker_abort1() {
         "Prepare failed as expected: {:?}",
         prepare_result.err().unwrap()
     );
-    taker.log_tracker_state();
 
     // The accepted-but-unfunded swap must be dropped without requiring a restart.
     let log_path = test_framework.taker_log_path();
@@ -174,7 +173,6 @@ fn test_taproot_taker_abort1() {
         balance_diff.to_sat(),
     );
 
-    taker.log_tracker_state();
     info!("Taproot taker abort1 test completed successfully!");
 
     shutdown_makers(&makers, maker_threads);

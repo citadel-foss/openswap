@@ -641,10 +641,14 @@ impl RecoveryReport {
         .emit(wallet);
     }
 
-    fn emit(&self, wallet: &mut Wallet) {
+    pub(crate) fn store_in_wallet(&self, wallet: &mut Wallet) -> Result<(), WalletError> {
         self.print();
-        if let Err(e) = wallet
-            .push_report(RECOVERY_REPORTS, self)
+        wallet.push_report(RECOVERY_REPORTS, self)
+    }
+
+    fn emit(&self, wallet: &mut Wallet) {
+        if let Err(e) = self
+            .store_in_wallet(wallet)
             .and_then(|()| wallet.save_to_disk())
         {
             log::warn!("Failed to save {} recovery report: {:?}", self.role, e);

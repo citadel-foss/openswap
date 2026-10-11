@@ -26,7 +26,6 @@ use crate::{
 use super::{
     api::{fund_all_or_nothing, Taker},
     error::{breach_or_wallet_error, TakerError},
-    swap_tracker::SwapPhase,
 };
 
 #[cfg(feature = "integration-test")]
@@ -221,8 +220,7 @@ impl Taker {
     pub(crate) fn exchange_taproot(&mut self) -> Result<(), TakerError> {
         // Makers verify that contract txs are on-chain before creating their
         // own outgoing, so we must broadcast first.
-        self.swap_state_mut()?.phase = SwapPhase::FundsBroadcast;
-        self.persist_swap(SwapPhase::FundsBroadcast)?;
+        self.commit_outgoing_swapcoins()?;
         self.funding_broadcast()?;
 
         // Phase 2: Exchange contract data with makers.
@@ -241,9 +239,6 @@ impl Taker {
             // during confirmation can expire under the maker's admission deadline.
             // The separate route heartbeat keeps swap activity alive while waiting.
             let mut stream = self.net_connect(&maker_address)?;
-            self.swap_state_mut()?.makers[i]
-                .taproot_exchange_mut()?
-                .connected = true;
 
             let (
                 pubkeys,
@@ -394,9 +389,6 @@ impl Taker {
                 &mut stream,
                 &TakerToMakerMessage::TaprootContractData(Box::new(contract_data.clone())),
             )?;
-            self.swap_state_mut()?.makers[i]
-                .taproot_exchange_mut()?
-                .contract_data_sent = true;
 
             let msg_bytes = read_message(&mut stream).map_err(TakerError::from);
             #[cfg(feature = "integration-test")]
@@ -528,10 +520,6 @@ impl Taker {
                         }
                     }
 
-                    self.swap_state_mut()?.makers[i]
-                        .taproot_exchange_mut()?
-                        .maker_contract_received = true;
-
                     let is_last_maker = i == num_makers - 1;
                     if is_last_maker {
                         // Only the last maker's contract is addressed to the taker.
@@ -595,13 +583,6 @@ impl Taker {
                     .inspect_err(|e| self.note_withheld_funding(i, e))?;
 
                     received_contracts.push(*maker_contract);
-                    self.swap_state_mut()?.makers[i]
-                        .taproot_exchange_mut()?
-                        .swapcoins_created = true;
-                    self.swap_state_mut()?.makers[i]
-                        .taproot_exchange_mut()?
-                        .maker_funding_confirmed = true;
-                    self.persist_progress()?;
                     #[cfg(debug_assertions)]
                     log::debug!(
                         "[TAPROOT_HOP] Source: taker::taproot_swap::exchange_taproot | SwapID: {} | MakerIndex: {} | ContractTxs: {} | RequiredConfirms: {} | IncomingTotal: {} | WatchOnlyTotal: {}",
@@ -621,9 +602,6 @@ impl Taker {
                 }
             }
         }
-
-        // SP6-T: All makers responded, incoming/watchonly swapcoins created.
-        self.persist_swap(super::swap_tracker::SwapPhase::ContractsExchanged)?;
 
         Ok(())
     }

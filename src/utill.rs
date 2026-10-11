@@ -85,16 +85,6 @@ pub const TX_BROADCAST_TIMEOUT: Duration = Duration::from_secs(300);
 /// spends the timelock reaction margin.
 pub const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(7200);
 
-/// Grace before a swap with no recorded broadcast may be treated as never
-/// funded. A broadcast that has not reached our backend yet must not read as
-/// absent, so wait out the same window a confirmation is given.
-#[cfg(not(feature = "integration-test"))]
-pub const UNBROADCAST_DISCARD_GRACE: Duration = TX_CONFIRMATION_TIMEOUT;
-/// Shortened so a test can watch the grace expire, but longer than a maker
-/// restart takes, so a restart test still sees a live reservation.
-#[cfg(feature = "integration-test")]
-pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(120);
-
 /// Default fee rate in sats/vb for all transactions, and the absolute floor:
 /// Bitcoin Core's default `minrelaytxfee`. Lower rates stop relaying.
 pub const MIN_RELAY_FEE_RATE: f64 = 1.0;

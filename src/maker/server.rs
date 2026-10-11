@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin::{OutPoint, Txid};
+use bitcoin::OutPoint;
 
 #[cfg(not(feature = "integration-test"))]
 use crate::maker::rpc::server::MakerRpc;
@@ -22,10 +22,8 @@ use crate::{
     protocol::common_messages::{
         message_name, MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage, UnsupportedMessage,
     },
-    utill::{
-        HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE, UNBROADCAST_DISCARD_GRACE,
-    },
-    wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, Wallet},
+    utill::{HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE},
+    wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, SwapRole, Wallet},
 };
 
 use super::{
@@ -33,9 +31,6 @@ use super::{
     error::MakerError,
     handlers::{
         emit_maker_success_report, handle_message, ConnectionState, Maker, MAX_CONCURRENT_SWAPS,
-    },
-    swap_tracker::{
-        now_secs, MakerRecoveryPhase, MakerRecoveryState, MakerSwapPhase, MakerSwapRecord,
     },
 };
 
@@ -253,47 +248,6 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     // those waits. Recovery must not depend on being ready for new swaps.
     #[cfg(feature = "lightning")]
     spawn_lightning_threads(&maker)?;
-
-    // A crash between a finish's wallet save and its tracker save leaves a
-    // recovering record with no coins behind. Close it as the finish would have.
-    let recovering: Vec<_> = lock_debug!(maker.swap_tracker.lock())
-        .map_err(|_| MakerError::MutexPossion)?
-        .incomplete_swaps()
-        .into_iter()
-        .filter(|record| {
-            matches!(
-                record.phase,
-                MakerSwapPhase::Recovering | MakerSwapPhase::Completed
-            )
-        })
-        .map(|record| {
-            (
-                record.swap_id.clone(),
-                record.phase,
-                record.recovery.clone(),
-            )
-        })
-        .collect();
-    for (swap_id, phase, recovery) in recovering {
-        let wallet = lock_debug!(maker.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-        let settled = wallet.incoming_keys_for_swap(&swap_id).is_empty()
-            && wallet.outgoing_keys_for_swap(&swap_id).is_empty();
-        drop(wallet);
-        if settled {
-            let report = if !recovery.incoming_swept.is_empty() {
-                Some(("hashlock", &recovery.incoming_swept[..]))
-            } else {
-                (!recovery.outgoing_recovered.is_empty())
-                    .then_some(("timelock", &recovery.outgoing_recovered[..]))
-            };
-            let phase = match phase {
-                MakerSwapPhase::Completed => MakerSwapPhase::Completed,
-                _ => MakerSwapPhase::Recovered,
-            };
-            finish_swap(&maker, &swap_id, phase, report);
-        }
-    }
 
     // Check for unfinished swapcoins from a previous run and start recovery.
     {
@@ -957,28 +911,6 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                 idle.swap_id
             );
 
-            // Create a tracker record for this dropped swap.
-            let now = now_secs();
-            let record = MakerSwapRecord {
-                swap_id: idle.swap_id.clone(),
-                protocol: idle.protocol,
-                phase: MakerSwapPhase::TakerDropped,
-                swap_amount_sat: idle.swap_amount_sat,
-                incoming_count: idle.incoming_swapcoins.len(),
-                outgoing_count: idle.outgoing_swapcoins.len(),
-                funding_broadcast_txids: idle.funding_broadcast_txids.clone(),
-                recovery: MakerRecoveryState::default(),
-                created_at: now,
-                updated_at: now,
-            };
-
-            if let Err(e) = lock_debug!(maker.swap_tracker.lock())
-                .map_err(|_| MakerError::MutexPossion)?
-                .save_record(&record)
-            {
-                log::error!("Failed to save swap tracker record: {:?}", e);
-            }
-
             // A crashed process never reaches its idle recovery, so the contracts
             // stay unclaimed until a restart picks them up.
             #[cfg(feature = "integration-test")]
@@ -1266,60 +1198,6 @@ fn check_for_preimage(
     Ok(())
 }
 
-/// Update the Maker swap tracker with the given closure.
-///
-/// Locks the tracker, applies `f` to the record matching `swap_id`, then flushes.
-/// False when the change did not reach disk.
-fn update_tracker(
-    maker: &MakerServer,
-    swap_id: &str,
-    f: impl FnOnce(&mut super::swap_tracker::MakerSwapRecord),
-) -> bool {
-    let mut tracker = match lock_debug!(maker.swap_tracker.lock()) {
-        Ok(tracker) => tracker,
-        Err(_) => {
-            log::error!("Swap tracker lock poisoned, skipping update for {swap_id}");
-            return false;
-        }
-    };
-    if let Some(record) = tracker.get_record_mut(swap_id) {
-        f(record);
-        record.updated_at = super::swap_tracker::now_secs();
-        let cloned = record.clone();
-        if let Err(e) = tracker.save_record(&cloned) {
-            log::error!("Failed to flush swap tracker: {:?}", e);
-            return false;
-        }
-    }
-    true
-}
-
-/// Close a swap whose coins have all left the wallet on disk: its report,
-/// then its tracker record. Startup reruns this for a record a crash left open.
-fn finish_swap(
-    maker: &MakerServer,
-    swap_id: &str,
-    phase: MakerSwapPhase,
-    report: Option<(&str, &[Txid])>,
-) {
-    if let Some((recovery_type, txids)) = report {
-        match lock_debug!(maker.wallet.write()) {
-            Ok(mut wallet) => RecoveryReport::emit_maker(
-                &mut wallet,
-                &maker.data_dir,
-                swap_id.to_string(),
-                recovery_type.to_string(),
-                txids.iter().map(|txid| txid.to_string()).collect(),
-            ),
-            Err(e) => log::error!("Cannot store the recovery report for {swap_id}: {e:?}"),
-        }
-    }
-    update_tracker(maker, swap_id, |r| {
-        r.phase = phase;
-        r.recovery.phase = MakerRecoveryPhase::CleanedUp;
-    });
-}
-
 /// Recover maker funds after taker drops.
 ///
 /// Two recovery paths are tried in a loop:
@@ -1364,7 +1242,35 @@ fn recover_from_swap(
             if height.is_some() && tried_at != height {
                 tried_at = height;
                 match maker.sweep_incoming_swapcoins(&incoming_swapcoins) {
-                    Ok(_) => return Ok(()),
+                    Ok(_) => {
+                        let mut wallet = lock_debug!(maker.wallet.write())
+                            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                        let incoming = wallet.incoming_keys_for_swap(&swap_id);
+                        let refunded = wallet.swap_reports().recovery.iter().any(|report| {
+                            report.swap_id == swap_id
+                                && matches!(report.role, SwapRole::Maker)
+                                && report.recovery_type == "timelock"
+                                && !report.recovery_txids.is_empty()
+                        });
+                        let settled = incoming.is_empty()
+                            || (refunded
+                                && incoming.iter().all(|key| {
+                                    wallet.find_incoming_swapcoin(key).is_none_or(|coin| {
+                                        coin.other_privkey.is_none() && !coin.is_preimage_known()
+                                    })
+                                }));
+                        if settled {
+                            let saved = wallet.remove_swap_coins_and_save(&swap_id, true, true);
+                            drop(wallet);
+                            match saved {
+                                Ok(()) => return Ok(()),
+                                Err(error) => {
+                                    log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
+                                    tried_at = None;
+                                }
+                            }
+                        }
+                    }
                     Err(e) => log::warn!(
                         "[{}] Incoming sweep failed: {:?}; retrying on the next block",
                         maker.config.network_port,
@@ -1482,67 +1388,7 @@ fn recover_from_swap(
         }
         Ok(true)
     };
-    // A restart resumes both lists, so the reports keep txids from before it.
-    let (mut timelock_recovery_txids, mut incoming_swept_txids) =
-        lock_debug!(maker.swap_tracker.lock())
-            .map_err(|_| MakerError::MutexPossion)?
-            .get_record(&swap_id)
-            .map(|record| {
-                (
-                    record.recovery.outgoing_recovered.clone(),
-                    record.recovery.incoming_swept.clone(),
-                )
-            })
-            .unwrap_or_default();
-
-    // A restart reaches here with no record: the drain that would create one
-    // never ran. Create it aged from the reservation, so the unbroadcast grace
-    // runs from the event, not from the restart.
-    {
-        let record_missing = lock_debug!(maker.swap_tracker.lock())
-            .map_err(|_| MakerError::MutexPossion)?
-            .get_record(&swap_id)
-            .is_none();
-        if record_missing {
-            let created_at = lock_debug!(maker.wallet.read())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .reservation_created_at(&swap_id)
-                .unwrap_or_else(now_secs);
-            let now = now_secs();
-            let protocol = outgoing_swapcoins
-                .first()
-                .map(|sc| sc.protocol)
-                .or_else(|| incoming_swapcoins.first().map(|sc| sc.protocol))
-                .unwrap_or(ProtocolVersion::Taproot);
-            let record = MakerSwapRecord {
-                swap_id: swap_id.clone(),
-                protocol,
-                phase: MakerSwapPhase::TakerDropped,
-                swap_amount_sat: 0,
-                incoming_count: incoming_swapcoins.len(),
-                outgoing_count: outgoing_swapcoins.len(),
-                funding_broadcast_txids: Vec::new(),
-                recovery: MakerRecoveryState::default(),
-                created_at,
-                updated_at: now,
-            };
-            if let Err(e) = lock_debug!(maker.swap_tracker.lock())
-                .map_err(|_| MakerError::MutexPossion)?
-                .save_record(&record)
-            {
-                log::error!("Failed to save swap tracker record: {:?}", e);
-            }
-        }
-    }
-
-    // Tracker: Recovering + Monitoring
-    update_tracker(&maker, &swap_id, |r| {
-        r.phase = MakerSwapPhase::Recovering;
-        r.recovery.phase = MakerRecoveryPhase::Monitoring;
-    });
-
     let mut watchtower_down_logged = false;
-    let mut discard_deferred_logged = false;
     let mut last_block = None;
     let mut last_preimages_known = None;
     while !maker.is_shutdown() {
@@ -1609,25 +1455,19 @@ fn recover_from_swap(
                 }
             }
 
-            // Record the outcome before the cleanup: startup finishes a cleanup
-            // a crash cut short with the phase it finds here.
-            if !update_tracker(&maker, &swap_id, |r| r.phase = MakerSwapPhase::Completed) {
+            let saved = {
+                let mut wallet = lock_debug!(maker.wallet.write())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                wallet.remove_swap_coins_and_save(&swap_id, false, true)
+            };
+            if let Err(error) = saved {
+                log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
+                last_block = None;
                 if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
                     break;
                 }
                 continue;
             }
-            {
-                let mut wallet = lock_debug!(maker.wallet.write())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                for outgoing in &outgoing_swapcoins {
-                    let key = outgoing.contract_tx.compute_txid().to_string();
-                    wallet.remove_outgoing_swapcoin(&key);
-                }
-                wallet.release_swap_locks(&swap_id, None);
-                wallet.save_to_disk().map_err(MakerError::Wallet)?;
-            }
-            finish_swap(&maker, &swap_id, MakerSwapPhase::Completed, None);
 
             let incoming = incoming_swapcoins.iter().map(|s| &s.contract_tx);
             let outgoing = outgoing_swapcoins.iter().map(|s| &s.contract_tx);
@@ -1653,122 +1493,32 @@ fn recover_from_swap(
             return Ok(());
         }
 
-        // True while the discard decision is still waiting on the grace. The
-        // swap is not finished until that is settled, whatever the contracts say.
-        let discard_pending;
-        // Discard only when every funding tx of the batch is positively unknown to
-        // the backend: an empty broadcast record can follow a crash before the
-        // first send was logged, and a failed query is not proof of absence.
+        // A committed batch can still confirm after its mempool view disappears.
+        // Only coins saved before the write-ahead commitment are never funded.
         {
-            // A send that never reached the record, or a backend that has not seen
-            // it yet, both read as "no broadcast". Funding already in flight is
-            // committed money, so age the record before believing that. Age is
-            // measured from creation: recovery progress refreshes `updated_at`,
-            // which would hold the grace open forever. Legacy hands its funding
-            // txs out unsigned, so only we can broadcast them, as with Taproot.
-            let unrecorded_for = lock_debug!(maker.swap_tracker.lock())
-                .map_err(|_| MakerError::MutexPossion)?
-                .get_record(&swap_id)
-                .filter(|r| r.funding_broadcast_txids.is_empty())
-                .map(|r| now_secs().saturating_sub(r.created_at));
-            let never_recorded =
-                unrecorded_for.is_some_and(|age| age >= UNBROADCAST_DISCARD_GRACE.as_secs());
-            discard_pending = unrecorded_for.is_some() && !never_recorded;
-            if let Some(age) = unrecorded_for.filter(|_| discard_pending) {
-                if !discard_deferred_logged {
-                    discard_deferred_logged = true;
-                    log::info!(
-                        "[{}] Swap {} shows no funding broadcast after {}s; keeping it until {}s",
-                        maker.config.network_port,
-                        swap_id,
-                        age,
-                        UNBROADCAST_DISCARD_GRACE.as_secs()
-                    );
-                }
-            }
-
-            if never_recorded && new_block {
-                // The maker's own sends: Legacy's funding txs (each outgoing
-                // contract spends one) or Taproot's contract txs. `None` when a
-                // Legacy contract tx has no input, so it proves nothing.
-                let batch_txids: Option<Vec<_>> = outgoing_swapcoins
-                    .iter()
-                    .map(|outgoing| match outgoing.protocol {
-                        ProtocolVersion::Legacy => outgoing
-                            .contract_tx
-                            .input
-                            .first()
-                            .map(|input| input.previous_output.txid),
-                        ProtocolVersion::Taproot => Some(outgoing.contract_tx.compute_txid()),
-                    })
-                    .collect();
-
-                let wallet = lock_debug!(maker.wallet.read())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                let mut all_unknown = batch_txids.is_some();
-                if let Some(txids) = &batch_txids {
-                    for txid in txids {
-                        // Nothing re-spawns this thread, so a failed query must not
-                        // end recovery. Keep the records and let the monitoring
-                        // loop below retry on the next block.
-                        match wallet.blockchain.is_tx_unknown(txid) {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                all_unknown = false;
-                                break;
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "[{}] Could not check funding tx {} for swap {}: {:?}; keeping swapcoins",
-                                    maker.config.network_port,
-                                    txid,
-                                    swap_id,
-                                    e
-                                );
-                                all_unknown = false;
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    log::error!(
-                        "[{}] Malformed outgoing swapcoin for swap {}: contract tx has no inputs; keeping swapcoins for recovery",
-                        maker.config.network_port,
-                        swap_id
-                    );
-                }
+            let mut wallet = lock_debug!(maker.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            let keys = wallet.outgoing_keys_for_swap(&swap_id);
+            let uncommitted = !keys.is_empty() && !wallet.swap_funding_committed(&swap_id);
+            if uncommitted {
+                log::info!(
+                    "[{}] Funding was never committed for swap {} — nothing to recover. Discarding swapcoins.",
+                    maker.config.network_port,
+                    swap_id
+                );
+                let saved = wallet.remove_swap_coins_and_save(&swap_id, true, true);
                 drop(wallet);
-
-                if all_unknown {
-                    log::info!(
-                        "[{}] Funding was never broadcast for swap {} — nothing to recover. Discarding swapcoins.",
-                        maker.config.network_port,
-                        swap_id
-                    );
-
-                    {
-                        let mut wallet = lock_debug!(maker.wallet.write())
-                            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                        for outgoing in &outgoing_swapcoins {
-                            let key = outgoing.contract_tx.compute_txid().to_string();
-                            wallet.remove_outgoing_swapcoin(&key);
-                        }
-                        for incoming in &incoming_swapcoins {
-                            let key = incoming.contract_tx.compute_txid().to_string();
-                            wallet.remove_incoming_swapcoin(&key);
-                        }
-                        // The swap is settled as never funded: its input
-                        // reservation goes with it, not at the 4h TTL.
-                        wallet.release_swap_locks(&swap_id, None);
-                        wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                if let Err(error) = saved {
+                    log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
+                    last_block = None;
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
                     }
-
-                    finish_swap(&maker, &swap_id, MakerSwapPhase::Recovered, None);
-
-                    #[cfg(feature = "integration-test")]
-                    maker.shutdown.store(true, Relaxed);
-                    return Ok(());
+                    continue;
                 }
+                #[cfg(feature = "integration-test")]
+                maker.shutdown.store(true, Relaxed);
+                return Ok(());
             }
         }
 
@@ -1878,11 +1628,12 @@ fn recover_from_swap(
                 .map(|swapcoin| swapcoin.contract_tx.compute_txid())
                 .collect();
 
-            let swept = Wallet::sweep_incoming_swapcoins(
+            let swept = Wallet::sweep_incoming_swapcoins_for_role(
                 &maker.wallet,
                 chain,
                 &maker.shutdown,
                 Some(&contract_txids),
+                SwapRole::Maker,
             )
             // Retry next pass. With the preimage known the timelock refund is never
             // an option: a hashlock claim and a refund must not both happen.
@@ -1901,13 +1652,6 @@ fn recover_from_swap(
                     maker.config.network_port,
                     swept.resolved.len()
                 );
-
-                // Tracker: HashlockRecovered
-                incoming_swept_txids.extend(swept.resolved.iter().map(|(_, txid)| *txid));
-                update_tracker(&maker, &swap_id, |r| {
-                    r.recovery.incoming_swept = incoming_swept_txids.clone();
-                    r.recovery.phase = MakerRecoveryPhase::HashlockRecovered;
-                });
             }
 
             // A contract still in the mempool is swept on a later pass. A contract
@@ -1949,28 +1693,19 @@ fn recover_from_swap(
             if fully_swept {
                 // With the preimage known the outgoing coins are the next hop's
                 // to claim, never ours to refund, so drop them with the incoming.
-                {
+                let saved = {
                     let mut wallet = lock_debug!(maker.wallet.write())
                         .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                    for incoming in &remaining {
-                        wallet.remove_incoming_swapcoin(
-                            &incoming.contract_tx.compute_txid().to_string(),
-                        );
+                    wallet.remove_swap_coins_and_save(&swap_id, true, true)
+                };
+                if let Err(error) = saved {
+                    log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
+                    last_block = None;
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
                     }
-                    for outgoing in &outgoing_swapcoins {
-                        // Wallet stores outgoing swapcoins keyed by contract txid.
-                        let key = outgoing.contract_tx.compute_txid().to_string();
-                        wallet.remove_outgoing_swapcoin(&key);
-                    }
-                    // A partly broadcast batch still holds its unsent inputs.
-                    wallet.release_swap_locks(&swap_id, None);
-                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                    continue;
                 }
-                // An incoming the sender took back is a loss, not a recovery.
-                let report = (!incoming_swept_txids.is_empty())
-                    .then_some(("hashlock", &incoming_swept_txids[..]));
-                finish_swap(&maker, &swap_id, MakerSwapPhase::Recovered, report);
-
                 #[cfg(feature = "integration-test")]
                 maker.shutdown.store(true, Relaxed);
                 return Ok(());
@@ -1986,11 +1721,6 @@ fn recover_from_swap(
                 current_height,
                 timelock_expiry
             );
-
-            // Tracker: TimelockWaiting
-            update_tracker(&maker, &swap_id, |r| {
-                r.recovery.phase = MakerRecoveryPhase::TimelockWaiting;
-            });
 
             let chain = chain.as_ref().expect("connection created for this branch");
 
@@ -2020,15 +1750,6 @@ fn recover_from_swap(
                     maker.config.network_port,
                     recovered.len()
                 );
-
-                // Tracker: TimelockRecovered
-                let recovered_txids: Vec<_> =
-                    recovered.resolved.iter().map(|(_, txid)| *txid).collect();
-                timelock_recovery_txids.extend(recovered_txids.iter().copied());
-                update_tracker(&maker, &swap_id, |r| {
-                    r.recovery.outgoing_recovered = timelock_recovery_txids.clone();
-                    r.recovery.phase = MakerRecoveryPhase::TimelockRecovered;
-                });
             }
 
             // The wallet keeps an outgoing coin the next hop claimed, so with none
@@ -2041,26 +1762,20 @@ fn recover_from_swap(
             let incoming_unclaimable = incoming_swapcoins
                 .iter()
                 .all(|incoming| incoming.other_privkey.is_none());
-            // A swap that never funded waits for its pending discard.
-            if outgoing_done && incoming_unclaimable && !discard_pending {
-                {
+            if outgoing_done && incoming_unclaimable {
+                let saved = {
                     let mut wallet = lock_debug!(maker.wallet.write())
                         .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                    for incoming in &incoming_swapcoins {
-                        let key = incoming.contract_tx.compute_txid().to_string();
-                        wallet.remove_incoming_swapcoin(&key);
+                    wallet.remove_swap_coins_and_save(&swap_id, true, true)
+                };
+                if let Err(error) = saved {
+                    log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
+                    last_block = None;
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
                     }
-                    // A partly broadcast batch still holds its unsent inputs.
-                    wallet.release_swap_locks(&swap_id, None);
-                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                    continue;
                 }
-                finish_swap(
-                    &maker,
-                    &swap_id,
-                    MakerSwapPhase::Recovered,
-                    Some(("timelock", &timelock_recovery_txids)),
-                );
-
                 #[cfg(feature = "integration-test")]
                 maker.shutdown.store(true, Relaxed);
                 return Ok(());

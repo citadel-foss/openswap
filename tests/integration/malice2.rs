@@ -136,10 +136,6 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     log::info!("Starting malice2 test...");
 
     // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
 
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(
@@ -169,7 +165,6 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
             Duration::from_secs(30),
         );
     }
-    taker.log_tracker_state();
 
     let log_path = test_framework.taker_log_path();
     // A dead maker stays offline: it must never learn the preimage.
@@ -313,12 +308,10 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
         "taker balances mismatch"
     );
 
-    taker.log_tracker_state();
     info!("Malice2 test completed successfully!");
 
     shutdown_makers(&makers, maker_threads.into_iter().flatten().collect());
 
-    tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

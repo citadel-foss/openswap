@@ -74,10 +74,6 @@ fn maker_abort3_case3() {
     log::info!("Starting Legacy abort3 case 3 test...");
 
     // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
 
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
@@ -96,7 +92,6 @@ fn maker_abort3_case3() {
         "Swap should fail due to Maker2 closing at hash preimage handover"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -237,12 +232,10 @@ fn maker_abort3_case3() {
         );
     }
 
-    taker.log_tracker_state();
     info!("Legacy abort3 case 3 test completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
 
-    tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

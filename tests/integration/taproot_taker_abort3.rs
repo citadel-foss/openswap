@@ -108,11 +108,6 @@ fn run_taproot_taker_abort(
 
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
 
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
-
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
@@ -130,7 +125,6 @@ fn run_taproot_taker_abort(
         behavior
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -250,12 +244,10 @@ fn run_taproot_taker_abort(
         "Taker spendable balance change mismatch"
     );
 
-    taker.log_tracker_state();
     info!("Taproot taker abort ({case}) completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
 
-    tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

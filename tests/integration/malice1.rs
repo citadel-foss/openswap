@@ -87,7 +87,6 @@ fn test_malice1_taker_broadcast_contract() {
         "Swap should fail due to BroadcastContractAfterFullSetup behavior"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -197,7 +196,6 @@ fn test_malice1_taker_broadcast_contract() {
         taker_balances.spendable,
     );
 
-    taker.log_tracker_state();
     info!("Malice1 test completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
