@@ -21,6 +21,7 @@ use bitcoin::{
 use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 
 use crate::{
+    atomic_file::FileLock,
     blocklist::{AddOutcome, AddressBlocklist, BlocklistEntry},
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
@@ -522,6 +523,9 @@ pub struct Taker {
     /// Test behavior.
     #[cfg(feature = "integration-test")]
     pub behavior: TakerBehavior,
+    /// Keeps a second process off this wallet while this one runs. Last, so
+    /// it is released only after every other field has stopped.
+    _wallet_lock: Option<FileLock>,
 }
 
 impl Drop for Taker {
@@ -640,6 +644,15 @@ impl Taker {
             .unwrap_or_else(get_taker_dir)?;
         std::fs::create_dir_all(&data_dir)?;
         let wallet_path = data_dir.join("wallets").join(&wallet_name);
+        // Tests restart a taker in-process while the old one is still alive.
+        #[cfg(feature = "integration-test")]
+        let wallet_lock = None;
+        #[cfg(not(feature = "integration-test"))]
+        let wallet_lock = {
+            let mut lock_path = wallet_path.clone().into_os_string();
+            lock_path.push(".lock");
+            Some(FileLock::acquire(&PathBuf::from(lock_path))?)
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
         let blockchain = AnyBlockchain::from_config_with_shutdown(&backend, shutdown.clone())?;
         // Misconfiguration (no txindex, dead ZMQ) must fail here, not mid-swap.
@@ -694,6 +707,7 @@ impl Taker {
             offer_sync_handle,
             ongoing_swap: None,
             live_swap: Arc::new(Mutex::new(None)),
+            _wallet_lock: wallet_lock,
             recovery_loop: None,
             breach_detector: None,
             #[cfg(feature = "lightning")]

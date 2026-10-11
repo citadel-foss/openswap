@@ -19,6 +19,7 @@ use std::{
 use bitcoin::{bip32::ChainCode, Amount, Network, OutPoint, PublicKey, Transaction, Txid};
 
 use crate::{
+    atomic_file::FileLock,
     blocklist::AddressBlocklist,
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
@@ -783,6 +784,9 @@ pub struct MakerServer {
     /// Same handoff for the RPC port.
     #[cfg(feature = "integration-test")]
     pub reserved_rpc_listener: Mutex<Option<TcpListener>>,
+    /// Keeps a second daemon off this wallet while this one runs. Last, so
+    /// it is released only after every other field has stopped.
+    _wallet_lock: Option<FileLock>,
 }
 
 /// How long a derived Lightning offer is served before it is recomputed.
@@ -825,6 +829,15 @@ impl MakerServer {
             cfg.wallet_name = wallet_name.clone();
         }
         let wallet_path = config.data_dir.join("wallets").join(&wallet_name);
+        // Tests restart a maker in-process while the old one is still alive.
+        #[cfg(feature = "integration-test")]
+        let wallet_lock = None;
+        #[cfg(not(feature = "integration-test"))]
+        let wallet_lock = {
+            let mut lock_path = wallet_path.clone().into_os_string();
+            lock_path.push(".lock");
+            Some(FileLock::acquire(Path::new(&lock_path))?)
+        };
         let shutdown = ShutdownSignal::new();
         let backend_shutdown = shutdown.backend_flag();
         let blockchain =
@@ -944,6 +957,7 @@ impl MakerServer {
             completed_handovers: Mutex::new(HashMap::new()),
             thread_pool: Arc::new(ThreadPool::new(config.network_port)),
             data_dir,
+            _wallet_lock: wallet_lock,
             nostr_relays,
             #[cfg(feature = "lightning")]
             lightning,
@@ -3607,7 +3621,7 @@ pub(crate) mod tests {
     #[cfg(feature = "integration-test")]
     use super::MakerBehavior;
     use super::{
-        min_swap_amount, swap_cost_floor, BackendConnector, MakerError, MakerServer,
+        min_swap_amount, swap_cost_floor, BackendConnector, FileLock, MakerError, MakerServer,
         MakerServerConfig, ShutdownSignal, ThreadPool, WatchService, MIN_SWAP_STEP_SATS,
         REFUND_LOCKTIME_BASE,
     };
@@ -3670,6 +3684,7 @@ pub(crate) mod tests {
             watch_service,
             thread_pool: Arc::new(ThreadPool::new(0)),
             data_dir: path.to_path_buf(),
+            _wallet_lock: Some(FileLock::acquire(&path.join("wallet.lock")).unwrap()),
             nostr_relays: Vec::new(),
             config,
             #[cfg(feature = "lightning")]
