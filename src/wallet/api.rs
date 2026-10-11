@@ -973,11 +973,13 @@ impl Wallet {
             }
             return Err(error);
         }
+        let mut remaining = self.store.outgoing_swapcoins.len() + outgoing.len();
         for (key, _) in &outgoing {
+            remaining -= 1;
             log::info!(
                 "Removed outgoing swapcoin: {} (remaining: {})",
                 key,
-                self.store.outgoing_swapcoins.len()
+                remaining
             );
         }
         Ok(())
