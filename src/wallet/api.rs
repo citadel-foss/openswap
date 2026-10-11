@@ -984,11 +984,13 @@ impl Wallet {
         Ok(())
     }
 
-    fn funding_inputs_confirmed_spent(
+    /// Whether a confirmed transaction other than `tx` spends one of its
+    /// inputs, so `tx` can never confirm.
+    fn inputs_spent_elsewhere(
         chain: &AnyBlockchain,
-        funding: &Transaction,
+        tx: &Transaction,
     ) -> Result<bool, WalletError> {
-        for input in &funding.input {
+        for input in &tx.input {
             let outpoint = input.previous_output;
             let parent = match chain.get_raw_transaction(&outpoint.txid, None) {
                 Ok(tx) => tx,
@@ -1001,7 +1003,7 @@ impl Wallet {
             if let Some(output) = parent.output.get(outpoint.vout as usize) {
                 if chain
                     .confirmed_spending_transaction(&outpoint, &output.script_pubkey)?
-                    .is_some_and(|spender| spender.compute_txid() != funding.compute_txid())
+                    .is_some_and(|spender| spender.compute_txid() != tx.compute_txid())
                 {
                     return Ok(true);
                 }
@@ -1083,19 +1085,26 @@ impl Wallet {
         } else {
             swapcoin.funding_tx.as_ref()
         };
-        if let Some(funding) = funding {
-            if chain.tx_block_height(&funding.compute_txid())?.is_none()
-                && Self::funding_inputs_confirmed_spent(chain, funding)?
-            {
-                log::info!(
-                    "Funding input for {} was confirmed spent elsewhere, discarding swapcoin",
-                    swap_id
-                );
-                return Ok(ContractChainState::Discarded);
-            }
-        }
         // An absent committed funding tx may still confirm from another node.
-        // Only a confirmed conflicting input spend proves it cannot return.
+        // Only a confirmed conflicting spend proves it cannot return: of a
+        // funding input, or of the funding output a legacy contract spends.
+        let funding_dead = match funding {
+            Some(funding) => {
+                chain.tx_block_height(&funding.compute_txid())?.is_none()
+                    && Self::inputs_spent_elsewhere(chain, funding)?
+            }
+            None => false,
+        };
+        if funding_dead
+            || (swapcoin.protocol == ProtocolVersion::Legacy
+                && Self::inputs_spent_elsewhere(chain, &swapcoin.contract_tx)?)
+        {
+            log::info!(
+                "Funding for {} was confirmed spent elsewhere, discarding swapcoin",
+                swap_id
+            );
+            return Ok(ContractChainState::Discarded);
+        }
         let signed_contract = match swapcoin.create_signed_contract_tx() {
             Ok(tx) => tx,
             Err(e) => {
@@ -6653,7 +6662,7 @@ mod legacy_recovery_tests {
     }
 
     #[test]
-    fn test_ensure_contract_committed_without_funding_tx_is_retained() {
+    fn test_ensure_contract_unsigned_legacy_with_no_funding_tx_and_spent_parent_is_discarded() {
         let parent_tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
@@ -6723,7 +6732,7 @@ mod legacy_recovery_tests {
                 let res =
                     Wallet::ensure_contract_on_chain(&blockchain, "swap-no-funding-spent", &sc)
                         .unwrap();
-                assert_eq!(res, ContractChainState::NotYet);
+                assert_eq!(res, ContractChainState::Discarded);
             },
         );
     }
@@ -7098,7 +7107,16 @@ mod legacy_recovery_tests {
                     "swap-no-funding-mismatched",
                     &sc,
                 );
-                assert_eq!(res.unwrap(), ContractChainState::NotYet);
+                // Same split as the funded-mismatch case: Electrum's
+                // txid-validating fetch rejects the wrong transaction and
+                // that must propagate, while Core's stub returns it
+                // transparently and the plain txid comparison downstream
+                // catches the mismatch, leaving NotYet.
+                if matches!(blockchain, AnyBlockchain::Electrum(_)) {
+                    res.unwrap_err();
+                } else {
+                    assert_eq!(res.unwrap(), ContractChainState::NotYet);
+                }
             },
         );
     }
