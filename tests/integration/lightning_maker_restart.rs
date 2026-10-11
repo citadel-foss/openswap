@@ -455,3 +455,141 @@ fn stale_watchdog_expiry_keeps_paid_swap() {
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
+
+/// The funded-message handler moves a swap-in to InPaid with
+/// `store_ln_swap_if_phase`, from a copy read before its confirmation wait.
+/// That store must refuse the copy once another connection has moved the
+/// swap to InPaid, or once the swap is gone, and must store it while the
+/// swap is still InAccepted. This covers the store itself, not whether the
+/// handler calls it.
+#[test]
+fn conditional_paid_store_refuses_stale_copy() {
+    log::warn!("Running Test: conditional InPaid store refuses a stale copy");
+
+    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let maker = makers[0].clone();
+
+    // The InPaid state a handler builds from its copy and its own funding.
+    let paid = |accepted: &LnMakerSwap, funding: (OutPoint, Amount)| {
+        let mut paid = accepted.clone();
+        paid.phase = LnMakerPhase::InPaid;
+        paid.funding = Some(funding);
+        paid.funding_height = Some(101);
+        paid
+    };
+    let first_funding = (OutPoint::default(), Amount::from_sat(40_500));
+    let stale_funding = (
+        OutPoint {
+            vout: 1,
+            ..OutPoint::default()
+        },
+        Amount::from_sat(40_500),
+    );
+
+    // Stale copy: another connection pays the swap after this copy was read.
+    let stale_preimage = Preimage([0x71; 32]);
+    let stale_id = stale_preimage.payment_hash().to_string();
+    let stale_copy = accepted_swap_in(&stale_preimage);
+    maker.store_ln_swap(&stale_id, stale_copy.clone()).unwrap();
+    maker
+        .store_ln_swap(&stale_id, paid(&stale_copy, first_funding))
+        .unwrap();
+    let stored = maker
+        .store_ln_swap_if_phase(
+            &stale_id,
+            LnMakerPhase::InAccepted,
+            paid(&stale_copy, stale_funding),
+        )
+        .unwrap();
+    assert!(!stored, "a stale copy was stored over a paid swap");
+    let live = maker.get_ln_swap(&stale_id).unwrap().unwrap();
+    assert_eq!(live.phase, LnMakerPhase::InPaid);
+    assert_eq!(
+        live.funding,
+        Some(first_funding),
+        "a stale copy overwrote the paid swap"
+    );
+
+    // Removed swap: the copy outlives the swap it was read from.
+    let removed_preimage = Preimage([0x72; 32]);
+    let removed_id = removed_preimage.payment_hash().to_string();
+    let removed_copy = accepted_swap_in(&removed_preimage);
+    maker
+        .store_ln_swap(&removed_id, removed_copy.clone())
+        .unwrap();
+    maker.remove_ln_swap(&removed_id).unwrap();
+    let stored = maker
+        .store_ln_swap_if_phase(
+            &removed_id,
+            LnMakerPhase::InAccepted,
+            paid(&removed_copy, stale_funding),
+        )
+        .unwrap();
+    assert!(!stored, "a stale copy recreated a removed swap");
+    assert!(
+        maker.get_ln_swap(&removed_id).unwrap().is_none(),
+        "a stale copy recreated a removed swap in memory"
+    );
+
+    // Current copy: the swap is still InAccepted, so the move goes through.
+    let current_preimage = Preimage([0x73; 32]);
+    let current_id = current_preimage.payment_hash().to_string();
+    let current_copy = accepted_swap_in(&current_preimage);
+    maker
+        .store_ln_swap(&current_id, current_copy.clone())
+        .unwrap();
+    let stored = maker
+        .store_ln_swap_if_phase(
+            &current_id,
+            LnMakerPhase::InAccepted,
+            paid(&current_copy, first_funding),
+        )
+        .unwrap();
+    assert!(stored, "a current copy was refused");
+    let live = maker.get_ln_swap(&current_id).unwrap().unwrap();
+    assert_eq!(live.phase, LnMakerPhase::InPaid);
+    assert_eq!(live.funding, Some(first_funding));
+
+    // The wallet store is private to the crate, so check what reached disk by
+    // restarting: init rebuilds the swaps from the stored records.
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(maker);
+    drop(makers);
+
+    let restarted = MakerServer::init(config).expect("maker restarts");
+    let restored = restarted.ln_swaps.lock().unwrap().clone();
+    let restored_stale = restored
+        .get(&stale_id)
+        .expect("the paid swap's record was lost");
+    assert_eq!(restored_stale.phase, LnMakerPhase::InPaid);
+    assert_eq!(
+        restored_stale.funding,
+        Some(first_funding),
+        "a stale copy overwrote the paid swap's record"
+    );
+    assert!(
+        !restored.contains_key(&removed_id),
+        "a stale copy recreated a removed swap's record"
+    );
+    let restored_current = restored
+        .get(&current_id)
+        .expect("the current copy's InPaid record was not saved");
+    assert_eq!(restored_current.phase, LnMakerPhase::InPaid);
+    assert_eq!(restored_current.funding, Some(first_funding));
+
+    drop(takers);
+    restarted.shutdown.store(true, Relaxed);
+    restarted.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
