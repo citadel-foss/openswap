@@ -556,8 +556,7 @@ name = \"{}\"
             self.name,
         );
 
-        // Optional Lightning backend keys: only present when configured, so
-        // the round-trip rewrite makerd performs on startup preserves them.
+        // Optional Lightning backend keys: only present when configured.
         let mut toml_data = toml_data;
         if let Some(url) = &self.ldk_server_url {
             toml_data.push_str(&format!(

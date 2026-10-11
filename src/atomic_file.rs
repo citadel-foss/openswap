@@ -3,7 +3,7 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs::{File, OpenOptions, TryLockError},
-    io,
+    io::{self, Write},
     path::Path,
 };
 
@@ -57,13 +57,16 @@ pub(crate) fn read_json<T: DeserializeOwned + Default>(path: &Path) -> io::Resul
 
 pub(crate) fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let json = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
+    write_atomically(path, json.as_bytes())
+}
+
+/// Replace `path` with `bytes` so a crash leaves either the old or the new file.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary_path = path.with_extension("partial");
 
     {
-        use io::Write;
-
-        let mut temporary_file = std::fs::File::create(&temporary_path)?;
-        temporary_file.write_all(json.as_bytes())?;
+        let mut temporary_file = File::create(&temporary_path)?;
+        temporary_file.write_all(bytes)?;
         temporary_file.sync_all()?;
     }
 

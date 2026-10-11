@@ -50,6 +50,7 @@ pub(crate) fn global_secp() -> &'static Secp256k1<All> {
 }
 
 use crate::{
+    atomic_file::write_atomically,
     error::NetError,
     lock_debug,
     protocol::{
@@ -573,6 +574,37 @@ pub(crate) fn parse_list(value: Option<&String>) -> io::Result<Vec<String>> {
                 .ok_or_else(malformed)
         })
         .collect()
+}
+
+/// Sets `key = value` in a config file, touching no other line, and appends it
+/// if missing. Rewriting the whole file would drop keys this build doesn't know.
+pub fn set_config_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
+    let content = fs::read_to_string(path)?;
+    let new_line = format!("{key} = {value}");
+    let (mut found, mut changed) = (false, false);
+    let mut updated = String::with_capacity(content.len() + new_line.len() + 1);
+    for line in content.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\r', '\n']);
+        match text.split_once('=') {
+            Some((k, v)) if k.trim() == key => {
+                found = true;
+                changed |= v.trim() != value;
+                updated.push_str(&new_line);
+                updated.push_str(&line[text.len()..]);
+            }
+            _ => updated.push_str(line),
+        }
+    }
+    if !found {
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&new_line);
+        updated.push('\n');
+    } else if !changed {
+        return Ok(());
+    }
+    write_atomically(path, updated.as_bytes())
 }
 
 fn polynomial_modulus(mut checksum: u64, value: u64) -> u64 {
@@ -1732,5 +1764,24 @@ mod tests {
         ] {
             assert!(read(bad).is_err(), "{}", bad);
         }
+    }
+
+    #[test]
+    fn set_config_key_touches_only_its_line() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# note\nfuture_key = [\"x\"]\nport = 1\r\nname = \"m\"";
+        fs::write(&path, original).unwrap();
+        let written_at = fs::metadata(&path).unwrap().modified().unwrap();
+
+        set_config_key(&path, "port", "1").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), written_at);
+
+        set_config_key(&path, "port", "2").unwrap();
+        set_config_key(&path, "new_key", "true").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# note\nfuture_key = [\"x\"]\nport = 2\r\nname = \"m\"\nnew_key = true\n"
+        );
     }
 }

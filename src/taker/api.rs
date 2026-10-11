@@ -40,7 +40,7 @@ use crate::{
     },
     utill::{
         funding_fee_policy_sats, generate_maker_keys, get_taker_dir, read_message, send_message,
-        sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
+        set_config_key, sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
         blockchain::BackendConnector,
@@ -900,7 +900,9 @@ impl Taker {
         config: &TakerInitConfig,
         data_dir: &std::path::Path,
     ) -> Result<(), TakerError> {
-        let mut taker_config = TakerConfig::new(Some(&data_dir.join("config.toml")))?;
+        let config_path = data_dir.join("config.toml");
+        let loaded = TakerConfig::new(Some(&config_path))?;
+        let mut taker_config = loaded.clone();
 
         if let Some(control_port) = config.control_port {
             taker_config.control_port = control_port;
@@ -916,7 +918,7 @@ impl Taker {
             taker_config.check_blocklist = check_blocklist;
         }
 
-        // Carried across the rewrite like every other setting above: the CLI
+        // Saved like every other setting above: the CLI
         // rebuilds `TakerInitConfig` from this file on the next launch, so
         // dropping these would silently disable the Lightning backend — and
         // with it the automatic recovery of any swap still in flight.
@@ -940,7 +942,32 @@ impl Taker {
             )?;
         }
 
-        taker_config.write_to_file(&data_dir.join("config.toml"))?;
+        // Write only what changed: a full rewrite drops keys this build doesn't know.
+        let fields = |c: &TakerConfig| {
+            [
+                ("control_port", c.control_port.to_string()),
+                ("socks_port", c.socks_port.to_string()),
+                ("tor_auth_password", c.tor_auth_password.clone()),
+                ("check_blocklist", c.check_blocklist.to_string()),
+                (
+                    "ldk_server_url",
+                    c.ldk_server_url.clone().unwrap_or_default(),
+                ),
+                (
+                    "ldk_api_key_path",
+                    c.ldk_api_key_path.clone().unwrap_or_default(),
+                ),
+                (
+                    "ldk_tls_cert_path",
+                    c.ldk_tls_cert_path.clone().unwrap_or_default(),
+                ),
+            ]
+        };
+        for ((key, old), (_, new)) in fields(&loaded).iter().zip(&fields(&taker_config)) {
+            if old != new {
+                set_config_key(&config_path, key, new)?;
+            }
+        }
         Ok(())
     }
 
