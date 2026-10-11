@@ -15,15 +15,17 @@ use crate::{
     wallet::UTXOSpendInfo,
 };
 
-use super::{error::WalletError, fidelity::FidelityBond};
+use super::{error::WalletError, fidelity::FidelityBond, report::SwapReportFile};
 
 use bitcoin::{bip32::Xpriv, Network, OutPoint, ScriptBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_cbor::{value::from_value, Value};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::File,
-    io::{BufWriter, Write},
+    io::{BufWriter, ErrorKind, Write},
     path::Path,
 };
 
@@ -595,38 +597,220 @@ impl WalletStore {
     /// Reads and decrypts the wallet at `path`, returning the store and the
     /// key material derived from `password`.
     ///
-    /// A name in `requires` this build can't serve gives
-    /// [`WalletError::NeedsUpgrade`] before anything is decrypted. A bare
-    /// v0.2.3 file gives [`WalletError::OldFormat`]. No password gives
-    /// [`SecurityError::PasswordRequired`]. The file is never written here.
+    /// Unsupported requirements refuse before decryption. A closed legacy
+    /// wallet is archived and upgraded before returning; an open one is untouched.
     pub(crate) fn read_from_disk(
         path: &Path,
         password: Option<String>,
     ) -> Result<(Self, KeyMaterial), WalletError> {
         let content = std::fs::read(path)?;
-        let file = match deserialize_from_cbor::<WalletFile>(&content) {
-            Ok(file) => file,
-            Err(_) if deserialize_from_cbor::<EncryptedData>(&content).is_ok() => {
-                return Err(WalletError::OldFormat)
-            }
-            Err(e) => return Err(e.into()),
+        if let Ok(file) = deserialize_from_cbor::<WalletFile>(&content) {
+            check_requires(&file.requires, &supported()).map_err(WalletError::NeedsUpgrade)?;
+            let password = password
+                .filter(|p| !p.is_empty())
+                .ok_or(SecurityError::PasswordRequired)?;
+            return Ok(decrypt_with_password(
+                file.encrypted,
+                password,
+                &requires_aad(&file.requires),
+            )?);
+        }
+        let encrypted = deserialize_from_cbor::<EncryptedData>(&content);
+        let plaintext = if encrypted.is_err() {
+            Some(deserialize_from_cbor::<Self>(&content)?)
+        } else {
+            None
         };
-        check_requires(&file.requires, &supported()).map_err(WalletError::NeedsUpgrade)?;
         let password = password
             .filter(|p| !p.is_empty())
             .ok_or(SecurityError::PasswordRequired)?;
-        Ok(decrypt_with_password(
-            file.encrypted,
-            password,
-            &requires_aad(&file.requires),
-        )?)
+        let (mut store, material) = if let Some(store) = plaintext {
+            (
+                store,
+                KeyMaterial::new_from_password(Some(password))
+                    .ok_or(SecurityError::PasswordRequired)?,
+            )
+        } else {
+            decrypt_with_password(encrypted?, password, &[])?
+        };
+        let refuse = |reason: String| {
+            WalletError::General(format!(
+            "Cannot upgrade {}: {reason}. Stop every v0.2.3 process using this data directory; an old process can overwrite new swap keys and lose funds. Start v0.2.3 once and finish all swaps before retrying.",
+            path.display()
+        ))
+        };
+        if !store.incoming_swapcoins.is_empty()
+            || !store.outgoing_swapcoins.is_empty()
+            || store
+                .watchonly_swapcoins
+                .values()
+                .any(|coins| !coins.is_empty())
+            || !store.swap_locks.is_empty()
+            || !store.ln_pending_swaps.is_empty()
+            || !store.ln_maker_swaps.is_empty()
+        {
+            return Err(refuse("the wallet has open swaps".into()));
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let data_dir = if parent.file_name().is_some_and(|name| name == "wallets") {
+            parent.parent().unwrap_or(parent)
+        } else {
+            parent
+        };
+        for (name, maker) in [
+            ("maker_swap_tracker.cbor", true),
+            ("swap_tracker.cbor", false),
+        ] {
+            let tracker = data_dir.join(name);
+            match std::fs::read(&tracker) {
+                Ok(bytes) if legacy_tracker_is_open(&bytes, maker) => {
+                    return Err(refuse(format!(
+                        "{} is unreadable or incomplete",
+                        tracker.display()
+                    )));
+                }
+                Err(e) if e.kind() != ErrorKind::NotFound => {
+                    return Err(refuse(format!("cannot read {}: {e}", tracker.display())));
+                }
+                _ => {}
+            }
+        }
+        let report_path = parent.join(format!(
+            "{}_swap_report.json",
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| refuse("the wallet filename is invalid".into()))?
+        ));
+        let report_bytes = match std::fs::read(&report_path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(refuse(format!(
+                    "cannot read {}: {e}",
+                    report_path.display()
+                )))
+            }
+        };
+        if let Some(bytes) = &report_bytes {
+            let report: SwapReportFile = serde_json::from_slice(bytes)
+                .map_err(|e| refuse(format!("{} is unreadable: {e}", report_path.display())))?;
+            for (kind, entries) in report.into_values()? {
+                store
+                    .reports
+                    .entry(kind.into())
+                    .or_default()
+                    .extend(entries);
+            }
+        }
+        store.master_key.seal(&material)?;
+        log::warn!("Upgrading {}. Every v0.2.3 process must be stopped: an old process can overwrite new swap keys and lose funds.", path.display());
+        archive_legacy_file(path, &content)?;
+        if let Some(bytes) = &report_bytes {
+            archive_legacy_file(&report_path, bytes)?;
+        }
+        // Both archives must survive a crash before the live wallet is replaced.
+        File::open(parent)?.sync_all()?;
+        store.write_to_disk(path, &material)?;
+        // The entries are committed now, and a later load never imports the
+        // file again, so a failed delete only leaves a stale copy behind.
+        if report_bytes.is_some() {
+            if let Err(e) = std::fs::remove_file(&report_path) {
+                log::warn!("Could not delete {}: {e}", report_path.display());
+            }
+        }
+        log::warn!("Upgraded {}. After every wallet in this data directory is upgraded, manually delete maker_swap_tracker.cbor and swap_tracker.cbor. Keep the private .v023 archives for rollback.", path.display());
+        Ok((store, material))
     }
+}
+
+fn legacy_tracker_is_open(bytes: &[u8], maker: bool) -> bool {
+    let Ok(Value::Map(fields)) = serde_cbor::from_slice::<Value>(bytes) else {
+        return true;
+    };
+    let Some(Value::Map(swaps)) = fields.get(&Value::Text("swaps".into())) else {
+        return true;
+    };
+    swaps.values().any(|record| {
+        let Value::Map(record) = record else {
+            return true;
+        };
+        let phase = record.get(&Value::Text("phase".into()));
+        let Some(Value::Map(recovery)) = record.get(&Value::Text("recovery".into())) else {
+            return true;
+        };
+        let Some(Value::Text(recovery_phase)) = recovery.get(&Value::Text("phase".into())) else {
+            return true;
+        };
+        let recognized_recovery = if maker {
+            matches!(
+                recovery_phase.as_str(),
+                "NotStarted"
+                    | "Monitoring"
+                    | "HashlockRecovered"
+                    | "TimelockWaiting"
+                    | "TimelockRecovered"
+                    | "CleanedUp"
+            )
+        } else {
+            matches!(
+                recovery_phase.as_str(),
+                "NotStarted"
+                    | "PreimageStamped"
+                    | "SwapcoinsPersisted"
+                    | "IncomingRecovered"
+                    | "OutgoingRecovered"
+                    | "CleanedUp"
+            )
+        };
+        if !recognized_recovery {
+            return true;
+        }
+        let cleaned = recovery_phase == "CleanedUp";
+        if maker {
+            !matches!(phase, Some(Value::Text(p)) if p == "Completed" || p == "Recovered")
+                || !cleaned
+        } else {
+            !matches!(phase, Some(Value::Text(p)) if p == "Completed" || (p == "Failed" && cleaned))
+        }
+    })
+}
+
+fn archive_legacy_file(path: &Path, bytes: &[u8]) -> Result<(), WalletError> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".v023");
+    let archive = Path::new(&name);
+    match std::fs::read(archive) {
+        Ok(existing) if existing == bytes => {
+            #[cfg(unix)]
+            std::fs::set_permissions(archive, std::fs::Permissions::from_mode(0o600))?;
+            File::open(archive)?.sync_all()?;
+            return Ok(());
+        }
+        Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(archive).map_err(|e| e.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{security::SecurityError, wallet::Wallet};
+    use crate::{
+        security::SecurityError,
+        wallet::{
+            report::{RecoveryReport, SwapRole},
+            Wallet,
+        },
+    };
     use bip39::rand::{thread_rng, Rng};
     use bitcoin::{
         absolute::LockTime,
@@ -703,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn compat_wallet_headers_authenticate_and_bare_files_remain_untouched() {
+    fn compat_wallet_headers_authenticate_and_bare_files_upgrade() {
         let dir = tempdir().unwrap();
         let (path, store, material) = stored_wallet(dir.path());
         let encrypted = encrypt_struct_with_aad(&store, &material, b"legacy\ntaproot").unwrap();
@@ -734,13 +918,17 @@ mod tests {
         let bare = serde_cbor::to_vec(&encrypt_struct(&store, &material).unwrap()).unwrap();
         std::fs::write(&path, &bare).unwrap();
         assert!(Wallet::is_wallet_encrypted(&path).unwrap());
-        for password in [None, Some(PASSWORD.into())] {
-            assert!(matches!(
-                WalletStore::read_from_disk(&path, password),
-                Err(WalletError::OldFormat)
-            ));
-            assert_eq!(std::fs::read(&path).unwrap(), bare);
-        }
+        assert!(matches!(
+            WalletStore::read_from_disk(&path, None),
+            Err(WalletError::Security(SecurityError::PasswordRequired))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bare);
+        let (read, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+        assert_eq!(read, store);
+        assert_eq!(
+            std::fs::read(path.with_file_name("wallet.cbor.v023")).unwrap(),
+            bare
+        );
         std::fs::write(&path, b"garbage").unwrap();
         assert!(!Wallet::is_wallet_encrypted(&path).unwrap());
     }
@@ -974,8 +1162,158 @@ mod tests {
 
         let bare = encrypt_struct(&store, &material).unwrap();
         std::fs::write(&path, serde_cbor::to_vec(&bare).unwrap()).unwrap();
-        let error = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap_err();
-        assert!(matches!(error, WalletError::OldFormat));
+        let (read, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+        assert_eq!(read, store);
+    }
+
+    #[test]
+    fn legacy_upgrade_archives_exact_inputs_and_seals_the_master_key() {
+        for cleartext in [false, true] {
+            let dir = tempdir().unwrap();
+            let wallets = dir.path().join("wallets");
+            std::fs::create_dir(&wallets).unwrap();
+            let (path, store, material) = stored_wallet(&wallets);
+            let xpriv = store.master_key.plaintext_with(&material).unwrap();
+            let mut legacy = to_value(&store).unwrap();
+            let Value::Map(fields) = &mut legacy else {
+                panic!()
+            };
+            fields.insert(Value::Text("master_key".into()), to_value(xpriv).unwrap());
+            let bytes = if cleartext {
+                serde_cbor::to_vec(&legacy).unwrap()
+            } else {
+                serde_cbor::to_vec(&encrypt_struct(&legacy, &material).unwrap()).unwrap()
+            };
+            std::fs::write(&path, &bytes).unwrap();
+            let sibling = wallets.join("sibling.wallet");
+            std::fs::write(&sibling, &bytes).unwrap();
+            let report_path = wallets.join("wallet_swap_report.json");
+            let report = SwapReportFile {
+                recovery: vec![RecoveryReport {
+                    swap_id: "closed-swap".into(),
+                    role: SwapRole::Taker,
+                    node: None,
+                    recovery_type: "timelock".into(),
+                    recovery_txids: vec!["txid".into()],
+                    network: "regtest".into(),
+                    timestamp: 10,
+                }],
+                ..Default::default()
+            };
+            let report_bytes = serde_json::to_vec(&report).unwrap();
+            std::fs::write(&report_path, &report_bytes).unwrap();
+            let archive = wallets.join("wallet.cbor.v023");
+            std::fs::write(&archive, b"older wallet").unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let (read, key) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+            assert!(matches!(read.master_key, MasterKey::Sealed(_)));
+            assert_eq!(read.master_key.plaintext_with(&key), Some(xpriv));
+            assert_eq!(
+                read.reports["recovery"],
+                vec![to_value(&report.recovery[0]).unwrap()]
+            );
+            assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+            let report_archive = wallets.join("wallet_swap_report.json.v023");
+            assert_eq!(std::fs::read(&report_archive).unwrap(), report_bytes);
+            assert_eq!(std::fs::read(&sibling).unwrap(), bytes);
+            assert!(!report_path.exists());
+            #[cfg(unix)]
+            for file in [&archive, &report_archive] {
+                assert_eq!(
+                    std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            let migrated = std::fs::read(&path).unwrap();
+            assert!(serde_cbor::from_slice::<WalletFile>(&migrated).is_ok());
+            // A report created beside a restored envelope is never imported or deleted.
+            std::fs::write(&report_path, &report_bytes).unwrap();
+            let (second, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+            assert_eq!(second, read);
+            assert_eq!(std::fs::read(&path).unwrap(), migrated);
+            assert_eq!(std::fs::read(&report_path).unwrap(), report_bytes);
+        }
+    }
+
+    #[test]
+    fn legacy_upgrade_refuses_before_creating_archives() {
+        for reason in [
+            "open wallet",
+            "incomplete tracker",
+            "bad tracker",
+            "bad report",
+        ] {
+            let dir = tempdir().unwrap();
+            let wallets = if reason == "incomplete tracker" {
+                dir.path().to_path_buf()
+            } else {
+                dir.path().join("wallets")
+            };
+            std::fs::create_dir_all(&wallets).unwrap();
+            let (path, mut store, material) = stored_wallet(&wallets);
+            if reason == "open wallet" {
+                store
+                    .swap_locks
+                    .insert("open".into(), SwapReservation::default());
+            }
+            let bytes = serde_cbor::to_vec(&encrypt_struct(&store, &material).unwrap()).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let tracker_path = dir.path().join("swap_tracker.cbor");
+            let tracker = if reason == "bad tracker" {
+                b"broken".to_vec()
+            } else if reason == "incomplete tracker" {
+                serde_cbor::to_vec(&serde_json::json!({"swaps":{"s":{"phase":"FundsBroadcast","recovery":{"phase":"CleanedUp"}}}})).unwrap()
+            } else {
+                serde_cbor::to_vec(&serde_json::json!({"swaps":{}})).unwrap()
+            };
+            std::fs::write(&tracker_path, &tracker).unwrap();
+            let report_path = wallets.join("wallet_swap_report.json");
+            let report_bytes = if reason == "bad report" {
+                b"broken".to_vec()
+            } else {
+                serde_json::to_vec(&SwapReportFile::default()).unwrap()
+            };
+            std::fs::write(&report_path, &report_bytes).unwrap();
+            let error = WalletStore::read_from_disk(&path, Some(PASSWORD.into()))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Start v0.2.3 once"), "{}", error);
+            assert!(error.contains("Stop every v0.2.3 process"));
+            assert!(error.contains("lose funds"));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(std::fs::read(&tracker_path).unwrap(), tracker);
+            assert_eq!(std::fs::read(&report_path).unwrap(), report_bytes);
+            assert_eq!(
+                std::fs::read_dir(&wallets).unwrap().count(),
+                if wallets == dir.path() { 3 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_tracker_predicates_match_v023() {
+        for (phase, cleanup, maker_open, taker_open) in [
+            ("Completed", "NotStarted", true, false),
+            ("Completed", "CleanedUp", false, false),
+            ("Recovered", "CleanedUp", false, true),
+            ("Failed", "CleanedUp", true, false),
+            ("Failed", "NotStarted", true, true),
+            ("FuturePhase", "CleanedUp", true, true),
+            ("Completed", "FutureRecovery", true, true),
+        ] {
+            let bytes = serde_cbor::to_vec(
+                &serde_json::json!({"swaps":{"s":{"phase":phase,"recovery":{"phase":cleanup}}}}),
+            )
+            .unwrap();
+            assert_eq!(legacy_tracker_is_open(&bytes, true), maker_open);
+            assert_eq!(legacy_tracker_is_open(&bytes, false), taker_open);
+        }
+        assert!(legacy_tracker_is_open(b"broken", false));
+        assert!(legacy_tracker_is_open(
+            &serde_cbor::to_vec(&serde_json::json!({"swaps":[]})).unwrap(),
+            true
+        ));
     }
 
     #[test]

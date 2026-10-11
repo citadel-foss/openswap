@@ -137,10 +137,6 @@ pub enum WalletError {
     /// The wallet holds records that need these feature names, which this
     /// build can't serve. The file is left untouched; open it with a newer build.
     NeedsUpgrade(Vec<String>),
-
-    /// The wallet file is in the v0.2.3 format, which this build only reads
-    /// to upgrade it.
-    OldFormat,
 }
 
 impl From<std::io::Error> for WalletError {
@@ -300,10 +296,6 @@ impl std::fmt::Display for WalletError {
             WalletError::NeedsUpgrade(names) => write!(
                 f,
                 "this wallet needs a newer build: it uses {names:?}, which this build can't serve"
-            ),
-            WalletError::OldFormat => write!(
-                f,
-                "this wallet is in the v0.2.3 format and must be upgraded before use"
             ),
         }
     }

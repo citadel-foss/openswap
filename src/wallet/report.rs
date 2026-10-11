@@ -11,7 +11,10 @@
 //! [`SwapReportFile`] still reads that file.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_cbor::value::{from_value, to_value};
+use serde_cbor::{
+    value::{from_value, to_value},
+    Value,
+};
 use std::{collections::HashMap, path::Path, time::Instant};
 
 use crate::utill::now_secs;
@@ -688,6 +691,23 @@ pub struct SwapReportFile {
     pub recovery: Vec<RecoveryReport>,
     /// Deniability proofs generated for swaps in this wallet.
     pub deniability_proofs: Vec<DeniabilityProof>,
+}
+
+impl SwapReportFile {
+    /// The entries as the wallet stores them: raw values under each kind.
+    pub(crate) fn into_values(self) -> Result<[(&'static str, Vec<Value>); 4], WalletError> {
+        fn values<T: Serialize>(
+            items: impl IntoIterator<Item = T>,
+        ) -> Result<Vec<Value>, WalletError> {
+            items.into_iter().map(|item| Ok(to_value(item)?)).collect()
+        }
+        Ok([
+            (TAKER_REPORTS, values(self.taker)?),
+            (MAKER_REPORTS, values(self.maker.into_values().flatten())?),
+            (RECOVERY_REPORTS, values(self.recovery)?),
+            (DENIABILITY_PROOFS, values(self.deniability_proofs)?),
+        ])
+    }
 }
 
 #[cfg(test)]
