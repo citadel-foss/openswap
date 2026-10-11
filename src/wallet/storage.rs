@@ -807,6 +807,7 @@ mod tests {
     use crate::{
         security::SecurityError,
         wallet::{
+            deniability::{verify_proof_for_test, DeniabilityProof},
             report::{RecoveryReport, SwapRole},
             Wallet,
         },
@@ -820,8 +821,270 @@ mod tests {
     };
     use bitcoind::tempfile::tempdir;
     use serde_cbor::value::to_value;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
 
     const PASSWORD: &str = "wallet password";
+    const V023_PASSWORD: &str = "compat-v023";
+    const V023_CLOSED: &[u8] = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed.wallet");
+    const V023_NEWER: &[u8] =
+        include_bytes!("../../tests/fixtures/compat/v0.2.3/closed-newer.wallet");
+    const V023_OPEN: &[u8] = include_bytes!("../../tests/fixtures/compat/v0.2.3/open.wallet");
+    const V023_REPORT: &[u8] =
+        include_bytes!("../../tests/fixtures/compat/v0.2.3/closed_swap_report.json");
+    const V023_SIBLING: &[u8] = include_bytes!("../../tests/fixtures/compat/v0.2.3/sibling.wallet");
+    const V023_MAKER_DONE: &[u8] =
+        include_bytes!("../../tests/fixtures/compat/v0.2.3/maker-completed.cbor");
+    const V023_MAKER_OPEN: &[u8] =
+        include_bytes!("../../tests/fixtures/compat/v0.2.3/maker-incomplete.cbor");
+    const V023_TAKER_DONE: &[u8] =
+        include_bytes!("../../tests/fixtures/compat/v0.2.3/taker-completed.cbor");
+    const V023_TAKER_OPEN: &[u8] =
+        include_bytes!("../../tests/fixtures/compat/v0.2.3/taker-incomplete.cbor");
+    const V023_BAD_REPORT: &[u8] =
+        include_bytes!("../../tests/fixtures/compat/v0.2.3/bad_swap_report.json");
+
+    fn install_v023_wallet(dir: &Path) -> std::path::PathBuf {
+        let wallets = dir.join("wallets");
+        std::fs::create_dir(&wallets).unwrap();
+        let path = wallets.join("closed.wallet");
+        std::fs::write(&path, V023_CLOSED).unwrap();
+        std::fs::write(wallets.join("closed_swap_report.json"), V023_REPORT).unwrap();
+        path
+    }
+
+    #[test]
+    fn compat_v023_upgrade_preserves_verified_proofs_and_manual_tracker_files() {
+        let dir = tempdir().unwrap();
+        let path = install_v023_wallet(dir.path());
+        let wallets = path.parent().unwrap();
+        let maker = dir.path().join("maker_swap_tracker.cbor");
+        let taker = dir.path().join("swap_tracker.cbor");
+        std::fs::write(&maker, V023_MAKER_DONE).unwrap();
+        std::fs::write(&taker, V023_TAKER_DONE).unwrap();
+        let sibling = wallets.join("sibling.wallet");
+        let sibling_report = wallets.join("sibling_swap_report.json");
+        std::fs::write(&sibling, V023_SIBLING).unwrap();
+        std::fs::write(&sibling_report, V023_BAD_REPORT).unwrap();
+        let expected: SwapReportFile = serde_json::from_slice(V023_REPORT).unwrap();
+        let chain_spk: ScriptBuf = serde_cbor::from_slice(include_bytes!(
+            "../../tests/fixtures/compat/v0.2.3/proof-chain-script.cbor"
+        ))
+        .unwrap();
+        verify_proof_for_test(&expected.deniability_proofs[0], &chain_spk).unwrap();
+        let (store, material) =
+            WalletStore::read_from_disk(&path, Some(V023_PASSWORD.into())).unwrap();
+        assert_eq!(store.external_index, 7);
+        assert_eq!(store.internal_index, 9);
+        assert_eq!(store.wallet_birthday, Some(100));
+        assert_eq!(store.last_synced_height, Some(200));
+        assert_eq!(
+            store.master_key.plaintext_with(&material),
+            Some(Xpriv::new_master(Network::Regtest, &[42; 32]).unwrap())
+        );
+        let proof: DeniabilityProof =
+            from_value(store.reports["deniability_proofs"][0].clone()).unwrap();
+        assert_eq!(proof, expected.deniability_proofs[0]);
+        verify_proof_for_test(&proof, &chain_spk).unwrap();
+        assert!(verify_proof_for_test(&proof, &ScriptBuf::new()).is_err());
+        for (archive, original) in [
+            (wallets.join("closed.wallet.v023"), V023_CLOSED),
+            (wallets.join("closed_swap_report.json.v023"), V023_REPORT),
+        ] {
+            assert_eq!(std::fs::read(&archive).unwrap(), original);
+            #[cfg(unix)]
+            assert_eq!(
+                std::fs::metadata(archive).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(!wallets.join("closed_swap_report.json").exists());
+        assert_eq!(std::fs::read(&sibling).unwrap(), V023_SIBLING);
+        assert_eq!(std::fs::read(&sibling_report).unwrap(), V023_BAD_REPORT);
+        assert_eq!(std::fs::read(&maker).unwrap(), V023_MAKER_DONE);
+        assert_eq!(std::fs::read(&taker).unwrap(), V023_TAKER_DONE);
+        let committed = std::fs::read(&path).unwrap();
+        let (again, _) = WalletStore::read_from_disk(&path, Some(V023_PASSWORD.into())).unwrap();
+        assert_eq!(again, store);
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+    }
+
+    #[test]
+    fn compat_v023_open_coins_trackers_and_bad_reports_refuse_untouched() {
+        for failure in [
+            "incoming coin",
+            "maker tracker",
+            "taker tracker",
+            "bad tracker",
+            "bad report",
+            "future proof",
+        ] {
+            let dir = tempdir().unwrap();
+            let path = install_v023_wallet(dir.path());
+            let report_path = path.parent().unwrap().join("closed_swap_report.json");
+            let maker = dir.path().join("maker_swap_tracker.cbor");
+            let taker = dir.path().join("swap_tracker.cbor");
+            std::fs::write(&maker, V023_MAKER_DONE).unwrap();
+            std::fs::write(&taker, V023_TAKER_DONE).unwrap();
+            match failure {
+                "incoming coin" => std::fs::write(&path, V023_OPEN).unwrap(),
+                "maker tracker" => std::fs::write(&maker, V023_MAKER_OPEN).unwrap(),
+                "taker tracker" => std::fs::write(&taker, V023_TAKER_OPEN).unwrap(),
+                "bad tracker" => std::fs::write(&maker, b"broken").unwrap(),
+                "bad report" => std::fs::write(&report_path, V023_BAD_REPORT).unwrap(),
+                "future proof" => {
+                    let mut report: serde_json::Value =
+                        serde_json::from_slice(V023_REPORT).unwrap();
+                    report["deniability_proofs"][0]["proof"] =
+                        serde_json::json!({"FutureProof": [1, 2, 3]});
+                    std::fs::write(&report_path, serde_json::to_vec(&report).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let snapshots: Vec<_> = [&path, &report_path, &maker, &taker]
+                .iter()
+                .map(|&file| (file, std::fs::read(file).unwrap()))
+                .collect();
+            let error = WalletStore::read_from_disk(&path, Some(V023_PASSWORD.into()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Stop every v0.2.3 process"),
+                "{}: {}",
+                failure,
+                error
+            );
+            assert!(error.contains("lose funds"));
+            assert!(error.contains("Start v0.2.3 once"));
+            if matches!(failure, "bad report" | "future proof") {
+                assert!(error.contains(&report_path.display().to_string()));
+            }
+            for (file, bytes) in snapshots {
+                assert_eq!(std::fs::read(file).unwrap(), bytes, "{}", failure);
+            }
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn compat_v023_archive_failure_retries_with_an_identical_private_archive() {
+        let dir = tempdir().unwrap();
+        let path = install_v023_wallet(dir.path());
+        let parent = path.parent().unwrap();
+        let archive = parent.join("closed.wallet.v023");
+        let report_archive = parent.join("closed_swap_report.json.v023");
+        // Fail the second archive after the first has completed, before commit.
+        std::fs::create_dir(&report_archive).unwrap();
+        assert!(WalletStore::read_from_disk(&path, Some(V023_PASSWORD.into())).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), V023_CLOSED);
+        assert_eq!(std::fs::read(&archive).unwrap(), V023_CLOSED);
+        assert_eq!(
+            std::fs::read(parent.join("closed_swap_report.json")).unwrap(),
+            V023_REPORT
+        );
+        #[cfg(unix)]
+        let original_inode = std::fs::metadata(&archive).unwrap().ino();
+        #[cfg(unix)]
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_dir(&report_archive).unwrap();
+        let (store, _) = WalletStore::read_from_disk(&path, Some(V023_PASSWORD.into())).unwrap();
+        assert_eq!(store.reports["deniability_proofs"].len(), 1);
+        assert_eq!(std::fs::read(&archive).unwrap(), V023_CLOSED);
+        assert_eq!(std::fs::read(&report_archive).unwrap(), V023_REPORT);
+        #[cfg(unix)]
+        {
+            assert_eq!(std::fs::metadata(&archive).unwrap().ino(), original_inode);
+            assert_eq!(
+                std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn compat_v023_retry_archives_a_changed_live_wallet() {
+        let dir = tempdir().unwrap();
+        let path = install_v023_wallet(dir.path());
+        let parent = path.parent().unwrap();
+        let archive = parent.join("closed.wallet.v023");
+        let report_archive = parent.join("closed_swap_report.json.v023");
+        std::fs::create_dir(&report_archive).unwrap();
+        assert!(WalletStore::read_from_disk(&path, Some(V023_PASSWORD.into())).is_err());
+        assert_eq!(std::fs::read(&archive).unwrap(), V023_CLOSED);
+        std::fs::write(&path, V023_NEWER).unwrap();
+        std::fs::remove_dir(&report_archive).unwrap();
+        // A crash's unfinished temporary copy must never be mistaken for an archive.
+        let unfinished = parent.join(".tmp-v023-interrupted-copy");
+        std::fs::write(&unfinished, &V023_NEWER[..30]).unwrap();
+        let (store, _) = WalletStore::read_from_disk(&path, Some(V023_PASSWORD.into())).unwrap();
+        assert_eq!(store.external_index, 11);
+        assert_eq!(std::fs::read(&archive).unwrap(), V023_NEWER);
+        assert_eq!(std::fs::read(&report_archive).unwrap(), V023_REPORT);
+        assert_eq!(std::fs::read(&unfinished).unwrap(), &V023_NEWER[..30]);
+    }
+
+    #[test]
+    fn compat_v023_password_refusals_preserve_every_input() {
+        let dir = tempdir().unwrap();
+        let path = install_v023_wallet(dir.path());
+        for password in [None, Some(String::new()), Some("wrong-password".into())] {
+            let error = WalletStore::read_from_disk(&path, password).unwrap_err();
+            assert!(matches!(
+                error,
+                WalletError::Security(SecurityError::PasswordRequired | SecurityError::Decryption)
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), V023_CLOSED);
+            assert_eq!(
+                std::fs::read(path.parent().unwrap().join("closed_swap_report.json")).unwrap(),
+                V023_REPORT
+            );
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn compat_v023_malformed_tracker_predicates_refuse_untouched() {
+        let mut accepted = Vec::new();
+        // The tag rejects these malformed phase and recovery fields.
+        for (name, bytes) in [
+            (
+                "maker_swap_tracker.cbor",
+                include_bytes!("../../tests/fixtures/compat/v0.2.3/maker-malformed.cbor")
+                    .as_slice(),
+            ),
+            (
+                "swap_tracker.cbor",
+                include_bytes!("../../tests/fixtures/compat/v0.2.3/taker-malformed.cbor")
+                    .as_slice(),
+            ),
+        ] {
+            let dir = tempdir().unwrap();
+            let path = install_v023_wallet(dir.path());
+            let tracker = dir.path().join(name);
+            std::fs::write(&tracker, bytes).unwrap();
+            if WalletStore::read_from_disk(&path, Some(V023_PASSWORD.into())).is_ok() {
+                accepted.push(name);
+                continue;
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), V023_CLOSED);
+            assert_eq!(std::fs::read(&tracker).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                2
+            );
+        }
+        assert!(
+            accepted.is_empty(),
+            "malformed v0.2.3 tracker predicates accepted: {:?}",
+            accepted
+        );
+    }
 
     fn stored_wallet(dir: &Path) -> (std::path::PathBuf, WalletStore, KeyMaterial) {
         let path = dir.join("wallet.cbor");

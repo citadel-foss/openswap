@@ -633,12 +633,16 @@ impl Drop for RouteHeartbeat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::{swapcoin::OutgoingSwapCoin, test_wallet};
+    use crate::wallet::{
+        swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
+        test_wallet, LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap,
+    };
     use bitcoin::{
         absolute::LockTime,
+        hashes::{sha256, Hash},
         secp256k1::{PublicKey as SecpPublicKey, Secp256k1, SecretKey},
         transaction::Version,
-        Amount, PublicKey, Transaction,
+        Amount, PublicKey, Transaction, TxOut,
     };
     use std::net::{Shutdown, TcpListener};
 
@@ -652,7 +656,10 @@ mod tests {
                 version: Version::TWO,
                 lock_time: LockTime::from_consensus(locktime),
                 input: Vec::new(),
-                output: Vec::new(),
+                output: vec![TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::new(),
+                }],
             },
             ScriptBuf::new(),
             key,
@@ -663,21 +670,60 @@ mod tests {
         coin
     }
 
+    fn incoming_for(id: &str, locktime: u32) -> IncomingSwapCoin {
+        let outgoing = outgoing_for(id, locktime);
+        let key = outgoing.my_privkey.unwrap();
+        let mut coin = IncomingSwapCoin::new_legacy(
+            key,
+            outgoing.other_pubkey.unwrap(),
+            outgoing.contract_tx,
+            ScriptBuf::new(),
+            key,
+            outgoing.funding_amount,
+            1,
+        );
+        coin.swap_id = Some(id.to_owned());
+        coin
+    }
+
+    fn watchonly_for(id: &str, locktime: u32) -> WatchOnlySwapCoin {
+        let outgoing = outgoing_for(id, locktime);
+        WatchOnlySwapCoin::new_legacy(
+            outgoing.my_pubkey.unwrap(),
+            outgoing.other_pubkey.unwrap(),
+            outgoing.contract_tx,
+            ScriptBuf::new(),
+            outgoing.funding_amount,
+        )
+    }
+
     #[test]
-    fn recovery_scope_excludes_prepared_live_coins_until_handover() {
+    fn compat_recovery_scope_excludes_live_coins_until_durable_handover() {
         let dir = tempfile::tempdir().unwrap();
         let mut wallet = test_wallet(&dir.path().join("wallet"));
         wallet.add_outgoing_swapcoin(&outgoing_for("failed", 1));
+        let failed_incoming = incoming_for("failed", 3);
+        let failed_txid = failed_incoming.contract_tx.compute_txid();
+        wallet.add_incoming_swapcoin(&failed_incoming);
         let wallet = RwLock::new(wallet);
         let live = Mutex::new(Some("prepared".to_owned()));
         assert_eq!(
             RecoveryLoop::scope(&live, &wallet).unwrap().0,
             HashSet::from(["failed".to_owned()])
         );
-        wallet
-            .write()
-            .unwrap()
-            .add_outgoing_swapcoin(&outgoing_for("prepared", 2));
+        let live_incoming = incoming_for("prepared", 4);
+        let live_txid = live_incoming.contract_tx.compute_txid();
+        {
+            let mut wallet = wallet.write().unwrap();
+            wallet.add_outgoing_swapcoin(&outgoing_for("prepared", 2));
+            wallet.add_incoming_swapcoin(&live_incoming);
+            wallet.add_watchonly_swapcoins("prepared", vec![watchonly_for("prepared", 5)]);
+            wallet.save_to_disk().unwrap();
+        }
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().1,
+            HashSet::from([failed_txid])
+        );
         assert_eq!(
             RecoveryLoop::scope(&live, &wallet).unwrap().0,
             HashSet::from(["failed".to_owned()])
@@ -691,10 +737,14 @@ mod tests {
             RecoveryLoop::scope(&live, &wallet).unwrap().0,
             HashSet::from(["failed".to_owned(), "prepared".to_owned()])
         );
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().1,
+            HashSet::from([failed_txid, live_txid])
+        );
     }
 
     #[test]
-    fn handover_save_failure_keeps_the_live_slot() {
+    fn compat_handover_save_failure_keeps_the_live_slot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet");
         let wallet = test_wallet(&path);
@@ -706,6 +756,128 @@ mod tests {
         std::fs::remove_dir(path).unwrap();
         RecoveryLoop::finish_handover(&wallet, &mut live).unwrap();
         assert!(live.is_none());
+    }
+
+    #[test]
+    fn compat_recovery_scope_includes_watchonly_and_claim_ready_coins_but_excludes_lightning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let mut outgoing = outgoing_for("claimed-outgoing", 1);
+        outgoing.hash_preimage = Some([7; 32]);
+        outgoing.committed = true;
+        outgoing.incoming_claimed = true;
+        wallet.add_outgoing_swapcoin(&outgoing);
+        let mut incoming = incoming_for("incoming-only", 2);
+        incoming.other_privkey = incoming.my_privkey;
+        let incoming_txid = incoming.contract_tx.compute_txid();
+        wallet.add_incoming_swapcoin(&incoming);
+        wallet.add_watchonly_swapcoins("watchonly-only", vec![watchonly_for("watchonly-only", 3)]);
+        let key = SecretKey::from_slice(&[1; 32]).unwrap();
+        wallet.store.ln_pending_swaps.insert(
+            "pending-lightning".into(),
+            LnPendingSwap {
+                is_swap_in: true,
+                preimage: None,
+                redeemscript: ScriptBuf::new(),
+                locktime: 100,
+                privkey: key,
+                outpoint: None,
+                value: None,
+            },
+        );
+        wallet.store.ln_maker_swaps.insert(
+            "maker-lightning".into(),
+            LnMakerSwapRecord {
+                direction: LnMakerDirection::SwapIn,
+                phase: LnMakerPhase::InAccepted,
+                payment_hash: sha256::Hash::hash(&[1]),
+                amount: Amount::from_sat(10_000),
+                fee: Amount::ZERO,
+                locktime: 100,
+                min_confirmations: 1,
+                redeemscript: ScriptBuf::new(),
+                privkey: key,
+                invoice: "pending".into(),
+                preimage: None,
+                refund_txid: None,
+                accepted_height: None,
+                payout_script: None,
+                funding_outpoint: None,
+                funding_value: None,
+                funding_height: None,
+            },
+        );
+        let wallet = RwLock::new(wallet);
+        let live = Mutex::new(None);
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap(),
+            (
+                HashSet::from([
+                    "claimed-outgoing".to_owned(),
+                    "incoming-only".to_owned(),
+                    "watchonly-only".to_owned()
+                ]),
+                HashSet::from([incoming_txid]),
+            )
+        );
+        *live.lock().unwrap() = Some("watchonly-only".into());
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().0,
+            HashSet::from(["claimed-outgoing".to_owned(), "incoming-only".to_owned()])
+        );
+    }
+
+    #[test]
+    fn compat_unfunded_abort_preserves_scope_until_its_coin_removal_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let mut wallet = test_wallet(&path);
+        wallet.add_outgoing_swapcoin(&outgoing_for("failed", 1));
+        wallet.add_outgoing_swapcoin(&outgoing_for("prepared", 2));
+        wallet.add_incoming_swapcoin(&incoming_for("prepared", 3));
+        wallet.add_watchonly_swapcoins("prepared", vec![watchonly_for("prepared", 4)]);
+        wallet.save_to_disk().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let snapshot = dir.path().join("snapshot");
+        std::fs::rename(&path, &snapshot).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let wallet = RwLock::new(wallet);
+        let live = Mutex::new(Some("prepared".to_owned()));
+        {
+            let mut guard = live.lock().unwrap();
+            let mut wallet = wallet.write().unwrap();
+            assert!(wallet
+                .remove_swap_coins_and_save("prepared", true, true)
+                .is_err());
+            assert_eq!(guard.as_deref(), Some("prepared"));
+            assert_eq!(wallet.get_incoming_swapcoins_count(), 1);
+            assert_eq!(wallet.get_outgoing_swapcoins_count(), 2);
+            assert_eq!(wallet.watchonly_contract_outpoints().len(), 1);
+            assert!(RecoveryLoop::finish_handover(&wallet, &mut guard).is_err());
+        }
+        assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().0,
+            HashSet::from(["failed".to_owned()])
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(snapshot, &path).unwrap();
+        {
+            let mut guard = live.lock().unwrap();
+            let mut wallet = wallet.write().unwrap();
+            wallet
+                .remove_swap_coins_and_save("prepared", true, true)
+                .unwrap();
+            RecoveryLoop::finish_handover(&wallet, &mut guard).unwrap();
+            assert_eq!(wallet.get_incoming_swapcoins_count(), 0);
+            assert_eq!(wallet.get_outgoing_swapcoins_count(), 1);
+            assert!(wallet.watchonly_contract_outpoints().is_empty());
+        }
+        assert!(live.lock().unwrap().is_none());
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().0,
+            HashSet::from(["failed".to_owned()])
+        );
     }
 
     fn peer_on(address: &str) -> HeartbeatPeer {

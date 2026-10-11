@@ -3621,9 +3621,9 @@ pub(crate) mod tests {
     #[cfg(feature = "integration-test")]
     use super::MakerBehavior;
     use super::{
-        min_swap_amount, swap_cost_floor, BackendConnector, FileLock, MakerError, MakerServer,
-        MakerServerConfig, ShutdownSignal, ThreadPool, WatchService, MIN_SWAP_STEP_SATS,
-        REFUND_LOCKTIME_BASE,
+        min_swap_amount, swap_cost_floor, BackendConnector, ConnectionState, FileLock, MakerError,
+        MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal, ThreadPool, WatchService,
+        MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
@@ -3705,7 +3705,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reservations_are_owned_by_wallet_coins_without_a_tracker() {
+    fn compat_maker_reservations_and_readmission_use_saved_coins() {
         let dir = tempfile::tempdir().unwrap();
         let maker = compat_test_maker(dir.path(), Vec::new());
         let secret = SecretKey::from_slice(&[2; 32]).unwrap();
@@ -3725,6 +3725,7 @@ pub(crate) mod tests {
         );
         coin.swap_id = Some("owned".into());
         coin.committed = true;
+        coin.hash_preimage = Some([7; 32]);
         {
             let mut wallet = maker.wallet.write().unwrap();
             wallet.add_outgoing_swapcoin(&coin);
@@ -3737,6 +3738,19 @@ pub(crate) mod tests {
         assert!(!wallet.store.swap_locks.contains_key("orphan"));
         assert_eq!(wallet.store.swap_locks["owned"].outpoints.len(), 1);
         assert!(!dir.path().join("maker_swap_tracker.cbor").exists());
+        assert_eq!(wallet.find_unfinished_swapcoins().1.len(), 1);
+        drop(wallet);
+        let error = maker
+            .store_connection_state(
+                "owned",
+                &ConnectionState::new(ProtocolVersion::Legacy),
+                true,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MakerError::General("Swap id belongs to an unfinished swap")
+        ));
     }
 
     /// Non-finite or below-minimum fidelity feerates clamp to the relay

@@ -370,6 +370,14 @@ fn verify_proof(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn verify_proof_for_test(
+    proof: &DeniabilityProof,
+    chain_spk: &ScriptBuf,
+) -> Result<(), DeniabilityProofError> {
+    verify_proof(proof, chain_spk)
+}
+
 /// Parses a Taproot hashlock leaf script and returns the embedded x-only pubkey.
 fn parse_taproot_hashlock_script(
     script: &ScriptBuf,
