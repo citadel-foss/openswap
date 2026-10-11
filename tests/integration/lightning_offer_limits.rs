@@ -112,6 +112,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for() {
                 locktime: 60,
                 min_confirmations: 1,
                 taker_hashlock_pubkey: test_pubkey(0x31),
+                features: vec!["ln-swap-out".to_string()],
             })),
         )
         .unwrap(),
@@ -150,6 +151,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for() {
                 locktime: 60,
                 min_confirmations: 1,
                 taker_timelock_pubkey: test_pubkey(0x41),
+                features: vec!["ln-swap-in".to_string()],
             })),
         )
         .unwrap(),
@@ -199,6 +201,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for() {
                         locktime: 60,
                         min_confirmations: confirmations,
                         taker_timelock_pubkey: test_pubkey(0x42),
+                        features: vec!["ln-swap-in".to_string()],
                     })),
                 )
             })
@@ -237,6 +240,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for() {
                 locktime: 60,
                 min_confirmations: 1,
                 taker_hashlock_pubkey: test_pubkey(0x31),
+                features: vec!["ln-swap-out".to_string()],
             })),
         )
         .unwrap(),

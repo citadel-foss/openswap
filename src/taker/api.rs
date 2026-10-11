@@ -37,7 +37,7 @@ use crate::{
             SwapDetails, SwapPrivkey, TakerToMakerMessage,
         },
         contract::calculate_pubkey_from_nonce,
-        features::{supported, KNOWN},
+        features::{choose_pins, supported, unmet_for_flow, KNOWN},
     },
     utill::{
         funding_fee_policy_sats, generate_maker_keys, get_taker_dir, read_message, send_message,
@@ -421,6 +421,9 @@ pub(crate) struct MakerConnection {
     pub(crate) address: MakerAddress,
     /// Protocol version negotiated with this maker.
     pub(crate) protocol: ProtocolVersion,
+    /// Exact feature names this hop's swap uses. Every reconnect checks the
+    /// maker still lists them. Empty until negotiated.
+    pub(crate) pins: Vec<String>,
     /// Tweakable point for this swap.
     pub(crate) tweakable_point: Option<PublicKey>,
     /// Maker's offer (fee schedule), if known from offerbook discovery.
@@ -453,6 +456,7 @@ impl MakerConnection {
         Self {
             address,
             protocol,
+            pins: Vec::new(),
             tweakable_point: None,
             offer,
             negotiated_timelock: 0,
@@ -468,6 +472,16 @@ impl MakerConnection {
                 }
             },
             finalization: FinalizationProgress::default(),
+        }
+    }
+
+    /// Names this maker's Hello must list on every reconnect: the pins, or
+    /// just the protocol before they are negotiated.
+    pub(crate) fn needed(&self) -> Vec<String> {
+        if self.pins.is_empty() {
+            vec![self.protocol.feature_name().to_string()]
+        } else {
+            self.pins.clone()
         }
     }
 
@@ -526,6 +540,8 @@ impl Taker {
 pub struct Taker {
     /// Configuration.
     pub(crate) config: TakerInitConfig,
+    /// Feature names every swap must pin, from `require_features` in config.toml.
+    pub(crate) require_features: Vec<String>,
     /// Wallet for managing funds.
     pub(crate) wallet: Arc<RwLock<Wallet>>,
     /// Opens backend connections without taking the wallet lock.
@@ -710,7 +726,7 @@ impl Taker {
             log::error!("could not rebuild watches on startup: {e}; recovery remains active");
         }
 
-        Self::init_taker_config(&config, &data_dir)?;
+        let require_features = Self::init_taker_config(&config, &data_dir)?;
 
         let connector = BackendConnector::new(backend, shutdown.clone());
 
@@ -731,6 +747,7 @@ impl Taker {
 
         let mut taker = Taker {
             config,
+            require_features,
             wallet: Arc::new(RwLock::new(wallet)),
             backend: connector,
             shutdown,
@@ -896,11 +913,11 @@ impl Taker {
         Ok((watch_service, registry_clone, initial_sync_complete))
     }
 
-    /// Load/merge taker config and check Tor status.
+    /// Load/merge taker config and check Tor status. Returns `require_features`.
     fn init_taker_config(
         config: &TakerInitConfig,
         data_dir: &std::path::Path,
-    ) -> Result<(), TakerError> {
+    ) -> Result<Vec<String>, TakerError> {
         let config_path = data_dir.join("config.toml");
         let loaded = TakerConfig::new(Some(&config_path))?;
         let mut taker_config = loaded.clone();
@@ -969,7 +986,7 @@ impl Taker {
                 set_config_key(&config_path, key, new)?;
             }
         }
-        Ok(())
+        Ok(loaded.require_features)
     }
 
     /// Start the background offer sync service.
@@ -1930,9 +1947,19 @@ impl Taker {
         let maker_address = self.swap_state()?.makers[maker_idx].address.to_string();
         log::info!("Connecting to maker {} at {}", maker_idx, maker_address);
 
-        let mut stream = self.net_connect(&maker_address)?;
         let negotiated_protocol = self.swap_state()?.params.protocol;
-        log::info!("Handshake complete, protocol: {:?}", negotiated_protocol);
+        let flow = negotiated_protocol.feature_name();
+        let (mut stream, features) = self.net_connect_with(&maker_address, &[flow.to_string()])?;
+        let pins = choose_pins(flow, &features);
+        // Checked before anything is funded: a maker that can't meet our
+        // requirements for this flow is skipped like any refusing maker.
+        unmet_for_flow(&self.require_features, &pins, flow).map_err(|missing| {
+            TakerError::General(format!(
+                "Maker {} cannot meet required features {:?}",
+                maker_idx, missing
+            ))
+        })?;
+        log::info!("Handshake complete, pins: {:?}", pins);
 
         // Fetch the maker's offer before proposing swap details.
         // This gives us the fee schedule for amount verification later.
@@ -2007,7 +2034,7 @@ impl Taker {
 
         let swap_details = SwapDetails {
             id: swap_id.to_string(),
-            protocol_version: negotiated_protocol,
+            features: pins.clone(),
             amount,
             tx_count,
             incoming_count,
@@ -2044,6 +2071,7 @@ impl Taker {
                     let swap = self.swap_state_mut()?;
                     swap.makers[maker_idx].tweakable_point = Some(tweakable_point);
                     swap.makers[maker_idx].protocol = negotiated_protocol;
+                    swap.makers[maker_idx].pins = pins;
                     swap.makers[maker_idx].negotiated_timelock = timelock;
                     swap.makers[maker_idx].amount = amount;
                     swap.makers[maker_idx].incoming_count = incoming_count;
@@ -2127,8 +2155,7 @@ impl Taker {
     ) -> Result<MakerToTakerMessage, TakerError> {
         // A replay can target a swap that already aborted and cleared the live
         // state, so the maker must list what the replayed details use.
-        let needed = [details.protocol_version.feature_name().to_string()];
-        let (mut stream, _) = self.net_connect_with(maker_address, &needed)?;
+        let (mut stream, _) = self.net_connect_with(maker_address, &details.features)?;
         send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
         read_message(&mut stream)?;
         send_message(
@@ -2146,7 +2173,7 @@ impl Taker {
             + REFUND_LOCKTIME_STEP * (swap.makers.len() - maker_idx - 1) as u16;
         let details = SwapDetails {
             id: swap.id.clone(),
-            protocol_version: swap.params.protocol,
+            features: swap.makers[maker_idx].needed(),
             amount: swap.makers[maker_idx].amount,
             tx_count: swap.params.tx_count,
             incoming_count: swap.makers[maker_idx].incoming_count,
@@ -2584,14 +2611,18 @@ impl Taker {
         Ok(())
     }
 
-    /// Connect to a maker on the live swap and exchange Hellos.
+    /// Connect to a maker on the live swap and exchange Hellos. The maker must
+    /// still list this hop's pins.
     pub(crate) fn net_connect(&self, address: &str) -> Result<TcpStream, TakerError> {
-        let needed = [self
-            .swap_state()?
-            .params
-            .protocol
-            .feature_name()
-            .to_string()];
+        let swap = self.swap_state()?;
+        let needed = match swap
+            .makers
+            .iter()
+            .find(|m| m.address.to_string() == address)
+        {
+            Some(maker) => maker.needed(),
+            None => vec![swap.params.protocol.feature_name().to_string()],
+        };
         Ok(self.net_connect_with(address, &needed)?.0)
     }
 
@@ -2703,11 +2734,10 @@ impl Taker {
         swap_id: &str,
     ) -> Option<super::background_services::RouteHeartbeat> {
         let state = self.swap_state().ok()?;
-        let needed = vec![state.params.protocol.feature_name().to_string()];
         let peers: Vec<(String, Vec<String>)> = state
             .makers
             .iter()
-            .map(|maker| (maker.address.to_string(), needed.clone()))
+            .map(|maker| (maker.address.to_string(), maker.needed()))
             .collect();
         let dial = super::background_services::PeerDial {
             connection_type: self.config.connection_type,

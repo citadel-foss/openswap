@@ -154,8 +154,9 @@ pub(crate) fn check_maker_name(name: &str) -> Result<(), String> {
 pub struct SwapDetails {
     /// Unique 8-byte ID to identify this swap.
     pub id: String,
-    /// Protocol version to use for this swap.
-    pub protocol_version: ProtocolVersion,
+    /// Exact feature names this swap uses: its protocol plus any feature that
+    /// changes it. Both sides keep them for every reconnect of the swap.
+    pub features: Vec<String>,
     /// Amount to swap in satoshis.
     pub amount: Amount,
     /// Maximum contract transactions this hop plans to send — a ceiling.
@@ -180,6 +181,16 @@ pub struct SwapDetails {
     /// offset, not the funding height, so it is fixed at negotiation and identical on both
     /// sides. Not bound to the real lock duration; assess the CSV transition as the real fix.
     pub refund_locktime_offset: u16,
+}
+
+impl SwapDetails {
+    /// The on-chain protocol these details pin, if any.
+    pub fn protocol(&self) -> Option<ProtocolVersion> {
+        [ProtocolVersion::Legacy, ProtocolVersion::Taproot]
+            .iter()
+            .copied()
+            .find(|p| self.features.iter().any(|f| f == p.feature_name()))
+    }
 }
 
 /// Acknowledgment of swap details from Maker.

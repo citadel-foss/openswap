@@ -13,7 +13,7 @@ use crate::{
             AckSwapDetails, FidelityProof, GetOffer, Hello, MakerToTakerMessage, Offer,
             ProtocolVersion, SwapDetails, TakerToMakerMessage, UnsupportedMessage,
         },
-        features::{check_requires, supported},
+        features::{check_pins, check_requires, supported},
         legacy_messages::LegacyTakerMessage,
         taproot_messages::TaprootTakerMessage,
     },
@@ -1045,12 +1045,34 @@ fn handle_swap_details<M: Maker>(
         )));
     }
 
+    // The pins fix this swap's flow and features for every later reconnect.
+    let pinned =
+        check_pins(&details.features, &maker.get_config().require_features).and_then(|_| {
+            details
+                .protocol()
+                .ok_or_else(|| "pins name no on-chain protocol".to_string())
+        });
+    let protocol = match pinned {
+        Ok(protocol) => protocol,
+        Err(reason) => {
+            log::warn!(
+                "[{}] Rejecting SwapDetails for {}: {}",
+                Maker::network_port(maker.as_ref()),
+                details.id,
+                reason
+            );
+            return Ok(Some(MakerToTakerMessage::AckSwapDetails(
+                AckSwapDetails::reject(),
+            )));
+        }
+    };
+
     log::info!(
-        "[{}] Received SwapDetails: amount={}, timelock={}, protocol={:?}",
+        "[{}] Received SwapDetails: amount={}, timelock={}, pins={:?}",
         Maker::network_port(maker.as_ref()),
         details.amount,
         details.timelock,
-        details.protocol_version
+        details.features
     );
 
     // The fee pays for how long our funds stay locked, so use the length derived from the
@@ -1080,7 +1102,7 @@ fn handle_swap_details<M: Maker>(
     state.swap_feerate = details.feerate as f64;
     state.timelock = details.timelock;
     state.refund_locktime_offset = refund_locktime_offset;
-    state.protocol = details.protocol_version;
+    state.protocol = protocol;
     state.swap_start_time = Instant::now();
     let swap_fee = maker.calculate_swap_fee(details.amount, state.refund_locktime_offset as u32);
     state.service_fee_sats = swap_fee.to_sat();

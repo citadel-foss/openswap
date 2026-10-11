@@ -33,6 +33,7 @@ use crate::{
     lightning::{swap::SwapHtlc, ChannelInfo, LightningBackend, LnEvent, Preimage},
     protocol::{
         common_messages::MakerToTakerMessage,
+        features::check_pins,
         lightning_messages::{
             LightningMakerMessage, LightningTakerMessage, LnHtlcFunded, LnReject, LnSwapInAccept,
             LnSwapInComplete, LnSwapInRequest, LnSwapOutAccept, LnSwapOutComplete,
@@ -463,6 +464,14 @@ fn payout_script<M: Maker>(
 /// Refuses a swap id that already has state, so a second connection cannot
 /// overwrite an in-flight swap's record — which holds the only copy of the
 /// branch key needed to sweep or refund its HTLC.
+/// A request's pins must name exactly `flow` and meet our requirements for it.
+fn check_flow_pins<M: Maker>(maker: &Arc<M>, pins: &[String], flow: &str) -> Result<(), String> {
+    match check_pins(pins, &maker.get_config().require_features)? {
+        pinned if pinned == flow => Ok(()),
+        pinned => Err(format!("pins name {pinned}, not {flow}")),
+    }
+}
+
 fn reject_if_swap_exists<M: Maker>(maker: &Arc<M>, swap_id: &str) -> Result<(), String> {
     match maker.get_ln_swap(swap_id) {
         Ok(Some(_)) => return Err("a swap with this id is already in progress".to_string()),
@@ -551,6 +560,7 @@ fn handle_swap_in_request<M: Maker>(
     req: LnSwapInRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     if let Err(reason) = swap_id_matches_hash(&req.swap_id, &req.payment_hash)
+        .and_then(|()| check_flow_pins(maker, &req.features, "ln-swap-in"))
         .and_then(|()| reject_if_swap_exists(maker, &req.swap_id))
     {
         return Ok(reject(&req.swap_id, reason));
@@ -874,6 +884,7 @@ fn handle_swap_out_request<M: Maker>(
     req: LnSwapOutRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     if let Err(reason) = swap_id_matches_hash(&req.swap_id, &req.payment_hash)
+        .and_then(|()| check_flow_pins(maker, &req.features, "ln-swap-out"))
         .and_then(|()| reject_if_swap_exists(maker, &req.swap_id))
     {
         return Ok(reject(&req.swap_id, reason));

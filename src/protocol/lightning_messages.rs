@@ -73,6 +73,8 @@ pub struct LnSwapInRequest {
     pub min_confirmations: u32,
     /// Taker pubkey for the timelock (refund) branch of the HTLC script.
     pub taker_timelock_pubkey: PublicKey,
+    /// Exact feature names this swap uses, `ln-swap-in` plus any modifier.
+    pub features: Vec<String>,
 }
 
 /// Maker -> Taker: acceptance of a [`LnSwapInRequest`].
@@ -131,6 +133,8 @@ pub struct LnSwapOutRequest {
     pub min_confirmations: u32,
     /// Taker pubkey for the hashlock (claim) branch of the HTLC script.
     pub taker_hashlock_pubkey: PublicKey,
+    /// Exact feature names this swap uses, `ln-swap-out` plus any modifier.
+    pub features: Vec<String>,
 }
 
 /// Maker -> Taker: acceptance of a [`LnSwapOutRequest`].

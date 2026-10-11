@@ -2179,12 +2179,15 @@ impl MakerTrait for MakerServer {
             return Err(MakerError::General("Swap feerate below the relay floor"));
         }
 
+        let protocol = details
+            .protocol()
+            .ok_or(MakerError::General("Swap details pin no on-chain protocol"))?;
+
         // Check amount is within bounds
         let amount_sat = details.amount.to_sat();
         // Every incoming contract must be worth recovering at the swap feerate.
-        let contract_floor =
-            min_contract_value_sats(details.protocol_version, details.feerate as f64)
-                .ok_or(MakerError::General("Contract floor cannot be priced"))?;
+        let contract_floor = min_contract_value_sats(protocol, details.feerate as f64)
+            .ok_or(MakerError::General("Contract floor cannot be priced"))?;
         if amount_sat < contract_floor.saturating_mul(details.incoming_count as u64) {
             return Err(MakerError::General(
                 "Swap amount below the incoming contract floor",
@@ -2195,7 +2198,7 @@ impl MakerTrait for MakerServer {
         }
 
         // Check timelock bounds and work out how long the funds stay locked.
-        let locked_blocks = if details.protocol_version == ProtocolVersion::Legacy {
+        let locked_blocks = if protocol == ProtocolVersion::Legacy {
             if details.timelock < MIN_CONTRACT_REACTION_TIME as u32 {
                 log::warn!(
                     "Legacy timelock {} is below minimum reaction time {}",

@@ -121,6 +121,7 @@ fn lightning_maker_restart_recovers_funded_swap() {
                 locktime,
                 min_confirmations: 1,
                 taker_hashlock_pubkey,
+                features: vec!["ln-swap-out".to_string()],
             })),
         )
         .unwrap(),
