@@ -516,6 +516,10 @@ mod tests {
             decrypt_struct_with_aad::<String>(encrypted.clone(), &material, &aad).unwrap(),
             "known payload"
         );
+        assert!(matches!(
+            decrypt_struct::<String>(encrypted.clone(), &material),
+            Err(SecurityError::Decryption)
+        ));
         for wrong in [
             Vec::new(),
             b"taproot".to_vec(),
@@ -527,6 +531,15 @@ mod tests {
             ));
         }
         let old_compatible = encrypt_struct("old payload", &material).unwrap();
+        assert_eq!(
+            decrypt_struct_with_aad::<String>(old_compatible.clone(), &material, &[]).unwrap(),
+            "old payload"
+        );
+        let empty_aad = encrypt_struct_with_aad("helper payload", &material, &[]).unwrap();
+        assert_eq!(
+            decrypt_struct::<String>(empty_aad, &material).unwrap(),
+            "helper payload"
+        );
         let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(material.key));
         let plain = cipher
             .decrypt(
