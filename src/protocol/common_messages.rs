@@ -2,6 +2,7 @@
 
 use bitcoin::{bip32::ChainCode, hashes::sha256d::Hash, Amount, PublicKey};
 use serde::{Deserialize, Serialize};
+use serde_cbor::Value;
 
 use super::{
     legacy_messages::{
@@ -294,6 +295,30 @@ pub enum MakerToTakerMessage {
     Unsupported(UnsupportedMessage),
 }
 
+/// The variant name of an externally tagged message: a one-entry map's key or
+/// bare text. Lets a receiver name a message it can't decode.
+fn variant_name(value: &Value) -> Option<(&str, Option<&Value>)> {
+    match value {
+        Value::Text(name) => Some((name, None)),
+        Value::Map(map) if map.len() == 1 => match map.iter().next()? {
+            (Value::Text(name), body) => Some((name, Some(body))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Names a message we failed to decode, looking inside the `Lightning` family.
+/// `None` when even the name is unreadable.
+pub(crate) fn message_name(bytes: &[u8]) -> Option<String> {
+    let value: Value = serde_cbor::from_slice(bytes).ok()?;
+    let (name, body) = variant_name(&value)?;
+    match body.and_then(variant_name) {
+        Some((inner, _)) if name == "Lightning" => Some(format!("Lightning::{inner}")),
+        _ => Some(name.to_string()),
+    }
+}
+
 /// Graceful rejection of a message the receiver does not handle. Frozen like
 /// [`Hello`]. The sender closes the connection after it, and it is never answered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,4 +327,43 @@ pub struct UnsupportedMessage {
     pub what: String,
     /// Human-readable reason.
     pub reason: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn tagged(name: &str, body: Value) -> Vec<u8> {
+        serde_cbor::to_vec(&Value::Map(BTreeMap::from([(
+            Value::Text(name.to_string()),
+            body,
+        )])))
+        .unwrap()
+    }
+
+    #[test]
+    fn undecodable_messages_are_named_by_their_tag() {
+        let future = tagged("FutureThing", Value::Integer(7));
+        assert!(serde_cbor::from_slice::<TakerToMakerMessage>(&future).is_err());
+        assert_eq!(message_name(&future).as_deref(), Some("FutureThing"));
+
+        let bare = serde_cbor::to_vec(&Value::Text("FutureUnit".to_string())).unwrap();
+        assert_eq!(message_name(&bare).as_deref(), Some("FutureUnit"));
+
+        let nested = tagged(
+            "Lightning",
+            serde_cbor::from_slice(&tagged("SwapX", Value::Null)).unwrap(),
+        );
+        assert_eq!(message_name(&nested).as_deref(), Some("Lightning::SwapX"));
+
+        assert_eq!(message_name(&[0xff, 0x00]), None);
+        assert_eq!(message_name(&serde_cbor::to_vec(&7u8).unwrap()), None);
+    }
+
+    #[test]
+    fn hello_frame_starts_with_its_frozen_tag() {
+        let bytes = serde_cbor::to_vec(&TakerToMakerMessage::Hello(Hello::default())).unwrap();
+        assert_eq!(&bytes[..7], b"\xa1\x65Hello");
+    }
 }

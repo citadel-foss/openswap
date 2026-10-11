@@ -19,7 +19,9 @@ use crate::maker::rpc::server::MakerRpc;
 use crate::{
     lock_debug,
     maker::nostr::broadcast_bond_on_nostr,
-    protocol::common_messages::{MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage},
+    protocol::common_messages::{
+        message_name, MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage, UnsupportedMessage,
+    },
     utill::{
         HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE, UNBROADCAST_DISCARD_GRACE,
     },
@@ -648,8 +650,8 @@ fn handle_connection(
             break;
         }
 
-        let message = match read_message(&stream, permit.pending.then_some(pending_deadline)) {
-            Ok(msg) => msg,
+        let frame = match read_message(&stream, permit.pending.then_some(pending_deadline)) {
+            Ok(frame) => frame,
             Err(e) => {
                 // A read timeout is only a wakeup: keepalives arrive on separate
                 // connections and refresh the shared swap activity. Break only
@@ -664,6 +666,28 @@ fn handle_connection(
                     maker.config.network_port,
                     e
                 );
+                break;
+            }
+        };
+        let message = match serde_cbor::from_slice::<TakerToMakerMessage>(&frame) {
+            Ok(message) => message,
+            Err(e) => {
+                // Name what we can't read, so the taker can tell "unsupported"
+                // from "down". A refusal is never answered, or two peers loop.
+                let what = message_name(&frame).filter(|name| name != "Unsupported");
+                log::info!(
+                    "[{}] Cannot decode {:?}: {}",
+                    maker.config.network_port,
+                    what,
+                    e
+                );
+                if let Some(what) = what {
+                    let refusal = MakerToTakerMessage::Unsupported(UnsupportedMessage {
+                        what,
+                        reason: "cannot decode".to_string(),
+                    });
+                    let _ = send_message(&stream, &refusal);
+                }
                 break;
             }
         };
@@ -2049,12 +2073,12 @@ fn recover_from_swap(
     Ok(())
 }
 
-/// Read a message, enforcing one absolute deadline until the connection proves
-/// that it belongs to an admitted swap.
+/// Read one message frame, enforcing one absolute deadline until the connection
+/// proves that it belongs to an admitted swap.
 fn read_message(
     stream: &TcpStream,
     pending_deadline: Option<Instant>,
-) -> Result<TakerToMakerMessage, MakerError> {
+) -> Result<Vec<u8>, MakerError> {
     let mut len_buf = [0u8; 4];
     read_exact_until(stream, &mut len_buf[..1], pending_deadline)?;
     let assembly_deadline = Instant::now() + MESSAGE_ASSEMBLY_TIMEOUT;
@@ -2070,11 +2094,7 @@ fn read_message(
 
     let mut buf = vec![0u8; len];
     read_exact_until(stream, &mut buf, deadline)?;
-
-    let message: TakerToMakerMessage = serde_cbor::from_slice(&buf)
-        .map_err(|_| MakerError::General("Failed to deserialize message"))?;
-
-    Ok(message)
+    Ok(buf)
 }
 
 fn read_exact_until(
