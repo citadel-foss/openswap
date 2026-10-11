@@ -143,13 +143,6 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
     // of asserting at a fixed wall-clock point.
     if watcher_available {
         wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
-        thread::sleep(Duration::from_secs(5));
-
-        let after_incoming = restarted
-            .wallet
-            .read()
-            .unwrap()
-            .get_incoming_swapcoins_count();
         wait_for_log(
             &log_path,
             "Incomplete swaps detected on startup",
@@ -162,23 +155,39 @@ fn run_reboot_recovery_with_watcher<B: TestBackend>(watcher_available: bool) {
         );
         wait_for_log(
             &log_path,
-            "Removed outgoing swapcoin",
+            &format!(
+                "[{}] Recovered {} incoming swapcoins via hashlock",
+                restarted.config.network_port, before_incoming
+            ),
             Duration::from_secs(120),
         );
-        let log_contents = std::fs::read_to_string(&log_path).unwrap();
-        assert!(
-            !log_contents.contains("Funding was never broadcast for swap"),
-            "reboot recovery took the unsafe discard path"
-        );
-        let recovered_via_hashlock = log_contents.contains("incoming swapcoins via hashlock");
+        // The sweep log precedes the atomic cleanup; wait for both sides to finish.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let wallet = restarted.wallet.read().unwrap();
+            if wallet.get_incoming_swapcoins_count() == 0
+                && wallet.get_outgoing_swapcoins_count() == 0
+            {
+                break;
+            }
+            drop(wallet);
+            assert!(
+                Instant::now() < deadline,
+                "reboot recovery did not finish cleanup"
+            );
+            thread::sleep(Duration::from_secs(2));
+        }
 
         restarted.shutdown.store(true, Relaxed);
         restarted_thread.join().unwrap();
+        let wallet = restarted.wallet.read().unwrap();
         assert!(
-            after_incoming > 0 || recovered_via_hashlock,
-            "maker reboot recovery lost funded incoming swapcoins without hashlock recovery; before={}, after={}",
-            before_incoming,
-            after_incoming
+            wallet.swap_reports().recovery.iter().any(|report| {
+                report.swap_id == summary.swap_id
+                    && report.recovery_type == "hashlock"
+                    && report.recovery_txids.len() == before_incoming
+            }),
+            "maker reboot recovery must record the incoming hashlock claims"
         );
     } else {
         wait_for_log(
