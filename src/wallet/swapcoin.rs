@@ -905,6 +905,20 @@ pub struct OutgoingSwapCoin {
     /// Negotiated swap feerate (sats/vB) at creation.
     #[serde(default = "default_negotiated_feerate")]
     pub negotiated_feerate: u64,
+    /// Saved `true` before any funding send, and never set back. A committed
+    /// coin's funding may be on the network, so it is never discarded for
+    /// looking unsent. Missing reads as `true`, the safe answer.
+    #[serde(default = "yes")]
+    pub committed: bool,
+    /// Saved `true` with the sweep of this swap's incoming coin, and never set
+    /// back. Our outgoing is then the first maker's to claim, not ours to
+    /// refund early. Missing reads as `true`, the safe answer.
+    #[serde(default = "yes")]
+    pub incoming_claimed: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Requires for OutgoingSwapCoin {
@@ -929,6 +943,8 @@ impl Requires for OutgoingSwapCoin {
             internal_key: _,
             recovery_address: _,
             negotiated_feerate: _,
+            committed: _,
+            incoming_claimed: _,
         } = self;
         protocol_requires(protocol);
     }
@@ -971,6 +987,8 @@ impl OutgoingSwapCoin {
             internal_key: None,
             recovery_address: None,
             negotiated_feerate,
+            committed: false,
+            incoming_claimed: false,
         }
     }
 
@@ -1003,6 +1021,8 @@ impl OutgoingSwapCoin {
             internal_key: None,
             recovery_address: None,
             negotiated_feerate,
+            committed: false,
+            incoming_claimed: false,
         }
     }
 

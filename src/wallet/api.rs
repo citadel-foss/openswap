@@ -693,9 +693,14 @@ impl Wallet {
         // Use contract txid as key to ensure each swapcoin has a unique entry,
         // even when multiple outgoing swapcoins share the same swap_id.
         let key = coin.contract_tx.compute_txid().to_string();
-        self.store
-            .outgoing_swapcoins
-            .insert(key.clone(), coin.clone());
+        let mut coin = coin.clone();
+        // Both flags only ever go to `true`: a stale copy re-inserted must not
+        // make a committed coin look unsent or forget a claimed incoming.
+        if let Some(stored) = self.store.outgoing_swapcoins.get(&key) {
+            coin.committed |= stored.committed;
+            coin.incoming_claimed |= stored.incoming_claimed;
+        }
+        self.store.outgoing_swapcoins.insert(key.clone(), coin);
         log::info!(
             "Added outgoing swapcoin to wallet store: {} (total: {})",
             key,
