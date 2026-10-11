@@ -22,9 +22,12 @@ use crate::{
     blocklist::AddressBlocklist,
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
-    protocol::common_messages::{
-        check_fee_pcts, check_maker_name, FidelityProof, MakerToTakerMessage, PrivateKeyHandover,
-        ProtocolVersion, SwapDetails, MAX_MAKER_NAME_LEN,
+    protocol::{
+        common_messages::{
+            check_fee_pcts, check_maker_name, FidelityProof, MakerToTakerMessage,
+            PrivateKeyHandover, ProtocolVersion, SwapDetails, MAX_MAKER_NAME_LEN,
+        },
+        features::parse_require_features,
     },
     taker::api::{REFUND_LOCKTIME_BASE, REFUND_LOCKTIME_STEP},
     utill::{
@@ -281,6 +284,8 @@ pub struct MakerServerConfig {
     pub required_confirms: u32,
     /// Whether funding inputs should be checked against the address blocklist.
     pub check_blocklist: bool,
+    /// Feature names a taker must support to swap with this maker.
+    pub require_features: Vec<String>,
     /// Supported protocol versions.
     pub supported_protocols: Vec<ProtocolVersion>,
     /// Fidelity bond amount in satoshis.
@@ -330,6 +335,7 @@ impl Default for MakerServerConfig {
             time_relative_fee_pct: 0.0001,
             required_confirms: 1,
             check_blocklist: false,
+            require_features: Vec::new(),
             supported_protocols: vec![ProtocolVersion::Legacy, ProtocolVersion::Taproot],
             fidelity_amount: 10_000,   // 0.0001 BTC
             fidelity_timelock: 15_000, // ~6 months (MAX_FIDELITY_TIMELOCK)
@@ -455,6 +461,7 @@ impl MakerServerConfig {
                 config_map.get("check_blocklist"),
                 default_config.check_blocklist,
             ),
+            require_features: parse_require_features(config_map.get("require_features"))?,
             fidelity_amount,
             fidelity_timelock,
             fidelity_feerate,
@@ -518,6 +525,8 @@ time_relative_fee_pct = {}
 required_confirms = {}
 # Check funding inputs against the address blocklist
 check_blocklist = {}
+# Feature names a taker must support, on one line, e.g. [\"taproot\"]
+require_features = [{}]
 # Public name shown to takers (required, at most {} characters, no control characters)
 name = \"{}\"
 ",
@@ -538,6 +547,11 @@ name = \"{}\"
             self.time_relative_fee_pct,
             self.required_confirms,
             self.check_blocklist,
+            self.require_features
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
             MAX_MAKER_NAME_LEN,
             self.name,
         );

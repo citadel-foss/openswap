@@ -3,7 +3,10 @@
 //! This module defines the configuration options for the Taker module, controlling various aspects
 //! of the taker's behavior including network settings, connection preferences, and security settings.
 
-use crate::utill::{get_taker_dir, parse_field, parse_toml};
+use crate::{
+    protocol::features::parse_require_features,
+    utill::{get_taker_dir, parse_field, parse_toml},
+};
 use std::{io, io::Write, path::Path};
 
 /// Taker configuration
@@ -19,6 +22,8 @@ pub struct TakerConfig {
     pub tor_auth_password: String,
     /// Whether funding inputs should be checked against the address blocklist.
     pub check_blocklist: bool,
+    /// Feature names every maker in a swap must support.
+    pub require_features: Vec<String>,
     /// LDK Server gRPC address (`host:port`, no scheme) for Lightning swaps.
     pub ldk_server_url: Option<String>,
     /// Path to the LDK Server API key file.
@@ -34,6 +39,7 @@ impl Default for TakerConfig {
             socks_port: 9050,
             tor_auth_password: "".to_string(),
             check_blocklist: false,
+            require_features: Vec::new(),
             ldk_server_url: None,
             ldk_api_key_path: None,
             ldk_tls_cert_path: None,
@@ -85,6 +91,7 @@ impl TakerConfig {
                 config_map.get("check_blocklist"),
                 default_config.check_blocklist,
             ),
+            require_features: parse_require_features(config_map.get("require_features"))?,
             ldk_server_url: config_map.get("ldk_server_url").cloned(),
             ldk_api_key_path: config_map.get("ldk_api_key_path").cloned(),
             ldk_tls_cert_path: config_map.get("ldk_tls_cert_path").cloned(),
@@ -103,8 +110,18 @@ socks_port = {}
 # Authentication password for Tor control interface
 tor_auth_password = {}
 # Check funding inputs against the address blocklist
-check_blocklist = {}",
-            self.control_port, self.socks_port, self.tor_auth_password, self.check_blocklist,
+check_blocklist = {}
+# Feature names every maker must support, on one line, e.g. [\"taproot\"]
+require_features = [{}]",
+            self.control_port,
+            self.socks_port,
+            self.tor_auth_password,
+            self.check_blocklist,
+            self.require_features
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
         );
         let mut toml_data = toml_data;
         if let Some(url) = &self.ldk_server_url {

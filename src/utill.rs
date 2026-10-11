@@ -542,6 +542,39 @@ pub(crate) fn parse_field<T: std::str::FromStr>(value: Option<&String>, default:
         .unwrap_or(default)
 }
 
+/// Parses a one-line list of quoted names, `["a", "b"]`. Anything else is an
+/// error: a list we can't read must not silently become empty.
+pub(crate) fn parse_list(value: Option<&String>) -> io::Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let malformed = || {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("expected a one-line list like [\"a\", \"b\"], got {value}"),
+        )
+    };
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .ok_or_else(malformed)?
+        .trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .strip_prefix('"')
+                .and_then(|i| i.strip_suffix('"'))
+                .filter(|i| !i.contains(['"', '\\']))
+                .map(str::to_string)
+                .ok_or_else(malformed)
+        })
+        .collect()
+}
+
 fn polynomial_modulus(mut checksum: u64, value: u64) -> u64 {
     let upper_bits = checksum >> SHIFT_FOR_C0;
     checksum = ((checksum & MASK_LOW_35_BITS) << 5) ^ value;
@@ -1679,6 +1712,25 @@ mod tests {
         if let WalletError::General(msg) = &err {
             assert!(msg.contains("Address Network Mismatch"));
             assert!(msg.contains("Details"));
+        }
+    }
+
+    #[test]
+    fn list_values_parse_only_on_one_well_formed_line() {
+        let read = |v: &str| parse_list(Some(&v.to_string()));
+        assert_eq!(read(r#"["a", "b-v2"]"#).unwrap(), ["a", "b-v2"]);
+        assert_eq!(read("[ ]").unwrap(), Vec::<String>::new());
+        assert_eq!(parse_list(None).unwrap(), Vec::<String>::new());
+        for bad in [
+            "[",
+            r#""a""#,
+            r#"["a",]"#,
+            r#"["a"] # note"#,
+            r#"[a]"#,
+            r#"["a,b"]"#,
+            r#"["a\"b"]"#,
+        ] {
+            assert!(read(bad).is_err(), "{}", bad);
         }
     }
 }
