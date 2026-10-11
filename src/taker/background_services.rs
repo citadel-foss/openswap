@@ -125,7 +125,6 @@ impl RecoveryLoop {
                                 swept.resolved.len(),
                                 recovered.len()
                             );
-
                         }
                         Ok(_) => {}
                         Err(e) => log::debug!("Recovery loop: recovery pass: {:?}", e),
@@ -175,52 +174,18 @@ impl RecoveryLoop {
                         );
                     } else {
                         log::info!("Recovery loop: all contracts resolved");
-                        let mut saved = false;
-                        if let Ok(mut w) = lock_debug!(wallet.write()) {
-                            let mut incoming = Vec::new();
-                            let mut outgoing = Vec::new();
-                            let mut watched = Vec::new();
-                            for swap_id in &swap_ids {
-                                // A sweep normally removes its incoming entry
-                                // after confirmation. If the process stops
-                                // after broadcast but before that removal, a
-                                // restarted recovery sees the outpoint spent
-                                // and arrives here with a stale incoming entry.
-                                // Since `all_resolved` is based on confirmed
-                                // spends, it is now safe to remove both sides.
-                                let incoming_keys = w.incoming_keys_for_swap(swap_id);
-                                for key in &incoming_keys {
-                                    if let Some(coin) = w.remove_incoming_swapcoin(key) {
-                                        incoming.push(coin);
-                                    }
-                                }
-                                let outgoing_keys = w.outgoing_keys_for_swap(swap_id);
-                                for key in &outgoing_keys {
-                                    if let Some(coin) = w.remove_outgoing_swapcoin(key) {
-                                        outgoing.push(coin);
-                                    }
-                                }
-                                if let Some(coins) = w.remove_watchonly_swapcoins(swap_id) {
-                                    watched.push((swap_id.clone(), coins));
-                                }
-                            }
-                            saved = w
-                                .save_to_disk()
-                                .inspect_err(|e| log::warn!("Recovery loop: cleanup save: {:?}", e))
-                                .is_ok();
-                            if !saved {
-                                for coin in incoming {
-                                    w.add_incoming_swapcoin(&coin);
-                                }
-                                for coin in outgoing {
-                                    w.add_outgoing_swapcoin(&coin);
-                                }
-                                for (id, coins) in watched {
-                                    w.add_watchonly_swapcoins(&id, coins);
-                                }
-                            }
-                        }
-                        // Keep the stored coin set until its removal is durable.
+                        // Every contract has a confirmed spend, so a stale incoming
+                        // entry left by a crash after its sweep goes with the rest.
+                        // A failed save keeps the coins for the next pass.
+                        let saved = lock_debug!(wallet.write()).is_ok_and(|mut w| {
+                            swap_ids.iter().all(|swap_id| {
+                                w.remove_swap_coins_and_save(swap_id, true, true)
+                                    .inspect_err(|e| {
+                                        log::warn!("Recovery loop: cleanup save: {:?}", e)
+                                    })
+                                    .is_ok()
+                            })
+                        });
                         if !saved {
                             last_tip = None;
                             thread::park_timeout(RECOVERY_LOOP_INTERVAL);

@@ -798,14 +798,6 @@ impl Wallet {
         log::info!("Added {} watch-only swapcoins for swap {}", count, swap_id);
     }
 
-    /// Removes watch-only swapcoins for a given swap.
-    pub(crate) fn remove_watchonly_swapcoins(
-        &mut self,
-        swap_id: &str,
-    ) -> Option<Vec<super::swapcoin::WatchOnlySwapCoin>> {
-        self.store.watchonly_swapcoins.remove(swap_id)
-    }
-
     /// True when this wallet talks to an Electrum server rather than Bitcoin Core.
     pub fn is_electrum(&self) -> bool {
         self.blockchain.is_electrum()
@@ -1138,6 +1130,8 @@ impl Wallet {
     /// The caller supplies the backend connection: the confirmation wait runs
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
     /// Without `swap_scope` every eligible outgoing swapcoin is considered.
+    /// The callback is ignored and kept so callers still compile; each coin's
+    /// saved `committed` flag now decides.
     pub fn recover_timelocked_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
@@ -1584,7 +1578,10 @@ impl Wallet {
     /// refund while its race is open. Returns the (incoming, outgoing) outcomes.
     ///
     /// A swap settles one way: a swap whose incoming coin we claim, now or in an
-    /// earlier pass (`incoming_claimed`), gets no refund unless it provably dangles.
+    /// earlier pass, gets no refund unless it provably dangles.
+    ///
+    /// Both callbacks are ignored and kept so callers still compile; the saved
+    /// `committed` and `incoming_claimed` flags now decide.
     pub fn recover_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
