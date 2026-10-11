@@ -113,6 +113,9 @@ pub struct OfferAndAddress {
     pub state: MakerState,
     /// Supporting protocol (Legacy or Taproot)
     pub protocol: MakerProtocol,
+    /// Feature names from the maker's Hello that this build recognizes.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 /// Rank eligible makers by their estimated fee at a common amount and locktime.
@@ -157,8 +160,14 @@ pub struct MakerOfferCandidate {
     #[serde(default, rename = "proven_violation", skip_serializing)]
     legacy_proven_violation: bool,
 
-    /// Supporting protocol (Legacy or Taproot), if known
+    /// Supporting protocol (Legacy or Taproot), if known. Still written so
+    /// v0.2.3 can read this book.
     pub protocol: Option<MakerProtocol>,
+
+    /// Feature names from the maker's last Hello that this build recognizes,
+    /// so the list stays bounded by the registry.
+    #[serde(default)]
+    pub features: Vec<String>,
 
     /// Timestamp(secs) of last successful offer download, used to avoid re-downloading offers too frequently.
     pub last_offer_update_ts: Option<u64>,
@@ -177,7 +186,13 @@ pub struct MakerOfferCandidate {
 }
 
 impl MakerOfferCandidate {
-    fn mark_success(&mut self, offer: Offer, protocol: MakerProtocol, now_ts: u64) {
+    fn mark_success(
+        &mut self,
+        offer: Offer,
+        protocol: MakerProtocol,
+        features: Vec<String>,
+        now_ts: u64,
+    ) {
         if let MakerState::Banned(ban) = &self.state {
             log::warn!(
                 "Ignoring offer from banned maker {}, banned at {}",
@@ -197,6 +212,7 @@ impl MakerOfferCandidate {
         }
         self.offer = Some(offer);
         self.protocol = Some(protocol);
+        self.features = features;
         self.last_offer_update_ts = Some(now_ts);
         self.next_offer_check_ts = None;
         self.backend_retry_pending = false;
@@ -249,6 +265,7 @@ impl MakerOfferCandidate {
                 address: self.address.clone(),
                 state: self.state.clone(),
                 protocol: protocol.clone(),
+                features: self.features.clone(),
             }),
             _ => None,
         }
@@ -1010,7 +1027,9 @@ impl OfferSyncService {
             }
         };
         match outcome {
-            Some((oa, Ok(_))) => book.mark_success(&oa.address, oa.offer, oa.protocol, now),
+            Some((oa, Ok(_))) => {
+                book.mark_success(&oa.address, oa.offer, oa.protocol, oa.features, now)
+            }
             Some((oa, Err(e))) => book.record_offer_failure(&oa.address, &e, now),
             None => book.mark_failure(&addr, UnavailableReason::NoOfferResponse, now),
         }
@@ -1549,6 +1568,7 @@ impl OfferBook {
             state,
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: Some(first_seen_ts),
             backend_retry_pending: false,
@@ -1682,10 +1702,11 @@ impl OfferBook {
         address: &MakerAddress,
         offer: Offer,
         protocol: MakerProtocol,
+        features: Vec<String>,
         now_ts: u64,
     ) {
         if let Some(m) = self.makers.iter_mut().find(|m| &m.address == address) {
-            m.mark_success(offer, protocol, now_ts);
+            m.mark_success(offer, protocol, features, now_ts);
         }
     }
 
@@ -1898,17 +1919,21 @@ impl MakerAddress {
     }
 
     fn download_offer_auto(self, socks_port: u16) -> Result<OfferAndAddress, TakerError> {
-        let (offer, protocol) = self.fetch_offer(socks_port)?;
+        let (offer, protocol, features) = self.fetch_offer(socks_port)?;
         Ok(OfferAndAddress {
             offer,
             address: self,
             state: MakerState::Good,
             protocol,
+            features,
         })
     }
 
-    /// Download a single offer from a maker.
-    fn fetch_offer(&self, socks_port: u16) -> Result<(Offer, MakerProtocol), TakerError> {
+    /// Download a single offer from a maker, with the features its Hello lists.
+    fn fetch_offer(
+        &self,
+        socks_port: u16,
+    ) -> Result<(Offer, MakerProtocol, Vec<String>), TakerError> {
         if !is_valid_maker_address(&self.0) {
             return Err(TakerError::General("invalid maker address".into()));
         }
@@ -1937,7 +1962,7 @@ impl MakerAddress {
         socket.set_read_timeout(Some(Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC)))?;
         socket.set_write_timeout(Some(Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC)))?;
 
-        handshake_with_maker(&mut socket, &[])?;
+        let features = handshake_with_maker(&mut socket, &[])?;
 
         // Send GetOffer
         let get_offer = RouterTakerToMakerMessage::GetOffer(RouterGetOffer);
@@ -1989,7 +2014,7 @@ impl MakerAddress {
             self
         );
 
-        Ok((offer, MakerProtocol::Unified))
+        Ok((offer, MakerProtocol::Unified, features))
     }
 }
 
@@ -2132,6 +2157,7 @@ mod tests {
             }),
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: None,
             backend_retry_pending: false,
@@ -2161,6 +2187,7 @@ mod tests {
                 address,
                 state: MakerState::Good,
                 protocol: MakerProtocol::Unified,
+                features: Vec::new(),
             }
         })
         .collect();
@@ -2406,6 +2433,7 @@ mod tests {
                 state: MakerState::Good,
                 legacy_proven_violation: false,
                 protocol: Some(MakerProtocol::Taproot),
+                features: Vec::new(),
                 last_offer_update_ts: Some(now),
                 first_seen_ts: Some(now),
                 backend_retry_pending: false,
@@ -2490,6 +2518,7 @@ mod tests {
             &address,
             dummy_offer(&address.to_string()),
             MakerProtocol::Taproot,
+            Vec::new(),
             2,
         );
 
@@ -2507,6 +2536,7 @@ mod tests {
             state: MakerState::Good,
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
             backend_retry_pending: false,
@@ -2558,6 +2588,7 @@ mod tests {
             }),
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
             backend_retry_pending: false,
@@ -2567,6 +2598,7 @@ mod tests {
         candidate.mark_success(
             dummy_offer(&candidate.address.to_string()),
             MakerProtocol::Taproot,
+            Vec::new(),
             now_ts,
         );
         assert_eq!(candidate.state, MakerState::Good);
@@ -2591,6 +2623,7 @@ mod tests {
             }),
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
             backend_retry_pending: false,
@@ -2698,6 +2731,7 @@ mod tests {
             &address,
             dummy_offer(&address.to_string()),
             MakerProtocol::Taproot,
+            Vec::new(),
             now_ts,
         );
         assert!(matches!(book.makers[0].state, MakerState::Banned(_)));
@@ -2994,6 +3028,7 @@ mod tests {
             state: MakerState::Good,
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
             backend_retry_pending: false,
@@ -3332,6 +3367,7 @@ mod tests {
             &address,
             dummy_offer(&address.to_string()),
             MakerProtocol::Taproot,
+            Vec::new(),
             170000,
         );
         let snapshot = handle.snapshot().unwrap();
@@ -3354,6 +3390,7 @@ mod tests {
                 &honest,
                 dummy_offer(&honest.to_string()),
                 MakerProtocol::Taproot,
+                Vec::new(),
                 170000,
             );
         }
