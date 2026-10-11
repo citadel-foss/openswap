@@ -95,6 +95,76 @@ pub fn check_requires<R: AsRef<str>>(
     }
 }
 
+/// Picks a swap's pins for `flow`: per family that changes the flow, the highest
+/// version both sides list. Pins are exact names, unlike requirements.
+pub fn choose_pins(flow: &str, theirs: &[String]) -> Vec<String> {
+    let ours = supported();
+    let mut pins: Vec<&str> = Vec::new();
+    for feature in KNOWN.iter().filter(|f| {
+        f.flows.contains(&flow) && ours.contains(&f.name) && theirs.iter().any(|t| t == f.name)
+    }) {
+        let (family, version) = family_and_version(feature.name);
+        match pins
+            .iter_mut()
+            .find(|pin| family_and_version(pin).0 == family)
+        {
+            Some(pin) if family_and_version(pin).1 < version => *pin = feature.name,
+            Some(_) => {}
+            None => pins.push(feature.name),
+        }
+    }
+    pins.into_iter().map(String::from).collect()
+}
+
+/// Whether a requirement constrains `flow`. A family this build doesn't know
+/// always does, so an unknown requirement refuses the swap instead of passing it.
+fn applies_to(required: &str, flow: &str) -> bool {
+    let family = family_and_version(required).0;
+    let mut known = KNOWN
+        .iter()
+        .filter(|f| family_and_version(f.name).0 == family)
+        .peekable();
+    known.peek().is_none() || known.any(|f| f.flows.contains(&flow))
+}
+
+/// The requirements a swap on `flow` leaves unmet with these pins.
+pub fn unmet_for_flow(required: &[String], pins: &[String], flow: &str) -> Result<(), Vec<String>> {
+    check_requires(required.iter().filter(|r| applies_to(r, flow)), pins)
+}
+
+/// Checks a peer's pins for one swap and returns its flow. Every pin must be a
+/// name we serve that changes that one flow, at most one per family, and our
+/// requirements for the flow must be met.
+pub fn check_pins(pins: &[String], required: &[String]) -> Result<&'static str, String> {
+    let ours = supported();
+    let flows: Vec<&'static str> = ours
+        .iter()
+        .copied()
+        .filter(|name| {
+            pins.iter().any(|p| p == name) && KNOWN.iter().any(|f| f.flows.contains(name))
+        })
+        .collect();
+    let [flow] = flows[..] else {
+        return Err(format!("pins {pins:?} must name exactly one flow"));
+    };
+    if let Some(stray) = pins.iter().find(|p| {
+        !KNOWN
+            .iter()
+            .any(|f| f.name == p.as_str() && ours.contains(&f.name) && f.flows.contains(&flow))
+    }) {
+        return Err(format!("pin {stray:?} is not served for {flow}"));
+    }
+    for (i, pin) in pins.iter().enumerate() {
+        let family = family_and_version(pin).0;
+        if pins[..i].iter().any(|p| family_and_version(p).0 == family) {
+            return Err(format!("more than one pin in family {family:?}"));
+        }
+    }
+    unmet_for_flow(required, pins, flow)
+        .map_err(|missing| format!("pins leave required features unmet: {missing:?}"))?;
+    Ok(flow)
+}
+
 /// Reads a `require_features` config value. A malformed list or name stops
 /// startup; a name this build can't serve only warns, as requiring it is the user's choice.
 pub(crate) fn parse_require_features(value: Option<&String>) -> io::Result<Vec<String>> {
@@ -214,5 +284,42 @@ mod tests {
         assert!(read(r#"["Taproot"]"#).is_err());
         assert!(read(r#"[""]"#).is_err());
         assert!(parse_require_features(None).unwrap().is_empty());
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn pins_take_only_mutual_names_for_the_flow() {
+        let theirs = names(&["legacy", "taproot", "future-v9"]);
+        assert_eq!(choose_pins("taproot", &theirs), ["taproot"]);
+        assert_eq!(choose_pins("legacy", &theirs), ["legacy"]);
+        assert!(choose_pins("taproot", &names(&["legacy"])).is_empty());
+    }
+
+    #[test]
+    fn pins_are_checked_for_one_served_flow() {
+        assert_eq!(check_pins(&names(&["taproot"]), &[]), Ok("taproot"));
+        for bad in [
+            names(&[]),
+            names(&["legacy", "taproot"]),
+            names(&["taproot", "taproot"]),
+            names(&["taproot", "future-v1"]),
+        ] {
+            assert!(check_pins(&bad, &[]).is_err(), "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn requirements_bind_only_their_own_flows_but_unknown_ones_bind_all() {
+        let taproot = names(&["taproot"]);
+        // `legacy` changes only the legacy flow, so a taproot swap meets it.
+        assert_eq!(
+            unmet_for_flow(&names(&["legacy"]), &taproot, "taproot"),
+            Ok(())
+        );
+        assert!(unmet_for_flow(&names(&["future-v1"]), &taproot, "taproot").is_err());
+        assert!(check_pins(&taproot, &names(&["future-v1"])).is_err());
     }
 }
