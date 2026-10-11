@@ -117,8 +117,6 @@ pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &E
 
     generate_blocks(bitcoind, 1);
 
-    // Start periodic swap tracker logging
-
     // Prepare should succeed; execution should fail with DropAfterFundsBroadcast
     let summary = taker
         .prepare_swap(swap_params)

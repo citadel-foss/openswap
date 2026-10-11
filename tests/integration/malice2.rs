@@ -135,8 +135,6 @@ fn run_malice2_with_taker_behavior<B: TestBackend>(
     let _maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting malice2 test...");
 
-    // Start periodic swap tracker logging (every 10s)
-
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(
         ProtocolVersion::Legacy,

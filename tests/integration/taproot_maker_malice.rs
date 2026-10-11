@@ -81,8 +81,6 @@ fn test_taproot_malice_maker_broadcast_contract() {
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting taproot maker malice test...");
 
-    // Start periodic swap tracker logging (every 10s)
-
     // Swap params for openswap (Taproot)
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(1)

@@ -74,8 +74,6 @@ fn taker_abort_1_legacy_corerpc() {
 
     generate_blocks(bitcoind, 1);
 
-    // Start periodic swap tracker logging
-
     // Prepare should succeed; execution should fail with DropAfterFundsBroadcast
     let summary = taker
         .prepare_swap(swap_params)

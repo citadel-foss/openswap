@@ -7,9 +7,9 @@
 //! 1. Taker initiates a Legacy openswap with 2 makers.
 //! 2. Maker2 broadcasts its funding transaction and persists unfinished swapcoins.
 //! 3. Maker2 closes at hash preimage / private key handover.
-//! 4. Maker2 is restarted before idle recovery can write a tracker record.
-//! 5. Startup recovery must not discard the persisted swapcoins merely because
-//!    it cannot find a matching tracker record.
+//! 4. Maker2 is restarted before idle recovery runs.
+//! 5. Startup recovery must not discard the persisted swapcoins: they were
+//!    saved as committed before the funding broadcast.
 
 use bitcoin::Amount;
 use openswap::{
@@ -29,8 +29,7 @@ use std::{
 };
 
 /// Test: maker reboot recovery should preserve Legacy swapcoins when funding
-/// was broadcast but the maker has not yet persisted an idle-recovery tracker
-/// record for the original swap id.
+/// was broadcast but idle recovery never ran for the original swap id.
 #[test]
 fn test_legacy_maker_reboot_recovery_preserves_funded_swapcoins() {
     warn!("Running Test: Legacy Maker Reboot Recovery Preserves Funded Swapcoins");

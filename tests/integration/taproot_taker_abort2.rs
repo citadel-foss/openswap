@@ -71,8 +71,6 @@ fn test_taproot_taker_abort2() {
     let _maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting taproot taker abort2 test...");
 
-    // Start periodic swap tracker logging (every 10s)
-
     // Swap params for openswap (Taproot)
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)

@@ -72,8 +72,6 @@ fn maker_abort2_case3() {
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting Legacy abort2 case 3 test...");
 
-    // Start periodic swap tracker logging (every 10s)
-
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
