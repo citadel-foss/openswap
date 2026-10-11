@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin::{Amount, OutPoint};
-use bitcoind::bitcoincore_rpc::RpcApi;
+use bitcoin::{Amount, Network, TxOut};
+use bitcoind::bitcoincore_rpc::{json::ScanTxOutRequest, RpcApi};
 use openswap::{
     blocklist::BlocklistError,
     lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest},
@@ -454,28 +454,33 @@ fn lightning_swap_in_refuses_announced_value_mismatch() {
     // Only the value check can have refused: the funding the taker
     // broadcast passes the maker's own output check for this swap, and no
     // check after it refused.
-    let contents = std::fs::read_to_string(&log_path).unwrap();
-    let new_lines = contents.get(log_offset as usize..).unwrap_or_default();
-    let outpoint: OutPoint = new_lines
-        .lines()
-        .find_map(|line| line.split_once("HTLC funding broadcast: "))
-        .and_then(|(_, rest)| rest.split_once(','))
-        .and_then(|(outpoint, _)| outpoint.parse().ok())
-        .expect("the taker logs its funding outpoint");
-    let funding_tx = bitcoind
+    // The HTLC remains unspent: the maker has not paid the invoice
+    // or learned the preimage needed to sweep, and paused blocks
+    // prevent the taker's CSV refund from becoming spendable.
+    let htlc_address = kept.htlc.address(Network::Regtest).unwrap();
+    let scan = bitcoind
         .client
-        .get_raw_transaction(&outpoint.txid, None)
+        .scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(format!("addr({htlc_address})"))])
         .unwrap();
+    let [funding] = scan.unspents.as_slice() else {
+        panic!("expected one funded HTLC output, found {:?}", scan.unspents);
+    };
     kept.htlc
         .validate_funding_output(
-            &funding_tx.output[outpoint.vout as usize],
+            &TxOut {
+                value: funding.amount,
+                script_pubkey: funding.script_pub_key.clone(),
+            },
             kept.amount + kept.fee,
         )
         .expect("the taker's funding is valid for this swap");
+    let contents = std::fs::read_to_string(&log_path).unwrap();
+    let new_lines = contents.get(log_offset as usize..).unwrap_or_default();
     let refusals: Vec<&str> = new_lines
         .lines()
         .filter(|line| line.contains(": refused: "))
         .collect();
+    // The value-mismatch `reject` logs no ": refused: " line, so an empty list is expected.
     assert!(
         refusals.is_empty(),
         "a check after the value check refused: {:?}",

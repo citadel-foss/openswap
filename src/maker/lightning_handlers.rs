@@ -771,11 +771,14 @@ fn handle_swap_in_funded<M: Maker>(
     ))))
 }
 
-/// Refuses a funded swap-in. Every refusal comes before this handler pays the
-/// invoice or watches the HTLC, so a swap still awaiting funding holds nothing
-/// the maker would need later: the taker refunds its HTLC on its own. Forget
-/// such a swap now, so it does not hold one of the concurrent swap slots until
-/// the watchdog expires it.
+/// Refuses a funded swap-in. Callers must first validate the outpoint, proving
+/// it pays this swap's HTLC: until then anyone who knows the swap id could have
+/// sent the announcement, so reply with a plain `reject` and keep the swap.
+/// Only refusals after that validation reach here, and every one comes before
+/// `handle_swap_in_funded` pays the invoice or watches the HTLC, so a swap
+/// still awaiting funding holds nothing the maker would need later: the taker
+/// refunds its HTLC on its own. Forget such a swap now, so it does not hold one
+/// of the concurrent swap slots until the watchdog expires it.
 fn refuse_swap_in<M: Maker>(
     maker: &Arc<M>,
     swap_id: &str,
