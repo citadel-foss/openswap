@@ -2101,6 +2101,202 @@ mod tests {
     #[cfg(not(feature = "integration-test"))]
     use sha3::{Digest, Sha3_256};
 
+    // Frozen from v0.2.3: new names or changed field types must break this reader.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CompatV023Book {
+        makers: Vec<CompatV023Candidate>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        suppressed_makers: HashMap<MakerAddress, CompatV023Suppressed>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CompatV023Candidate {
+        address: MakerAddress,
+        fidelity_outpoint: Option<OutPoint>,
+        #[serde(default)]
+        fidelity_expiry_height: Option<u32>,
+        offer: Option<Offer>,
+        state: CompatV023State,
+        #[serde(default, rename = "proven_violation", skip_serializing)]
+        legacy_proven_violation: bool,
+        protocol: Option<CompatV023Protocol>,
+        last_offer_update_ts: Option<u64>,
+        #[serde(default)]
+        first_seen_ts: Option<u64>,
+        #[serde(default)]
+        backend_retry_pending: bool,
+        next_offer_check_ts: Option<u64>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CompatV023Suppressed {
+        fidelity_outpoint: Option<OutPoint>,
+        fidelity_expiry_height: Option<u32>,
+        #[serde(default)]
+        state: Option<CompatV023State>,
+        #[serde(default, rename = "proven_violation", skip_serializing)]
+        legacy_proven_violation: bool,
+        retry_after_ts: u64,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023Protocol {
+        Legacy,
+        Taproot,
+        Unified,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023State {
+        Good,
+        Unavailable {
+            reason: CompatV023Unavailable,
+            since_ts: Option<u64>,
+            last_attempt_ts: Option<u64>,
+            attempts: u32,
+        },
+        Banned {
+            reason: CompatV023Ban,
+            recorded_at_ts: u64,
+        },
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023Unavailable {
+        AwaitingOffer,
+        NoOfferResponse,
+        BondUnconfirmed,
+        BondExpired,
+        BondReorged,
+        BondUnverified,
+        UnpriceableOffer,
+        LegacyStatus,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023Ban {
+        ProvenViolation,
+        InvalidFidelityProof,
+        FundingWithheld,
+        LegacyProvenViolation,
+    }
+
+    #[test]
+    fn compat_offerbook_round_trips_all_states_through_v023() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("offerbook.json");
+        let mut book = OfferBook::default();
+        let mut states = vec![MakerState::Good];
+        states.extend(
+            [
+                UnavailableReason::AwaitingOffer,
+                UnavailableReason::NoOfferResponse,
+                UnavailableReason::BondUnconfirmed,
+                UnavailableReason::BondExpired,
+                UnavailableReason::BondReorged,
+                UnavailableReason::BondUnverified,
+                UnavailableReason::UnpriceableOffer,
+                UnavailableReason::LegacyStatus,
+            ]
+            .iter()
+            .cloned()
+            .map(|reason| {
+                MakerState::Unavailable(UnavailableState {
+                    reason,
+                    since_ts: Some(10),
+                    last_attempt_ts: Some(20),
+                    attempts: 3,
+                })
+            }),
+        );
+        states.extend(
+            [
+                BanReason::ProvenViolation,
+                BanReason::InvalidFidelityProof,
+                BanReason::FundingWithheld,
+                BanReason::LegacyProvenViolation,
+            ]
+            .iter()
+            .cloned()
+            .map(|reason| {
+                MakerState::Banned(BanRecord {
+                    reason,
+                    recorded_at_ts: 30,
+                })
+            }),
+        );
+        for (i, state) in states.into_iter().enumerate() {
+            let address = addr(&(6102 + i).to_string());
+            let mut maker = candidate(address.clone());
+            maker.fidelity_outpoint = Some(OutPoint {
+                txid: Txid::from_slice(&[i as u8; 32]).unwrap(),
+                vout: 0,
+            });
+            maker.fidelity_expiry_height = Some(800_100);
+            maker.first_seen_ts = Some(1);
+            maker.mark_success(
+                dummy_offer(&address.to_string()),
+                MakerProtocol::Unified,
+                vec!["legacy".into(), "taproot".into()],
+                40,
+            );
+            maker.state = state.clone();
+            book.suppressed_makers.insert(
+                address,
+                SuppressedMaker {
+                    fidelity_outpoint: maker.fidelity_outpoint,
+                    fidelity_expiry_height: maker.fidelity_expiry_height,
+                    state: Some(state),
+                    legacy_proven_violation: false,
+                    retry_after_ts: 50,
+                },
+            );
+            book.makers.push(maker);
+        }
+        book.write_to_disk(&path).unwrap();
+        let old: CompatV023Book = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(old.makers.len(), 13);
+        assert!(old
+            .makers
+            .iter()
+            .all(|m| matches!(m.protocol, Some(CompatV023Protocol::Unified))));
+        assert!(old.makers.iter().all(|m| !m.legacy_proven_violation));
+        assert!(old
+            .suppressed_makers
+            .values()
+            .all(|m| !m.legacy_proven_violation));
+        let mut expected = serde_json::to_value(&book).unwrap();
+        for maker in expected["makers"].as_array_mut().unwrap() {
+            maker.as_object_mut().unwrap().remove("features");
+        }
+        assert_eq!(serde_json::to_value(&old).unwrap(), expected);
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let restored = OfferBook::read_from_disk(&path).unwrap();
+        for (new, before) in restored.makers.iter().zip(&book.makers) {
+            let mut expected = before.clone();
+            expected.features.clear();
+            assert_eq!(new, &expected);
+        }
+        assert_eq!(
+            serde_json::to_value(restored.suppressed_makers).unwrap(),
+            serde_json::to_value(book.suppressed_makers).unwrap()
+        );
+    }
+
+    #[test]
+    fn compat_offerbook_ignores_future_fields_but_refuses_unknown_states() {
+        let maker = candidate(addr("6102"));
+        let mut value = serde_json::to_value(&maker).unwrap();
+        value["future_field"] = serde_json::json!({"nested": [1, 2, 3]});
+        assert_eq!(
+            serde_json::from_value::<MakerOfferCandidate>(value.clone()).unwrap(),
+            maker
+        );
+        value["state"] = serde_json::json!({"FutureState": {"proof": "keep"}});
+        assert!(serde_json::from_value::<MakerOfferCandidate>(value.clone()).is_err());
+        assert!(serde_json::from_value::<CompatV023Candidate>(value).is_err());
+    }
+
     /// Derives a distinct v3 onion address from the id. The checksum is real
     /// because `is_valid_maker_address` verifies it, and a single shared
     /// address would collapse every test maker into the same one.

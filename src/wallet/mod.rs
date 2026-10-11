@@ -1,6 +1,8 @@
 //! The OpenSwap Wallet (unsecured). Used by both the Taker and Maker.
 
 mod api;
+#[cfg(test)]
+pub(crate) use api::test_support::test_wallet;
 mod backup;
 pub(crate) mod blockchain;
 pub mod deniability;

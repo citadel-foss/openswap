@@ -453,6 +453,26 @@ mod tests {
     }
 
     #[test]
+    fn compat_nostr_content_uses_only_two_fields_and_keeps_validation() {
+        let txid = Txid::from_slice(&[7u8; 32]).unwrap();
+        for suffix in ["", ":", ":future:more:fields", ":not-a-number"] {
+            assert_eq!(
+                parse_fidelity_event(&fidelity_event(format!("  {txid}:0{suffix}  "))),
+                Some((txid, 0))
+            );
+            assert!(parse_fidelity_event(&fidelity_event(format!("{txid}:1{suffix}"))).is_none());
+        }
+        for bad in [
+            format!("{txid}"),
+            format!("{txid}::future"),
+            format!("{txid}:4294967296:future"),
+            "invalid:0:future".into(),
+        ] {
+            assert!(parse_fidelity_event(&fidelity_event(bad)).is_none());
+        }
+    }
+
+    #[test]
     fn test_process_fidelity_valid() {
         let lock = 500;
         let tx = fidelity_tx(lock, &announcement(lock));

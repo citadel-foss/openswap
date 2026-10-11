@@ -428,6 +428,60 @@ mod tests {
     }
 
     #[test]
+    fn compat_rpc_old_requests_and_future_envelope_fields_keep_working() {
+        // Unit request names and envelope keys from the v0.2.3 writer.
+        for request in ["Ping", "GetDataDir"] {
+            let reply = rpc_round_trip(|cookie| {
+                Value::Map(BTreeMap::from([
+                    (Value::Text("token".into()), Value::Text(cookie.into())),
+                    (Value::Text("request".into()), Value::Text(request.into())),
+                    (
+                        Value::Text("future_field".into()),
+                        Value::Bytes(vec![1, 2, 3]),
+                    ),
+                ]))
+            })
+            .unwrap();
+            assert!(if request == "Ping" {
+                matches!(reply, RpcMsgResp::Pong)
+            } else {
+                matches!(reply, RpcMsgResp::GetDataDirResp(_))
+            });
+        }
+    }
+
+    #[test]
+    fn compat_rpc_unknown_bodies_authenticate_before_request_decode() {
+        for request in [
+            Value::Text("FutureRequest".into()),
+            Value::Map(BTreeMap::from([(
+                Value::Text("FutureRequest".into()),
+                Value::Map(BTreeMap::new()),
+            )])),
+            Value::Map(BTreeMap::from([(
+                Value::Text("SendToAddress".into()),
+                Value::Bool(true),
+            )])),
+        ] {
+            for valid_token in [false, true] {
+                let reply = rpc_round_trip(|cookie| {
+                    Value::Map(BTreeMap::from([
+                        (
+                            Value::Text("token".into()),
+                            Value::Text(if valid_token { cookie } else { "wrong" }.into()),
+                        ),
+                        (Value::Text("request".into()), request.clone()),
+                    ]))
+                })
+                .unwrap();
+                assert!(
+                    matches!(reply, RpcMsgResp::ServerError(reason) if if valid_token { reason.starts_with("unknown request:") } else { reason == "unauthorized" })
+                );
+            }
+        }
+    }
+
+    #[test]
     fn send_to_address_rejects_unusable_rates_over_rpc() {
         for rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.5] {
             let RpcMsgResp::ServerError(e) = rpc_send_to_address("bcrt1qinvalid", rate).unwrap()

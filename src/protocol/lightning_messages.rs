@@ -286,6 +286,57 @@ impl std::fmt::Display for LightningMakerMessage {
 mod tests {
     use super::*;
     use crate::protocol::common_messages::{MakerToTakerMessage, TakerToMakerMessage};
+    use bitcoin::hashes::Hash;
+    use serde_cbor::{value::to_value, Value};
+
+    #[test]
+    fn compat_lightning_requests_keep_pins_and_bitcoin_fields() {
+        let hash = sha256::Hash::from_slice(&[7; 32]).unwrap();
+        let pubkey: PublicKey =
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap();
+        for request in [
+            LightningTakerMessage::SwapInRequest(LnSwapInRequest {
+                swap_id: hash.to_string(),
+                invoice: "ln-compat".into(),
+                payment_hash: hash,
+                amount: Amount::from_sat(45_678),
+                locktime: 60,
+                min_confirmations: 2,
+                taker_timelock_pubkey: pubkey,
+                features: vec!["ln-swap-in".into()],
+            }),
+            LightningTakerMessage::SwapOutRequest(LnSwapOutRequest {
+                swap_id: hash.to_string(),
+                payment_hash: hash,
+                amount: Amount::from_sat(45_678),
+                locktime: 60,
+                min_confirmations: 2,
+                taker_hashlock_pubkey: pubkey,
+                features: vec!["ln-swap-out".into()],
+            }),
+        ] {
+            let baseline = to_value(TakerToMakerMessage::Lightning(Box::new(request))).unwrap();
+            let mut future = baseline.clone();
+            let Value::Map(outer) = &mut future else {
+                panic!()
+            };
+            let Value::Map(inner) = outer.get_mut(&Value::Text("Lightning".into())).unwrap() else {
+                panic!()
+            };
+            let Value::Map(body) = inner.values_mut().next().unwrap() else {
+                panic!()
+            };
+            body.insert(
+                Value::Text("future_field".into()),
+                Value::Bytes(vec![1, 2, 3]),
+            );
+            let decoded: TakerToMakerMessage =
+                serde_cbor::from_slice(&serde_cbor::to_vec(&future).unwrap()).unwrap();
+            assert_eq!(to_value(decoded).unwrap(), baseline);
+        }
+    }
 
     /// Old peers must keep decoding offers that carry the new optional
     /// lightning field, and new peers must decode offers without it. CBOR

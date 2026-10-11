@@ -343,7 +343,13 @@ pub struct UnsupportedMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use crate::utill::send_message;
+    use serde_cbor::value::to_value;
+    use std::{
+        collections::BTreeMap,
+        io::Read,
+        net::{TcpListener, TcpStream},
+    };
 
     fn tagged(name: &str, body: Value) -> Vec<u8> {
         serde_cbor::to_vec(&Value::Map(BTreeMap::from([(
@@ -376,5 +382,105 @@ mod tests {
     fn hello_frame_starts_with_its_frozen_tag() {
         let bytes = serde_cbor::to_vec(&TakerToMakerMessage::Hello(Hello::default())).unwrap();
         assert_eq!(&bytes[..7], b"\xa1\x65Hello");
+    }
+
+    #[test]
+    fn compat_hello_and_unsupported_accept_future_fields_both_ways() {
+        for tag in ["Hello", "Unsupported"] {
+            let mut fields = BTreeMap::new();
+            if tag == "Hello" {
+                fields.insert(
+                    Value::Text("features".into()),
+                    Value::Array(vec![Value::Text("taproot".into())]),
+                );
+            } else {
+                fields.insert(
+                    Value::Text("what".into()),
+                    Value::Text("FutureThing".into()),
+                );
+                fields.insert(
+                    Value::Text("reason".into()),
+                    Value::Text("cannot decode".into()),
+                );
+            }
+            let baseline = Value::Map(fields.clone());
+            fields.insert(
+                Value::Text("future".into()),
+                Value::Map(BTreeMap::from([(
+                    Value::Text("nested".into()),
+                    Value::Bytes(vec![1, 2, 3]),
+                )])),
+            );
+            let bytes = tagged(tag, Value::Map(fields));
+            let taker: TakerToMakerMessage = serde_cbor::from_slice(&bytes).unwrap();
+            let maker: MakerToTakerMessage = serde_cbor::from_slice(&bytes).unwrap();
+            let frozen: Value = serde_cbor::from_slice(&tagged(tag, baseline)).unwrap();
+            assert_eq!(to_value(&taker).unwrap(), frozen);
+            assert_eq!(to_value(&maker).unwrap(), frozen);
+            assert_eq!(message_name(&bytes).as_deref(), Some(tag));
+        }
+    }
+
+    #[test]
+    fn compat_hello_frame_keeps_length_prefix_and_tag_both_ways() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut reader, _) = listener.accept().unwrap();
+        let hello = Hello {
+            features: vec!["taproot".into(), "future-v1".into()],
+        };
+        let taker = TakerToMakerMessage::Hello(hello.clone());
+        let maker = MakerToTakerMessage::Hello(hello.clone());
+        for bytes in [
+            serde_cbor::to_vec(&taker).unwrap(),
+            serde_cbor::to_vec(&maker).unwrap(),
+        ] {
+            send_message(
+                &mut sender,
+                &serde_cbor::from_slice::<Value>(&bytes).unwrap(),
+            )
+            .unwrap();
+            let mut prefix = [0; 4];
+            reader.read_exact(&mut prefix).unwrap();
+            assert_eq!(prefix, (bytes.len() as u32).to_be_bytes());
+            let mut body = vec![0; bytes.len()];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(&body[..7], b"\xa1\x65Hello");
+            let TakerToMakerMessage::Hello(decoded) = serde_cbor::from_slice(&body).unwrap() else {
+                panic!()
+            };
+            assert_eq!(decoded, hello);
+        }
+    }
+
+    #[test]
+    fn compat_swap_details_keep_bitcoin_fields_and_ignore_future_fields() {
+        let details = SwapDetails {
+            id: "swap-compat".into(),
+            features: vec!["taproot".into()],
+            amount: Amount::from_sat(123_456),
+            tx_count: 3,
+            incoming_count: 2,
+            max_input_budget: 4,
+            feerate: 5,
+            timelock: 800_100,
+            refund_locktime_offset: 60,
+        };
+        let mut value = to_value(TakerToMakerMessage::SwapDetails(details.clone())).unwrap();
+        let Value::Map(outer) = &mut value else {
+            panic!()
+        };
+        let Value::Map(body) = outer.get_mut(&Value::Text("SwapDetails".into())).unwrap() else {
+            panic!()
+        };
+        assert!(!body.contains_key(&Value::Text("protocol_version".into())));
+        body.insert(Value::Text("future".into()), Value::Bool(true));
+        let TakerToMakerMessage::SwapDetails(decoded) =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&value).unwrap()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(decoded, details);
+        assert_eq!(decoded.protocol(), Some(ProtocolVersion::Taproot));
     }
 }

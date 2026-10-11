@@ -4017,6 +4017,35 @@ mod tests {
             compat_hello_reply(reply, &["taproot".into()]).unwrap(),
             ["taproot"]
         );
+        let repeated = (0..100)
+            .flat_map(|_| KNOWN.iter().rev().map(|f| f.name.to_string()))
+            .chain(["future-v1".into()])
+            .collect();
+        let reply = to_value(MakerToTakerMessage::Hello(Hello { features: repeated })).unwrap();
+        assert_eq!(
+            compat_hello_reply(reply, &[]).unwrap(),
+            KNOWN.iter().map(|f| f.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compat_v023_maker_hello_cannot_repin_a_new_taker() {
+        let old_hello = Value::Map(BTreeMap::from([(
+            Value::Text("MakerHello".into()),
+            Value::Map(BTreeMap::from([(
+                Value::Text("supported_protocols".into()),
+                Value::Array(vec![
+                    Value::Text("Legacy".into()),
+                    Value::Text("Taproot".into()),
+                ]),
+            )])),
+        )]));
+        for needed in [vec![], vec!["taproot".into()]] {
+            assert!(matches!(
+                compat_hello_reply(old_hello.clone(), &needed),
+                Err(TakerError::Deserialize(_))
+            ));
+        }
     }
 
     #[test]

@@ -1298,6 +1298,57 @@ fn handle_taproot_dispatch<M: Maker>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::maker::api::tests::compat_test_maker;
+
+    #[test]
+    fn compat_maker_rejects_invalid_pins_before_admission() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        for (i, (pins, required)) in [
+            (vec![], vec![]),
+            (vec!["legacy", "taproot"], vec![]),
+            (vec!["taproot", "taproot"], vec![]),
+            (vec!["taproot", "future-v1"], vec![]),
+            (vec!["taproot"], vec!["future-v1"]),
+            (vec!["taproot"], vec!["taproot-v1"]),
+            (vec!["ln-swap-in"], vec![]),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let maker = compat_test_maker(
+                &dir.path().join(i.to_string()),
+                required.iter().map(|s| s.to_string()).collect(),
+            );
+            let mut state = ConnectionState {
+                phase: SwapPhase::AwaitingSwapDetails,
+                ..Default::default()
+            };
+            let details = SwapDetails {
+                id: "compat-pins".into(),
+                features: pins.iter().map(|s| s.to_string()).collect(),
+                amount: Amount::from_sat(123_456),
+                tx_count: 1,
+                incoming_count: 1,
+                max_input_budget: 1,
+                feerate: 1,
+                timelock: 1_000,
+                refund_locktime_offset: 60,
+            };
+            let reply = handle_message(
+                &maker,
+                &mut state,
+                TakerToMakerMessage::SwapDetails(details),
+            )
+            .unwrap();
+            assert!(
+                matches!(reply, Some(MakerToTakerMessage::AckSwapDetails(ack)) if ack.tweakable_point.is_none())
+            );
+            assert_eq!(state.phase, SwapPhase::AwaitingSwapDetails);
+            assert!(state.swap_id.is_none());
+            assert!(maker.get_connection_state("compat-pins").unwrap().is_none());
+            maker.watch_service.shutdown();
+        }
+    }
 
     #[test]
     fn offset_below_reaction_time_is_rejected() {

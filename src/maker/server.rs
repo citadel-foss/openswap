@@ -2183,7 +2183,267 @@ pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use crate::{
+        maker::api::tests::compat_test_maker,
+        protocol::common_messages::{Hello, PrivateKeyHandover},
+    };
+    use serde::{Deserialize, Serialize};
+    use serde_cbor::{value::to_value, Value};
+    use std::{
+        collections::BTreeMap,
+        io::{Read, Write},
+        net::Shutdown,
+    };
+
+    // The handshake variants and fields from v0.2.3 stay independent of
+    // the new enums so removing the deliberate refusal breaks this test.
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023TakerMessage {
+        TakerHello(()),
+        Unsupported { what: String, reason: String },
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023MakerMessage {
+        MakerHello {
+            supported_protocols: Vec<ProtocolVersion>,
+        },
+        Unsupported {
+            what: String,
+            reason: String,
+        },
+    }
+
+    fn compat_connection_replies(
+        maker: &Arc<MakerServer>,
+        frames: &[Vec<u8>],
+        close_input: bool,
+    ) -> Vec<MakerToTakerMessage> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let maker = maker.clone();
+        let permit = ConnectionLimiter::new().try_acquire().unwrap();
+        let handler = thread::spawn(move || handle_connection(maker, Arc::new(server), permit));
+        for frame in frames {
+            client
+                .write_all(&(frame.len() as u32).to_be_bytes())
+                .unwrap();
+            client.write_all(frame).unwrap();
+        }
+        if close_input {
+            client.shutdown(Shutdown::Write).unwrap();
+        }
+        let mut replies = Vec::new();
+        loop {
+            let mut prefix = [0; 4];
+            match client.read_exact(&mut prefix) {
+                Ok(()) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    break
+                }
+                Err(e) => panic!("maker did not close after the frames: {}", e),
+            }
+            let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+            client.read_exact(&mut body).unwrap();
+            replies.push(serde_cbor::from_slice(&body).unwrap());
+        }
+        handler.join().unwrap().unwrap();
+        replies
+    }
+
+    #[test]
+    fn compat_v023_taker_gets_readable_refusal_and_connection_close() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec![]);
+        let old_hello = serde_cbor::to_vec(&CompatV023TakerMessage::TakerHello(())).unwrap();
+        let replies = compat_connection_replies(&maker, &[old_hello], false);
+        let [refusal] = replies.as_slice() else {
+            panic!("expected one refusal: {:?}", replies)
+        };
+        let old_refusal: CompatV023MakerMessage =
+            serde_cbor::from_slice(&serde_cbor::to_vec(refusal).unwrap()).unwrap();
+        assert!(matches!(
+            old_refusal,
+            CompatV023MakerMessage::Unsupported { what, reason }
+                if what == "TakerHello" && reason == "cannot decode"
+        ));
+        let hello = Hello::default();
+        for bytes in [
+            serde_cbor::to_vec(&TakerToMakerMessage::Hello(hello.clone())).unwrap(),
+            serde_cbor::to_vec(&MakerToTakerMessage::Hello(hello)).unwrap(),
+        ] {
+            assert!(serde_cbor::from_slice::<CompatV023TakerMessage>(&bytes).is_err());
+            assert!(serde_cbor::from_slice::<CompatV023MakerMessage>(&bytes).is_err());
+        }
+        let old_refusal = CompatV023TakerMessage::Unsupported {
+            what: "Hello".into(),
+            reason: "unsupported".into(),
+        };
+        assert!(compat_connection_replies(
+            &maker,
+            &[serde_cbor::to_vec(&old_refusal).unwrap()],
+            false,
+        )
+        .is_empty());
+        maker.watch_service.shutdown();
+    }
+
+    #[test]
+    fn compat_maker_gate_requires_hello_before_heartbeat_and_handover() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec![]);
+        let legacy = PrivateKeyHandover {
+            id: "cached-legacy".into(),
+            privkeys: vec![],
+        };
+        let taproot = PrivateKeyHandover {
+            id: "cached-taproot".into(),
+            privkeys: vec![],
+        };
+        for (protocol, request, response) in [
+            (
+                ProtocolVersion::Legacy,
+                legacy.clone(),
+                MakerToTakerMessage::LegacyPrivateKeyHandover(legacy.clone()),
+            ),
+            (
+                ProtocolVersion::Taproot,
+                taproot.clone(),
+                MakerToTakerMessage::TaprootPrivateKeyHandover(taproot.clone()),
+            ),
+        ] {
+            maker
+                .cache_completed_handover(protocol, request.clone(), &response)
+                .unwrap();
+            assert!(maker
+                .replay_completed_handover(protocol, &request)
+                .unwrap()
+                .is_some());
+        }
+        for message in [
+            TakerToMakerMessage::GetOffer(Default::default()),
+            TakerToMakerMessage::WaitingFundingConfirmation("unknown".into()),
+            TakerToMakerMessage::LegacyPrivateKeyHandover(legacy.clone()),
+            TakerToMakerMessage::TaprootPrivateKeyHandover(taproot.clone()),
+        ] {
+            assert!(compat_connection_replies(
+                &maker,
+                &[serde_cbor::to_vec(&message).unwrap()],
+                false
+            )
+            .is_empty());
+        }
+        let hello = serde_cbor::to_vec(&TakerToMakerMessage::Hello(Hello::default())).unwrap();
+        let replies = compat_connection_replies(
+            &maker,
+            &[
+                hello.clone(),
+                serde_cbor::to_vec(&TakerToMakerMessage::LegacyPrivateKeyHandover(legacy)).unwrap(),
+            ],
+            true,
+        );
+        assert!(matches!(
+            replies.as_slice(),
+            [
+                MakerToTakerMessage::Hello(_),
+                MakerToTakerMessage::LegacyPrivateKeyHandover(_)
+            ]
+        ));
+        let replies = compat_connection_replies(&maker, &[hello.clone(), hello], false);
+        assert!(matches!(
+            replies.as_slice(),
+            [MakerToTakerMessage::Hello(_)]
+        ));
+        maker.watch_service.shutdown();
+    }
+
+    #[test]
+    fn compat_maker_requirements_refuse_and_close_or_accept_higher_versions() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec!["x-v1".into()]);
+        for (features, accepted) in [
+            (vec!["x-v1", "x-v2"], true),
+            (vec!["x-v2"], true),
+            (vec!["x"], false),
+            (vec![], false),
+        ] {
+            let hello = TakerToMakerMessage::Hello(Hello {
+                features: features.into_iter().map(String::from).collect(),
+            });
+            let replies =
+                compat_connection_replies(&maker, &[serde_cbor::to_vec(&hello).unwrap()], accepted);
+            if accepted {
+                assert!(matches!(
+                    replies.as_slice(),
+                    [MakerToTakerMessage::Hello(_)]
+                ));
+            } else {
+                assert!(
+                    matches!(replies.as_slice(), [MakerToTakerMessage::Unsupported(refusal)] if refusal.what == "Hello" && refusal.reason.contains("x-v1"))
+                );
+            }
+        }
+        maker.watch_service.shutdown();
+    }
+
+    #[test]
+    fn compat_maker_decode_failure_names_future_variants_without_reply_loops() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec![]);
+        let hello = serde_cbor::to_vec(&TakerToMakerMessage::Hello(Hello::default())).unwrap();
+        let tagged =
+            |tag: &str, body: Value| Value::Map(BTreeMap::from([(Value::Text(tag.into()), body)]));
+        for (value, expected) in [
+            (Value::Text("FutureUnit".into()), Some("FutureUnit")),
+            (tagged("FutureBody", Value::Integer(7)), Some("FutureBody")),
+            (
+                tagged("Lightning", tagged("FutureLn", Value::Null)),
+                Some("Lightning::FutureLn"),
+            ),
+            (tagged("Unsupported", Value::Null), None),
+            (Value::Text("Unsupported".into()), None),
+            (Value::Integer(7), None),
+        ] {
+            let replies = compat_connection_replies(
+                &maker,
+                &[hello.clone(), serde_cbor::to_vec(&value).unwrap()],
+                false,
+            );
+            assert!(matches!(
+                replies.first(),
+                Some(MakerToTakerMessage::Hello(_))
+            ));
+            match expected {
+                Some(name) => assert!(
+                    matches!(&replies[1..], [MakerToTakerMessage::Unsupported(refusal)] if refusal.what == name && refusal.reason == "cannot decode")
+                ),
+                None => assert_eq!(replies.len(), 1),
+            }
+        }
+        let mut future_hello = to_value(TakerToMakerMessage::Hello(Hello::default())).unwrap();
+        let Value::Map(outer) = &mut future_hello else {
+            panic!()
+        };
+        let Value::Map(body) = outer.get_mut(&Value::Text("Hello".into())).unwrap() else {
+            panic!()
+        };
+        body.insert(Value::Text("future".into()), Value::Bool(true));
+        assert!(matches!(
+            compat_connection_replies(&maker, &[serde_cbor::to_vec(&future_hello).unwrap()], true)
+                .as_slice(),
+            [MakerToTakerMessage::Hello(_)]
+        ));
+        maker.watch_service.shutdown();
+    }
 
     #[test]
     fn pending_connections_are_bounded() {

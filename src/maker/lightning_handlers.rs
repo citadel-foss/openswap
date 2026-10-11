@@ -1446,7 +1446,30 @@ fn watchdog_resolve_swap_out(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::maker::api::tests::compat_test_maker;
     use bitcoin::ScriptBuf;
+
+    #[test]
+    fn compat_lightning_pins_require_exact_direction_and_requirements() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec![]);
+        for flow in ["ln-swap-in", "ln-swap-out"] {
+            assert!(check_flow_pins(&maker, &[flow.into()], flow).is_ok());
+            for pins in [
+                vec![],
+                vec!["taproot".into()],
+                vec![flow.into(), flow.into()],
+                vec![flow.into(), "future-v1".into()],
+            ] {
+                assert!(check_flow_pins(&maker, &pins, flow).is_err());
+            }
+        }
+        assert!(check_flow_pins(&maker, &["ln-swap-in".into()], "ln-swap-out").is_err());
+        maker.watch_service.shutdown();
+        let maker = compat_test_maker(&dir.path().join("required"), vec!["future-v1".into()]);
+        assert!(check_flow_pins(&maker, &["ln-swap-out".into()], "ln-swap-out").is_err());
+        maker.watch_service.shutdown();
+    }
 
     fn sample_swap(direction: LnDirection, phase: LnMakerPhase) -> LnMakerSwap {
         let preimage = Preimage([0x33; 32]);

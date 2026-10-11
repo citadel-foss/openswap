@@ -322,4 +322,22 @@ mod tests {
         assert!(unmet_for_flow(&names(&["future-v1"]), &taproot, "taproot").is_err());
         assert!(check_pins(&taproot, &names(&["future-v1"])).is_err());
     }
+
+    #[test]
+    fn compat_pins_obey_flow_requirements_and_build_support() {
+        let theirs = KNOWN.iter().map(|f| f.name.to_string()).collect::<Vec<_>>();
+        for flow in ["legacy", "taproot", "ln-swap-in", "ln-swap-out"] {
+            let pins = choose_pins(flow, &theirs);
+            let served = supported().contains(&flow);
+            assert_eq!(pins, if served { names(&[flow]) } else { vec![] });
+            assert_eq!(check_pins(&names(&[flow]), &[]).is_ok(), served);
+            assert!(check_pins(&names(&[flow, flow]), &[]).is_err());
+            assert!(check_pins(&names(&[flow]), &names(&["future-v1"])).is_err());
+            assert!(check_pins(&names(&[flow]), &names(&[&format!("{flow}-v1")])).is_err());
+        }
+        assert_eq!(
+            unmet_for_flow(&names(&["ln-swap-in-v1"]), &names(&["taproot"]), "taproot"),
+            Ok(())
+        );
+    }
 }

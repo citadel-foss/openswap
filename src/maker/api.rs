@@ -3657,21 +3657,82 @@ impl MakerRpc for MakerServer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    #[cfg(feature = "integration-test")]
+    use super::MakerBehavior;
     use super::{
-        min_swap_amount, swap_cost_floor, MakerError, MakerServer, MakerServerConfig,
-        ShutdownSignal, ThreadPool, MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
+        min_swap_amount, swap_cost_floor, BackendConnector, MakerError, MakerServer,
+        MakerServerConfig, MakerSwapTracker, ShutdownSignal, ThreadPool, WatchService,
+        MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
         utill::MIN_RELAY_FEE_RATE,
-        wallet::{FidelityError, WalletError, MIN_FIDELITY_BOND_AMOUNT_SATS},
+        wallet::{test_wallet, FidelityError, WalletError, MIN_FIDELITY_BOND_AMOUNT_SATS},
     };
     use std::{
-        sync::{atomic::Ordering, mpsc, Arc, TryLockError},
+        collections::HashMap,
+        path::Path,
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc, Arc, Mutex, RwLock, TryLockError,
+        },
         thread,
         time::{Duration, Instant},
     };
+
+    pub(crate) fn compat_test_maker(
+        path: &Path,
+        require_features: Vec<String>,
+    ) -> Arc<MakerServer> {
+        let config = MakerServerConfig {
+            data_dir: path.to_path_buf(),
+            require_features,
+            ..MakerServerConfig::default()
+        };
+        let shutdown = ShutdownSignal::new();
+        let (tx, rx) = mpsc::channel();
+        let watch_service = WatchService::spawn(
+            tx,
+            shutdown.backend_flag(),
+            Arc::new(AtomicU64::new(0)),
+            move || {
+                let _ = rx.recv();
+                Ok(())
+            },
+        )
+        .unwrap();
+        Arc::new(MakerServer {
+            backend: BackendConnector::new(config.backend.clone(), shutdown.backend_flag()),
+            wallet: Arc::new(RwLock::new(test_wallet(&path.join("wallet")))),
+            shutdown,
+            is_setup_complete: AtomicBool::new(false),
+            highest_fidelity_proof: RwLock::new(None),
+            ongoing_swaps: Mutex::new(HashMap::new()),
+            funding_claims: Mutex::new(()),
+            completed_handovers: Mutex::new(HashMap::new()),
+            watch_service,
+            thread_pool: Arc::new(ThreadPool::new(0)),
+            data_dir: path.to_path_buf(),
+            swap_tracker: Mutex::new(MakerSwapTracker::load_or_create(path).unwrap()),
+            nostr_relays: Vec::new(),
+            config,
+            #[cfg(feature = "lightning")]
+            lightning: None,
+            #[cfg(feature = "lightning")]
+            ln_router: None,
+            #[cfg(feature = "lightning")]
+            ln_offer_cache: Mutex::new(None),
+            #[cfg(feature = "lightning")]
+            ln_swaps: Mutex::new(HashMap::new()),
+            #[cfg(feature = "integration-test")]
+            behavior: MakerBehavior::default(),
+            #[cfg(feature = "integration-test")]
+            reserved_network_listener: Mutex::new(None),
+            #[cfg(feature = "integration-test")]
+            reserved_rpc_listener: Mutex::new(None),
+        })
+    }
 
     /// Non-finite or below-minimum fidelity feerates clamp to the relay
     /// minimum; a valid value is kept. A plain `<` comparison would let
