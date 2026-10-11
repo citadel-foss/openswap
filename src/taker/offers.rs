@@ -1999,6 +1999,7 @@ impl MakerAddress {
                 // peer cannot stuff payload into memory and the offerbook.
                 bond: FidelityBond {
                     tx: None,
+                    extra: Default::default(),
                     ..router_offer.fidelity.bond
                 },
                 cert_hash: router_offer.fidelity.cert_hash,
@@ -2425,6 +2426,7 @@ mod tests {
             is_spent: false,
             bond_index: 0,
             tx: None,
+            extra: Default::default(),
         };
 
         let cert_hash = bond.generate_cert_hash(maker_addr, &pubkey);

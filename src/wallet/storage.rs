@@ -6,19 +6,22 @@
 //! is additionally sealed individually, see [`MasterKey`].
 
 use crate::{
+    protocol::features::{check_requires, supported},
     security::{
-        decrypt_struct, encrypt_struct, load_sensitive_struct, EncryptedData, KeyMaterial,
-        SerdeCbor,
+        decrypt_struct, decrypt_with_password, encrypt_struct, requires_aad, EncryptedData,
+        KeyMaterial, SecurityError, FORMAT_NAMES,
     },
+    utill::deserialize_from_cbor,
     wallet::UTXOSpendInfo,
 };
 
 use super::{error::WalletError, fidelity::FidelityBond};
 
 use bitcoin::{bip32::Xpriv, Network, OutPoint, ScriptBuf};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_cbor::{value::from_value, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::File,
     io::{BufWriter, Write},
     path::Path,
@@ -68,7 +71,7 @@ impl MasterKey {
     /// the key is already sealed.
     pub(crate) fn seal(&mut self, key: &KeyMaterial) -> Result<(), WalletError> {
         if let Self::Plaintext(xpriv) = self {
-            let data = encrypt_struct(xpriv, key)
+            let data = encrypt_struct(xpriv, key, &[])
                 .map_err(|e| WalletError::General(format!("master key sealing failed: {e:?}")))?;
             let mut old = std::mem::replace(self, Self::Sealed(data));
             if let Self::Plaintext(old_xpriv) = &mut old {
@@ -89,7 +92,7 @@ impl MasterKey {
         match self {
             Self::Plaintext(xpriv) => f(xpriv),
             Self::Sealed(data) => {
-                let mut xpriv: Xpriv = decrypt_struct(data.clone(), key)?;
+                let mut xpriv: Xpriv = decrypt_struct(data.clone(), key, &[])?;
                 let result = f(&xpriv);
                 xpriv.private_key.non_secure_erase();
                 result
@@ -104,7 +107,7 @@ impl MasterKey {
     pub(crate) fn plaintext_with(&self, key: &KeyMaterial) -> Option<Xpriv> {
         match self {
             Self::Plaintext(xpriv) => Some(*xpriv),
-            Self::Sealed(data) => decrypt_struct(data.clone(), key).ok(),
+            Self::Sealed(data) => decrypt_struct(data.clone(), key, &[]).ok(),
         }
     }
 }
@@ -167,6 +170,37 @@ impl<'de> Deserialize<'de> for MasterKey {
     }
 }
 
+/// Cleartext envelope around the encrypted store. `requires` is read before
+/// anything is decrypted and is bound to the ciphertext as AES-GCM associated
+/// data, so stripping a name makes decryption fail. No other fields: any future
+/// cleartext field must be gated by a name in `requires`.
+#[derive(Serialize, Deserialize)]
+pub(super) struct WalletFile {
+    requires: Vec<String>,
+    encrypted: EncryptedData,
+}
+
+/// Feature names a stored record needs its reader to understand. Each impl
+/// destructures every field and matches every variant, so a new one forces a
+/// decision: a build that can't serve a name refuses the whole wallet.
+pub(crate) trait Requires {
+    /// Adds the names this record needs to `out`.
+    fn requires(&self, out: &mut BTreeSet<&'static str>);
+}
+
+/// Keeps each cache entry this build can decode and drops the rest: a UTXO
+/// type it can't spend, or one a dependency bump reshaped. The next sync
+/// rebuilds them; until then the balance only reads low.
+fn decodable_cache_entries<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashMap<OutPoint, (ListUnspentResultEntry, UTXOSpendInfo)>, D::Error> {
+    let raw = BTreeMap::<Value, Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(outpoint, entry)| Some((from_value(outpoint).ok()?, from_value(entry).ok()?)))
+        .collect())
+}
+
 /// Inputs one swap holds out of coin selection, and when it took them.
 /// Persisted so a restart inside the grace still honours the reservation:
 /// a funding broadcast can still arrive for a swap the process forgot.
@@ -211,7 +245,7 @@ pub(crate) struct WalletStore {
     pub(super) wallet_birthday: Option<u64>,
 
     /// Maps transaction outpoints to their associated UTXO and spend information.
-    #[serde(default)] // Ensures deserialization works if `utxo_cache` is missing
+    #[serde(default, deserialize_with = "decodable_cache_entries")]
     pub(super) utxo_cache: HashMap<OutPoint, (ListUnspentResultEntry, UTXOSpendInfo)>,
     /// Outpoints promised to one in-flight swap, keyed by swap id. Unlike
     /// `locked_utxos` (a property of the coin), these live and die with the
@@ -229,6 +263,58 @@ pub(crate) struct WalletStore {
     /// sweep or refund.
     #[serde(default)]
     pub(crate) ln_maker_swaps: HashMap<String, LnMakerSwapRecord>,
+
+    /// Fields a newer build wrote that this one doesn't know, written back
+    /// unchanged. Never rebuild the store through a conversion that drops them.
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
+}
+
+impl Requires for WalletStore {
+    fn requires(&self, out: &mut BTreeSet<&'static str>) {
+        let Self {
+            file_name: _,
+            network: _,
+            master_key: _,
+            external_index: _,
+            internal_index: _,
+            offer_maxsize: _,
+            incoming_swapcoins,
+            outgoing_swapcoins,
+            watchonly_swapcoins,
+            prevout_to_contract_map: _,
+            swept_incoming_swapcoins: _,
+            fidelity_bond,
+            last_synced_height: _,
+            wallet_birthday: _,
+            // An entry this build can't read is dropped on load, never refused.
+            utxo_cache: _,
+            swap_locks,
+            ln_pending_swaps,
+            ln_maker_swaps,
+            // Kept for a newer build; this one needs nothing from them.
+            extra: _,
+        } = self;
+        incoming_swapcoins.values().for_each(|c| c.requires(out));
+        outgoing_swapcoins.values().for_each(|c| c.requires(out));
+        watchonly_swapcoins
+            .values()
+            .flatten()
+            .for_each(|c| c.requires(out));
+        fidelity_bond.iter().for_each(|b| b.requires(out));
+        swap_locks.values().for_each(|r| r.requires(out));
+        ln_pending_swaps.values().for_each(|s| s.requires(out));
+        ln_maker_swaps.values().for_each(|s| s.requires(out));
+    }
+}
+
+impl Requires for SwapReservation {
+    fn requires(&self, _out: &mut BTreeSet<&'static str>) {
+        let Self {
+            outpoints: _,
+            reserved_at: _,
+        } = self;
+    }
 }
 
 /// Which side of a Lightning swap the maker is serving.
@@ -353,6 +439,60 @@ impl std::fmt::Debug for LnPendingSwap {
     }
 }
 
+impl Requires for LnMakerSwapRecord {
+    fn requires(&self, out: &mut BTreeSet<&'static str>) {
+        let Self {
+            direction,
+            phase,
+            payment_hash: _,
+            amount: _,
+            fee: _,
+            locktime: _,
+            min_confirmations: _,
+            redeemscript: _,
+            privkey: _,
+            invoice: _,
+            preimage: _,
+            refund_txid: _,
+            accepted_height: _,
+            payout_script: _,
+            funding_outpoint: _,
+            funding_value: _,
+            funding_height: _,
+        } = self;
+        out.insert(match direction {
+            LnMakerDirection::SwapIn => "ln-swap-in",
+            LnMakerDirection::SwapOut => "ln-swap-out",
+        });
+        match phase {
+            LnMakerPhase::InAccepted
+            | LnMakerPhase::InPaid
+            | LnMakerPhase::InSwept
+            | LnMakerPhase::OutAccepted
+            | LnMakerPhase::OutFunded => {}
+        }
+    }
+}
+
+impl Requires for LnPendingSwap {
+    fn requires(&self, out: &mut BTreeSet<&'static str>) {
+        let Self {
+            is_swap_in,
+            preimage: _,
+            redeemscript: _,
+            locktime: _,
+            privkey: _,
+            outpoint: _,
+            value: _,
+        } = self;
+        out.insert(if *is_swap_in {
+            "ln-swap-in"
+        } else {
+            "ln-swap-out"
+        });
+    }
+}
+
 impl WalletStore {
     /// Initialize a store at a path (if path already exists, it will overwrite it).
     ///
@@ -385,6 +525,7 @@ impl WalletStore {
             swap_locks: HashMap::new(),
             ln_pending_swaps: HashMap::new(),
             ln_maker_swaps: HashMap::new(),
+            extra: BTreeMap::new(),
         };
         store.master_key.seal(store_enc_material)?;
 
@@ -415,13 +556,22 @@ impl WalletStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let encrypted = encrypt_struct(self, store_enc_material)
+        let mut names: BTreeSet<&'static str> = FORMAT_NAMES.iter().copied().collect();
+        self.requires(&mut names);
+        let requires: Vec<String> = names.into_iter().map(String::from).collect();
+        let encrypted = encrypt_struct(self, store_enc_material, &requires_aad(&requires))
             .map_err(|e| WalletError::General(format!("wallet store encryption failed: {e:?}")))?;
 
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
         let mut writer = BufWriter::new(&mut tmp);
-        serde_cbor::to_writer(&mut writer, &encrypted)?;
+        serde_cbor::to_writer(
+            &mut writer,
+            &WalletFile {
+                requires,
+                encrypted,
+            },
+        )?;
         // `Drop for BufWriter` discards flush errors, so flush explicitly:
         // a swallowed error would rename a truncated wallet over the good one.
         writer.flush()?;
@@ -434,17 +584,34 @@ impl WalletStore {
         Ok(())
     }
 
-    /// Reads from a path (errors if path doesn't exist).
-    /// If `password` is provided, attempts to decrypt the file using the
-    /// provided key. Returns the deserialized `WalletStore` and the derived
-    /// encryption material (`None` for a plaintext file).
-    /// An encrypted file read without a password yields
-    /// [`crate::security::SecurityError::PasswordRequired`].
+    /// Reads and decrypts the wallet at `path`, returning the store and the
+    /// key material derived from `password`.
+    ///
+    /// A name in `requires` this build can't serve gives
+    /// [`WalletError::NeedsUpgrade`] before anything is decrypted. A bare
+    /// v0.2.3 file gives [`WalletError::OldFormat`]. No password gives
+    /// [`SecurityError::PasswordRequired`]. The file is never written here.
     pub(crate) fn read_from_disk(
-        backup_file_path: &Path,
+        path: &Path,
         password: Option<String>,
-    ) -> Result<(Self, Option<KeyMaterial>), WalletError> {
-        load_sensitive_struct::<Self, SerdeCbor>(backup_file_path, password).map_err(Into::into)
+    ) -> Result<(Self, KeyMaterial), WalletError> {
+        let content = std::fs::read(path)?;
+        let file = match deserialize_from_cbor::<WalletFile>(&content) {
+            Ok(file) => file,
+            Err(_) if deserialize_from_cbor::<EncryptedData>(&content).is_ok() => {
+                return Err(WalletError::OldFormat)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        check_requires(&file.requires, &supported()).map_err(WalletError::NeedsUpgrade)?;
+        let password = password
+            .filter(|p| !p.is_empty())
+            .ok_or(SecurityError::PasswordRequired)?;
+        Ok(decrypt_with_password(
+            file.encrypted,
+            password,
+            &requires_aad(&file.requires),
+        )?)
     }
 }
 
@@ -453,7 +620,116 @@ mod tests {
     use super::*;
     use crate::security::SecurityError;
     use bip39::rand::{thread_rng, Rng};
+    use bitcoin::{hashes::Hash, Amount, Txid};
     use bitcoind::tempfile::tempdir;
+    use serde_cbor::value::to_value;
+
+    const PASSWORD: &str = "wallet password";
+
+    fn stored_wallet(dir: &Path) -> (std::path::PathBuf, WalletStore, KeyMaterial) {
+        let path = dir.join("wallet.cbor");
+        let xpriv = Xpriv::new_master(Network::Regtest, &thread_rng().gen::<[u8; 16]>()).unwrap();
+        let material = KeyMaterial::new_from_password(Some(PASSWORD.to_string())).unwrap();
+        let store =
+            WalletStore::init("w".into(), &path, Network::Regtest, xpriv, None, &material).unwrap();
+        (path, store, material)
+    }
+
+    fn cache_entry(vout: u32) -> (OutPoint, (ListUnspentResultEntry, UTXOSpendInfo)) {
+        let outpoint = OutPoint::new(Txid::all_zeros(), vout);
+        let entry = ListUnspentResultEntry {
+            txid: outpoint.txid,
+            vout,
+            address: None,
+            label: None,
+            redeem_script: None,
+            witness_script: None,
+            script_pub_key: ScriptBuf::new(),
+            amount: Amount::from_sat(1_000),
+            confirmations: 1,
+            spendable: true,
+            solvable: true,
+            descriptor: None,
+            safe: true,
+        };
+        let info = UTXOSpendInfo::SeedCoin {
+            path: "m/84'/1'/0'/0/0".to_string(),
+            input_value: Amount::from_sat(1_000),
+            address_type: AddressType::P2WPKH,
+        };
+        (outpoint, (entry, info))
+    }
+
+    #[test]
+    fn requires_aad_is_sorted_unique_names_joined_by_newline() {
+        assert_eq!(requires_aad::<&str>(&[]), b"");
+        assert_eq!(requires_aad(&["taproot"]), b"taproot");
+        assert_eq!(requires_aad(&["b", "a-v2", "b"]), b"a-v2\nb");
+    }
+
+    #[test]
+    fn unknown_fields_survive_and_unreadable_cache_entries_drop() {
+        let dir = tempdir().unwrap();
+        let (_, mut store, _) = stored_wallet(dir.path());
+        let (outpoint, entry) = cache_entry(0);
+        store.utxo_cache.insert(outpoint, entry);
+        store
+            .prevout_to_contract_map
+            .insert(outpoint, ScriptBuf::new());
+
+        let Value::Map(mut fields) = to_value(&store).unwrap() else {
+            panic!("a store encodes as a map");
+        };
+        fields.insert(Value::Text("future_field".into()), Value::Integer(7));
+        let Some(Value::Map(cache)) = fields.get_mut(&Value::Text("utxo_cache".into())) else {
+            panic!("the cache encodes as a map");
+        };
+        let future_entry = Value::Array(vec![Value::Null, Value::Text("FutureSpendInfo".into())]);
+        cache.insert(to_value(cache_entry(1).0).unwrap(), future_entry);
+
+        let bytes = serde_cbor::to_vec(&Value::Map(fields)).unwrap();
+        let read: WalletStore = serde_cbor::from_slice(&bytes).unwrap();
+        assert_eq!(read.utxo_cache, store.utxo_cache);
+        assert_eq!(read.prevout_to_contract_map, store.prevout_to_contract_map);
+        assert_eq!(read.extra.get("future_field"), Some(&Value::Integer(7)));
+
+        let rewritten: WalletStore =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&read).unwrap()).unwrap();
+        assert_eq!(rewritten, read);
+    }
+
+    #[test]
+    fn unserved_names_refuse_untouched_and_stripped_names_fail_decryption() {
+        let dir = tempdir().unwrap();
+        let (path, store, material) = stored_wallet(dir.path());
+
+        let write = |requires: &[&str], aad: &[&str]| {
+            let file = WalletFile {
+                requires: requires.iter().map(|n| n.to_string()).collect(),
+                encrypted: encrypt_struct(&store, &material, &requires_aad(aad)).unwrap(),
+            };
+            let bytes = serde_cbor::to_vec(&file).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            bytes
+        };
+
+        let bytes = write(&["future-v1"], &["future-v1"]);
+        let error = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap_err();
+        assert!(matches!(error, WalletError::NeedsUpgrade(names) if names == ["future-v1"]));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        write(&[], &["legacy"]);
+        let error = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap_err();
+        assert!(matches!(
+            error,
+            WalletError::Security(SecurityError::Decryption)
+        ));
+
+        let bare = encrypt_struct(&store, &material, &[]).unwrap();
+        std::fs::write(&path, serde_cbor::to_vec(&bare).unwrap()).unwrap();
+        let error = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap_err();
+        assert!(matches!(error, WalletError::OldFormat));
+    }
 
     #[test]
     fn test_write_and_read_wallet_to_disk() {
@@ -481,9 +757,8 @@ mod tests {
             .write_to_disk(&file_path, &encryption_material)
             .unwrap();
 
-        let (read_wallet, material) =
+        let (read_wallet, _material) =
             WalletStore::read_from_disk(&file_path, Some(password)).unwrap();
-        assert!(material.is_some());
         assert_eq!(original_wallet_store, read_wallet);
     }
 
@@ -581,10 +856,9 @@ mod tests {
             .expect_err("a wrong password must fail authentication");
         assert!(error.to_string().contains("decryption failed"));
 
-        let (read_wallet, read_encryption_material) =
+        let (read_wallet, _read_encryption_material) =
             WalletStore::read_from_disk(&file_path, Some(password)).unwrap();
         assert_eq!(original_wallet_store, read_wallet);
-        assert!(read_encryption_material.is_some());
     }
 
     #[test]

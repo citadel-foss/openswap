@@ -58,7 +58,7 @@ impl Wallet {
 
         let backup = WalletBackup::from(self);
 
-        let encrypted = encrypt_struct(backup, &backup_enc_material)
+        let encrypted = encrypt_struct(backup, &backup_enc_material, &[])
             .map_err(|e| WalletError::General(format!("wallet backup encryption failed: {e:?}")))?;
         let backup_file_content = serde_json::to_string_pretty(&encrypted)?;
         // Atomic replace: never truncate an existing backup before the new

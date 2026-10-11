@@ -531,14 +531,7 @@ impl Wallet {
 
         let (store, store_enc_material) = match WalletStore::read_from_disk(path, password.clone())
         {
-            Ok((store, Some(material))) => (store, material),
-            // Cleartext wallet files are not supported at all.
-            Ok((_, None)) => {
-                return Err(WalletError::General(format!(
-                    "wallet file {path:?} is unencrypted; \
-                         cleartext wallet files are not supported"
-                )))
-            }
+            Ok(loaded) => loaded,
             // Encrypted file, no passphrase supplied. Report how to supply
             // one instead of failing decryption with an empty passphrase.
             Err(WalletError::Security(SecurityError::PasswordRequired)) => {

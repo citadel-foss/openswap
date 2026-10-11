@@ -11,7 +11,10 @@ use crate::{
 use bitcoin::{Amount, OutPoint, Txid};
 use bitcoind::bitcoincore_rpc::json::ListTransactionResult;
 
-use super::blockchain::{BackendConfig, Blockchain};
+use super::{
+    blockchain::{BackendConfig, Blockchain},
+    storage::WalletFile,
+};
 use std::path::{Path, PathBuf};
 
 pub use super::report::{
@@ -149,13 +152,9 @@ impl Wallet {
 
         let content = std::fs::read(wallet_path).map_err(WalletError::IO)?;
 
-        // Try to deserialize as EncryptedData using CBOR
-        // If it succeeds, the wallet is encrypted
-        // If it fails, the wallet is plaintext
-        match serde_cbor::from_slice::<crate::security::EncryptedData>(&content) {
-            Ok(_) => Ok(true),   // Successfully parsed as EncryptedData = encrypted
-            Err(_) => Ok(false), // Failed to parse as EncryptedData = plaintext
-        }
+        // Encrypted in either shape: the current envelope or a bare v0.2.3 file.
+        Ok(serde_cbor::from_slice::<WalletFile>(&content).is_ok()
+            || serde_cbor::from_slice::<crate::security::EncryptedData>(&content).is_ok())
     }
 
     /// Returns a list of recent Incoming Transactions (bydefault last 10)
