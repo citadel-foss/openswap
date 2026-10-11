@@ -668,6 +668,18 @@ fn handle_connection(
             }
         };
 
+        // Every connection opens with Hello, so a reconnect or keepalive can't
+        // skip the requirement check that Hello runs.
+        if state.phase == super::handlers::SwapPhase::AwaitingHello
+            && !matches!(message, TakerToMakerMessage::Hello(_))
+        {
+            log::debug!(
+                "[{}] First message was not Hello; closing",
+                maker.config.network_port
+            );
+            break;
+        }
+
         // Heartbeat connections carry a known swap id but intentionally keep a
         // lightweight local state. Recognize them without changing the protocol.
         if let TakerToMakerMessage::WaitingFundingConfirmation(id) = &message {
