@@ -564,7 +564,7 @@ The data directory contains the following files:
 2. `debug.log` - The log file for the taker.
 3. `wallets` directory - Contains the wallet files for the taker.
 4. `offerbook.json` - The locally cached offerbook of known makers, updated by `fetch-offers` and `poll-maker`.
-5. `swap_tracker.cbor` - Only present if you used v0.2.3. This release does not read or write it. Delete it after every wallet is upgraded.
+5. `swap_tracker.cbor` - Only present if you used v0.2.3. This release never writes it. The upgrade reads it once to check that nothing is open. Delete it after every wallet is upgraded.
 
 **Default Taker Configuration (`~/.openswap/taker/config.toml`):**
 
@@ -612,7 +612,14 @@ The new wallet file also keeps the swap state that older versions kept in tracke
 
 ### Going back
 
-v0.2.3 cannot open the new wallet. To go back, restore the `.v023` copies over the new files.
+v0.2.3 cannot open the new wallet. The `.v023` copies are only a snapshot from the moment of the upgrade. Any swap you started after that is missing from them. Restoring them over the new files **erases the keys for those swaps and can lose funds**.
+
+Go back only like this:
+
+1. Stop every daemon that uses this data directory.
+2. Wait until every swap you started after the upgrade has finished and is gone from the wallet.
+3. Make a fresh copy of the whole new wallet file and keep it.
+4. Restore the `.v023` copies.
 
 ### Later releases
 
@@ -622,4 +629,7 @@ v0.2.3 cannot open the new wallet. To go back, restore the `.v023` copies over t
 
 ### A coin that stays locked
 
-Before your node sends funding, it saves the coin as committed. Your node then keeps that coin until a timelock refund, or until a confirmed transaction spends its inputs elsewhere. A crash between the save and the send can leave a coin held this way. The funds stay in your wallet. Leave your node running. The refund frees the coin when its timelock matures.
+Before your node sends funding, it saves the coin as committed. Your node then keeps that coin until a timelock refund, or until a confirmed transaction spends its inputs elsewhere. A crash between the save and the send can leave a coin held this way.
+
+- **If the funding reached the chain**, leave your node running. The refund frees the coin when its timelock matures.
+- **If the funding never left your node**, nothing is on the chain and your original coins are untouched. No refund happens in this case. Older legacy swaps cannot clear the held record by themselves. Do not edit the wallet file. Ask for help in the [community forum](https://matrix.to/#/#citadel-foss:matrix.org) or open an issue.
