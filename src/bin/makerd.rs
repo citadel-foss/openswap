@@ -97,7 +97,7 @@ fn main() -> Result<(), MakerError> {
     let wallet_name = args.wallet_name.unwrap_or_else(|| "maker".to_string());
     config.wallet_name = wallet_name.clone();
     config.password = args.password;
-    if let Some(tor_auth) = args.tor_auth {
+    if let Some(tor_auth) = args.tor_auth.filter(|a| *a != config.tor_auth_password) {
         set_config_key(&config_path, "tor_auth_password", &tor_auth)?;
         config.tor_auth_password = tor_auth;
     }
