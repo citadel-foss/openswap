@@ -273,6 +273,10 @@ impl MakerOfferCandidate {
 }
 
 /// Represents the Maker connection state
+///
+/// Frozen: never add a variant, not even a unit one. v0.2.3 shares this book
+/// and starts empty on a name it can't read, forgiving every ban. New detail
+/// goes in defaulted fields of [`BanRecord`] or [`UnavailableState`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MakerState {
     /// Maker returned a valid offer and a verified fidelity proof.
@@ -299,6 +303,8 @@ pub struct UnavailableState {
 
 /// The recoverable ways a maker can fail. None of these is the maker's fault
 /// in a way we can prove, so every one of them can be undone by a good offer.
+///
+/// Frozen like [`MakerState`]: never add a variant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UnavailableReason {
     /// Discovered, but no offer downloaded yet.
@@ -332,6 +338,8 @@ pub struct BanRecord {
 
 /// What earns a maker a ban. Every variant is something we proved, never
 /// something we suspected.
+///
+/// Frozen like [`MakerState`]: never add a variant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BanReason {
     /// A violation proven by arithmetic or by a failed signature check.
@@ -575,22 +583,13 @@ impl OfferBookHandle {
                     log::info!("Successfully loaded offerbook at {path:?}");
                     book
                 }
+                // Starting empty would forgive every recorded ban, so stop and
+                // leave the file for the user.
                 Err(e) => {
-                    // Starting empty forgives every recorded ban, so keep the
-                    // unreadable file, under a name no earlier one holds.
-                    let kept = (0u64..)
-                        .map(|n| path.with_extension(format!("corrupt.{n}")))
-                        .find(|kept| !kept.exists())
-                        .expect("an unused name exists");
-                    std::fs::rename(&path, &kept).inspect_err(|rename_error| {
-                        log::error!("Could not set aside the corrupt offerbook: {rename_error:?}");
-                    })?;
-                    log::error!(
-                        "Offerbook corrupted at {path:?}, kept at {kept:?}. Starting empty; every recorded ban is lost. Error: {e:?}"
-                    );
-                    let book = OfferBook::default();
-                    book.write_to_disk(&path)?;
-                    book
+                    return Err(TakerError::General(format!(
+                        "cannot read the offerbook at {path:?}: {e:?}. Fix the file, or \
+                         remove it to start empty, which forgives every recorded ban"
+                    )))
                 }
             }
         } else {
@@ -2552,17 +2551,13 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_offerbook_is_kept_and_never_overwritten() {
+    fn a_corrupt_offerbook_stops_the_taker_and_is_never_overwritten() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("offerbook.json");
 
-        for (n, garbage) in ["not json", "still not json"].iter().enumerate() {
-            std::fs::write(&path, garbage).unwrap();
-            OfferBookHandle::load_or_create(dir.path()).unwrap();
-            let kept = path.with_extension(format!("corrupt.{n}"));
-            assert_eq!(std::fs::read_to_string(kept).unwrap(), *garbage);
-        }
-        assert!(OfferBook::read_from_disk(&path).unwrap().makers.is_empty());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(OfferBookHandle::load_or_create(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
     }
 
     #[test]
