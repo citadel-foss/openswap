@@ -461,9 +461,6 @@ fn payout_script<M: Maker>(
     Ok(script)
 }
 
-/// Refuses a swap id that already has state, so a second connection cannot
-/// overwrite an in-flight swap's record — which holds the only copy of the
-/// branch key needed to sweep or refund its HTLC.
 /// A request's pins must name exactly `flow` and meet our requirements for it.
 fn check_flow_pins<M: Maker>(maker: &Arc<M>, pins: &[String], flow: &str) -> Result<(), String> {
     match check_pins(pins, &maker.get_config().require_features)? {
@@ -472,6 +469,9 @@ fn check_flow_pins<M: Maker>(maker: &Arc<M>, pins: &[String], flow: &str) -> Res
     }
 }
 
+/// Refuses a swap id that already has state, so a second connection cannot
+/// overwrite an in-flight swap's record — which holds the only copy of the
+/// branch key needed to sweep or refund its HTLC.
 fn reject_if_swap_exists<M: Maker>(maker: &Arc<M>, swap_id: &str) -> Result<(), String> {
     match maker.get_ln_swap(swap_id) {
         Ok(Some(_)) => return Err("a swap with this id is already in progress".to_string()),
