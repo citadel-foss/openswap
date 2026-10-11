@@ -2343,21 +2343,25 @@ mod tests {
             .is_empty());
         }
         let hello = serde_cbor::to_vec(&TakerToMakerMessage::Hello(Hello::default())).unwrap();
-        let replies = compat_connection_replies(
-            &maker,
-            &[
-                hello.clone(),
-                serde_cbor::to_vec(&TakerToMakerMessage::LegacyPrivateKeyHandover(legacy)).unwrap(),
-            ],
-            true,
-        );
-        assert!(matches!(
-            replies.as_slice(),
-            [
-                MakerToTakerMessage::Hello(_),
-                MakerToTakerMessage::LegacyPrivateKeyHandover(_)
-            ]
-        ));
+        for (request, expected) in [
+            (
+                TakerToMakerMessage::LegacyPrivateKeyHandover(legacy.clone()),
+                MakerToTakerMessage::LegacyPrivateKeyHandover(legacy),
+            ),
+            (
+                TakerToMakerMessage::TaprootPrivateKeyHandover(taproot.clone()),
+                MakerToTakerMessage::TaprootPrivateKeyHandover(taproot),
+            ),
+        ] {
+            let replies = compat_connection_replies(
+                &maker,
+                &[hello.clone(), serde_cbor::to_vec(&request).unwrap()],
+                true,
+            );
+            assert_eq!(replies.len(), 2);
+            assert!(matches!(replies[0], MakerToTakerMessage::Hello(_)));
+            assert_eq!(to_value(&replies[1]).unwrap(), to_value(expected).unwrap());
+        }
         let replies = compat_connection_replies(&maker, &[hello.clone(), hello], false);
         assert!(matches!(
             replies.as_slice(),
