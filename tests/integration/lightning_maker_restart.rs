@@ -7,17 +7,21 @@
 //! so the restart happens at a precisely controlled point: right after the
 //! maker has funded the on-chain HTLC.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{mpsc, Arc},
+    thread,
+    time::{Duration, Instant},
+};
 
 use bitcoin::{
     secp256k1::{Secp256k1, SecretKey},
-    Amount, OutPoint, PublicKey,
+    Amount, Network, OutPoint, PublicKey,
 };
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     lightning::{
-        InvoiceParams, LightningBackend, LnEvent, MockLightningBackend, OpenChannelRequest,
-        Preimage, SwapHtlc,
+        invoice::verify_invoice, InvoiceParams, LightningBackend, LnEvent, MockLightningBackend,
+        OpenChannelRequest, Preimage, SwapHtlc,
     },
     maker::{
         handlers::{handle_message, ConnectionState, Maker},
@@ -30,7 +34,8 @@ use openswap::{
     protocol::{
         common_messages::{MakerToTakerMessage, TakerHello, TakerToMakerMessage},
         lightning_messages::{
-            LightningMakerMessage, LightningTakerMessage, LnSwapOutPaid, LnSwapOutRequest,
+            LightningMakerMessage, LightningTakerMessage, LnHtlcFunded, LnSwapInRequest,
+            LnSwapOutPaid, LnSwapOutRequest,
         },
     },
     taker::TakerBehavior,
@@ -590,6 +595,209 @@ fn conditional_paid_store_refuses_stale_copy() {
     drop(takers);
     restarted.shutdown.store(true, Relaxed);
     restarted.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// handle_swap_in_funded reads the swap, waits for the funding to confirm and
+/// only then moves it to InPaid and pays. If another connection pays the swap
+/// during that wait, the waiting handler must stop: it must neither overwrite
+/// the paid record nor pay the invoice.
+#[test]
+fn swap_in_funded_handler_yields_to_swap_paid_during_wait() {
+    log::warn!("Running Test: swap-in funded handler yields to a swap paid during its wait");
+
+    // The maker's node needs outbound capacity to serve swap-ins.
+    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
+    ln.set_onchain_balance(Amount::from_btc(0.02).unwrap());
+    let peer = SecretKey::from_slice(&[0x21; 32]).unwrap();
+    let channel = ln
+        .open_channel(OpenChannelRequest {
+            node_pubkey: peer.public_key(&Secp256k1::new()),
+            address: "127.0.0.1:9735".to_string(),
+            channel_amount: Amount::from_sat(1_000_000),
+            push_to_counterparty_msat: Some(500_000_000),
+            announce_channel: false,
+        })
+        .unwrap();
+    ln.simulate_channel_ready(&channel);
+    let _ = ln.poll_event().unwrap();
+    // The taker's node only issues the hold invoice. It shares no ledger with
+    // the maker's node, so a payment attempt fails at once instead of
+    // blocking the handler on a preimage that never comes.
+    let taker_ln = MockLightningBackend::new();
+
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers[0].clone();
+
+    let amount = Amount::from_sat(40_000);
+    let preimage = Preimage([0x81; 32]);
+    let payment_hash = preimage.payment_hash();
+    let swap_id = payment_hash.to_string();
+    let invoice = taker_ln
+        .create_hold_invoice(
+            payment_hash,
+            InvoiceParams {
+                amount_msat: Some(amount.to_sat() * 1000),
+                description: format!("swap-in {swap_id}"),
+                expiry_secs: 3600,
+            },
+        )
+        .unwrap();
+    // Clear the invoice's CLTV window the way the taker does.
+    let cltv_delta = verify_invoice(&invoice.invoice, &payment_hash, amount.to_sat() * 1000)
+        .unwrap()
+        .min_final_cltv_expiry_delta;
+    let locktime = (cltv_delta + 48) as u16;
+    let taker_timelock_pubkey = PublicKey::new(
+        SecretKey::from_slice(&[0x82; 32])
+            .unwrap()
+            .public_key(&Secp256k1::new()),
+    );
+
+    let mut state = ConnectionState::default();
+    handle_message(
+        &maker,
+        &mut state,
+        TakerToMakerMessage::TakerHello(TakerHello),
+    )
+    .unwrap();
+    let accept = match expect_ln(
+        handle_message(
+            &maker,
+            &mut state,
+            ln_message(LightningTakerMessage::SwapInRequest(LnSwapInRequest {
+                swap_id: swap_id.clone(),
+                invoice: invoice.invoice,
+                payment_hash,
+                amount,
+                locktime,
+                min_confirmations: 1,
+                taker_timelock_pubkey,
+            })),
+        )
+        .unwrap(),
+    ) {
+        LightningMakerMessage::SwapInAccept(accept) => accept,
+        other => panic!("expected SwapInAccept, got {}", other),
+    };
+
+    // Fund the HTLC with no blocks coming, so the handler stays in its wait.
+    test_framework.set_block_gen_paused(true);
+    let htlc = SwapHtlc::new(
+        &accept.maker_hashlock_pubkey,
+        &taker_timelock_pubkey,
+        &payment_hash,
+        locktime,
+    );
+    let htlc_address = htlc.address(Network::Regtest).unwrap();
+    let funding_txid = send_to_address(bitcoind, &htlc_address, amount + accept.fee);
+    let funding_tx = bitcoind
+        .client
+        .get_raw_transaction(&funding_txid, None)
+        .unwrap();
+    let vout = funding_tx
+        .output
+        .iter()
+        .position(|output| output.script_pubkey == htlc_address.script_pubkey())
+        .unwrap();
+    let outpoint = OutPoint {
+        txid: funding_txid,
+        vout: vout as u32,
+    };
+    let value = funding_tx.output[vout].value;
+
+    // The funding message arrives on a second connection, whose handler
+    // reads the swap and then blocks until the funding confirms.
+    let log_path = test_framework.taker_log_path();
+    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    let (result_tx, result_rx) = mpsc::channel();
+    let handler_maker = maker.clone();
+    let funded_id = swap_id.clone();
+    thread::spawn(move || {
+        let mut state = ConnectionState::default();
+        let result = handle_message(
+            &handler_maker,
+            &mut state,
+            TakerToMakerMessage::TakerHello(TakerHello),
+        )
+        .and_then(|_| {
+            handle_message(
+                &handler_maker,
+                &mut state,
+                ln_message(LightningTakerMessage::SwapInFunded(LnHtlcFunded {
+                    swap_id: funded_id,
+                    outpoint,
+                    value,
+                })),
+            )
+        });
+        let _ = result_tx.send(format!("{result:?}"));
+    });
+
+    // The confirmation wait logs its first sight of the funding, which comes
+    // after the handler has read the swap. Wait for that line rather than for
+    // a fixed time.
+    let waiting = format!("Tx {funding_txid} seen in mempool");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if contents
+            .get(log_offset as usize..)
+            .is_some_and(|new| new.contains(&waiting))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the handler never reached its confirmation wait"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    // Meanwhile another connection funds and pays the swap.
+    let mut paid = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    assert_eq!(paid.phase, LnMakerPhase::InAccepted);
+    let other_funding = (OutPoint::default(), value);
+    paid.phase = LnMakerPhase::InPaid;
+    paid.funding = Some(other_funding);
+    paid.funding_height = Some(101);
+    maker.store_ln_swap(&swap_id, paid).unwrap();
+
+    // The funding confirms and the waiting handler resumes on its old copy.
+    generate_blocks(bitcoind, 1);
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the handler did not return after the funding confirmed");
+    assert!(
+        result.starts_with("Err") && result.contains("swap-in no longer awaiting funding"),
+        "the handler did not stop on its stale copy: {}",
+        result
+    );
+    let kept = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    assert_eq!(kept.phase, LnMakerPhase::InPaid);
+    assert_eq!(
+        kept.funding,
+        Some(other_funding),
+        "the handler overwrote the paid swap"
+    );
+    assert_eq!(
+        ln.last_pay_cltv_bound(),
+        None,
+        "the handler paid a swap another connection had paid"
+    );
+
+    test_framework.set_block_gen_paused(false);
+    drop(takers);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
