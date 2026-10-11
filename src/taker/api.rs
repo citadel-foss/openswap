@@ -2657,7 +2657,7 @@ pub(crate) fn handshake_with_maker(
     send_message(stream, &TakerToMakerMessage::Hello(hello))?;
 
     let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(stream)?)?;
-    let mut features = match msg {
+    let features = match msg {
         MakerToTakerMessage::Hello(hello) => hello.features,
         MakerToTakerMessage::Unsupported(refusal) => {
             return Err(TakerError::General(format!(
@@ -2671,7 +2671,12 @@ pub(crate) fn handshake_with_maker(
             )))
         }
     };
-    features.retain(|name| KNOWN.iter().any(|f| f.name == name));
+    // Registry order, each name once: repeats can't grow what we keep.
+    let features: Vec<String> = KNOWN
+        .iter()
+        .filter(|f| features.iter().any(|name| name == f.name))
+        .map(|f| f.name.to_string())
+        .collect();
     let missing: Vec<&String> = needed.iter().filter(|n| !features.contains(n)).collect();
     if !missing.is_empty() {
         return Err(TakerError::General(format!(
@@ -3954,6 +3959,147 @@ pub enum TakerBehavior {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_cbor::{value::to_value, Value};
+    use std::{collections::BTreeMap, net::TcpListener, thread};
+
+    fn compat_hello_reply(reply: Value, needed: &[String]) -> Result<Vec<String>, TakerError> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let peer = thread::spawn(move || {
+            let (mut server, _) = listener.accept().unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let message: TakerToMakerMessage =
+                serde_cbor::from_slice(&read_message(&mut server).unwrap()).unwrap();
+            let TakerToMakerMessage::Hello(hello) = message else {
+                panic!("first message must be Hello");
+            };
+            assert_eq!(hello.features, supported());
+            send_message(&mut server, &reply).unwrap();
+        });
+        let result = handshake_with_maker(&mut client, needed);
+        peer.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn compat_hello_accepts_many_future_names_and_fields() {
+        let mut names: Vec<_> = (0..100).map(|i| format!("future-{i}-v1")).collect();
+        names.extend(KNOWN.iter().map(|f| f.name.to_string()));
+        let mut reply = to_value(MakerToTakerMessage::Hello(Hello { features: names })).unwrap();
+        let Value::Map(outer) = &mut reply else {
+            panic!()
+        };
+        let Value::Map(body) = outer.get_mut(&Value::Text("Hello".into())).unwrap() else {
+            panic!()
+        };
+        body.insert(
+            Value::Text("future_field".into()),
+            Value::Array(vec![Value::Integer(1)]),
+        );
+        let features = compat_hello_reply(reply, &["taproot".into()]).unwrap();
+        assert_eq!(features, KNOWN.iter().map(|f| f.name).collect::<Vec<_>>());
+        assert_eq!(choose_pins("taproot", &features), ["taproot"]);
+        assert!(unmet_for_flow(&["future-0-v1".into()], &["taproot".into()], "taproot").is_err());
+    }
+
+    #[test]
+    fn compat_hello_keeps_recognized_names_bounded_by_registry() {
+        let reply = to_value(MakerToTakerMessage::Hello(Hello {
+            features: vec!["taproot".into(); 100],
+        }))
+        .unwrap();
+        assert_eq!(
+            compat_hello_reply(reply, &["taproot".into()]).unwrap(),
+            ["taproot"]
+        );
+    }
+
+    #[test]
+    fn compat_hello_requires_exact_reconnect_pins_and_readable_reply() {
+        for (features, needed, accepted) in [
+            (vec!["taproot"], vec!["taproot"], true),
+            (vec!["legacy"], vec!["taproot"], false),
+            (vec!["taproot", "future-v2"], vec!["future-v1"], false),
+            (vec!["taproot"], vec![], true),
+        ] {
+            let reply = to_value(MakerToTakerMessage::Hello(Hello {
+                features: features.into_iter().map(String::from).collect(),
+            }))
+            .unwrap();
+            let needed = needed.into_iter().map(String::from).collect::<Vec<_>>();
+            assert_eq!(compat_hello_reply(reply, &needed).is_ok(), accepted);
+        }
+        for reply in [
+            Value::Text("FutureReply".into()),
+            Value::Map(BTreeMap::from([(
+                Value::Text("Hello".into()),
+                Value::Integer(7),
+            )])),
+            Value::Map(BTreeMap::from([(
+                Value::Text("Unsupported".into()),
+                Value::Map(BTreeMap::from([
+                    (Value::Text("what".into()), Value::Text("Hello".into())),
+                    (
+                        Value::Text("reason".into()),
+                        Value::Text("required feature missing".into()),
+                    ),
+                ])),
+            )])),
+        ] {
+            assert!(compat_hello_reply(reply, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn compat_taker_requirements_survive_cli_merge_and_bind_pins() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "require_features = [\"future-v1\"]\n").unwrap();
+        let requirements = Taker::init_taker_config(
+            &TakerInitConfig {
+                connection_type: ConnectionType::Clearnet,
+                ..TakerInitConfig::default()
+            },
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(requirements, ["future-v1"]);
+        for flow in ["legacy", "taproot", "ln-swap-in", "ln-swap-out"] {
+            let pins = choose_pins(
+                flow,
+                &supported()
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                unmet_for_flow(&requirements, &pins, flow),
+                Err(requirements.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn compat_maker_connection_carries_pins_into_reconnects() {
+        let address = if cfg!(feature = "integration-test") {
+            "127.0.0.1:6102"
+        } else {
+            "aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaea37ead.onion"
+        };
+        let mut maker = MakerConnection::new(
+            MakerAddress::try_from(address.to_string()).unwrap(),
+            ProtocolVersion::Taproot,
+            None,
+        );
+        assert_eq!(maker.needed(), ["taproot"]);
+        maker.pins = vec!["taproot".into(), "future-v2".into()];
+        assert_eq!(maker.clone().needed(), ["taproot", "future-v2"]);
+    }
 
     #[test]
     fn compat_taker_cli_merge_keeps_unknown_keys_and_requirements() {
