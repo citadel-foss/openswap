@@ -8,8 +8,8 @@ use std::{
 };
 
 use bitcoin::{
-    address::NetworkUnchecked, block::Header, Address, Amount, Block, BlockHash, Network, OutPoint,
-    Script, Transaction, Txid,
+    address::NetworkUnchecked, block::Header, Address, Block, BlockHash, Network, OutPoint, Script,
+    Transaction, Txid,
 };
 use bitcoind::bitcoincore_rpc::{
     json::{
@@ -441,8 +441,14 @@ impl Blockchain for CoreRPC {
         };
         // Counts received amounts even after they are spent, so an emptied
         // address still shows up. Requires the address's descriptor imported.
-        match self.rpc.get_received_by_address(&address, Some(0)) {
-            Ok(amount) => Ok(amount > Amount::ZERO),
+        // Immature coinbase is excluded unless asked for, which would miss a
+        // fresh mining payout address.
+        let received: Result<f64, _> = self.rpc.call(
+            "getreceivedbyaddress",
+            &[json!(address.to_string()), json!(0), json!(true)],
+        );
+        match received {
+            Ok(btc) => Ok(btc > 0.0),
             // -4 (RPC_WALLET_ERROR): "Address not found in wallet".
             Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -4 => Ok(false),
             Err(e) => Err(e.into()),

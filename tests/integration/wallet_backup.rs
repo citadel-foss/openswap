@@ -254,7 +254,14 @@ fn core_restore_skips_emptied_receive_addresses() {
     generate_blocks(&bitcoind, 1);
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
     assert!(wallet.list_descriptor_utxo_spend_info().is_empty());
-    assert_eq!(*wallet.get_external_index(), 4);
+
+    // An immature mining payout is no spendable coin either; only its history shows.
+    let payout = wallet
+        .get_next_external_address(AddressType::P2WPKH)
+        .unwrap();
+    bitcoind.client.generate_to_address(1, &payout).unwrap();
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    assert_eq!(*wallet.get_external_index(), 5);
 
     let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
         &backup_file,
@@ -269,7 +276,7 @@ fn core_restore_skips_emptied_receive_addresses() {
     )
     .unwrap();
 
-    assert_eq!(*restored.get_external_index(), 4);
+    assert_eq!(*restored.get_external_index(), 5);
     let next_change = |w: &mut Wallet| {
         w.get_next_internal_addresses(1, AddressType::P2TR)
             .unwrap()
