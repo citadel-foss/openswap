@@ -4026,3 +4026,86 @@ fn legacy_replan_with_extra_inputs_completes() {
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
+
+/// Runs one single-maker swap of `protocol` from a one-coin taker wallet with
+/// `behavior` set, returning the start result and the taker's regular balance
+/// before and after.
+fn run_one_coin_swap(
+    protocol: ProtocolVersion,
+    behavior: TakerBehavior,
+) -> (Result<(), TakerError>, Amount, Amount) {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(1, vec![behavior], vec![MakerBehavior::Normal]);
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 1);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+    generate_blocks(bitcoind, 1);
+
+    let before = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    let params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    let summary = taker
+        .prepare_swap(params)
+        .expect("prepare_swap should succeed");
+    let result = taker.start_swap(&summary.swap_id).map(|_| ());
+
+    generate_blocks(bitcoind, 1);
+    taker
+        .get_wallet()
+        .write()
+        .unwrap()
+        .sync_and_save(&NO_SHUTDOWN)
+        .unwrap();
+    let after = taker.get_wallet().read().unwrap().get_balances().unwrap();
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.finish(takers, block_generation_handle);
+    (result, before.regular, after.regular)
+}
+
+/// A planned coin reserved by another swap after `prepare_swap` makes
+/// `start_swap` refuse before anything is signed or broadcast.
+fn run_reserved_plan_refuses(protocol: ProtocolVersion) {
+    let (result, before, after) =
+        run_one_coin_swap(protocol, TakerBehavior::ReservePlannedCoinElsewhere);
+    let err = result.expect_err("a plan whose coin another swap holds must not fund");
+    assert!(
+        format!("{err:?}").contains("spent or reserved"),
+        "expected the reservation refusal, got: {:?}",
+        err
+    );
+    assert_eq!(after, before, "nothing may leave the wallet");
+}
+
+#[test]
+fn taker_refuses_a_reserved_plan_legacy() {
+    run_reserved_plan_refuses(ProtocolVersion::Legacy);
+}
+
+#[test]
+fn taker_refuses_a_reserved_plan_taproot() {
+    run_reserved_plan_refuses(ProtocolVersion::Taproot);
+}
+
+/// A wallet payment between signing the hop-0 funding and broadcasting it
+/// finds no coin, so the swap still funds and completes. Had the payment
+/// taken the planned coin, the funding broadcast would conflict and fail.
+fn run_payment_cannot_take_planned_coin(protocol: ProtocolVersion) {
+    let (result, _, _) = run_one_coin_swap(protocol, TakerBehavior::PayBeforeFundingBroadcast);
+    result.expect("the swap must still complete");
+}
+
+#[test]
+fn payment_cannot_take_planned_coin_legacy() {
+    run_payment_cannot_take_planned_coin(ProtocolVersion::Legacy);
+}
+
+#[test]
+fn payment_cannot_take_planned_coin_taproot() {
+    run_payment_cannot_take_planned_coin(ProtocolVersion::Taproot);
+}

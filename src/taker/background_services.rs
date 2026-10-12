@@ -222,6 +222,9 @@ impl RecoveryLoop {
                                     w.remove_outgoing_swapcoin(key);
                                 }
                                 w.remove_watchonly_swapcoins(swap_id);
+                                // Every funding tx has resolved, so no reserved
+                                // input can still land.
+                                w.release_swap_locks(swap_id, None);
                             }
                             saved = w
                                 .save_to_disk()

@@ -773,6 +773,7 @@ impl Taker {
     fn funding_broadcast(&mut self) -> Result<(), TakerError> {
         log::info!("Broadcasting contract transactions...");
 
+        let swap_id = self.swap_state()?.id.clone();
         let mut wallet = self.write_wallet()?;
 
         for swapcoin in &self.swap_state()?.outgoing_swapcoins {
@@ -792,6 +793,7 @@ impl Taker {
             // at the next sync; until then a new swap must not plan them. The
             // lock is in memory only: once synced the coins are gone anyway.
             wallet.lock_utxos(&spent_inputs(&swapcoin.contract_tx));
+            wallet.release_swap_locks(&swap_id, Some(&spent_inputs(&swapcoin.contract_tx)));
 
             let vout = swapcoin
                 .contract_tx

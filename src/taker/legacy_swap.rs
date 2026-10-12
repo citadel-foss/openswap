@@ -357,6 +357,7 @@ impl Taker {
                         // plan them. The lock is in memory only: once synced the
                         // coins are gone anyway.
                         wallet.lock_utxos(&spent_inputs(funding_tx));
+                        wallet.release_swap_locks(&swap_id, Some(&spent_inputs(funding_tx)));
                     }
                     wallet.save_to_disk()?;
                 }

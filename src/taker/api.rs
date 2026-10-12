@@ -13,8 +13,8 @@ use std::{
 pub(crate) use super::swap_tracker::SwapPhase;
 use super::swap_tracker::{
     funding_shared, incoming_claimed, now_secs, ContractOutcome, ContractResolution,
-    ExchangeProgress, FinalizationProgress, LegacyExchangeProgress, MakerProgress, RecoveryState,
-    SerializableSecretKey, SwapRecord, SwapTracker, TaprootExchangeProgress,
+    ExchangeProgress, FinalizationProgress, LegacyExchangeProgress, MakerProgress, RecoveryPhase,
+    RecoveryState, SerializableSecretKey, SwapRecord, SwapTracker, TaprootExchangeProgress,
 };
 
 use bitcoin::{
@@ -746,6 +746,33 @@ impl Taker {
             .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?
             .cleanup_incomplete();
 
+        // Reservations persist across a crash. Keep only those whose swap may
+        // still have funding in flight; recovery frees them once it resolves.
+        let mut wallet = wallet;
+        {
+            let tracker = lock_debug!(swap_tracker.lock())
+                .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?;
+            let settled: Vec<String> = wallet
+                .store
+                .swap_locks
+                .keys()
+                .filter(|id| {
+                    tracker.get_record(id).is_none_or(|record| {
+                        record.phase == SwapPhase::Completed
+                            || (record.phase == SwapPhase::Failed
+                                && record.recovery.phase >= RecoveryPhase::CleanedUp)
+                    })
+                })
+                .cloned()
+                .collect();
+            if !settled.is_empty() {
+                for id in &settled {
+                    wallet.release_swap_locks(id, None);
+                }
+                wallet.save_to_disk()?;
+            }
+        }
+
         let mut taker = Taker {
             config,
             wallet: Arc::new(RwLock::new(wallet)),
@@ -1294,6 +1321,16 @@ impl Taker {
     /// contracts with makers, finalizes, and sweeps.
     pub fn start_swap(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
         let result = self.start_swap_inner(swap_id);
+        // Past the broadcast phase a funding tx may still land, so its
+        // reservation waits for recovery; before it, nothing can.
+        let unbroadcast = self
+            .swap_state()
+            .map_or(true, |swap| swap.phase < SwapPhase::FundsBroadcast);
+        if result.is_ok() || unbroadcast {
+            if let Err(e) = self.release_hop0_claim(swap_id) {
+                log::warn!("Failed to release swap {swap_id}'s funding claim: {e:?}");
+            }
+        }
         if let Err(error) = &result {
             if let Err(reconcile_error) = self.reconcile_start_failure(error) {
                 log::error!(
@@ -1368,7 +1405,26 @@ impl Taker {
             )?);
         }
 
+        #[cfg(feature = "integration-test")]
+        if self.behavior == TakerBehavior::ReservePlannedCoinElsewhere {
+            let inputs: Vec<OutPoint> = self
+                .swap_state()?
+                .hop0_plan
+                .splits
+                .iter()
+                .flat_map(|split| split.utxos.iter().copied())
+                .collect();
+            log::warn!("Test behavior: reserving the planned coins for another swap");
+            self.write_wallet()?
+                .reserve_swap_locks(&format!("{swap_id}-other"), &inputs);
+        }
+
         self.funding_initialize()?;
+
+        #[cfg(feature = "integration-test")]
+        if self.behavior == TakerBehavior::PayBeforeFundingBroadcast {
+            self.pay_from_wallet_for_test()?;
+        }
 
         // SP3: Persist after funding initialization (outgoing txids created).
         self.persist_swap(SwapPhase::FundingCreated)?;
@@ -2498,6 +2554,49 @@ impl Taker {
         }
     }
 
+    /// Pays 10,000 sats out of the wallet as `send_to_address` does: coin
+    /// selection, sign, broadcast. Logs whether it found a coin to spend.
+    #[cfg(feature = "integration-test")]
+    fn pay_from_wallet_for_test(&self) -> Result<(), TakerError> {
+        let mut wallet = self.write_wallet()?;
+        let payee = wallet.get_next_external_address(crate::wallet::AddressType::P2TR)?;
+        let amount = Amount::from_sat(10_000);
+        match wallet.coin_select(
+            amount,
+            MIN_RELAY_FEE_RATE,
+            crate::wallet::AddressType::P2TR,
+            None,
+            None,
+        ) {
+            Ok(coins) => {
+                let tx = wallet.spend_from_wallet(
+                    MIN_RELAY_FEE_RATE,
+                    crate::wallet::Destination::Multi {
+                        outputs: vec![(payee, amount)],
+                        op_return_data: None,
+                        change_address_type: crate::wallet::AddressType::P2TR,
+                    },
+                    &coins,
+                )?;
+                wallet.send_tx(&tx)?;
+                log::warn!("Test behavior: payment before funding broadcast went out");
+            }
+            Err(e) => {
+                log::warn!("Test behavior: payment before funding broadcast found no coin: {e:?}")
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops whatever hop-0 coins `swap_id` still holds reserved.
+    fn release_hop0_claim(&self, swap_id: &str) -> Result<(), TakerError> {
+        let mut wallet = self.write_wallet()?;
+        if wallet.release_swap_locks(swap_id, None) {
+            wallet.save_to_disk()?;
+        }
+        Ok(())
+    }
+
     /// Rebuild funding against a substituted first maker. This destroys the
     /// old swapcoins' recovery material, so the call site must first prove
     /// nothing is on-chain.
@@ -2597,6 +2696,25 @@ impl Taker {
         }
 
         let mut wallet = self.write_wallet()?;
+
+        // Reserve the planned coins before signing, so no payment or other
+        // swap can spend them before broadcast. A re-funding after maker
+        // substitution finds them already held by this swap.
+        let inputs: Vec<OutPoint> = hop0_plan
+            .splits
+            .iter()
+            .flat_map(|split| split.utxos.iter().copied())
+            .collect();
+        let held = wallet
+            .store
+            .swap_locks
+            .get(&swap_id)
+            .is_some_and(|locks| inputs.iter().all(|input| locks.outpoints.contains(input)));
+        if !held && !wallet.claim_swap_inputs(&swap_id, &inputs) {
+            return Err(TakerError::General(
+                "A planned funding coin is spent or reserved; prepare the swap again".to_string(),
+            ));
+        }
 
         let network = wallet.store.network;
 
@@ -3883,6 +4001,12 @@ pub enum TakerBehavior {
     ForgeIncomingCount(u32),
     /// Re-send identical then mutated SwapDetails after admission.
     ResendMutatedDetails,
+    /// Reserve the saved hop-0 plan's coins for another swap right before
+    /// funding, as a concurrent swap claiming them would.
+    ReservePlannedCoinElsewhere,
+    /// After the hop-0 funding is signed, before it is broadcast, try a
+    /// wallet payment the way the public send API does.
+    PayBeforeFundingBroadcast,
     /// Close connection early (after maker selection).
     CloseEarly,
     /// Drop after funds/contracts are broadcast but before finalization.
