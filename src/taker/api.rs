@@ -3346,11 +3346,14 @@ impl Taker {
         // A crashed process never reaches its recovery. Gate here rather than at
         // each failure site, so every path into recovery is covered. The legacy
         // replay behavior dies the same way: its recovery would spend the
-        // funding the replayed proof presents.
+        // funding the replayed proof presents. A malicious taker just walks away.
         #[cfg(feature = "integration-test")]
         if matches!(
             self.behavior,
-            TakerBehavior::CrashBeforeRecovery | TakerBehavior::ReplayLegacyProofOfFunding
+            TakerBehavior::CrashBeforeRecovery
+                | TakerBehavior::CrashAfterContractExchange
+                | TakerBehavior::BroadcastContractAfterFullSetup
+                | TakerBehavior::ReplayLegacyProofOfFunding
         ) {
             log::warn!("Test behavior: crashing instead of recovering");
             // A real crash loses the in-memory swap; the replay test then
