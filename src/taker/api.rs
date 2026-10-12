@@ -3273,6 +3273,13 @@ impl Taker {
             TakerBehavior::CrashBeforeRecovery | TakerBehavior::ReplayLegacyProofOfFunding
         ) {
             log::warn!("Test behavior: crashing instead of recovering");
+            // A real crash loses the in-memory swap; the replay test then
+            // prepares swap 2 on this same taker.
+            if self.behavior == TakerBehavior::ReplayLegacyProofOfFunding {
+                self.ongoing_swap = None;
+                *lock_debug!(self.live_swap.lock())
+                    .map_err(|_| TakerError::General("live swap lock poisoned".into()))? = None;
+            }
             return Ok(());
         }
 
