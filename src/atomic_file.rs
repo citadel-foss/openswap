@@ -86,7 +86,12 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
         temporary_file.sync_all()?;
     }
 
-    std::fs::rename(&temporary_path, path)
+    std::fs::rename(&temporary_path, path)?;
+    // Without this the rename itself can be lost in a crash.
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
