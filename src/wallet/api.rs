@@ -1514,6 +1514,7 @@ impl Wallet {
         let mut reports: HashMap<(String, bool), Vec<String>> = HashMap::new();
         let mut incoming = RecoveryOutcome::default();
         for (key, contract_txid, txid) in sweeps {
+            log::info!("Sweep transaction {} confirmed", txid);
             if let Some(coin) = w.remove_incoming_swapcoin(&key) {
                 if let Some(id) = coin.swap_id {
                     for outgoing in w.store.outgoing_swapcoins.values_mut() {
@@ -1533,6 +1534,7 @@ impl Wallet {
         }
         let mut outgoing = RecoveryOutcome::default();
         for (key, contract_txid, txid) in refunds {
+            log::info!("Timelock recovery tx {} confirmed", txid);
             if let Some(coin) = w.remove_outgoing_swapcoin(&key) {
                 reports
                     .entry((coin.swap_id.unwrap_or(key), false))
