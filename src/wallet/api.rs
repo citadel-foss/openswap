@@ -513,6 +513,16 @@ impl Wallet {
         )
     }
 
+    /// Replaces the in-memory store with the saved file, so a test sees only
+    /// what reached the disk.
+    #[cfg(feature = "integration-test")]
+    pub fn reload_store_from_disk(&mut self, password: &str) -> Result<(), WalletError> {
+        let (store, _) =
+            WalletStore::read_from_disk(&self.wallet_file_path, Some(password.to_string()))?;
+        self.store = store;
+        self.seal_master_key()
+    }
+
     /// Load wallet data from file and connect to a blockchain backend.
     /// In case of core rpc, core wallet name, and wallet_id field in the file should match.
     ///
