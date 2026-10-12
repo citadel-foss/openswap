@@ -668,28 +668,43 @@ fn handle_swap_in_funded<M: Maker>(
         .get(funded.outpoint.vout as usize)
         .ok_or(MakerError::General("funding vout out of range"))?;
     let expected = swap.amount + swap.fee;
+    // Until the output is shown to pay this swap's HTLC, the announcement
+    // could come from anyone who knows the swap id, such as the next maker
+    // on a routed swap. Reject without forgetting the swap, so a forged
+    // announcement cannot drop the honest taker's swap.
     if funded.value != output.value {
         return Ok(reject(&funded.swap_id, "announced value mismatch"));
     }
     if let Err(e) = swap.htlc.validate_funding_output(output, expected) {
         return Ok(reject(&funded.swap_id, format!("bad funding output: {e}")));
     }
+    // Our blocklist is local policy, not taker misbehaviour: refuse without
+    // paying, and keep the matched entry out of the reply.
+    if let Err(e) = maker.screen_funding_tx(&funding_tx) {
+        log::warn!(
+            "[{}] Swap-in {}: funding refused: {e:?}",
+            maker.network_port(),
+            funded.swap_id
+        );
+        return refuse_swap_in(maker, &funded.swap_id, "funding refused");
+    }
     // Value and script are not enough. The taker chose this outpoint, so it
     // may be one whose refund is already spendable — or already spent. Paying
     // against either loses the Lightning amount outright.
     let (unspent, age) = maker.htlc_unspent_and_age(&funded.outpoint)?;
     if !unspent {
-        return Ok(reject(&funded.swap_id, "funding output is already spent"));
+        return refuse_swap_in(maker, &funded.swap_id, "funding output is already spent");
     }
     let remaining = (swap.locktime as u32).saturating_sub(age);
     if remaining < MIN_REMAINING_LOCKTIME {
-        return Ok(reject(
+        return refuse_swap_in(
+            maker,
             &funded.swap_id,
             format!(
                 "only {remaining} of {} locktime blocks remain after {age} elapsed",
                 swap.locktime
             ),
-        ));
+        );
     }
     // The route budget derived below is `remaining - margin`. If that falls
     // under the invoice's own final delta no route can satisfy it, so the
@@ -704,26 +719,37 @@ fn handle_swap_in_funded<M: Maker>(
     // Saturate: a truncated delta could wrap to 0 and pass the check below.
     .map_or(0u32, |delta| u32::try_from(delta).unwrap_or(u32::MAX));
     if remaining < invoice_delta.saturating_add(CLTV_SAFETY_MARGIN as u32) {
-        return Ok(reject(
+        return refuse_swap_in(
+            maker,
             &funded.swap_id,
             format!(
                 "{remaining} blocks left after {age} elapsed cannot cover the invoice's \
                  {invoice_delta}-block final delta plus the {CLTV_SAFETY_MARGIN}-block margin"
             ),
-        ));
+        );
     }
 
     let htlc_spk = swap.htlc.script_pubkey().map_err(|e| {
         log::warn!("lightning: htlc script build failed: {e}");
         MakerError::General("htlc script build failed")
     })?;
-    maker.register_watch_outpoint(funded.outpoint, htlc_spk)?;
 
     swap.funding = Some((funded.outpoint, output.value));
     swap.funding_height = maker.get_current_height().ok();
     swap.phase = LnMakerPhase::InPaid;
     swap.touch();
-    store_swap(maker, &funded.swap_id, swap.clone())?;
+    // `swap` was read before the confirmation wait. Another connection for
+    // the same swap may have paid it since, or the watchdog expired it, so
+    // move it on only if it is still awaiting funding. Paying from a stale
+    // copy would pay twice or pay a swap no one is waiting on.
+    if !maker.store_ln_swap_if_phase(&funded.swap_id, LnMakerPhase::InAccepted, swap.clone())? {
+        return Err(MakerError::General("swap-in no longer awaiting funding"));
+    }
+    // Watch only once the swap is ours to pay. If this fails, the swap stays
+    // InPaid without a payment, like a failed pay_invoice below, and the
+    // watchdog drops it once the taker's refund window has passed. A restart
+    // rebuilds the watch from the stored funding.
+    maker.register_watch_outpoint(funded.outpoint, htlc_spk)?;
 
     // The on-chain money is locked to our hashlock; paying the invoice is
     // now safe. The settlement event hands us the preimage.
@@ -753,6 +779,57 @@ fn handle_swap_in_funded<M: Maker>(
             swap_id: funded.swap_id,
         }),
     ))))
+}
+
+/// Refuses a funded swap-in. Callers must first validate the outpoint, proving
+/// it pays this swap's HTLC: until then anyone who knows the swap id could have
+/// sent the announcement, so reply with a plain `reject` and keep the swap.
+/// Only refusals after that validation reach here, and every one comes before
+/// `handle_swap_in_funded` pays the invoice or watches the HTLC, so a swap
+/// still awaiting funding holds nothing the maker would need later: the taker
+/// refunds its HTLC on its own. Forget such a swap now, so it does not hold one
+/// of the concurrent swap slots until the watchdog expires it.
+fn refuse_swap_in<M: Maker>(
+    maker: &Arc<M>,
+    swap_id: &str,
+    reason: impl Into<String>,
+) -> Result<Option<MakerToTakerMessage>, MakerError> {
+    let reason = reason.into();
+    log::info!(
+        "[{}] Swap-in {swap_id}: refused: {reason}",
+        maker.network_port()
+    );
+    // The refusal was decided on a copy read before the confirmation wait. If
+    // another connection has paid the swap since, its record holds the HTLC
+    // key and its mailbox is where the preimage arrives, so both must stay.
+    match maker.remove_ln_swap_if_phase(swap_id, LnMakerPhase::InAccepted) {
+        Ok(true) => {}
+        Ok(false) => log::info!(
+            "[{}] Swap-in {swap_id}: refused this funding; the swap is no longer awaiting \
+             funding, so it is left as it is",
+            maker.network_port()
+        ),
+        // The refusal stands either way. The wallet record goes after the
+        // in-memory one, so if only the disk write failed the slot is already
+        // free. A record left on disk is restored at the next start, where the
+        // watchdog expires it like any swap-in that never got past acceptance.
+        Err(e) => log::warn!(
+            "[{}] Swap-in {swap_id}: could not forget the refused swap: {e:?}",
+            maker.network_port()
+        ),
+    }
+    Ok(reject(swap_id, reason))
+}
+
+/// Runs the swap-in refusal for `swap_id` as a funded-message handler would
+/// after its confirmation wait, whatever state the swap has reached since.
+#[cfg(feature = "integration-test")]
+pub fn refuse_swap_in_after_wait(
+    maker: &Arc<MakerServer>,
+    swap_id: &str,
+    reason: &str,
+) -> Result<Option<MakerToTakerMessage>, MakerError> {
+    refuse_swap_in(maker, swap_id, reason)
 }
 
 /// Blocks until the settlement for `payment_hash` reveals the preimage, the
@@ -1220,22 +1297,7 @@ pub(crate) fn ln_watchdog_tick(maker: &Arc<MakerServer>) {
             // taker did everything right on — and strand its HTLC until the
             // CSV refund. Measure that one in blocks.
             (LnDirection::SwapIn, LnMakerPhase::InAccepted) => {
-                let expired = match (swap.accepted_height, maker.get_current_height().ok()) {
-                    (Some(accepted), Some(tip)) => {
-                        tip > accepted
-                            .saturating_add(swap.min_confirmations)
-                            .saturating_add(FUNDING_CONF_BUDGET)
-                    }
-                    // Without heights to compare, fall back to the timer
-                    // rather than keeping the swap open forever.
-                    _ => swap.updated_at.elapsed() > SWAP_OUT_PAYMENT_DEADLINE,
-                };
-                if expired {
-                    log::info!("Lightning swap {swap_id} expired unfunded; forgetting");
-                    ctx.router.unsubscribe(&swap.payment_hash);
-                    let _ = maker.remove_ln_swap(&swap_id);
-                }
-                Ok(())
+                watchdog_expire_swap_in(maker, &swap_id, &swap)
             }
             // A swap-out's taker only has to pay an invoice, so the timer is
             // the right measure there.
@@ -1261,6 +1323,42 @@ pub(crate) fn ln_watchdog_tick(maker: &Arc<MakerServer>) {
             log::warn!("Lightning watchdog on swap {swap_id}: {e:?}");
         }
     }
+}
+
+/// Forgets a swap-in whose funding never arrived within its budget. `swap`
+/// is the watchdog's snapshot: a funded-message handler may have paid the
+/// swap since, so only a swap still awaiting funding is removed, and only a
+/// removed swap loses its mailbox.
+fn watchdog_expire_swap_in(
+    maker: &Arc<MakerServer>,
+    swap_id: &str,
+    swap: &LnMakerSwap,
+) -> Result<(), MakerError> {
+    let expired = match (swap.accepted_height, maker.get_current_height().ok()) {
+        (Some(accepted), Some(tip)) => {
+            tip > accepted
+                .saturating_add(swap.min_confirmations)
+                .saturating_add(FUNDING_CONF_BUDGET)
+        }
+        // Without heights to compare, fall back to the timer rather than
+        // keeping the swap open forever.
+        _ => swap.updated_at.elapsed() > SWAP_OUT_PAYMENT_DEADLINE,
+    };
+    if expired && maker.remove_ln_swap_if_phase(swap_id, LnMakerPhase::InAccepted)? {
+        log::info!("Lightning swap {swap_id} expired unfunded; forgetting");
+    }
+    Ok(())
+}
+
+/// Runs the watchdog's expiry of an unfunded swap-in on a snapshot the test
+/// supplies, whatever state the stored swap has reached since.
+#[cfg(feature = "integration-test")]
+pub fn watchdog_expire_swap_in_snapshot(
+    maker: &Arc<MakerServer>,
+    swap_id: &str,
+    swap: &LnMakerSwap,
+) -> Result<(), MakerError> {
+    watchdog_expire_swap_in(maker, swap_id, swap)
 }
 
 fn watchdog_finish_swap_in(

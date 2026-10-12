@@ -145,8 +145,8 @@ fn test_legacy_breach_before_handover() {
         );
         // Observed in a real run: each maker swept its incoming contract via the
         // hashlock. A maker that had handed over its outgoing leg would be ~500k short.
-        let expected_regular = [14500865u64, 14502398][i];
-        let expected_swap = [499100u64, 497530][i];
+        let expected_regular = [14501360u64, 14502893][i];
+        let expected_swap = [498605u64, 497035][i];
         assert_eq!(
             balances.regular.to_sat(),
             expected_regular,

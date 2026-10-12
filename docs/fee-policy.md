@@ -92,27 +92,32 @@ return.
 ## A worked example
 
 Say you swap 500,000 sats through one maker, with the default settings.
-Taproot, feerate 1 sat/vB, 20 blocks of lock time. The maker delivers 2
-funding transactions with 1 input each.
+Taproot, feerate 1 sat/vB, 20 blocks of lock time. You fund the maker with
+1 transaction of 1 input, and the maker delivers 2 funding transactions
+with 1 input each.
 
-**Service fee:**
+**Your funding fee:** one transaction costs 97 + 68 = 165 virtual bytes.
+That is **165 sats** at 1 sat/vB. It comes out of the amount you swap, so
+your wallet spends exactly 500,000 and the maker is declared **499,835 sats**.
+PaySwap is the exception: there this fee is paid on top of the route amount.
+
+**Service fee,** priced on the declared amount:
 
 - Flat part: 500 sats.
-- Amount part: 0.0025% of 500,000 = 12.5 sats.
-- Time part: 0.0001% of 500,000 times 20 blocks = 10 sats.
-- Total: 522.5, rounded up to **523 sats**.
+- Amount part: 0.0025% of 499,835 = 12.50 sats.
+- Time part: 0.0001% of 499,835 times 20 blocks = 10.00 sats.
+- Total: 522.49, rounded up to **523 sats**.
 
-**Funding fee:** one transaction costs 97 + 68 = 165 virtual bytes. That is
-165 sats at 1 sat/vB. Two transactions: **330 sats**.
+**Maker's funding fee:** 165 sats per transaction. Two transactions:
+**330 sats**.
 
 **Sweep fee:** one taproot claim costs 112 virtual bytes. That is 112 sats.
 Two contracts: **224 sats**.
 
-**What you receive:** 500,000 − 523 − 330 − 224 = **498,923 sats**.
+**What you receive:** 499,835 − 523 − 330 − 224 = **498,758 sats**.
 
-The hop costs 1,077 sats in total, about 0.22%. You also pay the miner fee
-for your own funding transaction on top. Raising the feerate raises the two
-miner fees in step. The service fee stays the same.
+The swap costs 1,242 sats in total, about 0.25%. Raising the feerate raises
+the three miner fees in step. The service fee stays the same.
 
 ## Funding splits
 

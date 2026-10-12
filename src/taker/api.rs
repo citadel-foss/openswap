@@ -16,7 +16,7 @@ use bitcoin::{
         rand::{rngs::OsRng, RngCore},
         SecretKey,
     },
-    Amount, OutPoint, PublicKey,
+    Amount, OutPoint, PublicKey, Transaction,
 };
 use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 
@@ -39,7 +39,8 @@ use crate::{
     },
     wallet::{
         blockchain::BackendConnector,
-        funding::CreateFundingTxesResult,
+        funding::{net_policy_fees, CreateFundingTxesResult, SplitPlan},
+        p2tr_min_non_dust_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig,
         MakerFeeInfo as ReportMakerFeeInfo, RecoveryOutcome, ReportUtxo, SwapStatus, TakerReport,
@@ -397,13 +398,30 @@ pub(crate) struct OngoingSwapState {
     /// Reference block height captured during negotiation for consistent Taproot CLTV timelocks.
     /// Taproot uses absolute heights, so all timelock calculations must use the same base height.
     pub(crate) reference_height: Option<u32>,
-    /// Our own hop-0 funding plan shape from negotiation: one entry per planned
-    /// funding tx, valued by input count. The funding build replays this plan,
-    /// so the fee ceiling prices hop 0 from it exactly.
-    pub(crate) hop0_funding_splits: Vec<u32>,
+    /// Our own hop-0 funding, planned once at negotiation. Maker 0 is declared
+    /// its split values and the funding build spends exactly this plan.
+    pub(crate) hop0_plan: Hop0Plan,
     /// PaySwap state; `None` for regular swaps. When set, `params.send_amount`
     /// holds the solved gross route amount.
     pub(crate) payment: Option<PaymentQuote>,
+}
+
+/// The taker's own hop-0 funding plan.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Hop0Plan {
+    /// One entry per funding tx, valued at what its contract receives.
+    pub(crate) splits: Vec<SplitPlan>,
+    /// What each funding tx takes from the wallet: its value plus the priced
+    /// funding fee, so the spends sum to the send amount and the splits to
+    /// less. `None` for PaySwap, which pays the fee on top at the swap feerate.
+    pub(crate) spends: Option<Vec<Amount>>,
+}
+
+impl Hop0Plan {
+    /// What maker 0 is declared: the sum of the split values.
+    pub(crate) fn declared_amount(&self) -> Amount {
+        self.splits.iter().map(|split| split.value).sum()
+    }
 }
 
 /// Connection state for a maker in the swap route.
@@ -978,6 +996,10 @@ impl Taker {
     ///
     /// No funds are committed. The caller reviews the summary and then calls
     /// `start_swap` with the returned `swap_id` to execute.
+    ///
+    /// The summary is bound to the coins planned here. If one of them is spent
+    /// or locked before `start_swap`, `start_swap` fails before anything is
+    /// broadcast; prepare again to plan from the coins left.
     pub fn prepare_swap(&mut self, params: SwapParams) -> Result<SwapSummary, TakerError> {
         // A prepared swap that was never started has nothing committed, so a
         // new prepare replaces it, as it did before the live slot existed.
@@ -1090,7 +1112,7 @@ impl Taker {
             hashlock_nonces: Vec::new(),
             spare_makers: Vec::new(),
             reference_height: None,
-            hop0_funding_splits: Vec::new(),
+            hop0_plan: Hop0Plan::default(),
             payment: None,
         });
 
@@ -1140,9 +1162,11 @@ impl Taker {
         let send_amount = swap.params.send_amount;
         let protocol = swap.params.protocol;
         let mut maker_fees = Vec::with_capacity(maker_count);
-        let mut amount_sats = send_amount.to_sat() as f64;
 
+        // Each maker prices its fee on the amount it was declared. That is
+        // below the previous hop's net: funding and sweep fees come out too.
         for (i, mc) in swap.makers.iter().enumerate() {
+            let amount_sats = mc.amount.to_sat() as f64;
             let locktime =
                 REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - i - 1) as u16;
 
@@ -1169,8 +1193,6 @@ impl Taker {
                 locktime,
                 estimated_fee_sats: fee_sats,
             });
-
-            amount_sats = (amount_sats - fee).max(0.0);
         }
 
         let service_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
@@ -1200,10 +1222,11 @@ impl Taker {
         // The taker's own hop-0 funding pays its real plan: hop 0 has no input
         // budget, so the ceiling must price every input it actually takes.
         let hop0_sats = swap
-            .hop0_funding_splits
+            .hop0_plan
+            .splits
             .iter()
-            .try_fold(0u64, |acc, &inputs| {
-                funding_fee_policy_sats(inputs as usize, u32::MAX, swap_feerate)
+            .try_fold(0u64, |acc, split| {
+                funding_fee_policy_sats(split.utxos.len(), u32::MAX, swap_feerate)
                     .and_then(|fee| acc.checked_add(fee))
             })
             .ok_or_else(policy_err)?;
@@ -1535,6 +1558,7 @@ impl Taker {
         let swap = self.swap_state()?;
         let maker_count = swap.params.maker_count;
         let send_amount = swap.params.send_amount;
+        let is_payswap = swap.params.payment_address.is_some();
         let protocol = swap.params.protocol;
         let preferred = swap.params.preferred_makers.clone();
 
@@ -1594,11 +1618,20 @@ impl Taker {
                 return Err(TakerError::NotEnoughMakersInOfferBook);
             }
 
+            // Maker 0 is declared the send amount less our hop-0 funding fees,
+            // so filter and rank on that. A PaySwap pays them on top. An amount
+            // hop 0 cannot fund keeps the gross; negotiation reports why.
+            let first_hop_amount = if is_payswap {
+                send_amount
+            } else {
+                self.plan_hop0()
+                    .map_or(send_amount, |plan| plan.declared_amount())
+            };
             let mut suitable_makers: Vec<OfferAndAddress> = available_makers
                 .into_iter()
                 .filter(|maker| {
-                    let min_ok = send_amount.to_sat() >= maker.offer.min_size;
-                    let max_ok = send_amount.to_sat() <= maker.offer.max_size;
+                    let min_ok = first_hop_amount.to_sat() >= maker.offer.min_size;
+                    let max_ok = first_hop_amount.to_sat() <= maker.offer.max_size;
                     min_ok && max_ok
                 })
                 .collect();
@@ -1615,7 +1648,7 @@ impl Taker {
             // Price every offer at the same amount and first-hop locktime.
             let locktime =
                 REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * maker_count.saturating_sub(1) as u16;
-            sort_makers_by_fee(&mut suitable_makers, send_amount.to_sat(), locktime);
+            sort_makers_by_fee(&mut suitable_makers, first_hop_amount.to_sat(), locktime);
 
             let spare_count = suitable_makers.len().saturating_sub(maker_count).min(2);
             let total_select = maker_count + spare_count;
@@ -1668,7 +1701,6 @@ impl Taker {
         let swap = self.swap_state()?;
         let maker_count = swap.params.maker_count;
         let swap_id = swap.id.clone();
-        let send_amount = swap.params.send_amount;
         let tx_count = swap.params.tx_count;
         let protocol = swap.params.protocol;
 
@@ -1683,33 +1715,18 @@ impl Taker {
             };
         self.swap_state_mut()?.reference_height = Some(reference_height);
 
-        // Plan our own hop-0 funding before the first declaration: the planned
-        // count is what we declare to maker 0, and the funding build later
-        // replays the same deterministic plan on the same pool.
-        let planned_hop0 = {
-            let swap = self.swap_state()?;
-            let wallet = self.read_wallet()?;
-            wallet.plan_funding(
-                send_amount,
-                tx_count,
-                swap.params.swap_feerate(),
-                // Our own hop pays the fee on top: no input budget, no
-                // over-budget guard, mirroring the funding call sites.
-                u32::MAX,
-                None,
-                swap.params.manually_selected_outpoints.clone(),
-                None,
-                swap.params.protocol,
-            )?
-        };
-        let planned_hop0_count = planned_hop0.len() as u32;
-        self.swap_state_mut()?.hop0_funding_splits = planned_hop0
-            .iter()
-            .map(|split| split.utxos.len() as u32)
-            .collect();
+        // Plan our own hop-0 funding before the first declaration: maker 0 is
+        // declared the plan's count and value, and the funding build spends
+        // this same plan. Planned again rather than reused from discovery: a
+        // PaySwap only knows its gross amount now, and a regular plan that
+        // changed with the wallet is refused before anything is signed.
+        let hop0_plan = self.plan_hop0()?;
+        let planned_hop0_count = hop0_plan.splits.len() as u32;
+        let declared_amount = hop0_plan.declared_amount();
+        self.swap_state_mut()?.hop0_plan = hop0_plan;
         self.payment_check_dust_floor()?;
 
-        self.walk_route(0, send_amount, planned_hop0_count, reference_height)?;
+        self.walk_route(0, declared_amount, planned_hop0_count, reference_height)?;
 
         #[cfg(debug_assertions)]
         log::debug!(
@@ -1721,6 +1738,77 @@ impl Taker {
             tx_count
         );
         Ok(())
+    }
+
+    /// Plan our own hop-0 funding. A regular swap spends exactly the send
+    /// amount: each split's funding fee, priced at its own input count, comes
+    /// out of its value, and its coins leave non-dust change so nothing more
+    /// leaves the wallet. A PaySwap pays the fee on top of the solved gross.
+    fn plan_hop0(&self) -> Result<Hop0Plan, TakerError> {
+        let swap = self.swap_state()?;
+        let swap_feerate = swap.params.swap_feerate();
+        let exact = swap.payment.is_none();
+        let wallet = self.read_wallet()?;
+        // Netting can push a split under the floor where fewer, larger splits
+        // would pass, so retry one split fewer, as maker admission does.
+        let mut max_splits = swap.params.tx_count;
+        let (splits, spends) = loop {
+            let mut splits = wallet.plan_funding_with_change(
+                swap.params.send_amount,
+                max_splits,
+                swap_feerate,
+                // Our own hop has no input budget and no over-budget guard.
+                u32::MAX,
+                None,
+                swap.params.manually_selected_outpoints.clone(),
+                None,
+                swap.params.protocol,
+                exact.then(p2tr_min_non_dust_sats),
+            )?;
+            if !exact {
+                return Ok(Hop0Plan {
+                    splits,
+                    spends: None,
+                });
+            }
+            let spends: Vec<Amount> = splits.iter().map(|split| split.value).collect();
+            let inputs: Vec<usize> = splits.iter().map(|split| split.utxos.len()).collect();
+            match net_policy_fees(
+                &mut splits,
+                &inputs,
+                u32::MAX,
+                swap_feerate,
+                swap.params.protocol,
+            ) {
+                Ok(()) => break (splits, spends),
+                Err(_) if splits.len() > 1 => {
+                    max_splits = splits.len() as u32 - 1;
+                    log::info!("Hop-0 fees push a split below the floor; retrying with {max_splits} split(s)");
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        // QA: even splits keep the count and the total exact, so only the maker's
+        // per-contract floor can refuse the one split skewed a sat below it. The
+        // spends move with the values, so each split still pays its own fee.
+        #[cfg(feature = "integration-test")]
+        let (splits, spends) = {
+            let (mut splits, mut spends) = (splits, spends);
+            if self.behavior == TakerBehavior::SkewSplitBelowFloor && splits.len() > 1 {
+                let floor = min_contract_value_sats(swap.params.protocol, swap_feerate)
+                    .expect("test: the swap feerate always prices the floor");
+                let skimmed = Amount::from_sat(splits[0].value.to_sat() - (floor - 1));
+                splits[0].value -= skimmed;
+                splits[1].value += skimmed;
+                spends[0] -= skimmed;
+                spends[1] += skimmed;
+            }
+            (splits, spends)
+        };
+        Ok(Hop0Plan {
+            splits,
+            spends: Some(spends),
+        })
     }
 
     /// Derive the next hop's declaration from maker `i`'s frozen shape:
@@ -2386,12 +2474,11 @@ impl Taker {
 
         let hashvalue = Hash160::hash(&swap.preimage);
         let preimage = swap.preimage;
-        let send_amount = swap.params.send_amount;
         let swap_id = swap.id.clone();
         // Fund hop 0 with the count declared at negotiation: the planned
         // count, which may be below the `tx_count` ceiling on a thin wallet.
         let hop0_tx_count = first_maker.incoming_count as usize;
-        let manually_selected_outpoints = swap.params.manually_selected_outpoints.clone();
+        let hop0_plan = swap.hop0_plan.clone();
         let reference_height = swap.reference_height;
         let swap_feerate = swap.params.swap_feerate();
 
@@ -2443,13 +2530,10 @@ impl Taker {
                 &hashlock_pubkeys,
                 hashvalue,
                 refund_locktime_offset,
-                send_amount,
+                &hop0_plan,
                 &swap_id,
                 network,
-                manually_selected_outpoints,
                 swap_feerate,
-                #[cfg(feature = "integration-test")]
-                self.behavior,
             )?,
             ProtocolVersion::Taproot => {
                 let hashlock_pubkey = taproot_hashlock_pubkey
@@ -2460,14 +2544,11 @@ impl Taker {
                     &vec![hashlock_pubkey; hop0_tx_count],
                     preimage,
                     refund_locktime_offset,
-                    send_amount,
+                    &hop0_plan,
                     &swap_id,
                     network,
-                    manually_selected_outpoints,
                     reference_height,
                     swap_feerate,
-                    #[cfg(feature = "integration-test")]
-                    self.behavior,
                 )?
             }
         };
@@ -2489,7 +2570,7 @@ impl Taker {
             swap.id,
             protocol,
             num_swapcoins,
-            send_amount.to_sat(),
+            swap.params.send_amount.to_sat(),
             swap.params
                 .manually_selected_outpoints
                 .as_ref()
@@ -3043,9 +3124,8 @@ impl Taker {
             vec![]
         };
 
-        // Per-maker fee breakdown (same algorithm as master)
+        // Per-maker fee breakdown, each priced on that maker's declared amount.
         let mut maker_fee_info = Vec::new();
-        let mut temp_target_amount = swap.params.send_amount.to_sat();
         let completed_hops = swap.makers.len().min(maker_count);
 
         log::info!(
@@ -3058,6 +3138,7 @@ impl Taker {
             .map(|maker_index| {
                 let maker_refund_locktime = REFUND_LOCKTIME_BASE
                     + REFUND_LOCKTIME_STEP * (maker_count - maker_index - 1) as u16;
+                let temp_target_amount = swap.makers[maker_index].amount.to_sat();
 
                 let (base_fee, amount_rel_fee, time_rel_fee) = if let Some(offer) =
                     swap.makers[maker_index].offer.as_ref()
@@ -3086,7 +3167,6 @@ impl Taker {
                     total_fee: total_maker_fee as f64,
                 });
 
-                temp_target_amount = temp_target_amount.saturating_sub(total_maker_fee);
                 total_maker_fee
             })
             .sum();
@@ -3414,6 +3494,24 @@ impl Taker {
             .map_err(TakerError::Blocklist)
     }
 
+    /// Screen a maker's funding transaction against the blocklist when
+    /// `check_blocklist` is on. A match is local policy: the caller aborts the
+    /// swap, and nothing is recorded against the maker.
+    pub(crate) fn screen_funding_tx(&self, tx: &Transaction) -> Result<(), TakerError> {
+        if !self.config.check_blocklist.unwrap_or(false) {
+            return Ok(());
+        }
+        let data_dir = self
+            .config
+            .data_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(get_taker_dir)?;
+        let wallet = self.read_wallet()?;
+        crate::blocklist::screen_funding_tx(&data_dir, wallet.store.network, &wallet, tx)
+            .map_err(TakerError::Blocklist)
+    }
+
     /// Restore a wallet from a backup file (static — no taker instance needed).
     /// A `None` wallet name restores under the backup's original filename.
     pub fn restore_wallet(
@@ -3451,50 +3549,33 @@ static REPLAY_POF_CACHE: std::sync::Mutex<
     Vec<(String, crate::protocol::legacy_messages::ProofOfFunding)>,
 > = std::sync::Mutex::new(Vec::new());
 
-/// Fund every destination of the taker's own hop, or none of them. The taker
-/// pays this hop's fee on top, so it takes no input budget and no over-budget
-/// guard, and a degraded plan is a funding failure rather than a smaller swap.
+/// The outpoints `tx` spends.
+pub(crate) fn spent_inputs(tx: &bitcoin::Transaction) -> Vec<OutPoint> {
+    tx.input.iter().map(|input| input.previous_output).collect()
+}
+
+/// Fund every destination of the taker's own hop from the plan negotiated
+/// for it, or none of them. The plan is never re-derived: maker 0 was
+/// declared its values, and a planned coin gone since fails the funding
+/// before anything is broadcast. A fresh `prepare_swap` plans from what is left.
 pub(crate) fn fund_all_or_nothing(
     wallet: &mut Wallet,
-    send_amount: Amount,
+    hop0_plan: &Hop0Plan,
     destinations: &[bitcoin::Address],
     feerate: f64,
-    manually_selected_outpoints: Option<Vec<OutPoint>>,
-    protocol: ProtocolVersion,
-    #[cfg(feature = "integration-test")] behavior: TakerBehavior,
 ) -> Result<CreateFundingTxesResult, TakerError> {
-    let plan = wallet.plan_funding(
-        send_amount,
-        destinations.len() as u32,
-        feerate,
-        u32::MAX,
-        None,
-        manually_selected_outpoints,
-        None,
-        protocol,
-    )?;
+    let plan = &hop0_plan.splits;
     if plan.len() != destinations.len() {
         return Err(TakerError::General(format!(
-            "wallet can fund only {} of the {} funding transactions",
+            "hop-0 plan has {} splits for {} funding transactions",
             plan.len(),
             destinations.len()
         )));
     }
-    // QA: even splits keep the count and the total exact, so only the maker's
-    // per-contract floor can refuse the one split skewed a sat below it.
-    #[cfg(feature = "integration-test")]
-    let plan = {
-        let mut plan = plan;
-        if behavior == TakerBehavior::SkewSplitBelowFloor && plan.len() > 1 {
-            let floor = min_contract_value_sats(protocol, feerate)
-                .expect("test: the swap feerate always prices the floor");
-            let skimmed = plan[0].value.to_sat() - (floor - 1);
-            plan[0].value = Amount::from_sat(floor - 1);
-            plan[1].value += Amount::from_sat(skimmed);
-        }
-        plan
-    };
-    Ok(wallet.execute_funding_plan(&plan, destinations, feerate)?)
+    Ok(match &hop0_plan.spends {
+        Some(spends) => wallet.execute_exact_funding_plan(plan, spends, destinations, feerate)?,
+        None => wallet.execute_funding_plan(plan, destinations, feerate)?,
+    })
 }
 
 /// Last value stashed for `maker_address`, if any.
@@ -3666,6 +3747,9 @@ pub enum TakerBehavior {
     /// Skew one funding split a sat below the contract floor while keeping the
     /// count and total exact (maker per-contract floor rejection tests).
     SkewSplitBelowFloor,
+    /// Announce a swap-in HTLC value one sat above the funded output, so the
+    /// maker must refuse the funding message (Lightning swap-in mismatch test).
+    ForgeSwapInFundedValue,
 }
 
 #[cfg(test)]

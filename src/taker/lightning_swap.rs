@@ -641,10 +641,19 @@ impl Taker {
         let (outpoint, actual_value) =
             self.fund_htlc_output(&htlc, funding_value, params.min_confirmations, &swap_id)?;
 
+        #[cfg(feature = "integration-test")]
+        let announced_value = if self.behavior == super::api::TakerBehavior::ForgeSwapInFundedValue
+        {
+            actual_value + Amount::from_sat(1)
+        } else {
+            actual_value
+        };
+        #[cfg(not(feature = "integration-test"))]
+        let announced_value = actual_value;
         conn.send(LightningTakerMessage::SwapInFunded(LnHtlcFunded {
             swap_id: swap_id.clone(),
             outpoint,
-            value: actual_value,
+            value: announced_value,
         }))?;
 
         // The maker verifies and pays our hold invoice; claim it with the
@@ -785,6 +794,10 @@ impl Taker {
         }
         htlc.validate_funding_output(&output, params.amount)
             .map_err(|e| general(format!("bad funding output: {e}")))?;
+        // Screen the transaction that confirmed, before recording its outpoint:
+        // recovery claims any recorded outpoint, so a refused one must never
+        // reach the record.
+        self.screen_funding_tx(&funding_tx)?;
         {
             let mut wallet = self.write_wallet()?;
             if let Some(record) = wallet.store.ln_pending_swaps.get_mut(&swap_id) {
@@ -1038,6 +1051,9 @@ impl Taker {
         htlc2
             .validate_funding_output(&output2, params.amount)
             .map_err(|e| general(format!("bad funding output: {e}")))?;
+        // As in a swap-out: screen before recording, so recovery never claims
+        // a refused hop 2. Not claiming keeps the preimage from maker 1.
+        self.screen_funding_tx(&funding_tx)?;
         {
             let mut wallet = self.write_wallet()?;
             if let Some(record) = wallet.store.ln_pending_swaps.get_mut(&out_key) {

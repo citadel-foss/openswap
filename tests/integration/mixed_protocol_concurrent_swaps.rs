@@ -150,11 +150,11 @@ fn test_concurrent_legacy_and_taproot_swaps() {
         "Taproot swap should succeed while the makers also process a Legacy swap"
     );
 
-    let expected_taker_regular = [14_499_538, 14_299_538];
-    let expected_taker_swap = [496_447, 696_704];
-    let expected_taker_fees = [4_015, 3_758];
-    let expected_maker_regular = [302_152, 305_139];
-    let expected_maker_swap = [1_199_214, 1_196_138];
+    let expected_taker_regular = [14_500_000, 14_300_000];
+    let expected_taker_swap = [495_952, 696_209];
+    let expected_taker_fees = [4_048, 3_791];
+    let expected_maker_regular = [303_142, 306_129];
+    let expected_maker_swap = [1_198_224, 1_195_148];
     let expected_maker_earnings = [1_366, 1_277];
 
     // Sync and log every party before any assert, so one stale golden value

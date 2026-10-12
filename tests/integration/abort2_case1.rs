@@ -103,7 +103,7 @@ fn maker_abort2_case1() {
 
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14995985,
+        14995952,
         "Taker spendable balance mismatch"
     );
     assert_eq!(
@@ -582,7 +582,7 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing() {
     // Pinned from a real run: 3 funding txs + 3 timelock refunds at 1 sat/vB.
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14998662,
+        14998629,
         "Taker spendable after recovery mismatch"
     );
 
@@ -695,7 +695,7 @@ fn last_hop_equal_priced_spare_completes() {
     // Pinned from a real run: both selected hops use the cheap fee schedule.
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14996805,
+        14996772,
         "Taker spendable balance mismatch"
     );
     assert_eq!(taker_balances.contract, Amount::ZERO);

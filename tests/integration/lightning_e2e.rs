@@ -4,14 +4,19 @@
 //! paired `MockLightningBackend` whose two handles behave like two separate
 //! nodes sharing a payment network.
 
-use std::{sync::Arc, thread, time::Duration};
+use std::{
+    sync::{atomic::AtomicBool, Arc},
+    thread,
+    time::{Duration, Instant},
+};
 
-use bitcoin::Amount;
-use bitcoind::bitcoincore_rpc::RpcApi;
+use bitcoin::{Amount, Network, TxOut};
+use bitcoind::bitcoincore_rpc::{json::ScanTxOutRequest, RpcApi};
 use openswap::{
+    blocklist::BlocklistError,
     lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest},
-    maker::{start_server, MakerBehavior},
-    taker::{lightning_swap::LnSwapParams, TakerBehavior},
+    maker::{lightning_handlers::LnMakerPhase, start_server, MakerBehavior},
+    taker::{error::TakerError, lightning_swap::LnSwapParams, Taker, TakerBehavior},
     wallet::AddressType,
 };
 
@@ -175,6 +180,385 @@ fn lightning_submarine_swaps_e2e() {
     maker_threads
         .into_iter()
         .for_each(|thread| thread.join().unwrap());
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// A maker node and a taker node joined by one ready channel with capacity
+/// both ways, as set up in [`lightning_submarine_swaps_e2e`].
+fn ready_channel_pair() -> (Arc<MockLightningBackend>, Arc<MockLightningBackend>) {
+    let (maker_ln, taker_ln) = MockLightningBackend::new_pair();
+    maker_ln.set_onchain_balance(Amount::from_btc(0.02).unwrap());
+    let channel = maker_ln
+        .open_channel(OpenChannelRequest {
+            node_pubkey: taker_ln.node_info().unwrap().node_id,
+            address: "127.0.0.1:9736".to_string(),
+            channel_amount: Amount::from_sat(1_000_000),
+            push_to_counterparty_msat: Some(500_000_000),
+            announce_channel: false,
+        })
+        .unwrap();
+    maker_ln.simulate_channel_ready(&channel);
+    let _ = maker_ln.poll_event().unwrap();
+    (maker_ln, taker_ln)
+}
+
+/// Runs Lightning recovery until no record remains and returns every
+/// outcome line seen on the way.
+fn recover_all_lightning_swaps(taker: &mut Taker, timeout: Duration) -> Vec<String> {
+    let deadline = Instant::now() + timeout;
+    let mut history = Vec::new();
+    loop {
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        if outcomes.is_empty() {
+            return history;
+        }
+        history.extend(outcomes);
+        assert!(
+            Instant::now() < deadline,
+            "lightning swaps still pending: {:?}",
+            history
+        );
+        thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// With screening on, a maker must refuse a swap-in whose on-chain funding
+/// spends from a listed address, and must never pay the taker's invoice.
+#[test]
+fn lightning_swap_in_refuses_blocklisted_funding() {
+    let (maker_ln, taker_ln) = ready_channel_pair();
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning_and_blocklist::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![maker_ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    taker.set_lightning_backend(taker_ln.clone() as Arc<dyn LightningBackend>);
+
+    // Every taker coin comes from this address, so whichever coins fund the
+    // HTLC trip the maker's source-address check.
+    let blocked_address = taker
+        .get_wallet()
+        .write()
+        .unwrap()
+        .get_next_external_address(AddressType::P2WPKH)
+        .unwrap();
+    for _ in 0..3 {
+        send_to_address(bitcoind, &blocked_address, Amount::from_btc(0.05).unwrap());
+    }
+    generate_blocks(bitcoind, 1);
+    taker
+        .get_wallet()
+        .write()
+        .unwrap()
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    taker
+        .add_blocklist_entry(
+            blocked_address.to_string(),
+            Some("swap-in source".to_string()),
+        )
+        .unwrap();
+
+    fund_makers(
+        &makers,
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2WPKH,
+    );
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+
+    // Maker and taker share the process logger, so the maker's lines land in
+    // the taker's debug.log. Only lines past this offset belong to the swap.
+    let log_path = test_framework.taker_log_path();
+    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+
+    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let result = taker.lightning_swap_in(LnSwapParams {
+        amount: Amount::from_sat(50_000),
+        maker_address: Some(maker_address),
+        locktime: None,
+        min_confirmations: 1,
+    });
+    assert!(
+        result.is_err(),
+        "the maker completed a swap-in funded from a blocked address: {:?}",
+        result
+    );
+    assert_eq!(
+        maker_ln.last_pay_cltv_bound(),
+        None,
+        "the maker paid the invoice of a refused swap-in"
+    );
+    // The maker forgets the swap before it replies. The watchdog only looks
+    // at swaps idle for minutes, so a record left here would still be held.
+    assert!(
+        makers[0].ln_swaps.lock().unwrap().is_empty(),
+        "the refused swap-in still holds a maker swap slot"
+    );
+
+    // The maker never paid, so it never learned the preimage: only the
+    // taker's refund branch can resolve the HTLC.
+    let history = recover_all_lightning_swaps(taker, Duration::from_secs(300));
+    assert!(
+        history
+            .iter()
+            .any(|line| line.contains("recovered via") || line.contains("already resolved")),
+        "the taker must refund its swap-in HTLC, got: {:?}",
+        history
+    );
+
+    // The swap failing is not enough: the maker must have refused this swap's
+    // funding because its blocklist matched the listed address. Recovery
+    // outcomes start with the swap id, which the maker logs too.
+    let swap_id = history
+        .iter()
+        .find_map(|line| line.split_once(": ").map(|(id, _)| id.to_string()))
+        .expect("recovery reports the swap id");
+    let needle = format!("Swap-in {swap_id}: funding refused: Blocklist(BlockedAddress");
+    let listed = blocked_address.to_string();
+    wait_for_log(&log_path, &needle, Duration::from_secs(30));
+    // wait_for_log echoes the needle into the log, but not the address, so
+    // requiring both skips the echo.
+    let contents = std::fs::read_to_string(&log_path).unwrap();
+    let refusals: Vec<&str> = contents
+        .get(log_offset as usize..)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(&needle) && line.contains(&listed))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "the maker must refuse swap-in {} once, for the listed address {}",
+        swap_id,
+        blocked_address
+    );
+
+    drop(takers);
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// A maker must refuse a swap-in whose funding message announces a value the
+/// funded output does not hold. Until the output is validated the message
+/// could come from anyone who knows the swap id, so the maker must keep the
+/// accepted swap rather than forget it.
+#[test]
+fn lightning_swap_in_refuses_announced_value_mismatch() {
+    let (maker_ln, taker_ln) = ready_channel_pair();
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::ForgeSwapInFundedValue],
+            vec![MakerBehavior::Normal],
+            vec![maker_ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    taker.set_lightning_backend(taker_ln.clone() as Arc<dyn LightningBackend>);
+
+    fund_taker(
+        taker,
+        bitcoind,
+        3,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2WPKH,
+    );
+    fund_makers(
+        &makers,
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2WPKH,
+    );
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+
+    // Maker and taker share the process logger, so the maker's lines land in
+    // the taker's debug.log. Only lines past this offset belong to the swap.
+    let log_path = test_framework.taker_log_path();
+    let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+
+    // The funding itself is honest: only the announced value is one sat off,
+    // so the value check is the one that refuses.
+    //
+    // The taker announces only once its funding has confirmed, so the maker
+    // checks the value as soon as the message arrives. The taker then waits
+    // minutes for a payment that never comes, long enough for the watchdog
+    // to expire the swap the maker kept. Stop the blocks once the message
+    // is in, so the record checked below is the one the refusal left.
+    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let dispatched = "Dispatching Lightning message: SwapInFunded";
+    let swap_done = AtomicBool::new(false);
+    let (result, paused) = thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            while !swap_done.load(Relaxed) {
+                let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if contents
+                    .get(log_offset as usize..)
+                    .is_some_and(|new| new.contains(dispatched))
+                {
+                    test_framework.set_block_gen_paused(true);
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            false
+        });
+        let result = taker.lightning_swap_in(LnSwapParams {
+            amount: Amount::from_sat(50_000),
+            maker_address: Some(maker_address),
+            locktime: None,
+            min_confirmations: 1,
+        });
+        swap_done.store(true, Relaxed);
+        (result, watcher.join().unwrap())
+    });
+    assert!(paused, "the maker never received the funding message");
+    assert!(
+        result.is_err(),
+        "the maker completed a swap-in with a misannounced value: {:?}",
+        result
+    );
+    assert_eq!(
+        maker_ln.last_pay_cltv_bound(),
+        None,
+        "the maker paid the invoice of a refused swap-in"
+    );
+    let kept: Vec<_> = makers[0]
+        .ln_swaps
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    assert_eq!(
+        kept.len(),
+        1,
+        "the refusal of an unvalidated announcement deleted the accepted swap"
+    );
+    let kept = &kept[0];
+    assert_eq!(kept.phase, LnMakerPhase::InAccepted);
+    assert_eq!(kept.funding, None);
+
+    // Only the value check can have refused: the funding the taker
+    // broadcast passes the maker's own output check for this swap, and no
+    // check after it refused.
+    // The HTLC remains unspent: the maker has not paid the invoice
+    // or learned the preimage needed to sweep, and paused blocks
+    // prevent the taker's CSV refund from becoming spendable.
+    let htlc_address = kept.htlc.address(Network::Regtest).unwrap();
+    let scan = bitcoind
+        .client
+        .scan_tx_out_set_blocking(&[ScanTxOutRequest::Single(format!("addr({htlc_address})"))])
+        .unwrap();
+    let [funding] = scan.unspents.as_slice() else {
+        panic!("expected one funded HTLC output, found {:?}", scan.unspents);
+    };
+    kept.htlc
+        .validate_funding_output(
+            &TxOut {
+                value: funding.amount,
+                script_pubkey: funding.script_pub_key.clone(),
+            },
+            kept.amount + kept.fee,
+        )
+        .expect("the taker's funding is valid for this swap");
+    let contents = std::fs::read_to_string(&log_path).unwrap();
+    let new_lines = contents.get(log_offset as usize..).unwrap_or_default();
+    let refusals: Vec<&str> = new_lines
+        .lines()
+        .filter(|line| line.contains(": refused: "))
+        .collect();
+    // The value-mismatch `reject` logs no ": refused: " line, so an empty list is expected.
+    assert!(
+        refusals.is_empty(),
+        "a check after the value check refused: {:?}",
+        refusals
+    );
+
+    test_framework.set_block_gen_paused(false);
+    drop(takers);
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// With screening on, a taker must refuse to claim a swap-out HTLC whose
+/// funding spends from a listed address, and keep nothing that could claim
+/// it later.
+#[test]
+fn lightning_swap_out_refuses_blocklisted_funding() {
+    let (maker_ln, taker_ln) = ready_channel_pair();
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning_and_blocklist::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![maker_ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    taker.set_lightning_backend(taker_ln.clone() as Arc<dyn LightningBackend>);
+
+    fund_maker_from_one_address(
+        &makers[0],
+        bitcoind,
+        4,
+        Amount::from_btc(0.05).unwrap(),
+        AddressType::P2WPKH,
+    );
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+
+    let blocked_address = sole_regular_utxo_address(&makers[0]);
+    taker
+        .add_blocklist_entry(
+            blocked_address.to_string(),
+            Some("swap-out source".to_string()),
+        )
+        .unwrap();
+
+    let maker_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    match taker.lightning_swap_out(LnSwapParams {
+        amount: Amount::from_sat(40_000),
+        maker_address: Some(maker_address),
+        locktime: Some(30),
+        min_confirmations: 1,
+    }) {
+        Err(TakerError::Blocklist(BlocklistError::BlockedAddress { entry, .. })) => {
+            assert_eq!(entry.address, blocked_address.to_string());
+        }
+        Err(other) => panic!("expected blocked-address error, got {:?}", other),
+        Ok(report) => panic!(
+            "the taker claimed swap-out funding from a blocked address: {:?}",
+            report
+        ),
+    }
+
+    // Refused before the outpoint was recorded, so recovery holds nothing
+    // that could claim the listed coins later.
+    let outcomes = taker.recover_lightning_swaps().unwrap();
+    assert_eq!(outcomes.len(), 1, "{:?}", outcomes);
+    assert!(
+        outcomes[0].contains("no on-chain commitment"),
+        "{:?}",
+        outcomes
+    );
+
+    drop(takers);
+    shutdown_makers(&makers, maker_threads);
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

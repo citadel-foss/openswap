@@ -98,7 +98,7 @@ fn maker_abort2_case2() {
 
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14995985,
+        14995952,
         "Taker spendable balance mismatch"
     );
     assert_eq!(

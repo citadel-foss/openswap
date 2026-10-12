@@ -72,7 +72,7 @@ fn test_taproot_openswap() {
     let summary = taker
         .prepare_swap(swap_params)
         .expect("Failed to prepare Taproot openswap");
-    taker
+    let report = taker
         .start_swap(&summary.swap_id)
         .expect("Taproot openswap should complete successfully");
     log::info!("Taproot openswap completed successfully!");
@@ -109,10 +109,10 @@ fn test_taproot_openswap() {
 
     assert_eq!(
         taker_balances.regular.to_sat(),
-        14499538,
+        14500000,
         "Taker regular balance mismatch"
     );
-    assert_eq!(taker_balances.swap.to_sat(), 496789, "Taker swap balance");
+    assert_eq!(taker_balances.swap.to_sat(), 496294, "Taker swap balance");
     assert_eq!(
         taker_balances.contract.to_sat(),
         0,
@@ -128,13 +128,14 @@ fn test_taproot_openswap() {
 
     assert_eq!(
         balance_diff.to_sat(),
-        3673,
+        3706,
         "Taker spendable balance change"
     );
+    assert_taker_report_exact(&report, Amount::from_sat(500000), balance_diff);
 
     // Verify makers earned fees
-    let expected_regular = [14500751, 14502170];
-    let expected_swap = [499664, 498208];
+    let expected_regular = [14501246, 14502665];
+    let expected_swap = [499169, 497713];
     let expected_fee = [658, 621];
     for (i, (maker, original_spendable)) in makers.iter().zip(maker_spendable_balance).enumerate() {
         let balances = maker.wallet.read().unwrap().get_balances().unwrap();
@@ -176,17 +177,33 @@ fn test_taproot_openswap() {
         assert_eq!(maker_fee.to_sat(), expected_fee[i], "Maker {i} fee earned");
     }
 
-    // Every swap tx must pay the negotiated 1 sat/vB: funding txs price their
-    // real vsize; sweeps pay the 112 vB taproot key-path model they were built
-    // at. A completed swap mines 9 funding txs (3 splits x 3 parties), 9 sweeps.
+    // Every swap tx must pay the negotiated 1 sat/vB: maker funding txs price
+    // their real vsize; the taker's own pay the 165 vB one-input model out of
+    // the send amount, at or above their real vsize; sweeps pay the 112 vB
+    // taproot key-path model they were built at.
+    // A completed swap mines 9 funding txs (3 splits x 3 parties), 9 sweeps.
     let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[9, 9]);
+    let mut taker_funding = 0;
     for txid in &depths[0] {
         let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
+        if fee == vsize as u64 {
+            continue;
+        }
         assert_eq!(
-            fee, vsize as u64,
-            "funding tx {txid} must pay exactly 1 sat/vB"
+            fee, 165,
+            "funding tx {txid} must pay 1 sat/vB or the 165 vB model"
         );
+        assert!(
+            vsize <= 165,
+            "taker funding tx {} exceeds its 165 vB model",
+            txid
+        );
+        taker_funding += 1;
     }
+    assert_eq!(
+        taker_funding, 3,
+        "only the taker's 3 funding txs pay the model"
+    );
     for txid in &depths[1] {
         let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
         assert_eq!(fee, 112, "sweep tx {txid} must pay the 112 vB model");
