@@ -333,11 +333,18 @@ impl AddressBlocklist {
         let (file, mut current) = self.read_current()?;
         let mut outcome = AddOutcome::default();
 
-        for (entry, script) in entries.into_iter().zip(scripts) {
-            match current.insert(script, entry) {
-                Some(_) => outcome.updated += 1,
+        for (mut entry, script) in entries.into_iter().zip(scripts) {
+            match current.remove(&script) {
+                // A relabel must not drop fields a newer build wrote.
+                Some(old) => {
+                    for (key, value) in old.extra {
+                        entry.extra.entry(key).or_insert(value);
+                    }
+                    outcome.updated += 1;
+                }
                 None => outcome.added += 1,
             }
+            current.insert(script, entry);
         }
         self.commit(&lock, file, current)?;
         Ok(outcome)
@@ -677,6 +684,13 @@ mod tests {
         book.remove(vec![added.address]).unwrap();
         let saved: Value = read_json(&path).unwrap();
         assert_eq!(saved["future"], 7);
+        assert_eq!(saved["entries"][0]["note"], "x");
+
+        // Relabelling the same address keeps the unknown field too.
+        book.add(vec![BlocklistEntry::new(kept, Some("new".into()))])
+            .unwrap();
+        let saved: Value = read_json(&path).unwrap();
+        assert_eq!(saved["entries"][0]["label"], "new");
         assert_eq!(saved["entries"][0]["note"], "x");
     }
 
