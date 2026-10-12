@@ -1592,12 +1592,17 @@ pub fn assert_wallet_has_deniability_proofs(
     label: &str,
     expected_count: usize,
 ) {
-    let mut wallet = wallet.write().unwrap();
+    let wallet = wallet.read().unwrap();
     // Check what was saved, not what is in memory.
-    wallet
-        .reload_store_from_disk("integration-test")
-        .unwrap_or_else(|e| panic!("{} wallet reload failed: {}", label, e));
-    let proofs = wallet.swap_reports().deniability_proofs;
+    let proofs = wallet
+        .saved_deniability_proofs("integration-test")
+        .unwrap_or_else(|e| panic!("{} wallet read failed: {}", label, e));
+    assert_eq!(
+        proofs,
+        wallet.swap_reports().deniability_proofs,
+        "{} saved proofs differ from the live wallet",
+        label
+    );
     assert_eq!(
         proofs.len(),
         expected_count,

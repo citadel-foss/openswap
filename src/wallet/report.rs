@@ -19,6 +19,8 @@ use std::{collections::HashMap, path::Path, time::Instant};
 
 use crate::utill::now_secs;
 
+#[cfg(feature = "integration-test")]
+use super::storage::WalletStore;
 use super::{
     deniability::{proof_from_swapcoins, DeniabilityProof},
     swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
@@ -74,6 +76,24 @@ impl Wallet {
             recovery: self.decoded_reports(RECOVERY_REPORTS),
             deniability_proofs: self.decoded_reports(DENIABILITY_PROOFS),
         }
+    }
+
+    /// The deniability proofs in the saved file, so a test sees only what
+    /// reached the disk. Reads a copy; the live store is left alone.
+    #[cfg(feature = "integration-test")]
+    pub fn saved_deniability_proofs(
+        &self,
+        password: &str,
+    ) -> Result<Vec<DeniabilityProof>, WalletError> {
+        let (store, _) =
+            WalletStore::read_from_disk(&self.wallet_file_path, Some(password.to_string()))?;
+        store
+            .reports
+            .get(DENIABILITY_PROOFS)
+            .into_iter()
+            .flatten()
+            .map(|value| from_value(value.clone()).map_err(|e| WalletError::General(e.to_string())))
+            .collect()
     }
 }
 
