@@ -54,6 +54,24 @@ pub fn supported() -> Vec<&'static str> {
         .collect()
 }
 
+/// Most names a peer's feature list may hold.
+pub const MAX_FEATURES: usize = 128;
+/// Longest feature name a peer may send.
+pub const MAX_FEATURE_NAME_LEN: usize = 64;
+
+/// Refuses a list with too many names or an overlong one.
+pub fn check_bounds(names: &[String]) -> Result<(), String> {
+    if names.len() > MAX_FEATURES {
+        return Err(format!("more than {MAX_FEATURES} feature names"));
+    }
+    if names.iter().any(|n| n.len() > MAX_FEATURE_NAME_LEN) {
+        return Err(format!(
+            "a feature name is longer than {MAX_FEATURE_NAME_LEN} bytes"
+        ));
+    }
+    Ok(())
+}
+
 /// Splits `x-vN` into family `x` and version N. A name without a canonical
 /// `-vN` suffix (no leading zero) is its own family at version 0.
 pub fn family_and_version(name: &str) -> (&str, u32) {
@@ -148,6 +166,7 @@ pub fn unmet_for_flow(required: &[String], pins: &[String], flow: &str) -> Resul
 /// name we serve that changes that one flow, at most one per family, and our
 /// requirements for the flow must be met.
 pub fn check_pins(pins: &[String], required: &[String]) -> Result<&'static str, String> {
+    check_bounds(pins)?;
     let ours = supported();
     let flows: Vec<&'static str> = ours
         .iter()
@@ -181,6 +200,9 @@ pub fn check_pins(pins: &[String], required: &[String]) -> Result<&'static str, 
 /// startup; a name this build can't serve only warns, as requiring it is the user's choice.
 pub(crate) fn parse_require_features(value: Option<&String>) -> io::Result<Vec<String>> {
     let names = parse_list(value)?;
+    check_bounds(&names).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("require_features: {e}"))
+    })?;
     if let Some(bad) = names.iter().find(|n| !is_valid_name(n)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -284,6 +306,15 @@ mod tests {
             cfg!(feature = "lightning")
         );
         assert!(supported().contains(&"taproot"));
+    }
+
+    #[test]
+    fn feature_lists_are_bounded() {
+        let names = |n: usize| vec!["a".to_string(); n];
+        assert!(check_bounds(&names(MAX_FEATURES)).is_ok());
+        assert!(check_bounds(&names(MAX_FEATURES + 1)).is_err());
+        assert!(check_bounds(&["a".repeat(MAX_FEATURE_NAME_LEN + 1)]).is_err());
+        assert!(check_pins(&names(MAX_FEATURES + 1), &[]).is_err());
     }
 
     #[test]
