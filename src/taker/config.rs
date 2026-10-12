@@ -157,7 +157,9 @@ require_features = [{}]",
 #[cfg(test)]
 mod tests {
 
-    use crate::{maker::MakerServerConfig, taker::api::REFUND_LOCKTIME_BASE};
+    use crate::{
+        maker::MakerServerConfig, taker::api::REFUND_LOCKTIME_BASE, wallet::MIN_FIDELITY_TIMELOCK,
+    };
 
     use super::*;
     use std::{
@@ -177,6 +179,7 @@ mod tests {
             network_port = 16102\nrpc_port = 16103\nbase_fee = 700\n\
             name = \"old-maker\"\nldk_server_url = localhost:3537\n\
             ldk_api_key_path = /tmp/ldk/api_key\nldk_tls_cert_path = /tmp/ldk/tls.crt\n";
+        let original = &format!("{original}fidelity_timelock = {MIN_FIDELITY_TIMELOCK}\n");
         fs::write(&path, original).unwrap();
         let maker = MakerServerConfig::new(Some(&path)).unwrap();
         let taker = TakerConfig::new(Some(&path)).unwrap();
@@ -198,7 +201,7 @@ mod tests {
         assert_eq!(taker.ldk_server_url.as_deref(), Some("localhost:3537"));
         assert_eq!(taker.ldk_api_key_path.as_deref(), Some("/tmp/ldk/api_key"));
         assert_eq!(taker.ldk_tls_cert_path.as_deref(), Some("/tmp/ldk/tls.crt"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(fs::read_to_string(&path).unwrap(), *original);
     }
 
     #[test]
@@ -207,6 +210,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let original = "# future config\nfuture_key = { enabled = true }\n\
             require_features = [\"taproot\", \"future-v2\", \"ln-swap-out\"]\n";
+        let original = &format!("{original}fidelity_timelock = {MIN_FIDELITY_TIMELOCK}\n");
         fs::write(&path, original).unwrap();
         let expected = ["taproot", "future-v2", "ln-swap-out"];
         assert_eq!(
@@ -219,7 +223,7 @@ mod tests {
             TakerConfig::new(Some(&path)).unwrap().require_features,
             expected
         );
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(fs::read_to_string(&path).unwrap(), *original);
     }
 
     #[test]
@@ -263,7 +267,10 @@ mod tests {
                 vec!["taproot", "future-v2"],
             ),
         ] {
-            let original = format!("require_features = {value}\nfuture_key = keep\n");
+            let original = format!(
+                "require_features = {value}\nfuture_key = keep\n\
+                 fidelity_timelock = {MIN_FIDELITY_TIMELOCK}\n"
+            );
             fs::write(&path, &original).unwrap();
             let maker = MakerServerConfig::new(Some(&path)).unwrap();
             let taker = TakerConfig::new(Some(&path)).unwrap();
@@ -332,6 +339,7 @@ mod tests {
             let requires: Vec<String> = names.iter().map(|n| n.to_string()).collect();
             let maker = MakerServerConfig {
                 require_features: requires.clone(),
+                fidelity_timelock: MIN_FIDELITY_TIMELOCK,
                 ..MakerServerConfig::default()
             };
             maker.write_to_file(&path).unwrap();
