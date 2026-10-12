@@ -515,8 +515,13 @@ fn process_taproot_contract<M: Maker>(
     for incoming in &incoming_swapcoins {
         maker.save_incoming_swapcoin(incoming)?;
     }
+    // A withholding maker never sends, so its recovery must not send either.
+    #[cfg(feature = "integration-test")]
+    let commit = maker.behavior() != MakerBehavior::WithholdFundingSilently;
+    #[cfg(not(feature = "integration-test"))]
+    let commit = true;
     for outgoing in outgoing_swapcoins.iter_mut() {
-        outgoing.committed = true;
+        outgoing.committed = commit;
         maker.save_outgoing_swapcoin(outgoing)?;
     }
     state.outgoing_swapcoins = outgoing_swapcoins.clone();
