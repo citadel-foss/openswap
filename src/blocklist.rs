@@ -11,6 +11,7 @@ use crate::{
 };
 use bitcoin::{Network, OutPoint, Script, ScriptBuf, Transaction};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::{
     collections::HashMap,
     fmt, io,
@@ -32,6 +33,9 @@ pub struct BlocklistEntry {
     /// Optional note describing why the address is blocked.
     #[serde(default)]
     pub label: Option<String>,
+    /// Fields a newer build wrote; kept so a rewrite does not drop them.
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +56,9 @@ struct BlocklistFile {
     requires: Vec<String>,
     #[serde(default)]
     entries: Vec<BlocklistEntry>,
+    /// Top-level fields a newer build wrote; kept so a rewrite does not drop them.
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 /// Only the names, read before any entry is decoded.
@@ -149,7 +156,11 @@ impl From<WalletError> for BlocklistError {
 impl BlocklistEntry {
     /// Construct an address entry with an optional explanatory label.
     pub fn new(address: String, label: Option<String>) -> Self {
-        Self { address, label }
+        Self {
+            address,
+            label,
+            extra: Map::new(),
+        }
     }
 }
 
@@ -290,21 +301,19 @@ impl AddressBlocklist {
 
     fn read_current(
         &self,
-    ) -> Result<(Vec<String>, HashMap<ScriptBuf, BlocklistEntry>), BlocklistError> {
-        let file = read_blocklist(&self.path)?;
-        Ok((file.requires, index_entries(file.entries, self.network)))
+    ) -> Result<(BlocklistFile, HashMap<ScriptBuf, BlocklistEntry>), BlocklistError> {
+        let mut file = read_blocklist(&self.path)?;
+        let entries = index_entries(std::mem::take(&mut file.entries), self.network);
+        Ok((file, entries))
     }
 
     fn commit(
         &mut self,
         _lock: &FileLock,
-        requires: Vec<String>,
+        mut file: BlocklistFile,
         entries: HashMap<ScriptBuf, BlocklistEntry>,
     ) -> Result<(), BlocklistError> {
-        let file = BlocklistFile {
-            requires,
-            entries: entries.values().cloned().collect(),
-        };
+        file.entries = entries.values().cloned().collect();
 
         write_json_atomically(&self.path, &file)?;
         self.inner = entries;
@@ -321,7 +330,7 @@ impl AddressBlocklist {
 
         let lock_path = self.path.with_extension("lock");
         let lock = FileLock::acquire(&lock_path)?;
-        let (requires, mut current) = self.read_current()?;
+        let (file, mut current) = self.read_current()?;
         let mut outcome = AddOutcome::default();
 
         for (entry, script) in entries.into_iter().zip(scripts) {
@@ -330,7 +339,7 @@ impl AddressBlocklist {
                 None => outcome.added += 1,
             }
         }
-        self.commit(&lock, requires, current)?;
+        self.commit(&lock, file, current)?;
         Ok(outcome)
     }
 
@@ -343,14 +352,14 @@ impl AddressBlocklist {
 
         let lock_path = self.path.with_extension("lock");
         let lock = FileLock::acquire(&lock_path)?;
-        let (requires, mut current) = self.read_current()?;
+        let (file, mut current) = self.read_current()?;
 
         let removed = scripts
             .into_iter()
             .filter(|script| current.remove(script).is_some())
             .count();
 
-        self.commit(&lock, requires, current)?;
+        self.commit(&lock, file, current)?;
         Ok(removed)
     }
 
@@ -495,6 +504,7 @@ mod tests {
             serde_json::to_vec(&BlocklistFile {
                 requires: requires.clone(),
                 entries,
+                extra: Map::new(),
             })
             .unwrap(),
         )
@@ -648,6 +658,26 @@ mod tests {
             Err(other) => panic!("unexpected error: {}", other),
             Ok(_) => panic!("malformed blocklist must not be treated as empty"),
         }
+    }
+
+    #[test]
+    fn rewrites_keep_fields_this_build_does_not_know() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("taker");
+        let path = blocklist_path(&data_dir);
+        let kept = test_address(1, Network::Regtest).to_string();
+        std::fs::write(
+            &path,
+            format!(r#"{{"future":7,"entries":[{{"address":"{kept}","note":"x"}}]}}"#),
+        )
+        .unwrap();
+        let mut book = AddressBlocklist::load(&data_dir, Network::Regtest).unwrap();
+        let added = BlocklistEntry::new(test_address(2, Network::Regtest).to_string(), None);
+        book.add(vec![added.clone()]).unwrap();
+        book.remove(vec![added.address]).unwrap();
+        let saved: Value = read_json(&path).unwrap();
+        assert_eq!(saved["future"], 7);
+        assert_eq!(saved["entries"][0]["note"], "x");
     }
 
     #[test]
