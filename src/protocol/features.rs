@@ -127,6 +127,18 @@ fn applies_to(required: &str, flow: &str) -> bool {
     known.peek().is_none() || known.any(|f| f.flows.contains(&flow))
 }
 
+/// The requirements the Hello can already judge: families this build doesn't
+/// know apply to every flow. Known families wait for the swap's pins.
+pub fn unmet_at_hello(required: &[String], offered: &[String]) -> Result<(), Vec<String>> {
+    check_requires(
+        required.iter().filter(|r| {
+            let family = family_and_version(r).0;
+            !KNOWN.iter().any(|f| family_and_version(f.name).0 == family)
+        }),
+        offered,
+    )
+}
+
 /// The requirements a swap on `flow` leaves unmet with these pins.
 pub fn unmet_for_flow(required: &[String], pins: &[String], flow: &str) -> Result<(), Vec<String>> {
     check_requires(required.iter().filter(|r| applies_to(r, flow)), pins)
@@ -272,6 +284,16 @@ mod tests {
             cfg!(feature = "lightning")
         );
         assert!(supported().contains(&"taproot"));
+    }
+
+    #[test]
+    fn hello_defers_known_families_to_pins() {
+        let required = vec!["ln-swap-out".to_string(), "x-v1".to_string()];
+        assert_eq!(
+            unmet_at_hello(&required, &[]),
+            Err(vec!["x-v1".to_string()])
+        );
+        assert_eq!(unmet_at_hello(&required, &["x-v1".to_string()]), Ok(()));
     }
 
     #[test]

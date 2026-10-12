@@ -13,7 +13,7 @@ use crate::{
             AckSwapDetails, FidelityProof, GetOffer, Hello, MakerToTakerMessage, Offer,
             ProtocolVersion, SwapDetails, TakerToMakerMessage, UnsupportedMessage,
         },
-        features::{check_pins, check_requires, supported},
+        features::{check_pins, supported, unmet_at_hello},
         legacy_messages::LegacyTakerMessage,
         taproot_messages::TaprootTakerMessage,
     },
@@ -924,7 +924,8 @@ pub fn handle_message<M: Maker>(
     }
 }
 
-/// Handle the taker's Hello: it must list every feature we require.
+/// Handle the taker's Hello: it must list every unknown-family feature we
+/// require. Known ones are checked per flow when the swap is pinned.
 fn handle_hello<M: Maker>(
     maker: &Arc<M>,
     state: &mut ConnectionState,
@@ -933,7 +934,7 @@ fn handle_hello<M: Maker>(
     state.expect_phase(&[SwapPhase::AwaitingHello])?;
 
     let config = maker.get_config();
-    if let Err(missing) = check_requires(&config.require_features, &hello.features) {
+    if let Err(missing) = unmet_at_hello(&config.require_features, &hello.features) {
         log::info!(
             "[{}] Refusing a taker without required features {:?}",
             Maker::network_port(maker.as_ref()),
