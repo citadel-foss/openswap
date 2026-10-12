@@ -1447,10 +1447,17 @@ impl Wallet {
                     // step. Pays the saved recovery address, never one read off the
                     // backend's tx. An unreplaced refund is recorded once mined.
                     ContractChainState::RecoveryPending(pending) => {
-                        let (Some(address), Some(contract_output)) = (
-                            swapcoin.recovery_address.as_ref(),
-                            swapcoin.contract_tx.output.get(contract_vout as usize),
-                        ) else {
+                        let Some(address) = swapcoin.recovery_address.as_ref() else {
+                            log::debug!(
+                                "Not fee-bumping refund {} for swap {}: no stored recovery address",
+                                pending.compute_txid(),
+                                swap_id
+                            );
+                            return Ok(());
+                        };
+                        let Some(contract_output) =
+                            swapcoin.contract_tx.output.get(contract_vout as usize)
+                        else {
                             return Ok(());
                         };
                         let fee_of = |tx: &Transaction| {
