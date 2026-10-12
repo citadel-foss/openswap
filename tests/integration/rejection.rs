@@ -2016,7 +2016,8 @@ fn maker_recovers_partial_broadcast_legacy() {
 
 #[test]
 fn maker_recovers_partial_broadcast_taproot() {
-    run_maker_partial_broadcast::<BitcoindBackend>(ProtocolVersion::Taproot, 14_999_463);
+    // The committed unsent split is sent and refunded too: 154 + 140 sats of fees.
+    run_maker_partial_broadcast::<BitcoindBackend>(ProtocolVersion::Taproot, 14_999_169);
 }
 
 #[test]
