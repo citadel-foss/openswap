@@ -709,6 +709,8 @@ impl WalletStore {
             archive_legacy_file(&report_path, bytes)?;
         }
         // Both archives must survive a crash before the live wallet is replaced.
+        // Windows cannot open a directory as a file, so the sync is Unix only.
+        #[cfg(unix)]
         File::open(parent)?.sync_all()?;
         store.write_to_disk(path, &material)?;
         // The entries are committed now, and a later load never imports the

@@ -87,9 +87,11 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 
     std::fs::rename(&temporary_path, path)?;
-    // Without this the rename itself can be lost in a crash.
+    // Without this the rename itself can be lost in a crash. Windows cannot
+    // open a directory as a file, so the sync is Unix only.
+    #[cfg(unix)]
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::File::open(parent)?.sync_all()?;
+        File::open(parent)?.sync_all()?;
     }
     Ok(())
 }
