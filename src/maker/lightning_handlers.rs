@@ -589,16 +589,9 @@ fn handle_swap_in_request<M: Maker>(
         ));
     }
 
-    // The node keeps every payment under its hash, after the swap that made
-    // it is gone. A hash it already knows cannot be this swap's: ldk-node
-    // refuses to pay a hash it holds a pending or succeeded payment for, in
-    // either direction, and an old outbound payment's preimage would read as
-    // this swap's settlement and sweep the taker's HTLC unpaid. Refusing the
-    // hash here, before anything is stored, means an outbound payment on
-    // record for it is this swap's own, unless the node's operator pays the
-    // hash by hand. Inbound records that appear later never count:
-    // payment_outcome reads only outbound ones. It runs after the checks
-    // above, so a request they refuse never costs a lookup.
+    // Refuse a hash the node already has a record of, before storing anything:
+    // an old outbound preimage would read as this swap's settlement. Runs after
+    // the local checks, so a request they refuse costs no lookup.
     match ctx.ln.has_payment_record(req.payment_hash) {
         Ok(false) => {}
         Ok(true) => return Ok(reject(&req.swap_id, "payment hash already used")),
