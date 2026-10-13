@@ -1124,6 +1124,16 @@ impl Wallet {
                 return Ok(ContractChainState::NotYet);
             }
         };
+        // A send that failed or never ran leaves a committed legacy funding
+        // unknown, and its contract can't go out without it. Only sent once
+        // the contract is signed, so the funds can always come back.
+        if let Some(funding) = funding.filter(|_| swapcoin.protocol == ProtocolVersion::Legacy) {
+            if chain.is_tx_unknown(&funding.compute_txid())? {
+                if let Err(e) = chain.send_raw_transaction(funding) {
+                    log::warn!("Failed to resend funding tx for {}: {:?}", swap_id, e);
+                }
+            }
+        }
         if let Err(e) = chain.send_raw_transaction(&signed_contract) {
             if chain
                 .get_tx_out(&contract_txid, contract_vout, Some(true))?
@@ -6127,6 +6137,40 @@ mod mempool_deferral_tests {
         assert_eq!(
             Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
             ContractChainState::Discarded
+        );
+    }
+
+    #[test]
+    fn committed_legacy_resends_unknown_funding_before_its_contract() {
+        let parent = tx(OutPoint::null(), 100_000, ScriptBuf::new());
+        let funding = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            50_000,
+            ScriptBuf::new(),
+        );
+        let mut coin = outgoing_coin();
+        coin.contract_tx.input[0].previous_output = OutPoint::new(funding.compute_txid(), 0);
+        coin.funding_tx = Some(funding.clone());
+        let chain = StubChain::with(&[(&parent, 50)]);
+        let url = start_electrum_stub(chain.clone());
+        let backend = electrum(&url);
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::NotYet
+        );
+        assert!(chain.lock().unwrap().broadcast.is_empty());
+
+        let digest = secp256k1::Message::from_digest([1; 32]);
+        coin.others_contract_sig = Some(bitcoin::ecdsa::Signature::sighash_all(
+            crate::utill::global_secp().sign_ecdsa(&digest, &key(3)),
+        ));
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::OnChain
+        );
+        assert_eq!(
+            chain.lock().unwrap().broadcast,
+            vec![funding.compute_txid(), coin.contract_tx.compute_txid()]
         );
     }
 

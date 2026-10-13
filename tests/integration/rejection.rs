@@ -1972,7 +1972,7 @@ fn wait_for_maker_timelock_recovery(
 
 /// The maker's second funding broadcast fails with the first tx already sent.
 /// The partial batch must not read as never broadcast: recovery keeps the
-/// swap's material and reclaims the on-chain split via timelock.
+/// swap's material, sends the unsent split and reclaims both via timelock.
 fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expected_spendable: u64) {
     warn!(
         "Running Test: maker partial funding broadcast recovery ({:?})",
@@ -2020,10 +2020,17 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
         timelock_recovery_wait::<B>() + Duration::from_secs(120),
     );
 
+    // Recovery sends the unsent split too. Legacy contracts both go out when
+    // recovery starts, so both splits come back together; a Taproot split
+    // went out with the swap, so the resent one comes back later.
+    let splits_left = match protocol {
+        ProtocolVersion::Legacy => 0,
+        ProtocolVersion::Taproot => 1,
+    };
     assert_eq!(
         recovered.len(),
-        1,
-        "the on-chain split must be timelock-recovered"
+        2 - splits_left,
+        "every sent split must be timelock-recovered"
     );
 
     let log_contents = std::fs::read_to_string(&log_path).unwrap();
@@ -2032,11 +2039,10 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
         "a partial batch must never be discarded as never broadcast"
     );
 
-    // The unsent split is committed too: its transaction may still confirm.
     let wallet = makers[0].wallet.read().unwrap();
-    assert_eq!(wallet.get_outgoing_swapcoins_count(), 1);
+    assert_eq!(wallet.get_outgoing_swapcoins_count(), splits_left);
     drop(wallet);
-    assert!(makers[0].reserved_inputs().unwrap() > 0);
+    assert_eq!(makers[0].reserved_inputs().unwrap() > 0, splits_left > 0);
     shutdown_makers(&makers, maker_threads);
 
     generate_blocks(bitcoind, 1);
@@ -2067,7 +2073,8 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
 
 #[test]
 fn maker_recovers_partial_broadcast_legacy() {
-    run_maker_partial_broadcast::<BitcoindBackend>(ProtocolVersion::Legacy, 14_999_311);
+    // The unsent split is sent, locked and refunded too: 446 sats of fees.
+    run_maker_partial_broadcast::<BitcoindBackend>(ProtocolVersion::Legacy, 14_998_865);
 }
 
 #[test]
@@ -2078,7 +2085,7 @@ fn maker_recovers_partial_broadcast_taproot() {
 
 #[test]
 fn maker_recovers_partial_broadcast_electrum() {
-    run_maker_partial_broadcast::<ElectrumBackend>(ProtocolVersion::Legacy, 14_999_311);
+    run_maker_partial_broadcast::<ElectrumBackend>(ProtocolVersion::Legacy, 14_998_865);
 }
 
 /// The taker's second funding broadcast fails with the first split already in
@@ -2157,19 +2164,18 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         "a failed broadcast must keep its inputs claimed"
     );
 
-    // The broadcast split is refunded. The committed unbroadcast split remains:
-    // absence cannot prove it is safe to forget those recovery keys.
+    // Recovery sends the unsent split too, so both splits come back together.
     let recovery_start = Instant::now();
     while taker
         .get_wallet()
         .read()
         .unwrap()
         .get_outgoing_swapcoins_count()
-        > 1
+        > 0
     {
         assert!(
             recovery_start.elapsed() <= Duration::from_secs(360),
-            "the broadcast split was not recovered in time"
+            "the splits were not recovered in time"
         );
         thread::sleep(Duration::from_secs(5));
     }
@@ -2179,10 +2185,6 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         "recovery must release the claim of the swap it settled"
     );
 
-    assert!(
-        !taker.is_recovery_complete(),
-        "the committed unsent split stays held"
-    );
     assert!(
         taker
             .get_wallet()
@@ -2194,9 +2196,9 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
             .any(|report| {
                 report.swap_id == swap_id
                     && report.recovery_type == "timelock"
-                    && report.recovery_txids.len() == 1
+                    && report.recovery_txids.len() == 2
             }),
-        "the confirmed refund must be stored with the coin removal"
+        "the confirmed refunds must be stored with the coin removal"
     );
     generate_blocks(bitcoind, 1);
     test_framework.wait_for_electrs_tip();
@@ -2229,7 +2231,8 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
 
 #[test]
 fn taker_recovers_partial_broadcast_with_spare_maker() {
-    run_taker_recovers_partial_broadcast_with_spare_maker::<BitcoindBackend>(14_999_543);
+    // The unsent split is sent, locked and refunded too: 457 sats of fees.
+    run_taker_recovers_partial_broadcast_with_spare_maker::<BitcoindBackend>(14_999_086);
 }
 
 /// The same partial batch on Electrum: the backend can lag the session's own
@@ -2237,7 +2240,7 @@ fn taker_recovers_partial_broadcast_with_spare_maker() {
 /// the recovery material intact.
 #[test]
 fn taker_recovers_partial_broadcast_with_spare_maker_electrum() {
-    run_taker_recovers_partial_broadcast_with_spare_maker::<ElectrumBackend>(14_999_543);
+    run_taker_recovers_partial_broadcast_with_spare_maker::<ElectrumBackend>(14_999_086);
 }
 
 /// One replay-guard scenario: swap 1 either completes or dies with the maker's

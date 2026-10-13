@@ -397,7 +397,7 @@ Go back only like this:
 
 ### A coin that stays locked
 
-Before your node sends funding, it saves the coin as committed. Your node then keeps that coin until a timelock refund, or until a confirmed transaction spends its inputs elsewhere. A crash between the save and the send can leave a coin held this way.
+Before your node sends funding, it saves the coin as committed. Your node then keeps that coin until a timelock refund, or until a confirmed transaction spends its inputs elsewhere. A crash between the save and the send can leave a coin held this way. A failed send does the same, for example when your node loses its connection to the backend.
 
 - **If the funding reached the chain**, leave your node running. The refund frees the coin when its timelock matures.
-- **If the funding never left your node**, nothing is on the chain and your original coins are untouched. A Taproot swap still sends its saved funding and then refunds, so keep recovery running. A legacy swap cannot clear the held record by itself. Do not edit the wallet file. Ask for help in the [community forum](https://matrix.to/#/#citadel-foss:matrix.org) or open an issue.
+- **If the funding never left your node**, recovery sends the saved funding and then refunds it. This holds for Legacy and Taproot swaps alike. Leave your node running until the refund confirms. You pay the network fees of those transactions. Do not edit the wallet file.
