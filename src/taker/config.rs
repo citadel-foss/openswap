@@ -22,7 +22,7 @@ pub struct TakerConfig {
     pub tor_auth_password: String,
     /// Whether funding inputs should be checked against the address blocklist.
     pub check_blocklist: bool,
-    /// Feature names every maker in a swap must support.
+    /// Feature names every maker must support, each only in the swaps it applies to.
     pub require_features: Vec<String>,
     /// LDK Server gRPC address (`host:port`, no scheme) for Lightning swaps.
     pub ldk_server_url: Option<String>,
@@ -111,7 +111,7 @@ socks_port = {}
 tor_auth_password = {}
 # Check funding inputs against the address blocklist
 check_blocklist = {}
-# Feature names every maker must support, on one line, e.g. [\"taproot\"]
+# Features every maker must support in the swaps they apply to, on one line, e.g. [\"taproot\"]
 require_features = [{}]",
             self.control_port,
             self.socks_port,

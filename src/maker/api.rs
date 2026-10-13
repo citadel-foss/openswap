@@ -283,7 +283,7 @@ pub struct MakerServerConfig {
     pub required_confirms: u32,
     /// Whether funding inputs should be checked against the address blocklist.
     pub check_blocklist: bool,
-    /// Feature names a taker must support to swap with this maker.
+    /// Feature names a taker must support, each only in the swaps it applies to.
     pub require_features: Vec<String>,
     /// Fidelity bond amount in satoshis.
     pub fidelity_amount: u64,
@@ -520,7 +520,7 @@ time_relative_fee_pct = {}
 required_confirms = {}
 # Check funding inputs against the address blocklist
 check_blocklist = {}
-# Feature names a taker must support, on one line, e.g. [\"taproot\"]
+# Features a taker must support in the swaps they apply to, on one line, e.g. [\"taproot\"]
 require_features = [{}]
 # Public name shown to takers (required, at most {} characters, no control characters)
 name = \"{}\"

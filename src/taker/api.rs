@@ -513,7 +513,7 @@ impl Taker {
 pub struct Taker {
     /// Configuration.
     pub(crate) config: TakerInitConfig,
-    /// Feature names every swap must pin, from `require_features` in config.toml.
+    /// Feature names a swap must pin where they apply, from `require_features` in config.toml.
     pub(crate) require_features: Vec<String>,
     /// Wallet for managing funds.
     pub(crate) wallet: Arc<RwLock<Wallet>>,

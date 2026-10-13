@@ -392,7 +392,7 @@ Go back only like this:
 ### Later releases
 
 - A newer wallet may need a feature your build does not have. Your build then refuses to open it and names the missing feature. Upgrade and try again.
-- The `require_features` setting lists features you insist on in every swap. It must sit on one line. That line takes no comment.
+- The `require_features` setting lists features you insist on. Each one counts only in the swaps it belongs to. For example, `taproot` counts in Taproot swaps only. It does not turn Legacy swaps off, and no setting does. A name your node does not know counts in every swap. The list must sit on one line. That line takes no comment.
 - Changing the default of `require_features` in a later release counts as a break.
 
 ### A coin that stays locked

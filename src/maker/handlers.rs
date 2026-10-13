@@ -898,7 +898,7 @@ pub struct MakerConfig {
     pub max_swap_amount: u64,
     /// Required confirmations.
     pub required_confirms: u32,
-    /// Feature names a taker must support.
+    /// Feature names a taker must support, each only in the swaps it applies to.
     pub require_features: Vec<String>,
     /// Public name sent in the offer.
     pub name: String,
