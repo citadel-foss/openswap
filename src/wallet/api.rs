@@ -1959,6 +1959,22 @@ impl Wallet {
         true
     }
 
+    /// [`Self::claim_swap_inputs`], except that inputs `swap_key` already holds
+    /// pass as they are: rebuilding a swap's funding must not lose to its own
+    /// claim.
+    pub(crate) fn claim_or_hold_swap_inputs(
+        &mut self,
+        swap_key: &str,
+        inputs: &[OutPoint],
+    ) -> bool {
+        let held = self
+            .store
+            .swap_locks
+            .get(swap_key)
+            .is_some_and(|locks| inputs.iter().all(|input| locks.outpoints.contains(input)));
+        held || self.claim_swap_inputs(swap_key, inputs)
+    }
+
     /// `Some(inputs)` frees the inputs of a funding transaction the backend
     /// accepted, and drops them from the cache so no claim reads them as free
     /// before the next sync; `None` drops the whole swap's reservation. Never
@@ -1995,6 +2011,18 @@ impl Wallet {
             .swap_locks
             .values()
             .any(|locks| locks.outpoints.contains(outpoint))
+    }
+
+    /// Test-only: reserve `outpoints` for `swap_key` and persist it, as
+    /// another swap's claim would be.
+    #[cfg(feature = "integration-test")]
+    pub fn reserve_swap_locks_for_test(
+        &mut self,
+        swap_key: &str,
+        outpoints: &[OutPoint],
+    ) -> Result<(), WalletError> {
+        self.reserve_swap_locks(swap_key, outpoints);
+        self.save_to_disk()
     }
 
     /// Outpoints currently held out of coin selection by a reservation.
@@ -4721,6 +4749,26 @@ mod swap_reservation_tests {
         assert!(
             !wallet.claim_swap_inputs("swap-b", &[coin]),
             "held by another swap"
+        );
+        assert!(!wallet.store.swap_locks.contains_key("swap-b"));
+
+        assert!(
+            wallet.claim_or_hold_swap_inputs("swap-a", &[coin]),
+            "a swap's own claim does not block it"
+        );
+        assert!(
+            !wallet.claim_or_hold_swap_inputs("swap-b", &[coin]),
+            "another swap's claim does"
+        );
+        assert!(
+            !wallet.claim_or_hold_swap_inputs("swap-a", &[coin, outpoint(4)]),
+            "a claim that does not cover every input is not held"
+        );
+        assert!(
+            !wallet.store.swap_locks["swap-a"]
+                .outpoints
+                .contains(&outpoint(4)),
+            "a refused claim reserves nothing"
         );
         assert!(!wallet.store.swap_locks.contains_key("swap-b"));
     }

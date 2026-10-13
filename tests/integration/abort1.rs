@@ -8,12 +8,12 @@
 //! The Taker after coming live again will see unfinished openswaps in its wallet.
 //! It can reclaim funds via broadcasting contract transactions and claiming via timelock.
 
-use bitcoin::Amount;
+use bitcoin::{Amount, OutPoint};
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
+    taker::{SwapParams, Taker, TakerBehavior},
 };
 
 use super::test_framework::*;
@@ -361,4 +361,99 @@ fn legacy_new_plan_skips_inputs_of_a_dropped_swap() {
 #[test]
 fn taproot_new_plan_skips_inputs_of_a_dropped_swap() {
     new_plan_skips_inputs_of_a_dropped_swap(ProtocolVersion::Taproot);
+}
+
+/// Another swap claims the planned coins after `prepare_swap`. `start_swap`
+/// must refuse before signing: nothing spent, no claim added, the other claim
+/// untouched. That claim has no swap behind it, so a restart frees it.
+fn start_refuses_planned_coins_another_swap_claimed(protocol: ProtocolVersion) {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            2,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal, MakerBehavior::Normal],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let mut taker = takers.pop().unwrap();
+    fund_taker_default(&taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    let summary = taker.prepare_swap(params).expect("prepare");
+
+    // Claim every coin, so whichever ones the plan took are held.
+    let coins: Vec<OutPoint> = taker
+        .get_wallet()
+        .read()
+        .unwrap()
+        .list_descriptor_utxo_spend_info()
+        .iter()
+        .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+        .collect();
+    taker
+        .get_wallet()
+        .write()
+        .unwrap()
+        .reserve_swap_locks_for_test("other-swap", &coins)
+        .unwrap();
+
+    let err = taker
+        .start_swap(&summary.swap_id)
+        .expect_err("a planned coin another swap holds must stop the swap");
+    assert!(
+        format!("{err:?}").contains("no longer free"),
+        "unexpected refusal: {:?}",
+        err
+    );
+    assert_eq!(
+        taker.reserved_inputs().unwrap(),
+        coins.len(),
+        "the refusal must claim nothing and leave the other claim as it was"
+    );
+    assert_eq!(
+        taker
+            .get_wallet()
+            .read()
+            .unwrap()
+            .get_outgoing_swapcoins_count(),
+        0,
+        "nothing may be signed for a refused swap"
+    );
+    for outpoint in &coins {
+        let unspent = bitcoind
+            .client
+            .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+            .unwrap();
+        assert!(
+            unspent.is_some(),
+            "{} was spent by a refused swap",
+            outpoint
+        );
+    }
+
+    drop(taker);
+    let restarted = Taker::init(test_framework.taker_init_config::<BitcoindBackend>(0))
+        .expect("restarted taker should open the same wallet");
+    assert_eq!(
+        restarted.reserved_inputs().unwrap(),
+        0,
+        "a claim no unfinished swap owns must not survive a restart"
+    );
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+#[test]
+fn legacy_start_refuses_planned_coins_another_swap_claimed() {
+    start_refuses_planned_coins_another_swap_claimed(ProtocolVersion::Legacy);
+}
+
+#[test]
+fn taproot_start_refuses_planned_coins_another_swap_claimed() {
+    start_refuses_planned_coins_another_swap_claimed(ProtocolVersion::Taproot);
 }

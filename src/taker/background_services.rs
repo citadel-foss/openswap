@@ -81,12 +81,18 @@ impl RecoveryLoop {
                     }
 
                     // The chain only moves with a block, so a pass waits for one. The
-                    // watcher hears each block; asking the server is the fallback.
+                    // watcher hears each block; asking the server is the fallback. It
+                    // uses its own connection: a slow server must not hold the wallet lock.
+                    // The pass below reuses that connection.
+                    let mut fallback = None;
                     let tip = watch_service.tip().or_else(|| {
-                        lock_debug!(wallet.read())
-                            .ok()?
-                            .blockchain
-                            .get_block_count()
+                        backend
+                            .connect()
+                            .and_then(|chain| {
+                                let height = chain.get_block_count()?;
+                                fallback = Some(chain);
+                                Ok(height)
+                            })
                             .inspect_err(|e| log::warn!("Recovery loop: block height: {:?}", e))
                             .ok()
                     });
@@ -97,7 +103,7 @@ impl RecoveryLoop {
 
                     // One connection per pass, shared by both steps below:
                     // on Tor Electrum each fresh connection costs a circuit handshake.
-                    let chain = match backend.connect() {
+                    let chain = match fallback.map_or_else(|| backend.connect(), Ok) {
                         Ok(chain) => chain,
                         Err(e) => {
                             log::warn!("Recovery loop: no connection: {:?}", e);

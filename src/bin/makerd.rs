@@ -131,7 +131,7 @@ fn main() -> Result<(), MakerError> {
     }
 
     // Discover and save RPC port to config
-    let (_, rpc_port) = bind_port_retry(config.rpc_port - 2)?;
+    let (_, rpc_port) = bind_port_retry(config.rpc_port)?;
     config.rpc_port = rpc_port;
     set_config_key(&config_path, "rpc_port", &rpc_port.to_string())?;
 

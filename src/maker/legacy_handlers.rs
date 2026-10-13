@@ -342,6 +342,11 @@ fn process_proof_of_funding<M: Maker>(
         .iter()
         .map(|sc| sc.contract_tx.compute_txid())
         .collect();
+    // Held from the claim through the stored state: a reconnect resending
+    // ProofOfFunding meanwhile is refused instead of building a second batch.
+    let _funding = maker.begin_funding(&pof.id)?;
+    #[cfg(feature = "integration-test")]
+    super::handlers::pause_in_funding_step(maker.as_ref(), &pof.id);
     maker.claim_incoming_contract_txids(&pof.id, &incoming_txids)?;
 
     let hashvalue = maker.verify_proof_of_funding(&pof)?;
@@ -609,6 +614,11 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
     if resp.senders_sigs.len() != state.outgoing_swapcoins.len() {
         return Err(MakerError::General("Invalid number of sender signatures"));
     }
+
+    // The broadcast below must not race a resent ProofOfFunding rebuilding the batch.
+    let _funding = maker.begin_funding(&resp.id)?;
+    #[cfg(feature = "integration-test")]
+    super::handlers::pause_in_funding_step(maker.as_ref(), &resp.id);
 
     // The sync, persistence and broadcast loop below can outlive the idle
     // timeout; refresh the stored activity so the idle checker does not drain

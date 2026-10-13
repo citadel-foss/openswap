@@ -1213,14 +1213,21 @@ fn recover_from_swap(
     outgoing_swapcoins: Vec<crate::wallet::swapcoin::OutgoingSwapCoin>,
 ) -> Result<(), MakerError> {
     // The watcher hears each new block, so asking the server every pass is waste.
-    let tip = || match maker.watch_service.tip() {
-        Some(height) => Ok(height as u32),
-        None => lock_debug!(maker.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .blockchain
-            .get_block_count()
-            .map(|height| height as u32)
-            .map_err(MakerError::Wallet),
+    // The fallback uses its own connection, kept while the watcher is down and dropped on error:
+    // a slow server must not hold the wallet lock.
+    let mut fallback: Option<AnyBlockchain> = None;
+    let mut tip = || -> Result<u32, MakerError> {
+        if let Some(height) = maker.watch_service.tip() {
+            fallback = None;
+            return Ok(height as u32);
+        }
+        let chain = match fallback.take() {
+            Some(chain) => chain,
+            None => maker.backend.connect().map_err(MakerError::Wallet)?,
+        };
+        let height = chain.get_block_count().map_err(MakerError::Wallet)?;
+        fallback = Some(chain);
+        Ok(height as u32)
     };
 
     // Timelock recovery may already have removed every outgoing coin before a
@@ -1877,14 +1884,17 @@ fn send_message(stream: &TcpStream, message: &MakerToTakerMessage) -> Result<(),
     Ok(())
 }
 
-/// Retry with different ports if not availabe
+/// Binds `port`, or the first free port above it in steps of 2.
 pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
-    let mut current_port = port + 2;
+    let mut current_port = port;
     const MAX_PORT: u16 = 62000;
 
     while current_port < MAX_PORT {
         match TcpListener::bind((Ipv4Addr::LOCALHOST, current_port)) {
-            Ok(l) => return Ok((l, current_port)),
+            Ok(l) => {
+                let bound_port = l.local_addr().map_err(MakerError::IO)?.port();
+                return Ok((l, bound_port));
+            }
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
                 log::info!("Port {} in use, trying {}", current_port, current_port + 2);
                 current_port += 2
@@ -2167,6 +2177,28 @@ mod tests {
             [MakerToTakerMessage::Hello(_)]
         ));
         maker.watch_service.shutdown();
+    }
+
+    /// A fresh maker must get the default port when it is free.
+    #[test]
+    fn bind_port_retry_tries_the_given_port_first() {
+        // Two free ports a step apart, below the search's upper bound.
+        let (held, port) = (20_000..30_000)
+            .step_by(2)
+            .find_map(|port| {
+                let held = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok()?;
+                TcpListener::bind((Ipv4Addr::LOCALHOST, port + 2)).ok()?;
+                Some((held, port))
+            })
+            .expect("no free port pair");
+
+        let (_next, bound) = bind_port_retry(port).unwrap();
+        assert_eq!(bound, port + 2, "a taken port moves the search on");
+        drop(_next);
+
+        drop(held);
+        let (_listener, bound) = bind_port_retry(port).unwrap();
+        assert_eq!(bound, port, "a free port is used as is");
     }
 
     #[test]

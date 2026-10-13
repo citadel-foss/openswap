@@ -491,3 +491,66 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
+
+/// Between signing its hop-0 funding and broadcasting it, the taker's wallet
+/// is asked to pay from the planned coins through the public API. The funding
+/// claim must refuse that payment, so the swap still completes and leaves no
+/// claim behind.
+fn run_payment_cannot_take_planned_funding_coins(protocol: ProtocolVersion) {
+    warn!("Running Test: a payment cannot take the planned funding coins");
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::PayFromPlannedCoinsBeforeBroadcast],
+            vec![MakerBehavior::Normal],
+        );
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+    let maker_threads = spawn_ready_makers_and_mine(&makers, bitcoind);
+
+    let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
+        .with_tx_count(2)
+        .with_required_confirms(1);
+    let summary = taker.prepare_swap(swap_params).expect("prepare swap");
+    taker
+        .start_swap(&summary.swap_id)
+        .expect("the claimed funding must still reach the network");
+
+    let log_path = test_framework.taker_log_path();
+    test_framework.assert_log(
+        "Test behavior: payment from planned funding coins refused by funding claim",
+        &log_path,
+    );
+    let log_contents = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        !log_contents.contains("Test behavior: payment from planned funding coins sent"),
+        "the payment spent coins the signed funding needs"
+    );
+    assert!(
+        !log_contents.contains("payment from planned funding coins refused for another reason"),
+        "the payment must be refused by the funding claim, not by anything else"
+    );
+    assert_eq!(
+        taker.reserved_inputs().unwrap(),
+        0,
+        "a completed swap must leave no claim behind"
+    );
+
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+#[test]
+fn legacy_payment_cannot_take_planned_funding_coins() {
+    run_payment_cannot_take_planned_funding_coins(ProtocolVersion::Legacy);
+}
+
+#[test]
+fn taproot_payment_cannot_take_planned_funding_coins() {
+    run_payment_cannot_take_planned_funding_coins(ProtocolVersion::Taproot);
+}

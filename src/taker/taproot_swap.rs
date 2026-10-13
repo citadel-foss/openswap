@@ -372,10 +372,26 @@ impl Taker {
                 ));
             }
 
+            #[cfg(feature = "integration-test")]
+            let entered = crate::maker::handlers::funding_steps_entered(&contract_data.id);
             send_message(
                 &mut stream,
                 &TakerToMakerMessage::TaprootContractData(Box::new(contract_data.clone())),
             )?;
+
+            #[cfg(feature = "integration-test")]
+            if self.races_funding_step(&maker_address)? {
+                self.wait_for_funding_step(&contract_data.id, entered)?;
+                log::warn!("Test behavior: racing duplicate contract data to maker {i}");
+                if self
+                    .resume_contract_data_exchange(&maker_address, i, &contract_data)
+                    .is_ok()
+                {
+                    return Err(TakerError::General(
+                        "Maker answered a duplicate contract data mid-funding".to_string(),
+                    ));
+                }
+            }
 
             let msg_bytes = read_message(&mut stream).map_err(TakerError::from);
             #[cfg(feature = "integration-test")]
@@ -749,6 +765,7 @@ impl Taker {
     fn funding_broadcast(&mut self) -> Result<(), TakerError> {
         log::info!("Broadcasting contract transactions...");
 
+        let swap_id = self.swap_state()?.id.clone();
         let mut wallet = self.write_wallet()?;
 
         for swapcoin in &self.swap_state()?.outgoing_swapcoins {
@@ -759,6 +776,8 @@ impl Taker {
                 log::warn!("Test behavior: withholding the contract tx broadcast");
                 continue;
             }
+            // A failed send keeps the claim: the tx may still land. Recovery
+            // releases it once it judges the tx absent from the backend.
             let txid = wallet.send_tx(&swapcoin.contract_tx).map_err(|e| {
                 TakerError::General(format!("Failed to broadcast contract tx: {:?}", e))
             })?;
@@ -768,6 +787,9 @@ impl Taker {
             // at the next sync; until then a new swap must not plan them. The
             // lock is in memory only: once synced the coins are gone anyway.
             wallet.lock_utxos(&spent_inputs(&swapcoin.contract_tx));
+            // Accepted, so this tx's inputs need no claim. The save after the
+            // loop persists the release.
+            wallet.release_swap_locks(&swap_id, Some(&spent_inputs(&swapcoin.contract_tx)));
 
             let vout = swapcoin
                 .contract_tx

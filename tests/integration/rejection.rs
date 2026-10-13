@@ -777,11 +777,13 @@ fn stale_hop0_plan_fails_safely_and_a_fresh_prepare_recovers() {
         .sync_and_save(&NO_SHUTDOWN)
         .unwrap();
 
+    // The funding claim checks the plan before anything is signed, so it is
+    // the one that refuses a coin that has left the wallet.
     let err = taker
         .start_swap(&stale.swap_id)
         .expect_err("a plan whose coin has left the wallet must not fund");
     assert!(
-        format!("{err:?}").contains("is no longer in the wallet"),
+        format!("{err:?}").contains("A planned funding input is no longer free"),
         "Expected the stale-plan refusal, got: {:?}",
         err
     );
@@ -810,6 +812,60 @@ fn stale_hop0_plan_fails_safely_and_a_fresh_prepare_recovers() {
     );
 
     shutdown_makers(&makers, maker_threads);
+
+    test_framework.finish(takers, block_generation_handle);
+}
+
+/// The maker holds each funding step open while the taker sends the same
+/// message again on a second connection. Each duplicate must be refused and
+/// the first handler's swap must still complete: Legacy refuses a duplicate
+/// proof of funding and contract sigs, Taproot a duplicate contract data.
+#[test]
+fn maker_refuses_a_concurrent_funding_step() {
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::RaceFundingStep],
+            vec![MakerBehavior::PauseInFundingStep],
+        );
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+    fund_taker_default(taker, bitcoind, 4);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = spawn_makers(&makers);
+    wait_for_makers_setup(&makers, 120);
+    sync_maker_wallets(&makers);
+    generate_blocks(bitcoind, 1);
+
+    let log_path = test_framework.taker_log_path();
+    let refusals = || {
+        std::fs::read_to_string(&log_path)
+            .unwrap()
+            .matches("Funding for this swap is already in progress")
+            .count()
+    };
+
+    for (protocol, expected) in [(ProtocolVersion::Legacy, 2), (ProtocolVersion::Taproot, 3)] {
+        let params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
+            .with_tx_count(1)
+            .with_required_confirms(1);
+        let summary = taker
+            .prepare_swap(params)
+            .expect("prepare_swap should succeed");
+        taker
+            .start_swap(&summary.swap_id)
+            .expect("the first handler's swap must complete");
+        assert_eq!(
+            refusals(),
+            expected,
+            "every duplicate {protocol:?} funding step must be refused"
+        );
+    }
+
+    shutdown_makers(&makers, maker_threads);
+
     test_framework.finish(takers, block_generation_handle);
 }
 
@@ -2094,6 +2150,12 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         2,
         "both splits' swapcoins must survive — no substitution cleanup"
     );
+    // Split 1 was accepted, so its inputs are free; split 2 failed and might
+    // still land, so its inputs stay claimed until recovery settles the swap.
+    assert!(
+        taker.reserved_inputs().unwrap() > 0,
+        "a failed broadcast must keep its inputs claimed"
+    );
 
     // The broadcast split is refunded. The committed unbroadcast split remains:
     // absence cannot prove it is safe to forget those recovery keys.
@@ -2111,6 +2173,11 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         );
         thread::sleep(Duration::from_secs(5));
     }
+    assert_eq!(
+        taker.reserved_inputs().unwrap(),
+        0,
+        "recovery must release the claim of the swap it settled"
+    );
 
     assert!(
         !taker.is_recovery_complete(),

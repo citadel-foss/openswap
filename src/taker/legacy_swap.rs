@@ -322,6 +322,8 @@ impl Taker {
                         let funding_tx = swapcoin.funding_tx.as_ref().ok_or_else(|| {
                             TakerError::General("Outgoing swapcoin missing funding_tx".to_string())
                         })?;
+                        // A failed send keeps the claim: the tx may still land. Recovery
+                        // releases it once it judges the tx absent from the backend.
                         wallet.send_tx(funding_tx).map_err(|e| {
                             TakerError::General(format!("Failed to broadcast funding tx: {:?}", e))
                         })?;
@@ -330,6 +332,9 @@ impl Taker {
                         // plan them. The lock is in memory only: once synced the
                         // coins are gone anyway.
                         wallet.lock_utxos(&spent_inputs(funding_tx));
+                        // Accepted, so this tx's inputs need no claim. The save
+                        // after the loop persists the release.
+                        wallet.release_swap_locks(&swap_id, Some(&spent_inputs(funding_tx)));
                     }
                     wallet.save_to_disk()?;
                 }
@@ -1250,7 +1255,12 @@ impl Taker {
             pof
         };
 
-        send_message(&mut stream, &TakerToMakerMessage::ProofOfFunding(pof))?;
+        let msg = TakerToMakerMessage::ProofOfFunding(pof);
+        #[cfg(feature = "integration-test")]
+        let entered = crate::maker::handlers::funding_steps_entered(swap_id);
+        send_message(&mut stream, &msg)?;
+        #[cfg(feature = "integration-test")]
+        self.race_legacy_funding_step(maker_address, swap_id, entered, &msg)?;
 
         let msg_bytes = read_message(&mut stream)?;
         let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
@@ -1317,10 +1327,12 @@ impl Taker {
             senders_sigs,
         };
 
-        send_message(
-            &mut stream,
-            &TakerToMakerMessage::RespContractSigsForRecvrAndSender(resp),
-        )?;
+        let msg = TakerToMakerMessage::RespContractSigsForRecvrAndSender(resp);
+        #[cfg(feature = "integration-test")]
+        let entered = crate::maker::handlers::funding_steps_entered(swap_id);
+        send_message(&mut stream, &msg)?;
+        #[cfg(feature = "integration-test")]
+        self.race_legacy_funding_step(maker_address, swap_id, entered, &msg)?;
 
         log::info!(
             "Sent RespContractSigsForRecvrAndSender for swap {}",
