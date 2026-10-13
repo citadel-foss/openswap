@@ -29,7 +29,7 @@ use openswap::{
             ln_watchdog_tick_now, refuse_swap_in_after_wait, watchdog_expire_swap_in_snapshot,
             watchdog_finish_swap_in_snapshot, LnDirection, LnMakerPhase, LnMakerSwap,
         },
-        MakerBehavior, MakerServer,
+        MakerBehavior, MakerError, MakerServer,
     },
     protocol::{
         common_messages::{MakerToTakerMessage, TakerHello, TakerToMakerMessage},
@@ -1981,6 +1981,12 @@ fn request_swap_in(
     taker_ln: &MockLightningBackend,
     preimage: &Preimage,
 ) -> LightningMakerMessage {
+    expect_ln(send_swap_in_request(maker, swap_in_request(taker_ln, preimage)).unwrap())
+}
+
+/// A valid request for a 40k-sat swap-in on `preimage`'s payment hash, with
+/// a hold invoice from `taker_ln` and 48 blocks of locktime to spare.
+fn swap_in_request(taker_ln: &MockLightningBackend, preimage: &Preimage) -> LnSwapInRequest {
     let amount = Amount::from_sat(40_000);
     let payment_hash = preimage.payment_hash();
     let swap_id = payment_hash.to_string();
@@ -1997,6 +2003,27 @@ fn request_swap_in(
     let cltv_delta = verify_invoice(&invoice.invoice, &payment_hash, amount.to_sat() * 1000)
         .unwrap()
         .min_final_cltv_expiry_delta;
+    LnSwapInRequest {
+        swap_id,
+        invoice: invoice.invoice,
+        payment_hash,
+        amount,
+        locktime: (cltv_delta + 48) as u16,
+        min_confirmations: 1,
+        taker_timelock_pubkey: PublicKey::new(
+            SecretKey::from_slice(&[0x82; 32])
+                .unwrap()
+                .public_key(&Secp256k1::new()),
+        ),
+    }
+}
+
+/// Sends `req` to `maker` on a fresh connection and returns the handler's
+/// result.
+fn send_swap_in_request(
+    maker: &Arc<MakerServer>,
+    req: LnSwapInRequest,
+) -> Result<Option<MakerToTakerMessage>, MakerError> {
     let mut state = ConnectionState::default();
     handle_message(
         maker,
@@ -2004,25 +2031,10 @@ fn request_swap_in(
         TakerToMakerMessage::TakerHello(TakerHello),
     )
     .unwrap();
-    expect_ln(
-        handle_message(
-            maker,
-            &mut state,
-            ln_message(LightningTakerMessage::SwapInRequest(LnSwapInRequest {
-                swap_id,
-                invoice: invoice.invoice,
-                payment_hash,
-                amount,
-                locktime: (cltv_delta + 48) as u16,
-                min_confirmations: 1,
-                taker_timelock_pubkey: PublicKey::new(
-                    SecretKey::from_slice(&[0x82; 32])
-                        .unwrap()
-                        .public_key(&Secp256k1::new()),
-                ),
-            })),
-        )
-        .unwrap(),
+    handle_message(
+        maker,
+        &mut state,
+        ln_message(LightningTakerMessage::SwapInRequest(req)),
     )
 }
 
@@ -2279,6 +2291,168 @@ fn swap_in_request_refuses_payment_hash_already_on_record() {
         .get_ln_swap(&fresh.payment_hash().to_string())
         .unwrap()
         .is_some());
+
+    drop(takers);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// The payment-record lookup is a call to the node. A swap-in request that
+/// fails the maker's own checks on its terms or invoice must be refused
+/// before that call is made, and must store nothing.
+#[test]
+fn swap_in_request_checks_terms_and_invoice_before_payment_record_lookup() {
+    log::warn!("Running Test: swap-in request checks terms and invoice before the record lookup");
+
+    let ln = swap_in_ready_ln();
+    let taker_ln = MockLightningBackend::new();
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let maker = makers[0].clone();
+
+    let base = swap_in_request(&taker_ln, &Preimage([0xa1; 32]));
+    let other = swap_in_request(&taker_ln, &Preimage([0xa2; 32]));
+    let cltv_delta = base.locktime - 48;
+    let expect_reject = |req: LnSwapInRequest, what: &str, reason: &str| {
+        let swap_id = req.swap_id.clone();
+        match expect_ln(send_swap_in_request(&maker, req).unwrap()) {
+            LightningMakerMessage::Reject(reject) => {
+                assert_eq!(reject.swap_id, swap_id);
+                assert!(
+                    reject.reason.contains(reason),
+                    "{}: refused for another reason: {}",
+                    what,
+                    reject.reason
+                );
+            }
+            other => panic!("{}: expected a Reject, got {}", what, other),
+        }
+        assert!(
+            maker.get_ln_swap(&swap_id).unwrap().is_none(),
+            "{}: the maker stored the swap",
+            what
+        );
+        assert_eq!(
+            ln.payment_record_lookups(),
+            0,
+            "{}: the maker looked up the payment record",
+            what
+        );
+    };
+
+    // Terms.
+    expect_reject(
+        LnSwapInRequest {
+            amount: Amount::from_sat(1),
+            ..base.clone()
+        },
+        "amount below the minimum",
+        "outside the swap-in range",
+    );
+    expect_reject(
+        LnSwapInRequest {
+            locktime: 1,
+            ..base.clone()
+        },
+        "locktime below the reaction time",
+        "below minimum reaction time",
+    );
+    // Invoice.
+    expect_reject(
+        LnSwapInRequest {
+            invoice: other.invoice.clone(),
+            ..base.clone()
+        },
+        "invoice for another hash",
+        "",
+    );
+    expect_reject(
+        LnSwapInRequest {
+            amount: base.amount + Amount::from_sat(1),
+            ..base.clone()
+        },
+        "invoice for another amount",
+        "",
+    );
+    expect_reject(
+        LnSwapInRequest {
+            locktime: cltv_delta + 11,
+            ..base.clone()
+        },
+        "locktime inside the invoice's CLTV window",
+        "too short for invoice cltv delta",
+    );
+
+    // The same request with valid terms and invoice is looked up once and
+    // accepted.
+    let swap_id = base.swap_id.clone();
+    match expect_ln(send_swap_in_request(&maker, base).unwrap()) {
+        LightningMakerMessage::SwapInAccept(_) => {}
+        other => panic!("expected SwapInAccept, got {}", other),
+    }
+    assert_eq!(ln.payment_record_lookups(), 1);
+    assert!(maker.get_ln_swap(&swap_id).unwrap().is_some());
+
+    drop(takers);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// A payment-record lookup that fails says nothing about the hash. The
+/// swap-in request must fail with it, not go ahead as if the hash were
+/// unused, and nothing may be stored or subscribed.
+#[test]
+fn swap_in_request_fails_when_payment_record_lookup_fails() {
+    log::warn!("Running Test: swap-in request fails when the payment record lookup fails");
+
+    let ln = swap_in_ready_ln();
+    let taker_ln = MockLightningBackend::new();
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let maker = makers[0].clone();
+
+    let preimage = Preimage([0xa3; 32]);
+    let req = swap_in_request(&taker_ln, &preimage);
+    let swap_id = req.swap_id.clone();
+
+    ln.fail_payment_record_lookups(true);
+    let result = send_swap_in_request(&maker, req.clone());
+    assert!(
+        matches!(result, Err(MakerError::General(reason)) if reason == "payment record lookup failed"),
+        "the request did not fail with the lookup: {:?}",
+        result
+    );
+    assert_eq!(ln.payment_record_lookups(), 1);
+    assert!(
+        maker.get_ln_swap(&swap_id).unwrap().is_none(),
+        "the maker stored a swap without knowing the hash was unused"
+    );
+    assert!(
+        !mailbox_open(&maker, &ln, &preimage),
+        "the maker opened a mailbox for the swap"
+    );
+
+    // Once the node answers again, the same request goes through.
+    ln.fail_payment_record_lookups(false);
+    match expect_ln(send_swap_in_request(&maker, req).unwrap()) {
+        LightningMakerMessage::SwapInAccept(_) => {}
+        other => panic!("expected SwapInAccept, got {}", other),
+    }
+    assert!(maker.get_ln_swap(&swap_id).unwrap().is_some());
 
     drop(takers);
     maker.shutdown.store(true, Relaxed);

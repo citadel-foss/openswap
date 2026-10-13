@@ -158,14 +158,10 @@ impl LdkServerBackend {
         let request = proto_api::GetPaymentDetailsRequest {
             payment_id: payment_hash.to_string(),
         };
-        match self.call(self.client.get_payment_details(request)) {
-            Ok(response) => Ok(response.payment),
-            // Only an explicit "no such payment" is an answer. Every other
-            // failure must surface: recovery treating a transport error as
-            // "not settled" would silently give up on a sweep.
-            Err(LightningError::Api { ref code, .. }) if code.contains("NotFound") => Ok(None),
-            Err(e) => Err(e),
-        }
+        // The server answers an unknown id with no payment, not an error. So
+        // every error is a failed lookup and must surface: read as "no
+        // record", it would let a used hash through swap-in admission.
+        Ok(self.call(self.client.get_payment_details(request))?.payment)
     }
 }
 

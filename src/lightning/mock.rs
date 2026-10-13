@@ -2,7 +2,10 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use bitcoin::{
@@ -105,6 +108,11 @@ pub struct MockLightningBackend {
     /// whose hold window is generous. Stock ldk-node's is only a few blocks
     /// wide; [`MockLightningBackend::set_claim_deadline`] reproduces that.
     claim_deadline: Mutex<Option<u32>>,
+    /// How many times [`LightningBackend::has_payment_record`] was called.
+    payment_record_lookups: AtomicUsize,
+    /// Fail every [`LightningBackend::has_payment_record`] call, as an
+    /// unreachable or broken backend would.
+    fail_payment_record_lookups: AtomicBool,
 }
 
 impl Default for MockLightningBackend {
@@ -125,7 +133,20 @@ impl MockLightningBackend {
             node_sk: sk,
             last_pay_cltv_bound: Mutex::new(None),
             claim_deadline: Mutex::new(Some(1_000_000)),
+            payment_record_lookups: AtomicUsize::new(0),
+            fail_payment_record_lookups: AtomicBool::new(false),
         }
+    }
+
+    /// How many payment-record lookups this node has answered or failed.
+    pub fn payment_record_lookups(&self) -> usize {
+        self.payment_record_lookups.load(Ordering::SeqCst)
+    }
+
+    /// Makes every later payment-record lookup fail, or work again.
+    pub fn fail_payment_record_lookups(&self, fail: bool) {
+        self.fail_payment_record_lookups
+            .store(fail, Ordering::SeqCst);
     }
 
     /// Sets the claim deadline reported with held payments. `None` models a
@@ -640,6 +661,13 @@ impl LightningBackend for MockLightningBackend {
     }
 
     fn has_payment_record(&self, payment_hash: sha256::Hash) -> Result<bool, LightningError> {
+        self.payment_record_lookups.fetch_add(1, Ordering::SeqCst);
+        if self.fail_payment_record_lookups.load(Ordering::SeqCst) {
+            return Err(LightningError::Api {
+                code: "InternalServerError".to_string(),
+                message: "mock: payment record lookup failed".to_string(),
+            });
+        }
         // This node created the invoice, or paid it and still has the record.
         Ok(self
             .ledger
