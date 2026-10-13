@@ -776,7 +776,7 @@ impl Taker {
                 log::warn!("Test behavior: withholding the contract tx broadcast");
                 continue;
             }
-            // A failed send keeps the claim: the tx may still land. Recovery
+            // A failed send keeps the claim: the tx may still land.
             // Recovery resends it and refunds it.
             let txid = wallet.send_tx(&swapcoin.contract_tx).map_err(|e| {
                 TakerError::General(format!("Failed to broadcast contract tx: {:?}", e))

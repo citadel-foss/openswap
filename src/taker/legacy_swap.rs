@@ -322,7 +322,7 @@ impl Taker {
                         let funding_tx = swapcoin.funding_tx.as_ref().ok_or_else(|| {
                             TakerError::General("Outgoing swapcoin missing funding_tx".to_string())
                         })?;
-                        // A failed send keeps the claim: the tx may still land. Recovery
+                        // A failed send keeps the claim: the tx may still land.
                         // Recovery resends it and refunds it.
                         wallet.send_tx(funding_tx).map_err(|e| {
                             TakerError::General(format!("Failed to broadcast funding tx: {:?}", e))
