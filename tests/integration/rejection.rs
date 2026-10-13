@@ -32,6 +32,7 @@ use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
+    collections::HashSet,
     fs,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread::{self, JoinHandle},
@@ -1943,10 +1944,13 @@ fn maker_rejects_over_budget_funding_plan() {
     block_generation_handle.join().unwrap();
 }
 
-/// Wait for a timelock recovery report saved with the maker's removed coin.
+/// Wait until the maker's timelock recovery reports, summed over all passes,
+/// hold `expected` refund txids and its outgoing swapcoins are down to `left`.
 fn wait_for_maker_timelock_recovery(
     maker: &MakerServer,
     swap_id: &str,
+    expected: usize,
+    left: usize,
     timeout: Duration,
 ) -> Vec<String> {
     let start = Instant::now();
@@ -1958,7 +1962,8 @@ fn wait_for_maker_timelock_recovery(
             .filter(|report| report.swap_id == swap_id && report.recovery_type == "timelock")
             .flat_map(|report| report.recovery_txids.clone())
             .collect();
-        if !txids.is_empty() {
+        let cleaned = maker.wallet.read().unwrap().get_outgoing_swapcoins_count() == left;
+        if txids.len() >= expected && cleaned {
             return txids;
         }
         assert!(
@@ -2014,19 +2019,22 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
 
     // The 30s idle timeout starts recovery; the timelock path then needs the
     // maker's outgoing timelock (150 CSV blocks from the contract broadcast).
-    let recovered = wait_for_maker_timelock_recovery(
-        &makers[0],
-        &swap_id,
-        timelock_recovery_wait::<B>() + Duration::from_secs(120),
-    );
-
     // Recovery sends the unsent split too. Legacy contracts both go out when
-    // recovery starts, so both splits come back together; a Taproot split
-    // went out with the swap, so the resent one comes back later.
+    // recovery starts, but a block between the two broadcasts can give them
+    // different maturity, so their refunds may land in separate passes. A
+    // Taproot split went out with the swap, so the resent one comes back later.
     let splits_left = match protocol {
         ProtocolVersion::Legacy => 0,
         ProtocolVersion::Taproot => 1,
     };
+    let recovered = wait_for_maker_timelock_recovery(
+        &makers[0],
+        &swap_id,
+        2 - splits_left,
+        splits_left,
+        timelock_recovery_wait::<B>() + Duration::from_secs(120),
+    );
+
     assert_eq!(
         recovered.len(),
         2 - splits_left,
@@ -2164,7 +2172,8 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         "a failed broadcast must keep its inputs claimed"
     );
 
-    // Recovery sends the unsent split too, so both splits come back together.
+    // Recovery sends the unsent split too; the refunds may come in separate
+    // passes, so the reports are summed below.
     let recovery_start = Instant::now();
     while taker
         .get_wallet()
@@ -2185,19 +2194,19 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expecte
         "recovery must release the claim of the swap it settled"
     );
 
-    assert!(
-        taker
-            .get_wallet()
-            .read()
-            .unwrap()
-            .swap_reports()
-            .recovery
-            .iter()
-            .any(|report| {
-                report.swap_id == swap_id
-                    && report.recovery_type == "timelock"
-                    && report.recovery_txids.len() == 2
-            }),
+    let refunds: HashSet<_> = taker
+        .get_wallet()
+        .read()
+        .unwrap()
+        .swap_reports()
+        .recovery
+        .iter()
+        .filter(|report| report.swap_id == swap_id && report.recovery_type == "timelock")
+        .flat_map(|report| report.recovery_txids.clone())
+        .collect();
+    assert_eq!(
+        refunds.len(),
+        2,
         "the confirmed refunds must be stored with the coin removal"
     );
     generate_blocks(bitcoind, 1);
