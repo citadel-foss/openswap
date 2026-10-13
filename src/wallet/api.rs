@@ -1130,13 +1130,28 @@ impl Wallet {
         if chain.tx_block_height(&contract_txid)?.is_some() {
             let outpoint = OutPoint::new(contract_txid, contract_vout);
             let script = &swapcoin.contract_tx.output[contract_vout as usize].script_pubkey;
+            // Look only at the mined spender: Electrum history can list an
+            // unconfirmed conflict, such as a replaced recovery, ahead of it.
             match chain.confirmed_spending_transaction(&outpoint, script)? {
+                // Our own timelock recovery whose bookkeeping was lost to a
+                // crash or a failed confirmation wait.
                 Some(recovery) if swapcoin.is_own_timelock_spend(&recovery) => {
-                    return Ok(ContractChainState::RecoveredByTimelock(
-                        recovery.compute_txid(),
-                    ));
+                    let recovery_txid = recovery.compute_txid();
+                    log::info!(
+                        "Contract output for {} already spent by our confirmed timelock recovery {} — recording as resolved",
+                        swap_id,
+                        recovery_txid
+                    );
+                    return Ok(ContractChainState::RecoveredByTimelock(recovery_txid));
                 }
-                Some(_) => {}
+                // The other side claimed it, and that spend may carry the preimage
+                // we still need. Keep the coin until the swap settles.
+                Some(_) => {
+                    log::info!(
+                        "Contract output for {} claimed by a confirmed tx — keeping swapcoin",
+                        swap_id
+                    );
+                }
                 None => {
                     if let Some(pending) = Self::pending_own_recovery(chain, swapcoin)? {
                         return Ok(ContractChainState::RecoveryPending(pending));
