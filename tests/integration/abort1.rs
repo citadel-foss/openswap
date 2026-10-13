@@ -348,6 +348,12 @@ fn new_plan_skips_inputs_of_a_dropped_swap(protocol: ProtocolVersion) {
         );
     }
 
+    // Recovery took over the dropped swap, so it must not block a new one.
+    let params = SwapParams::new(protocol, amount, 2)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    taker.prepare_swap(params).expect("prepare after recovery");
+
     shutdown_makers(&makers, maker_threads);
     test_framework.stop();
     block_generation_handle.join().unwrap();
