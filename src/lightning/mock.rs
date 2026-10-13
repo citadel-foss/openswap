@@ -639,6 +639,19 @@ impl LightningBackend for MockLightningBackend {
         })
     }
 
+    fn has_payment_record(&self, payment_hash: sha256::Hash) -> Result<bool, LightningError> {
+        // This node created the invoice, or paid it and still has the record.
+        Ok(self
+            .ledger
+            .lock()?
+            .invoices
+            .get(&payment_hash)
+            .is_some_and(|invoice| {
+                invoice.owner == self.node_index
+                    || (invoice.payer == Some(self.node_index) && !invoice.payer_record_lost)
+            }))
+    }
+
     fn poll_event(&self) -> Result<Option<LnEvent>, LightningError> {
         Ok(self.ledger.lock()?.queues[self.node_index].pop_front())
     }
@@ -835,6 +848,33 @@ mod tests {
             .unwrap();
         standalone.simulate_htlc_arrival(held.payment_hash(), 1_000);
         assert_eq!(outcome(&standalone, &held), PaymentOutcome::NotFound);
+    }
+
+    /// A node has a record of an invoice it created, from the start, and of
+    /// a payment it made until it loses that record.
+    #[test]
+    fn payment_record_covers_both_directions_of_the_node_only() {
+        let (owner, payer) = MockLightningBackend::new_pair();
+        let preimage = Preimage([0x31; 32]);
+        let hash = preimage.payment_hash();
+        let has = |node: &MockLightningBackend| node.has_payment_record(hash).unwrap();
+
+        assert!(!has(&owner) && !has(&payer));
+        let invoice = owner
+            .create_hold_invoice(hash, InvoiceParams::default())
+            .unwrap();
+        assert!(has(&owner), "the owner has no record of its own invoice");
+        assert!(!has(&payer));
+
+        payer
+            .pay_invoice(&invoice.invoice, Some(1_000), Some(200))
+            .unwrap();
+        owner.claim_held_payment(&preimage).unwrap();
+        assert!(has(&owner) && has(&payer));
+
+        payer.lose_payment_record(hash);
+        assert!(!has(&payer));
+        assert!(has(&owner));
     }
 
     /// A payment whose record the payer lost reads as `NotFound` for good,

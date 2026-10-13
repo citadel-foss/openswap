@@ -557,6 +557,25 @@ fn handle_swap_in_request<M: Maker>(
     {
         return Ok(reject(&req.swap_id, reason));
     }
+    // The node keeps every payment under its hash, after the swap that made
+    // it is gone. A hash it already knows cannot be this swap's: ldk-node
+    // refuses to pay a hash it has paid or been paid for, and the old
+    // payment's preimage would read as this swap's settlement and sweep the
+    // taker's HTLC unpaid. Refusing the hash here, before anything is stored,
+    // means an outbound payment on record for it is this swap's own, unless
+    // the node's operator pays the hash by hand. Inbound records that appear
+    // later never count: payment_outcome reads only outbound ones.
+    match ctx.ln.has_payment_record(req.payment_hash) {
+        Ok(false) => {}
+        Ok(true) => return Ok(reject(&req.swap_id, "payment hash already used")),
+        Err(e) => {
+            log::warn!(
+                "swap-in {}: payment record lookup failed: {e:?}",
+                req.swap_id
+            );
+            return Err(MakerError::General("payment record lookup failed"));
+        }
+    }
     let fee = match validate_terms(
         maker,
         LnDirection::SwapIn,

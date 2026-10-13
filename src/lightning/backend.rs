@@ -111,6 +111,11 @@ pub trait LightningBackend: Send + Sync {
     fn payment_outcome(&self, payment_hash: sha256::Hash)
         -> Result<PaymentOutcome, LightningError>;
 
+    /// Whether the node holds any payment record under this hash, inbound or
+    /// outbound, whatever its status. An invoice the node created counts:
+    /// ldk-node records the inbound payment when it creates the invoice.
+    fn has_payment_record(&self, payment_hash: sha256::Hash) -> Result<bool, LightningError>;
+
     /// Returns the next pending backend event, or `Ok(None)` if no event is
     /// currently queued. Never blocks.
     ///

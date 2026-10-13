@@ -146,6 +146,27 @@ impl LdkServerBackend {
             Err(_elapsed) => Err(LightningError::Timeout),
         }
     }
+
+    /// The server's payment record under this hash, in either direction, or
+    /// `None` if it has none.
+    fn payment_record(
+        &self,
+        payment_hash: sha256::Hash,
+    ) -> Result<Option<proto_types::Payment>, LightningError> {
+        // ldk-node identifies a BOLT11 payment by its payment hash, so the
+        // hex hash doubles as the payment id.
+        let request = proto_api::GetPaymentDetailsRequest {
+            payment_id: payment_hash.to_string(),
+        };
+        match self.call(self.client.get_payment_details(request)) {
+            Ok(response) => Ok(response.payment),
+            // Only an explicit "no such payment" is an answer. Every other
+            // failure must surface: recovery treating a transport error as
+            // "not settled" would silently give up on a sweep.
+            Err(LightningError::Api { ref code, .. }) if code.contains("NotFound") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl Drop for LdkServerBackend {
@@ -389,20 +410,12 @@ impl LightningBackend for LdkServerBackend {
         &self,
         payment_hash: sha256::Hash,
     ) -> Result<PaymentOutcome, LightningError> {
-        // ldk-node identifies a BOLT11 payment by its payment hash, so the
-        // hex hash doubles as the payment id.
-        let request = proto_api::GetPaymentDetailsRequest {
-            payment_id: payment_hash.to_string(),
-        };
-        let payment = match self.call(self.client.get_payment_details(request)) {
-            Ok(response) => response.payment,
-            // Only an explicit "no such payment" is an answer. Every other
-            // failure must surface: recovery treating a transport error as
-            // "not settled" would silently give up on a sweep.
-            Err(LightningError::Api { ref code, .. }) if code.contains("NotFound") => None,
-            Err(e) => return Err(e),
-        };
+        let payment = self.payment_record(payment_hash)?;
         Ok(payment_outcome_of(payment.as_ref()))
+    }
+
+    fn has_payment_record(&self, payment_hash: sha256::Hash) -> Result<bool, LightningError> {
+        Ok(self.payment_record(payment_hash)?.is_some())
     }
 
     fn poll_event(&self) -> Result<Option<LnEvent>, LightningError> {
@@ -513,17 +526,18 @@ fn payment_outcome_of(payment: Option<&proto_types::Payment>) -> PaymentOutcome 
     let Some(payment) = payment else {
         return PaymentOutcome::NotFound;
     };
+    // ldk-node keeps an inbound payment under the same id, and an outbound
+    // payment it sent but lost the record of leaves that inbound record in
+    // place. So only an outbound record speaks for our payment, its preimage
+    // included: an inbound preimage for this hash proves someone paid us,
+    // not that we paid. A missing direction reads as inbound, the default.
+    if payment.direction() != proto_types::PaymentDirection::Outbound {
+        return PaymentOutcome::NotFound;
+    }
     // A preimage proves settlement whatever the status says: LDK can report
     // a failure after a success, and the success then stands.
     if let Some(preimage) = extract_payment_fields(Some(payment)).preimage {
         return PaymentOutcome::Settled(preimage);
-    }
-    // ldk-node keeps an inbound payment under the same id, and an outbound
-    // payment it sent but lost the record of leaves that inbound record in
-    // place. So only an outbound record speaks for our payment. A missing
-    // direction reads as inbound, the default.
-    if payment.direction() != proto_types::PaymentDirection::Outbound {
-        return PaymentOutcome::NotFound;
     }
     // LDK reports a failure only once no HTLC of the payment is left
     // pending. A success without a preimage proves nothing, so it counts as
@@ -752,18 +766,20 @@ mod tests {
         unknown.status = 7;
         assert_eq!(payment_outcome_of(Some(&unknown)), PaymentOutcome::Pending);
 
-        // A preimage proves settlement whatever the record's direction or
-        // status.
+        // An outbound preimage proves settlement whatever the status says.
         let preimage = Preimage([5u8; 32]);
-        for direction in [PaymentDirection::Outbound, PaymentDirection::Inbound] {
-            let mut settled = bolt11_payment(Some(&preimage));
-            settled.direction = direction.into();
-            settled.status = PaymentStatus::Failed.into();
-            assert_eq!(
-                payment_outcome_of(Some(&settled)),
-                PaymentOutcome::Settled(preimage)
-            );
-        }
+        let mut settled = bolt11_payment(Some(&preimage));
+        settled.direction = PaymentDirection::Outbound.into();
+        settled.status = PaymentStatus::Failed.into();
+        assert_eq!(
+            payment_outcome_of(Some(&settled)),
+            PaymentOutcome::Settled(preimage)
+        );
+        // An inbound preimage for the hash proves only that someone paid us,
+        // as a completed swap-out's hold invoice leaves behind.
+        settled.direction = PaymentDirection::Inbound.into();
+        settled.status = PaymentStatus::Succeeded.into();
+        assert_eq!(payment_outcome_of(Some(&settled)), PaymentOutcome::NotFound);
     }
 
     #[test]

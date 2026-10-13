@@ -1943,6 +1943,12 @@ fn watchdog_keeps_swap_in_without_payment_record_until_refunded() {
 /// A mock node with outbound capacity, so the maker serves swap-ins.
 fn swap_in_ready_ln() -> Arc<MockLightningBackend> {
     let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
+    open_ready_channel(&ln);
+    ln
+}
+
+/// Gives `ln` a ready channel with outbound capacity to pay swap-ins from.
+fn open_ready_channel(ln: &MockLightningBackend) {
     ln.set_onchain_balance(Amount::from_btc(0.02).unwrap());
     let peer = SecretKey::from_slice(&[0x21; 32]).unwrap();
     let channel = ln
@@ -1956,13 +1962,25 @@ fn swap_in_ready_ln() -> Arc<MockLightningBackend> {
         .unwrap();
     ln.simulate_channel_ready(&channel);
     let _ = ln.poll_event().unwrap();
-    ln
 }
 
 /// Has `maker` accept a 40k-sat swap-in for `preimage`'s payment hash. The
 /// hold invoice comes from `taker_ln`, which shares no ledger with the
 /// maker's node, so the maker's payment attempt fails at once.
 fn accept_swap_in(maker: &Arc<MakerServer>, taker_ln: &MockLightningBackend, preimage: &Preimage) {
+    match request_swap_in(maker, taker_ln, preimage) {
+        LightningMakerMessage::SwapInAccept(_) => {}
+        other => panic!("expected SwapInAccept, got {}", other),
+    }
+}
+
+/// Asks `maker` for a 40k-sat swap-in for `preimage`'s payment hash, with a
+/// hold invoice from `taker_ln`, and returns the maker's reply.
+fn request_swap_in(
+    maker: &Arc<MakerServer>,
+    taker_ln: &MockLightningBackend,
+    preimage: &Preimage,
+) -> LightningMakerMessage {
     let amount = Amount::from_sat(40_000);
     let payment_hash = preimage.payment_hash();
     let swap_id = payment_hash.to_string();
@@ -1986,7 +2004,7 @@ fn accept_swap_in(maker: &Arc<MakerServer>, taker_ln: &MockLightningBackend, pre
         TakerToMakerMessage::TakerHello(TakerHello),
     )
     .unwrap();
-    match expect_ln(
+    expect_ln(
         handle_message(
             maker,
             &mut state,
@@ -2005,10 +2023,7 @@ fn accept_swap_in(maker: &Arc<MakerServer>, taker_ln: &MockLightningBackend, pre
             })),
         )
         .unwrap(),
-    ) {
-        LightningMakerMessage::SwapInAccept(_) => {}
-        other => panic!("expected SwapInAccept, got {}", other),
-    }
+    )
 }
 
 /// Sends `SwapInFunded` on a fresh connection and returns the handler's
@@ -2190,6 +2205,84 @@ fn handler_stops_without_funding_height(
     drop(takers);
     restarted.shutdown.store(true, Relaxed);
     restarted.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// The maker's node keeps a payment's record under its hash after the swap
+/// that made it is gone, and ldk-node will not pay that hash again. So a
+/// swap-in on a hash the node already has a record of must be refused before
+/// anything is stored. Otherwise the old record's preimage reads as the new
+/// swap's settlement, and the maker sweeps the taker's HTLC without paying.
+#[test]
+fn swap_in_request_refuses_payment_hash_already_on_record() {
+    log::warn!("Running Test: swap-in request refuses a payment hash already on record");
+
+    // The payee shares the maker node's ledger, so the maker can pay it.
+    let (ln, payee_ln) = MockLightningBackend::new_pair();
+    open_ready_channel(&ln);
+    let taker_ln = MockLightningBackend::new();
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let maker = makers[0].clone();
+
+    // `paid`: the maker's node paid an invoice for this hash, as for an
+    // earlier swap-in, and the payment settled.
+    let paid = Preimage([0xf1; 32]);
+    let invoice = payee_ln
+        .create_hold_invoice(
+            paid.payment_hash(),
+            InvoiceParams {
+                amount_msat: Some(40_000_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    ln.pay_invoice(&invoice.invoice, None, None).unwrap();
+    payee_ln.claim_held_payment(&paid).unwrap();
+    // The old payment's preimage is what a new swap on this hash would find.
+    assert_eq!(
+        ln.payment_outcome(paid.payment_hash()).unwrap(),
+        PaymentOutcome::Settled(paid)
+    );
+
+    // `received`: the maker's node created an invoice for this hash, as for
+    // an earlier swap-out.
+    let received = Preimage([0xf2; 32]);
+    ln.create_hold_invoice(received.payment_hash(), InvoiceParams::default())
+        .unwrap();
+
+    for preimage in [&paid, &received] {
+        let swap_id = preimage.payment_hash().to_string();
+        match request_swap_in(&maker, &taker_ln, preimage) {
+            LightningMakerMessage::Reject(reject) => {
+                assert_eq!(reject.swap_id, swap_id);
+                assert_eq!(reject.reason, "payment hash already used");
+            }
+            other => panic!("expected a Reject, got {}", other),
+        }
+        assert!(
+            maker.get_ln_swap(&swap_id).unwrap().is_none(),
+            "the maker stored a swap on a payment hash already on record"
+        );
+    }
+
+    // A hash the node has no record of is still accepted.
+    let fresh = Preimage([0xf3; 32]);
+    accept_swap_in(&maker, &taker_ln, &fresh);
+    assert!(maker
+        .get_ln_swap(&fresh.payment_hash().to_string())
+        .unwrap()
+        .is_some());
+
+    drop(takers);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
