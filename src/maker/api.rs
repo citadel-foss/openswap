@@ -33,7 +33,7 @@ use crate::{
     taker::api::{REFUND_LOCKTIME_BASE, REFUND_LOCKTIME_STEP},
     utill::{
         fee_at_rate_sats, funding_fee_policy_sats, get_maker_dir, parse_field, parse_toml,
-        sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
+        set_config_key, sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
         blockchain::BackendConnector,
@@ -293,8 +293,12 @@ pub struct MakerServerConfig {
     /// Defaults to `MIN_RELAY_FEE_RATE`, which is also the floor — lower
     /// rates stop relaying.
     pub fidelity_feerate: f64,
-    /// Bitcoin network.
+    /// Bitcoin network. `init` replaces it with the wallet's network.
     pub network: Network,
+    /// Whether `network` is known: read from `config.toml`, or set by `init`
+    /// from the wallet. `write_to_file` writes the key only then, so a
+    /// missing key means the network is unknown, not regtest.
+    pub network_confirmed: bool,
     /// Selected blockchain backend (Bitcoin Core or Electrum) and its settings.
     pub backend: BackendConfig,
     /// On-disk wallet name; Same as Bitcoin Core watch-only wallet name.
@@ -337,6 +341,7 @@ impl Default for MakerServerConfig {
             fidelity_timelock: 15_000, // ~6 months (MAX_FIDELITY_TIMELOCK)
             fidelity_feerate: MIN_RELAY_FEE_RATE,
             network: Network::Regtest,
+            network_confirmed: false,
             backend: BackendConfig::CoreRpc(CoreRpcConfig::default()),
             // "maker" predates this branch; changing it would strand an upgrading
             // operator's wallet and fidelity bond.
@@ -443,6 +448,12 @@ impl MakerServerConfig {
         check_fee_pcts(amount_relative_fee_pct, time_relative_fee_pct)
             .map_err(WalletError::General)?;
 
+        // Written by `init` once the wallet is loaded. Readers that can't
+        // unlock the wallet use it to tell signet makers from mainnet ones.
+        let file_network = config_map
+            .get("network")
+            .and_then(|value| value.parse::<Network>().ok());
+
         Ok(MakerServerConfig {
             network_port: parse_field(config_map.get("network_port"), default_config.network_port),
             rpc_port: parse_field(config_map.get("rpc_port"), default_config.rpc_port),
@@ -473,7 +484,8 @@ impl MakerServerConfig {
             ldk_tls_cert_path: config_map.get("ldk_tls_cert_path").cloned(),
             // Runtime fields — not read from config file
             data_dir: default_config.data_dir,
-            network: default_config.network,
+            network: file_network.unwrap_or(default_config.network),
+            network_confirmed: file_network.is_some(),
             backend: default_config.backend,
             wallet_name: default_config.wallet_name,
             password: default_config.password,
@@ -551,8 +563,17 @@ name = \"{}\"
             self.name,
         );
 
-        // Optional Lightning backend keys: only present when configured.
         let mut toml_data = toml_data;
+        // Omitted until the wallet confirms it, so a default config can't
+        // record the regtest default for a maker on another network.
+        if self.network_confirmed {
+            toml_data.push_str(&format!(
+                "# Bitcoin network, taken from the wallet (not a setting)\nnetwork = \"{}\"\n",
+                self.network
+            ));
+        }
+
+        // Optional Lightning backend keys: only present when configured.
         if let Some(url) = &self.ldk_server_url {
             toml_data.push_str(&format!(
                 "# LDK Server gRPC address (host:port, no scheme) for Lightning swaps\nldk_server_url = {url}\n"
@@ -857,14 +878,31 @@ impl MakerServer {
         let data_dir = config.data_dir.clone();
         log::info!("Sync at:----MakerServer init----");
         wallet.sync_and_save(&shutdown)?;
+        // The wallet is authoritative. Record its network in `config.toml`
+        // when the file lacks it or disagrees.
         let wallet_network = wallet.store.network;
-        if config.network != wallet_network {
-            log::info!(
-                "Maker config network ({:?}) differs from wallet network ({:?}); using wallet network",
-                config.network,
-                wallet_network
-            );
+        if !config.network_confirmed || config.network != wallet_network {
+            if config.network_confirmed {
+                log::warn!(
+                    "config.toml network ({}) differs from wallet network ({}); using the wallet's",
+                    config.network,
+                    wallet_network
+                );
+            }
             config.network = wallet_network;
+            config.network_confirmed = true;
+            // Only a hint for readers that can't unlock the wallet, so a
+            // failed write shouldn't abort startup. Touch only our line when
+            // the file exists, so keys this build doesn't know survive.
+            let config_path = data_dir.join("config.toml");
+            let written = if config_path.exists() {
+                set_config_key(&config_path, "network", &format!("\"{wallet_network}\""))
+            } else {
+                config.write_to_file(&config_path)
+            };
+            if let Err(e) = written {
+                log::warn!("Couldn't record the wallet network in config.toml: {e}");
+            }
         }
         // Validate the blocklist on startup when screening is enabled.
         if config.check_blocklist {
@@ -3974,6 +4012,46 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(MakerServerConfig::new(Some(&path)).is_err());
+    }
+
+    /// A UI that lists makers on disk reads the network from `config.toml`,
+    /// since the wallet is encrypted. A missing key means unknown, and
+    /// rewriting such a config must not invent the regtest default.
+    #[test]
+    fn maker_config_network_round_trips_only_once_confirmed() {
+        let timelock = if cfg!(feature = "integration-test") {
+            950
+        } else {
+            15_000
+        };
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let rewritten = dir.path().join("rewritten.toml");
+        let has_network_key = |p: &std::path::Path| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .any(|l| l.starts_with("network ="))
+        };
+
+        std::fs::write(&path, format!("fidelity_timelock = {timelock}\n")).unwrap();
+        let unknown = MakerServerConfig::new(Some(&path)).unwrap();
+        assert!(!unknown.network_confirmed);
+        unknown.write_to_file(&rewritten).unwrap();
+        assert!(!has_network_key(&rewritten));
+
+        std::fs::write(
+            &path,
+            format!("fidelity_timelock = {timelock}\nnetwork = \"signet\"\n"),
+        )
+        .unwrap();
+        let signet = MakerServerConfig::new(Some(&path)).unwrap();
+        assert_eq!(signet.network, bitcoin::Network::Signet);
+        assert!(signet.network_confirmed);
+        signet.write_to_file(&rewritten).unwrap();
+        let reloaded = MakerServerConfig::new(Some(&rewritten)).unwrap();
+        assert_eq!(reloaded.network, bitcoin::Network::Signet);
+        assert!(reloaded.network_confirmed);
     }
 
     /// A config built in code never goes through `MakerServerConfig::new`,

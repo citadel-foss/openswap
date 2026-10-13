@@ -6,7 +6,7 @@
 //! recovery. Exercise the complete protocol, restart both makers from the same
 //! wallets, and prove that neither protocol leaves recovery material behind.
 
-use bitcoin::Amount;
+use bitcoin::{Amount, Network};
 use openswap::{
     maker::{start_server, MakerBehavior, MakerServer},
     protocol::common_messages::ProtocolVersion,
@@ -20,6 +20,14 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+/// The `network` line `init` records in the maker's `config.toml`.
+fn recorded_network(maker: &MakerServer) -> Option<String> {
+    std::fs::read_to_string(maker.data_dir.join("config.toml"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("network = ").map(str::to_string))
+}
 
 fn run_successful_swap_restart(protocol: ProtocolVersion) {
     let (test_framework, mut takers, makers, block_generation_handle) =
@@ -70,12 +78,22 @@ fn run_successful_swap_restart(protocol: ProtocolVersion) {
         thread::sleep(Duration::from_millis(250));
     }
 
+    // The first `init` records the wallet's network for readers that
+    // can't unlock the wallet.
+    for maker in &makers {
+        assert_eq!(recorded_network(maker).as_deref(), Some("\"regtest\""));
+    }
+
     let configs = makers
         .iter()
         .map(|maker| {
             let mut config = maker.config.clone();
             // Initialization consumes the configured passphrase.
             config.password = Some("integration-test".to_string());
+            // What `MakerServerConfig::new` yields for a stale
+            // `network = "signet"`: the wallet must win on restart.
+            config.network = Network::Signet;
+            config.network_confirmed = true;
             config
         })
         .collect::<Vec<_>>();
@@ -87,6 +105,10 @@ fn run_successful_swap_restart(protocol: ProtocolVersion) {
         .into_iter()
         .map(|config| Arc::new(MakerServer::init(config).unwrap()))
         .collect::<Vec<_>>();
+    for maker in &restarted {
+        assert_eq!(maker.config.network, Network::Regtest);
+        assert_eq!(recorded_network(maker).as_deref(), Some("\"regtest\""));
+    }
     let restarted_threads = restarted
         .iter()
         .map(|maker| {
