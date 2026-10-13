@@ -41,5 +41,5 @@ pub use swap::{
 pub use swap_out::{SwapOutAccept, SwapOutMaker, SwapOutParams, SwapOutRequest, SwapOutTaker};
 pub use types::{
     Balances, Bolt11Invoice, ChannelId, ChannelInfo, ChannelState, InvoiceParams, LnEvent,
-    NodeInfo, OpenChannelRequest, PaymentId, Preimage,
+    NodeInfo, OpenChannelRequest, PaymentId, PaymentOutcome, Preimage,
 };

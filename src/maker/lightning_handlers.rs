@@ -30,7 +30,7 @@ use std::{
 use bitcoin::{hashes::sha256, secp256k1::SecretKey, Amount, OutPoint};
 
 use crate::{
-    lightning::{swap::SwapHtlc, ChannelInfo, LightningBackend, LnEvent, Preimage},
+    lightning::{swap::SwapHtlc, ChannelInfo, LightningBackend, LnEvent, PaymentOutcome, Preimage},
     protocol::{
         common_messages::MakerToTakerMessage,
         lightning_messages::{
@@ -131,7 +131,9 @@ pub struct LnMakerSwap {
     pub payout_script: Option<bitcoin::ScriptBuf>,
     /// The confirmed/broadcast HTLC funding output, once known.
     pub funding: Option<(OutPoint, Amount)>,
-    /// Block height when the funding was first seen (refund timing).
+    /// Refund timing. Swap-in: the block that confirmed the funding, where the
+    /// taker's CSV refund window starts. Swap-out: the chain tip when the
+    /// maker broadcast its funding.
     pub funding_height: Option<u32>,
     /// Last phase-change time; the watchdog only touches idle states.
     pub updated_at: Instant,
@@ -724,8 +726,19 @@ fn handle_swap_in_funded<M: Maker>(
         MakerError::General("htlc script build failed")
     })?;
 
+    // The taker's CSV refund window opens `locktime` blocks after the block
+    // that confirmed the funding, and the watchdog times it from
+    // `funding_height`. Without that block it could never tell when an
+    // unsettled swap is past its window, so stop while the swap is still
+    // InAccepted, where the unfunded expiry frees it, rather than pay.
+    let Some(funding_height) = maker.tx_confirmation_height(&funded.outpoint.txid)? else {
+        return Err(MakerError::General(
+            "swap-in funding has no confirmation height",
+        ));
+    };
+
     swap.funding = Some((funded.outpoint, output.value));
-    swap.funding_height = maker.get_current_height().ok();
+    swap.funding_height = Some(funding_height);
     swap.phase = LnMakerPhase::InPaid;
     swap.touch();
     // `swap` was read before the confirmation wait. Another connection for
@@ -736,9 +749,10 @@ fn handle_swap_in_funded<M: Maker>(
         return Err(MakerError::General("swap-in no longer awaiting funding"));
     }
     // Watch only once the swap is ours to pay. If this fails, the swap stays
-    // InPaid without a payment, like a failed pay_invoice below, and the
-    // watchdog drops it once the taker's refund window has passed. A restart
-    // rebuilds the watch from the stored funding.
+    // InPaid without a payment, like a failed pay_invoice below. The node then
+    // has no record of the payment, which the watchdog cannot tell from one
+    // the node lost, so it keeps the swap until the taker's refund confirms.
+    // A restart rebuilds the watch from the stored funding.
     maker.register_watch_outpoint(funded.outpoint, htlc_spk)?;
 
     // The on-chain money is locked to our hashlock; paying the invoice is
@@ -1255,6 +1269,17 @@ fn settle_swap_out_from_spend<M: Maker>(
 /// Runs on a maker background thread; states touched recently are left to
 /// their connection handler.
 pub(crate) fn ln_watchdog_tick(maker: &Arc<MakerServer>) {
+    ln_watchdog_pass(maker, Some(WATCHDOG_MIN_IDLE));
+}
+
+/// Runs one watchdog pass over every swap, however recently it was touched.
+/// Tests use this instead of waiting out `WATCHDOG_MIN_IDLE`.
+#[cfg(feature = "integration-test")]
+pub fn ln_watchdog_tick_now(maker: &Arc<MakerServer>) {
+    ln_watchdog_pass(maker, None);
+}
+
+fn ln_watchdog_pass(maker: &Arc<MakerServer>, min_idle: Option<Duration>) {
     let (Some(ctx_ln), Some(router)) = (maker.lightning.clone(), maker.ln_router.clone()) else {
         return;
     };
@@ -1263,7 +1288,7 @@ pub(crate) fn ln_watchdog_tick(maker: &Arc<MakerServer>) {
     let swaps: Vec<(String, LnMakerSwap)> = match maker.ln_swaps.lock() {
         Ok(swaps) => swaps
             .iter()
-            .filter(|(_, s)| s.updated_at.elapsed() > WATCHDOG_MIN_IDLE)
+            .filter(|(_, s)| min_idle.is_none_or(|idle| s.updated_at.elapsed() > idle))
             .map(|(id, s)| (id.clone(), s.clone()))
             .collect(),
         Err(_) => return,
@@ -1371,35 +1396,136 @@ fn watchdog_finish_swap_in(
     // it may have been delivered while this maker was down, since event
     // delivery is at-most-once. Ask the node directly, which is the only way
     // a restarted swap-in maker can still reach the preimage it needs.
-    let preimage = ctx.ln.settled_preimage(swap.payment_hash).map_err(|e| {
-        log::warn!("swap-in {swap_id}: preimage lookup failed: {e:?}");
-        MakerError::General("preimage lookup failed")
+    let outcome = ctx.ln.payment_outcome(swap.payment_hash).map_err(|e| {
+        log::warn!("swap-in {swap_id}: payment lookup failed: {e:?}");
+        MakerError::General("payment lookup failed")
     })?;
-    if let Some(preimage) = preimage {
+    if let PaymentOutcome::Settled(preimage) = outcome {
         if preimage.payment_hash() == swap.payment_hash {
             log::info!("Swap-in {swap_id}: recovered preimage from the node's payment store");
             return sweep_swap_in(maker, swap_id, swap, &preimage);
         }
     }
 
-    // The payment never settled and the taker's refund window has closed, so
-    // the HTLC is theirs and there is nothing left for us to sweep. Without
+    // Not settled. Once the taker's refund window has closed, a swap whose
+    // payment can no longer settle has nothing left for us to sweep. Without
     // this an `InPaid` swap whose payment failed would be polled forever.
-    if let (Some(funded_at), Ok(tip)) = (swap.funding_height, maker.get_current_height()) {
+    let funded_at = match swap.funding_height {
+        Some(height) => height,
+        None => match recover_swap_in_funding_height(maker, swap_id, swap)? {
+            Some(height) => height,
+            None => return Ok(()),
+        },
+    };
+    if let Ok(tip) = maker.get_current_height() {
         let refundable_at = funded_at.saturating_add(swap.locktime as u32);
         if tip > refundable_at.saturating_add(REFUND_GRACE_BLOCKS) {
-            log::info!(
-                "Swap-in {swap_id}: never settled and the taker's refund window has passed; \
-                 dropping the swap"
-            );
-            ctx.router.unsubscribe(&swap.payment_hash);
-            if let (Some((outpoint, _)), Ok(spk)) = (swap.funding, swap.htlc.script_pubkey()) {
-                maker.unwatch_outpoint(outpoint, spk);
+            // The payment's route budget ends before the window does, but an
+            // HTLC that outlives its expiry is resolved on-chain, and until
+            // then the payee can still claim it with the preimage. That
+            // preimage sweeps the HTLC for as long as the taker has not
+            // refunded it, and only this record holds the key. So the
+            // window is not enough. Drop the swap only once the node reports
+            // the payment failed, which LDK does only once no HTLC of it is
+            // pending, or once the taker's refund has confirmed and there is
+            // nothing left for the key to reach.
+            let reason = match outcome {
+                PaymentOutcome::Failed => "its payment failed",
+                // No record is no proof: ldk-node records a payment only
+                // after LDK has taken it on, so a crash or a failed write in
+                // between leaves a payment in flight that it knows nothing
+                // of. Wait for the taker's refund instead.
+                PaymentOutcome::Pending | PaymentOutcome::NotFound => {
+                    if !swap_in_htlc_refunded(maker, swap)? {
+                        log::warn!(
+                            "Swap-in {swap_id}: past the taker's refund window, but the payment \
+                             is {}; keeping the swap until it settles, fails, or the taker's \
+                             refund confirms",
+                            if outcome == PaymentOutcome::Pending {
+                                "still in flight"
+                            } else {
+                                "not on record, which does not prove it was never sent"
+                            }
+                        );
+                        return Ok(());
+                    }
+                    "the taker's refund confirmed"
+                }
+                // A preimage for another hash: the node's answer is wrong,
+                // so keep the swap.
+                PaymentOutcome::Settled(_) => return Ok(()),
+            };
+            // `swap` is this pass's snapshot. If the swap has moved on since,
+            // say to InSwept with the preimage, its record is what reaches
+            // the money, so drop it only while it is still InPaid.
+            if maker.remove_ln_swap_if_phase(swap_id, LnMakerPhase::InPaid)? {
+                log::info!(
+                    "Swap-in {swap_id}: never settled, {reason}, and the taker's refund window \
+                     has passed; dropped the swap"
+                );
+                if let (Some((outpoint, _)), Ok(spk)) = (swap.funding, swap.htlc.script_pubkey()) {
+                    maker.unwatch_outpoint(outpoint, spk);
+                }
             }
-            return maker.remove_ln_swap(swap_id);
         }
     }
     Ok(())
+}
+
+/// Whether an InPaid swap-in's HTLC has a confirmed spend. The maker never
+/// spent it: a sweep moves the swap to InSwept before it is broadcast. So the
+/// spend is the taker's refund, and the swap's key has nothing left to reach.
+fn swap_in_htlc_refunded(maker: &Arc<MakerServer>, swap: &LnMakerSwap) -> Result<bool, MakerError> {
+    let Some((outpoint, _)) = swap.funding else {
+        return Ok(false);
+    };
+    let spk = swap.htlc.script_pubkey().map_err(|e| {
+        log::warn!("lightning: htlc script build failed: {e}");
+        MakerError::General("htlc script build failed")
+    })?;
+    maker.is_htlc_spend_confirmed(&outpoint, &spk)
+}
+
+/// Recovers the funding height of an InPaid swap-in stored without one, as a
+/// handler whose height lookup failed used to store it. The watchdog cannot
+/// time the taker's refund window without it. Returns the height once it is
+/// stored; `None` leaves the swap for a later pass, because the funding has
+/// no confirmation height yet or the swap has changed since `swap` was read.
+/// A failed lookup is an error, and the swap is kept.
+fn recover_swap_in_funding_height(
+    maker: &Arc<MakerServer>,
+    swap_id: &str,
+    swap: &LnMakerSwap,
+) -> Result<Option<u32>, MakerError> {
+    let Some((outpoint, _)) = swap.funding else {
+        return Ok(None);
+    };
+    let Some(height) = maker.tx_confirmation_height(&outpoint.txid)? else {
+        log::warn!(
+            "Swap-in {swap_id}: funding {outpoint} has no confirmation height; keeping the swap \
+             until it does"
+        );
+        return Ok(None);
+    };
+    if !maker.fill_ln_funding_height(swap_id, LnMakerPhase::InPaid, outpoint, height)? {
+        return Ok(None);
+    }
+    log::info!("Swap-in {swap_id}: recovered funding height {height} from the chain");
+    Ok(Some(height))
+}
+
+/// Runs the watchdog's pass over an InPaid swap-in on a snapshot the test
+/// supplies, whatever state the stored swap has reached since.
+#[cfg(feature = "integration-test")]
+pub fn watchdog_finish_swap_in_snapshot(
+    maker: &Arc<MakerServer>,
+    swap_id: &str,
+    swap: &LnMakerSwap,
+) -> Result<(), MakerError> {
+    let (Some(ln), Some(router)) = (maker.lightning.clone(), maker.ln_router.clone()) else {
+        return Err(MakerError::General("lightning is not configured"));
+    };
+    watchdog_finish_swap_in(maker, &LnContext { ln, router }, swap_id, swap)
 }
 
 fn watchdog_resolve_swap_out(

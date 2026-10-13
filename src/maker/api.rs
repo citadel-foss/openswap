@@ -3521,6 +3521,55 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn fill_ln_funding_height(
+        &self,
+        swap_id: &str,
+        expected: super::lightning_handlers::LnMakerPhase,
+        outpoint: OutPoint,
+        height: u32,
+    ) -> Result<bool, MakerError> {
+        // Same lock order as store_ln_swap_if_phase, so the check and the
+        // write are one step for every other writer.
+        let mut wallet = lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let mut swaps = lock_debug!(self.ln_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        let in_memory = swaps.get(swap_id).is_some_and(|swap| {
+            swap.phase == expected
+                && swap.funding.map(|(funded, _)| funded) == Some(outpoint)
+                && swap.funding_height.is_none()
+        });
+        let on_disk = wallet
+            .store
+            .ln_maker_swaps
+            .get(swap_id)
+            .is_some_and(|record| {
+                record.phase == expected
+                    && record.funding_outpoint == Some(outpoint)
+                    && record.funding_height.is_none()
+            });
+        if !(in_memory && on_disk) {
+            return Ok(false);
+        }
+        // Persist first, as the other stores do. Only the height changes, on
+        // the records already stored, so nothing newer is overwritten.
+        if let Some(record) = wallet.store.ln_maker_swaps.get_mut(swap_id) {
+            record.funding_height = Some(height);
+        }
+        if let Err(e) = wallet.save_to_disk() {
+            // Put the record back, so the wallet store still matches the map
+            // and the disk.
+            if let Some(record) = wallet.store.ln_maker_swaps.get_mut(swap_id) {
+                record.funding_height = None;
+            }
+            return Err(MakerError::Wallet(e));
+        }
+        if let Some(swap) = swaps.get_mut(swap_id) {
+            swap.funding_height = Some(height);
+        }
+        Ok(true)
+    }
+
+    #[cfg(feature = "lightning")]
     fn is_tx_confirmed(&self, txid: &bitcoin::Txid) -> Result<bool, MakerError> {
         use crate::wallet::Blockchain;
         // `tx_block_height` already distinguishes "not in a block" from a
@@ -3533,6 +3582,25 @@ impl MakerTrait for MakerServer {
             .tx_block_height(txid)
             .map_err(MakerError::Wallet)?;
         Ok(height.is_some())
+    }
+
+    #[cfg(feature = "lightning")]
+    fn tx_confirmation_height(&self, txid: &bitcoin::Txid) -> Result<Option<u32>, MakerError> {
+        use crate::wallet::Blockchain;
+        #[cfg(feature = "integration-test")]
+        match self.behavior() {
+            MakerBehavior::FailFundingHeightLookup => {
+                return Err(MakerError::General("Test: funding height lookup failed"))
+            }
+            MakerBehavior::NoFundingHeight => return Ok(None),
+            _ => {}
+        }
+        let height = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .tx_block_height(txid)
+            .map_err(MakerError::Wallet)?;
+        Ok(height.map(|h| h as u32))
     }
 
     #[cfg(feature = "lightning")]

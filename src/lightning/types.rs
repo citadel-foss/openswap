@@ -78,6 +78,21 @@ impl std::fmt::Display for PaymentId {
     }
 }
 
+/// Where an outbound payment stands, as the node's payment store records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentOutcome {
+    /// Settled. The preimage is the proof.
+    Settled(Preimage),
+    /// Still in flight: it may yet settle or fail.
+    Pending,
+    /// Failed with no HTLC left pending. It can no longer settle.
+    Failed,
+    /// The node holds no record of an outbound payment with this hash. That
+    /// does not prove none is in flight: a node can lose the record of a
+    /// payment it has already sent.
+    NotFound,
+}
+
 /// Coarse lifecycle state of a channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelState {

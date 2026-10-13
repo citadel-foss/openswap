@@ -15,19 +15,19 @@ use std::{
 
 use bitcoin::{
     secp256k1::{Secp256k1, SecretKey},
-    Amount, Network, OutPoint, PublicKey,
+    Amount, Network, OutPoint, PublicKey, Txid,
 };
-use bitcoind::bitcoincore_rpc::RpcApi;
+use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
 use openswap::{
     lightning::{
         invoice::verify_invoice, InvoiceParams, LightningBackend, LnEvent, MockLightningBackend,
-        OpenChannelRequest, Preimage, SwapHtlc,
+        OpenChannelRequest, PaymentId, PaymentOutcome, Preimage, SwapHtlc,
     },
     maker::{
         handlers::{handle_message, ConnectionState, Maker},
         lightning_handlers::{
-            refuse_swap_in_after_wait, watchdog_expire_swap_in_snapshot, LnDirection, LnMakerPhase,
-            LnMakerSwap,
+            ln_watchdog_tick_now, refuse_swap_in_after_wait, watchdog_expire_swap_in_snapshot,
+            watchdog_finish_swap_in_snapshot, LnDirection, LnMakerPhase, LnMakerSwap,
         },
         MakerBehavior, MakerServer,
     },
@@ -235,6 +235,11 @@ fn lightning_maker_restart_recovers_funded_swap() {
 
 /// An unfunded swap-in as the maker stores it on acceptance.
 fn accepted_swap_in(preimage: &Preimage) -> LnMakerSwap {
+    accepted_swap_in_with_locktime(preimage, 144)
+}
+
+/// [`accepted_swap_in`] with a chosen refund locktime.
+fn accepted_swap_in_with_locktime(preimage: &Preimage, locktime: u16) -> LnMakerSwap {
     let secp = Secp256k1::new();
     let hashlock_privkey = SecretKey::from_slice(&[0x41; 32]).unwrap();
     let hashlock_pubkey = PublicKey::new(hashlock_privkey.public_key(&secp));
@@ -250,9 +255,9 @@ fn accepted_swap_in(preimage: &Preimage) -> LnMakerSwap {
         payment_hash,
         amount: Amount::from_sat(40_000),
         fee: Amount::from_sat(500),
-        locktime: 144,
+        locktime,
         min_confirmations: 1,
-        htlc: SwapHtlc::new(&hashlock_pubkey, &timelock_pubkey, &payment_hash, 144),
+        htlc: SwapHtlc::new(&hashlock_pubkey, &timelock_pubkey, &payment_hash, locktime),
         privkey: hashlock_privkey,
         invoice: "lnbcrt-test".to_string(),
         preimage: None,
@@ -266,18 +271,16 @@ fn accepted_swap_in(preimage: &Preimage) -> LnMakerSwap {
 }
 
 /// Whether the maker's mailbox for `payment_hash` is still open: an event
-/// for it reaches the mailbox only if it is.
+/// for it reaches the mailbox only if it is. The probe event is pushed
+/// straight onto the node's queue, so the node records no payment for it.
 fn mailbox_open(maker: &MakerServer, ln: &MockLightningBackend, preimage: &Preimage) -> bool {
     let payment_hash = preimage.payment_hash();
-    ln.create_hold_invoice(
-        payment_hash,
-        InvoiceParams {
-            amount_msat: Some(40_000_000),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    ln.simulate_htlc_arrival(payment_hash, 40_000_000);
+    ln.push_event(LnEvent::PaymentClaimable {
+        payment_id: PaymentId(payment_hash.to_string()),
+        payment_hash: Some(payment_hash),
+        amount_msat: Some(40_000_000),
+        claim_deadline: None,
+    });
     let router = maker.ln_router.as_ref().unwrap();
     router.pump_once();
     matches!(
@@ -907,6 +910,1286 @@ fn swap_in_funded_handler_yields_to_swap_paid_during_wait() {
     drop(takers);
     maker.shutdown.store(true, Relaxed);
     maker.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// Blocks past the taker's refund maturity before the maker drops a swap-in
+/// it never settled. Mirrors the maker's `REFUND_GRACE_BLOCKS`.
+const REFUND_GRACE_BLOCKS: u64 = 12;
+
+/// Stops the framework's block generation and waits out a round that may
+/// already be mining, so the heights a test reads stay put.
+fn pause_block_generation(test_framework: &TestFramework) {
+    test_framework.set_block_gen_paused(true);
+    let bitcoind = &test_framework.bitcoind;
+    let mut height = bitcoind.client.get_block_count().unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        let now = bitcoind.client.get_block_count().unwrap();
+        if now == height {
+            return;
+        }
+        height = now;
+    }
+}
+
+/// Mines until the tip is exactly `height`.
+fn mine_to(bitcoind: &BitcoinD, height: u64) {
+    let tip = bitcoind.client.get_block_count().unwrap();
+    assert!(tip <= height, "the chain is already past height {}", height);
+    if tip < height {
+        generate_blocks(bitcoind, height - tip);
+    }
+    assert_eq!(bitcoind.client.get_block_count().unwrap(), height);
+}
+
+/// Pays `swap`'s HTLC its amount plus fee from the node's wallet. The
+/// funding is left unconfirmed.
+fn fund_htlc(bitcoind: &BitcoinD, swap: &LnMakerSwap) -> OutPoint {
+    let address = swap.htlc.address(Network::Regtest).unwrap();
+    let txid = send_to_address(bitcoind, &address, swap.amount + swap.fee);
+    let tx = bitcoind.client.get_raw_transaction(&txid, None).unwrap();
+    let vout = tx
+        .output
+        .iter()
+        .position(|output| output.script_pubkey == address.script_pubkey())
+        .unwrap();
+    OutPoint {
+        txid,
+        vout: vout as u32,
+    }
+}
+
+/// Broadcasts the taker's refund of `swap`'s HTLC through the timelock
+/// branch, signed with the taker's key. Valid once `swap.locktime` blocks
+/// have passed since the funding confirmed.
+fn broadcast_taker_refund(bitcoind: &BitcoinD, swap: &LnMakerSwap, funding: OutPoint) -> Txid {
+    let timelock_privkey = SecretKey::from_slice(&[0x42; 32]).unwrap();
+    let destination = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap()
+        .script_pubkey();
+    let refund = swap
+        .htlc
+        .create_timelock_spend(
+            funding,
+            swap.amount + swap.fee,
+            &timelock_privkey,
+            destination,
+        )
+        .unwrap();
+    bitcoind.client.send_raw_transaction(&refund).unwrap()
+}
+
+/// Height of the block that confirmed `txid`.
+fn confirmation_height(bitcoind: &BitcoinD, txid: &Txid) -> u64 {
+    let info = bitcoind
+        .client
+        .get_raw_transaction_info(txid, None)
+        .unwrap();
+    let hash = info.blockhash.expect("the funding is confirmed");
+    bitcoind.client.get_block_header_info(&hash).unwrap().height as u64
+}
+
+/// `swap` moved to InPaid on `funding` with no `funding_height`: the record a
+/// maker stored when its height lookup failed as it paid the swap.
+fn paid_without_height(swap: &LnMakerSwap, funding: OutPoint) -> LnMakerSwap {
+    let mut paid = swap.clone();
+    paid.phase = LnMakerPhase::InPaid;
+    paid.funding = Some((funding, swap.amount + swap.fee));
+    paid.funding_height = None;
+    paid
+}
+
+/// Has `ln` pay a hold invoice for `preimage`'s hash and fail it back, so the
+/// node records a payment that can no longer settle. Returns the invoice,
+/// for the swap that paid it. A standalone mock node plays both ends.
+fn failed_payment_invoice(ln: &MockLightningBackend, preimage: &Preimage) -> String {
+    let invoice = ln
+        .create_hold_invoice(
+            preimage.payment_hash(),
+            InvoiceParams {
+                amount_msat: Some(40_000_000),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .invoice;
+    ln.pay_invoice(&invoice, None, Some(100)).unwrap();
+    ln.fail_held_payment(preimage.payment_hash()).unwrap();
+    assert_eq!(
+        ln.payment_outcome(preimage.payment_hash()).unwrap(),
+        PaymentOutcome::Failed
+    );
+    invoice
+}
+
+/// A swap-in whose height lookup failed as the maker paid it is stored as
+/// InPaid with funding but no `funding_height`. If its payment failed, the
+/// watchdog must still drop it once the taker's refund window has passed,
+/// measured from the funding's confirmation, as it does any other swap-in
+/// whose payment failed. Otherwise the record holds one of the maker's swap
+/// slots for good.
+#[test]
+fn watchdog_releases_swap_in_missing_funding_height() {
+    log::warn!("Running Test: watchdog releases a swap-in missing its funding height");
+
+    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers[0].clone();
+    let router = maker.ln_router.clone().unwrap();
+    pause_block_generation(&test_framework);
+
+    // Three paid swap-ins on real HTLC funding, confirmed in one block, each
+    // with a payment the node reports failed.
+    // - `control` kept its funding height, as a healthy handler stores it.
+    // - `missing` lost it.
+    // - `longer` lost it too, but its longer locktime keeps it inside its
+    //   refund window when the other two leave theirs.
+    let preimages = [
+        Preimage([0x91; 32]),
+        Preimage([0x92; 32]),
+        Preimage([0x93; 32]),
+    ];
+    let ids: Vec<String> = preimages
+        .iter()
+        .map(|preimage| preimage.payment_hash().to_string())
+        .collect();
+    let mut accepted = [
+        accepted_swap_in_with_locktime(&preimages[0], 144),
+        accepted_swap_in_with_locktime(&preimages[1], 144),
+        accepted_swap_in_with_locktime(&preimages[2], 160),
+    ];
+    for (swap, preimage) in accepted.iter_mut().zip(&preimages) {
+        swap.invoice = failed_payment_invoice(&ln, preimage);
+    }
+    let fundings: Vec<OutPoint> = accepted
+        .iter()
+        .map(|swap| fund_htlc(bitcoind, swap))
+        .collect();
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &fundings[0].txid);
+    for funding in &fundings {
+        assert_eq!(confirmation_height(bitcoind, &funding.txid), confirmed_at);
+    }
+    let mut control = paid_without_height(&accepted[0], fundings[0]);
+    control.funding_height = Some(confirmed_at as u32);
+    let stored = [
+        control,
+        paid_without_height(&accepted[1], fundings[1]),
+        paid_without_height(&accepted[2], fundings[2]),
+    ];
+    for (id, swap) in ids.iter().zip(stored) {
+        router.subscribe(swap.payment_hash);
+        maker.store_ln_swap(id, swap).unwrap();
+    }
+
+    // Rule out the other reasons a swap could stay: every HTLC is unspent
+    // and every payment failed.
+    for (funding, preimage) in fundings.iter().zip(&preimages) {
+        assert!(bitcoind
+            .client
+            .get_tx_out(&funding.txid, funding.vout, Some(true))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            ln.payment_outcome(preimage.payment_hash()).unwrap(),
+            PaymentOutcome::Failed
+        );
+    }
+
+    // At the last height inside the 144-block refund window plus grace,
+    // every swap stays.
+    let last_kept = confirmed_at + 144 + REFUND_GRACE_BLOCKS;
+    mine_to(bitcoind, last_kept);
+    ln_watchdog_tick_now(&maker);
+    for id in &ids {
+        assert!(
+            maker.get_ln_swap(id).unwrap().is_some(),
+            "the watchdog dropped swap {} inside its refund window",
+            id
+        );
+    }
+
+    // One block later the 144-block swaps are past it.
+    mine_to(bitcoind, last_kept + 1);
+    ln_watchdog_tick_now(&maker);
+    assert!(
+        maker.get_ln_swap(&ids[0]).unwrap().is_none(),
+        "the watchdog kept an unsettled swap that has its funding height"
+    );
+    assert!(
+        maker.get_ln_swap(&ids[1]).unwrap().is_none(),
+        "the watchdog never released a swap missing its funding height"
+    );
+    let kept = maker
+        .get_ln_swap(&ids[2])
+        .unwrap()
+        .expect("the watchdog dropped a swap still inside its refund window");
+    assert_eq!(kept.phase, LnMakerPhase::InPaid);
+    assert_eq!(
+        kept.funding_height,
+        Some(confirmed_at as u32),
+        "the watchdog did not recover the funding's confirmation height"
+    );
+    assert_eq!(
+        maker.ln_swap_count(),
+        1,
+        "the released swaps kept their slots"
+    );
+    assert!(!mailbox_open(&maker, &ln, &preimages[1]));
+    assert!(mailbox_open(&maker, &ln, &preimages[2]));
+
+    // Restart: the released swaps are gone from disk, and the recovered
+    // height was saved.
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(router);
+    drop(maker);
+    drop(makers);
+    let mut restarted = MakerServer::init(config).expect("maker restarts");
+    restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
+    let restarted = Arc::new(restarted);
+    let restored = restarted.ln_swaps.lock().unwrap().clone();
+    assert!(
+        !restored.contains_key(&ids[0]) && !restored.contains_key(&ids[1]),
+        "a released swap came back after a restart"
+    );
+    assert_eq!(
+        restored
+            .get(&ids[2])
+            .expect("the kept swap's record was lost")
+            .funding_height,
+        Some(confirmed_at as u32),
+        "the recovered funding height was not saved"
+    );
+
+    // The restarted maker drops the longer swap once its own window passes.
+    let last_kept = confirmed_at + 160 + REFUND_GRACE_BLOCKS;
+    mine_to(bitcoind, last_kept);
+    ln_watchdog_tick_now(&restarted);
+    assert!(restarted.get_ln_swap(&ids[2]).unwrap().is_some());
+    mine_to(bitcoind, last_kept + 1);
+    ln_watchdog_tick_now(&restarted);
+    assert!(
+        restarted.get_ln_swap(&ids[2]).unwrap().is_none(),
+        "the restarted watchdog kept a swap past its refund window"
+    );
+    assert_eq!(restarted.ln_swap_count(), 0);
+
+    test_framework.set_block_gen_paused(false);
+    drop(takers);
+    restarted.shutdown.store(true, Relaxed);
+    restarted.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// The watchdog must not read a failed or empty height lookup as a sign that
+/// the refund window has passed. A backend failure keeps the swap and its
+/// mailbox, and so does a funding with no confirmation height. A later pass,
+/// here after a restart, recovers the height and releases the swap.
+#[test]
+fn watchdog_keeps_swap_in_while_funding_height_is_unknown() {
+    log::warn!("Running Test: watchdog keeps a swap-in while its funding height is unknown");
+
+    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::FailFundingHeightLookup],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers[0].clone();
+    pause_block_generation(&test_framework);
+
+    // A paid swap-in whose payment failed, on confirmed funding, stored
+    // without a funding height, and already past its refund window.
+    let preimage = Preimage([0xb1; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    let mut accepted = accepted_swap_in(&preimage);
+    accepted.invoice = failed_payment_invoice(&ln, &preimage);
+    let funding = fund_htlc(bitcoind, &accepted);
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &funding.txid);
+    maker
+        .ln_router
+        .as_ref()
+        .unwrap()
+        .subscribe(preimage.payment_hash());
+    maker
+        .store_ln_swap(&swap_id, paid_without_height(&accepted, funding))
+        .unwrap();
+    mine_to(bitcoind, confirmed_at + 144 + REFUND_GRACE_BLOCKS + 1);
+
+    // The height lookup fails, so the watchdog cannot tell and keeps it.
+    ln_watchdog_tick_now(&maker);
+    let kept = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .expect("a failed height lookup dropped the swap");
+    assert_eq!(kept.phase, LnMakerPhase::InPaid);
+    assert_eq!(
+        kept.funding,
+        Some((funding, accepted.amount + accepted.fee))
+    );
+    assert_eq!(kept.funding_height, None);
+    assert!(
+        mailbox_open(&maker, &ln, &preimage),
+        "a failed height lookup closed the swap's mailbox"
+    );
+
+    // Restart with a working backend, and add a swap whose funding has no
+    // confirmation height: no node knows its transaction.
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(maker);
+    drop(makers);
+    let mut restarted = MakerServer::init(config.clone()).expect("maker restarts");
+    restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
+    let restarted = Arc::new(restarted);
+    assert_eq!(
+        restarted
+            .get_ln_swap(&swap_id)
+            .unwrap()
+            .unwrap()
+            .funding_height,
+        None
+    );
+    let unknown_preimage = Preimage([0xb2; 32]);
+    let unknown_id = unknown_preimage.payment_hash().to_string();
+    restarted
+        .ln_router
+        .as_ref()
+        .unwrap()
+        .subscribe(unknown_preimage.payment_hash());
+    restarted
+        .store_ln_swap(
+            &unknown_id,
+            paid_without_height(&accepted_swap_in(&unknown_preimage), OutPoint::default()),
+        )
+        .unwrap();
+
+    ln_watchdog_tick_now(&restarted);
+    assert!(
+        restarted.get_ln_swap(&swap_id).unwrap().is_none(),
+        "the watchdog did not release the swap once it could read its funding height"
+    );
+    let unknown = restarted
+        .get_ln_swap(&unknown_id)
+        .unwrap()
+        .expect("a funding with no confirmation height was taken as expired");
+    assert_eq!(unknown.phase, LnMakerPhase::InPaid);
+    assert_eq!(unknown.funding_height, None);
+    assert!(mailbox_open(&restarted, &ln, &unknown_preimage));
+    assert_eq!(restarted.ln_swap_count(), 1);
+
+    // What reached disk matches.
+    restarted.shutdown.store(true, Relaxed);
+    restarted.watch_service.shutdown();
+    drop(restarted);
+    let reloaded = MakerServer::init(config).expect("maker restarts");
+    let restored = reloaded.ln_swaps.lock().unwrap().clone();
+    assert!(
+        !restored.contains_key(&swap_id),
+        "the released swap came back after a restart"
+    );
+    assert_eq!(
+        restored
+            .get(&unknown_id)
+            .expect("the unconfirmed swap's record was lost")
+            .funding_height,
+        None
+    );
+
+    test_framework.set_block_gen_paused(false);
+    drop(takers);
+    reloaded.shutdown.store(true, Relaxed);
+    reloaded.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// The watchdog acts on a snapshot of each swap. If the stored swap has
+/// changed since, recovering a missing funding height must not overwrite the
+/// newer record or bring back a removed one. Dropping a swap past its refund
+/// window must not delete one that has moved on either, such as a swap swept
+/// with its preimage, whose record is what reaches the money.
+#[test]
+fn stale_watchdog_snapshot_keeps_newer_swap_in_state() {
+    log::warn!("Running Test: stale watchdog snapshot keeps newer swap-in state");
+
+    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers[0].clone();
+    let router = maker.ln_router.clone().unwrap();
+    pause_block_generation(&test_framework);
+
+    // Five paid swap-ins on confirmed funding, each with a payment that
+    // failed. Each snapshot is the swap as the watchdog read it; the live
+    // record then changes under it.
+    let preimages: Vec<Preimage> = (0xc1..=0xc5).map(|byte| Preimage([byte; 32])).collect();
+    let ids: Vec<String> = preimages
+        .iter()
+        .map(|preimage| preimage.payment_hash().to_string())
+        .collect();
+    let accepted: Vec<LnMakerSwap> = preimages
+        .iter()
+        .map(|preimage| {
+            let mut swap = accepted_swap_in(preimage);
+            swap.invoice = failed_payment_invoice(&ln, preimage);
+            swap
+        })
+        .collect();
+    let fundings: Vec<OutPoint> = accepted
+        .iter()
+        .map(|swap| fund_htlc(bitcoind, swap))
+        .collect();
+    // A second funding of the fourth swap's HTLC, for the outpoint case.
+    let other_funding = fund_htlc(bitcoind, &accepted[3]);
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &fundings[0].txid);
+    let value = accepted[0].amount + accepted[0].fee;
+
+    let mut snapshots: Vec<LnMakerSwap> = accepted
+        .iter()
+        .zip(&fundings)
+        .map(|(swap, funding)| paid_without_height(swap, *funding))
+        .collect();
+    // The last snapshot already has its height, so this pass would drop it.
+    snapshots[4].funding_height = Some(confirmed_at as u32);
+    for (id, snapshot) in ids.iter().zip(&snapshots) {
+        router.subscribe(snapshot.payment_hash);
+        maker.store_ln_swap(id, snapshot.clone()).unwrap();
+    }
+
+    let swept = |snapshot: &LnMakerSwap, preimage: &Preimage| {
+        let mut swept = snapshot.clone();
+        swept.phase = LnMakerPhase::InSwept;
+        swept.preimage = Some(*preimage);
+        swept
+    };
+    // 0: swept with the preimage since the snapshot.
+    maker
+        .store_ln_swap(&ids[0], swept(&snapshots[0], &preimages[0]))
+        .unwrap();
+    // 1: removed since the snapshot.
+    maker.remove_ln_swap(&ids[1]).unwrap();
+    // 2: another writer stored a different height.
+    let mut filled = snapshots[2].clone();
+    filled.funding_height = Some(confirmed_at as u32 + 3);
+    maker.store_ln_swap(&ids[2], filled).unwrap();
+    // 3: now funded at another outpoint.
+    let mut refunded = snapshots[3].clone();
+    refunded.funding = Some((other_funding, value));
+    maker.store_ln_swap(&ids[3], refunded).unwrap();
+    // 4: swept with the preimage since a snapshot that has its height.
+    maker
+        .store_ln_swap(&ids[4], swept(&snapshots[4], &preimages[4]))
+        .unwrap();
+
+    // Past the refund window of every snapshot, but not of swap 2's live
+    // height: a pass that used the snapshots' state would drop them.
+    mine_to(bitcoind, confirmed_at + 144 + REFUND_GRACE_BLOCKS + 1);
+    for (id, snapshot) in ids.iter().zip(&snapshots) {
+        watchdog_finish_swap_in_snapshot(&maker, id, snapshot).unwrap();
+    }
+
+    let check = |swaps: &dyn Fn(&str) -> Option<LnMakerSwap>, when: &str| {
+        for i in [0, 4] {
+            let swap =
+                swaps(&ids[i]).unwrap_or_else(|| panic!("{}: a swept swap was deleted", when));
+            assert_eq!(swap.phase, LnMakerPhase::InSwept, "{when}");
+            assert_eq!(swap.preimage, Some(preimages[i]), "{when}: preimage lost");
+            assert_eq!(swap.funding, Some((fundings[i], value)), "{when}");
+        }
+        assert_eq!(
+            swaps(&ids[0]).unwrap().funding_height,
+            None,
+            "{when}: the swept record was overwritten"
+        );
+        assert!(
+            swaps(&ids[1]).is_none(),
+            "{}: a removed swap was brought back",
+            when
+        );
+        let filled = swaps(&ids[2]).unwrap_or_else(|| panic!("{}: swap 2 was deleted", when));
+        assert_eq!(filled.phase, LnMakerPhase::InPaid, "{when}");
+        assert_eq!(
+            filled.funding_height,
+            Some(confirmed_at as u32 + 3),
+            "{when}: another writer's height was overwritten"
+        );
+        let refunded = swaps(&ids[3]).unwrap_or_else(|| panic!("{}: swap 3 was deleted", when));
+        assert_eq!(refunded.phase, LnMakerPhase::InPaid, "{when}");
+        assert_eq!(refunded.funding, Some((other_funding, value)), "{when}");
+        assert_eq!(
+            refunded.funding_height, None,
+            "{when}: a height was stored for an outpoint the swap no longer has"
+        );
+    };
+    check(&|id| maker.get_ln_swap(id).unwrap(), "in memory");
+    for i in [0, 2, 3, 4] {
+        assert!(
+            mailbox_open(&maker, &ln, &preimages[i]),
+            "the stale pass closed swap {}'s mailbox",
+            i
+        );
+    }
+
+    // The wallet store is private to the crate, so check what reached disk by
+    // restarting.
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(router);
+    drop(maker);
+    drop(makers);
+    let restarted = MakerServer::init(config).expect("maker restarts");
+    let restored = restarted.ln_swaps.lock().unwrap().clone();
+    check(&|id| restored.get(id).cloned(), "after a restart");
+
+    test_framework.set_block_gen_paused(false);
+    drop(takers);
+    restarted.shutdown.store(true, Relaxed);
+    restarted.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// A swap-in's payment can still be in flight after the taker's refund
+/// window. An HTLC that outlives its expiry is resolved on-chain, and the
+/// payee can claim it with the preimage until that resolution confirms.
+/// While the node reports the payment pending, the watchdog must keep the
+/// swap, whose record holds the key that sweeps the HTLC with that preimage.
+#[test]
+fn watchdog_keeps_swap_in_while_payment_is_in_flight() {
+    log::warn!("Running Test: watchdog keeps a swap-in while its payment is in flight");
+
+    // The payee shares the maker node's ledger, so the maker's payments reach
+    // it and stay held until it claims or fails them.
+    let (ln, payee_ln) = MockLightningBackend::new_pair();
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers[0].clone();
+    let router = maker.ln_router.clone().unwrap();
+    pause_block_generation(&test_framework);
+
+    // Two paid swap-ins on HTLCs confirmed in one block, each stored with its
+    // funding height, and each paid to a hold invoice of the payee's.
+    // - `held` stays in flight.
+    // - `failed` is failed back by the payee, so it can no longer settle.
+    let preimages = [Preimage([0xa1; 32]), Preimage([0xa2; 32])];
+    let ids: Vec<String> = preimages
+        .iter()
+        .map(|preimage| preimage.payment_hash().to_string())
+        .collect();
+    let accepted: Vec<LnMakerSwap> = preimages
+        .iter()
+        .map(|preimage| {
+            let mut swap = accepted_swap_in(preimage);
+            swap.invoice = payee_ln
+                .create_hold_invoice(
+                    preimage.payment_hash(),
+                    InvoiceParams {
+                        amount_msat: Some(swap.amount.to_sat() * 1000),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .invoice;
+            swap
+        })
+        .collect();
+    let fundings: Vec<OutPoint> = accepted
+        .iter()
+        .map(|swap| fund_htlc(bitcoind, swap))
+        .collect();
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &fundings[0].txid);
+    assert_eq!(
+        confirmation_height(bitcoind, &fundings[1].txid),
+        confirmed_at
+    );
+    for ((id, swap), funding) in ids.iter().zip(&accepted).zip(&fundings) {
+        let mut paid = paid_without_height(swap, *funding);
+        paid.funding_height = Some(confirmed_at as u32);
+        router.subscribe(paid.payment_hash);
+        maker.store_ln_swap(id, paid).unwrap();
+        ln.pay_invoice(&swap.invoice, None, Some(100)).unwrap();
+    }
+    payee_ln
+        .fail_held_payment(preimages[1].payment_hash())
+        .unwrap();
+
+    // Past the 144-block refund window plus grace, the swap whose payment
+    // failed goes. The one in flight stays, however long it is held.
+    let past_window = confirmed_at + 144 + REFUND_GRACE_BLOCKS + 1;
+    for height in [past_window, past_window + 24] {
+        mine_to(bitcoind, height);
+        ln_watchdog_tick_now(&maker);
+        assert!(
+            maker.get_ln_swap(&ids[1]).unwrap().is_none(),
+            "the watchdog kept a swap whose payment failed"
+        );
+        let kept = maker
+            .get_ln_swap(&ids[0])
+            .unwrap()
+            .expect("the watchdog dropped a swap whose payment is still in flight");
+        assert_eq!(kept.phase, LnMakerPhase::InPaid);
+        assert_eq!(
+            kept.funding.map(|(outpoint, _)| outpoint),
+            Some(fundings[0])
+        );
+    }
+    assert_eq!(maker.ln_swap_count(), 1);
+
+    // The payee claims at last. The kept record sweeps the HTLC.
+    payee_ln.claim_held_payment(&preimages[0]).unwrap();
+    ln_watchdog_tick_now(&maker);
+    let swept = maker
+        .get_ln_swap(&ids[0])
+        .unwrap()
+        .expect("the settled swap was dropped");
+    assert_eq!(swept.phase, LnMakerPhase::InSwept);
+    assert_eq!(swept.preimage, Some(preimages[0]));
+    assert!(
+        bitcoind
+            .client
+            .get_tx_out(&fundings[0].txid, fundings[0].vout, Some(true))
+            .unwrap()
+            .is_none(),
+        "the sweep did not reach the mempool"
+    );
+
+    test_framework.set_block_gen_paused(false);
+    drop(takers);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// A swap-in stored without its funding height is released or settled by
+/// what the node reports for its payment, across a restart. Once the refund
+/// window has passed, a failed payment releases the swap and one in flight
+/// keeps it. A payment that settles while the maker is down, its event lost,
+/// is found in the node's payment store, and the restarted maker sweeps.
+#[test]
+fn restarted_watchdog_follows_payment_of_swap_in_missing_funding_height() {
+    log::warn!(
+        "Running Test: restarted watchdog follows the payment of a swap-in missing its funding height"
+    );
+
+    let (ln, payee_ln) = MockLightningBackend::new_pair();
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers[0].clone();
+    let router = maker.ln_router.clone().unwrap();
+    pause_block_generation(&test_framework);
+
+    // Three swap-ins on HTLCs confirmed in one block, each stored without
+    // its funding height and paid to a hold invoice of the payee's.
+    // - `settled` is claimed while the maker is down.
+    // - `failed` is failed back before its window passes.
+    // - `held` stays in flight until after the restart.
+    let preimages = [
+        Preimage([0xb1; 32]),
+        Preimage([0xb2; 32]),
+        Preimage([0xb3; 32]),
+    ];
+    let ids: Vec<String> = preimages
+        .iter()
+        .map(|preimage| preimage.payment_hash().to_string())
+        .collect();
+    let accepted: Vec<LnMakerSwap> = preimages
+        .iter()
+        .map(|preimage| {
+            let mut swap = accepted_swap_in(preimage);
+            swap.invoice = payee_ln
+                .create_hold_invoice(
+                    preimage.payment_hash(),
+                    InvoiceParams {
+                        amount_msat: Some(swap.amount.to_sat() * 1000),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .invoice;
+            swap
+        })
+        .collect();
+    let fundings: Vec<OutPoint> = accepted
+        .iter()
+        .map(|swap| fund_htlc(bitcoind, swap))
+        .collect();
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &fundings[0].txid);
+    for funding in &fundings {
+        assert_eq!(confirmation_height(bitcoind, &funding.txid), confirmed_at);
+    }
+    for ((id, swap), funding) in ids.iter().zip(&accepted).zip(&fundings) {
+        router.subscribe(swap.payment_hash);
+        maker
+            .store_ln_swap(id, paid_without_height(swap, *funding))
+            .unwrap();
+        ln.pay_invoice(&swap.invoice, None, Some(100)).unwrap();
+    }
+    payee_ln
+        .fail_held_payment(preimages[1].payment_hash())
+        .unwrap();
+    let outcome = |i: usize| ln.payment_outcome(preimages[i].payment_hash()).unwrap();
+    assert_eq!(outcome(0), PaymentOutcome::Pending);
+    assert_eq!(outcome(1), PaymentOutcome::Failed);
+    assert_eq!(outcome(2), PaymentOutcome::Pending);
+
+    // Past the 144-block refund window plus grace, the failed swap goes. The
+    // two in flight stay, with the height recovered from the chain.
+    let past_window = confirmed_at + 144 + REFUND_GRACE_BLOCKS + 1;
+    mine_to(bitcoind, past_window);
+    ln_watchdog_tick_now(&maker);
+    assert!(
+        maker.get_ln_swap(&ids[1]).unwrap().is_none(),
+        "the watchdog kept a swap whose payment failed"
+    );
+    for i in [0, 2] {
+        let kept = maker.get_ln_swap(&ids[i]).unwrap().unwrap_or_else(|| {
+            panic!(
+                "the watchdog dropped swap {} while its payment is in flight",
+                i
+            )
+        });
+        assert_eq!(kept.phase, LnMakerPhase::InPaid);
+        assert_eq!(
+            kept.funding_height,
+            Some(confirmed_at as u32),
+            "the watchdog did not recover swap {}'s funding height",
+            i
+        );
+    }
+
+    // The maker goes down. Meanwhile the payee claims `settled`, and the
+    // event carrying the preimage is lost, as it is to a maker that is not
+    // connected to its node.
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(router);
+    drop(maker);
+    drop(makers);
+    payee_ln.claim_held_payment(&preimages[0]).unwrap();
+    while ln.poll_event().unwrap().is_some() {}
+    assert_eq!(outcome(0), PaymentOutcome::Settled(preimages[0]));
+    let mut restarted = MakerServer::init(config).expect("maker restarts");
+    restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
+    let restarted = Arc::new(restarted);
+
+    // The restarted maker sweeps `settled` with the preimage from the node's
+    // payment store, and keeps `held`.
+    mine_to(bitcoind, past_window + 24);
+    ln_watchdog_tick_now(&restarted);
+    let swept = restarted
+        .get_ln_swap(&ids[0])
+        .unwrap()
+        .expect("the restarted watchdog dropped a settled swap");
+    assert_eq!(swept.phase, LnMakerPhase::InSwept);
+    assert_eq!(swept.preimage, Some(preimages[0]));
+    assert!(
+        bitcoind
+            .client
+            .get_tx_out(&fundings[0].txid, fundings[0].vout, Some(true))
+            .unwrap()
+            .is_none(),
+        "the sweep did not reach the mempool"
+    );
+    let kept = restarted
+        .get_ln_swap(&ids[2])
+        .unwrap()
+        .expect("the restarted watchdog dropped a swap whose payment is still in flight");
+    assert_eq!(kept.phase, LnMakerPhase::InPaid);
+    assert!(
+        restarted.get_ln_swap(&ids[1]).unwrap().is_none(),
+        "a released swap came back after a restart"
+    );
+
+    // Once `held` fails, it goes too.
+    payee_ln
+        .fail_held_payment(preimages[2].payment_hash())
+        .unwrap();
+    assert_eq!(outcome(2), PaymentOutcome::Failed);
+    ln_watchdog_tick_now(&restarted);
+    assert!(
+        restarted.get_ln_swap(&ids[2]).unwrap().is_none(),
+        "the restarted watchdog kept a swap whose payment failed"
+    );
+    assert_eq!(restarted.ln_swap_count(), 1);
+
+    test_framework.set_block_gen_paused(false);
+    drop(takers);
+    restarted.shutdown.store(true, Relaxed);
+    restarted.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// A node can lose the record of a payment it has already sent: ldk-node
+/// records a payment only after LDK has taken it on. So past the refund
+/// window, a swap-in whose payment the node has no record of, or still
+/// reports pending, must stay: the payment can still settle, and only this
+/// record holds the key that sweeps the HTLC with its preimage. The swap goes
+/// once the taker's refund confirms, which leaves that key nothing to reach.
+#[test]
+fn watchdog_keeps_swap_in_without_payment_record_until_refunded() {
+    log::warn!("Running Test: watchdog keeps a swap-in without a payment record until refunded");
+
+    // The payee shares the maker node's ledger, so the maker's payments reach
+    // it and stay held until it claims them.
+    let (ln, payee_ln) = MockLightningBackend::new_pair();
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers[0].clone();
+    let router = maker.ln_router.clone().unwrap();
+    pause_block_generation(&test_framework);
+
+    // Three swap-ins on HTLCs confirmed in one block, with a hold invoice of
+    // the payee's.
+    // - `lost` is paid, and the maker's node then loses the payment's record.
+    // - `unpaid` is never paid, as when the maker stopped before paying, and
+    //   is stored without its funding height.
+    // - `held` is paid and held by the payee.
+    let preimages = [
+        Preimage([0xe1; 32]),
+        Preimage([0xe2; 32]),
+        Preimage([0xe3; 32]),
+    ];
+    let ids: Vec<String> = preimages
+        .iter()
+        .map(|preimage| preimage.payment_hash().to_string())
+        .collect();
+    let accepted: Vec<LnMakerSwap> = preimages
+        .iter()
+        .map(|preimage| {
+            let mut swap = accepted_swap_in(preimage);
+            swap.invoice = payee_ln
+                .create_hold_invoice(
+                    preimage.payment_hash(),
+                    InvoiceParams {
+                        amount_msat: Some(swap.amount.to_sat() * 1000),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .invoice;
+            swap
+        })
+        .collect();
+    let fundings: Vec<OutPoint> = accepted
+        .iter()
+        .map(|swap| fund_htlc(bitcoind, swap))
+        .collect();
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &fundings[0].txid);
+    for funding in &fundings {
+        assert_eq!(confirmation_height(bitcoind, &funding.txid), confirmed_at);
+    }
+    for (i, ((id, swap), funding)) in ids.iter().zip(&accepted).zip(&fundings).enumerate() {
+        let mut paid = paid_without_height(swap, *funding);
+        if i != 1 {
+            paid.funding_height = Some(confirmed_at as u32);
+        }
+        router.subscribe(paid.payment_hash);
+        maker.store_ln_swap(id, paid).unwrap();
+    }
+    for i in [0, 2] {
+        ln.pay_invoice(&accepted[i].invoice, None, Some(100))
+            .unwrap();
+    }
+    ln.lose_payment_record(preimages[0].payment_hash());
+    let outcome = |i: usize| ln.payment_outcome(preimages[i].payment_hash()).unwrap();
+    assert_eq!(outcome(0), PaymentOutcome::NotFound);
+    assert_eq!(outcome(1), PaymentOutcome::NotFound);
+    assert_eq!(outcome(2), PaymentOutcome::Pending);
+
+    // Past the 144-block refund window plus grace, and long after, all stay.
+    let past_window = confirmed_at + 144 + REFUND_GRACE_BLOCKS + 1;
+    for height in [past_window, past_window + 24] {
+        mine_to(bitcoind, height);
+        ln_watchdog_tick_now(&maker);
+        for (i, id) in ids.iter().enumerate() {
+            let kept = maker.get_ln_swap(id).unwrap().unwrap_or_else(|| {
+                panic!(
+                    "the watchdog dropped swap {} while its payment could still settle",
+                    i
+                )
+            });
+            assert_eq!(kept.phase, LnMakerPhase::InPaid);
+            assert_eq!(
+                kept.funding_height,
+                Some(confirmed_at as u32),
+                "the watchdog did not recover swap {}'s funding height",
+                i
+            );
+        }
+    }
+
+    // The taker refunds `unpaid` and `held`. A refund in the mempool can
+    // still be evicted, so both stay until it confirms.
+    let refunds: Vec<Txid> = [1, 2]
+        .iter()
+        .map(|&i| broadcast_taker_refund(bitcoind, &accepted[i], fundings[i]))
+        .collect();
+    ln_watchdog_tick_now(&maker);
+    for i in [1, 2] {
+        assert!(
+            maker.get_ln_swap(&ids[i]).unwrap().is_some(),
+            "the watchdog dropped swap {} on a refund still in the mempool",
+            i
+        );
+    }
+    generate_blocks(bitcoind, 1);
+    for refund in &refunds {
+        assert!(bitcoind
+            .client
+            .get_raw_transaction_info(refund, None)
+            .unwrap()
+            .blockhash
+            .is_some());
+    }
+    ln_watchdog_tick_now(&maker);
+    for i in [1, 2] {
+        assert!(
+            maker.get_ln_swap(&ids[i]).unwrap().is_none(),
+            "the watchdog kept swap {} after the taker's refund confirmed",
+            i
+        );
+    }
+    assert!(!mailbox_open(&maker, &ln, &preimages[1]));
+    assert_eq!(maker.ln_swap_count(), 1);
+
+    // The payee claims the payment whose record was lost. The node still
+    // has no record of it, but the settlement event carries the preimage,
+    // and the kept record sweeps the HTLC with it.
+    payee_ln.claim_held_payment(&preimages[0]).unwrap();
+    assert_eq!(outcome(0), PaymentOutcome::NotFound);
+    router.pump_once();
+    ln_watchdog_tick_now(&maker);
+    let swept = maker
+        .get_ln_swap(&ids[0])
+        .unwrap()
+        .expect("the watchdog dropped the swap whose payment record was lost");
+    assert_eq!(swept.phase, LnMakerPhase::InSwept);
+    assert_eq!(swept.preimage, Some(preimages[0]));
+    assert!(
+        bitcoind
+            .client
+            .get_tx_out(&fundings[0].txid, fundings[0].vout, Some(true))
+            .unwrap()
+            .is_none(),
+        "the sweep did not reach the mempool"
+    );
+
+    test_framework.set_block_gen_paused(false);
+    drop(takers);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// A mock node with outbound capacity, so the maker serves swap-ins.
+fn swap_in_ready_ln() -> Arc<MockLightningBackend> {
+    let ln: Arc<MockLightningBackend> = Arc::new(MockLightningBackend::new());
+    ln.set_onchain_balance(Amount::from_btc(0.02).unwrap());
+    let peer = SecretKey::from_slice(&[0x21; 32]).unwrap();
+    let channel = ln
+        .open_channel(OpenChannelRequest {
+            node_pubkey: peer.public_key(&Secp256k1::new()),
+            address: "127.0.0.1:9735".to_string(),
+            channel_amount: Amount::from_sat(1_000_000),
+            push_to_counterparty_msat: Some(500_000_000),
+            announce_channel: false,
+        })
+        .unwrap();
+    ln.simulate_channel_ready(&channel);
+    let _ = ln.poll_event().unwrap();
+    ln
+}
+
+/// Has `maker` accept a 40k-sat swap-in for `preimage`'s payment hash. The
+/// hold invoice comes from `taker_ln`, which shares no ledger with the
+/// maker's node, so the maker's payment attempt fails at once.
+fn accept_swap_in(maker: &Arc<MakerServer>, taker_ln: &MockLightningBackend, preimage: &Preimage) {
+    let amount = Amount::from_sat(40_000);
+    let payment_hash = preimage.payment_hash();
+    let swap_id = payment_hash.to_string();
+    let invoice = taker_ln
+        .create_hold_invoice(
+            payment_hash,
+            InvoiceParams {
+                amount_msat: Some(amount.to_sat() * 1000),
+                description: format!("swap-in {swap_id}"),
+                expiry_secs: 3600,
+            },
+        )
+        .unwrap();
+    let cltv_delta = verify_invoice(&invoice.invoice, &payment_hash, amount.to_sat() * 1000)
+        .unwrap()
+        .min_final_cltv_expiry_delta;
+    let mut state = ConnectionState::default();
+    handle_message(
+        maker,
+        &mut state,
+        TakerToMakerMessage::TakerHello(TakerHello),
+    )
+    .unwrap();
+    match expect_ln(
+        handle_message(
+            maker,
+            &mut state,
+            ln_message(LightningTakerMessage::SwapInRequest(LnSwapInRequest {
+                swap_id,
+                invoice: invoice.invoice,
+                payment_hash,
+                amount,
+                locktime: (cltv_delta + 48) as u16,
+                min_confirmations: 1,
+                taker_timelock_pubkey: PublicKey::new(
+                    SecretKey::from_slice(&[0x82; 32])
+                        .unwrap()
+                        .public_key(&Secp256k1::new()),
+                ),
+            })),
+        )
+        .unwrap(),
+    ) {
+        LightningMakerMessage::SwapInAccept(_) => {}
+        other => panic!("expected SwapInAccept, got {}", other),
+    }
+}
+
+/// Sends `SwapInFunded` on a fresh connection and returns the handler's
+/// result, formatted.
+fn announce_funding(
+    maker: &Arc<MakerServer>,
+    swap_id: &str,
+    funding: OutPoint,
+    value: Amount,
+) -> String {
+    let mut state = ConnectionState::default();
+    let result = handle_message(
+        maker,
+        &mut state,
+        TakerToMakerMessage::TakerHello(TakerHello),
+    )
+    .and_then(|_| {
+        handle_message(
+            maker,
+            &mut state,
+            ln_message(LightningTakerMessage::SwapInFunded(LnHtlcFunded {
+                swap_id: swap_id.to_string(),
+                outpoint: funding,
+                value,
+            })),
+        )
+    });
+    format!("{result:?}")
+}
+
+/// The taker's CSV refund window starts at the block that confirmed its
+/// funding, so that block, not the tip when the handler runs, is what
+/// handle_swap_in_funded must record as the funding height.
+#[test]
+fn swap_in_funded_handler_records_confirmation_height() {
+    log::warn!("Running Test: swap-in funded handler records the confirmation height");
+
+    let ln = swap_in_ready_ln();
+    let taker_ln = MockLightningBackend::new();
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![MakerBehavior::Normal],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers[0].clone();
+    pause_block_generation(&test_framework);
+
+    let preimage = Preimage([0xd1; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    accept_swap_in(&maker, &taker_ln, &preimage);
+    let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    let value = accepted.amount + accepted.fee;
+    let funding = fund_htlc(bitcoind, &accepted);
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &funding.txid);
+    // The taker announces two blocks after its funding confirmed.
+    mine_to(bitcoind, confirmed_at + 2);
+
+    let result = announce_funding(&maker, &swap_id, funding, value);
+    assert!(
+        result.starts_with("Err") && result.contains("pay_invoice failed"),
+        "the handler did not reach the payment: {}",
+        result
+    );
+    assert!(
+        ln.last_pay_cltv_bound().is_some(),
+        "the handler never tried to pay"
+    );
+    let paid = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    assert_eq!(paid.phase, LnMakerPhase::InPaid);
+    assert_eq!(paid.funding, Some((funding, value)));
+    assert_eq!(
+        paid.funding_height,
+        Some(confirmed_at as u32),
+        "the handler did not record the funding's confirmation height"
+    );
+
+    test_framework.set_block_gen_paused(false);
+    drop(takers);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// If the funding's confirmation height cannot be read, handle_swap_in_funded
+/// must stop before the swap moves to InPaid. It must not pay, and the swap
+/// must stay InAccepted, unfunded and with its mailbox, so the unfunded
+/// expiry can still free it.
+#[test]
+fn swap_in_funded_handler_stops_without_funding_height() {
+    log::warn!("Running Test: swap-in funded handler stops without a funding height");
+    handler_stops_without_funding_height(
+        MakerBehavior::FailFundingHeightLookup,
+        "funding height lookup failed",
+        Preimage([0xd2; 32]),
+    );
+}
+
+/// The handler waits for the funding to confirm, but the block can be
+/// reorged away before it reads the height. A lookup that answers with no
+/// height must stop the handler just as a failed one does.
+#[test]
+fn swap_in_funded_handler_stops_when_funding_has_no_height() {
+    log::warn!("Running Test: swap-in funded handler stops when the funding has no height");
+    handler_stops_without_funding_height(
+        MakerBehavior::NoFundingHeight,
+        "swap-in funding has no confirmation height",
+        Preimage([0xd3; 32]),
+    );
+}
+
+/// Announces a confirmed funding to a maker whose height lookup `behavior`
+/// breaks, and checks that the handler stopped with `expected_error` before
+/// paying, leaving the swap as it was.
+fn handler_stops_without_funding_height(
+    behavior: MakerBehavior,
+    expected_error: &str,
+    preimage: Preimage,
+) {
+    let ln = swap_in_ready_ln();
+    let taker_ln = MockLightningBackend::new();
+    let (test_framework, takers, makers, block_generation_handle) =
+        TestFramework::init_with_lightning::<BitcoindBackend>(
+            1,
+            vec![TakerBehavior::Normal],
+            vec![behavior],
+            vec![ln.clone() as Arc<dyn LightningBackend>],
+        );
+    let bitcoind = &test_framework.bitcoind;
+    let maker = makers[0].clone();
+    pause_block_generation(&test_framework);
+
+    let swap_id = preimage.payment_hash().to_string();
+    accept_swap_in(&maker, &taker_ln, &preimage);
+    let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    let value = accepted.amount + accepted.fee;
+    let funding = fund_htlc(bitcoind, &accepted);
+    generate_blocks(bitcoind, 1);
+
+    let result = announce_funding(&maker, &swap_id, funding, value);
+    assert!(
+        result.starts_with("Err") && result.contains(expected_error),
+        "the handler did not stop without a funding height: {}",
+        result
+    );
+    assert_eq!(
+        ln.last_pay_cltv_bound(),
+        None,
+        "the handler paid without a funding height"
+    );
+    let kept = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .expect("the handler deleted the swap");
+    assert_eq!(kept.phase, LnMakerPhase::InAccepted);
+    assert_eq!(kept.funding, None);
+    assert_eq!(kept.funding_height, None);
+    assert!(mailbox_open(&maker, &ln, &preimage));
+
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(maker);
+    drop(makers);
+    let restarted = MakerServer::init(config).expect("maker restarts");
+    let restored = restarted
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .expect("the swap's record was lost");
+    assert_eq!(restored.phase, LnMakerPhase::InAccepted);
+    assert_eq!(restored.funding, None);
+
+    test_framework.set_block_gen_paused(false);
+    drop(takers);
+    restarted.shutdown.store(true, Relaxed);
+    restarted.watch_service.shutdown();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

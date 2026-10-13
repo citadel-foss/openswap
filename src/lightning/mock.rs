@@ -17,7 +17,7 @@ use super::{
     error::LightningError,
     types::{
         Balances, Bolt11Invoice, ChannelId, ChannelInfo, ChannelState, InvoiceParams, LnEvent,
-        NodeInfo, OpenChannelRequest, PaymentId, Preimage,
+        NodeInfo, OpenChannelRequest, PaymentId, PaymentOutcome, Preimage,
     },
 };
 
@@ -48,6 +48,9 @@ struct MockInvoice {
     /// Node that paid it, once paid (receives `PaymentSuccessful` /
     /// `PaymentFailed`).
     payer: Option<usize>,
+    /// The payer's node has lost its record of the payment, which still
+    /// goes on: see [`MockLightningBackend::lose_payment_record`].
+    payer_record_lost: bool,
 }
 
 /// Invoice ledger and event routing shared by all nodes of a mock network.
@@ -229,6 +232,31 @@ impl MockLightningBackend {
         );
     }
 
+    /// Makes this node lose its record of the payment it made for
+    /// `payment_hash`, as ldk-node does if it crashes, or fails to write the
+    /// record, after LDK has taken the payment on. The payment goes on: it
+    /// can still settle or fail, and this node still sees the event, but
+    /// [`LightningBackend::payment_outcome`] reports it `NotFound` for good.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this node never paid an invoice for `payment_hash` (test
+    /// misuse).
+    pub fn lose_payment_record(&self, payment_hash: sha256::Hash) {
+        let mut ledger = self.ledger.lock().unwrap();
+        let invoice = ledger
+            .invoices
+            .get_mut(&payment_hash)
+            .filter(|invoice| invoice.payer == Some(self.node_index))
+            .expect("lose_payment_record: this node did not pay that hash");
+        invoice.payer_record_lost = true;
+    }
+
+    /// Queues `event` on this node, as if the node had emitted it.
+    pub fn push_event(&self, event: LnEvent) {
+        self.ledger.lock().unwrap().push(self.node_index, event);
+    }
+
     /// Marks the channel `channel_id` as ready, queuing a
     /// [`LnEvent::ChannelStateChanged`].
     ///
@@ -405,6 +433,7 @@ impl LightningBackend for MockLightningBackend {
                 status: InvoiceStatus::Open,
                 owner: self.node_index,
                 payer: None,
+                payer_record_lost: false,
             },
         );
         Ok(Bolt11Invoice {
@@ -512,6 +541,7 @@ impl LightningBackend for MockLightningBackend {
                 status: InvoiceStatus::Open,
                 owner: self.node_index,
                 payer: None,
+                payer_record_lost: false,
             },
         );
         Ok(Bolt11Invoice {
@@ -582,16 +612,31 @@ impl LightningBackend for MockLightningBackend {
         Ok(())
     }
 
-    fn settled_preimage(
+    fn payment_outcome(
         &self,
         payment_hash: sha256::Hash,
-    ) -> Result<Option<Preimage>, LightningError> {
+    ) -> Result<PaymentOutcome, LightningError> {
         let ledger = self.ledger.lock()?;
-        Ok(ledger
+        // Only an invoice this node paid is its payment. An HTLC that reached
+        // one of its own invoices from elsewhere is not.
+        let Some(invoice) = ledger
             .invoices
             .get(&payment_hash)
-            .filter(|invoice| invoice.status == InvoiceStatus::Settled)
-            .and_then(|invoice| invoice.preimage))
+            .filter(|invoice| invoice.payer == Some(self.node_index))
+            .filter(|invoice| !invoice.payer_record_lost)
+        else {
+            return Ok(PaymentOutcome::NotFound);
+        };
+        Ok(match (invoice.status, invoice.preimage) {
+            (InvoiceStatus::Settled, Some(preimage)) => PaymentOutcome::Settled(preimage),
+            (InvoiceStatus::Settled, None) | (InvoiceStatus::Held { .. }, _) => {
+                PaymentOutcome::Pending
+            }
+            // The payee failed it back.
+            (InvoiceStatus::Cancelled, _) => PaymentOutcome::Failed,
+            // Paying an invoice moves it out of Open for good.
+            (InvoiceStatus::Open, _) => PaymentOutcome::NotFound,
+        })
     }
 
     fn poll_event(&self) -> Result<Option<LnEvent>, LightningError> {
@@ -736,6 +781,91 @@ mod tests {
             payer.poll_event().unwrap(),
             Some(LnEvent::PaymentFailed { .. })
         ));
+    }
+
+    /// A node reports the outcome of the payments it made, and nothing for a
+    /// hash it never paid, even one whose invoice it holds an HTLC for.
+    #[test]
+    fn payment_outcome_reports_only_the_nodes_own_payments() {
+        let (owner, payer) = MockLightningBackend::new_pair();
+        let preimages = [Preimage([0x11; 32]), Preimage([0x12; 32])];
+        let invoices: Vec<String> = preimages
+            .iter()
+            .map(|preimage| {
+                owner
+                    .create_hold_invoice(preimage.payment_hash(), InvoiceParams::default())
+                    .unwrap()
+                    .invoice
+            })
+            .collect();
+        let outcome = |node: &MockLightningBackend, preimage: &Preimage| {
+            node.payment_outcome(preimage.payment_hash()).unwrap()
+        };
+
+        // Unknown, and created but unpaid.
+        let unknown = Preimage([0x13; 32]);
+        assert_eq!(outcome(&payer, &unknown), PaymentOutcome::NotFound);
+        assert_eq!(outcome(&payer, &preimages[0]), PaymentOutcome::NotFound);
+
+        for invoice in &invoices {
+            payer.pay_invoice(invoice, Some(1_000), Some(200)).unwrap();
+        }
+        assert_eq!(outcome(&payer, &preimages[0]), PaymentOutcome::Pending);
+        // The owner holds the HTLC, but the payment is not its own.
+        assert_eq!(outcome(&owner, &preimages[0]), PaymentOutcome::NotFound);
+
+        owner.claim_held_payment(&preimages[0]).unwrap();
+        owner
+            .fail_held_payment(preimages[1].payment_hash())
+            .unwrap();
+        assert_eq!(
+            outcome(&payer, &preimages[0]),
+            PaymentOutcome::Settled(preimages[0])
+        );
+        assert_eq!(outcome(&payer, &preimages[1]), PaymentOutcome::Failed);
+        assert_eq!(outcome(&owner, &preimages[0]), PaymentOutcome::NotFound);
+        assert_eq!(outcome(&owner, &preimages[1]), PaymentOutcome::NotFound);
+
+        // An HTLC simulated into a standalone node's own invoice is not a
+        // payment of that node.
+        let standalone = MockLightningBackend::new();
+        let held = Preimage([0x14; 32]);
+        standalone
+            .create_hold_invoice(held.payment_hash(), InvoiceParams::default())
+            .unwrap();
+        standalone.simulate_htlc_arrival(held.payment_hash(), 1_000);
+        assert_eq!(outcome(&standalone, &held), PaymentOutcome::NotFound);
+    }
+
+    /// A payment whose record the payer lost reads as `NotFound` for good,
+    /// but it still settles, and the payer still hears of it.
+    #[test]
+    fn lost_payment_record_still_settles() {
+        let (owner, payer) = MockLightningBackend::new_pair();
+        let preimage = Preimage([0x21; 32]);
+        let invoice = owner
+            .create_hold_invoice(preimage.payment_hash(), InvoiceParams::default())
+            .unwrap();
+        payer
+            .pay_invoice(&invoice.invoice, Some(1_000), Some(200))
+            .unwrap();
+        payer.lose_payment_record(preimage.payment_hash());
+        assert_eq!(
+            payer.payment_outcome(preimage.payment_hash()).unwrap(),
+            PaymentOutcome::NotFound
+        );
+
+        owner.claim_held_payment(&preimage).unwrap();
+        assert_eq!(
+            payer.payment_outcome(preimage.payment_hash()).unwrap(),
+            PaymentOutcome::NotFound
+        );
+        match payer.poll_event().unwrap() {
+            Some(LnEvent::PaymentSuccessful {
+                preimage: released, ..
+            }) => assert_eq!(released, Some(preimage)),
+            other => panic!("expected PaymentSuccessful, got {:?}", other),
+        }
     }
 
     #[test]

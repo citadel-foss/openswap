@@ -7,7 +7,7 @@ use super::{
     error::LightningError,
     types::{
         Balances, Bolt11Invoice, ChannelId, ChannelInfo, InvoiceParams, LnEvent, NodeInfo,
-        OpenChannelRequest, PaymentId, Preimage,
+        OpenChannelRequest, PaymentId, PaymentOutcome, Preimage,
     },
 };
 
@@ -94,17 +94,22 @@ pub trait LightningBackend: Send + Sync {
     /// Fails a held payment back to the payer.
     fn fail_held_payment(&self, payment_hash: sha256::Hash) -> Result<(), LightningError>;
 
-    /// Looks up a settled payment's preimage by payment hash.
+    /// Looks up an outbound payment's outcome by payment hash.
     ///
     /// [`poll_event`](Self::poll_event) is at-most-once, so a node that
     /// restarted — or was merely disconnected — can miss the settlement that
     /// carried the preimage. This is the resynchronization path for that:
     /// it answers from the backend's own payment store rather than the event
-    /// stream. Returns `Ok(None)` when the payment is unknown or unsettled.
-    fn settled_preimage(
-        &self,
-        payment_hash: sha256::Hash,
-    ) -> Result<Option<Preimage>, LightningError>;
+    /// stream.
+    ///
+    /// The preimage and the status come from one lookup, so a payment that
+    /// settles between two reads can never look failed. Anything the node
+    /// has not reported as finished is `Pending`. A hash with no outbound
+    /// payment on record is `NotFound`, which is not a failure: ldk-node
+    /// records a payment only after LDK has taken it on, so a crash or a
+    /// failed write in between leaves a payment in flight with no record.
+    fn payment_outcome(&self, payment_hash: sha256::Hash)
+        -> Result<PaymentOutcome, LightningError>;
 
     /// Returns the next pending backend event, or `Ok(None)` if no event is
     /// currently queued. Never blocks.

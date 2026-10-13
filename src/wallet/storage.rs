@@ -311,7 +311,9 @@ pub struct LnMakerSwapRecord {
     pub funding_outpoint: Option<OutPoint>,
     /// The HTLC funding value, once known.
     pub funding_value: Option<bitcoin::Amount>,
-    /// Block height when the funding was first seen (refund timing).
+    /// Refund timing. Swap-in: the block that confirmed the funding, where the
+    /// taker's CSV refund window starts. Swap-out: the chain tip when the
+    /// maker broadcast its funding.
     pub funding_height: Option<u32>,
 }
 

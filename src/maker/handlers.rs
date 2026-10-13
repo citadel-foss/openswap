@@ -144,6 +144,12 @@ pub enum MakerBehavior {
     /// Hold the frozen plan's coins under a stand-in swap at funding, so the
     /// first pass must re-plan as if another swap had taken them.
     ForceReplan,
+    /// Fail every lookup of a Lightning HTLC funding's confirmation height,
+    /// as an unreachable chain backend would.
+    FailFundingHeightLookup,
+    /// Answer every lookup of a Lightning HTLC funding's confirmation height
+    /// with no height, as after a reorg takes the funding's block away.
+    NoFundingHeight,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).
@@ -610,6 +616,21 @@ pub trait Maker: Send + Sync {
         Ok(false)
     }
 
+    /// Set a Lightning swap's `funding_height`, but only while the stored swap
+    /// is still in `expected`, still funded at `outpoint` and still has no
+    /// height. Only that field changes, so whatever else another writer has
+    /// stored is kept. Returns whether the height was stored.
+    #[cfg(feature = "lightning")]
+    fn fill_ln_funding_height(
+        &self,
+        _swap_id: &str,
+        _expected: super::lightning_handlers::LnMakerPhase,
+        _outpoint: bitcoin::OutPoint,
+        _height: u32,
+    ) -> Result<bool, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
     /// How many Lightning swaps are currently in flight.
     #[cfg(feature = "lightning")]
     fn ln_swap_count(&self) -> usize {
@@ -622,6 +643,16 @@ pub trait Maker: Send + Sync {
     /// the outpoint has some confirmed spend does not say whose it was.
     #[cfg(feature = "lightning")]
     fn is_tx_confirmed(&self, _txid: &bitcoin::Txid) -> Result<bool, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Height of the block that confirmed this transaction, or `None` while
+    /// it is unconfirmed or unknown. A failed query is an error, never `None`.
+    ///
+    /// A swap-in's CSV refund window starts at this block, so it is what the
+    /// maker records as the funding height.
+    #[cfg(feature = "lightning")]
+    fn tx_confirmation_height(&self, _txid: &bitcoin::Txid) -> Result<Option<u32>, MakerError> {
         Err(MakerError::General("lightning swaps not supported"))
     }
 

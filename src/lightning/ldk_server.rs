@@ -41,7 +41,7 @@ use super::{
     error::LightningError,
     types::{
         Balances, Bolt11Invoice, ChannelId, ChannelInfo, ChannelState, InvoiceParams, LnEvent,
-        NodeInfo, OpenChannelRequest, PaymentId, Preimage,
+        NodeInfo, OpenChannelRequest, PaymentId, PaymentOutcome, Preimage,
     },
 };
 
@@ -385,23 +385,24 @@ impl LightningBackend for LdkServerBackend {
         Ok(())
     }
 
-    fn settled_preimage(
+    fn payment_outcome(
         &self,
         payment_hash: sha256::Hash,
-    ) -> Result<Option<Preimage>, LightningError> {
+    ) -> Result<PaymentOutcome, LightningError> {
         // ldk-node identifies a BOLT11 payment by its payment hash, so the
         // hex hash doubles as the payment id.
         let request = proto_api::GetPaymentDetailsRequest {
             payment_id: payment_hash.to_string(),
         };
-        match self.call(self.client.get_payment_details(request)) {
-            Ok(response) => Ok(extract_payment_fields(response.payment.as_ref()).preimage),
+        let payment = match self.call(self.client.get_payment_details(request)) {
+            Ok(response) => response.payment,
             // Only an explicit "no such payment" is an answer. Every other
             // failure must surface: recovery treating a transport error as
             // "not settled" would silently give up on a sweep.
-            Err(LightningError::Api { ref code, .. }) if code.contains("NotFound") => Ok(None),
-            Err(e) => Err(e),
-        }
+            Err(LightningError::Api { ref code, .. }) if code.contains("NotFound") => None,
+            Err(e) => return Err(e),
+        };
+        Ok(payment_outcome_of(payment.as_ref()))
     }
 
     fn poll_event(&self) -> Result<Option<LnEvent>, LightningError> {
@@ -503,6 +504,35 @@ fn extract_payment_fields(payment: Option<&proto_types::Payment>) -> PaymentFiel
         preimage,
         amount_msat: payment.amount_msat,
         fee_paid_msat: payment.fee_paid_msat,
+    }
+}
+
+/// Reads an outbound payment's outcome from the server's record for its id.
+fn payment_outcome_of(payment: Option<&proto_types::Payment>) -> PaymentOutcome {
+    // The server answers an unknown id with no payment.
+    let Some(payment) = payment else {
+        return PaymentOutcome::NotFound;
+    };
+    // A preimage proves settlement whatever the status says: LDK can report
+    // a failure after a success, and the success then stands.
+    if let Some(preimage) = extract_payment_fields(Some(payment)).preimage {
+        return PaymentOutcome::Settled(preimage);
+    }
+    // ldk-node keeps an inbound payment under the same id, and an outbound
+    // payment it sent but lost the record of leaves that inbound record in
+    // place. So only an outbound record speaks for our payment. A missing
+    // direction reads as inbound, the default.
+    if payment.direction() != proto_types::PaymentDirection::Outbound {
+        return PaymentOutcome::NotFound;
+    }
+    // LDK reports a failure only once no HTLC of the payment is left
+    // pending. A success without a preimage proves nothing, so it counts as
+    // still pending, and so does any status this client does not know:
+    // `status()` reads those as the default, pending.
+    if payment.status() == proto_types::PaymentStatus::Failed {
+        PaymentOutcome::Failed
+    } else {
+        PaymentOutcome::Pending
     }
 }
 
@@ -666,6 +696,73 @@ mod tests {
                 assert_eq!(fee_paid_msat, Some(12));
             }
             other => panic!("expected PaymentSuccessful, got {:?}", other),
+        }
+    }
+
+    /// A BOLT11 payment record with no preimage, as the server holds one
+    /// that has not settled.
+    fn unsettled_payment(
+        direction: proto_types::PaymentDirection,
+        status: proto_types::PaymentStatus,
+    ) -> proto_types::Payment {
+        let mut payment = bolt11_payment(None);
+        if let Some(proto_types::payment_kind::Kind::Bolt11(bolt11)) =
+            payment.kind.as_mut().and_then(|kind| kind.kind.as_mut())
+        {
+            bolt11.preimage = None;
+        }
+        payment.direction = direction.into();
+        payment.status = status.into();
+        payment
+    }
+
+    #[test]
+    fn payment_outcome_trusts_only_outbound_records() {
+        use proto_types::{PaymentDirection, PaymentStatus};
+        let outcome =
+            |direction, status| payment_outcome_of(Some(&unsettled_payment(direction, status)));
+
+        assert_eq!(payment_outcome_of(None), PaymentOutcome::NotFound);
+        assert_eq!(
+            outcome(PaymentDirection::Outbound, PaymentStatus::Pending),
+            PaymentOutcome::Pending
+        );
+        assert_eq!(
+            outcome(PaymentDirection::Outbound, PaymentStatus::Failed),
+            PaymentOutcome::Failed
+        );
+        // A success with no preimage proves nothing.
+        assert_eq!(
+            outcome(PaymentDirection::Outbound, PaymentStatus::Succeeded),
+            PaymentOutcome::Pending
+        );
+        // An inbound record says nothing about our payment, failed or not.
+        for status in [
+            PaymentStatus::Pending,
+            PaymentStatus::Succeeded,
+            PaymentStatus::Failed,
+        ] {
+            assert_eq!(
+                outcome(PaymentDirection::Inbound, status),
+                PaymentOutcome::NotFound
+            );
+        }
+        // A status this client does not know reads as pending.
+        let mut unknown = unsettled_payment(PaymentDirection::Outbound, PaymentStatus::Pending);
+        unknown.status = 7;
+        assert_eq!(payment_outcome_of(Some(&unknown)), PaymentOutcome::Pending);
+
+        // A preimage proves settlement whatever the record's direction or
+        // status.
+        let preimage = Preimage([5u8; 32]);
+        for direction in [PaymentDirection::Outbound, PaymentDirection::Inbound] {
+            let mut settled = bolt11_payment(Some(&preimage));
+            settled.direction = direction.into();
+            settled.status = PaymentStatus::Failed.into();
+            assert_eq!(
+                payment_outcome_of(Some(&settled)),
+                PaymentOutcome::Settled(preimage)
+            );
         }
     }
 
