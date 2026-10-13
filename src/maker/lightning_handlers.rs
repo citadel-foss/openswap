@@ -1279,6 +1279,8 @@ pub fn ln_watchdog_tick_now(maker: &Arc<MakerServer>) {
     ln_watchdog_pass(maker, None);
 }
 
+/// One watchdog pass over the Lightning swaps. With `min_idle`, swaps touched
+/// more recently than that are skipped; with `None`, every swap is checked.
 fn ln_watchdog_pass(maker: &Arc<MakerServer>, min_idle: Option<Duration>) {
     let (Some(ctx_ln), Some(router)) = (maker.lightning.clone(), maker.ln_router.clone()) else {
         return;
