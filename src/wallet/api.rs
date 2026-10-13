@@ -1036,7 +1036,7 @@ impl Wallet {
             .collect()
     }
 
-    /// All persisted swaps that still own maker reservations.
+    /// All persisted swaps that still own reservations.
     pub(crate) fn swap_ids(&self) -> HashSet<String> {
         let mut ids = self.onchain_swap_ids();
         ids.extend(self.store.ln_pending_swaps.keys().cloned());

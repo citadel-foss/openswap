@@ -777,7 +777,7 @@ impl Taker {
                 continue;
             }
             // A failed send keeps the claim: the tx may still land. Recovery
-            // releases it once it judges the tx absent from the backend.
+            // Recovery resends it and refunds it.
             let txid = wallet.send_tx(&swapcoin.contract_tx).map_err(|e| {
                 TakerError::General(format!("Failed to broadcast contract tx: {:?}", e))
             })?;
