@@ -584,8 +584,8 @@ fn wait_until<T>(what: &str, timeout: Duration, mut probe: impl FnMut() -> Optio
 ///
 /// The second maker drops once funding is on chain, so the taker refunds its
 /// outgoing coin by timelock. Mining stops just before that refund goes out.
-/// A recovery pass parks in its confirmation wait after every broadcast, so
-/// the taker is restarted wherever the test needs a fresh pass.
+/// Recovery passes only on a new block, so the test mines empty ones to keep
+/// the refund stuck, and restarts the taker to free a pass parked in its wait.
 ///
 /// `full` adds the checks the Electrum backend is tested for: no bump while
 /// fees are flat, a second bump, and silence once the refund confirms.
@@ -744,8 +744,27 @@ pub(crate) fn run_refund_fee_bump<B: TestBackend>(
         assert!(logged_replacements(&log_path).is_empty());
     }
 
+    // Recovery passes only on a new block. An empty one leaves the refund
+    // stuck, as when fees rise faster than it can confirm.
+    let mine_empty_block = || {
+        let miner = bitcoind
+            .client
+            .get_new_address(None, None)
+            .unwrap()
+            .assume_checked();
+        let _: serde_json::Value = bitcoind
+            .client
+            .call(
+                "generateblock",
+                &[serde_json::json!(miner.to_string()), serde_json::json!([])],
+            )
+            .unwrap();
+        test_framework.wait_for_electrs_tip();
+    };
+
     // ---- 3. A bump once fees rise ----
     feerate.set(5);
+    mine_empty_block();
     let mut latest = wait_for_bump(first);
     let entry = bitcoind.client.get_mempool_entry(&latest).unwrap();
     assert!(
@@ -758,8 +777,11 @@ pub(crate) fn run_refund_fee_bump<B: TestBackend>(
 
     // ---- 4. A second bump works too ----
     if full {
+        // The pass that bumped now waits on that refund; a restart frees the
+        // loop. Its startup pass runs at the old rate, so it has nothing to bump.
         taker = restart(taker);
         feerate.set(12);
+        mine_empty_block();
         latest = wait_for_bump(latest);
     }
     let bumps = logged_replacements(&log_path).len();
@@ -826,10 +848,10 @@ pub(crate) fn run_refund_fee_bump<B: TestBackend>(
 /// never fires: the unit tests only assume it does.
 #[test]
 fn electrum_bumps_a_stuck_taproot_refund() {
-    run_refund_fee_bump::<ElectrumBackend>(ProtocolVersion::Taproot, true, 1834);
+    run_refund_fee_bump::<ElectrumBackend>(ProtocolVersion::Taproot, true, 1845);
 }
 
 #[test]
 fn electrum_bumps_a_stuck_legacy_refund() {
-    run_refund_fee_bump::<ElectrumBackend>(ProtocolVersion::Legacy, true, 2008);
+    run_refund_fee_bump::<ElectrumBackend>(ProtocolVersion::Legacy, true, 2019);
 }

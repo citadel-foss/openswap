@@ -295,6 +295,6 @@ fn test_taproot_refund_fee_bump() {
     super::electrum_abort1::run_refund_fee_bump::<BitcoindBackend>(
         ProtocolVersion::Taproot,
         false,
-        854,
+        865,
     );
 }
