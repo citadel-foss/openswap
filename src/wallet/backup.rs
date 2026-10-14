@@ -186,7 +186,11 @@ impl Wallet {
         tmp.as_file().sync_all()?;
         tmp.persist(&backup_path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        fs::File::open(parent)?.sync_all()?;
+        // The backup is already in place; a directory that can't be synced
+        // (e.g. on Windows) is not a failed backup.
+        if let Err(e) = fs::File::open(parent).and_then(|d| d.sync_all()) {
+            log::warn!("backup written, but syncing {parent:?} failed: {e}");
+        }
 
         Ok(())
     }
@@ -311,7 +315,9 @@ impl Wallet {
         let wallet_birthday = options.birthday.or(wallet_backup.wallet_birthday);
 
         // Initialise wallet
-        let mut store = WalletStore::init(
+        // Counters and swept tags go into the first write, so a restore cut
+        // short resumes with them rather than with defaults.
+        let store = WalletStore::init_with(
             wallet_file_name,
             wallet_path,
             wallet_backup.network,
@@ -319,12 +325,12 @@ impl Wallet {
             wallet_birthday,
             Some(options),
             &restored_enc_material,
+            |store| {
+                store.swept_incoming_swapcoins = wallet_backup.swept_incoming_swapcoins.clone();
+                store.external_index = wallet_backup.external_index;
+                store.internal_index = wallet_backup.internal_index;
+            },
         )?;
-        store.swept_incoming_swapcoins = wallet_backup.swept_incoming_swapcoins.clone();
-        store.external_index = wallet_backup.external_index;
-        store.internal_index = wallet_backup.internal_index;
-        // Saved before the scan, so a restore cut short resumes with them.
-        store.write_to_disk(wallet_path, &restored_enc_material)?;
 
         let mut tmp_wallet = Wallet {
             blockchain,

@@ -374,6 +374,31 @@ impl WalletStore {
         pending_restore: Option<RestoreOptions>,
         store_enc_material: &KeyMaterial,
     ) -> Result<Self, WalletError> {
+        Self::init_with(
+            file_name,
+            path,
+            network,
+            master_key,
+            wallet_birthday,
+            pending_restore,
+            store_enc_material,
+            |_| {},
+        )
+    }
+
+    /// Like [`WalletStore::init`], but `prepare` fills in extra state before
+    /// the first durable write, so no partial store ever reaches disk.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn init_with(
+        file_name: String,
+        path: &Path,
+        network: Network,
+        master_key: Xpriv,
+        wallet_birthday: Option<u64>,
+        pending_restore: Option<RestoreOptions>,
+        store_enc_material: &KeyMaterial,
+        prepare: impl FnOnce(&mut Self),
+    ) -> Result<Self, WalletError> {
         let mut store = Self {
             file_name,
             network,
@@ -395,6 +420,7 @@ impl WalletStore {
             ln_pending_swaps: HashMap::new(),
             ln_maker_swaps: HashMap::new(),
         };
+        prepare(&mut store);
         store.master_key.seal(store_enc_material)?;
 
         if let Some(parent) = path.parent() {
