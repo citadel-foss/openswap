@@ -88,8 +88,8 @@ fn send_and_mine(
     Ok(())
 }
 
-/// Locks a bond the way a maker does, OP_RETURN included. A backup holds only
-/// the seed, so the restore must find this bond on-chain.
+/// Locks a bond the way a maker does, OP_RETURN included, so a restore finds
+/// it on-chain even from a backup taken before it.
 fn create_maker_bond(wallet: &mut Wallet, blocks: u32) {
     let (tip, _) = wallet.chain_tip().unwrap();
     wallet
@@ -166,8 +166,14 @@ fn assert_restores_past_address_gaps(
 }
 
 /// Locks a bare bond at index 0, as an API user can, then a maker's at index 1,
-/// both maturing in 10 blocks. Returns the hint that finds bond 0.
-fn create_sparse_bonds(wallet: &mut Wallet, bitcoind: &BitcoinD, wait: impl Fn()) -> BondHint {
+/// both maturing in 10 blocks, then hands out 30 addresses it never funds.
+/// Returns a backup from before all that, and the hint that finds bond 0.
+fn create_sparse_bonds(
+    wallet: &mut Wallet,
+    bitcoind: &BitcoinD,
+    wait: impl Fn(),
+) -> (WalletBackup, BondHint) {
+    let seed_only = WalletBackup::from(&*wallet);
     let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
     send_to_address(bitcoind, &addr, Amount::from_btc(0.1).unwrap());
     generate_blocks(bitcoind, 1);
@@ -190,13 +196,19 @@ fn create_sparse_bonds(wallet: &mut Wallet, bitcoind: &BitcoinD, wait: impl Fn()
     create_maker_bond(wallet, 10);
     generate_blocks(bitcoind, 1);
     wait();
-    BondHint { index: 0, locktime }
+    for _ in 0..30 {
+        wallet.get_next_external_address(AddressType::P2TR).unwrap();
+    }
+    (seed_only, BondHint { index: 0, locktime })
 }
 
 /// A plain restore must look past bare bond 0 to bond 1 and redeem it by its
-/// index; only the hint brings bond 0 back.
+/// index; only the hint brings bond 0 back. A `full` backup's records find
+/// both and see the redeem it predates, and its counters survive.
+#[allow(clippy::too_many_arguments)]
 fn assert_restores_sparse_bonds(
     backup: &WalletBackup,
+    full: &WalletBackup,
     hint: BondHint,
     dir: &Path,
     backend: &BackendConfig,
@@ -247,6 +259,16 @@ fn assert_restores_sparse_bonds(
         .sync_and_save(&openswap::utill::NO_SHUTDOWN)
         .unwrap();
     assert_eq!(restored.get_balances().unwrap().fidelity, Amount::ZERO);
+
+    let from_full = Wallet::restore(full, &dir.join("restored-full"), backend, km.clone()).unwrap();
+    assert_eq!(indexes(&from_full), [0, 1]);
+    let spent: Vec<bool> = from_full
+        .get_fidelity_bonds()
+        .iter()
+        .map(|bond| bond.is_spent())
+        .collect();
+    assert_eq!(spent, [false, true]);
+    assert_eq!(*from_full.get_external_index(), 31);
 }
 
 /// Asserts the wallet file on disk is genuinely encrypted with the given
@@ -371,8 +393,9 @@ fn restore_finds_funds_past_address_gaps() {
     )
     .unwrap();
 
-    fund_past_address_gaps(&mut wallet, &bitcoind, || {});
+    // Taken before any hand-out, so only the gap search can reach the funds.
     wallet.backup(&backup_file, km.clone()).unwrap();
+    fund_past_address_gaps(&mut wallet, &bitcoind, || {});
     let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
         &backup_file,
         Some("integration-test".to_string()),
@@ -407,8 +430,9 @@ fn restore_recovers_sparse_and_hinted_bonds() {
     )
     .unwrap();
 
-    let hint = create_sparse_bonds(&mut wallet, &bitcoind, || {});
+    let (seed_only, hint) = create_sparse_bonds(&mut wallet, &bitcoind, || {});
     assert_restores_sparse_bonds(
+        &seed_only,
         &WalletBackup::from(&wallet),
         hint,
         restored_wallet_file.parent().unwrap(),
@@ -546,10 +570,11 @@ fn restore_finds_funds_past_address_gaps_electrum() {
     )
     .unwrap();
 
+    // Taken before any hand-out, so only the gap search can reach the funds.
+    wallet.backup(&s.backup_file, km.clone()).unwrap();
     fund_past_address_gaps(&mut wallet, &s.bitcoind, || {
         wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg)
     });
-    wallet.backup(&s.backup_file, km.clone()).unwrap();
     let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
         &s.backup_file,
         Some("integration-test".to_string()),
@@ -578,8 +603,9 @@ fn restore_recovers_sparse_and_hinted_bonds_electrum() {
     .unwrap();
 
     let wait = || wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
-    let hint = create_sparse_bonds(&mut wallet, &s.bitcoind, wait);
+    let (seed_only, hint) = create_sparse_bonds(&mut wallet, &s.bitcoind, wait);
     assert_restores_sparse_bonds(
+        &seed_only,
         &WalletBackup::from(&wallet),
         hint,
         s.restored_wallet.parent().unwrap(),

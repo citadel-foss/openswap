@@ -69,7 +69,7 @@ use super::{
 /// the rolling watch/import window always extends this many unused addresses
 /// beyond the last used one per keychain (see [`Wallet::max_watch_index`]).
 pub(crate) const ADDRESS_IMPORT_COUNT: u32 = 20;
-/// Default gap used while syncing a wallet restored from backup. The backup
+/// Default gap used while syncing a wallet restored from backup. A seed phrase
 /// carries no hand-out counters, so index gaps left by aborted multi-tx
 /// funding (see [`Wallet::get_next_internal_addresses`]) must be bridged by
 /// scanning alone; a run of unused indices longer than the gap would otherwise
@@ -2579,7 +2579,7 @@ impl Wallet {
         }
         let mut next = (max_index + 1) as u32;
 
-        // A backup carries no hand-out counters, and an emptied address leaves no
+        // A seed carries no hand-out counters, and an emptied address leaves no
         // UTXO to find, so the loop above stops at the first spent-out run. Script
         // history still remembers those addresses, so probe forward on it.
         if let Some(restore) = &self.store.pending_restore {
@@ -4334,7 +4334,7 @@ impl Wallet {
     ) -> Result<(), WalletError> {
         log::info!("Sync Started for {:?}", self.store.file_name);
         self.sync_no_fail(shutdown)?;
-        // A backup carries no bond records. Rebuild them, then rescan from the
+        // A seed carries no bond records. Rebuild them, then rescan from the
         // birthday so Core finds their coins.
         if self.store.pending_restore.is_some() && self.recover_fidelity_bonds()? {
             self.store.last_synced_height = None;

@@ -1,4 +1,4 @@
-use std::{env, ffi::OsStr, fs, io::Write, path::PathBuf};
+use std::{collections::HashSet, env, ffi::OsStr, fs, io::Write, path::PathBuf};
 
 use crate::{
     security::{encrypt_struct, load_sensitive_struct, KeyMaterial, SecurityError, SerdeJson},
@@ -12,7 +12,7 @@ use super::{
     storage::WalletStore,
 };
 use bip39::Mnemonic;
-use bitcoin::{absolute::LockTime, bip32::Xpriv, Network};
+use bitcoin::{absolute::LockTime, bip32::Xpriv, Network, ScriptBuf};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -88,6 +88,22 @@ pub struct WalletBackup {
     pub(super) wallet_birthday: Option<u64>, //Avoid scanning from genesis block
     /// The file name associated with the wallet store.
     pub file_name: String, //Can be asked to user, or stored for convenience
+
+    // Added after v0.2.3: older backups read them as empty, and older
+    // readers skip them.
+    /// Every bond the wallet held. The restore treats each as a [`BondHint`],
+    /// so a record the chain no longer backs is dropped, not trusted.
+    #[serde(default)]
+    pub(super) fidelity_bonds: Vec<BondHint>,
+    /// Swept swap coin scripts, kept out of the regular coin pool.
+    #[serde(default)]
+    pub(super) swept_incoming_swapcoins: HashSet<ScriptBuf>,
+    /// Receive addresses handed out, including ones never funded.
+    #[serde(default)]
+    pub(super) external_index: u32,
+    /// Change addresses handed out, including ones never funded.
+    #[serde(default)]
+    pub(super) internal_index: u32,
 }
 impl From<&Wallet> for WalletBackup {
     fn from(wallet: &Wallet) -> Self {
@@ -98,6 +114,26 @@ impl From<&Wallet> for WalletBackup {
                 .expect("in-memory master key unsealing failed"),
             wallet_birthday: (wallet.store.wallet_birthday),
             file_name: (wallet.store.file_name.clone()),
+            fidelity_bonds: wallet
+                .store
+                .fidelity_bond
+                .iter()
+                .map(|bond| BondHint {
+                    index: bond.bond_index,
+                    locktime: bond.lock_time,
+                })
+                // A restore still in progress may not have found these yet.
+                .chain(
+                    wallet
+                        .store
+                        .pending_restore
+                        .iter()
+                        .flat_map(|o| o.bond_hints.clone()),
+                )
+                .collect(),
+            swept_incoming_swapcoins: wallet.store.swept_incoming_swapcoins.clone(),
+            external_index: wallet.store.external_index,
+            internal_index: wallet.store.internal_index,
         }
     }
 }
@@ -168,8 +204,9 @@ impl Wallet {
         wallet_path: &Path,
         backend_config: &BackendConfig,
         restored_enc_material: KeyMaterial,
-        options: RestoreOptions,
+        mut options: RestoreOptions,
     ) -> Result<Wallet, WalletError> {
+        options.bond_hints.extend(&wallet_backup.fidelity_bonds);
         for (name, gap, min) in [
             ("address", options.address_gap, ADDRESS_IMPORT_COUNT),
             ("bond", options.bond_gap, 1),
@@ -250,7 +287,7 @@ impl Wallet {
         let wallet_birthday = options.birthday.or(wallet_backup.wallet_birthday);
 
         // Initialise wallet
-        let store = WalletStore::init(
+        let mut store = WalletStore::init(
             wallet_file_name,
             wallet_path,
             wallet_backup.network,
@@ -259,6 +296,11 @@ impl Wallet {
             Some(options),
             &restored_enc_material,
         )?;
+        store.swept_incoming_swapcoins = wallet_backup.swept_incoming_swapcoins.clone();
+        store.external_index = wallet_backup.external_index;
+        store.internal_index = wallet_backup.internal_index;
+        // Saved before the scan, so a restore cut short resumes with them.
+        store.write_to_disk(wallet_path, &restored_enc_material)?;
 
         let mut tmp_wallet = Wallet {
             blockchain,
@@ -280,9 +322,9 @@ impl Wallet {
     /// genesis, and the effective start may be up to 2h of blocks later. Electrum
     /// ignores it and never rescans.
     ///
-    /// Recovers exactly what a [`WalletBackup`] file does: HD funds, fidelity bonds
-    /// and already-swept swap coins — though swap coins lose the label that keeps
-    /// them out of the regular coin pool. Bonds are found by their OP_RETURN or a
+    /// Recovers HD funds, fidelity bonds and already-swept swap coins — though swap
+    /// coins lose the label a [`WalletBackup`] file keeps, which holds them out of
+    /// the regular coin pool. Bonds are found by their OP_RETURN or a
     /// [`BondHint`], until `options.bond_gap` indexes in a row find none. Live swap
     /// keys are per-swap `OsRng` and unrecoverable from any seed.
     pub fn restore_from_mnemonic(
@@ -311,6 +353,10 @@ impl Wallet {
             master_key: Wallet::master_key_from_mnemonic(&mnemonic, network)?,
             wallet_birthday: None,
             file_name,
+            fidelity_bonds: Vec::new(),
+            swept_incoming_swapcoins: HashSet::new(),
+            external_index: 0,
+            internal_index: 0,
         };
 
         Wallet::restore_with(
@@ -452,17 +498,17 @@ mod tests {
             LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap, SwapReservation,
         },
         swapcoin::IncomingSwapCoin,
-        CoreRpcConfig,
+        CoreRpcConfig, FidelityBond,
     };
     use bip39::rand::{thread_rng, Rng};
     use bitcoin::{
         hashes::{sha256, Hash},
         secp256k1::SecretKey,
         transaction::Version,
-        Amount, PublicKey, ScriptBuf, Transaction,
+        Amount, OutPoint, PublicKey, Transaction,
     };
     use bitcoind::tempfile::tempdir;
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
 
     fn dummy_backup(file_name: &str) -> WalletBackup {
         let seed: [u8; 16] = thread_rng().gen();
@@ -471,7 +517,80 @@ mod tests {
             master_key: Xpriv::new_master(Network::Regtest, &seed).unwrap(),
             wallet_birthday: None,
             file_name: file_name.to_string(),
+            fidelity_bonds: Vec::new(),
+            swept_incoming_swapcoins: HashSet::new(),
+            external_index: 0,
+            internal_index: 0,
         }
+    }
+
+    /// The backup as v0.2.3 and v1 write and read it.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct BackupV1 {
+        network: Network,
+        master_key: Xpriv,
+        wallet_birthday: Option<u64>,
+        file_name: String,
+    }
+
+    /// A v2 backup file keeps bonds, swept tags and counters; v1 readers still
+    /// open it, and a v1 file opens with those fields empty.
+    #[test]
+    fn backup_v2_keeps_new_fields_and_reads_v1_both_ways() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let locktime = LockTime::from_height(900).unwrap();
+        wallet.store.fidelity_bond.push(FidelityBond {
+            outpoint: OutPoint::null(),
+            amount: Amount::from_sat(50_000),
+            lock_time: locktime,
+            pubkey: PublicKey::new(wallet.get_fidelity_keypair(3).unwrap().public_key()),
+            conf_height: Some(100),
+            is_spent: false,
+            bond_index: 3,
+            tx: None,
+        });
+        let pending = BondHint { index: 7, locktime };
+        wallet.store.pending_restore = Some(RestoreOptions {
+            bond_hints: vec![pending],
+            ..Default::default()
+        });
+        let swept = HashSet::from([ScriptBuf::from_bytes(vec![0x51])]);
+        wallet.store.swept_incoming_swapcoins = swept.clone();
+        wallet.store.external_index = 30;
+        wallet.store.internal_index = 7;
+
+        let password = Some("backup password".to_string());
+        let km = KeyMaterial::new_from_password(password.clone()).unwrap();
+        let v2_path = dir.path().join("v2.json");
+        wallet.backup(&v2_path, km.clone()).unwrap();
+        let (v2, _) =
+            load_sensitive_struct::<WalletBackup, SerdeJson>(&v2_path, password.clone()).unwrap();
+        assert_eq!(
+            v2.fidelity_bonds,
+            [BondHint { index: 3, locktime }, pending]
+        );
+        assert_eq!(v2.swept_incoming_swapcoins, swept);
+        assert_eq!((v2.external_index, v2.internal_index), (30, 7));
+
+        let (v1, _) =
+            load_sensitive_struct::<BackupV1, SerdeJson>(&v2_path, password.clone()).unwrap();
+        let expected = BackupV1 {
+            network: v2.network,
+            master_key: v2.master_key,
+            wallet_birthday: v2.wallet_birthday,
+            file_name: v2.file_name,
+        };
+        assert_eq!(v1, expected);
+
+        let v1_path = dir.path().join("v1.json");
+        let encrypted = encrypt_struct(expected, &km).unwrap();
+        fs::write(&v1_path, serde_json::to_string_pretty(&encrypted).unwrap()).unwrap();
+        let (read, _) =
+            load_sensitive_struct::<WalletBackup, SerdeJson>(&v1_path, password).unwrap();
+        assert_eq!(read.master_key, v1.master_key);
+        assert!(read.fidelity_bonds.is_empty() && read.swept_incoming_swapcoins.is_empty());
+        assert_eq!((read.external_index, read.internal_index), (0, 0));
     }
 
     /// Each kind of open swap lands in its own count; a fresh wallet has none.

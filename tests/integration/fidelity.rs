@@ -204,8 +204,8 @@ fn test_fidelity_creation() {
     };
 
     // ----- Restore the maker from a backup and restart it -----
-    // A backup holds only the seed, so the restarted maker must find its bond
-    // on-chain instead of locking a second one.
+    // The backup's bond record is checked on-chain, so the restarted maker
+    // must adopt its bond instead of locking a second one.
     let bond_txid = maker.wallet.read().unwrap().get_fidelity_bonds()[0]
         .outpoint()
         .txid;

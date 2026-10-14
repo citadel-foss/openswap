@@ -764,8 +764,8 @@ impl Wallet {
         Ok(payload.into_bytes().into_boxed_slice())
     }
 
-    /// Rebuilds the bond records a backup does not carry, from the wallet's own
-    /// sends: the OP_RETURN or a hint gives the locktime, the seed gives the key per index.
+    /// Rebuilds bond records from the wallet's own sends: the OP_RETURN, a hint or
+    /// a backup's record gives the locktime, the seed gives the key per index.
     pub(crate) fn recover_fidelity_bonds(&mut self) -> Result<bool, WalletError> {
         // Only our own send can fund a bond; anyone can pay us a lookalike.
         let txids: HashSet<Txid> = self
