@@ -1,10 +1,10 @@
 use bitcoind::bitcoincore_rpc::Auth;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use openswap::{
     lock_debug,
     maker::{bind_port_retry, start_server, MakerError, MakerServer, MakerServerConfig},
     utill::{parse_proxy_auth, print_new_wallet_seed, setup_maker_logger},
-    wallet::{BackendConfig, CoreRpcConfig, ElectrumConfig},
+    wallet::{BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions},
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -75,6 +75,40 @@ struct Cli {
     /// encrypted one.
     #[clap(name = "PASSWORD", long, short = 'p')]
     pub password: Option<String>,
+    #[clap(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Restore the wallet from a backup file or its seed phrase, then exit.
+    ///
+    /// `--mnemonic` prompts for the phrase at a hidden prompt. Stop every
+    /// process using the old wallet first. Open swaps are not recovered.
+    #[clap(group(clap::ArgGroup::new("source").required(true).args(["mnemonic", "backup_file"])))]
+    Restore {
+        #[clap(long)]
+        mnemonic: bool,
+        #[clap(long, short = 'f')]
+        backup_file: Option<PathBuf>,
+        /// First block Bitcoin Core rescans from. Default: the backup's, else genesis.
+        #[clap(long)]
+        birthday: Option<u64>,
+        /// Unused addresses in a row that end the search. Default: 100.
+        #[clap(long)]
+        address_gap: Option<u32>,
+        /// A bond made without an announcement, as `INDEX:LOCKTIME`. Repeatable.
+        #[clap(long)]
+        bond_hint: Vec<BondHint>,
+    },
+    /// Write an encrypted backup of the existing wallet, then exit.
+    ///
+    /// Run it with the maker stopped. Open swaps are not in a backup.
+    Backup {
+        /// Backup file. Default: `<wallet>-backup.json` in the current directory.
+        #[clap(long, short = 'o')]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<(), MakerError> {
@@ -122,6 +156,27 @@ fn main() -> Result<(), MakerError> {
         }),
     };
 
+    match args.command {
+        Some(Commands::Restore {
+            backup_file,
+            birthday,
+            address_gap,
+            bond_hint,
+            ..
+        }) => {
+            let defaults = RestoreOptions::default();
+            let options = RestoreOptions {
+                birthday,
+                address_gap: address_gap.unwrap_or(defaults.address_gap),
+                bond_hints: bond_hint,
+                ..defaults
+            };
+            return MakerServer::restore_wallet(&config, backup_file.as_deref(), options);
+        }
+        Some(Commands::Backup { output }) => return MakerServer::backup_wallet(config, output),
+        None => {}
+    }
+
     // First run: discover available port and save to config
     const DEFAULT_NETWORK_PORT: u16 = 6102;
     if config.network_port == DEFAULT_NETWORK_PORT {
@@ -153,4 +208,61 @@ fn main() -> Result<(), MakerError> {
     start_server(maker)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(["makerd"].iter().chain(args))
+    }
+
+    #[test]
+    fn plain_makerd_has_no_subcommand() {
+        assert!(parse(&["-w", "m"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn restore_needs_exactly_one_source() {
+        assert!(parse(&["restore"]).is_err());
+        assert!(parse(&["restore", "--mnemonic", "-f", "b.json"]).is_err());
+        assert!(parse(&["restore", "--mnemonic"]).is_ok());
+        assert!(parse(&["-w", "m", "restore", "-f", "b.json"]).is_ok());
+    }
+
+    #[test]
+    fn restore_and_backup_read_their_options() {
+        let cli = parse(&[
+            "restore",
+            "--mnemonic",
+            "--birthday",
+            "7",
+            "--address-gap",
+            "250",
+            "--bond-hint",
+            "3:900000",
+        ])
+        .unwrap();
+        let Some(Commands::Restore {
+            birthday,
+            address_gap,
+            bond_hint,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected restore")
+        };
+        assert_eq!(
+            (birthday, address_gap, bond_hint[0].index),
+            (Some(7), Some(250), 3)
+        );
+        assert!(parse(&["restore", "--mnemonic", "--bond-hint", "3"]).is_err());
+
+        let cli = parse(&["backup", "-o", "x.json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Backup { output: Some(_) })
+        ));
+    }
 }

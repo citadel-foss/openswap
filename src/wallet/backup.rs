@@ -14,7 +14,7 @@ use super::{
 use bip39::Mnemonic;
 use bitcoin::{absolute::LockTime, bip32::Xpriv, Network, ScriptBuf};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{path::Path, str::FromStr};
 use zeroize::Zeroizing;
 
 /// The way back from a wallet file that cannot be used.
@@ -61,6 +61,21 @@ pub struct BondHint {
     pub index: u32,
     /// The bond's locktime.
     pub locktime: LockTime,
+}
+
+/// Parses the CLI form `INDEX:LOCKTIME`.
+impl FromStr for BondHint {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (index, locktime) = s.split_once(':').ok_or("expected INDEX:LOCKTIME")?;
+        Ok(BondHint {
+            index: index.parse().map_err(|e| format!("bad index: {e}"))?,
+            locktime: LockTime::from_consensus(
+                locktime.parse().map_err(|e| format!("bad locktime: {e}"))?,
+            ),
+        })
+    }
 }
 
 /// Open swaps a restore loses: their keys are random per swap and live only
@@ -532,8 +547,8 @@ impl Wallet {
     /// # Behavior
     ///
     /// - Names the backup file as `{wallet_name}-backup.json`.
-    /// - Writes the backup to the current working directory.
-    pub fn backup_interactive(wallet: &Self) -> Result<(), WalletError> {
+    /// - Writes the backup to the current working directory, or to `output`.
+    pub fn backup_interactive(wallet: &Self, output: Option<PathBuf>) -> Result<(), WalletError> {
         log::info!("Initiating wallet backup!");
         let open = wallet.open_swaps_summary();
         if open != OpenSwapsSummary::default() {
@@ -550,9 +565,6 @@ impl Wallet {
             backup_name
         );
 
-        let working_directory: PathBuf = env::current_dir()
-            .map_err(|e| WalletError::General(format!("failed to get current directory: {e}")))?;
-
         let backup_enc_material = KeyMaterial::new_interactive(None)
             .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?
             .ok_or_else(|| {
@@ -563,7 +575,14 @@ impl Wallet {
                 )
             })?;
 
-        let backup_path = working_directory.join(backup_name);
+        let backup_path = match output {
+            Some(path) => path,
+            None => env::current_dir()
+                .map_err(|e| WalletError::General(format!("failed to get current directory: {e}")))?
+                .join(backup_name),
+        }
+        // `backup` swaps any extension for `.json`; log the file it really writes.
+        .with_extension("json");
         wallet.backup(&backup_path, backup_enc_material)?;
         log::info!("Wallet backup succeeded: {backup_path:?}");
         Ok(())

@@ -1,4 +1,4 @@
-use bitcoin::{absolute::LockTime, Amount};
+use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::Auth;
 use clap::Parser;
 use log::LevelFilter;
@@ -303,7 +303,7 @@ enum Commands {
         #[clap(long)]
         address_gap: Option<u32>,
         /// A bond made without an announcement, as `INDEX:LOCKTIME`. Repeatable.
-        #[clap(long, value_parser = parse_bond_hint)]
+        #[clap(long)]
         bond_hint: Vec<BondHint>,
     },
     /// Verify the deniability proof for a specific swap.
@@ -312,18 +312,6 @@ enum Commands {
         #[clap(long, short = 's')]
         swap_id: String,
     },
-}
-
-fn parse_bond_hint(s: &str) -> Result<BondHint, String> {
-    let (index, locktime) = s
-        .split_once(':')
-        .ok_or("expected INDEX:LOCKTIME".to_string())?;
-    Ok(BondHint {
-        index: index.parse().map_err(|e| format!("bad index: {e}"))?,
-        locktime: LockTime::from_consensus(
-            locktime.parse().map_err(|e| format!("bad locktime: {e}"))?,
-        ),
-    })
 }
 
 fn parse_protocol(s: &str) -> Result<ProtocolVersion, TakerError> {
@@ -931,7 +919,7 @@ fn main() -> Result<(), TakerError> {
         }
         Commands::Backup => {
             let wallet = lock_debug!(taker.get_wallet().read()).unwrap();
-            Wallet::backup_interactive(&wallet)?;
+            Wallet::backup_interactive(&wallet, None)?;
         }
         Commands::Restore { .. } => {
             // Handled above before taker init
@@ -950,6 +938,7 @@ fn main() -> Result<(), TakerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::absolute::LockTime;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(["taker"].iter().chain(args))
@@ -996,7 +985,7 @@ mod tests {
     #[test]
     fn bond_hint_rejects_malformed_values() {
         for bad in ["3", "x:1", "3:y", ":"] {
-            assert!(parse_bond_hint(bad).is_err());
+            assert!(bad.parse::<BondHint>().is_err());
         }
     }
 }
