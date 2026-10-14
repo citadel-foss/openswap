@@ -89,7 +89,7 @@ Each percentage fee must be at least 0 and below 100. Your node refuses to start
 
 ### 2. **wallets Directory**
 
-This folder contains the wallet files used by the Maker to store wallet data, including private keys. Ensure these wallet files are backed up securely.
+This folder contains the wallet files used by the Maker to store wallet data, including private keys. Ensure these wallet files are backed up securely. See "Backing up and restoring the wallet" below.
 
 The default wallet directory is `$HOME/.openswap/maker/wallets`.
 
@@ -100,6 +100,50 @@ The log file for `makerd`, where debug information is stored for troubleshooting
 ### 4. **rpc_cookie**
 
 A randomly generated authentication token written by `makerd` on startup and removed on shutdown. `maker-cli` reads this file from the maker data directory to authenticate its RPC requests, so it must be run on the same machine (and with read access to the data directory) as `makerd`.
+
+---
+
+## Backing Up and Restoring the Wallet
+
+Both commands run on their own and then exit. They do not start the maker. Stop `makerd` before you use them. Pass the same `-d`, `-w` and blockchain flags you use to run the maker.
+
+### Backup
+
+```bash
+$ makerd backup -o maker-backup.json
+```
+
+The command asks for a backup password. It writes an encrypted file. Without `-o`, the file is `<wallet>-backup.json` in the current directory. The file always ends in `.json`: `-o maker.bak` writes `maker.json`. The log shows the path written. The command needs an existing wallet. It never creates one.
+
+The backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. Finish open swaps first. Copy `<wallet>_swap_report.json` by hand. There is no backup command in `maker-cli`.
+
+### Restore
+
+Stop every process that uses the old wallet. Keep the old wallet files. Then restore from a backup file:
+
+```bash
+$ makerd restore --backup-file maker-backup.json
+```
+
+Or from your seed phrase:
+
+```bash
+$ makerd restore --mnemonic
+```
+
+The phrase goes in at a hidden prompt. A restore never overwrites an existing wallet. The new wallet uses the maker wallet name (`maker` by default, or what you pass with `-w`).
+
+A restore cannot bring back swaps in progress or pending refunds. It does find coins and your announced fidelity bond. After the restore, start `makerd` as usual. It adopts the restored bond and does not make a second one.
+
+Options:
+
+- `--birthday <HEIGHT>`: the first block to scan from. Pick one before the wallet's first transaction.
+- `--address-gap <N>`: unused addresses in a row that end the search. Default 100, lowest 20, highest 100000.
+- `--bond-hint <INDEX:LOCKTIME>`: a bond made without an announcement. `makerd` always announces its bonds, so you rarely need this. You can repeat it.
+
+After the restore, the command lists the bond indexes it found. It also names each hint that found no bond.
+
+See [wallet security](wallet-security.md) for what a restore does and does not bring back.
 
 ---
 

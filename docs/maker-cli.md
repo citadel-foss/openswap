@@ -13,6 +13,10 @@ In this guide, we'll walk you through how to use `maker-cli` to get the most out
 > 👉 **Before starting this tutorial**, ensure your `makerd` setup is complete.  
 > If you're unsure how to set it up, check out our [Makerd Setup Guide](./makerd.md) first, and then return to this tutorial.
 
+> ### **Backup and restore**
+>
+> `maker-cli` has no backup or restore command. Use `makerd backup` and `makerd restore` with the maker stopped. See the [Makerd guide](./makerd.md).
+
 ---
 
 ## Getting Started with `maker-cli`

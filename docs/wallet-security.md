@@ -102,13 +102,51 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
 - **No cleartext formats**: unencrypted wallet files and unencrypted backups
   are rejected, not migrated. The project is pre-launch, so no legacy
   plaintext compatibility path exists.
-- **The BIP39 mnemonic** is shown once at wallet creation and is the ultimate
-  backup — record it offline. It is kept in memory until the CLI displays it
-  (`take_new_mnemonic`) and is not zeroized.
+- **The BIP39 mnemonic** is shown once at wallet creation — record it offline.
+  It is kept in memory until the CLI displays it (`take_new_mnemonic`) and is
+  not zeroized. It is a backup of your keys, not of your whole wallet state.
+  See "What a restore brings back" below.
 - **Test builds** (`cfg(test)` / the `integration-test` feature) reduce
   PBKDF2 to 1 iteration for speed. Never use such a build with real funds.
-- **FFI**: `backup_wallet_gui_app` and `restore_wallet_gui_app` both require
-  a password; `is_wallet_encrypted` reports whether a file is encrypted.
+- **FFI**: `backup_wallet_gui_app`, `restore_wallet_gui_app` and the
+  `Result`-returning `restore_wallet_from_backup_gui_app` and
+  `restore_wallet_from_mnemonic_gui_app` all require a password; `is_wallet_encrypted` reports whether a file is encrypted.
+
+## What a restore brings back
+
+The seed phrase and the encrypted backup file both rebuild the wallet from
+keys. A restore searches the chain for what those keys own.
+
+**A restore finds:**
+
+- Coins on addresses within the address gap (default 100 unused addresses in
+  a row; set it with `--address-gap`) and after the birthday block.
+- Fidelity bonds the maker announced, and bonds listed in a backup file.
+  Bonds made without an announcement need `--bond-hint INDEX:LOCKTIME`.
+  The restore checks each hint against the chain.
+
+**A restore does not find:**
+
+- Swaps still in progress, on either side. Their keys are random and live
+  only in the wallet file.
+- Pending refunds from failed swaps.
+- Lightning swaps in progress. A restored wallet does not know about them.
+- Swap reports and deniability proofs. Copy the `<wallet>_swap_report.json`
+  file by hand.
+- Tags on swept coins. A backup file carries them. A seed phrase does not.
+- A BIP39 passphrase. OpenSwap has none, so a restore uses an empty one.
+
+**Before you restore:**
+
+1. Finish or refund every swap on the old wallet.
+2. Stop every process that uses the old wallet.
+3. Keep the old wallet files. Do not delete them.
+4. Pick an early birthday block. A late one skips older coins.
+5. Raise the address gap if you used more than 100 addresses in a row
+   without receiving coins.
+
+A restore refuses to overwrite an existing wallet file. Restore under a new
+name or move the old file first.
 
 ## File formats
 
