@@ -21,6 +21,11 @@ use zeroize::Zeroizing;
 pub const RESTORE_FROM_MNEMONIC_HINT: &str =
     "restore the wallet from its seed phrase with `restore --mnemonic`";
 
+/// Shown before every restore, since no seed or backup holds open swap keys.
+pub const RESTORE_OPEN_SWAPS_WARNING: &str =
+    "A restore cannot recover swaps still in progress (including Lightning swaps): \
+     their keys are not in a seed phrase or backup. Finish or refund them on the old wallet first.";
+
 /// How far a restore searches. Saved in the wallet file until the first scan
 /// finishes, so a restore cut short resumes with the same options.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -404,7 +409,9 @@ impl Wallet {
         backup_file_path: &PathBuf,
         backend: &BackendConfig,
         restored_path: &Path,
+        options: RestoreOptions,
     ) -> Result<(), WalletError> {
+        println!("{RESTORE_OPEN_SWAPS_WARNING}");
         log::info!(
             "Initiating wallet restore, from backup: {backup_file_path:?} to wallet {:?}",
             restored_path.file_name()
@@ -445,9 +452,75 @@ impl Wallet {
             )
         })?;
 
-        Wallet::restore(&backup, restored_path, backend, restore_enc_material)?;
+        let hints = options.bond_hints.clone();
+        let wallet = Wallet::restore_with(
+            &backup,
+            restored_path,
+            backend,
+            restore_enc_material,
+            options,
+        )?;
         println!("Wallet restore succeeded!");
+        wallet.print_restored_bonds(&hints);
         Ok(())
+    }
+
+    /// Interactively restores a wallet from a seed phrase read at a hidden
+    /// prompt, so it never appears in argv or shell history.
+    pub fn restore_from_mnemonic_interactive(
+        restored_path: &Path,
+        backend: &BackendConfig,
+        options: RestoreOptions,
+    ) -> Result<(), WalletError> {
+        println!("{RESTORE_OPEN_SWAPS_WARNING}");
+        let phrase = Zeroizing::new(
+            prompt_password("Enter seed phrase: ".to_string())
+                .map_err(|e| WalletError::General(format!("failed to read seed phrase: {e}")))?,
+        );
+        Wallet::validate_mnemonic(&phrase)?;
+        let restore_enc_material = KeyMaterial::new_interactive(Some(
+            "Enter restored wallet encryption passphrase: ".to_string(),
+        ))
+        .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?
+        .ok_or_else(|| {
+            WalletError::General(
+                "wallet restore failed: a passphrase is required; \
+                 cleartext wallet files are not supported"
+                    .to_string(),
+            )
+        })?;
+
+        let hints = options.bond_hints.clone();
+        let wallet = Wallet::restore_from_mnemonic(
+            phrase,
+            restored_path,
+            backend,
+            options,
+            restore_enc_material,
+        )?;
+        println!("Wallet restore succeeded!");
+        wallet.print_restored_bonds(&hints);
+        Ok(())
+    }
+
+    /// A hint that finds nothing must not pass silently: the user may have
+    /// mistyped it, and that bond's money is still out there.
+    fn print_restored_bonds(&self, hints: &[BondHint]) {
+        let bonds = &self.store.fidelity_bond;
+        let indexes: Vec<u32> = bonds.iter().map(|bond| bond.bond_index).collect();
+        println!("Fidelity bonds recovered at indexes: {indexes:?}");
+        for hint in hints {
+            if !bonds
+                .iter()
+                .any(|bond| bond.bond_index == hint.index && bond.lock_time == hint.locktime)
+            {
+                println!(
+                    "Bond hint {}:{} matched no bond",
+                    hint.index,
+                    hint.locktime.to_consensus_u32()
+                );
+            }
+        }
     }
     /// Interactively creates a wallet backup.
     ///
@@ -462,6 +535,14 @@ impl Wallet {
     /// - Writes the backup to the current working directory.
     pub fn backup_interactive(wallet: &Self) -> Result<(), WalletError> {
         log::info!("Initiating wallet backup!");
+        let open = wallet.open_swaps_summary();
+        if open != OpenSwapsSummary::default() {
+            println!(
+                "Warning: {} incoming and {} outgoing swap coins, {} swap fundings and {} \
+                 Lightning swaps are still open. {RESTORE_OPEN_SWAPS_WARNING}",
+                open.incoming, open.outgoing, open.swap_locks, open.lightning
+            );
+        }
         let backup_name = format!("{}-backup", wallet.get_name());
         log::info!(
             "Backing up wallet: {} to {}",

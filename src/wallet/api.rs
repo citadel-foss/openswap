@@ -5031,7 +5031,9 @@ mod prevout_contract_tests {
 #[cfg(test)]
 mod restore_history_probe_tests {
     use super::*;
-    use crate::wallet::{blockchain::Electrum, BackendConfig};
+    use crate::wallet::{
+        blockchain::Electrum, ffi::restore_wallet_from_backup_gui_app, BackendConfig,
+    };
     use bitcoin::{
         consensus::encode::serialize_hex,
         hashes::{sha256, Hash},
@@ -5302,6 +5304,33 @@ mod restore_history_probe_tests {
             wallet.with_master_key(|key| Ok(*key)).unwrap(),
             Wallet::master_key_from_mnemonic(&mnemonic, bitcoin::Network::Regtest).unwrap()
         );
+    }
+
+    /// A nameless backup restore into a fresh data dir lands under `wallets/`,
+    /// instead of taking `wallets` itself as the wallet file.
+    #[test]
+    fn backup_restore_into_a_fresh_data_dir() {
+        let temp_dir = tempdir().unwrap();
+        let wallet = test_support::test_wallet(&temp_dir.path().join("source"));
+        let password = "backup password".to_string();
+        let backup = temp_dir.path().join("backup.json");
+        let km = KeyMaterial::new_from_password(Some(password.clone())).unwrap();
+        wallet.backup(&backup, km).unwrap();
+
+        let data_dir = temp_dir.path().join("fresh");
+        restore_wallet_from_backup_gui_app(
+            Some(data_dir.clone()),
+            None,
+            BackendConfig::Electrum(electrum_config(start_stub(StdHashSet::new()))),
+            backup,
+            Some(password),
+            RestoreOptions::default(),
+        )
+        .unwrap();
+        assert!(data_dir
+            .join("wallets")
+            .join(&wallet.store.file_name)
+            .is_file());
     }
 
     /// Proves a stopped sync returns before making its first backend request.

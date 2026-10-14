@@ -3,6 +3,7 @@
 use std::{
     collections::HashSet,
     convert::TryFrom,
+    fs,
     net::TcpStream,
     path::PathBuf,
     sync::{atomic::AtomicBool, mpsc, Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -48,8 +49,8 @@ use crate::{
         p2tr_min_non_dust_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig,
-        MakerFeeInfo as ReportMakerFeeInfo, RecoveryOutcome, ReportUtxo, SwapStatus, TakerReport,
-        Wallet,
+        MakerFeeInfo as ReportMakerFeeInfo, RecoveryOutcome, ReportUtxo, RestoreOptions,
+        SwapStatus, TakerReport, Wallet,
     },
     watch_tower::{
         registry_storage::FileRegistry,
@@ -3937,28 +3938,43 @@ impl Taker {
             .map_err(TakerError::Blocklist)
     }
 
-    /// Restore a wallet from a backup file (static — no taker instance needed).
-    /// A `None` wallet name restores under the backup's original filename.
+    /// Restore a wallet from a backup file, or from a seed phrase prompted for
+    /// when `backup_file` is `None` (static — no taker instance needed).
+    /// A backup restore with no wallet name keeps the backup's filename; a
+    /// phrase restore falls back to `taker-wallet`.
     pub fn restore_wallet(
         data_dir: Option<PathBuf>,
         wallet_file_name: Option<String>,
         backend: BackendConfig,
-        backup_file: &String,
+        backup_file: Option<&String>,
+        options: RestoreOptions,
     ) -> Result<(), TakerError> {
-        let backup_file_path = PathBuf::from(backup_file);
-
         let wallets_dir = data_dir
             .map(Ok)
             .unwrap_or_else(get_taker_dir)
             .map_err(|e| TakerError::General(format!("wallet restore failed: {e}")))?
             .join("wallets");
-        // A nameless path resolves to the backup's filename inside `Wallet::restore`.
-        let restored_wallet_path = match wallet_file_name {
-            Some(name) => wallets_dir.join(name),
-            None => wallets_dir,
-        };
+        // Missing, `wallets` would read as the wallet file's own name.
+        fs::create_dir_all(&wallets_dir)?;
 
-        Wallet::restore_interactive(&backup_file_path, &backend, &restored_wallet_path)?;
+        match backup_file {
+            // A nameless path resolves to the backup's filename inside `Wallet::restore_with`.
+            Some(file) => {
+                let path = match wallet_file_name {
+                    Some(name) => wallets_dir.join(name),
+                    None => wallets_dir,
+                };
+                Wallet::restore_interactive(&PathBuf::from(file), &backend, &path, options)?;
+            }
+            None => {
+                let name = wallet_file_name.unwrap_or_else(|| "taker-wallet".to_string());
+                Wallet::restore_from_mnemonic_interactive(
+                    &wallets_dir.join(name),
+                    &backend,
+                    options,
+                )?;
+            }
+        }
         Ok(())
     }
 }

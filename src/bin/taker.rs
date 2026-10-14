@@ -1,4 +1,4 @@
-use bitcoin::Amount;
+use bitcoin::{absolute::LockTime, Amount};
 use bitcoind::bitcoincore_rpc::Auth;
 use clap::Parser;
 use log::LevelFilter;
@@ -10,7 +10,7 @@ use openswap::{
         TakerConfig, TakerInitConfig,
     },
     utill::{parse_proxy_auth, print_new_wallet_seed, setup_taker_logger, MAX_TX_COUNT, UTXO},
-    wallet::{AddressType, CoreRpcConfig, Wallet},
+    wallet::{AddressType, BondHint, CoreRpcConfig, RestoreOptions, Wallet},
 };
 use serde_json::{json, to_string_pretty};
 use std::{
@@ -282,17 +282,29 @@ enum Commands {
     #[clap(verbatim_doc_comment)]
     Backup,
 
-    /// Restore a wallet from a backup file.
+    /// Restore a wallet from a backup file or from its seed phrase.
     ///
-    /// The `-f, --backup-file <FILE>` parameter specifies the backup file to restore from.
+    /// `--backup-file <FILE>` restores from an encrypted backup. If no wallet name
+    /// is given with `-w, --WALLET`, the backup's original name is kept.
     ///
-    /// You can optionally specify a wallet name using the default `-w, --WALLET` parameter.
-    /// If no wallet name is provided, the wallet will be restored with its original name
-    /// stored in the backup. If a wallet name is provided, the backup will be restored
-    /// under that name instead.
+    /// `--mnemonic` prompts for the seed phrase at a hidden prompt, and the wallet
+    /// is named `taker-wallet` unless `-w` says otherwise. It recovers funds,
+    /// announced fidelity bonds and no open swaps.
+    #[clap(group(clap::ArgGroup::new("source").required(true).args(["mnemonic", "backup_file"])))]
     Restore {
+        #[clap(long)]
+        mnemonic: bool,
         #[clap(long, short = 'f')]
-        backup_file: String,
+        backup_file: Option<String>,
+        /// First block Bitcoin Core rescans from. Default: the backup's, else genesis.
+        #[clap(long)]
+        birthday: Option<u64>,
+        /// Unused addresses in a row that end the search. Default: 100.
+        #[clap(long)]
+        address_gap: Option<u32>,
+        /// A bond made without an announcement, as `INDEX:LOCKTIME`. Repeatable.
+        #[clap(long, value_parser = parse_bond_hint)]
+        bond_hint: Vec<BondHint>,
     },
     /// Verify the deniability proof for a specific swap.
     VerifyDeniability {
@@ -300,6 +312,18 @@ enum Commands {
         #[clap(long, short = 's')]
         swap_id: String,
     },
+}
+
+fn parse_bond_hint(s: &str) -> Result<BondHint, String> {
+    let (index, locktime) = s
+        .split_once(':')
+        .ok_or("expected INDEX:LOCKTIME".to_string())?;
+    Ok(BondHint {
+        index: index.parse().map_err(|e| format!("bad index: {e}"))?,
+        locktime: LockTime::from_consensus(
+            locktime.parse().map_err(|e| format!("bad locktime: {e}"))?,
+        ),
+    })
 }
 
 fn parse_protocol(s: &str) -> Result<ProtocolVersion, TakerError> {
@@ -465,12 +489,26 @@ fn main() -> Result<(), TakerError> {
         }),
     };
 
-    if let Commands::Restore { ref backup_file } = args.command {
+    if let Commands::Restore {
+        ref backup_file,
+        birthday,
+        address_gap,
+        ref bond_hint,
+        ..
+    } = args.command
+    {
+        let defaults = RestoreOptions::default();
         openswap::taker::Taker::restore_wallet(
             args.data_directory,
-            Some(wallet_name), // Use the actual translated wallet name here.
+            args.wallet_name.clone(),
             backend,
-            backup_file,
+            backup_file.as_ref(),
+            RestoreOptions {
+                birthday,
+                address_gap: address_gap.unwrap_or(defaults.address_gap),
+                bond_hints: bond_hint.clone(),
+                ..defaults
+            },
         )?;
         return Ok(());
     }
@@ -907,4 +945,58 @@ fn main() -> Result<(), TakerError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(["taker"].iter().chain(args))
+    }
+
+    #[test]
+    fn restore_needs_exactly_one_source() {
+        assert!(parse(&["restore"]).is_err());
+        assert!(parse(&["restore", "--mnemonic", "-f", "b.json"]).is_err());
+        assert!(parse(&["restore", "--mnemonic"]).is_ok());
+        assert!(parse(&["restore", "-f", "b.json"]).is_ok());
+    }
+
+    #[test]
+    fn restore_reads_options_and_keeps_wallet_name_unset() {
+        let cli = parse(&[
+            "restore",
+            "--mnemonic",
+            "--birthday",
+            "100",
+            "--address-gap",
+            "250",
+            "--bond-hint",
+            "3:900000",
+            "--bond-hint",
+            "4:900001",
+        ])
+        .unwrap();
+        assert_eq!(cli.wallet_name, None);
+        let Commands::Restore {
+            birthday,
+            address_gap,
+            bond_hint,
+            ..
+        } = cli.command
+        else {
+            panic!("expected restore")
+        };
+        assert_eq!((birthday, address_gap), (Some(100), Some(250)));
+        assert_eq!(bond_hint[1].index, 4);
+        assert_eq!(bond_hint[0].locktime, LockTime::from_consensus(900000));
+    }
+
+    #[test]
+    fn bond_hint_rejects_malformed_values() {
+        for bad in ["3", "x:1", "3:y", ":"] {
+            assert!(parse_bond_hint(bad).is_err());
+        }
+    }
 }

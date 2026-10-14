@@ -11,8 +11,10 @@ use bitcoind::{
 };
 use electrsd::ElectrsD;
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
 use openswap::wallet::{
+    ffi::{restore_wallet_from_backup_gui_app, restore_wallet_from_mnemonic_gui_app},
     AddressType, AnyBlockchain, BackendConfig, Blockchain, BondHint, CoreRPC, CoreRpcConfig,
     Destination, Electrum, ElectrumConfig, RestoreOptions, Wallet, WalletBackup,
 };
@@ -163,6 +165,129 @@ fn assert_restores_past_address_gaps(
             "{name}"
         );
     }
+}
+
+/// Funds both address types on both chains, then restores through the FFI
+/// functions: from the phrase, then from a backup. Each must find the coins
+/// and spend them; a second restore onto the same name is refused.
+fn assert_ffi_restores_funded_wallet(
+    wallet: &mut Wallet,
+    data_dir: &Path,
+    backend: &BackendConfig,
+    bitcoind: &BitcoinD,
+    wait: impl Fn(),
+) {
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    let phrase = wallet.take_new_mnemonic().unwrap().words();
+    wallet.backup(&data_dir.join("backup"), km).unwrap();
+    for address_type in [AddressType::P2WPKH, AddressType::P2TR] {
+        let external = wallet.get_next_external_address(address_type).unwrap();
+        let internal = wallet
+            .get_next_internal_addresses(1, address_type)
+            .unwrap()
+            .remove(0);
+        for addr in [external, internal] {
+            send_to_address(bitcoind, &addr, Amount::from_btc(0.01).unwrap());
+        }
+    }
+    generate_blocks(bitcoind, 1);
+    wait();
+
+    let password = Some("integration-test".to_string());
+    let from_phrase = restore_wallet_from_mnemonic_gui_app(
+        Some(data_dir.to_path_buf()),
+        "from-phrase".to_string(),
+        backend.clone(),
+        phrase.clone(),
+        password.clone(),
+        RestoreOptions::default(),
+    );
+    from_phrase.unwrap();
+    let again = restore_wallet_from_mnemonic_gui_app(
+        Some(data_dir.to_path_buf()),
+        "from-phrase".to_string(),
+        backend.clone(),
+        phrase.clone(),
+        password.clone(),
+        RestoreOptions::default(),
+    );
+    assert!(format!("{:?}", again.unwrap_err()).contains("already exists"));
+    assert!(restore_wallet_from_backup_gui_app(
+        Some(data_dir.to_path_buf()),
+        Some("from-backup".to_string()),
+        backend.clone(),
+        data_dir.join("backup.json"),
+        None,
+        RestoreOptions::default(),
+    )
+    .is_err());
+    restore_wallet_from_backup_gui_app(
+        Some(data_dir.to_path_buf()),
+        Some("from-backup".to_string()),
+        backend.clone(),
+        data_dir.join("backup.json"),
+        password.clone(),
+        RestoreOptions::default(),
+    )
+    .unwrap();
+
+    // The FFI calls return no wallet, so they must leave files behind, and
+    // the same restores through the library must find the coins and spend them.
+    let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
+        &data_dir.join("backup.json"),
+        password.clone(),
+    )
+    .unwrap();
+    for name in ["from-phrase", "from-backup"] {
+        assert!(data_dir.join("wallets").join(name).exists(), "{}", name);
+    }
+    let km = KeyMaterial::new_from_password(password).unwrap();
+    let phrase = Zeroizing::new(phrase);
+    let mut restored_wallets = Vec::new();
+    for name in ["lib-phrase", "lib-backup"] {
+        let path = data_dir.join("wallets").join(name);
+        let mut backend = backend.clone();
+        if let BackendConfig::CoreRpc(cfg) = &mut backend {
+            cfg.wallet_name = name.to_string();
+        }
+        let restored = if name == "lib-phrase" {
+            Wallet::restore_from_mnemonic(
+                phrase.clone(),
+                &path,
+                &backend,
+                RestoreOptions::default(),
+                km.clone(),
+            )
+        } else {
+            Wallet::restore(&backup, &path, &backend, km.clone())
+        }
+        .unwrap();
+        assert_eq!(
+            restored.list_descriptor_utxo_spend_info().len(),
+            4,
+            "{name}"
+        );
+        restored_wallets.push(restored);
+    }
+
+    // Both see the same coins; spending them from one proves the keys work.
+    let restored = &mut restored_wallets[0];
+    let coins = restored.list_descriptor_utxo_spend_info();
+    let sink = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+    let sweep = restored
+        .spend_from_wallet(MIN_RELAY_FEE_RATE, Destination::Sweep(sink), &coins)
+        .unwrap();
+    restored.send_tx(&sweep).unwrap();
+    generate_blocks(bitcoind, 1);
+    wait();
+    restored
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    assert_eq!(restored.get_balances().unwrap().spendable, Amount::ZERO);
 }
 
 /// Locks a bare bond at index 0, as an API user can, then a maker's at index 1,
@@ -419,6 +544,27 @@ fn restore_finds_funds_past_address_gaps() {
 }
 
 #[test]
+fn ffi_restore_from_mnemonic_and_backup_funded() {
+    let (original_wallet, rpc_config, _, mut bitcoind, restored_wallet_file, root_dir) =
+        setup("ffi_restore_from_mnemonic_and_backup_funded".to_string());
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    let mut wallet = Wallet::init(
+        &original_wallet,
+        AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap()),
+        km,
+    )
+    .unwrap();
+    assert_ffi_restores_funded_wallet(
+        &mut wallet,
+        restored_wallet_file.parent().unwrap(),
+        &BackendConfig::CoreRpc(rpc_config),
+        &bitcoind,
+        || {},
+    );
+    cleanup(&mut bitcoind, &root_dir);
+}
+
+#[test]
 fn restore_recovers_sparse_and_hinted_bonds() {
     let (original_wallet, rpc_config, _, mut bitcoind, restored_wallet_file, root_dir) =
         setup("restore_recovers_sparse_and_hinted_bonds".to_string());
@@ -587,6 +733,27 @@ fn restore_finds_funds_past_address_gaps_electrum() {
         &km,
     );
 
+    drop(s.electrsd);
+    cleanup(&mut s.bitcoind, &s.root_dir);
+}
+
+#[test]
+fn ffi_restore_from_mnemonic_and_backup_funded_electrum() {
+    let mut s = setup_electrum("ffi_restore_from_mnemonic_and_backup_funded_electrum");
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    let mut wallet = Wallet::init(
+        &s.original_wallet,
+        AnyBlockchain::Electrum(Electrum::new(&s.electrum_cfg).unwrap()),
+        km,
+    )
+    .unwrap();
+    assert_ffi_restores_funded_wallet(
+        &mut wallet,
+        s.restored_wallet.parent().unwrap(),
+        &BackendConfig::Electrum(s.electrum_cfg.clone()),
+        &s.bitcoind,
+        || wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg),
+    );
     drop(s.electrsd);
     cleanup(&mut s.bitcoind, &s.root_dir);
 }

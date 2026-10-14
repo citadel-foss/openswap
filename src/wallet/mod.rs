@@ -22,6 +22,7 @@ pub use api::{
 };
 pub use backup::{
     BondHint, OpenSwapsSummary, RestoreOptions, WalletBackup, RESTORE_FROM_MNEMONIC_HINT,
+    RESTORE_OPEN_SWAPS_WARNING,
 };
 pub use blockchain::{
     AnyBlockchain, BackendConfig, Blockchain, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
