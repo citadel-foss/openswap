@@ -23,7 +23,7 @@ use bitcoin::{
     consensus::encode::serialize,
     hashes::Hash,
     hex::DisplayHex,
-    Address, BlockHash, CompressedPublicKey, OutPoint, Script, ScriptBuf, SignedAmount,
+    Address, BlockHash, CompressedPublicKey, Network, OutPoint, Script, ScriptBuf, SignedAmount,
     Transaction, Txid,
 };
 use bitcoind::bitcoincore_rpc::json::{
@@ -1150,7 +1150,7 @@ impl Blockchain for Electrum {
         Ok(false)
     }
 
-    fn script_has_history(&self, script: &Script) -> Result<bool, WalletError> {
+    fn script_has_history(&self, script: &Script, _network: Network) -> Result<bool, WalletError> {
         // History keeps spent outputs, so an emptied address still answers here
         // while `listunspent` reports nothing.
         Ok(!self.history(script)?.is_empty())

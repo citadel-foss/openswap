@@ -8,13 +8,13 @@ use std::{
 };
 
 use bitcoin::{
-    address::NetworkUnchecked, block::Header, Address, Block, BlockHash, OutPoint, Script,
-    Transaction, Txid,
+    address::NetworkUnchecked, block::Header, Address, Amount, Block, BlockHash, Network, OutPoint,
+    Script, Transaction, Txid,
 };
 use bitcoind::bitcoincore_rpc::{
     json::{
-        GetAddressInfoResult, GetBlockchainInfoResult, GetRawTransactionResult, GetTxOutResult,
-        ListTransactionResult, ListUnspentResultEntry, ScanningDetails,
+        GetBlockchainInfoResult, GetRawTransactionResult, GetTxOutResult, ListTransactionResult,
+        ListUnspentResultEntry, ScanningDetails,
     },
     jsonrpc, Auth, Client, Error as CoreRpcError, RpcApi,
 };
@@ -458,6 +458,19 @@ impl Blockchain for CoreRPC {
             .list_transactions(label, count, skip, include_watchonly)?)
     }
 
+    fn script_has_history(&self, script: &Script, network: Network) -> Result<bool, WalletError> {
+        let address = Address::from_script(script, network)
+            .map_err(|e| WalletError::General(e.to_string()))?;
+        // The transaction list hides change outputs; the received total
+        // still counts an address after it is emptied.
+        match self.rpc.get_received_by_address(&address, Some(0)) {
+            Ok(received) => Ok(received > Amount::ZERO),
+            // -4: not imported yet. The gap loop imports the wider range and asks again.
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -4 => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn estimate_feerate(&self, priority: FeePriority) -> Result<f64, WalletError> {
         let res = self.rpc.estimate_smart_fee(priority as u16, None)?;
         let per_kvb = res.fee_rate.ok_or_else(|| {
@@ -498,15 +511,44 @@ impl Blockchain for CoreRPC {
         Ok(())
     }
 
-    fn get_address_info(&self, addr: &Address) -> Result<GetAddressInfoResult, WalletError> {
-        Ok(self.rpc.get_address_info(addr)?)
+    fn imported_range_end(&self, descriptor: &str) -> Result<Option<u32>, WalletError> {
+        #[derive(Deserialize)]
+        struct Listed {
+            desc: String,
+            range: Option<[u32; 2]>,
+        }
+        #[derive(Deserialize)]
+        struct Descriptors {
+            descriptors: Vec<Listed>,
+        }
+        let listed: Descriptors = self.rpc.call("listdescriptors", &[])?;
+        Ok(listed
+            .descriptors
+            .into_iter()
+            .find(|listed| listed.desc == descriptor)
+            .and_then(|listed| listed.range)
+            .map(|[_, end]| end))
     }
 
     fn import_descriptors(&self, requests: &[Value]) -> Result<(), WalletError> {
-        let _res: Vec<Value> = self
+        let results: Vec<Value> = self
             .rpc
             .call("importdescriptors", &[Value::Array(requests.to_vec())])?;
-        Ok(())
+        // Core rejects a descriptor in its own result, not as an RPC error.
+        let failures: Vec<String> = requests
+            .iter()
+            .zip(&results)
+            .filter(|(_, result)| result["success"] != true)
+            .map(|(request, result)| format!("{}: {}", request["desc"], result["error"]))
+            .collect();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WalletError::General(format!(
+                "importdescriptors failed: {}",
+                failures.join("; ")
+            )))
+        }
     }
 
     fn rescan_wallet_from(&self, height: u64) -> Result<(), WalletError> {

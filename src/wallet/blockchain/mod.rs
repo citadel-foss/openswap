@@ -31,12 +31,12 @@ use std::{
 };
 
 use bitcoin::{
-    address::NetworkUnchecked, block::Header, Address, Block, BlockHash, OutPoint, Script,
+    address::NetworkUnchecked, block::Header, Address, Block, BlockHash, Network, OutPoint, Script,
     Transaction, Txid,
 };
 use bitcoind::bitcoincore_rpc::json::{
-    GetAddressInfoResult, GetBlockchainInfoResult, GetRawTransactionResult, GetTxOutResult,
-    ListTransactionResult, ListUnspentResultEntry, ScanningDetails,
+    GetBlockchainInfoResult, GetRawTransactionResult, GetTxOutResult, ListTransactionResult,
+    ListUnspentResultEntry, ScanningDetails,
 };
 use serde_json::Value;
 
@@ -297,13 +297,14 @@ pub trait Blockchain: Send + Sync + 'static {
     fn prepare_backend_wallet(&self, _wallet_name: &str) -> Result<(), WalletError> {
         Ok(())
     }
-    /// Address metadata used to detect already-imported descriptors. Defaults to
-    /// an error on Electrum (never reached: the sync path early-returns first).
-    fn get_address_info(&self, _addr: &Address) -> Result<GetAddressInfoResult, WalletError> {
-        Err(unsupported("get_address_info"))
+    /// Last index of `descriptor`'s imported range, `None` if not imported.
+    /// Defaults to an error on Electrum (never reached: the sync path early-returns first).
+    fn imported_range_end(&self, _descriptor: &str) -> Result<Option<u32>, WalletError> {
+        Err(unsupported("imported_range_end"))
     }
-    /// Import descriptor request objects and trigger a rescan. Defaults to a
-    /// no-op (Electrum pre-derives and registers scripts via `watch_script`).
+    /// Import descriptor request objects and trigger a rescan, failing if any
+    /// descriptor is rejected. Defaults to a no-op (Electrum pre-derives and
+    /// registers scripts via `watch_script`).
     fn import_descriptors(&self, _requests: &[Value]) -> Result<(), WalletError> {
         Ok(())
     }
@@ -328,11 +329,9 @@ pub trait Blockchain: Send + Sync + 'static {
         None
     }
     /// True when the backend's history for `script` is non-empty, spent outputs
-    /// included. Restore probing uses this to bridge runs of emptied addresses;
-    /// the default `false` keeps Bitcoin Core on the UTXO-based path.
-    fn script_has_history(&self, _script: &Script) -> Result<bool, WalletError> {
-        Ok(false)
-    }
+    /// included. Restore probing uses this to bridge runs of emptied addresses.
+    /// `network` is the wallet's, so Core can name the address without asking.
+    fn script_has_history(&self, script: &Script, network: Network) -> Result<bool, WalletError>;
 
     // ---- watchtower notifications --------------------------------------
 
@@ -675,10 +674,10 @@ impl Blockchain for AnyBlockchain {
             AnyBlockchain::Electrum(b) => b.prepare_backend_wallet(wallet_name),
         }
     }
-    fn get_address_info(&self, addr: &Address) -> Result<GetAddressInfoResult, WalletError> {
+    fn imported_range_end(&self, descriptor: &str) -> Result<Option<u32>, WalletError> {
         match self {
-            AnyBlockchain::CoreRPC(b) => b.get_address_info(addr),
-            AnyBlockchain::Electrum(b) => b.get_address_info(addr),
+            AnyBlockchain::CoreRPC(b) => b.imported_range_end(descriptor),
+            AnyBlockchain::Electrum(b) => b.imported_range_end(descriptor),
         }
     }
     fn import_descriptors(&self, requests: &[Value]) -> Result<(), WalletError> {
@@ -711,10 +710,10 @@ impl Blockchain for AnyBlockchain {
             AnyBlockchain::Electrum(b) => b.hd_origin_for_script(script),
         }
     }
-    fn script_has_history(&self, script: &Script) -> Result<bool, WalletError> {
+    fn script_has_history(&self, script: &Script, network: Network) -> Result<bool, WalletError> {
         match self {
-            AnyBlockchain::CoreRPC(b) => b.script_has_history(script),
-            AnyBlockchain::Electrum(b) => b.script_has_history(script),
+            AnyBlockchain::CoreRPC(b) => b.script_has_history(script, network),
+            AnyBlockchain::Electrum(b) => b.script_has_history(script, network),
         }
     }
     fn poll_event(&self) -> Option<WatchEvent> {

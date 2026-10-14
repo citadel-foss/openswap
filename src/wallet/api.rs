@@ -2000,38 +2000,18 @@ impl Wallet {
             .collect()
     }
 
-    /// Checks if the addresses derived from the wallet descriptor is imported upto the
+    /// Returns the wallet descriptors whose imported range stops short of the
     /// rolling gap-limit window ([`Wallet::max_watch_index`]).
-    /// Returns the list of descriptors not imported yet.
     pub(super) fn get_unimported_wallet_desc(
         &self,
         address_type: AddressType,
     ) -> Result<Vec<String>, WalletError> {
         let mut unimported = Vec::new();
         for (keychain, descriptor) in self.get_wallet_descriptors(address_type)? {
-            let first_addr = self
-                .blockchain
-                .derive_addresses(&descriptor, Some([0, 0]))?[0]
-                .clone();
-
-            let last_index = self.max_watch_index(keychain)?;
-            let last_addr = self
-                .blockchain
-                .derive_addresses(&descriptor, Some([last_index, last_index]))?[0]
-                .clone();
-
-            let first_addr_imported = self
-                .blockchain
-                .get_address_info(&first_addr.assume_checked())?
-                .is_watchonly
-                .unwrap_or(false);
-            let last_addr_imported = self
-                .blockchain
-                .get_address_info(&last_addr.assume_checked())?
-                .is_watchonly
-                .unwrap_or(false);
-
-            if !first_addr_imported || !last_addr_imported {
+            // Core may have grown the range past ours, and a re-import must
+            // cover it, so only import when the window has outgrown it.
+            let imported_end = self.blockchain.imported_range_end(&descriptor)?;
+            if !matches!(imported_end, Some(end) if end >= self.max_watch_index(keychain)?) {
                 unimported.push(descriptor);
             }
         }
@@ -2606,8 +2586,7 @@ impl Wallet {
         // A backup carries no hand-out counters, and an emptied address leaves no
         // UTXO to find, so the loop above stops at the first spent-out run. Script
         // history still remembers those addresses, so probe forward on it.
-        if let (Some(restore), true) = (&self.store.pending_restore, self.blockchain.is_electrum())
-        {
+        if let Some(restore) = &self.store.pending_restore {
             let secp = crate::utill::global_secp();
             let mut accounts = Vec::with_capacity(2);
             for address_type in [AddressType::P2WPKH, AddressType::P2TR] {
@@ -2630,7 +2609,10 @@ impl Wallet {
                 let mut has_history = false;
                 for (address_type, account) in &accounts {
                     let script = derive_child_script(account, *address_type, keychain, probe)?;
-                    if self.blockchain.script_has_history(&script)? {
+                    if self
+                        .blockchain
+                        .script_has_history(&script, self.store.network)?
+                    {
                         has_history = true;
                         break;
                     }

@@ -6,14 +6,15 @@ use std::{
 use bip39::rand;
 use bitcoin::{absolute::LockTime, Address, Amount};
 use bitcoind::{
-    bitcoincore_rpc::{self, Auth},
+    bitcoincore_rpc::{self, Auth, RpcApi},
     BitcoinD,
 };
 use electrsd::ElectrsD;
+use serde_json::{json, Value};
 
 use openswap::wallet::{
-    AddressType, AnyBlockchain, BackendConfig, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
-    Wallet, WalletBackup,
+    AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRPC, CoreRpcConfig, Destination,
+    Electrum, ElectrumConfig, RestoreOptions, Wallet, WalletBackup,
 };
 
 use openswap::{
@@ -43,6 +44,10 @@ fn setup(test_name: String) -> (PathBuf, CoreRpcConfig, PathBuf, BitcoinD, PathB
 
     let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
 
+    // Core pads every imported range with its keypool (1000 by default),
+    // which would hide a restore that stops short.
+    fs::create_dir_all(temp_dir.join(".bitcoin")).unwrap();
+    fs::write(temp_dir.join(".bitcoin/bitcoin.conf"), "keypool=1\n").unwrap();
     let bitcoind = init_bitcoind(&temp_dir, zmq_addr).expect("bitcoind failed to start");
 
     let url = bitcoind.rpc_url().split_at(7).1.to_string();
@@ -96,6 +101,68 @@ fn create_maker_bond(wallet: &mut Wallet, blocks: u32) {
             AddressType::P2TR,
         )
         .unwrap();
+}
+
+/// Pays external addresses 0..150 and sweeps them, then pays index 150 and,
+/// after 150 never-used addresses, index 301. `wait` lets the backend catch up.
+fn fund_past_address_gaps(wallet: &mut Wallet, bitcoind: &BitcoinD, wait: impl Fn()) {
+    let addrs: Vec<Address> = (0..302)
+        .map(|_| wallet.get_next_external_address(AddressType::P2TR).unwrap())
+        .collect();
+    let outputs = addrs[..150]
+        .iter()
+        .map(|addr| (addr.to_string(), json!(0.001)))
+        .collect();
+    let _: Value = bitcoind
+        .client
+        .call("sendmany", &[json!(""), Value::Object(outputs)])
+        .unwrap();
+    generate_blocks(bitcoind, 1);
+    wait();
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+
+    let coins = wallet.list_descriptor_utxo_spend_info();
+    assert_eq!(coins.len(), 150);
+    let sink = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+    let sweep = wallet
+        .spend_from_wallet(MIN_RELAY_FEE_RATE, Destination::Sweep(sink), &coins)
+        .unwrap();
+    wallet.send_tx(&sweep).unwrap();
+    send_to_address(bitcoind, &addrs[150], Amount::from_btc(0.01).unwrap());
+    send_to_address(bitcoind, &addrs[301], Amount::from_btc(0.02).unwrap());
+    generate_blocks(bitcoind, 1);
+    wait();
+}
+
+/// The default gap bridges the 150 emptied addresses but not the unused run
+/// before index 301; a gap of 200 reaches it.
+fn assert_restores_past_address_gaps(
+    backup: &WalletBackup,
+    dir: &Path,
+    backend: &BackendConfig,
+    km: &KeyMaterial,
+) {
+    let wide = RestoreOptions {
+        address_gap: 200,
+        ..Default::default()
+    };
+    for (name, options, next_index, balance) in [
+        ("restored-default-gap", RestoreOptions::default(), 151, 0.01),
+        ("restored-wide-gap", wide, 302, 0.03),
+    ] {
+        let restored =
+            Wallet::restore_with(backup, &dir.join(name), backend, km.clone(), options).unwrap();
+        assert_eq!(*restored.get_external_index(), next_index, "{name}");
+        assert_eq!(
+            restored.get_balances().unwrap().spendable,
+            Amount::from_btc(balance).unwrap(),
+            "{name}"
+        );
+    }
 }
 
 /// Asserts the wallet file on disk is genuinely encrypted with the given
@@ -204,6 +271,42 @@ fn encwallet_encbackup_encrestore() {
     )
     .unwrap();
     assert_wallet_file_encrypted(&nameless_dir.join("original-wallet"), "integration-test");
+
+    cleanup(&mut bitcoind, &root_dir);
+}
+
+#[test]
+fn restore_finds_funds_past_address_gaps() {
+    let (original_wallet, rpc_config, backup_file, mut bitcoind, restored_wallet_file, root_dir) =
+        setup("restore_finds_funds_past_address_gaps".to_string());
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    let mut wallet = Wallet::init(
+        &original_wallet,
+        AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap()),
+        km.clone(),
+    )
+    .unwrap();
+
+    fund_past_address_gaps(&mut wallet, &bitcoind, || {});
+    wallet.backup(&backup_file, km.clone()).unwrap();
+    let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
+        &backup_file,
+        Some("integration-test".to_string()),
+    )
+    .unwrap();
+    assert_restores_past_address_gaps(
+        &backup,
+        restored_wallet_file.parent().unwrap(),
+        &BackendConfig::CoreRpc(rpc_config.clone()),
+        &km,
+    );
+
+    // Core reports a rejected descriptor in its result, not as an RPC error.
+    let err = CoreRPC::new(&rpc_config)
+        .unwrap()
+        .import_descriptors(&[json!({"desc": "raw(00)", "timestamp": "now"})])
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("Missing checksum"), "{:?}", err);
 
     cleanup(&mut bitcoind, &root_dir);
 }
@@ -318,6 +421,37 @@ fn encwallet_encbackup_encrestore_electrum() {
     assert_wallet_file_encrypted(&s.restored_wallet, "integration-test");
 
     // Kill electrs before cleanup wipes root_dir, which holds its datadir.
+    drop(s.electrsd);
+    cleanup(&mut s.bitcoind, &s.root_dir);
+}
+
+#[test]
+fn restore_finds_funds_past_address_gaps_electrum() {
+    let mut s = setup_electrum("restore_finds_funds_past_address_gaps_electrum");
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    let mut wallet = Wallet::init(
+        &s.original_wallet,
+        AnyBlockchain::Electrum(Electrum::new(&s.electrum_cfg).unwrap()),
+        km.clone(),
+    )
+    .unwrap();
+
+    fund_past_address_gaps(&mut wallet, &s.bitcoind, || {
+        wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg)
+    });
+    wallet.backup(&s.backup_file, km.clone()).unwrap();
+    let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
+        &s.backup_file,
+        Some("integration-test".to_string()),
+    )
+    .unwrap();
+    assert_restores_past_address_gaps(
+        &backup,
+        s.restored_wallet.parent().unwrap(),
+        &BackendConfig::Electrum(s.electrum_cfg.clone()),
+        &km,
+    );
+
     drop(s.electrsd);
     cleanup(&mut s.bitcoind, &s.root_dir);
 }
