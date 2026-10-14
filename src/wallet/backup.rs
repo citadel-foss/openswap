@@ -186,11 +186,9 @@ impl Wallet {
         tmp.as_file().sync_all()?;
         tmp.persist(&backup_path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        // The backup is already in place; a directory that can't be synced
-        // (e.g. on Windows) is not a failed backup.
-        if let Err(e) = fs::File::open(parent).and_then(|d| d.sync_all()) {
-            log::warn!("backup written, but syncing {parent:?} failed: {e}");
-        }
+        // Make the rename durable. Windows can't open a directory as a file.
+        #[cfg(not(windows))]
+        fs::File::open(parent)?.sync_all()?;
 
         Ok(())
     }
