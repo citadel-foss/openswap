@@ -1,0 +1,39 @@
+{
+  "addresses": {
+    "p2tr": {
+      "external": {
+        "0": "bcrt1p2qqwgl9uc2l3jcntcnkmtfvkw3gmefttch53r5apmrw2g36a693q3f9hsd",
+        "1": "bcrt1pdreqxdmanms0qknnw6cqsf28gdx5eqtppuph2mgwervwaxypnlcslxeqsg",
+        "150": "bcrt1p2z9erv5ecf36hpdsfxzcnytwj6un2c7ku4603ff5ndz7zl964qsquqyeaj",
+        "25": "bcrt1psrjpfsg2jhvd990qstaz6c6x8n57n2c72xxk7kfltey2rcrngrys8vm5al"
+      },
+      "internal": {
+        "0": "bcrt1ps70c7xst03cy9gad2avvz9hkg9hh6kzyfn7jzkxghsy2p2m4knkqnpc9uk",
+        "1": "bcrt1pqhp980nllycurw6wls8psjd83mv09ytucsj2xd4dlsjgejjchdesjek8f5",
+        "150": "bcrt1px9t87degm4f6zlyl56v76en847dkjjyf8meuva7xac5ety679nusv4lu2y",
+        "25": "bcrt1pnhqyjudlxlmf8xkqv79mr24jye92huyt632zac3m9njl384qqhfqnvwdqk"
+      }
+    },
+    "p2wpkh": {
+      "external": {
+        "0": "bcrt1ql4uxs3hqzfxm2jmr6kj68dwswfxjajqkwt9vuj",
+        "1": "bcrt1q5mc3r2pedh280gjxnfxle28k7t7zntpvrtm6l4",
+        "150": "bcrt1q6csmdk5xnu7f0j0s7adl00gxk3xg4klsy57xwr",
+        "25": "bcrt1qp3ea95hyr405sw23lt9d05a2xekr96jw2kqvh0"
+      },
+      "internal": {
+        "0": "bcrt1q4th7m3hq9qts3rh30cm8vr5frnpdruhm23fl82",
+        "1": "bcrt1qaxxl2scfmwsv0m22pup0zkf0v74xdw67nfdy70",
+        "150": "bcrt1qmwwj28nptjqvkadzxl38qgwp2pu5hdn4z8vj5l",
+        "25": "bcrt1qjc76hx63r9gh73ltw45cs62dhgrkesm5yqpj5m"
+      }
+    }
+  },
+  "backup_password": "v023-fixture",
+  "bond_pubkeys": [
+    "0392dbe23cc95c0111b6c42ecb92e5ed94b653dbf9ec83da1bef47fc63ddac8946",
+    "023f4e30232d36f6db56c6a584d4becc4b20bc1f3851ff93db4eccf78cd651f972",
+    "03be8f90f5d7a456833b71d358bc232e2c2afcd6222b5c7cf5eaabd30db92b0184"
+  ],
+  "phrase": "permit feature evolve opera festival shrimp place banner long fit vacant arrest"
+}

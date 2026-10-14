@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use bip39::rand;
@@ -27,6 +28,8 @@ use openswap::{
 use super::test_framework::{
     generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
 };
+
+const V023_FIXTURES: &str = include_str!("../fixtures/restore/v023/fixtures.json");
 
 fn setup(test_name: String) -> (PathBuf, CoreRpcConfig, PathBuf, BitcoinD, PathBuf, PathBuf) {
     let root_dir = std::env::temp_dir().join(format!("openswap-{}", rand::random::<u64>()));
@@ -246,10 +249,7 @@ fn assert_ffi_restores_funded_wallet(
     let mut restored_wallets = Vec::new();
     for name in ["lib-phrase", "lib-backup"] {
         let path = data_dir.join("wallets").join(name);
-        let mut backend = backend.clone();
-        if let BackendConfig::CoreRpc(cfg) = &mut backend {
-            cfg.wallet_name = name.to_string();
-        }
+        let backend = named(backend, name);
         let restored = if name == "lib-phrase" {
             Wallet::restore_from_mnemonic(
                 phrase.clone(),
@@ -288,6 +288,114 @@ fn assert_ffi_restores_funded_wallet(
         .sync_and_save(&openswap::utill::NO_SHUTDOWN)
         .unwrap();
     assert_eq!(restored.get_balances().unwrap().spendable, Amount::ZERO);
+}
+
+/// Core keeps one wallet per name, so each restore needs its own.
+fn named(backend: &BackendConfig, name: &str) -> BackendConfig {
+    let mut backend = backend.clone();
+    if let BackendConfig::CoreRpc(cfg) = &mut backend {
+        cfg.wallet_name = name.to_string();
+    }
+    backend
+}
+
+/// Pays the 16 addresses a v0.2.3 wallet handed out (both types and chains,
+/// indexes 0/1/25/150), then restores that wallet from its phrase and from
+/// its v0.2.3 backup. Both must find the coins at index 150, which is beyond
+/// the default gap but within 200, and the announced bond keys must match.
+fn assert_restores_v023_wallet(
+    backend: &BackendConfig,
+    dir: &Path,
+    bitcoind: &BitcoinD,
+    km: &KeyMaterial,
+    wait: impl Fn(),
+) {
+    let fixtures: Value = serde_json::from_str(V023_FIXTURES).unwrap();
+    for kind in ["p2wpkh", "p2tr"] {
+        for chain in ["external", "internal"] {
+            for addr in fixtures["addresses"][kind][chain]
+                .as_object()
+                .unwrap()
+                .values()
+            {
+                let addr = Address::from_str(addr.as_str().unwrap()).unwrap();
+                send_to_address(
+                    bitcoind,
+                    &addr.assume_checked(),
+                    Amount::from_btc(0.01).unwrap(),
+                );
+            }
+        }
+    }
+    generate_blocks(bitcoind, 1);
+    wait();
+
+    let options = || RestoreOptions {
+        address_gap: 200,
+        ..Default::default()
+    };
+    let phrase = Zeroizing::new(fixtures["phrase"].as_str().unwrap().to_string());
+    let mut from_phrase = Wallet::restore_from_mnemonic(
+        phrase,
+        &dir.join("v023-phrase"),
+        &named(backend, "v023-phrase"),
+        options(),
+        km.clone(),
+    )
+    .unwrap();
+    assert_eq!(from_phrase.list_descriptor_utxo_spend_info().len(), 16);
+    assert_eq!(
+        from_phrase.get_balances().unwrap().spendable,
+        Amount::from_btc(0.16).unwrap()
+    );
+
+    create_maker_bond(&mut from_phrase, 10);
+    generate_blocks(bitcoind, 1);
+    wait();
+    from_phrase
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    let bond = &from_phrase.get_fidelity_bonds()[0];
+    assert_eq!(
+        serde_json::to_value(bond).unwrap()["pubkey"],
+        fixtures["bond_pubkeys"][0]
+    );
+
+    // The fixture is read from a copy, in case loading rewrites the file.
+    let backup_file = dir.join("v023-backup.json");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/restore/v023/backup.json"),
+        &backup_file,
+    )
+    .unwrap();
+    let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
+        &backup_file,
+        Some(fixtures["backup_password"].as_str().unwrap().to_string()),
+    )
+    .unwrap();
+    let from_backup = Wallet::restore_with(
+        &backup,
+        &dir.join("v023-backup"),
+        &named(backend, "v023-backup"),
+        km.clone(),
+        options(),
+    )
+    .unwrap();
+
+    let outpoints = |wallet: &Wallet| {
+        let mut coins: Vec<_> = wallet
+            .list_descriptor_utxo_spend_info()
+            .iter()
+            .map(|(utxo, _)| (utxo.txid, utxo.vout))
+            .collect();
+        coins.sort();
+        coins
+    };
+    assert_eq!(outpoints(&from_backup), outpoints(&from_phrase));
+    assert_eq!(
+        from_backup.get_fidelity_bonds()[0].outpoint(),
+        from_phrase.get_fidelity_bonds()[0].outpoint()
+    );
 }
 
 /// Locks a bare bond at index 0, as an API user can, then a maker's at index 1,
@@ -591,6 +699,21 @@ fn restore_recovers_sparse_and_hinted_bonds() {
     cleanup(&mut bitcoind, &root_dir);
 }
 
+#[test]
+fn restore_v023_seed_and_backup_funded() {
+    let (_, rpc_config, _, mut bitcoind, restored_wallet_file, root_dir) =
+        setup("restore_v023_seed_and_backup_funded".to_string());
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    assert_restores_v023_wallet(
+        &BackendConfig::CoreRpc(rpc_config),
+        restored_wallet_file.parent().unwrap(),
+        &bitcoind,
+        &km,
+        || {},
+    );
+    cleanup(&mut bitcoind, &root_dir);
+}
+
 /// Setup state for the Electrum-backed backup/restore tests.
 struct ElectrumSetup {
     original_wallet: PathBuf,
@@ -782,6 +905,21 @@ fn restore_recovers_sparse_and_hinted_bonds_electrum() {
         wait,
     );
 
+    drop(s.electrsd);
+    cleanup(&mut s.bitcoind, &s.root_dir);
+}
+
+#[test]
+fn restore_v023_seed_and_backup_funded_electrum() {
+    let mut s = setup_electrum("restore_v023_seed_and_backup_funded_electrum");
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    assert_restores_v023_wallet(
+        &BackendConfig::Electrum(s.electrum_cfg.clone()),
+        s.restored_wallet.parent().unwrap(),
+        &s.bitcoind,
+        &km,
+        || wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg),
+    );
     drop(s.electrsd);
     cleanup(&mut s.bitcoind, &s.root_dir);
 }

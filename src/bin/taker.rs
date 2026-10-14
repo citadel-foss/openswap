@@ -939,9 +939,30 @@ fn main() -> Result<(), TakerError> {
 mod tests {
     use super::*;
     use bitcoin::absolute::LockTime;
+    #[cfg(not(feature = "integration-test"))]
+    use openswap::{
+        security::{load_sensitive_struct, SerdeJson},
+        wallet::WalletBackup,
+    };
+    #[cfg(not(feature = "integration-test"))]
+    use std::path::Path;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(["taker"].iter().chain(args))
+    }
+
+    /// Released builds hash backup passwords 600,000 times, test builds once.
+    /// A bin test links the released library, so only here can it be checked.
+    #[cfg(not(feature = "integration-test"))]
+    #[test]
+    fn opens_a_v023_release_backup() {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/restore/v023/backup-release.json");
+        let (backup, material) =
+            load_sensitive_struct::<WalletBackup, SerdeJson>(&file, Some("v023-fixture".into()))
+                .unwrap();
+        assert!(material.is_some());
+        assert_eq!(backup.file_name, "w1");
     }
 
     #[test]
