@@ -14,9 +14,10 @@ use super::error::MakerError;
 use crate::{
     protocol::{
         common_messages::{
-            AckSwapDetails, FidelityProof, GetOffer, MakerHello, MakerToTakerMessage, Offer,
-            ProtocolVersion, SwapDetails, TakerHello, TakerToMakerMessage,
+            AckSwapDetails, FidelityProof, GetOffer, Hello, MakerToTakerMessage, Offer,
+            ProtocolVersion, SwapDetails, TakerToMakerMessage, UnsupportedMessage,
         },
+        features::{check_bounds, check_pins, supported, unmet_at_hello},
         legacy_messages::LegacyTakerMessage,
         taproot_messages::TaprootTakerMessage,
     },
@@ -556,11 +557,8 @@ pub trait Maker: Send + Sync {
     /// Remove connection state for a completed swap.
     fn remove_connection_state(&self, swap_id: &str) -> Result<(), MakerError>;
 
-    /// Get the data directory path for saving reports.
-    fn data_dir(&self) -> &std::path::Path;
-
-    /// Get the active maker wallet file name.
-    fn wallet_name(&self) -> &str;
+    /// Store a swap report in the wallet and save it.
+    fn save_report(&self, report: &MakerReport) -> Result<(), MakerError>;
 
     /// Get the current block height from the Bitcoin node.
     fn get_current_height(&self) -> Result<u32, MakerError>;
@@ -900,7 +898,7 @@ pub(super) fn emit_maker_success_report<M: Maker>(
         state.outgoing_swapcoins.first(),
     );
     report.print();
-    if let Err(error) = report.save_for_wallet(maker.data_dir(), Some(maker.wallet_name())) {
+    if let Err(error) = maker.save_report(&report) {
         log::warn!("Failed to save maker success report: {error:?}");
     }
 }
@@ -931,8 +929,8 @@ pub struct MakerConfig {
     pub max_swap_amount: u64,
     /// Required confirmations.
     pub required_confirms: u32,
-    /// Supported protocol versions.
-    pub supported_protocols: Vec<ProtocolVersion>,
+    /// Feature names a taker must support, each only in the swaps it applies to.
+    pub require_features: Vec<String>,
     /// Public name sent in the offer.
     pub name: String,
 }
@@ -954,7 +952,7 @@ pub fn handle_message<M: Maker>(
     );
 
     match message {
-        TakerToMakerMessage::TakerHello(hello) => handle_taker_hello(maker, state, hello),
+        TakerToMakerMessage::Hello(hello) => handle_hello(maker, state, hello),
         TakerToMakerMessage::GetOffer(get_offer) => handle_get_offer(maker, state, get_offer),
         TakerToMakerMessage::SwapDetails(details) => handle_swap_details(maker, state, details),
 
@@ -1042,12 +1040,10 @@ pub fn handle_message<M: Maker>(
                     maker.network_port(),
                     ln_msg
                 );
-                Ok(Some(MakerToTakerMessage::Unsupported(
-                    crate::protocol::common_messages::UnsupportedMessage {
-                        what: "Lightning".to_string(),
-                        reason: "maker built without lightning support".to_string(),
-                    },
-                )))
+                Ok(Some(MakerToTakerMessage::Unsupported(UnsupportedMessage {
+                    what: "Lightning".to_string(),
+                    reason: "maker built without lightning support".to_string(),
+                })))
             }
         }
         TakerToMakerMessage::Unsupported(unsupported) => {
@@ -1062,30 +1058,38 @@ pub fn handle_message<M: Maker>(
     }
 }
 
-/// Handle TakerHello message.
-fn handle_taker_hello<M: Maker>(
+/// Handle the taker's Hello: it must list every unknown-family feature we
+/// require. Known ones are checked per flow when the swap is pinned.
+fn handle_hello<M: Maker>(
     maker: &Arc<M>,
     state: &mut ConnectionState,
-    _hello: TakerHello,
+    hello: Hello,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     state.expect_phase(&[SwapPhase::AwaitingHello])?;
 
-    log::info!(
-        "[{}] Received TakerHello",
-        Maker::network_port(maker.as_ref()),
-    );
+    if let Err(reason) = check_bounds(&hello.features) {
+        return Ok(Some(MakerToTakerMessage::Unsupported(UnsupportedMessage {
+            what: "Hello".to_string(),
+            reason,
+        })));
+    }
 
     let config = maker.get_config();
+    if let Err(missing) = unmet_at_hello(&config.require_features, &hello.features) {
+        log::info!(
+            "[{}] Refusing a taker without required features {:?}",
+            Maker::network_port(maker.as_ref()),
+            missing
+        );
+        return Ok(Some(MakerToTakerMessage::Unsupported(UnsupportedMessage {
+            what: "Hello".to_string(),
+            reason: format!("missing required features: {missing:?}"),
+        })));
+    }
+
     state.phase = SwapPhase::AwaitingOfferRequest;
-
-    log::info!(
-        "[{}] Supported protocols: {:?}",
-        Maker::network_port(maker.as_ref()),
-        config.supported_protocols
-    );
-
-    Ok(Some(MakerToTakerMessage::MakerHello(MakerHello {
-        supported_protocols: config.supported_protocols,
+    Ok(Some(MakerToTakerMessage::Hello(Hello {
+        features: supported().into_iter().map(String::from).collect(),
     })))
 }
 
@@ -1180,12 +1184,34 @@ fn handle_swap_details<M: Maker>(
         )));
     }
 
+    // The pins fix this swap's flow and features for every later reconnect.
+    let pinned =
+        check_pins(&details.features, &maker.get_config().require_features).and_then(|_| {
+            details
+                .protocol()
+                .ok_or_else(|| "pins name no on-chain protocol".to_string())
+        });
+    let protocol = match pinned {
+        Ok(protocol) => protocol,
+        Err(reason) => {
+            log::warn!(
+                "[{}] Rejecting SwapDetails for {}: {}",
+                Maker::network_port(maker.as_ref()),
+                details.id,
+                reason
+            );
+            return Ok(Some(MakerToTakerMessage::AckSwapDetails(
+                AckSwapDetails::reject(),
+            )));
+        }
+    };
+
     log::info!(
-        "[{}] Received SwapDetails: amount={}, timelock={}, protocol={:?}",
+        "[{}] Received SwapDetails: amount={}, timelock={}, pins={:?}",
         Maker::network_port(maker.as_ref()),
         details.amount,
         details.timelock,
-        details.protocol_version
+        details.features
     );
 
     // The fee pays for how long our funds stay locked, so use the length derived from the
@@ -1215,7 +1241,7 @@ fn handle_swap_details<M: Maker>(
     state.swap_feerate = details.feerate as f64;
     state.timelock = details.timelock;
     state.refund_locktime_offset = refund_locktime_offset;
-    state.protocol = details.protocol_version;
+    state.protocol = protocol;
     state.swap_start_time = Instant::now();
     let swap_fee = maker.calculate_swap_fee(details.amount, state.refund_locktime_offset as u32);
     state.service_fee_sats = swap_fee.to_sat();
@@ -1411,6 +1437,57 @@ fn handle_taproot_dispatch<M: Maker>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::maker::api::tests::compat_test_maker;
+
+    #[test]
+    fn compat_maker_rejects_invalid_pins_before_admission() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        for (i, (pins, required)) in [
+            (vec![], vec![]),
+            (vec!["legacy", "taproot"], vec![]),
+            (vec!["taproot", "taproot"], vec![]),
+            (vec!["taproot", "future-v1"], vec![]),
+            (vec!["taproot"], vec!["future-v1"]),
+            (vec!["taproot"], vec!["taproot-v1"]),
+            (vec!["ln-swap-in"], vec![]),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let maker = compat_test_maker(
+                &dir.path().join(i.to_string()),
+                required.iter().map(|s| s.to_string()).collect(),
+            );
+            let mut state = ConnectionState {
+                phase: SwapPhase::AwaitingSwapDetails,
+                ..Default::default()
+            };
+            let details = SwapDetails {
+                id: "compat-pins".into(),
+                features: pins.iter().map(|s| s.to_string()).collect(),
+                amount: Amount::from_sat(123_456),
+                tx_count: 1,
+                incoming_count: 1,
+                max_input_budget: 1,
+                feerate: 1,
+                timelock: 1_000,
+                refund_locktime_offset: 60,
+            };
+            let reply = handle_message(
+                &maker,
+                &mut state,
+                TakerToMakerMessage::SwapDetails(details),
+            )
+            .unwrap();
+            assert!(
+                matches!(reply, Some(MakerToTakerMessage::AckSwapDetails(ack)) if ack.tweakable_point.is_none())
+            );
+            assert_eq!(state.phase, SwapPhase::AwaitingSwapDetails);
+            assert!(state.swap_id.is_none());
+            assert!(maker.get_connection_state("compat-pins").unwrap().is_none());
+            maker.watch_service.shutdown();
+        }
+    }
 
     /// A second handler for a swap whose funding is running is refused; the
     /// swap is free again once the first handler is done, on any exit path.

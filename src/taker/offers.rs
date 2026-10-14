@@ -31,7 +31,7 @@ use crate::{
         common_messages::{
             FidelityProof, GetOffer as RouterGetOffer,
             MakerToTakerMessage as RouterMakerToTakerMessage, Offer,
-            TakerHello as RouterTakerHello, TakerToMakerMessage as RouterTakerToMakerMessage,
+            TakerToMakerMessage as RouterTakerToMakerMessage,
         },
         contract::calculate_swap_fee,
         error::ProtocolError,
@@ -57,7 +57,7 @@ const FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC: u64 = 30;
 /// Sleep delay in milliseconds between connection retry attempts.
 const FIRST_CONNECT_SLEEP_DELAY_SEC: u64 = 1000;
 
-use super::error::TakerError;
+use super::{api::handshake_with_maker, error::TakerError};
 
 enum SyncCommand {
     SyncNow(mpsc::Sender<()>),
@@ -113,6 +113,9 @@ pub struct OfferAndAddress {
     pub state: MakerState,
     /// Supporting protocol (Legacy or Taproot)
     pub protocol: MakerProtocol,
+    /// Feature names from the maker's Hello that this build recognizes.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 /// Rank eligible makers by their estimated fee at a common amount and locktime.
@@ -157,8 +160,14 @@ pub struct MakerOfferCandidate {
     #[serde(default, rename = "proven_violation", skip_serializing)]
     legacy_proven_violation: bool,
 
-    /// Supporting protocol (Legacy or Taproot), if known
+    /// Supporting protocol (Legacy or Taproot), if known. Still written so
+    /// v0.2.3 can read this book.
     pub protocol: Option<MakerProtocol>,
+
+    /// Feature names from the maker's last Hello that this build recognizes,
+    /// so the list stays bounded by the registry.
+    #[serde(default)]
+    pub features: Vec<String>,
 
     /// Timestamp(secs) of last successful offer download, used to avoid re-downloading offers too frequently.
     pub last_offer_update_ts: Option<u64>,
@@ -177,7 +186,13 @@ pub struct MakerOfferCandidate {
 }
 
 impl MakerOfferCandidate {
-    fn mark_success(&mut self, offer: Offer, protocol: MakerProtocol, now_ts: u64) {
+    fn mark_success(
+        &mut self,
+        offer: Offer,
+        protocol: MakerProtocol,
+        features: Vec<String>,
+        now_ts: u64,
+    ) {
         if let MakerState::Banned(ban) = &self.state {
             log::warn!(
                 "Ignoring offer from banned maker {}, banned at {}",
@@ -197,6 +212,7 @@ impl MakerOfferCandidate {
         }
         self.offer = Some(offer);
         self.protocol = Some(protocol);
+        self.features = features;
         self.last_offer_update_ts = Some(now_ts);
         self.next_offer_check_ts = None;
         self.backend_retry_pending = false;
@@ -249,6 +265,7 @@ impl MakerOfferCandidate {
                 address: self.address.clone(),
                 state: self.state.clone(),
                 protocol: protocol.clone(),
+                features: self.features.clone(),
             }),
             _ => None,
         }
@@ -256,6 +273,10 @@ impl MakerOfferCandidate {
 }
 
 /// Represents the Maker connection state
+///
+/// Frozen: never add a variant, not even a unit one. v0.2.3 shares this book
+/// and starts empty on a name it can't read, forgiving every ban. New detail
+/// goes in defaulted fields of [`BanRecord`] or [`UnavailableState`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MakerState {
     /// Maker returned a valid offer and a verified fidelity proof.
@@ -282,6 +303,8 @@ pub struct UnavailableState {
 
 /// The recoverable ways a maker can fail. None of these is the maker's fault
 /// in a way we can prove, so every one of them can be undone by a good offer.
+///
+/// Frozen like [`MakerState`]: never add a variant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UnavailableReason {
     /// Discovered, but no offer downloaded yet.
@@ -315,6 +338,8 @@ pub struct BanRecord {
 
 /// What earns a maker a ban. Every variant is something we proved, never
 /// something we suspected.
+///
+/// Frozen like [`MakerState`]: never add a variant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BanReason {
     /// A violation proven by arithmetic or by a failed signature check.
@@ -558,22 +583,13 @@ impl OfferBookHandle {
                     log::info!("Successfully loaded offerbook at {path:?}");
                     book
                 }
+                // Starting empty would forgive every recorded ban, so stop and
+                // leave the file for the user.
                 Err(e) => {
-                    // Starting empty forgives every recorded ban, so keep the
-                    // unreadable file, under a name no earlier one holds.
-                    let kept = (0u64..)
-                        .map(|n| path.with_extension(format!("corrupt.{n}")))
-                        .find(|kept| !kept.exists())
-                        .expect("an unused name exists");
-                    std::fs::rename(&path, &kept).inspect_err(|rename_error| {
-                        log::error!("Could not set aside the corrupt offerbook: {rename_error:?}");
-                    })?;
-                    log::error!(
-                        "Offerbook corrupted at {path:?}, kept at {kept:?}. Starting empty; every recorded ban is lost. Error: {e:?}"
-                    );
-                    let book = OfferBook::default();
-                    book.write_to_disk(&path)?;
-                    book
+                    return Err(TakerError::General(format!(
+                        "cannot read the offerbook at {path:?}: {e:?}. Fix the file, or \
+                         remove it to start empty, which forgives every recorded ban"
+                    )))
                 }
             }
         } else {
@@ -1010,7 +1026,9 @@ impl OfferSyncService {
             }
         };
         match outcome {
-            Some((oa, Ok(_))) => book.mark_success(&oa.address, oa.offer, oa.protocol, now),
+            Some((oa, Ok(_))) => {
+                book.mark_success(&oa.address, oa.offer, oa.protocol, oa.features, now)
+            }
             Some((oa, Err(e))) => book.record_offer_failure(&oa.address, &e, now),
             None => book.mark_failure(&addr, UnavailableReason::NoOfferResponse, now),
         }
@@ -1549,6 +1567,7 @@ impl OfferBook {
             state,
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: Some(first_seen_ts),
             backend_retry_pending: false,
@@ -1682,10 +1701,11 @@ impl OfferBook {
         address: &MakerAddress,
         offer: Offer,
         protocol: MakerProtocol,
+        features: Vec<String>,
         now_ts: u64,
     ) {
         if let Some(m) = self.makers.iter_mut().find(|m| &m.address == address) {
-            m.mark_success(offer, protocol, now_ts);
+            m.mark_success(offer, protocol, features, now_ts);
         }
     }
 
@@ -1898,17 +1918,21 @@ impl MakerAddress {
     }
 
     fn download_offer_auto(self, socks_port: u16) -> Result<OfferAndAddress, TakerError> {
-        let (offer, protocol) = self.fetch_offer(socks_port)?;
+        let (offer, protocol, features) = self.fetch_offer(socks_port)?;
         Ok(OfferAndAddress {
             offer,
             address: self,
             state: MakerState::Good,
             protocol,
+            features,
         })
     }
 
-    /// Download a single offer from a maker.
-    fn fetch_offer(&self, socks_port: u16) -> Result<(Offer, MakerProtocol), TakerError> {
+    /// Download a single offer from a maker, with the features its Hello lists.
+    fn fetch_offer(
+        &self,
+        socks_port: u16,
+    ) -> Result<(Offer, MakerProtocol, Vec<String>), TakerError> {
         if !is_valid_maker_address(&self.0) {
             return Err(TakerError::General("invalid maker address".into()));
         }
@@ -1937,26 +1961,7 @@ impl MakerAddress {
         socket.set_read_timeout(Some(Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC)))?;
         socket.set_write_timeout(Some(Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC)))?;
 
-        // Send TakerHello
-        let taker_hello = RouterTakerToMakerMessage::TakerHello(RouterTakerHello);
-        send_message(&mut socket, &taker_hello)?;
-
-        // Read MakerHello
-        let msg_bytes = read_message(&mut socket)?;
-        let msg: RouterMakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
-
-        match msg {
-            RouterMakerToTakerMessage::MakerHello(_hello) => {
-                // Maker - supports both Legacy and Taproot
-            }
-            msg => {
-                return Err(ProtocolError::WrongMessage {
-                    expected: "MakerHello".to_string(),
-                    received: format!("{msg:?}"),
-                }
-                .into());
-            }
-        };
+        let features = handshake_with_maker(&mut socket, &[])?;
 
         // Send GetOffer
         let get_offer = RouterTakerToMakerMessage::GetOffer(RouterGetOffer);
@@ -1993,6 +1998,7 @@ impl MakerAddress {
                 // peer cannot stuff payload into memory and the offerbook.
                 bond: FidelityBond {
                     tx: None,
+                    extra: Default::default(),
                     ..router_offer.fidelity.bond
                 },
                 cert_hash: router_offer.fidelity.cert_hash,
@@ -2008,7 +2014,7 @@ impl MakerAddress {
             self
         );
 
-        Ok((offer, MakerProtocol::Unified))
+        Ok((offer, MakerProtocol::Unified, features))
     }
 }
 
@@ -2079,7 +2085,7 @@ impl fmt::Display for BanReason {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         wallet::{CoreRPC, CoreRpcConfig},
@@ -2094,6 +2100,236 @@ mod tests {
     use bitcoind::tempfile::tempdir;
     #[cfg(not(feature = "integration-test"))]
     use sha3::{Digest, Sha3_256};
+
+    // Frozen from v0.2.3: new names or changed field types must break this reader.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CompatV023Book {
+        makers: Vec<CompatV023Candidate>,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        suppressed_makers: HashMap<MakerAddress, CompatV023Suppressed>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CompatV023Candidate {
+        address: MakerAddress,
+        fidelity_outpoint: Option<OutPoint>,
+        #[serde(default)]
+        fidelity_expiry_height: Option<u32>,
+        offer: Option<Offer>,
+        state: CompatV023State,
+        #[serde(default, rename = "proven_violation", skip_serializing)]
+        legacy_proven_violation: bool,
+        protocol: Option<CompatV023Protocol>,
+        last_offer_update_ts: Option<u64>,
+        #[serde(default)]
+        first_seen_ts: Option<u64>,
+        #[serde(default)]
+        backend_retry_pending: bool,
+        next_offer_check_ts: Option<u64>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CompatV023Suppressed {
+        fidelity_outpoint: Option<OutPoint>,
+        fidelity_expiry_height: Option<u32>,
+        #[serde(default)]
+        state: Option<CompatV023State>,
+        #[serde(default, rename = "proven_violation", skip_serializing)]
+        legacy_proven_violation: bool,
+        retry_after_ts: u64,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023Protocol {
+        Legacy,
+        Taproot,
+        Unified,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023State {
+        Good,
+        Unavailable {
+            reason: CompatV023Unavailable,
+            since_ts: Option<u64>,
+            last_attempt_ts: Option<u64>,
+            attempts: u32,
+        },
+        Banned {
+            reason: CompatV023Ban,
+            recorded_at_ts: u64,
+        },
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023Unavailable {
+        AwaitingOffer,
+        NoOfferResponse,
+        BondUnconfirmed,
+        BondExpired,
+        BondReorged,
+        BondUnverified,
+        UnpriceableOffer,
+        LegacyStatus,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023Ban {
+        ProvenViolation,
+        InvalidFidelityProof,
+        FundingWithheld,
+        LegacyProvenViolation,
+    }
+
+    pub(crate) fn compat_v023_round_trip(bytes: &[u8]) -> Vec<u8> {
+        let old: CompatV023Book = serde_cbor::from_slice(bytes).unwrap();
+        serde_cbor::to_vec(&old).unwrap()
+    }
+
+    pub(crate) fn compat_assert_empty_book_extras(book: &OfferBook) {
+        for maker in &book.makers {
+            if let Some(offer) = &maker.offer {
+                assert!(offer.fidelity.bond.extra.is_empty());
+                assert_eq!(
+                    offer.fidelity.cert_hash,
+                    offer
+                        .fidelity
+                        .bond
+                        .generate_cert_hash(&maker.address.to_string(), &offer.tweakable_point,)
+                );
+                let message =
+                    Message::from_digest_slice(offer.fidelity.cert_hash.as_byte_array()).unwrap();
+                Secp256k1::verification_only()
+                    .verify_ecdsa(
+                        &message,
+                        &offer.fidelity.cert_sig,
+                        &offer.fidelity.bond.pubkey.inner,
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    pub(crate) fn compat_sample_offerbook() -> OfferBook {
+        let mut book = OfferBook::default();
+        let mut states = vec![MakerState::Good];
+        states.extend(
+            [
+                UnavailableReason::AwaitingOffer,
+                UnavailableReason::NoOfferResponse,
+                UnavailableReason::BondUnconfirmed,
+                UnavailableReason::BondExpired,
+                UnavailableReason::BondReorged,
+                UnavailableReason::BondUnverified,
+                UnavailableReason::UnpriceableOffer,
+                UnavailableReason::LegacyStatus,
+            ]
+            .iter()
+            .cloned()
+            .map(|reason| {
+                MakerState::Unavailable(UnavailableState {
+                    reason,
+                    since_ts: Some(10),
+                    last_attempt_ts: Some(20),
+                    attempts: 3,
+                })
+            }),
+        );
+        states.extend(
+            [
+                BanReason::ProvenViolation,
+                BanReason::InvalidFidelityProof,
+                BanReason::FundingWithheld,
+                BanReason::LegacyProvenViolation,
+            ]
+            .iter()
+            .cloned()
+            .map(|reason| {
+                MakerState::Banned(BanRecord {
+                    reason,
+                    recorded_at_ts: 30,
+                })
+            }),
+        );
+        for (i, state) in states.into_iter().enumerate() {
+            let address = addr(&(6102 + i).to_string());
+            let mut maker = candidate(address.clone());
+            maker.fidelity_outpoint = Some(OutPoint {
+                txid: Txid::from_slice(&[i as u8; 32]).unwrap(),
+                vout: 0,
+            });
+            maker.fidelity_expiry_height = Some(800_100);
+            maker.first_seen_ts = Some(1);
+            maker.mark_success(
+                dummy_offer(&address.to_string()),
+                MakerProtocol::Unified,
+                vec!["legacy".into(), "taproot".into()],
+                40,
+            );
+            maker.state = state.clone();
+            book.suppressed_makers.insert(
+                address,
+                SuppressedMaker {
+                    fidelity_outpoint: maker.fidelity_outpoint,
+                    fidelity_expiry_height: maker.fidelity_expiry_height,
+                    state: Some(state),
+                    legacy_proven_violation: false,
+                    retry_after_ts: 50,
+                },
+            );
+            book.makers.push(maker);
+        }
+        book
+    }
+
+    #[test]
+    fn compat_offerbook_round_trips_all_states_through_v023() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("offerbook.json");
+        let book = compat_sample_offerbook();
+        book.write_to_disk(&path).unwrap();
+        let old: CompatV023Book = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(old.makers.len(), 13);
+        assert!(old
+            .makers
+            .iter()
+            .all(|m| matches!(m.protocol, Some(CompatV023Protocol::Unified))));
+        assert!(old.makers.iter().all(|m| !m.legacy_proven_violation));
+        assert!(old
+            .suppressed_makers
+            .values()
+            .all(|m| !m.legacy_proven_violation));
+        let mut expected = serde_json::to_value(&book).unwrap();
+        for maker in expected["makers"].as_array_mut().unwrap() {
+            maker.as_object_mut().unwrap().remove("features");
+        }
+        assert_eq!(serde_json::to_value(&old).unwrap(), expected);
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let restored = OfferBook::read_from_disk(&path).unwrap();
+        for (new, before) in restored.makers.iter().zip(&book.makers) {
+            let mut expected = before.clone();
+            expected.features.clear();
+            assert_eq!(new, &expected);
+        }
+        assert_eq!(
+            serde_json::to_value(restored.suppressed_makers).unwrap(),
+            serde_json::to_value(book.suppressed_makers).unwrap()
+        );
+    }
+
+    #[test]
+    fn compat_offerbook_ignores_future_fields_but_refuses_unknown_states() {
+        let maker = candidate(addr("6102"));
+        let mut value = serde_json::to_value(&maker).unwrap();
+        value["future_field"] = serde_json::json!({"nested": [1, 2, 3]});
+        assert_eq!(
+            serde_json::from_value::<MakerOfferCandidate>(value.clone()).unwrap(),
+            maker
+        );
+        value["state"] = serde_json::json!({"FutureState": {"proof": "keep"}});
+        assert!(serde_json::from_value::<MakerOfferCandidate>(value.clone()).is_err());
+        assert!(serde_json::from_value::<CompatV023Candidate>(value).is_err());
+    }
 
     /// Derives a distinct v3 onion address from the id. The checksum is real
     /// because `is_valid_maker_address` verifies it, and a single shared
@@ -2151,6 +2387,7 @@ mod tests {
             }),
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: None,
             backend_retry_pending: false,
@@ -2180,6 +2417,7 @@ mod tests {
                 address,
                 state: MakerState::Good,
                 protocol: MakerProtocol::Unified,
+                features: Vec::new(),
             }
         })
         .collect();
@@ -2221,6 +2459,7 @@ mod tests {
             is_spent: false,
             bond_index: 0,
             tx: None,
+            extra: Default::default(),
         };
 
         let cert_hash = bond.generate_cert_hash(maker_addr, &pubkey);
@@ -2346,17 +2585,13 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_offerbook_is_kept_and_never_overwritten() {
+    fn a_corrupt_offerbook_stops_the_taker_and_is_never_overwritten() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("offerbook.json");
 
-        for (n, garbage) in ["not json", "still not json"].iter().enumerate() {
-            std::fs::write(&path, garbage).unwrap();
-            OfferBookHandle::load_or_create(dir.path()).unwrap();
-            let kept = path.with_extension(format!("corrupt.{n}"));
-            assert_eq!(std::fs::read_to_string(kept).unwrap(), *garbage);
-        }
-        assert!(OfferBook::read_from_disk(&path).unwrap().makers.is_empty());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(OfferBookHandle::load_or_create(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
     }
 
     #[test]
@@ -2425,6 +2660,7 @@ mod tests {
                 state: MakerState::Good,
                 legacy_proven_violation: false,
                 protocol: Some(MakerProtocol::Taproot),
+                features: Vec::new(),
                 last_offer_update_ts: Some(now),
                 first_seen_ts: Some(now),
                 backend_retry_pending: false,
@@ -2509,6 +2745,7 @@ mod tests {
             &address,
             dummy_offer(&address.to_string()),
             MakerProtocol::Taproot,
+            Vec::new(),
             2,
         );
 
@@ -2526,6 +2763,7 @@ mod tests {
             state: MakerState::Good,
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
             backend_retry_pending: false,
@@ -2577,6 +2815,7 @@ mod tests {
             }),
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
             backend_retry_pending: false,
@@ -2586,6 +2825,7 @@ mod tests {
         candidate.mark_success(
             dummy_offer(&candidate.address.to_string()),
             MakerProtocol::Taproot,
+            Vec::new(),
             now_ts,
         );
         assert_eq!(candidate.state, MakerState::Good);
@@ -2610,6 +2850,7 @@ mod tests {
             }),
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
             backend_retry_pending: false,
@@ -2717,6 +2958,7 @@ mod tests {
             &address,
             dummy_offer(&address.to_string()),
             MakerProtocol::Taproot,
+            Vec::new(),
             now_ts,
         );
         assert!(matches!(book.makers[0].state, MakerState::Banned(_)));
@@ -3013,6 +3255,7 @@ mod tests {
             state: MakerState::Good,
             legacy_proven_violation: false,
             protocol: None,
+            features: Vec::new(),
             last_offer_update_ts: None,
             first_seen_ts: Some(now_ts),
             backend_retry_pending: false,
@@ -3351,6 +3594,7 @@ mod tests {
             &address,
             dummy_offer(&address.to_string()),
             MakerProtocol::Taproot,
+            Vec::new(),
             170000,
         );
         let snapshot = handle.snapshot().unwrap();
@@ -3373,6 +3617,7 @@ mod tests {
                 &honest,
                 dummy_offer(&honest.to_string()),
                 MakerProtocol::Taproot,
+                Vec::new(),
                 170000,
             );
         }

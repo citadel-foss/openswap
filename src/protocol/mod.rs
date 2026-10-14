@@ -8,6 +8,7 @@ pub mod taproot_messages;
 pub(crate) mod contract;
 pub mod contract2;
 pub mod error;
+pub mod features;
 pub mod musig2;
 pub mod musig_interface;
 

@@ -19,17 +19,21 @@ use std::{
 use bitcoin::{bip32::ChainCode, Amount, Network, OutPoint, PublicKey, Transaction, Txid};
 
 use crate::{
+    atomic_file::FileLock,
     blocklist::AddressBlocklist,
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
-    protocol::common_messages::{
-        check_fee_pcts, check_maker_name, FidelityProof, MakerToTakerMessage, PrivateKeyHandover,
-        ProtocolVersion, SwapDetails, MAX_MAKER_NAME_LEN,
+    protocol::{
+        common_messages::{
+            check_fee_pcts, check_maker_name, FidelityProof, MakerToTakerMessage,
+            PrivateKeyHandover, ProtocolVersion, SwapDetails, MAX_MAKER_NAME_LEN,
+        },
+        features::parse_require_features,
     },
     taker::api::{REFUND_LOCKTIME_BASE, REFUND_LOCKTIME_STEP},
     utill::{
         fee_at_rate_sats, funding_fee_policy_sats, get_maker_dir, parse_field, parse_toml,
-        sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
+        set_config_key, sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
         blockchain::BackendConnector,
@@ -37,8 +41,8 @@ use crate::{
         min_contract_value_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FeePriority,
-        FidelityError, RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK,
-        MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
+        FidelityError, MakerReport, RecoveryOutcome, SwapRole, Wallet, WalletError,
+        MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::service::WatchService,
 };
@@ -53,7 +57,6 @@ use super::{
         SwapPhase, MAX_CONCURRENT_SWAPS, MIN_CONTRACT_REACTION_TIME,
     },
     rpc::server::MakerRpc,
-    swap_tracker::{now_secs, MakerRecoveryPhase, MakerSwapPhase, MakerSwapTracker},
 };
 
 /// How often a pending fidelity bond is checked for confirmation.
@@ -126,14 +129,13 @@ fn swap_cost_floor(
 /// round number that still passes.
 const MIN_SWAP_STEP_SATS: u64 = 500;
 
-/// Smallest swap every supported protocol accepts: one coin in, one coin out,
+/// Smallest swap every protocol accepts: one coin in, one coin out,
 /// at the relay floor and a one-maker lock, rounded up to `MIN_SWAP_STEP_SATS`.
 fn min_swap_amount(config: &MakerServerConfig) -> u64 {
     let rel = (config.amount_relative_fee_pct
         + f64::from(REFUND_LOCKTIME_BASE) * config.time_relative_fee_pct)
         / 100.0;
-    config
-        .supported_protocols
+    [ProtocolVersion::Legacy, ProtocolVersion::Taproot]
         .iter()
         .filter_map(|p| swap_cost_floor(*p, MIN_RELAY_FEE_RATE, 1, 1))
         .max()
@@ -281,8 +283,8 @@ pub struct MakerServerConfig {
     pub required_confirms: u32,
     /// Whether funding inputs should be checked against the address blocklist.
     pub check_blocklist: bool,
-    /// Supported protocol versions.
-    pub supported_protocols: Vec<ProtocolVersion>,
+    /// Feature names a taker must support, each only in the swaps it applies to.
+    pub require_features: Vec<String>,
     /// Fidelity bond amount in satoshis.
     pub fidelity_amount: u64,
     /// Fidelity bond timelock in blocks.
@@ -334,7 +336,7 @@ impl Default for MakerServerConfig {
             time_relative_fee_pct: 0.0001,
             required_confirms: 1,
             check_blocklist: false,
-            supported_protocols: vec![ProtocolVersion::Legacy, ProtocolVersion::Taproot],
+            require_features: Vec::new(),
             fidelity_amount: 10_000,   // 0.0001 BTC
             fidelity_timelock: 15_000, // ~6 months (MAX_FIDELITY_TIMELOCK)
             fidelity_feerate: MIN_RELAY_FEE_RATE,
@@ -466,6 +468,7 @@ impl MakerServerConfig {
                 config_map.get("check_blocklist"),
                 default_config.check_blocklist,
             ),
+            require_features: parse_require_features(config_map.get("require_features"))?,
             fidelity_amount,
             fidelity_timelock,
             fidelity_feerate,
@@ -486,7 +489,6 @@ impl MakerServerConfig {
             backend: default_config.backend,
             wallet_name: default_config.wallet_name,
             password: default_config.password,
-            supported_protocols: default_config.supported_protocols,
             nostr_relays: default_config.nostr_relays,
         })
     }
@@ -530,6 +532,8 @@ time_relative_fee_pct = {}
 required_confirms = {}
 # Check funding inputs against the address blocklist
 check_blocklist = {}
+# Features a taker must support in the swaps they apply to, on one line, e.g. [\"taproot\"]
+require_features = [{}]
 # Public name shown to takers (required, at most {} characters, no control characters)
 name = \"{}\"
 ",
@@ -550,13 +554,18 @@ name = \"{}\"
             self.time_relative_fee_pct,
             self.required_confirms,
             self.check_blocklist,
+            self.require_features
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
             MAX_MAKER_NAME_LEN,
             self.name,
         );
 
         let mut toml_data = toml_data;
-        // Omitted until the wallet confirms it, so makerd's pre-init rewrite
-        // can't record the regtest default for a maker on another network.
+        // Omitted until the wallet confirms it, so a default config can't
+        // record the regtest default for a maker on another network.
         if self.network_confirmed {
             toml_data.push_str(&format!(
                 "# Bitcoin network, taken from the wallet (not a setting)\nnetwork = \"{}\"\n",
@@ -564,8 +573,7 @@ name = \"{}\"
             ));
         }
 
-        // Optional Lightning backend keys: only present when configured, so
-        // the round-trip rewrite makerd performs on startup preserves them.
+        // Optional Lightning backend keys: only present when configured.
         if let Some(url) = &self.ldk_server_url {
             toml_data.push_str(&format!(
                 "# LDK Server gRPC address (host:port, no scheme) for Lightning swaps\nldk_server_url = {url}\n"
@@ -767,8 +775,6 @@ pub struct MakerServer {
     pub thread_pool: Arc<ThreadPool>,
     /// Data directory.
     pub data_dir: PathBuf,
-    /// Persistent swap tracker for recovery progress.
-    pub swap_tracker: Mutex<MakerSwapTracker>,
     /// Nostr relay URLs for fidelity bond broadcasting.
     pub nostr_relays: Vec<String>,
     /// Lightning backend, present when configured. All Lightning swap
@@ -801,6 +807,9 @@ pub struct MakerServer {
     /// Same handoff for the RPC port.
     #[cfg(feature = "integration-test")]
     pub reserved_rpc_listener: Mutex<Option<TcpListener>>,
+    /// Keeps a second daemon off this wallet while this one runs. Last, so
+    /// it is released only after every other field has stopped.
+    _wallet_lock: Option<FileLock>,
 }
 
 /// How long a derived Lightning offer is served before it is recomputed.
@@ -819,7 +828,7 @@ pub struct IdleSwapData {
     pub incoming_swapcoins: Vec<IncomingSwapCoin>,
     /// Outgoing swapcoins (maker sends).
     pub outgoing_swapcoins: Vec<OutgoingSwapCoin>,
-    /// Funding txids broadcast so far; carried into the tracker record.
+    /// Funding txids broadcast so far.
     pub funding_broadcast_txids: Vec<Txid>,
 }
 
@@ -843,6 +852,15 @@ impl MakerServer {
             cfg.wallet_name = wallet_name.clone();
         }
         let wallet_path = config.data_dir.join("wallets").join(&wallet_name);
+        // Tests restart a maker in-process while the old one is still alive.
+        #[cfg(feature = "integration-test")]
+        let wallet_lock = None;
+        #[cfg(not(feature = "integration-test"))]
+        let wallet_lock = {
+            let mut lock_path = wallet_path.clone().into_os_string();
+            lock_path.push(".lock");
+            Some(FileLock::acquire(Path::new(&lock_path))?)
+        };
         let shutdown = ShutdownSignal::new();
         let backend_shutdown = shutdown.backend_flag();
         let blockchain =
@@ -874,8 +892,15 @@ impl MakerServer {
             config.network = wallet_network;
             config.network_confirmed = true;
             // Only a hint for readers that can't unlock the wallet, so a
-            // failed write shouldn't abort startup.
-            if let Err(e) = config.write_to_file(&data_dir.join("config.toml")) {
+            // failed write shouldn't abort startup. Touch only our line when
+            // the file exists, so keys this build doesn't know survive.
+            let config_path = data_dir.join("config.toml");
+            let written = if config_path.exists() {
+                set_config_key(&config_path, "network", &format!("\"{wallet_network}\""))
+            } else {
+                config.write_to_file(&config_path)
+            };
+            if let Err(e) = written {
                 log::warn!("Couldn't record the wallet network in config.toml: {e}");
             }
         }
@@ -934,17 +959,6 @@ impl MakerServer {
             log::error!("could not initialize watches on startup: {e}; recovery-only mode");
         }
 
-        let swap_tracker = MakerSwapTracker::load_or_create(&data_dir)?;
-        let incomplete = swap_tracker.incomplete_swaps();
-        if !incomplete.is_empty() {
-            log::info!(
-                "[{}] Loaded {} incomplete swap records from previous run",
-                config.network_port,
-                incomplete.len()
-            );
-            swap_tracker.log_state();
-        }
-
         let nostr_relays = config.nostr_relays.clone();
 
         #[cfg(feature = "lightning")]
@@ -984,7 +998,7 @@ impl MakerServer {
             completed_handovers: Mutex::new(HashMap::new()),
             thread_pool: Arc::new(ThreadPool::new(config.network_port)),
             data_dir,
-            swap_tracker: Mutex::new(swap_tracker),
+            _wallet_lock: wallet_lock,
             nostr_relays,
             #[cfg(feature = "lightning")]
             lightning,
@@ -1629,24 +1643,11 @@ impl MakerServer {
     }
 
     /// After a restart nothing in memory owns a reservation. Keep one only while
-    /// a tracker record, saved swapcoins or a Lightning swap still points at it.
+    /// saved swapcoins or a Lightning swap still points at it.
     pub(crate) fn release_orphan_reservations(&self) -> Result<(), MakerError> {
-        let tracked: HashSet<String> = lock_debug!(self.swap_tracker.lock())
-            .map_err(|_| MakerError::MutexPossion)?
-            .incomplete_swaps()
-            .into_iter()
-            .map(|record| record.swap_id.clone())
-            .collect();
         let mut wallet = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-        let (incoming, outgoing) = wallet.find_unfinished_swapcoins();
-        let owned: HashSet<String> = incoming
-            .iter()
-            .filter_map(|sc| sc.swap_id.clone())
-            .chain(outgoing.iter().filter_map(|sc| sc.swap_id.clone()))
-            .chain(wallet.store.ln_maker_swaps.keys().cloned())
-            .chain(tracked)
-            .collect();
+        let owned = wallet.swap_ids();
         let orphans: Vec<String> = wallet
             .store
             .swap_locks
@@ -2180,7 +2181,7 @@ impl MakerTrait for MakerServer {
                 .map(|w| w.store.offer_maxsize)
                 .unwrap_or(u64::MAX),
             required_confirms: self.config.required_confirms,
-            supported_protocols: self.config.supported_protocols.clone(),
+            require_features: self.config.require_features.clone(),
             name: self.config.name.clone(),
         }
     }
@@ -2223,12 +2224,15 @@ impl MakerTrait for MakerServer {
             return Err(MakerError::General("Swap feerate below the relay floor"));
         }
 
+        let protocol = details
+            .protocol()
+            .ok_or(MakerError::General("Swap details pin no on-chain protocol"))?;
+
         // Check amount is within bounds
         let amount_sat = details.amount.to_sat();
         // Every incoming contract must be worth recovering at the swap feerate.
-        let contract_floor =
-            min_contract_value_sats(details.protocol_version, details.feerate as f64)
-                .ok_or(MakerError::General("Contract floor cannot be priced"))?;
+        let contract_floor = min_contract_value_sats(protocol, details.feerate as f64)
+            .ok_or(MakerError::General("Contract floor cannot be priced"))?;
         if amount_sat < contract_floor.saturating_mul(details.incoming_count as u64) {
             return Err(MakerError::General(
                 "Swap amount below the incoming contract floor",
@@ -2238,17 +2242,8 @@ impl MakerTrait for MakerServer {
             return Err(MakerError::General("Swap amount above maximum"));
         }
 
-        // Check protocol is supported
-        if !self
-            .config
-            .supported_protocols
-            .contains(&details.protocol_version)
-        {
-            return Err(MakerError::General("Protocol version not supported"));
-        }
-
         // Check timelock bounds and work out how long the funds stay locked.
-        let locked_blocks = if details.protocol_version == ProtocolVersion::Legacy {
+        let locked_blocks = if protocol == ProtocolVersion::Legacy {
             if details.timelock < MIN_CONTRACT_REACTION_TIME as u32 {
                 log::warn!(
                     "Legacy timelock {} is below minimum reaction time {}",
@@ -2611,11 +2606,12 @@ impl MakerTrait for MakerServer {
             .iter()
             .map(|swapcoin| swapcoin.contract_tx.compute_txid())
             .collect();
-        let sweep_outcome = Wallet::sweep_incoming_swapcoins(
+        let sweep_outcome = Wallet::sweep_incoming_swapcoins_for_role(
             &self.wallet,
             &chain,
             &self.shutdown,
             Some(&contract_txids),
+            SwapRole::Maker,
         )
         .map_err(MakerError::Wallet)?;
 
@@ -2660,23 +2656,9 @@ impl MakerTrait for MakerServer {
         {
             let mut wallet = lock_debug!(self.wallet.write())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-            for key in &outgoing_keys {
-                wallet.remove_outgoing_swapcoin(key);
-            }
-            wallet.release_swap_locks(swap_id, None);
-            wallet.save_to_disk().map_err(MakerError::Wallet)?;
-        }
-
-        {
-            let mut tracker =
-                lock_debug!(self.swap_tracker.lock()).map_err(|_| MakerError::MutexPossion)?;
-            if let Some(record) = tracker.get_record_mut(swap_id) {
-                record.phase = MakerSwapPhase::Completed;
-                record.recovery.phase = MakerRecoveryPhase::CleanedUp;
-                record.updated_at = now_secs();
-                let completed = record.clone();
-                tracker.save_record(&completed)?;
-            }
+            wallet
+                .remove_swap_coins_and_save(swap_id, false, true)
+                .map_err(MakerError::Wallet)?;
         }
 
         log::info!(
@@ -2707,20 +2689,11 @@ impl MakerTrait for MakerServer {
                 // After a restart `ongoing_swaps` is empty, so a replayed
                 // SwapDetails for a swap still open on disk would re-admit and
                 // double-fund it. The open swap is recovered, never re-admitted.
-                let tracked_open = lock_debug!(self.swap_tracker.lock())?
-                    .incomplete_swaps()
-                    .iter()
-                    .any(|record| record.swap_id == swap_id);
-                let (unfinished_incoming, unfinished_outgoing) = lock_debug!(self.wallet.read())
+                let persisted_open = lock_debug!(self.wallet.read())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                    .find_unfinished_swapcoins();
-                let persisted_open = unfinished_incoming
-                    .iter()
-                    .any(|sc| sc.swap_id.as_deref() == Some(swap_id))
-                    || unfinished_outgoing
-                        .iter()
-                        .any(|sc| sc.swap_id.as_deref() == Some(swap_id));
-                if tracked_open || persisted_open {
+                    .swap_ids()
+                    .contains(swap_id);
+                if persisted_open {
                     log::warn!(
                         "[{}] Rejecting SwapDetails for {}: swap id belongs to an unfinished swap on disk",
                         self.config.network_port,
@@ -3012,12 +2985,8 @@ impl MakerTrait for MakerServer {
         Ok(None)
     }
 
-    fn data_dir(&self) -> &std::path::Path {
-        &self.data_dir
-    }
-
-    fn wallet_name(&self) -> &str {
-        &self.config.wallet_name
+    fn save_report(&self, report: &MakerReport) -> Result<(), MakerError> {
+        Ok(report.save_to_wallet(&mut *lock_debug!(self.wallet.write())?)?)
     }
 
     fn verify_and_sign_sender_contract_txs(
@@ -3845,21 +3814,142 @@ impl MakerRpc for MakerServer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    #[cfg(feature = "integration-test")]
+    use super::MakerBehavior;
     use super::{
-        min_swap_amount, swap_cost_floor, MakerError, MakerServer, MakerServerConfig,
-        ShutdownSignal, ThreadPool, MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
+        min_swap_amount, swap_cost_floor, BackendConnector, ConnectionState, FileLock, MakerError,
+        MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal, ThreadPool, WatchService,
+        MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
         utill::MIN_RELAY_FEE_RATE,
-        wallet::{FidelityError, WalletError, MIN_FIDELITY_BOND_AMOUNT_SATS},
+        wallet::{
+            swapcoin::OutgoingSwapCoin, test_wallet, FidelityError, WalletError,
+            MIN_FIDELITY_BOND_AMOUNT_SATS,
+        },
+    };
+    use bitcoin::{
+        absolute::LockTime,
+        hashes::Hash,
+        secp256k1::{Secp256k1, SecretKey},
+        transaction::Version,
+        Amount, OutPoint, PublicKey, ScriptBuf, Transaction, Txid,
     };
     use std::{
-        sync::{atomic::Ordering, mpsc, Arc, TryLockError},
+        collections::{HashMap, HashSet},
+        path::Path,
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc, Arc, Mutex, RwLock, TryLockError,
+        },
         thread,
         time::{Duration, Instant},
     };
+
+    pub(crate) fn compat_test_maker(
+        path: &Path,
+        require_features: Vec<String>,
+    ) -> Arc<MakerServer> {
+        let config = MakerServerConfig {
+            data_dir: path.to_path_buf(),
+            require_features,
+            ..MakerServerConfig::default()
+        };
+        let shutdown = ShutdownSignal::new();
+        let (tx, rx) = mpsc::channel();
+        let watch_service = WatchService::spawn(
+            tx,
+            shutdown.backend_flag(),
+            Arc::new(AtomicU64::new(0)),
+            move || {
+                let _ = rx.recv();
+                Ok(())
+            },
+        )
+        .unwrap();
+        Arc::new(MakerServer {
+            backend: BackendConnector::new(config.backend.clone(), shutdown.backend_flag()),
+            wallet: Arc::new(RwLock::new(test_wallet(&path.join("wallet")))),
+            shutdown,
+            is_setup_complete: AtomicBool::new(false),
+            highest_fidelity_proof: RwLock::new(None),
+            ongoing_swaps: Mutex::new(HashMap::new()),
+            funding_claims: Mutex::new(()),
+            funding_in_progress: Mutex::new(HashSet::new()),
+            completed_handovers: Mutex::new(HashMap::new()),
+            watch_service,
+            thread_pool: Arc::new(ThreadPool::new(0)),
+            data_dir: path.to_path_buf(),
+            _wallet_lock: Some(FileLock::acquire(&path.join("wallet.lock")).unwrap()),
+            nostr_relays: Vec::new(),
+            config,
+            #[cfg(feature = "lightning")]
+            lightning: None,
+            #[cfg(feature = "lightning")]
+            ln_router: None,
+            #[cfg(feature = "lightning")]
+            ln_offer_cache: Mutex::new(None),
+            #[cfg(feature = "lightning")]
+            ln_swaps: Mutex::new(HashMap::new()),
+            #[cfg(feature = "integration-test")]
+            behavior: MakerBehavior::default(),
+            #[cfg(feature = "integration-test")]
+            reserved_network_listener: Mutex::new(None),
+            #[cfg(feature = "integration-test")]
+            reserved_rpc_listener: Mutex::new(None),
+        })
+    }
+
+    #[test]
+    fn compat_maker_reservations_and_readmission_use_saved_coins() {
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let secret = SecretKey::from_slice(&[2; 32]).unwrap();
+        let mut coin = OutgoingSwapCoin::new_legacy(
+            secret,
+            PublicKey::new(secret.public_key(&Secp256k1::new())),
+            Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: Vec::new(),
+                output: Vec::new(),
+            },
+            ScriptBuf::new(),
+            secret,
+            Amount::from_sat(50_000),
+            1,
+        );
+        coin.swap_id = Some("owned".into());
+        coin.committed = true;
+        coin.hash_preimage = Some([7; 32]);
+        {
+            let mut wallet = maker.wallet.write().unwrap();
+            wallet.add_outgoing_swapcoin(&coin);
+            wallet.reserve_swap_locks("owned", &[OutPoint::new(Txid::all_zeros(), 0)]);
+            wallet.reserve_swap_locks("orphan", &[OutPoint::new(Txid::all_zeros(), 1)]);
+        }
+        maker.release_orphan_reservations().unwrap();
+        let wallet = maker.wallet.read().unwrap();
+        assert!(wallet.store.swap_locks.contains_key("owned"));
+        assert!(!wallet.store.swap_locks.contains_key("orphan"));
+        assert_eq!(wallet.store.swap_locks["owned"].outpoints.len(), 1);
+        assert!(!dir.path().join("maker_swap_tracker.cbor").exists());
+        assert_eq!(wallet.find_unfinished_swapcoins().1.len(), 1);
+        drop(wallet);
+        let error = maker
+            .store_connection_state(
+                "owned",
+                &ConnectionState::new(ProtocolVersion::Legacy),
+                true,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MakerError::General("Swap id belongs to an unfinished swap")
+        ));
+    }
 
     /// Non-finite or below-minimum fidelity feerates clamp to the relay
     /// minimum; a valid value is kept. A plain `<` comparison would let

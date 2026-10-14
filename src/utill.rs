@@ -50,6 +50,7 @@ pub(crate) fn global_secp() -> &'static Secp256k1<All> {
 }
 
 use crate::{
+    atomic_file::write_atomically,
     error::NetError,
     lock_debug,
     protocol::{
@@ -83,16 +84,6 @@ pub const TX_BROADCAST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Without it a low-fee counterparty tx parks a swap thread forever and quietly
 /// spends the timelock reaction margin.
 pub const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(7200);
-
-/// Grace before a swap with no recorded broadcast may be treated as never
-/// funded. A broadcast that has not reached our backend yet must not read as
-/// absent, so wait out the same window a confirmation is given.
-#[cfg(not(feature = "integration-test"))]
-pub const UNBROADCAST_DISCARD_GRACE: Duration = TX_CONFIRMATION_TIMEOUT;
-/// Shortened so a test can watch the grace expire, but longer than a maker
-/// restart takes, so a restart test still sees a live reservation.
-#[cfg(feature = "integration-test")]
-pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(120);
 
 /// Default fee rate in sats/vb for all transactions, and the absolute floor:
 /// Bitcoin Core's default `minrelaytxfee`. Lower rates stop relaying.
@@ -540,6 +531,73 @@ pub(crate) fn parse_field<T: std::str::FromStr>(value: Option<&String>, default:
     value
         .and_then(|value| value.parse::<T>().ok())
         .unwrap_or(default)
+}
+
+/// Parses a one-line list of quoted names, `["a", "b"]`. Anything else is an
+/// error: a list we can't read must not silently become empty.
+pub(crate) fn parse_list(value: Option<&String>) -> io::Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let malformed = || {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("expected a one-line list like [\"a\", \"b\"], got {value}"),
+        )
+    };
+    if value.contains(['\n', '\r']) {
+        return Err(malformed());
+    }
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .ok_or_else(malformed)?
+        .trim();
+    if inner.is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .strip_prefix('"')
+                .and_then(|i| i.strip_suffix('"'))
+                .filter(|i| !i.contains(['"', '\\']))
+                .map(str::to_string)
+                .ok_or_else(malformed)
+        })
+        .collect()
+}
+
+/// Sets `key = value` in a config file, touching no other line, and appends it
+/// if missing. Rewriting the whole file would drop keys this build doesn't know.
+pub fn set_config_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
+    let content = fs::read_to_string(path)?;
+    let new_line = format!("{key} = {value}");
+    let (mut found, mut changed) = (false, false);
+    let mut updated = String::with_capacity(content.len() + new_line.len() + 1);
+    for line in content.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\r', '\n']);
+        match text.split_once('=') {
+            Some((k, v)) if k.trim() == key => {
+                found = true;
+                changed |= v.trim() != value;
+                updated.push_str(&new_line);
+                updated.push_str(&line[text.len()..]);
+            }
+            _ => updated.push_str(line),
+        }
+    }
+    if !found {
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&new_line);
+        updated.push('\n');
+    } else if !changed {
+        return Ok(());
+    }
+    write_atomically(path, updated.as_bytes())
 }
 
 fn polynomial_modulus(mut checksum: u64, value: u64) -> u64 {
@@ -1276,7 +1334,11 @@ pub fn interactive_select(
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, thread};
+    use std::{
+        net::TcpListener,
+        os::unix::fs::{symlink, PermissionsExt},
+        thread,
+    };
 
     use bitcoin::{
         blockdata::{opcodes::all, script::Builder},
@@ -1284,7 +1346,7 @@ mod tests {
         PubkeyHash,
     };
 
-    use crate::protocol::common_messages::{MakerHello, MakerToTakerMessage, ProtocolVersion};
+    use crate::protocol::common_messages::{Hello, MakerToTakerMessage};
 
     use super::*;
 
@@ -1325,8 +1387,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
 
-        let message = MakerToTakerMessage::MakerHello(MakerHello {
-            supported_protocols: vec![ProtocolVersion::Legacy, ProtocolVersion::Taproot],
+        let message = MakerToTakerMessage::Hello(Hello {
+            features: vec!["legacy".to_string(), "taproot".to_string()],
         });
 
         thread::spawn(move || {
@@ -1334,15 +1396,11 @@ mod tests {
             let msg_bytes = read_message(&mut socket).unwrap();
             let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes).unwrap();
 
-            if let MakerToTakerMessage::MakerHello(hello) = msg {
-                assert_eq!(hello.supported_protocols.len(), 2);
-                assert!(hello.supported_protocols.contains(&ProtocolVersion::Legacy));
-                assert!(hello
-                    .supported_protocols
-                    .contains(&ProtocolVersion::Taproot));
+            if let MakerToTakerMessage::Hello(hello) = msg {
+                assert_eq!(hello.features, ["legacy", "taproot"]);
             } else {
                 panic!(
-                    "Received Wrong Message: Expected MakerHello variant, Got: {:?}",
+                    "Received Wrong Message: Expected Hello variant, Got: {:?}",
                     msg,
                 );
             }
@@ -1680,5 +1738,175 @@ mod tests {
             assert!(msg.contains("Address Network Mismatch"));
             assert!(msg.contains("Details"));
         }
+    }
+
+    #[test]
+    fn list_values_parse_only_on_one_well_formed_line() {
+        let read = |v: &str| parse_list(Some(&v.to_string()));
+        assert_eq!(read(r#"["a", "b-v2"]"#).unwrap(), ["a", "b-v2"]);
+        assert_eq!(read("[ ]").unwrap(), Vec::<String>::new());
+        assert_eq!(parse_list(None).unwrap(), Vec::<String>::new());
+        for bad in [
+            "[",
+            r#""a""#,
+            r#"["a",]"#,
+            r#"["a"] # note"#,
+            r#"[a]"#,
+            r#"["a,b"]"#,
+            r#"["a\"b"]"#,
+        ] {
+            assert!(read(bad).is_err(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn compat_list_rejects_line_breaks() {
+        for value in [
+            "[\n\"taproot\"]",
+            "[\"taproot\"\r\n]",
+            "[\n]",
+            "[\"taproot\",\n\"legacy\"]",
+        ] {
+            assert!(parse_list(Some(&value.to_string())).is_err(), "{:?}", value);
+        }
+    }
+
+    #[test]
+    fn compat_set_config_key_preserves_unchanged_bytes() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# keep\r\n  port  =  1  \r\nfuture_key = [\"x\"]";
+        fs::write(&path, original).unwrap();
+        // An in-place write would change the bytes seen through this handle.
+        let mut handle = fs::File::open(&path).unwrap();
+        set_config_key(&path, "port", "1").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        set_config_key(&path, "port", "2").unwrap();
+        let mut previous = String::new();
+        handle.read_to_string(&mut previous).unwrap();
+        assert_eq!(previous, original);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# keep\r\nport = 2\r\nfuture_key = [\"x\"]"
+        );
+    }
+
+    #[test]
+    fn compat_set_config_key_appends_after_a_missing_final_newline() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (original, expected) in [
+            ("", "port = 2\n"),
+            ("# keep", "# keep\nport = 2\n"),
+            ("# keep\n", "# keep\nport = 2\n"),
+        ] {
+            fs::write(&path, original).unwrap();
+            set_config_key(&path, "port", "2").unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn compat_set_config_key_failed_write_keeps_original() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "port = 1\nfuture_key = keep\n";
+        fs::write(&path, original).unwrap();
+        fs::create_dir(path.with_extension("partial")).unwrap();
+        assert!(set_config_key(&path, "port", "2").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn compat_set_config_key_preserves_permissions() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for mode in [0o600, 0o640, 0o400] {
+            fs::write(&path, "port = 1\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            set_config_key(&path, "port", "2").unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "port = 2\n");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            // Restore write access for the next case, including a read-only original.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn compat_atomic_write_creates_private_files() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let partial = path.with_extension("partial");
+        for stale in [false, true] {
+            if stale {
+                fs::remove_file(&path).unwrap();
+                fs::write(&partial, "stale").unwrap();
+                fs::set_permissions(&partial, fs::Permissions::from_mode(0o666)).unwrap();
+            }
+            write_atomically(&path, b"tor_auth_password = secret\n").unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"tor_auth_password = secret\n");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(!partial.exists());
+        }
+    }
+
+    #[test]
+    fn compat_set_config_key_replaces_stale_files_and_symlinks() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let partial = path.with_extension("partial");
+        let other = dir.path().join("other.toml");
+        for linked in [false, true] {
+            fs::write(&path, "port = 1\nfuture_key = keep\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            if linked {
+                fs::write(&other, "unrelated").unwrap();
+                symlink(&other, &partial).unwrap();
+            } else {
+                fs::write(&partial, "stale").unwrap();
+            }
+            let mut stale_handle = fs::File::open(&partial).unwrap();
+            set_config_key(&path, "port", "2").unwrap();
+            let mut previous = String::new();
+            stale_handle.read_to_string(&mut previous).unwrap();
+            assert_eq!(previous, if linked { "unrelated" } else { "stale" });
+            if linked {
+                assert_eq!(fs::read_to_string(&other).unwrap(), "unrelated");
+            }
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "port = 2\nfuture_key = keep\n"
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(!partial.exists());
+        }
+    }
+
+    #[test]
+    fn set_config_key_touches_only_its_line() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# note\nfuture_key = [\"x\"]\nport = 1\r\nname = \"m\"";
+        fs::write(&path, original).unwrap();
+        let written_at = fs::metadata(&path).unwrap().modified().unwrap();
+
+        set_config_key(&path, "port", "1").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), written_at);
+
+        set_config_key(&path, "port", "2").unwrap();
+        set_config_key(&path, "new_key", "true").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# note\nfuture_key = [\"x\"]\nport = 2\r\nname = \"m\"\nnew_key = true\n"
+        );
     }
 }

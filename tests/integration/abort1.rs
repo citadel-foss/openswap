@@ -75,12 +75,6 @@ fn taker_abort_1_legacy_corerpc() {
 
     generate_blocks(bitcoind, 1);
 
-    // Start periodic swap tracker logging
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
-
     // Prepare should succeed; execution should fail with DropAfterFundsBroadcast
     let summary = taker
         .prepare_swap(swap_params)
@@ -91,7 +85,6 @@ fn taker_abort_1_legacy_corerpc() {
         "Swap should fail due to DropAfterFundsBroadcast behavior"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -242,12 +235,10 @@ fn taker_abort_1_legacy_corerpc() {
         );
     }
 
-    taker.log_tracker_state();
     info!("Abort1 test completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
 
-    tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
@@ -356,6 +347,12 @@ fn new_plan_skips_inputs_of_a_dropped_swap(protocol: ProtocolVersion) {
             outpoint
         );
     }
+
+    // Recovery took over the dropped swap, so it must not block a new one.
+    let params = SwapParams::new(protocol, amount, 2)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    taker.prepare_swap(params).expect("prepare after recovery");
 
     shutdown_makers(&makers, maker_threads);
     test_framework.stop();

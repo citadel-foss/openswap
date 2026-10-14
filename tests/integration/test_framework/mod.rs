@@ -22,7 +22,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -40,12 +40,12 @@ use electrsd::ElectrsD;
 use log::info;
 use openswap::{
     maker::{start_server, MakerBehavior, MakerServer, MakerServerConfig},
-    protocol::common_messages::{ProtocolVersion, OPENSWAP_PORT},
+    protocol::common_messages::OPENSWAP_PORT,
     taker::{Taker, TakerBehavior, TakerInitConfig},
     utill::{check_tor_status, get_ephemeral_address, setup_logger, NO_SHUTDOWN},
     wallet::{
-        verify_deniability, AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRPC,
-        CoreRpcConfig, Electrum, ElectrumConfig, TakerReport,
+        AddressType, BackendConfig, Blockchain, CoreRpcConfig, Electrum, ElectrumConfig,
+        TakerReport, Wallet,
     },
 };
 
@@ -1268,10 +1268,6 @@ impl TestFramework {
                         time_relative_fee_pct: 0.0001,
                         required_confirms: 1,
                         check_blocklist,
-                        supported_protocols: vec![
-                            ProtocolVersion::Legacy,
-                            ProtocolVersion::Taproot,
-                        ],
                         fidelity_amount: 5_000_000, // 0.05 BTC
                         fidelity_timelock: 950,     // ~950 blocks for test
                         network: bitcoin::Network::Regtest,
@@ -1530,67 +1526,6 @@ pub(crate) fn wait_for_new_log(log_path: &str, expected: &str, timeout: Duration
     }
 }
 
-/// Handle returned by [`spawn_tracker_logger`] to stop the background thread.
-pub struct TrackerLoggerHandle {
-    shutdown: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl TrackerLoggerHandle {
-    /// Signal the background logger to stop and wait for it to finish.
-    #[allow(dead_code)]
-    pub fn stop(mut self) {
-        self.shutdown.store(true, Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-impl Drop for TrackerLoggerHandle {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-/// Spawn a background thread that periodically reads the swap tracker CBOR file
-/// from `data_dir` and logs its contents at INFO level.
-///
-/// Usage in a test:
-/// ```ignore
-/// let logger = spawn_tracker_logger(temp_dir.join("taker1"), Duration::from_secs(5));
-/// // ... run test ...
-/// logger.stop();
-/// ```
-#[allow(dead_code)]
-pub fn spawn_tracker_logger(data_dir: PathBuf, interval: Duration) -> TrackerLoggerHandle {
-    use openswap::taker::swap_tracker::SwapTracker;
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-
-    let handle = thread::spawn(move || {
-        while !shutdown_clone.load(Relaxed) {
-            thread::sleep(interval);
-            if shutdown_clone.load(Relaxed) {
-                break;
-            }
-            match SwapTracker::load_or_create(&data_dir) {
-                Ok(tracker) => tracker.log_state(),
-                Err(e) => log::warn!("[TrackerLogger] Failed to load tracker: {:?}", e),
-            }
-        }
-    });
-
-    TrackerLoggerHandle {
-        shutdown,
-        handle: Some(handle),
-    }
-}
-
 /// Spawns a dedicated `nostr-rs-relay` process for a single test.
 ///
 /// Each test gets its own relay on its own OS-assigned port with an in-memory
@@ -1650,57 +1585,49 @@ fn wait_for_relay_healthy(port: u16, child: &mut Child) -> bool {
     false
 }
 
-/// Verifies that a swap report file contains the expected number of deniability proofs,
+/// Verifies that a wallet holds the expected number of deniability proofs,
 /// and that each proof passes on-chain verification.
-pub fn assert_report_has_deniability_proofs(
-    report_path: &std::path::Path,
+pub fn assert_wallet_has_deniability_proofs(
+    wallet: &RwLock<Wallet>,
     label: &str,
-    bitcoind: &BitcoinD,
     expected_count: usize,
 ) {
-    let content = fs::read_to_string(report_path)
-        .unwrap_or_else(|e| panic!("Failed to read {} report: {}", label, e));
-    let json: serde_json::Value = serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("Failed to parse {} report: {}", label, e));
-    let proofs = json
-        .get("deniability_proofs")
-        .and_then(|v| v.as_array())
-        .unwrap_or_else(|| panic!("{} report is missing deniability_proofs", label));
+    let wallet = wallet.read().unwrap();
+    // Check what was saved, not what is in memory.
+    let proofs = wallet
+        .saved_deniability_proofs("integration-test")
+        .unwrap_or_else(|e| panic!("{} wallet read failed: {}", label, e));
+    assert_eq!(
+        proofs,
+        wallet.swap_reports().deniability_proofs,
+        "{} saved proofs differ from the live wallet",
+        label
+    );
     assert_eq!(
         proofs.len(),
         expected_count,
-        "{} report should contain {} deniability proof(s) at {}",
+        "{} wallet should hold {} deniability proof(s)",
         label,
-        expected_count,
-        report_path.display()
+        expected_count
     );
-    let rpc_config = CoreRpcConfig {
-        url: bitcoind.rpc_url().split_at(7).1.to_string(),
-        auth: Auth::CookieFile(bitcoind.params.cookie_file.clone()),
-        ..Default::default()
-    };
-    let blockchain = AnyBlockchain::CoreRPC(
-        CoreRPC::new(&rpc_config).expect("failed to connect blockchain backend for verification"),
-    );
-    for (i, proof_value) in proofs.iter().enumerate() {
-        let swap_id = proof_value
-            .get("swap_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| panic!("{} proof {} is missing swap_id", label, i));
-        let verified = verify_deniability(report_path, &blockchain, swap_id)
+    for (i, proof) in proofs.iter().enumerate() {
+        let verified = wallet
+            .verify_deniability(&proof.swap_id)
             .unwrap_or_else(|e| panic!("{} proof {} verification error: {}", label, i, e));
         assert!(
             verified,
             "{} proof {} failed on-chain verification",
             label, i
         );
-        info!("{} proof {} verified ok (swap_id={})", label, i, swap_id);
+        info!(
+            "{} proof {} verified ok (swap_id={})",
+            label, i, proof.swap_id
+        );
     }
     info!(
-        "{} all {} deniability proof(s) verified: {}",
+        "{} all {} deniability proof(s) verified",
         label,
-        proofs.len(),
-        report_path.display()
+        proofs.len()
     );
 }
 

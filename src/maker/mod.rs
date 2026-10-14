@@ -24,7 +24,6 @@ pub mod api;
 pub mod handlers;
 pub mod nostr;
 pub mod server;
-pub mod swap_tracker;
 
 pub use error::MakerError;
 pub use rpc::{AuthenticatedRpcRequest, RpcMsgReq, RpcMsgResp};
@@ -36,7 +35,6 @@ pub use handlers::{
     handle_message, ConnectionState, Maker as MakerTrait, MakerConfig as HandlerConfig, SwapPhase,
 };
 pub use server::{bind_port_retry, start_server};
-pub use swap_tracker::MakerSwapTracker;
 
 pub use legacy_handlers::handle_legacy_message;
 pub use taproot_handlers::handle_taproot_message;

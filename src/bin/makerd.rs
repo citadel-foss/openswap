@@ -3,7 +3,7 @@ use clap::Parser;
 use openswap::{
     lock_debug,
     maker::{bind_port_retry, start_server, MakerError, MakerServer, MakerServerConfig},
-    utill::{parse_proxy_auth, print_new_wallet_seed, setup_maker_logger},
+    utill::{parse_proxy_auth, print_new_wallet_seed, set_config_key, setup_maker_logger},
     wallet::{BackendConfig, CoreRpcConfig, ElectrumConfig},
 };
 use std::{path::PathBuf, sync::Arc};
@@ -98,7 +98,8 @@ fn main() -> Result<(), MakerError> {
     let wallet_name = args.wallet_name.unwrap_or_else(|| "maker".to_string());
     config.wallet_name = wallet_name.clone();
     config.password = args.password;
-    if let Some(tor_auth) = args.tor_auth {
+    if let Some(tor_auth) = args.tor_auth.filter(|a| *a != config.tor_auth_password) {
+        set_config_key(&config_path, "tor_auth_password", &tor_auth)?;
         config.tor_auth_password = tor_auth;
     }
 
@@ -127,13 +128,13 @@ fn main() -> Result<(), MakerError> {
     if config.network_port == DEFAULT_NETWORK_PORT {
         let (_, port) = bind_port_retry(config.network_port)?;
         config.network_port = port;
-        config.write_to_file(&config_path)?;
+        set_config_key(&config_path, "network_port", &port.to_string())?;
     }
 
     // Discover and save RPC port to config
     let (_, rpc_port) = bind_port_retry(config.rpc_port)?;
     config.rpc_port = rpc_port;
-    config.write_to_file(&config_path)?;
+    set_config_key(&config_path, "rpc_port", &rpc_port.to_string())?;
 
     let maker = Arc::new(MakerServer::init(config)?);
 

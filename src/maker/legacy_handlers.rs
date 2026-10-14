@@ -721,6 +721,13 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
     refuse_if_breached(maker.as_ref(), &resp.id)?;
     refuse_if_funding_spent(maker.as_ref(), state, &resp.id)?;
 
+    // Committed before the first send: from here recovery must never discard
+    // these coins for looking unsent. A refusal above leaves them discardable.
+    for outgoing in state.outgoing_swapcoins.iter_mut() {
+        outgoing.committed = true;
+        maker.save_outgoing_swapcoin(outgoing)?;
+    }
+
     log::info!(
         "[{}] SECURITY: Broadcasting {} funding txs after receiving signatures",
         maker.network_port(),

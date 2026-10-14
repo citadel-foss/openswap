@@ -71,12 +71,6 @@ fn test_taproot_taker_abort2() {
     let _maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting taproot taker abort2 test...");
 
-    // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
-
     // Swap params for openswap (Taproot)
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -94,7 +88,6 @@ fn test_taproot_taker_abort2() {
         "Swap should fail due to CloseAtSendersContract behavior"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -208,12 +201,10 @@ fn test_taproot_taker_abort2() {
         "Taker spendable balance change mismatch"
     );
 
-    taker.log_tracker_state();
     info!("Taproot taker abort2 test completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
 
-    tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }

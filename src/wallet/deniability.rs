@@ -370,6 +370,14 @@ fn verify_proof(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn verify_proof_for_test(
+    proof: &DeniabilityProof,
+    chain_spk: &ScriptBuf,
+) -> Result<(), DeniabilityProofError> {
+    verify_proof(proof, chain_spk)
+}
+
 /// Parses a Taproot hashlock leaf script and returns the embedded x-only pubkey.
 fn parse_taproot_hashlock_script(
     script: &ScriptBuf,
@@ -457,7 +465,8 @@ pub(crate) fn proof_from_swapcoins(
     })
 }
 
-/// Finds the proof for `swap_id` in the report file and verifies it against chain data.
+/// Finds the proof for `swap_id` in a v0.2.3 report JSON file and verifies it
+/// against chain data. Reports in a wallet are checked by `Wallet::verify_deniability`.
 ///
 /// Returns `Ok(true)` if the proof is valid, `Ok(false)` if it fails verification,
 /// or an outer `Err` if the file cannot be read, parsed, or the swap_id is not found.
@@ -469,9 +478,16 @@ pub fn verify_deniability(
     let content = std::fs::read_to_string(report_path)?;
     let report: super::report::SwapReportFile =
         serde_json::from_str(&content).map_err(std::io::Error::other)?;
+    verify_swap_proof(report.deniability_proofs, blockchain, swap_id)
+}
 
-    let proof = report
-        .deniability_proofs
+/// Finds the proof for `swap_id` among `proofs` and verifies it against chain data.
+pub(crate) fn verify_swap_proof(
+    proofs: Vec<DeniabilityProof>,
+    blockchain: &AnyBlockchain,
+    swap_id: &str,
+) -> Result<bool, std::io::Error> {
+    let proof = proofs
         .into_iter()
         .find(|p| p.swap_id == swap_id)
         .ok_or_else(|| {

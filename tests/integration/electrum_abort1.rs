@@ -118,12 +118,6 @@ pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &E
 
     generate_blocks(bitcoind, 1);
 
-    // Start periodic swap tracker logging
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
-
     // Prepare should succeed; execution should fail with DropAfterFundsBroadcast
     let summary = taker
         .prepare_swap(swap_params)
@@ -140,7 +134,6 @@ pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &E
         swap_error
     );
     info!("Swap failed as expected: {swap_error:?}");
-    taker.log_tracker_state();
 
     // Wait for makers to detect the drop and the outer timelock to mature;
     // slower-cadence backends (Tor) wait proportionally longer.
@@ -287,12 +280,10 @@ pub(crate) fn run_abort1<B: TestBackend>(protocol: ProtocolVersion, expected: &E
         );
     }
 
-    taker.log_tracker_state();
     info!("Electrum abort1 test ({protocol:?}) completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
 
-    tracker_logger.stop();
     // Drop the taker while relay, electrs, and bitcoind are still up, so its
     // background services shut down against live servers instead of dead ones.
     test_framework.finish(takers, block_generation_handle);

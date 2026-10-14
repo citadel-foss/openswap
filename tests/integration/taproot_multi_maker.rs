@@ -6,9 +6,10 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::start_server,
+    maker::{start_server, MakerServer},
     protocol::common_messages::ProtocolVersion,
     taker::{SwapParams, TakerBehavior},
+    wallet::MakerReport,
 };
 
 use super::test_framework::*;
@@ -250,13 +251,9 @@ fn test_taproot_multi_maker_fees_priced_on_each_makers_amount() {
             .unwrap_or_else(|| panic!("no maker serves route address {}", quoted.address));
 
         // The maker records what it was declared and the fee it charged on it.
-        let report_path = maker
-            .data_dir
-            .join("wallets")
-            .join(format!("{}_swap_report.json", maker.config.wallet_name));
-        let maker_report = wait_for_maker_report(&report_path, &summary.swap_id);
-        let negotiated = maker_report["incoming_amount"].as_u64().unwrap();
-        let fee_earned = maker_report["fee_earned"].as_u64().unwrap();
+        let maker_report = wait_for_maker_report(maker, &summary.swap_id);
+        let negotiated = maker_report.incoming_amount;
+        let fee_earned = maker_report.fee_earned;
         info!("Maker {i}: negotiated {negotiated} sats, fee earned {fee_earned} sats");
 
         assert_eq!(
@@ -288,29 +285,25 @@ fn test_taproot_multi_maker_fees_priced_on_each_makers_amount() {
 
 /// Waits for the maker's success report for `swap_id`; the maker writes it
 /// after its own sweep, which can land after the taker returns.
-fn wait_for_maker_report(path: &std::path::Path, swap_id: &str) -> serde_json::Value {
+fn wait_for_maker_report(maker: &MakerServer, swap_id: &str) -> MakerReport {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
-        let report = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|file| {
-                file["maker"]
-                    .as_object()?
-                    .values()
-                    .filter_map(|reports| reports.as_array())
-                    .flatten()
-                    .find(|report| report["swap_id"] == swap_id)
-                    .cloned()
-            });
+        let report = maker
+            .wallet
+            .read()
+            .unwrap()
+            .swap_reports()
+            .maker
+            .into_values()
+            .flatten()
+            .find(|report| report.swap_id == swap_id);
         if let Some(report) = report {
             return report;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "maker report for {} never appeared at {}",
-            swap_id,
-            path.display()
+            "maker report for {} never appeared in its wallet",
+            swap_id
         );
         thread::sleep(std::time::Duration::from_secs(1));
     }

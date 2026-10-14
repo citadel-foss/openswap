@@ -3,7 +3,7 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs::{File, OpenOptions, TryLockError},
-    io,
+    io::{self, Write},
     path::Path,
 };
 
@@ -57,15 +57,160 @@ pub(crate) fn read_json<T: DeserializeOwned + Default>(path: &Path) -> io::Resul
 
 pub(crate) fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let json = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
+    write_atomically(path, json.as_bytes())
+}
+
+/// Replace `path` with `bytes` so a crash leaves either the old or the new file.
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary_path = path.with_extension("partial");
 
     {
-        use io::Write;
-
-        let mut temporary_file = std::fs::File::create(&temporary_path)?;
-        temporary_file.write_all(json.as_bytes())?;
+        // Private from the first byte, and never a stale temp that keeps its old mode.
+        match std::fs::remove_file(&temporary_path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut temporary_file = options.open(&temporary_path)?;
+        // The rename would otherwise change the mode the user gave the file.
+        if let Ok(existing) = std::fs::metadata(path) {
+            temporary_file.set_permissions(existing.permissions())?;
+        }
+        temporary_file.write_all(bytes)?;
         temporary_file.sync_all()?;
     }
 
-    std::fs::rename(&temporary_path, path)
+    std::fs::rename(&temporary_path, path)?;
+    // Without this the rename itself can be lost in a crash. Windows cannot
+    // open a directory as a file, so the sync is Unix only.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::Read,
+        process::{Child, Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    struct LockProcess(Child);
+
+    impl Drop for LockProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn wait_for_lock(file: &File) {
+        // A parallel subprocess can inherit the owner's descriptor until exec.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return,
+                Err(TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the wallet lock was not released"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("could not acquire the wallet lock: {}", error),
+            }
+        }
+    }
+
+    #[test]
+    fn compat_wallet_lock_survives_atomic_wallet_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = dir.path().join("wallet.cbor");
+        let lock_path = dir.path().join("wallet.cbor.lock");
+        let owner = FileLock::acquire(&lock_path).unwrap();
+        let contender = OpenOptions::new().write(true).open(&lock_path).unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        write_atomically(&wallet, b"old wallet").unwrap();
+        write_atomically(&wallet, b"new wallet").unwrap();
+        assert_eq!(std::fs::read(&wallet).unwrap(), b"new wallet");
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(owner);
+        wait_for_lock(&contender);
+        contender.unlock().unwrap();
+        assert!(
+            lock_path.exists(),
+            "the sentinel inode must remain reusable"
+        );
+        drop(FileLock::acquire(&lock_path).unwrap());
+    }
+
+    #[test]
+    fn compat_wallet_lock_is_exclusive_until_its_process_exits() {
+        const CHILD_LOCK_ENV: &str = "OPENSWAP_COMPAT_WALLET_LOCK_CHILD";
+        if let Some(path) = std::env::var_os(CHILD_LOCK_ENV) {
+            let lock_path = Path::new(&path);
+            let _owner = FileLock::acquire(lock_path).unwrap();
+            std::fs::write(lock_path.with_extension("ready"), b"locked").unwrap();
+            let _ = std::io::stdin().read_exact(&mut [0]);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("wallet.cbor.lock");
+        let ready = lock_path.with_extension("ready");
+        let mut holder = LockProcess(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "atomic_file::tests::compat_wallet_lock_is_exclusive_until_its_process_exits",
+                    "--nocapture",
+                ])
+                .env(CHILD_LOCK_ENV, &lock_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the subprocess did not acquire its lock"
+            );
+            assert!(
+                holder.0.try_wait().unwrap().is_none(),
+                "the subprocess exited before taking its lock"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let contender = OpenOptions::new().write(true).open(&lock_path).unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        holder.0.kill().unwrap();
+        holder.0.wait().unwrap();
+        wait_for_lock(&contender);
+        contender.unlock().unwrap();
+        assert!(lock_path.exists());
+        drop(FileLock::acquire(&lock_path).unwrap());
+    }
 }

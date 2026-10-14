@@ -133,6 +133,10 @@ pub enum WalletError {
     /// invalid characters, etc.) without losing information by converting to a
     /// plain string
     InvalidAddress(bitcoin::address::ParseError),
+
+    /// The wallet holds records that need these feature names, which this
+    /// build can't serve. The file is left untouched; open it with a newer build.
+    NeedsUpgrade(Vec<String>),
 }
 
 impl From<std::io::Error> for WalletError {
@@ -289,6 +293,10 @@ impl std::fmt::Display for WalletError {
             }
             WalletError::Selection(e) => write!(f, "Coin selection error: {:?}", e),
             WalletError::InvalidAddress(e) => write!(f, "Invalid Bitcoin address: {}", e),
+            WalletError::NeedsUpgrade(names) => write!(
+                f,
+                "this wallet needs a newer build: it uses {names:?}, which this build can't serve"
+            ),
         }
     }
 }

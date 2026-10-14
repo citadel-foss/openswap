@@ -10,6 +10,8 @@ use bitcoind::{
     BitcoinD,
 };
 use electrsd::ElectrsD;
+use serde::Deserialize;
+use serde_cbor::{value::from_value, Value};
 
 use openswap::wallet::{
     AddressType, AnyBlockchain, BackendConfig, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
@@ -17,7 +19,10 @@ use openswap::wallet::{
 };
 
 use openswap::{
-    security::{load_sensitive_struct, KeyMaterial, SecurityError, SerdeCbor, SerdeJson},
+    security::{
+        decrypt_struct_with_aad, load_sensitive_struct, EncryptedData, KeyMaterial, SecurityError,
+        SerdeJson,
+    },
     utill::MIN_RELAY_FEE_RATE,
 };
 
@@ -98,28 +103,49 @@ fn create_maker_bond(wallet: &mut Wallet, blocks: u32) {
         .unwrap();
 }
 
-/// Asserts the wallet file on disk is genuinely encrypted with the given
-/// passphrase: it must be an encrypted container, reject a wrong password,
-/// and open with the correct one. (The missing-password `PasswordRequired`
-/// path is covered by wallet storage unit tests, which have the concrete
-/// `WalletStore` type available.)
+#[derive(Deserialize)]
+struct WalletEnvelope {
+    requires: Vec<String>,
+    encrypted: Value,
+}
+
+#[derive(Deserialize)]
+struct EncryptionParameters {
+    nonce: [u8; 12],
+    pbkdf2_salt: [u8; 16],
+}
+
+/// Check the envelope's ciphertext with both passwords, using its stored salt.
+/// The generic sensitive-file reader only handles the bare backup container.
 fn assert_wallet_file_encrypted(path: &Path, password: &str) {
     assert!(
         Wallet::is_wallet_encrypted(path).unwrap(),
         "restored wallet file must be encrypted"
     );
-
-    let err = load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(
-        path,
-        Some("definitely-wrong-password".to_string()),
-    )
-    .expect_err("encrypted wallet file must reject a wrong password");
-    assert!(matches!(err, SecurityError::Decryption));
-
-    let (_, material) =
-        load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(path, Some(password.to_string()))
-            .expect("the restore password must open the restored wallet file");
-    assert!(material.is_some());
+    let mut envelope: WalletEnvelope = serde_cbor::from_slice(&fs::read(path).unwrap()).unwrap();
+    envelope.requires.sort_unstable();
+    envelope.requires.dedup();
+    let aad = envelope.requires.join("\n").into_bytes();
+    let parameters: EncryptionParameters = from_value(envelope.encrypted.clone()).unwrap();
+    let encrypted: EncryptedData = from_value(envelope.encrypted).unwrap();
+    let wrong = KeyMaterial::existing(
+        "definitely-wrong-password".to_string(),
+        parameters.nonce,
+        parameters.pbkdf2_salt,
+    );
+    assert!(matches!(
+        decrypt_struct_with_aad::<Value>(encrypted.clone(), &wrong, &aad),
+        Err(SecurityError::Decryption)
+    ));
+    let correct = KeyMaterial::existing(
+        password.to_string(),
+        parameters.nonce,
+        parameters.pbkdf2_salt,
+    );
+    assert!(matches!(
+        decrypt_struct_with_aad::<Value>(encrypted, &correct, &aad).unwrap(),
+        Value::Map(_)
+    ));
 }
 
 #[test]

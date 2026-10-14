@@ -1,6 +1,7 @@
 use std::{env, ffi::OsStr, fs, io::Write, path::PathBuf};
 
 use crate::{
+    protocol::features::{check_requires, supported},
     security::{encrypt_struct, load_sensitive_struct, KeyMaterial, SecurityError, SerdeJson},
     utill::prompt_password,
     wallet::{Blockchain, Wallet, WalletError},
@@ -31,6 +32,11 @@ pub struct WalletBackup {
     pub(super) wallet_birthday: Option<u64>, //Avoid scanning from genesis block
     /// The file name associated with the wallet store.
     pub file_name: String, //Can be asked to user, or stored for convenience
+    /// Feature names a restore must understand. v0.2.3 ignores this key, so
+    /// new backups still restore there; a later build refuses a backup it
+    /// would restore wrongly.
+    #[serde(default)]
+    pub(super) requires: Vec<String>,
 }
 impl From<&Wallet> for WalletBackup {
     fn from(wallet: &Wallet) -> Self {
@@ -41,6 +47,7 @@ impl From<&Wallet> for WalletBackup {
                 .expect("in-memory master key unsealing failed"),
             wallet_birthday: (wallet.store.wallet_birthday),
             file_name: (wallet.store.file_name.clone()),
+            requires: Vec::new(),
         }
     }
 }
@@ -95,6 +102,9 @@ impl Wallet {
         backend_config: &BackendConfig,
         restored_enc_material: KeyMaterial,
     ) -> Result<Wallet, WalletError> {
+        // Before any backend or file work, so a refused backup changes nothing.
+        check_requires(&wallet_backup.requires, &supported()).map_err(WalletError::NeedsUpgrade)?;
+
         // Directories and nameless paths restore under the backup's filename.
         // That name is untrusted input: accept exactly one normal component,
         // or `../x` escapes the directory and an absolute path replaces it.
@@ -211,6 +221,7 @@ impl Wallet {
             master_key: Wallet::master_key_from_mnemonic(&mnemonic, network)?,
             wallet_birthday,
             file_name,
+            requires: Vec::new(),
         };
 
         Wallet::restore(&backup, wallet_path, backend_config, restored_enc_material)
@@ -321,11 +332,34 @@ impl Wallet {
 }
 
 #[cfg(test)]
+pub(crate) fn compat_backup() -> WalletBackup {
+    WalletBackup {
+        network: Network::Regtest,
+        master_key: Xpriv::new_master(Network::Regtest, &[42; 32]).unwrap(),
+        wallet_birthday: Some(101),
+        file_name: "fixture.wallet".into(),
+        requires: Vec::new(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::CoreRpcConfig;
+    use crate::{
+        security::decrypt_struct,
+        wallet::{test_wallet, CoreRpcConfig},
+    };
     use bip39::rand::{thread_rng, Rng};
     use bitcoind::tempfile::tempdir;
+
+    // The payload from v0.2.3, without the new requirement field.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CompatV023Backup {
+        network: Network,
+        master_key: Xpriv,
+        wallet_birthday: Option<u64>,
+        file_name: String,
+    }
 
     fn dummy_backup(file_name: &str) -> WalletBackup {
         let seed: [u8; 16] = thread_rng().gen();
@@ -334,7 +368,83 @@ mod tests {
             master_key: Xpriv::new_master(Network::Regtest, &seed).unwrap(),
             wallet_birthday: None,
             file_name: file_name.to_string(),
+            requires: Vec::new(),
         }
+    }
+
+    #[test]
+    fn compat_backups_round_trip_through_the_v023_payload() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet.cbor"));
+        wallet.store.wallet_birthday = Some(700_000);
+        let backup_path = dir.path().join("backup.json");
+        let material = KeyMaterial::new_from_password(Some("backup-password".into())).unwrap();
+        let expected = WalletBackup::from(&wallet);
+        wallet.backup(&backup_path, material.clone()).unwrap();
+        let encrypted = serde_json::from_slice(&fs::read(&backup_path).unwrap()).unwrap();
+        let old: CompatV023Backup = decrypt_struct(encrypted, &material).unwrap();
+        assert_eq!(old.network, expected.network);
+        assert_eq!(old.master_key, expected.master_key);
+        assert_eq!(old.wallet_birthday, expected.wallet_birthday);
+        assert_eq!(old.file_name, expected.file_name);
+        let rewritten = encrypt_struct(&old, &material).unwrap();
+        let new: WalletBackup = decrypt_struct(rewritten, &material).unwrap();
+        assert!(new.requires.is_empty());
+        assert_eq!(new.master_key, expected.master_key);
+        assert_eq!(new.wallet_birthday, expected.wallet_birthday);
+        assert_eq!(new.file_name, expected.file_name);
+        let gated = WalletBackup {
+            requires: vec!["legacy".into()],
+            ..new
+        };
+        let old_again: CompatV023Backup =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&gated).unwrap()).unwrap();
+        assert_eq!(old_again.master_key, old.master_key);
+    }
+
+    #[test]
+    fn compat_backup_refusal_preserves_existing_files_and_missing_parents() {
+        let dir = tempdir().unwrap();
+        let existing = dir.path().join("existing.cbor");
+        fs::write(&existing, b"existing wallet").unwrap();
+        let missing = dir.path().join("absent").join("wallet.cbor");
+        let backup = WalletBackup {
+            requires: vec!["future-v1".into()],
+            ..dummy_backup("wallet.cbor")
+        };
+        for target in [&existing, &missing] {
+            let error = Wallet::restore(
+                &backup,
+                target,
+                &BackendConfig::CoreRpc(CoreRpcConfig::default()),
+                KeyMaterial::new_ephemeral(),
+            )
+            .unwrap_err();
+            assert!(matches!(error, WalletError::NeedsUpgrade(names) if names == ["future-v1"]));
+            assert_eq!(fs::read(&existing).unwrap(), b"existing wallet");
+            assert!(!missing.parent().unwrap().exists());
+        }
+    }
+
+    /// A backup needing a name this build can't serve is refused before any
+    /// backend or file work.
+    #[test]
+    fn restore_refuses_unserved_requires_before_touching_anything() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("restored.cbor");
+        let backup = WalletBackup {
+            requires: vec!["future-v1".to_string()],
+            ..dummy_backup("restored.cbor")
+        };
+        let err = Wallet::restore(
+            &backup,
+            &target,
+            &BackendConfig::CoreRpc(CoreRpcConfig::default()),
+            KeyMaterial::new_ephemeral(),
+        )
+        .expect_err("an unserved name must refuse the restore");
+        assert!(matches!(err, WalletError::NeedsUpgrade(names) if names == ["future-v1"]));
+        assert!(!target.exists());
     }
 
     /// A backup whose `file_name` traverses or is absolute must be rejected

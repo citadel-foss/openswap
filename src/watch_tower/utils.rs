@@ -253,12 +253,12 @@ pub fn process_transaction(
     Ok(())
 }
 
+/// Reads `txid:vout` from the first two content fields; later releases may
+/// append more fields, which this build ignores.
 pub(crate) fn parse_fidelity_event(event: &nostr::Event) -> Option<(Txid, u32)> {
-    let content = event.content.trim();
-    let (txid, vout) = content.split_once(':')?;
-
-    let txid = Txid::from_str(txid).ok()?;
-    let vout = vout.parse::<u32>().ok()?;
+    let mut fields = event.content.trim().split(':');
+    let txid = Txid::from_str(fields.next()?).ok()?;
+    let vout = fields.next()?.parse::<u32>().ok()?;
     (vout == 0).then_some((txid, vout))
 }
 
@@ -446,6 +446,30 @@ mod tests {
 
         let noncanonical = fidelity_event(format!("{txid}:1"));
         assert!(parse_fidelity_event(&noncanonical).is_none());
+
+        // A later release may append fields; the first two still count.
+        let extended = fidelity_event(format!("{txid}:0:future"));
+        assert_eq!(parse_fidelity_event(&extended), Some((txid, 0)));
+    }
+
+    #[test]
+    fn compat_nostr_content_uses_only_two_fields_and_keeps_validation() {
+        let txid = Txid::from_slice(&[7u8; 32]).unwrap();
+        for suffix in ["", ":", ":future:more:fields", ":not-a-number"] {
+            assert_eq!(
+                parse_fidelity_event(&fidelity_event(format!("  {txid}:0{suffix}  "))),
+                Some((txid, 0))
+            );
+            assert!(parse_fidelity_event(&fidelity_event(format!("{txid}:1{suffix}"))).is_none());
+        }
+        for bad in [
+            format!("{txid}"),
+            format!("{txid}::future"),
+            format!("{txid}:4294967296:future"),
+            "invalid:0:future".into(),
+        ] {
+            assert!(parse_fidelity_event(&fidelity_event(bad)).is_none());
+        }
     }
 
     #[test]

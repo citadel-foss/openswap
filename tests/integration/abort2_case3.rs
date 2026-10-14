@@ -72,12 +72,6 @@ fn maker_abort2_case3() {
     let maker_spendable_balance = verify_maker_pre_swap_balances(&makers);
     log::info!("Starting Legacy abort2 case 3 test...");
 
-    // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = spawn_tracker_logger(
-        test_framework.temp_dir.join("taker1"),
-        Duration::from_secs(10),
-    );
-
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -95,7 +89,6 @@ fn maker_abort2_case3() {
         "Swap should fail due to Maker2 closing at ProofOfFunding"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    taker.log_tracker_state();
 
     // Sleep budget: 60s maker idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
@@ -234,12 +227,10 @@ fn maker_abort2_case3() {
         assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
     }
 
-    taker.log_tracker_state();
     info!("Legacy abort2 case 3 test completed successfully!");
 
     shutdown_makers(&makers, maker_threads);
 
-    tracker_logger.stop();
     test_framework.stop();
     block_generation_handle.join().unwrap();
 }
