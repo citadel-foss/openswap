@@ -1096,12 +1096,9 @@ impl MakerServer {
     ) -> Result<Option<u32>, MakerError> {
         let bond = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .store
-            .fidelity_bond
-            .get(index as usize)
+            .fidelity_bond(index)
             .cloned();
         let checked = bond
-            .ok_or(WalletError::Fidelity(FidelityError::BondDoesNotExist))
             .and_then(|bond| bond.ensure_broadcast(chain))
             .and_then(|txid| chain.tx_block_height(&txid))
             .and_then(|height| {
@@ -1265,10 +1262,8 @@ impl MakerServer {
             let wallet_read = lock_debug!(self.wallet.read())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
             let bond = wallet_read
-                .store
-                .fidelity_bond
-                .get(i as usize)
-                .ok_or(MakerError::General("fidelity bond index stale"))?
+                .fidelity_bond(i)
+                .map_err(|_| MakerError::General("fidelity bond index stale"))?
                 .clone();
             let (current_height, tip_time) = wallet_read.chain_tip().map_err(MakerError::Wallet)?;
             let bond_value = wallet_read

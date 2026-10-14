@@ -12,7 +12,7 @@ use super::{
     storage::WalletStore,
 };
 use bip39::Mnemonic;
-use bitcoin::{bip32::Xpriv, Network};
+use bitcoin::{absolute::LockTime, bip32::Xpriv, Network};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -24,6 +24,7 @@ pub const RESTORE_FROM_MNEMONIC_HINT: &str =
 /// How far a restore searches. Saved in the wallet file until the first scan
 /// finishes, so a restore cut short resumes with the same options.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RestoreOptions {
     /// First block the Core rescan reads; `None` keeps the backup's, else genesis.
     /// Not saved here: it becomes the wallet's own birthday.
@@ -31,6 +32,10 @@ pub struct RestoreOptions {
     pub birthday: Option<u64>,
     /// Unused addresses in a row that end the search on each keychain.
     pub address_gap: u32,
+    /// Unused bond indexes in a row that end the bond search.
+    pub bond_gap: u32,
+    /// Bonds made without an OP_RETURN announcement, which only these find.
+    pub bond_hints: Vec<BondHint>,
 }
 
 impl Default for RestoreOptions {
@@ -38,8 +43,19 @@ impl Default for RestoreOptions {
         Self {
             birthday: None,
             address_gap: RESTORE_ADDRESS_GAP,
+            bond_gap: 20,
+            bond_hints: Vec::new(),
         }
     }
+}
+
+/// A bond the user remembers. Used only if one of our own sends pays it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BondHint {
+    /// The bond key's index in the fidelity derivation path.
+    pub index: u32,
+    /// The bond's locktime.
+    pub locktime: LockTime,
 }
 
 /// Open swaps a restore loses: their keys are random per swap and live only
@@ -154,11 +170,15 @@ impl Wallet {
         restored_enc_material: KeyMaterial,
         options: RestoreOptions,
     ) -> Result<Wallet, WalletError> {
-        if !(ADDRESS_IMPORT_COUNT..=MAX_WATCH_WINDOW).contains(&options.address_gap) {
-            return Err(WalletError::General(format!(
-                "address gap {} is outside {ADDRESS_IMPORT_COUNT}..={MAX_WATCH_WINDOW}",
-                options.address_gap
-            )));
+        for (name, gap, min) in [
+            ("address", options.address_gap, ADDRESS_IMPORT_COUNT),
+            ("bond", options.bond_gap, 1),
+        ] {
+            if !(min..=MAX_WATCH_WINDOW).contains(&gap) {
+                return Err(WalletError::General(format!(
+                    "{name} gap {gap} is outside {min}..={MAX_WATCH_WINDOW}"
+                )));
+            }
         }
 
         // Directories and nameless paths restore under the backup's filename.
@@ -262,9 +282,9 @@ impl Wallet {
     ///
     /// Recovers exactly what a [`WalletBackup`] file does: HD funds, fidelity bonds
     /// and already-swept swap coins — though swap coins lose the label that keeps
-    /// them out of the regular coin pool. Bonds are found by their OP_RETURN, up to
-    /// the first index without one. Live swap keys are per-swap `OsRng` and
-    /// unrecoverable from any seed.
+    /// them out of the regular coin pool. Bonds are found by their OP_RETURN or a
+    /// [`BondHint`], until `options.bond_gap` indexes in a row find none. Live swap
+    /// keys are per-swap `OsRng` and unrecoverable from any seed.
     pub fn restore_from_mnemonic(
         phrase: Zeroizing<String>,
         wallet_path: &Path,
@@ -436,14 +456,13 @@ mod tests {
     };
     use bip39::rand::{thread_rng, Rng};
     use bitcoin::{
-        absolute::LockTime,
         hashes::{sha256, Hash},
         secp256k1::SecretKey,
         transaction::Version,
         Amount, PublicKey, ScriptBuf, Transaction,
     };
     use bitcoind::tempfile::tempdir;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
 
     fn dummy_backup(file_name: &str) -> WalletBackup {
         let seed: [u8; 16] = thread_rng().gen();
@@ -585,7 +604,11 @@ mod tests {
             err
         );
 
-        for address_gap in [ADDRESS_IMPORT_COUNT - 1, MAX_WATCH_WINDOW + 1] {
+        for (address_gap, bond_gap) in [
+            (ADDRESS_IMPORT_COUNT - 1, 20),
+            (MAX_WATCH_WINDOW + 1, 20),
+            (100, 0),
+        ] {
             let err = Wallet::restore_with(
                 &dummy_backup("wallet"),
                 &dir.path().join("wallet"),
@@ -593,16 +616,47 @@ mod tests {
                 KeyMaterial::new_ephemeral(),
                 RestoreOptions {
                     address_gap,
+                    bond_gap,
                     ..Default::default()
                 },
             )
             .expect_err("the gap is out of range");
             assert!(
                 err.to_string().contains("is outside"),
-                "{}: {}",
+                "{} {}: {}",
                 address_gap,
+                bond_gap,
                 err
             );
         }
+    }
+
+    /// The checkpoint lives in the wallet file: hints must survive it, and a
+    /// checkpoint saved without the bond fields reads them as the defaults.
+    #[test]
+    fn restore_options_survive_the_wallet_file_format() {
+        let options = RestoreOptions {
+            address_gap: 200,
+            bond_gap: 5,
+            bond_hints: vec![BondHint {
+                index: 3,
+                locktime: LockTime::from_height(900).unwrap(),
+            }],
+            ..Default::default()
+        };
+        let bytes = serde_cbor::to_vec(&options).unwrap();
+        assert_eq!(
+            serde_cbor::from_slice::<RestoreOptions>(&bytes).unwrap(),
+            options
+        );
+
+        let bytes = serde_cbor::to_vec(&BTreeMap::from([("address_gap", 200)])).unwrap();
+        assert_eq!(
+            serde_cbor::from_slice::<RestoreOptions>(&bytes).unwrap(),
+            RestoreOptions {
+                address_gap: 200,
+                ..Default::default()
+            }
+        );
     }
 }

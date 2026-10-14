@@ -409,10 +409,9 @@ impl Wallet {
             .store
             .fidelity_bond
             .iter()
-            .enumerate()
-            .map(|(index, bond)| -> Result<serde_json::Value, WalletError> {
+            .map(|bond| -> Result<serde_json::Value, WalletError> {
                 let mut bond_info = serde_json::json!({
-                        "index": index,
+                        "index": bond.bond_index,
                         "outpoint": bond.outpoint.to_string(),
                         "amount": bond.amount.to_sat(),
                         "status": if bond.is_spent {"Redeemed"} else {"Live"}
@@ -470,13 +469,13 @@ impl Wallet {
             .store
             .fidelity_bond
             .iter()
-            .enumerate()
-            .filter_map(|(i, bond)| {
+            .filter_map(|bond| {
+                let i = bond.bond_index;
                 if !bond.is_spent {
                     match self.calculate_bond_value(bond, tip_height, tip_time) {
                         Ok(v) => {
                             log::info!("Fidelity Bond found | Index: {i} | Bond Value : {v}");
-                            Some((i as u32, v))
+                            Some((i, v))
                         }
                         Err(e) => {
                             log::error!("Fidelity valuation failed for index {i}:  {e:?} ");
@@ -508,12 +507,29 @@ impl Wallet {
 
     /// Derives the fidelity redeemscript from bond values at a given index.
     pub(crate) fn get_fidelity_reedemscript(&self, index: u32) -> Result<ScriptBuf, WalletError> {
-        let bond = self
-            .store
+        Ok(self.fidelity_bond(index)?.redeem_script())
+    }
+
+    /// The bond whose key derives at `index`. A restore can skip indexes,
+    /// so a bond's place in the list is not its index.
+    pub(crate) fn fidelity_bond(&self, index: u32) -> Result<&FidelityBond, WalletError> {
+        self.store
             .fidelity_bond
-            .get(index as usize)
-            .ok_or(FidelityError::BondDoesNotExist)?;
-        Ok(bond.redeem_script())
+            .iter()
+            .find(|bond| bond.bond_index == index)
+            .ok_or_else(|| FidelityError::BondDoesNotExist.into())
+    }
+
+    /// [`Self::fidelity_bond`], writable.
+    pub(crate) fn fidelity_bond_mut(
+        &mut self,
+        index: u32,
+    ) -> Result<&mut FidelityBond, WalletError> {
+        self.store
+            .fidelity_bond
+            .iter_mut()
+            .find(|bond| bond.bond_index == index)
+            .ok_or_else(|| FidelityError::BondDoesNotExist.into())
     }
 
     /// Get the next fidelity bond address. If no fidelity bond is created
@@ -522,9 +538,13 @@ impl Wallet {
         &self,
         locktime: LockTime,
     ) -> Result<(u32, Address, PublicKey), WalletError> {
-        // Check what was the last fidelity address index.
-        // Derive a fidelity address
-        let next_index = self.store.fidelity_bond.len() as u32;
+        let next_index = self
+            .store
+            .fidelity_bond
+            .iter()
+            .map(|bond| bond.bond_index + 1)
+            .max()
+            .unwrap_or(0);
 
         let fidelity_pubkey = PublicKey {
             compressed: true,
@@ -656,12 +676,7 @@ impl Wallet {
         index: u32,
         conf_height: u32,
     ) -> Result<(), WalletError> {
-        let bond = self
-            .store
-            .fidelity_bond
-            .get_mut(index as usize)
-            .ok_or(FidelityError::BondDoesNotExist)?;
-
+        let bond = self.fidelity_bond_mut(index)?;
         bond.conf_height = Some(conf_height);
         bond.tx = None;
 
@@ -684,14 +699,8 @@ impl Wallet {
             .store
             .fidelity_bond
             .iter()
-            .enumerate()
-            .filter_map(|(i, bond)| {
-                if !bond.is_spent && curr_height > bond.lock_time.to_consensus_u32() {
-                    Some(i as u32)
-                } else {
-                    None
-                }
-            })
+            .filter(|bond| !bond.is_spent && curr_height > bond.lock_time.to_consensus_u32())
+            .map(|bond| bond.bond_index)
             .collect::<Vec<_>>();
 
         expired_bond_indices.into_iter().try_for_each(|i| {
@@ -708,11 +717,7 @@ impl Wallet {
         maker_addr: &str,
     ) -> Result<FidelityProof, WalletError> {
         // Generate a fidelity bond proof from the fidelity data.
-        let bond = self
-            .store
-            .fidelity_bond
-            .get(index as usize)
-            .ok_or(FidelityError::BondDoesNotExist)?;
+        let bond = self.fidelity_bond(index)?;
         if bond.is_spent {
             return Err(FidelityError::BondAlreadyRedeemed.into());
         }
@@ -760,7 +765,7 @@ impl Wallet {
     }
 
     /// Rebuilds the bond records a backup does not carry, from the wallet's own
-    /// sends: the OP_RETURN gives the locktime, the seed gives the key per index.
+    /// sends: the OP_RETURN or a hint gives the locktime, the seed gives the key per index.
     pub(crate) fn recover_fidelity_bonds(&mut self) -> Result<bool, WalletError> {
         // Only our own send can fund a bond; anyone can pay us a lookalike.
         let txids: HashSet<Txid> = self
@@ -775,58 +780,111 @@ impl Wallet {
             })
             .map(|entry| entry.info.txid)
             .collect();
-        let mut candidates = Vec::new();
-        for txid in txids {
-            let tx = self.blockchain.get_raw_transaction(&txid, None)?;
-            let lock_time = tx
-                .output
-                .get(1)
-                .and_then(|out| extract_op_return_data(out.script_pubkey.as_bytes()))
-                .and_then(parse_fidelity_op_return)
-                .and_then(|announcement| {
-                    LockTime::from_height(announcement.expires_at_height).ok()
-                });
-            if let Some(lock_time) = lock_time {
-                candidates.push((tx, lock_time));
+        let txs = txids
+            .iter()
+            .map(|txid| self.blockchain.get_raw_transaction(txid, None))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let bonds = self.find_bonds(&txs)?;
+        let found = !bonds.is_empty();
+        for mut bond in bonds {
+            bond.is_spent = self
+                .blockchain
+                .is_confirmed_spend(&bond.outpoint, &bond.script_pub_key())?;
+            // Left unconfirmed with its tx, so maker startup fills in the height.
+            self.store.fidelity_bond.push(bond);
+        }
+        Ok(found)
+    }
+
+    /// The bonds `txs` pay that the store lacks, in index order: each restore
+    /// hint at its own index, then every announced locktime at each index,
+    /// until `bond_gap` indexes in a row past the last bond find nothing.
+    fn find_bonds(&self, txs: &[Transaction]) -> Result<Vec<FidelityBond>, WalletError> {
+        let Some(options) = &self.store.pending_restore else {
+            return Ok(Vec::new());
+        };
+        let mut taken: HashSet<u32> = self
+            .store
+            .fidelity_bond
+            .iter()
+            .map(|bond| bond.bond_index)
+            .collect();
+        let mut bonds = Vec::new();
+        for hint in &options.bond_hints {
+            if taken.contains(&hint.index) {
+                continue;
+            }
+            match self.find_bond(hint.index, &[hint.locktime], txs)? {
+                Some(bond) => {
+                    taken.insert(hint.index);
+                    bonds.push(bond);
+                }
+                None => log::warn!("Bond hint {hint:?} matches none of the wallet's sends"),
             }
         }
 
-        // Bond positions must equal their index, so stop at the first index
-        // no transaction pays to.
-        let found = self.store.fidelity_bond.len();
-        'next_index: loop {
-            for (tx, lock_time) in &candidates {
-                let (bond_index, address, pubkey) = self.get_next_fidelity_address(*lock_time)?;
-                let bond_out = &tx.output[0];
-                if bond_out.script_pubkey != address.script_pubkey() {
-                    continue;
+        let announced: Vec<LockTime> = txs
+            .iter()
+            .filter_map(|tx| {
+                let data = extract_op_return_data(tx.output.get(1)?.script_pubkey.as_bytes())?;
+                LockTime::from_height(parse_fidelity_op_return(data)?.expires_at_height).ok()
+            })
+            .collect();
+        let mut end = taken.iter().max().map_or(0, |index| index + 1) + options.bond_gap;
+        let mut index = 0;
+        while index < end {
+            if !taken.contains(&index) {
+                if let Some(bond) = self.find_bond(index, &announced, txs)? {
+                    end = end.max(index + 1 + options.bond_gap);
+                    bonds.push(bond);
                 }
-                let outpoint = OutPoint::new(tx.compute_txid(), 0);
-                let is_spent = self
-                    .blockchain
-                    .is_confirmed_spend(&outpoint, &bond_out.script_pubkey)?;
-                // Left unconfirmed with its tx, so maker startup fills in the height.
-                self.store.fidelity_bond.push(FidelityBond {
-                    outpoint,
-                    amount: bond_out.value,
+            }
+            index += 1;
+        }
+        bonds.sort_by_key(|bond| bond.bond_index);
+        Ok(bonds)
+    }
+
+    /// The first output in `txs` paying the bond at `index` with one of `lock_times`.
+    fn find_bond(
+        &self,
+        index: u32,
+        lock_times: &[LockTime],
+        txs: &[Transaction],
+    ) -> Result<Option<FidelityBond>, WalletError> {
+        let pubkey = PublicKey {
+            compressed: true,
+            inner: self.get_fidelity_keypair(index)?.public_key(),
+        };
+        Ok(lock_times.iter().find_map(|lock_time| {
+            let script = fidelity_redeemscript(lock_time, &pubkey).to_p2wsh();
+            txs.iter().find_map(|tx| {
+                let vout = tx
+                    .output
+                    .iter()
+                    .position(|out| out.script_pubkey == script)?;
+                Some(FidelityBond {
+                    outpoint: OutPoint::new(tx.compute_txid(), vout as u32),
+                    amount: tx.output[vout].value,
                     lock_time: *lock_time,
                     pubkey,
                     conf_height: None,
-                    is_spent,
-                    bond_index,
+                    is_spent: false,
+                    bond_index: index,
                     tx: Some(tx.clone()),
-                });
-                continue 'next_index;
-            }
-            return Ok(self.store.fidelity_bond.len() > found);
-        }
+                })
+            })
+        }))
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::wallet::{api::test_support::test_wallet, BondHint, RestoreOptions};
     use bitcoin::{bip32::Xpriv, secp256k1::SecretKey, transaction::Version, NetworkKind, TxOut};
+    use bitcoind::tempfile::tempdir;
 
     /// A proof that passes every other check, built the way a maker builds one:
     /// the bond key is derived from the tweak point at [2, bond_index].
@@ -1101,6 +1159,103 @@ mod test {
                 calculate_fidelity_value(value, locktime, confirmation_time, current_time)
             );
         }
+    }
+
+    #[cfg(not(feature = "integration-test"))]
+    const MAKER_ADDRESS: &str = "aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaea37ead.onion";
+    #[cfg(feature = "integration-test")]
+    const MAKER_ADDRESS: &str = "127.0.0.1:6102";
+
+    /// A transaction paying the bond at `index`, announced as a maker does or bare.
+    fn bond_tx(wallet: &Wallet, index: u32, lock_time: LockTime, announce: bool) -> Transaction {
+        let pubkey = PublicKey::new(wallet.get_fidelity_keypair(index).unwrap().public_key());
+        let mut output = vec![TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: fidelity_redeemscript(&lock_time, &pubkey).to_p2wsh(),
+        }];
+        if announce {
+            let data = wallet
+                .encode_fidelity_op_return(MAKER_ADDRESS, lock_time)
+                .unwrap();
+            let mut script = vec![0x6a, data.len() as u8];
+            script.extend_from_slice(&data);
+            output.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: script.into(),
+            });
+        }
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output,
+        }
+    }
+
+    /// Bonds at 1 and 4 leave 0, 2 and 3 empty: a gap of 3 crosses both holes,
+    /// a gap of 2 stops before 4. Bare bond 9 needs a hint with its locktime,
+    /// and then counts as used, so the gap reaches 12. Every lookup must then
+    /// go by index, never by place in the list.
+    #[test]
+    fn restore_finds_bonds_past_missing_indexes_and_by_hint() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let lock_time = |height| LockTime::from_height(height).unwrap();
+        let txs = [
+            bond_tx(&wallet, 1, lock_time(1000), true),
+            bond_tx(&wallet, 4, lock_time(1001), true),
+            bond_tx(&wallet, 9, lock_time(1002), false),
+            bond_tx(&wallet, 12, lock_time(1003), true),
+        ];
+        let hint = BondHint {
+            index: 9,
+            locktime: lock_time(1002),
+        };
+        let wrong_locktime = BondHint {
+            locktime: lock_time(1004),
+            ..hint
+        };
+        for (bond_gap, bond_hints, expected) in [
+            (3, vec![], vec![1, 4]),
+            (2, vec![], vec![1]),
+            (3, vec![wrong_locktime], vec![1, 4]),
+            (3, vec![wrong_locktime, hint], vec![1, 4, 9, 12]),
+        ] {
+            wallet.store.pending_restore = Some(RestoreOptions {
+                bond_gap,
+                bond_hints,
+                ..Default::default()
+            });
+            let found: Vec<u32> = wallet
+                .find_bonds(&txs)
+                .unwrap()
+                .iter()
+                .map(|bond| bond.bond_index)
+                .collect();
+            assert_eq!(found, expected, "gap {bond_gap}");
+        }
+        wallet.store.fidelity_bond = wallet.find_bonds(&txs).unwrap();
+        assert!(
+            wallet.find_bonds(&txs).unwrap().is_empty(),
+            "a resumed restore must not add a bond twice"
+        );
+        assert_eq!(
+            wallet.fidelity_bond(9).unwrap().outpoint,
+            OutPoint::new(txs[2].compute_txid(), 0)
+        );
+
+        // Signing takes the key and the script by index, so they must agree.
+        for index in [1, 4, 9, 12] {
+            let script = wallet.get_fidelity_reedemscript(index).unwrap();
+            let key = wallet.get_fidelity_keypair(index).unwrap().public_key();
+            assert_eq!(
+                read_pubkey_from_fidelity_script(&script).unwrap().inner,
+                key
+            );
+        }
+        assert!(wallet.fidelity_bond(0).is_err());
+        let (next, _, _) = wallet.get_next_fidelity_address(lock_time(1000)).unwrap();
+        assert_eq!(next, 13, "a new bond must not reuse a recovered key");
     }
 }
 

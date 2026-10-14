@@ -99,11 +99,7 @@ impl Wallet {
         feerate: f64,
         destination_address_type: AddressType,
     ) -> Result<(), WalletError> {
-        let bond = self
-            .store
-            .fidelity_bond
-            .get(idx as usize)
-            .ok_or(FidelityError::BondDoesNotExist)?;
+        let bond = self.fidelity_bond(idx)?;
 
         if bond.is_spent {
             log::info!("Fidelity bond already spent.");
@@ -134,12 +130,7 @@ impl Wallet {
                 // As a temporary fix, we mark the bond as redeemed and exit gracefully.
                 log::info!("Fidelity bond already spent.");
 
-                let bond = self
-                    .store
-                    .fidelity_bond
-                    .get_mut(idx as usize)
-                    .ok_or(FidelityError::BondDoesNotExist)?;
-                bond.is_spent = true;
+                self.fidelity_bond_mut(idx)?.is_spent = true;
 
                 return Ok(());
             }
@@ -153,15 +144,7 @@ impl Wallet {
         // No need to wait for confirmation as that will delay the rpc call. Just send back the txid.
 
         // mark is_spent
-        {
-            let bond = self
-                .store
-                .fidelity_bond
-                .get_mut(idx as usize)
-                .ok_or(FidelityError::BondDoesNotExist)?;
-
-            bond.is_spent = true;
-        }
+        self.fidelity_bond_mut(idx)?.is_spent = true;
 
         Ok(())
     }
@@ -219,11 +202,7 @@ impl Wallet {
                     total_input_value += utxo_data.amount;
                 }
                 UTXOSpendInfo::FidelityBondCoin { index, input_value } => {
-                    let bond = self
-                        .store
-                        .fidelity_bond
-                        .get(*index as usize)
-                        .ok_or(FidelityError::BondDoesNotExist)?;
+                    let bond = self.fidelity_bond(*index)?;
                     if bond.is_spent {
                         return Err(FidelityError::BondAlreadyRedeemed.into());
                     }

@@ -13,8 +13,8 @@ use electrsd::ElectrsD;
 use serde_json::{json, Value};
 
 use openswap::wallet::{
-    AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRPC, CoreRpcConfig, Destination,
-    Electrum, ElectrumConfig, RestoreOptions, Wallet, WalletBackup,
+    AddressType, AnyBlockchain, BackendConfig, Blockchain, BondHint, CoreRPC, CoreRpcConfig,
+    Destination, Electrum, ElectrumConfig, RestoreOptions, Wallet, WalletBackup,
 };
 
 use openswap::{
@@ -165,6 +165,90 @@ fn assert_restores_past_address_gaps(
     }
 }
 
+/// Locks a bare bond at index 0, as an API user can, then a maker's at index 1,
+/// both maturing in 10 blocks. Returns the hint that finds bond 0.
+fn create_sparse_bonds(wallet: &mut Wallet, bitcoind: &BitcoinD, wait: impl Fn()) -> BondHint {
+    let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
+    send_to_address(bitcoind, &addr, Amount::from_btc(0.1).unwrap());
+    generate_blocks(bitcoind, 1);
+    wait();
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    let (tip, _) = wallet.chain_tip().unwrap();
+    let locktime = LockTime::from_height(tip as u32 + 10).unwrap();
+    wallet
+        .create_fidelity(
+            Amount::from_btc(0.02).unwrap(),
+            locktime,
+            None,
+            MIN_RELAY_FEE_RATE,
+            AddressType::P2TR,
+        )
+        .unwrap();
+    generate_blocks(bitcoind, 1);
+    wait();
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    create_maker_bond(wallet, 10);
+    generate_blocks(bitcoind, 1);
+    wait();
+    BondHint { index: 0, locktime }
+}
+
+/// A plain restore must look past bare bond 0 to bond 1 and redeem it by its
+/// index; only the hint brings bond 0 back.
+fn assert_restores_sparse_bonds(
+    backup: &WalletBackup,
+    hint: BondHint,
+    dir: &Path,
+    backend: &BackendConfig,
+    km: &KeyMaterial,
+    bitcoind: &BitcoinD,
+    wait: impl Fn(),
+) {
+    let indexes = |wallet: &Wallet| -> Vec<u32> {
+        wallet
+            .get_fidelity_bonds()
+            .iter()
+            .map(|bond| bond.bond_index)
+            .collect()
+    };
+    let hinted = RestoreOptions {
+        bond_hints: vec![hint],
+        ..Default::default()
+    };
+    let with_hint = Wallet::restore_with(
+        backup,
+        &dir.join("restored-hint"),
+        backend,
+        km.clone(),
+        hinted,
+    )
+    .unwrap();
+    assert_eq!(indexes(&with_hint), [0, 1]);
+
+    let mut restored =
+        Wallet::restore(backup, &dir.join("restored-no-hint"), backend, km.clone()).unwrap();
+    assert_eq!(indexes(&restored), [1]);
+    assert_eq!(
+        restored.get_balances().unwrap().fidelity,
+        Amount::from_btc(0.02).unwrap()
+    );
+
+    generate_blocks(bitcoind, 10);
+    wait();
+    restored
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    restored
+        .redeem_fidelity(1, MIN_RELAY_FEE_RATE, AddressType::P2TR)
+        .unwrap();
+    generate_blocks(bitcoind, 1);
+    wait();
+    restored
+        .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+        .unwrap();
+    assert_eq!(restored.get_balances().unwrap().fidelity, Amount::ZERO);
+}
+
 /// Asserts the wallet file on disk is genuinely encrypted with the given
 /// passphrase: it must be an encrypted container, reject a wrong password,
 /// and open with the correct one. (The missing-password `PasswordRequired`
@@ -311,6 +395,32 @@ fn restore_finds_funds_past_address_gaps() {
     cleanup(&mut bitcoind, &root_dir);
 }
 
+#[test]
+fn restore_recovers_sparse_and_hinted_bonds() {
+    let (original_wallet, rpc_config, _, mut bitcoind, restored_wallet_file, root_dir) =
+        setup("restore_recovers_sparse_and_hinted_bonds".to_string());
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    let mut wallet = Wallet::init(
+        &original_wallet,
+        AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap()),
+        km.clone(),
+    )
+    .unwrap();
+
+    let hint = create_sparse_bonds(&mut wallet, &bitcoind, || {});
+    assert_restores_sparse_bonds(
+        &WalletBackup::from(&wallet),
+        hint,
+        restored_wallet_file.parent().unwrap(),
+        &BackendConfig::CoreRpc(rpc_config.clone()),
+        &km,
+        &bitcoind,
+        || {},
+    );
+
+    cleanup(&mut bitcoind, &root_dir);
+}
+
 /// Setup state for the Electrum-backed backup/restore tests.
 struct ElectrumSetup {
     original_wallet: PathBuf,
@@ -450,6 +560,33 @@ fn restore_finds_funds_past_address_gaps_electrum() {
         s.restored_wallet.parent().unwrap(),
         &BackendConfig::Electrum(s.electrum_cfg.clone()),
         &km,
+    );
+
+    drop(s.electrsd);
+    cleanup(&mut s.bitcoind, &s.root_dir);
+}
+
+#[test]
+fn restore_recovers_sparse_and_hinted_bonds_electrum() {
+    let mut s = setup_electrum("restore_recovers_sparse_and_hinted_bonds_electrum");
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    let mut wallet = Wallet::init(
+        &s.original_wallet,
+        AnyBlockchain::Electrum(Electrum::new(&s.electrum_cfg).unwrap()),
+        km.clone(),
+    )
+    .unwrap();
+
+    let wait = || wait_for_electrs_tip(&s.bitcoind, &s.electrsd, &s.electrum_cfg);
+    let hint = create_sparse_bonds(&mut wallet, &s.bitcoind, wait);
+    assert_restores_sparse_bonds(
+        &WalletBackup::from(&wallet),
+        hint,
+        s.restored_wallet.parent().unwrap(),
+        &BackendConfig::Electrum(s.electrum_cfg.clone()),
+        &km,
+        &s.bitcoind,
+        wait,
     );
 
     drop(s.electrsd);
