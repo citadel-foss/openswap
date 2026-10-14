@@ -7,6 +7,7 @@ use crate::{
 };
 
 use super::{
+    api::{ADDRESS_IMPORT_COUNT, MAX_WATCH_WINDOW, RESTORE_ADDRESS_GAP},
     blockchain::{AnyBlockchain, BackendConfig},
     storage::WalletStore,
 };
@@ -14,6 +15,46 @@ use bip39::Mnemonic;
 use bitcoin::{bip32::Xpriv, Network};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use zeroize::Zeroizing;
+
+/// The way back from a wallet file that cannot be used.
+pub const RESTORE_FROM_MNEMONIC_HINT: &str =
+    "restore the wallet from its seed phrase with `restore --mnemonic`";
+
+/// How far a restore searches. Saved in the wallet file until the first scan
+/// finishes, so a restore cut short resumes with the same options.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestoreOptions {
+    /// First block the Core rescan reads; `None` keeps the backup's, else genesis.
+    /// Not saved here: it becomes the wallet's own birthday.
+    #[serde(skip)]
+    pub birthday: Option<u64>,
+    /// Unused addresses in a row that end the search on each keychain.
+    pub address_gap: u32,
+}
+
+impl Default for RestoreOptions {
+    fn default() -> Self {
+        Self {
+            birthday: None,
+            address_gap: RESTORE_ADDRESS_GAP,
+        }
+    }
+}
+
+/// Open swaps a restore loses: their keys are random per swap and live only
+/// in the wallet file, never in a seed phrase or backup.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OpenSwapsSummary {
+    /// Incoming swap coins not swept yet.
+    pub incoming: usize,
+    /// Outgoing swap coins whose preimage we never learned.
+    pub outgoing: usize,
+    /// Swaps holding wallet coins for their funding.
+    pub swap_locks: usize,
+    /// Taker and maker Lightning swaps in progress.
+    pub lightning: usize,
+}
 
 /// Represents a wallet backup, containing all the necessary information to
 /// restore a wallet instance.
@@ -74,6 +115,23 @@ impl Wallet {
         Ok(())
     }
 
+    /// Restores a `Wallet` from this backup to a specified path, with the
+    /// default [`RestoreOptions`]. See [`Wallet::restore_with`].
+    pub fn restore(
+        wallet_backup: &WalletBackup,
+        wallet_path: &Path,
+        backend_config: &BackendConfig,
+        restored_enc_material: KeyMaterial,
+    ) -> Result<Wallet, WalletError> {
+        Self::restore_with(
+            wallet_backup,
+            wallet_path,
+            backend_config,
+            restored_enc_material,
+            RestoreOptions::default(),
+        )
+    }
+
     /// Restores a `Wallet` from this backup to a specified path.
     ///
     /// Initializes a new wallet instance using the data from the backup and syncs
@@ -89,12 +147,20 @@ impl Wallet {
     /// restored inside it under `wallet_backup.file_name`. The method
     /// initializes the wallet store, connects to the blockchain backend,
     /// syncs wallet data, and saves the state to disk.
-    pub fn restore(
+    pub fn restore_with(
         wallet_backup: &WalletBackup,
         wallet_path: &Path,
         backend_config: &BackendConfig,
         restored_enc_material: KeyMaterial,
+        options: RestoreOptions,
     ) -> Result<Wallet, WalletError> {
+        if !(ADDRESS_IMPORT_COUNT..=MAX_WATCH_WINDOW).contains(&options.address_gap) {
+            return Err(WalletError::General(format!(
+                "address gap {} is outside {ADDRESS_IMPORT_COUNT}..={MAX_WATCH_WINDOW}",
+                options.address_gap
+            )));
+        }
+
         // Directories and nameless paths restore under the backup's filename.
         // That name is untrusted input: accept exactly one normal component,
         // or `../x` escapes the directory and an absolute path replaces it.
@@ -151,13 +217,26 @@ impl Wallet {
             )));
         }
 
+        // A requested birthday above the tip is a typo or a node still syncing.
+        // A backup's own birthday keeps the old behaviour: rescan from genesis.
+        if let Some(birthday) = options.birthday {
+            let tip = blockchain.get_block_count()?;
+            if birthday > tip {
+                return Err(WalletError::General(format!(
+                    "birthday {birthday} is above the chain tip {tip}"
+                )));
+            }
+        }
+        let wallet_birthday = options.birthday.or(wallet_backup.wallet_birthday);
+
         // Initialise wallet
         let store = WalletStore::init(
             wallet_file_name,
             wallet_path,
             wallet_backup.network,
             wallet_backup.master_key,
-            wallet_backup.wallet_birthday,
+            wallet_birthday,
+            Some(options),
             &restored_enc_material,
         )?;
 
@@ -168,8 +247,6 @@ impl Wallet {
             store_enc_material: restored_enc_material,
             new_mnemonic: None,
             locked_utxos: std::collections::HashSet::new(),
-            // Flag to use the RESTORE_ADDRESS_GAP instead of normal gap while restoring.
-            restore_scan: true,
         };
         tmp_wallet.seal_master_key()?;
         tmp_wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
@@ -177,9 +254,9 @@ impl Wallet {
         Ok(tmp_wallet)
     }
 
-    /// Restores a `Wallet` from its BIP39 seed phrase, via [`Wallet::restore`].
+    /// Restores a `Wallet` from its BIP39 seed phrase, via [`Wallet::restore_with`].
     ///
-    /// `wallet_birthday` is a floor on the Bitcoin Core rescan — `None` scans from
+    /// `options.birthday` is a floor on the Bitcoin Core rescan — `None` scans from
     /// genesis, and the effective start may be up to 2h of blocks later. Electrum
     /// ignores it and never rescans.
     ///
@@ -189,31 +266,57 @@ impl Wallet {
     /// the first index without one. Live swap keys are per-swap `OsRng` and
     /// unrecoverable from any seed.
     pub fn restore_from_mnemonic(
-        phrase: &str,
+        phrase: Zeroizing<String>,
         wallet_path: &Path,
         backend_config: &BackendConfig,
-        wallet_birthday: Option<u64>,
+        options: RestoreOptions,
         restored_enc_material: KeyMaterial,
     ) -> Result<Wallet, WalletError> {
+        // A phrase carries no wallet name, so the path must name the file.
+        let file_name = match wallet_path.file_name().and_then(|name| name.to_str()) {
+            Some(name) if !wallet_path.is_dir() => name.to_string(),
+            _ => {
+                return Err(WalletError::General(format!(
+                    "{wallet_path:?} is not a wallet file path"
+                )))
+            }
+        };
+        let mnemonic = Mnemonic::parse(phrase.as_str())?;
+
         let network = AnyBlockchain::from_config(backend_config)?
             .get_blockchain_info()?
             .chain;
-
-        let file_name = wallet_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-
-        let mnemonic = Mnemonic::parse(phrase)?;
         let backup = WalletBackup {
             network,
             master_key: Wallet::master_key_from_mnemonic(&mnemonic, network)?,
-            wallet_birthday,
+            wallet_birthday: None,
             file_name,
         };
 
-        Wallet::restore(&backup, wallet_path, backend_config, restored_enc_material)
+        Wallet::restore_with(
+            &backup,
+            wallet_path,
+            backend_config,
+            restored_enc_material,
+            options,
+        )
+    }
+
+    /// Checks a seed phrase's words and checksum before anything else is asked.
+    pub fn validate_mnemonic(phrase: &str) -> Result<(), WalletError> {
+        Mnemonic::parse(phrase)?;
+        Ok(())
+    }
+
+    /// Counts the open swaps a restore would lose, for backup and restore warnings.
+    pub fn open_swaps_summary(&self) -> OpenSwapsSummary {
+        let (incoming, outgoing) = self.find_unfinished_swapcoins();
+        OpenSwapsSummary {
+            incoming: incoming.len(),
+            outgoing: outgoing.len(),
+            swap_locks: self.store.swap_locks.len(),
+            lightning: self.store.ln_pending_swaps.len() + self.store.ln_maker_swaps.len(),
+        }
     }
 
     /// Interactively restores a wallet from a backup file.
@@ -323,9 +426,24 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::CoreRpcConfig;
+    use crate::wallet::{
+        api::test_support::test_wallet,
+        storage::{
+            LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap, SwapReservation,
+        },
+        swapcoin::IncomingSwapCoin,
+        CoreRpcConfig,
+    };
     use bip39::rand::{thread_rng, Rng};
+    use bitcoin::{
+        absolute::LockTime,
+        hashes::{sha256, Hash},
+        secp256k1::SecretKey,
+        transaction::Version,
+        Amount, PublicKey, ScriptBuf, Transaction,
+    };
     use bitcoind::tempfile::tempdir;
+    use std::collections::HashSet;
 
     fn dummy_backup(file_name: &str) -> WalletBackup {
         let seed: [u8; 16] = thread_rng().gen();
@@ -335,6 +453,86 @@ mod tests {
             wallet_birthday: None,
             file_name: file_name.to_string(),
         }
+    }
+
+    /// Each kind of open swap lands in its own count; a fresh wallet has none.
+    #[test]
+    fn open_swaps_summary_counts_each_kind() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        assert_eq!(wallet.open_swaps_summary(), OpenSwapsSummary::default());
+
+        let key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let pubkey = PublicKey::new(wallet.get_fidelity_keypair(0).unwrap().public_key());
+        let contract_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let store = &mut wallet.store;
+        store.incoming_swapcoins.insert(
+            "incoming".to_string(),
+            IncomingSwapCoin::new_legacy(
+                key,
+                pubkey,
+                contract_tx,
+                ScriptBuf::new(),
+                key,
+                Amount::ZERO,
+                1,
+            ),
+        );
+        store.swap_locks.insert(
+            "lock".to_string(),
+            SwapReservation {
+                outpoints: HashSet::new(),
+                reserved_at: 0,
+            },
+        );
+        store.ln_pending_swaps.insert(
+            "taker-ln".to_string(),
+            LnPendingSwap {
+                is_swap_in: true,
+                preimage: None,
+                redeemscript: ScriptBuf::new(),
+                locktime: 0,
+                privkey: key,
+                outpoint: None,
+                value: None,
+            },
+        );
+        store.ln_maker_swaps.insert(
+            "maker-ln".to_string(),
+            LnMakerSwapRecord {
+                direction: LnMakerDirection::SwapIn,
+                phase: LnMakerPhase::InAccepted,
+                payment_hash: sha256::Hash::all_zeros(),
+                amount: Amount::ZERO,
+                fee: Amount::ZERO,
+                locktime: 0,
+                min_confirmations: 1,
+                redeemscript: ScriptBuf::new(),
+                privkey: key,
+                invoice: String::new(),
+                preimage: None,
+                refund_txid: None,
+                accepted_height: None,
+                payout_script: None,
+                funding_outpoint: None,
+                funding_value: None,
+                funding_height: None,
+            },
+        );
+        assert_eq!(
+            wallet.open_swaps_summary(),
+            OpenSwapsSummary {
+                incoming: 1,
+                outgoing: 0,
+                swap_locks: 1,
+                lightning: 2,
+            }
+        );
     }
 
     /// A backup whose `file_name` traverses or is absolute must be rejected
@@ -357,6 +555,52 @@ mod tests {
                 err.to_string().contains("not a plain file name"),
                 "{}: {}",
                 bad,
+                err
+            );
+        }
+    }
+
+    /// A directory path or an out-of-range gap must fail before the backend
+    /// is touched (none runs here).
+    #[test]
+    fn restore_rejects_bad_options_before_touching_the_backend() {
+        let dir = tempdir().unwrap();
+        let backend = BackendConfig::CoreRpc(CoreRpcConfig::default());
+        let phrase = Zeroizing::new(
+            "abandon abandon abandon abandon abandon abandon \
+             abandon abandon abandon abandon abandon about"
+                .to_string(),
+        );
+        let err = Wallet::restore_from_mnemonic(
+            phrase,
+            dir.path(),
+            &backend,
+            RestoreOptions::default(),
+            KeyMaterial::new_ephemeral(),
+        )
+        .expect_err("a directory is not a wallet file");
+        assert!(
+            err.to_string().contains("not a wallet file path"),
+            "{}",
+            err
+        );
+
+        for address_gap in [ADDRESS_IMPORT_COUNT - 1, MAX_WATCH_WINDOW + 1] {
+            let err = Wallet::restore_with(
+                &dummy_backup("wallet"),
+                &dir.path().join("wallet"),
+                &backend,
+                KeyMaterial::new_ephemeral(),
+                RestoreOptions {
+                    address_gap,
+                    ..Default::default()
+                },
+            )
+            .expect_err("the gap is out of range");
+            assert!(
+                err.to_string().contains("is outside"),
+                "{}: {}",
+                address_gap,
                 err
             );
         }

@@ -13,7 +13,7 @@ use crate::{
     wallet::UTXOSpendInfo,
 };
 
-use super::{error::WalletError, fidelity::FidelityBond};
+use super::{backup::RestoreOptions, error::WalletError, fidelity::FidelityBond};
 
 use bitcoin::{bip32::Xpriv, Network, OutPoint, ScriptBuf};
 use serde::{Deserialize, Serialize};
@@ -210,6 +210,11 @@ pub(crate) struct WalletStore {
 
     pub(super) wallet_birthday: Option<u64>,
 
+    /// Set until a restore's first scan finishes, so a restart resumes that
+    /// scan with the options the user chose.
+    #[serde(default)]
+    pub(super) pending_restore: Option<RestoreOptions>,
+
     /// Maps transaction outpoints to their associated UTXO and spend information.
     #[serde(default)] // Ensures deserialization works if `utxo_cache` is missing
     pub(super) utxo_cache: HashMap<OutPoint, (ListUnspentResultEntry, UTXOSpendInfo)>,
@@ -366,6 +371,7 @@ impl WalletStore {
         network: Network,
         master_key: Xpriv,
         wallet_birthday: Option<u64>,
+        pending_restore: Option<RestoreOptions>,
         store_enc_material: &KeyMaterial,
     ) -> Result<Self, WalletError> {
         let mut store = Self {
@@ -383,6 +389,7 @@ impl WalletStore {
             fidelity_bond: Vec::new(),
             last_synced_height: None,
             wallet_birthday,
+            pending_restore,
             utxo_cache: HashMap::new(),
             swap_locks: HashMap::new(),
             ln_pending_swaps: HashMap::new(),
@@ -475,6 +482,7 @@ mod tests {
             Network::Bitcoin,
             master_key,
             None,
+            None,
             &encryption_material,
         )
         .unwrap();
@@ -543,6 +551,7 @@ mod tests {
             Network::Bitcoin,
             xpriv,
             None,
+            None,
             &encryption_material,
         )
         .unwrap();
@@ -575,6 +584,7 @@ mod tests {
             Network::Bitcoin,
             master_key,
             None,
+            None,
             &encryption_material,
         )
         .unwrap();
@@ -603,6 +613,7 @@ mod tests {
             &file_path,
             Network::Bitcoin,
             master_key,
+            None,
             None,
             &encryption_material,
         )

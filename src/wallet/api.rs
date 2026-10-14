@@ -54,6 +54,7 @@ use rust_coinselect::{
 };
 
 use super::{
+    backup::RestoreOptions,
     blockchain::{AnyBlockchain, Blockchain, HdOrigin},
     error::WalletError,
     storage::{AddressType, WalletStore},
@@ -68,7 +69,7 @@ use super::{
 /// the rolling watch/import window always extends this many unused addresses
 /// beyond the last used one per keychain (see [`Wallet::max_watch_index`]).
 pub(crate) const ADDRESS_IMPORT_COUNT: u32 = 20;
-/// Wider gap used while syncing a wallet restored from backup. The backup
+/// Default gap used while syncing a wallet restored from backup. The backup
 /// carries no hand-out counters, so index gaps left by aborted multi-tx
 /// funding (see [`Wallet::get_next_internal_addresses`]) must be bridged by
 /// scanning alone; a run of unused indices longer than the gap would otherwise
@@ -78,7 +79,7 @@ pub(crate) const RESTORE_ADDRESS_GAP: u32 = 100;
 /// Hard caps on the rolling-gap sync loop: a server inventing UTXOs at ever
 /// higher indices must not keep the loop or the watch window growing forever.
 const MAX_SYNC_PASSES: u32 = 100;
-const MAX_WATCH_WINDOW: u32 = 100_000;
+pub(crate) const MAX_WATCH_WINDOW: u32 = 100_000;
 /// script-path: sig+preimage+script+control_block (~154)
 const TAPROOT_SCRIPTPATH_VSIZE: u64 = 155;
 /// ≈141 + 1 (growing block-height)
@@ -112,10 +113,6 @@ pub struct Wallet {
     pub(super) new_mnemonic: Option<SecretMnemonic>,
     /// Wallet-side set of outpoints excluded from coin selection.
     pub(crate) locked_utxos: HashSet<OutPoint>,
-    /// Transient (never persisted): widens the gap-limit window to
-    /// [`RESTORE_ADDRESS_GAP`] during restore or when reopening a wallet whose
-    /// first scan never saved a height.
-    pub(crate) restore_scan: bool,
 }
 
 /// Manual impl: `AnyBlockchain` (and the encryption material) carry no useful
@@ -490,6 +487,7 @@ impl Wallet {
             network,
             master_key,
             Some(wallet_birthday),
+            None,
             &store_enc_material,
         )?;
         log::info!(
@@ -503,7 +501,6 @@ impl Wallet {
             store_enc_material,
             new_mnemonic: Some(SecretMnemonic(mnemonic)),
             locked_utxos: HashSet::new(),
-            restore_scan: false,
         })
     }
 
@@ -552,26 +549,26 @@ impl Wallet {
     ) -> Result<Self, WalletError> {
         let password = password.filter(|p| !p.is_empty());
 
-        let (store, store_enc_material) = match WalletStore::read_from_disk(path, password.clone())
-        {
-            Ok((store, Some(material))) => (store, material),
-            // Cleartext wallet files are not supported at all.
-            Ok((_, None)) => {
-                return Err(WalletError::General(format!(
-                    "wallet file {path:?} is unencrypted; \
+        let (mut store, store_enc_material) =
+            match WalletStore::read_from_disk(path, password.clone()) {
+                Ok((store, Some(material))) => (store, material),
+                // Cleartext wallet files are not supported at all.
+                Ok((_, None)) => {
+                    return Err(WalletError::General(format!(
+                        "wallet file {path:?} is unencrypted; \
                          cleartext wallet files are not supported"
-                )))
-            }
-            // Encrypted file, no passphrase supplied. Report how to supply
-            // one instead of failing decryption with an empty passphrase.
-            Err(WalletError::Security(SecurityError::PasswordRequired)) => {
-                return Err(WalletError::General(format!(
-                    "wallet file {path:?} is encrypted; \
+                    )))
+                }
+                // Encrypted file, no passphrase supplied. Report how to supply
+                // one instead of failing decryption with an empty passphrase.
+                Err(WalletError::Security(SecurityError::PasswordRequired)) => {
+                    return Err(WalletError::General(format!(
+                        "wallet file {path:?} is encrypted; \
                          provide the wallet passphrase via -p/--PASSWORD"
-                )))
-            }
-            Err(e) => return Err(e),
-        };
+                    )))
+                }
+                Err(e) => return Err(e),
+            };
         // Wipe the cleartext passphrase; only the derived key material is kept.
         if let Some(mut p) = password {
             p.zeroize();
@@ -606,7 +603,11 @@ impl Wallet {
         );
         // The first restore writes the encrypted file before its scan. A file
         // without a saved tip must finish that scan before it is usable.
-        let restore_scan = store.last_synced_height.is_none();
+        if store.last_synced_height.is_none() {
+            store
+                .pending_restore
+                .get_or_insert_with(RestoreOptions::default);
+        }
         let mut wallet = Self {
             blockchain,
             wallet_file_path: path.to_path_buf(),
@@ -614,7 +615,6 @@ impl Wallet {
             store_enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
-            restore_scan,
         };
         wallet.seal_master_key()?;
         Ok(wallet)
@@ -632,7 +632,7 @@ impl Wallet {
         let wallet = if path.exists() {
             // wallet already exists, load the wallet
             let mut wallet = Wallet::load(path, blockchain, password)?;
-            if wallet.restore_scan {
+            if wallet.store.pending_restore.is_some() {
                 log::warn!("Wallet at {path:?} has an unfinished first scan; resuming it");
                 wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
             }
@@ -2606,7 +2606,8 @@ impl Wallet {
         // A backup carries no hand-out counters, and an emptied address leaves no
         // UTXO to find, so the loop above stops at the first spent-out run. Script
         // history still remembers those addresses, so probe forward on it.
-        if self.restore_scan && self.blockchain.is_electrum() {
+        if let (Some(restore), true) = (&self.store.pending_restore, self.blockchain.is_electrum())
+        {
             let secp = crate::utill::global_secp();
             let mut accounts = Vec::with_capacity(2);
             for address_type in [AddressType::P2WPKH, AddressType::P2TR] {
@@ -2625,7 +2626,7 @@ impl Wallet {
             let mut empty_run = 0;
             // The window cap is only checked after this returns, so stop probing
             // at it too - otherwise a server claiming history everywhere loops on.
-            while empty_run < RESTORE_ADDRESS_GAP && probe <= MAX_WATCH_WINDOW {
+            while empty_run < restore.address_gap && probe <= MAX_WATCH_WINDOW {
                 let mut has_history = false;
                 for (address_type, account) in &accounts {
                     let script = derive_child_script(account, *address_type, keychain, probe)?;
@@ -2659,11 +2660,11 @@ impl Wallet {
         // the UTXO scan can't see addresses that are handed out but not yet
         // funded, and the store counters can't see on-chain funds past them.
         let used = self.find_hd_next_index(keychain)?.max(handed_out);
-        let gap = if self.restore_scan {
-            RESTORE_ADDRESS_GAP
-        } else {
-            ADDRESS_IMPORT_COUNT
-        };
+        let gap = self
+            .store
+            .pending_restore
+            .as_ref()
+            .map_or(ADDRESS_IMPORT_COUNT, |restore| restore.address_gap);
         Ok(used + gap - 1)
     }
 
@@ -4357,12 +4358,12 @@ impl Wallet {
         self.sync_no_fail(shutdown)?;
         // A backup carries no bond records. Rebuild them, then rescan from the
         // birthday so Core finds their coins.
-        if self.restore_scan && self.recover_fidelity_bonds()? {
+        if self.store.pending_restore.is_some() && self.recover_fidelity_bonds()? {
             self.store.last_synced_height = None;
             self.sync_no_fail(shutdown)?;
         }
+        self.store.pending_restore = None;
         self.save_to_disk()?;
-        self.restore_scan = false;
         log::info!("Synced & Saved {:?}", self.store.file_name);
         Ok(())
     }
@@ -4456,7 +4457,7 @@ impl Wallet {
 
         let mut descriptors_to_import = self.descriptors_to_import()?;
 
-        if descriptors_to_import.is_empty() && !self.restore_scan {
+        if descriptors_to_import.is_empty() && self.store.pending_restore.is_none() {
             // Nothing new to import, but the chain may have moved: refresh state.
             Self::check_shutdown(shutdown)?;
             self.update_utxo_cache(self.get_all_utxo_from_blockchain()?)?;
@@ -4487,7 +4488,7 @@ impl Wallet {
         // A resumed restore may have imported its full descriptor range before
         // the process died. Recheck those already-imported scripts from the
         // birthday instead of mistaking an empty import list for a full scan.
-        if self.restore_scan && descriptors_to_import.is_empty() {
+        if self.store.pending_restore.is_some() && descriptors_to_import.is_empty() {
             Self::check_shutdown(shutdown)?;
             self.blockchain.rescan_wallet_from(last_synced_height)?;
             // The rescan can reveal a UTXO near the old range boundary, so
@@ -4777,6 +4778,7 @@ pub(crate) mod test_support {
             bitcoin::Network::Regtest,
             master_key,
             None,
+            None,
             &enc_material,
         )
         .unwrap();
@@ -4791,7 +4793,6 @@ pub(crate) mod test_support {
             store_enc_material: enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
-            restore_scan: false,
         }
     }
 }
@@ -5052,7 +5053,7 @@ mod prevout_contract_tests {
 #[cfg(test)]
 mod restore_history_probe_tests {
     use super::*;
-    use crate::wallet::blockchain::Electrum;
+    use crate::wallet::{blockchain::Electrum, BackendConfig};
     use bitcoin::{
         consensus::encode::serialize_hex,
         hashes::{sha256, Hash},
@@ -5063,6 +5064,7 @@ mod restore_history_probe_tests {
         io::{BufRead, BufReader, Write as IoWrite},
         net::TcpListener,
     };
+    use zeroize::Zeroizing;
 
     const MASTER_SEED: [u8; 32] = [42; 32];
 
@@ -5139,9 +5141,9 @@ mod restore_history_probe_tests {
         url
     }
 
-    fn account_for(address_type: AddressType) -> Xpub {
+    fn account_for(seed: &[u8], address_type: AddressType) -> Xpub {
         let secp = crate::utill::global_secp();
-        let master = Xpriv::new_master(bitcoin::Network::Regtest, &MASTER_SEED).unwrap();
+        let master = Xpriv::new_master(bitcoin::Network::Regtest, seed).unwrap();
         let account = master
             .derive_priv(
                 secp,
@@ -5149,6 +5151,13 @@ mod restore_history_probe_tests {
             )
             .unwrap();
         Xpub::from_priv(secp, &account)
+    }
+
+    fn electrum_config(url: String) -> crate::wallet::ElectrumConfig {
+        crate::wallet::ElectrumConfig {
+            url,
+            ..Default::default()
+        }
     }
 
     fn stub_wallet(path: &Path, url: String) -> Wallet {
@@ -5160,14 +5169,11 @@ mod restore_history_probe_tests {
             bitcoin::Network::Regtest,
             master_key,
             None,
+            Some(RestoreOptions::default()),
             &enc_material,
         )
         .unwrap();
-        let electrum = Electrum::new(&crate::wallet::ElectrumConfig {
-            url,
-            ..Default::default()
-        })
-        .expect("connect to stub");
+        let electrum = Electrum::new(&electrum_config(url)).expect("connect to stub");
 
         Wallet {
             blockchain: AnyBlockchain::Electrum(electrum),
@@ -5176,7 +5182,6 @@ mod restore_history_probe_tests {
             store_enc_material: enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
-            restore_scan: true,
         }
     }
 
@@ -5188,7 +5193,7 @@ mod restore_history_probe_tests {
         let temp_dir = tempdir().unwrap();
         let external = KeychainKind::External;
         let funded = |address_type, index| {
-            let account = account_for(address_type);
+            let account = account_for(&MASTER_SEED, address_type);
             let script =
                 derive_child_script(&account, address_type, external, index).expect("derive");
             scripthash_hex(&script)
@@ -5207,52 +5212,118 @@ mod restore_history_probe_tests {
             "history probing must reach the P2TR-only index past the hole"
         );
 
+        // The hole is 59 unused addresses: a gap of 60 bridges it, 59 does not.
+        for (address_gap, expected) in [(60, 61), (59, 1)] {
+            wallet.store.pending_restore = Some(RestoreOptions {
+                address_gap,
+                ..Default::default()
+            });
+            let next = wallet.find_hd_next_index(external).unwrap();
+            assert_eq!(next, expected, "gap {address_gap}");
+        }
+
         // Without the restore flag the probe is off and the empty UTXO set decides.
-        wallet.restore_scan = false;
+        wallet.store.pending_restore = None;
         assert_eq!(wallet.find_hd_next_index(external).unwrap(), 0);
     }
 
+    /// A file from an older restore has no saved options and resumes at the
+    /// default gap of 100, which misses index 150; the saved gap of 200 finds it.
     #[test]
     fn interrupted_restore_finishes_before_wallet_is_loaded() {
-        let temp_dir = tempdir().unwrap();
-        let path = temp_dir.path().join("restore-probe-test");
         let script = derive_child_script(
-            &account_for(AddressType::P2TR),
+            &account_for(&MASTER_SEED, AddressType::P2TR),
             AddressType::P2TR,
             KeychainKind::External,
-            60,
+            150,
         )
         .unwrap();
-        let url = start_stub(StdHashSet::from([scripthash_hex(&script)]));
-        let password = "restore-test-password".to_string();
-        let material = KeyMaterial::new_from_password(Some(password.clone())).unwrap();
-        let master = Xpriv::new_master(bitcoin::Network::Regtest, &MASTER_SEED).unwrap();
-        // This is the on-disk state after restore created the file but before
-        // its first scan saved a height.
-        WalletStore::init(
-            path.file_name().unwrap().to_str().unwrap().to_string(),
+        let wider = RestoreOptions {
+            address_gap: 200,
+            ..Default::default()
+        };
+        for (pending_restore, expected) in [(None, 0), (Some(wider), 151)] {
+            let temp_dir = tempdir().unwrap();
+            let path = temp_dir.path().join("restore-probe-test");
+            let url = start_stub(StdHashSet::from([scripthash_hex(&script)]));
+            let password = "restore-test-password".to_string();
+            let material = KeyMaterial::new_from_password(Some(password.clone())).unwrap();
+            let master = Xpriv::new_master(bitcoin::Network::Regtest, &MASTER_SEED).unwrap();
+            // This is the on-disk state after restore created the file but before
+            // its first scan saved a height.
+            WalletStore::init(
+                path.file_name().unwrap().to_str().unwrap().to_string(),
+                &path,
+                bitcoin::Network::Regtest,
+                master,
+                None,
+                pending_restore,
+                &material,
+            )
+            .unwrap();
+
+            let backend = AnyBlockchain::Electrum(Electrum::new(&electrum_config(url)).unwrap());
+            let wallet = Wallet::load_or_init(&path, backend, Some(password.clone())).unwrap();
+            assert_eq!(wallet.store.external_index, expected);
+
+            let (saved, _) = WalletStore::read_from_disk(&path, Some(password)).unwrap();
+            assert_eq!(saved.external_index, expected);
+            assert!(saved.last_synced_height.is_some());
+            assert!(saved.pending_restore.is_none());
+        }
+    }
+
+    /// The phrase alone must give the key and, with a wide enough gap, the
+    /// coins at index 150 that the default gap of 100 cannot reach.
+    #[test]
+    fn restore_from_mnemonic_uses_the_phrase_key_and_gap() {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon \
+                              abandon abandon abandon abandon abandon about";
+        let mnemonic = Mnemonic::parse(PHRASE).unwrap();
+        let script = derive_child_script(
+            &account_for(&mnemonic.to_seed(""), AddressType::P2TR),
+            AddressType::P2TR,
+            KeychainKind::External,
+            150,
+        )
+        .unwrap();
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("mnemonic-wallet");
+        let backend = BackendConfig::Electrum(electrum_config(start_stub(StdHashSet::from([
+            scripthash_hex(&script),
+        ]))));
+
+        // The stub's tip is the genesis block, height 0.
+        let err = Wallet::restore_from_mnemonic(
+            Zeroizing::new(PHRASE.to_string()),
             &path,
-            bitcoin::Network::Regtest,
-            master,
-            None,
-            &material,
+            &backend,
+            RestoreOptions {
+                birthday: Some(1),
+                ..Default::default()
+            },
+            KeyMaterial::new_ephemeral(),
+        )
+        .expect_err("a birthday above the tip is rejected");
+        assert!(err.to_string().contains("above the chain tip"), "{}", err);
+        assert!(!path.exists());
+
+        let wallet = Wallet::restore_from_mnemonic(
+            Zeroizing::new(PHRASE.to_string()),
+            &path,
+            &backend,
+            RestoreOptions {
+                address_gap: 200,
+                ..Default::default()
+            },
+            KeyMaterial::new_ephemeral(),
         )
         .unwrap();
-
-        let backend = AnyBlockchain::Electrum(
-            Electrum::new(&crate::wallet::ElectrumConfig {
-                url,
-                ..Default::default()
-            })
-            .unwrap(),
+        assert_eq!(wallet.store.external_index, 151);
+        assert_eq!(
+            wallet.with_master_key(|key| Ok(*key)).unwrap(),
+            Wallet::master_key_from_mnemonic(&mnemonic, bitcoin::Network::Regtest).unwrap()
         );
-        let wallet = Wallet::load_or_init(&path, backend, Some(password.clone())).unwrap();
-        assert_eq!(wallet.store.external_index, 61);
-        assert!(!wallet.restore_scan);
-
-        let (saved, _) = WalletStore::read_from_disk(&path, Some(password)).unwrap();
-        assert_eq!(saved.external_index, 61);
-        assert!(saved.last_synced_height.is_some());
     }
 
     /// Proves a stopped sync returns before making its first backend request.
@@ -5498,6 +5569,7 @@ mod timelock_reconcile_tests {
             bitcoin::Network::Regtest,
             master_key,
             None,
+            None,
             &enc_material,
         )
         .unwrap();
@@ -5508,7 +5580,6 @@ mod timelock_reconcile_tests {
             store_enc_material: enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
-            restore_scan: false,
         }
     }
 
