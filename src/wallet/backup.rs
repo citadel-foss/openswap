@@ -176,7 +176,11 @@ impl Wallet {
         let backup_file_content = serde_json::to_string_pretty(&encrypted)?;
         // Atomic replace: never truncate an existing backup before the new
         // one is durable on disk.
-        let parent = backup_path.parent().unwrap_or_else(|| Path::new("."));
+        // A bare file name has an empty parent; use the current directory.
+        let parent = backup_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
         tmp.write_all(backup_file_content.as_bytes())?;
         tmp.as_file().sync_all()?;
