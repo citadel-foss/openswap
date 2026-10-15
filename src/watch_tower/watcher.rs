@@ -613,6 +613,12 @@ impl<R: Role> Watcher<R> {
                 }
             }
         });
+        // Every watch ahead of the one that stopped the pass has left the
+        // queue, so it is first. Moving it last lets the next pass reach the
+        // others, so one that never resolves cannot hold them back.
+        if stopped {
+            pending_reconcile.rotate_left(1);
+        }
     }
 
     /// Scan the node mempool into the registry.
@@ -1466,6 +1472,95 @@ mod tests {
             .unwrap()
             .iter()
             .any(|watch| watch.outpoint == outpoint && watch.in_block)
+    }
+
+    /// A watch Core can never resolve must not hold back the watches queued
+    /// behind it: here its funding transaction is mined but has no output at
+    /// that index, so every lookup comes back undecided.
+    #[test]
+    fn undecided_watch_does_not_starve_the_queue() {
+        let funding = spend(OutPoint::new(Txid::from_byte_array([9; 32]), 0));
+        let undecided = OutPoint::new(funding.compute_txid(), 5);
+        let spent = OutPoint::new(Txid::from_byte_array([2; 32]), 0);
+        let spender = spend(spent);
+        let node = Arc::new(Mutex::new(Node::default()));
+        {
+            let mut node = node.lock().unwrap();
+            node.mine(Vec::new());
+            node.mine(vec![funding]);
+            node.mempool.push(spender.clone());
+        }
+        let (url, _calls) = mock_node(&node);
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        for outpoint in [undecided, spent] {
+            watcher.handle_command(WatcherCommand::RegisterWatchRequest {
+                outpoint,
+                script_pubkey: ScriptBuf::new(),
+            });
+        }
+        watcher.pending_reconcile = vec![undecided, spent];
+
+        watcher.retry_pending_work();
+        watcher.retry_pending_work();
+
+        assert_eq!(recorded_spend(&watcher, spent), Some(spender));
+        assert_eq!(recorded_spend(&watcher, undecided), None);
+        assert_eq!(watcher.pending_reconcile, [undecided]);
+    }
+
+    /// A lookup that keeps failing for one outpoint must not hold back the
+    /// watches queued behind it, while each pass still stops at its first
+    /// failure.
+    #[test]
+    fn failing_watch_does_not_starve_the_queue() {
+        let failing = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let spent = OutPoint::new(Txid::from_byte_array([2; 32]), 0);
+        let spender = spend(spent);
+        let node = Node {
+            mempool: vec![spender.clone()],
+            ..Node::default()
+        };
+        // Calls served so far, and how many had been served when the latest
+        // failure was returned.
+        let served = Arc::new(AtomicU64::new(0));
+        let served_at_failure = Arc::new(AtomicU64::new(0));
+        let (url, _calls) = mock_core_rpc({
+            let (served, served_at_failure) = (served.clone(), served_at_failure.clone());
+            move |method, params| {
+                let count = served.fetch_add(1, Ordering::SeqCst) + 1;
+                if method == "gettxspendingprevout" && params[0][0]["txid"] == json!(failing.txid) {
+                    served_at_failure.store(count, Ordering::SeqCst);
+                    return Err(json!({ "code": -1, "message": "lookup failed" }));
+                }
+                node.answer(method, params)
+            }
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        for outpoint in [failing, spent] {
+            watcher.handle_command(WatcherCommand::RegisterWatchRequest {
+                outpoint,
+                script_pubkey: ScriptBuf::new(),
+            });
+        }
+        watcher.pending_reconcile = vec![failing, spent];
+
+        for _ in 0..2 {
+            watcher.retry_pending_work();
+            // The failing lookup is the last call of every pass.
+            assert_eq!(
+                served.load(Ordering::SeqCst),
+                served_at_failure.load(Ordering::SeqCst)
+            );
+        }
+
+        assert_eq!(recorded_spend(&watcher, spent), Some(spender));
+        assert_eq!(watcher.pending_reconcile, [failing]);
     }
 
     /// A spend recorded as confirmed costs one lookup, to prove its block is
