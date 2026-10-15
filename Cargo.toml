@@ -51,6 +51,7 @@ minreq = { version = "2.12.0", features = ["https"] }
 flate2 = {version = "1.0.35"}
 tar = {version = "0.4.43"}
 electrsd = { version = "0.28", features = ["electrs_0_9_11"] }
+openswap-test-macros = { path = "tests/macros" }
 
 #Empty default feature set, (helpful to generalise in github actions)
 [features]

@@ -73,10 +73,11 @@ Extensive functional testing simulates various protocol edge cases:
 
 ```console
 # needs nostr-rs-relay on PATH (cargo install nostr-rs-relay)
-cargo test --features=integration-test -- --nocapture
+# and cargo-nextest (cargo install cargo-nextest --locked)
+cargo nextest run --features integration-test
 ```
 
-The [Test Framework](./tests/integration/test_framework/mod.rs) spawns toy marketplaces in Bitcoin regtest to test swap scenarios. Each test in [tests/integration](./tests/integration/) covers different edge cases. Start with [standard_swap](./tests/integration/standard_swap.rs) to understand programmatic simulation.
+The [Test Framework](./tests/test_framework/) spawns toy marketplaces in Bitcoin regtest to test swap scenarios. The tests in [tests/integration](./tests/integration/) are grouped by topic; its [README](./tests/integration/README.md) explains how to write and run them. Start with [swap/standard](./tests/integration/swap/standard.rs) to understand programmatic simulation.
 
 ## Contributing
 

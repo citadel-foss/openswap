@@ -1,0 +1,29 @@
+# nextest profiles for the test suite.
+#
+# Integration tests spawn bitcoind, a nostr relay and (on Electrum) electrs per
+# test, and the abort-recovery tests wait out timelocks, so many run for several
+# minutes. Locally `slow-timeout` only flags them; the ci profile below also
+# kills a test that runs past 18m.
+
+[profile.default]
+slow-timeout = "3m"
+
+# CI runs the suite in 8 partitions, each running its tests in parallel; a
+# partition that takes an hour is hung. Selected with NEXTEST_PROFILE=ci (cargo
+# llvm-cov keeps --profile for itself).
+[profile.ci]
+global-timeout = "1h"
+# GitHub's runners have 4 cores, but these tests mostly wait on bitcoind,
+# electrs and timelocks rather than compute, so two per core keep the runner
+# busy. Lower it if tests start timing out under load.
+test-threads = 8
+# Kill a test after six slow periods (18m) so a hang fails that test with its
+# output instead of the whole partition at the global timeout. The longest test,
+# fidelity::creation::bond_creation_and_redemption, takes about 11m.
+slow-timeout = { period = "3m", terminate-after = 6 }
+# Output is captured so tests can run in parallel, and printed as one block
+# per test when it finishes: every test's logs reach the job log without
+# interleaving. A failing or killed test's output is printed again in the final
+# summary.
+failure-output = "immediate-final"
+success-output = "immediate"
