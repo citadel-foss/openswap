@@ -1073,7 +1073,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart() {
     let raw_tx = format!("-zmqpubrawtx={zmq_addr}");
     let block_hash = format!("-zmqpubrawblock={zmq_addr}");
     let new_bitcoind = spawn_replacement_bitcoind(
-        test_framework.temp_dir.join(".bitcoin"),
+        test_framework.bitcoind_datadir.clone(),
         &[
             "-persistmempool=0",
             "-walletbroadcast=0",
@@ -1302,7 +1302,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum() {
     // backend no node-side wallet tracks the bond tx. No ZMQ args either:
     // electrs talks to the node over RPC/p2p only.)
     let new_bitcoind = spawn_replacement_bitcoind(
-        test_framework.temp_dir.join(".bitcoin"),
+        test_framework.bitcoind_datadir.clone(),
         &["-persistmempool=0"],
     );
 
@@ -1349,7 +1349,7 @@ fn test_evicted_fidelity_bond_rebroadcast_on_restart_electrum() {
     // to index the block (the background miner stays paused: it talks to the
     // dead node).
     generate_blocks(&new_bitcoind, 1);
-    let _ = new_electrsd.trigger();
+    new_electrsd.trigger();
     wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
 
     assert_single_adopted_bond(&restarted, bond_txid);

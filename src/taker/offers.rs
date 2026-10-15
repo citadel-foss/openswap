@@ -2392,15 +2392,64 @@ mod tests {
     }
 
     #[test]
+    fn later_offerbook_write_replaces_existing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("offerbook.json");
+        let mut book = OfferBook::default();
+        book.write_to_disk(&path).unwrap();
+        assert!(OfferBook::read_from_disk(&path).unwrap().makers.is_empty());
+
+        book.makers.push(candidate(addr("6104")));
+        book.write_to_disk(&path).unwrap();
+        assert_eq!(OfferBook::read_from_disk(&path).unwrap().makers.len(), 1);
+    }
+
+    #[test]
     fn failed_offerbook_write_preserves_existing_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("offerbook.json");
         let mut book = OfferBook::default();
         book.write_to_disk(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
 
-        std::fs::create_dir(path.with_extension("partial")).unwrap();
         book.makers.push(candidate(addr("6104")));
-        assert!(book.write_to_disk(&path).is_err());
+
+        // A unique staging name no longer collides with a `*.partial` directory.
+        // Force the replacement itself to fail and prove the previous file stays.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            struct RestoreWrite<'a>(&'a std::path::Path);
+            impl Drop for RestoreWrite<'_> {
+                fn drop(&mut self) {
+                    if let Ok(metadata) = std::fs::metadata(self.0) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(0o755);
+                        let _ = std::fs::set_permissions(self.0, perms);
+                    }
+                }
+            }
+            let _restore = RestoreWrite(dir.path());
+            let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(dir.path(), perms).unwrap();
+            assert!(book.write_to_disk(&path).is_err());
+        }
+
+        #[cfg(windows)]
+        {
+            use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+            // Share read and write, but not delete, so MoveFileExW cannot
+            // replace the destination.
+            let _guard = OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2)
+                .open(&path)
+                .unwrap();
+            assert!(book.write_to_disk(&path).is_err());
+        }
+
+        assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(OfferBook::read_from_disk(&path).unwrap().makers.is_empty());
     }
 

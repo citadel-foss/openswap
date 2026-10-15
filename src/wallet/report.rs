@@ -732,7 +732,7 @@ fn discover_wallet_name(data_dir: &Path, role: SwapRole) -> String {
             if name.ends_with(REPORT_SUFFIX)
                 || name.ends_with(".lock")
                 || name.ends_with(".partial")
-                || name.ends_with(".tmp")
+                || name.starts_with(".openswap-staging-")
             {
                 None
             } else {

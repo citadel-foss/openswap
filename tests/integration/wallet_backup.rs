@@ -9,7 +9,6 @@ use bitcoind::{
     bitcoincore_rpc::{self, Auth},
     BitcoinD,
 };
-use electrsd::ElectrsD;
 
 use openswap::wallet::{
     AddressType, AnyBlockchain, BackendConfig, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
@@ -23,6 +22,7 @@ use openswap::{
 
 use super::test_framework::{
     generate_blocks, init_bitcoind, init_electrsd, send_to_address, wait_for_electrs_tip,
+    TestElectrs,
 };
 
 fn setup(test_name: String) -> (PathBuf, CoreRpcConfig, PathBuf, BitcoinD, PathBuf, PathBuf) {
@@ -216,7 +216,7 @@ struct ElectrumSetup {
     electrum_cfg: ElectrumConfig,
     bitcoind: BitcoinD,
     /// Owns the electrs child process for the lifetime of the test.
-    electrsd: ElectrsD,
+    electrsd: TestElectrs,
     root_dir: PathBuf,
 }
 
@@ -238,7 +238,7 @@ fn setup_electrum(test_name: &str) -> ElectrumSetup {
     let electrsd = init_electrsd(&bitcoind, &temp_dir);
     let electrum_url = format!("tcp://{}", electrsd.electrum_url);
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let _ = electrsd.trigger();
+    electrsd.trigger();
 
     ElectrumSetup {
         original_wallet: wallets_dir.join(&original_wallet_name),

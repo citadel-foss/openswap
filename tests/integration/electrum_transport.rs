@@ -160,7 +160,7 @@ impl Forwarder {
 
 struct Setup {
     bitcoind: BitcoinD,
-    _electrsd: electrsd::ElectrsD,
+    _electrsd: super::test_framework::TestElectrs,
     forwarder: Forwarder,
     root_dir: std::path::PathBuf,
 }
@@ -395,7 +395,7 @@ fn wait_for_tip(s: &Setup, electrum: &Electrum) {
     let expected = s.bitcoind.client.get_block_count().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        let _ = s._electrsd.trigger();
+        s._electrsd.trigger();
         if electrum
             .get_block_count()
             .map(|tip| tip >= expected)

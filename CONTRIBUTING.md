@@ -116,6 +116,14 @@ cargo test
 cargo test --features integration-test -- --nocapture
 ```
 
+On Windows, CI keeps the Windows build check and runs the standard Legacy and
+Taproot swap scenarios with both Bitcoind and Electrum. The full integration
+suite remains covered by Linux CI. To run the same focused Windows tests
+locally, use `./scripts/test-integration-windows.ps1`; it keeps Cargo offline
+and needs local Bitcoin Core files plus `ELECTRS_EXEC` pointing to a local
+electrs executable. Pass `-Filter '<test-name>'` for a filtered run, or
+`-FullSuite` to opt into all tests.
+
 We also strongly recommend manually testing affected flows on **regtest** (e.g. standard_swap, multi-hop, failure cases).
 
 ## Pull Requests
