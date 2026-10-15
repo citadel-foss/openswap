@@ -38,6 +38,9 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(unix)]
+use std::os::fd::AsFd;
+
 static LOGGER: OnceLock<()> = OnceLock::new();
 
 /// Process-wide `Secp256k1<All>` context. `Secp256k1::new()` allocates a ~1.5 MiB
@@ -860,7 +863,11 @@ impl Drop for RawModeGuard {
 /// character with `*` as feedback.
 pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
     let mut stdout = io::stdout();
-    let stdin = io::stdin();
+    // Read the terminal directly: `Stdin`'s buffer would keep a pasted secret unwiped.
+    #[cfg(unix)]
+    let mut stdin = fs::File::from(io::stdin().as_fd().try_clone_to_owned()?);
+    #[cfg(not(unix))]
+    let mut stdin = io::stdin();
 
     print!("{message}");
     stdout.flush()?; // Ensure the prompt is printed
@@ -870,7 +877,7 @@ pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
     let mut password = Zeroizing::new(Vec::with_capacity(256));
     let mut buf = Zeroizing::new([0u8; 1]);
 
-    while lock_debug!(stdin.lock()).read(&mut *buf)? == 1 {
+    while stdin.read(&mut *buf)? == 1 {
         let c = buf[0] as char;
 
         match c {

@@ -1,10 +1,9 @@
 use bitcoind::bitcoincore_rpc::Auth;
 use clap::{Parser, Subcommand};
 use openswap::{
-    lock_debug,
     maker::{bind_port_retry, start_server, MakerError, MakerServer, MakerServerConfig},
-    utill::{parse_proxy_auth, print_new_wallet_seed, setup_maker_logger},
-    wallet::{BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions},
+    utill::{parse_proxy_auth, setup_maker_logger},
+    wallet::{BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions, Wallet},
 };
 use std::{path::PathBuf, sync::Arc};
 use zeroize::Zeroizing;
@@ -196,21 +195,14 @@ fn main() -> Result<(), MakerError> {
     config.rpc_port = rpc_port;
     config.write_to_file(&config_path)?;
 
+    let wallet_path = config.data_dir.join("wallets").join(&config.wallet_name);
+    Wallet::init_interactive(
+        &wallet_path,
+        &config.backend,
+        wallet_password.as_deref().cloned(),
+    )?;
     config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
     let maker = Arc::new(MakerServer::init(config)?);
-
-    // Display and consume the mnemonic phrase. On failure, create a new wallet to get a new phrase.
-    if let Some(mnemonic) = lock_debug!(maker.wallet.write())
-        .unwrap()
-        .take_new_mnemonic()
-    {
-        print_new_wallet_seed(&mnemonic).inspect_err(|e| {
-            log::error!(
-                "Failed to display new wallet seed phrase: {e}. \
-                 Delete the wallet and re-create it to get a new phrase."
-            );
-        })?;
-    }
 
     start_server(maker)?;
 

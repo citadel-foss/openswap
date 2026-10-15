@@ -301,12 +301,12 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   On creation, the wallet's mnemonic seed phrase is displayed once on the terminal — back it up securely before continuing:
 
   ```bash
+  INFO openswap::wallet::api - New Wallet created at : "$HOME/.openswap/maker/wallets/maker"
+
   ========== New Wallet Seed Phrase ==========
   harvest trust catalog degree oxygen business crawl enemy hamster music this idle
 
   Write these words down and store them offline. They will not be shown again.
-
-  INFO openswap::wallet::api - New Wallet created at : "$HOME/.openswap/maker/wallets/maker"
   ```
 
 - **Configuration File**: If no `config` file exists, `makerd` will create a default `config.toml` file at `$HOME/.openswap/maker/config.toml`:

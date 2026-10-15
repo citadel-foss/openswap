@@ -4144,8 +4144,9 @@ mod tests {
             };
             let min = min_swap_amount(&config);
             assert_eq!(min % MIN_SWAP_STEP_SATS, 0);
-            assert!(kept(min) >= cost, "{:?}", config);
-            assert!(kept(min - MIN_SWAP_STEP_SATS) < cost, "{:?}", config);
+            let fees = (base_fee, amount_pct, time_pct);
+            assert!(kept(min) >= cost, "{:?}", fees);
+            assert!(kept(min - MIN_SWAP_STEP_SATS) < cost, "{:?}", fees);
         }
         // Fees the formula cannot price leave no minimum; startup refuses these.
         for amount_pct in [f64::NAN, 100.0, -1000.0] {

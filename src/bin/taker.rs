@@ -9,7 +9,7 @@ use openswap::{
         error::TakerError, format_state, MakerOfferCandidate, MakerState, SwapParams, Taker,
         TakerConfig, TakerInitConfig,
     },
-    utill::{parse_proxy_auth, print_new_wallet_seed, setup_taker_logger, MAX_TX_COUNT, UTXO},
+    utill::{parse_proxy_auth, setup_taker_logger, MAX_TX_COUNT, UTXO},
     wallet::{AddressType, BondHint, CoreRpcConfig, RestoreOptions, Wallet},
 };
 use serde_json::{json, to_string_pretty};
@@ -504,6 +504,12 @@ fn main() -> Result<(), TakerError> {
         return Ok(());
     }
 
+    Wallet::init_interactive(
+        &data_dir.join("wallets").join(&wallet_name),
+        &backend,
+        wallet_password.as_deref().cloned(),
+    )?;
+
     // CLI wins where a flag exists; the file fills in the rest.
     let config = TakerInitConfig {
         data_dir: Some(data_dir),
@@ -523,19 +529,6 @@ fn main() -> Result<(), TakerError> {
     .with_backend(backend.clone());
 
     let mut taker = Taker::init(config)?;
-
-    // Display and consume the mnemonic phrase. On failure, create a new wallet to get a new phrase.
-    if let Some(mnemonic) = lock_debug!(taker.get_wallet().write())
-        .unwrap()
-        .take_new_mnemonic()
-    {
-        print_new_wallet_seed(&mnemonic).inspect_err(|e| {
-            log::error!(
-                "Failed to display new wallet seed phrase: {e}. \
-                 Delete the wallet and re-create it to get a new phrase."
-            );
-        })?;
-    }
 
     // Sync wallet after initialization. Blocklist edits only touch the local
     // JSON file, so they skip the chain sync.

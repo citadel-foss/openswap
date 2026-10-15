@@ -483,29 +483,28 @@ impl Blockchain for CoreRPC {
     /// verbatim from the pre-refactor `Wallet::sync` Core bootstrap so behaviour
     /// is unchanged; only invoked on the Core sync path.
     fn prepare_backend_wallet(&self, wallet_name: &str) -> Result<(), WalletError> {
+        // Older nodes lack `listdescriptors` and `tr()`, so sync would fail
+        // and retry forever, whatever kind of wallet the node holds.
+        if self.rpc.version()? < 220_000 {
+            return Err(WalletError::CoreTooOld);
+        }
         if self.rpc.list_wallets()?.contains(&wallet_name.to_string()) {
             log::debug!("wallet already loaded: {wallet_name}");
         } else if list_wallet_dir(&self.rpc)?.contains(&wallet_name.to_string()) {
             self.rpc.load_wallet(wallet_name)?;
             log::debug!("wallet loaded: {wallet_name}");
         } else {
-            // pre-0.21 uses legacy wallets
-            if self.rpc.version()? < 210_000 {
-                self.rpc
-                    .create_wallet(wallet_name, Some(true), None, None, None)?;
-            } else {
-                // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/issues/225 is
-                // still open, so we issue the call directly to request a descriptor wallet.
-                let args = [
-                    Value::String(wallet_name.to_string()),
-                    Value::Bool(true),  // Disable Private Keys
-                    Value::Bool(false), // Create a blank wallet
-                    Value::Null,        // Optional Passphrase
-                    Value::Bool(false), // Avoid Reuse
-                    Value::Bool(true),  // Descriptor Wallet
-                ];
-                let _: Value = self.rpc.call("createwallet", &args)?;
-            }
+            // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/issues/225 is
+            // still open, so we issue the call directly to request a descriptor wallet.
+            let args = [
+                Value::String(wallet_name.to_string()),
+                Value::Bool(true),  // Disable Private Keys
+                Value::Bool(false), // Create a blank wallet
+                Value::Null,        // Optional Passphrase
+                Value::Bool(false), // Avoid Reuse
+                Value::Bool(true),  // Descriptor Wallet
+            ];
+            let _: Value = self.rpc.call("createwallet", &args)?;
             log::debug!("wallet created: {wallet_name}");
         }
         Ok(())
@@ -550,13 +549,7 @@ impl Blockchain for CoreRPC {
         struct Descriptors {
             descriptors: Vec<Listed>,
         }
-        // -32601: no such method. Core 0.21 has descriptor wallets but not this call.
-        let listed: Descriptors = match self.rpc.call("listdescriptors", &[]) {
-            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -32601 => {
-                return Err(WalletError::CoreTooOld)
-            }
-            listed => listed?,
-        };
+        let listed: Descriptors = self.rpc.call("listdescriptors", &[])?;
         // Core lists the range end inclusive, so `end == last_index` covers it.
         Ok(listed
             .descriptors
@@ -691,12 +684,7 @@ mod tests {
                         .1
                         .clone();
                     seen.push(method);
-                    // A canned `{"error": ..}` is sent as Core's error reply.
-                    let (result, error) = match result.get("error") {
-                        Some(error) => (Value::Null, error.clone()),
-                        None => (result, Value::Null),
-                    };
-                    let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result, "error": error })
+                    let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result, "error": null })
                         .to_string();
                     write!(
                         writer,
@@ -746,24 +734,16 @@ mod tests {
         }
     }
 
-    /// Core 0.21 makes descriptor wallets but has no `listdescriptors`.
+    /// Core 0.21 has no `listdescriptors`, and its default wallets are legacy:
+    /// the version is refused before any wallet is loaded or inspected.
     #[test]
-    fn imported_range_covers_reports_core_without_listdescriptors() {
-        let (core, server) = mock_core(vec![
-            (
-                "getwalletinfo",
-                json!({ "walletname": "w", "descriptors": true }),
-            ),
-            (
-                "listdescriptors",
-                json!({ "error": { "code": -32601, "message": "Method not found" } }),
-            ),
-        ]);
+    fn prepare_backend_wallet_refuses_core_before_v22() {
+        let (core, server) = mock_core(vec![("getnetworkinfo", json!({ "version": 210100 }))]);
         assert!(matches!(
-            core.imported_range_covers("wpkh(xpub/0/*)", 99),
+            core.prepare_backend_wallet("w"),
             Err(WalletError::CoreTooOld)
         ));
-        server.join().unwrap();
+        assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
     }
 
     #[test]

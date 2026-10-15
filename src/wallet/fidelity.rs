@@ -1,7 +1,7 @@
 use crate::{
     protocol::common_messages::FidelityProof,
     utill::redeemscript_to_scriptpubkey,
-    wallet::{infer_address_type, AddressType, Blockchain, Wallet},
+    wallet::{infer_address_type, storage::SecretXpriv, AddressType, Blockchain, Wallet},
     watch_tower::utils::{extract_op_return_data, parse_fidelity_op_return},
 };
 use bitcoin::{
@@ -490,8 +490,13 @@ impl Wallet {
             .map(|(i, _)| i))
     }
 
-    /// Get the [`Keypair`] for the fidelity bond at given index.
-    pub(crate) fn get_fidelity_keypair(&self, index: u32) -> Result<Keypair, WalletError> {
+    /// Runs `f` with the [`Keypair`] of the fidelity bond at `index`, erasing
+    /// the key pair and the extended key it came from afterwards.
+    pub(crate) fn with_fidelity_keypair<T>(
+        &self,
+        index: u32,
+        f: impl FnOnce(&Keypair) -> Result<T, WalletError>,
+    ) -> Result<T, WalletError> {
         let secp = Secp256k1::new();
 
         let derivation_path = DerivationPath::from_str(FIDELITY_DERIVATION_PATH)?;
@@ -499,9 +504,11 @@ impl Wallet {
         let child_derivation_path = derivation_path.child(ChildNumber::Normal { index });
 
         self.with_master_key(|mk| {
-            Ok(mk
-                .derive_priv(&secp, &child_derivation_path)?
-                .to_keypair(&secp))
+            let child = SecretXpriv(mk.derive_priv(&secp, &child_derivation_path)?);
+            let mut keypair = child.0.to_keypair(&secp);
+            let result = f(&keypair);
+            keypair.non_secure_erase();
+            result
         })
     }
 
@@ -548,7 +555,7 @@ impl Wallet {
 
         let fidelity_pubkey = PublicKey {
             compressed: true,
-            inner: self.get_fidelity_keypair(next_index)?.public_key(),
+            inner: self.with_fidelity_keypair(next_index, |keypair| Ok(keypair.public_key()))?,
         };
 
         Ok((
@@ -722,16 +729,15 @@ impl Wallet {
             return Err(FidelityError::BondAlreadyRedeemed.into());
         }
 
-        let fidelity_privkey = self.get_fidelity_keypair(index)?.secret_key();
         let (_, tweakable_point, _) = self.get_tweakable_keypair()?;
 
         let cert_hash = bond.generate_cert_hash(maker_addr, &tweakable_point);
 
         let secp = Secp256k1::new();
-        let cert_sig = secp.sign_ecdsa_low_r(
-            &Message::from_digest_slice(cert_hash.as_byte_array())?,
-            &fidelity_privkey,
-        );
+        let msg = Message::from_digest_slice(cert_hash.as_byte_array())?;
+        let cert_sig = self.with_fidelity_keypair(index, |keypair| {
+            Ok(secp.sign_ecdsa_low_r(&msg, &keypair.secret_key()))
+        })?;
 
         let mut bond = bond.clone();
         // The stored raw transaction is a local rebroadcast fallback, not part
@@ -872,7 +878,7 @@ impl Wallet {
     ) -> Result<Option<FidelityBond>, WalletError> {
         let pubkey = PublicKey {
             compressed: true,
-            inner: self.get_fidelity_keypair(index)?.public_key(),
+            inner: self.with_fidelity_keypair(index, |keypair| Ok(keypair.public_key()))?,
         };
         Ok(lock_times.iter().find_map(|lock_time| {
             let script = fidelity_redeemscript(lock_time, &pubkey).to_p2wsh();
@@ -1185,7 +1191,11 @@ mod test {
 
     /// A transaction paying the bond at `index`, announced as a maker does or bare.
     fn bond_tx(wallet: &Wallet, index: u32, lock_time: LockTime, announce: bool) -> Transaction {
-        let pubkey = PublicKey::new(wallet.get_fidelity_keypair(index).unwrap().public_key());
+        let pubkey = PublicKey::new(
+            wallet
+                .with_fidelity_keypair(index, |keypair| Ok(keypair.public_key()))
+                .unwrap(),
+        );
         let mut output = vec![TxOut {
             value: Amount::from_sat(50_000),
             script_pubkey: fidelity_redeemscript(&lock_time, &pubkey).to_p2wsh(),
@@ -1302,7 +1312,9 @@ mod test {
         // Signing takes the key and the script by index, so they must agree.
         for index in [1, 4, 9, 12] {
             let script = wallet.get_fidelity_reedemscript(index).unwrap();
-            let key = wallet.get_fidelity_keypair(index).unwrap().public_key();
+            let key = wallet
+                .with_fidelity_keypair(index, |keypair| Ok(keypair.public_key()))
+                .unwrap();
             assert_eq!(
                 read_pubkey_from_fidelity_script(&script).unwrap().inner,
                 key

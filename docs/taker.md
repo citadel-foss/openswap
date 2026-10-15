@@ -556,7 +556,7 @@ From your seed phrase:
 $ taker -w <wallet_name> restore --mnemonic
 ```
 
-The command asks for the phrase at a hidden prompt. It never takes the phrase as an argument. It then asks for a passphrase to encrypt the new wallet file. Without `-w`, the wallet is named `taker-wallet`. OpenSwap has no BIP39 passphrase, so a wallet made with one elsewhere will restore as an empty wallet.
+The command first asks for a passphrase to encrypt the new wallet file. Then it asks for the phrase at a hidden prompt. It never takes the phrase as an argument. Without `-w`, the wallet is named `taker-wallet`. OpenSwap has no BIP39 passphrase, so a wallet made with one elsewhere will restore as an empty wallet.
 
 A restore refuses to overwrite an existing wallet. Pick a new name or move the old file.
 

@@ -41,9 +41,9 @@ use crate::{
     protocol::{contract::create_multisig_redeemscript, ProtocolVersion},
     utill::{
         capped_fee, compute_checksum, fee_at_rate_sats, generate_keypair,
-        get_hd_path_from_descriptor, now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL,
-        LEGACY_CONTRACT_SPEND_VSIZE, MIN_RELAY_FEE_RATE, TAPROOT_KEYPATH_VSIZE,
-        TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
+        get_hd_path_from_descriptor, now_secs, print_new_wallet_seed, redeemscript_to_scriptpubkey,
+        HEART_BEAT_INTERVAL, LEGACY_CONTRACT_SPEND_VSIZE, MIN_RELAY_FEE_RATE,
+        TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
     },
 };
 
@@ -55,7 +55,7 @@ use rust_coinselect::{
 
 use super::{
     backup::RestoreOptions,
-    blockchain::{AnyBlockchain, Blockchain, HdOrigin},
+    blockchain::{AnyBlockchain, BackendConfig, Blockchain, HdOrigin},
     error::WalletError,
     storage::{AddressType, SecretXpriv, WalletStore},
     swapcoin::{contract_timelock, WatchOnlySwapCoin},
@@ -94,7 +94,16 @@ pub struct SecretMnemonic(Mnemonic);
 impl SecretMnemonic {
     /// Callers must not log or persist the result.
     pub fn words(&self) -> Zeroizing<String> {
-        Zeroizing::new(self.0.to_string())
+        // Sized up front: a growing string frees unwiped copies of the words.
+        let size = self.0.words().map(|word| word.len() + 1).sum();
+        let mut phrase = Zeroizing::new(String::with_capacity(size));
+        for word in self.0.words() {
+            if !phrase.is_empty() {
+                phrase.push(' ');
+            }
+            phrase.push_str(word);
+        }
+        phrase
     }
 }
 
@@ -562,6 +571,8 @@ impl Wallet {
             }
             Err(e) => return Err(e),
         };
+        // An older file may hold the key in plaintext; seal it before any backend call.
+        store.master_key.seal(&store_enc_material)?;
         if let AnyBlockchain::CoreRPC(core) = &blockchain {
             if core.wallet_name() != store.file_name {
                 return Err(WalletError::General(format!(
@@ -596,16 +607,14 @@ impl Wallet {
                 .pending_restore
                 .get_or_insert_with(RestoreOptions::default);
         }
-        let mut wallet = Self {
+        Ok(Self {
             blockchain,
             wallet_file_path: path.to_path_buf(),
             store,
             store_enc_material,
             new_mnemonic: None,
             locked_utxos: HashSet::new(),
-        };
-        wallet.seal_master_key()?;
-        Ok(wallet)
+        })
     }
 
     /// Loads an existing wallet from the given path or initializes a new one if none exists.
@@ -648,19 +657,33 @@ impl Wallet {
         Ok(wallet)
     }
 
+    /// Creates a missing wallet for the CLI and shows its seed phrase at once,
+    /// so no later startup failure can drop a phrase the user never saw.
+    pub fn init_interactive(
+        path: &Path,
+        backend: &BackendConfig,
+        password: Option<String>,
+    ) -> Result<(), WalletError> {
+        if path.exists() {
+            return Ok(());
+        }
+        let mut wallet = Self::load_or_init(path, AnyBlockchain::from_config(backend)?, password)?;
+        if let Some(mnemonic) = wallet.take_new_mnemonic() {
+            print_new_wallet_seed(&mnemonic).inspect_err(|e| {
+                log::error!(
+                    "Failed to display new wallet seed phrase: {e}. \
+                     Delete the wallet and re-create it to get a new phrase."
+                );
+            })?;
+        }
+        // Save a tip, or the next load resumes this wallet as an unfinished restore.
+        wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)
+    }
+
     /// Persist wallet data to disk, creating missing parent directories and file as needed.
     pub(crate) fn save_to_disk(&self) -> Result<(), WalletError> {
         self.store
             .write_to_disk(&self.wallet_file_path, &self.store_enc_material)
-    }
-
-    /// Seals the master key in memory under the wallet's encryption material
-    /// and erases the plaintext copy. Called once at wallet construction
-    /// (load/restore; `WalletStore::init` seals before its first write);
-    /// afterwards the plaintext key only exists transiently inside
-    /// [`Wallet::with_master_key`].
-    pub(crate) fn seal_master_key(&mut self) -> Result<(), WalletError> {
-        self.store.master_key.seal(&self.store_enc_material)
     }
 
     /// Runs `f` with the plaintext master key, unsealing the in-memory key
@@ -2932,11 +2955,13 @@ impl Wallet {
                     address_type,
                     ..
                 } => {
-                    let mut privkey = self.with_account_key(address_type, |account| {
-                        Ok(account
-                            .derive_priv(&secp, &DerivationPath::from_str(&path)?)?
-                            .private_key)
+                    // Wiped on drop, so an early `?` below cannot skip it.
+                    let child = self.with_account_key(address_type, |account| {
+                        Ok(SecretXpriv(
+                            account.derive_priv(&secp, &DerivationPath::from_str(&path)?)?,
+                        ))
                     })?;
+                    let privkey = &child.0.private_key;
 
                     match address_type {
                         AddressType::P2WPKH => {
@@ -2956,7 +2981,7 @@ impl Wallet {
                             //https://en.bitcoin.it/wiki/Privacy#Wallet_fingerprinting
                             let signature = secp.sign_ecdsa_low_r(
                                 &secp256k1::Message::from_digest_slice(&sighash[..])?,
-                                &privkey,
+                                privkey,
                             );
                             let mut sig_serialised = signature.serialize_der().to_vec();
                             sig_serialised.push(EcdsaSighashType::All as u8);
@@ -2964,8 +2989,6 @@ impl Wallet {
                             input.witness.push(pubkey.to_bytes());
                         }
                         AddressType::P2TR => {
-                            let mut keypair = Keypair::from_secret_key(&secp, &privkey);
-
                             // Calculate taproot key-spend sighash using all prevouts
                             let sighash = SighashCache::new(&tx_clone)
                                 .taproot_key_spend_signature_hash(
@@ -2974,15 +2997,17 @@ impl Wallet {
                                     TapSighashType::Default,
                                 )?;
 
-                            let tweaked_keypair = keypair.tap_tweak(&secp, None);
+                            // Nothing between building and erasing the key pairs can fail.
+                            let mut keypair = Keypair::from_secret_key(&secp, privkey);
+                            let mut tweaked = keypair.tap_tweak(&secp, None).to_keypair();
                             let msg = secp256k1::Message::from(sighash);
-                            let signature = secp.sign_schnorr(&msg, &tweaked_keypair.to_keypair());
+                            let signature = secp.sign_schnorr(&msg, &tweaked);
 
                             input.witness.push(signature.as_ref());
                             keypair.non_secure_erase();
+                            tweaked.non_secure_erase();
                         }
                     }
-                    privkey.non_secure_erase();
                 }
                 UTXOSpendInfo::TimelockContract {
                     swapcoin_multisig_redeemscript,
@@ -3017,7 +3042,6 @@ impl Wallet {
                     input.witness = spend_tx.input[0].witness.clone();
                 }
                 UTXOSpendInfo::FidelityBondCoin { index, input_value } => {
-                    let privkey = self.get_fidelity_keypair(index)?.secret_key();
                     let redeemscript = self.get_fidelity_reedemscript(index)?;
                     let sighash = SighashCache::new(&tx_clone).p2wsh_signature_hash(
                         ix,
@@ -3025,10 +3049,10 @@ impl Wallet {
                         input_value,
                         EcdsaSighashType::All,
                     )?;
-                    let sig = secp.sign_ecdsa_low_r(
-                        &secp256k1::Message::from_digest_slice(&sighash[..])?,
-                        &privkey,
-                    );
+                    let msg = secp256k1::Message::from_digest_slice(&sighash[..])?;
+                    let sig = self.with_fidelity_keypair(index, |keypair| {
+                        Ok(secp.sign_ecdsa_low_r(&msg, &keypair.secret_key()))
+                    })?;
 
                     let mut sig_serialised = sig.serialize_der().to_vec();
                     sig_serialised.push(EcdsaSighashType::All as u8);
@@ -4965,6 +4989,8 @@ mod prevout_contract_tests {
 
         let words: Zeroizing<String> = wallet.take_new_mnemonic().unwrap().words();
         assert_eq!(words.as_str(), TEST_PHRASE);
+        // Sized to one byte over the phrase, so the buffer never had to grow.
+        assert_eq!(words.capacity(), TEST_PHRASE.len() + 1);
         assert!(
             wallet.take_new_mnemonic().is_none(),
             "the phrase must be dropped from the wallet after the first take"

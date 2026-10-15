@@ -14,7 +14,7 @@ use crate::{
 use bitcoin::{Amount, OutPoint, Txid};
 use bitcoind::bitcoincore_rpc::json::ListTransactionResult;
 
-use super::blockchain::{BackendConfig, Blockchain};
+use super::blockchain::{AnyBlockchain, BackendConfig, Blockchain};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -44,6 +44,8 @@ pub fn restore_wallet_from_backup_gui_app(
             "a passphrase is required; cleartext wallet files are not supported".to_string(),
         ));
     };
+    // Probe first, so the decrypted backup is not held through a failing backend.
+    Wallet::require_backend(&AnyBlockchain::from_config(&backend)?)?;
     let (backup, encryption_material) = match load_sensitive_struct::<WalletBackup, SerdeJson>(
         &backup_file_path,
         Some(std::mem::take(&mut *password)),

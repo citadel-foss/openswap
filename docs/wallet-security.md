@@ -84,11 +84,11 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   encrypted at rest inside the wallet file). An in-memory reader during a
   swap can steal in-flight swap funds, though not the HD wallet itself.
   Sealing these is a planned follow-up.
-- **Erasure is best-effort, not guaranteed.** `Xpriv` is `Copy`, so earlier
-  copies may persist on the stack/in registers; `non_secure_erase` explicitly
-  permits the compiler to leave copies; a panic inside a key closure skips
-  the wipe; the extended key's `chain_code` is never erased (not
-  fund-critical: all wallet derivation below the master key is hardened).
+- **Erasure is best-effort, not guaranteed.** Copied keys, their chain
+  codes and signing key pairs are wiped when they go out of scope, also on
+  errors. But `Xpriv` is `Copy`, so earlier copies may persist on the
+  stack/in registers, and `non_secure_erase` explicitly permits the compiler
+  to leave copies. Library internals (key derivation, AES) keep their own.
 - **Passphrase theft** (keyloggers, phishing the prompt, reading the
   environment of the process) is out of scope — an attacker with the
   passphrase has the wallet.
@@ -103,8 +103,9 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   are rejected, not migrated. The project is pre-launch, so no legacy
   plaintext compatibility path exists.
 - **The BIP39 mnemonic** is shown once at wallet creation — record it offline.
-  It is kept in memory until the CLI displays it (`take_new_mnemonic`) and is
-  not zeroized. It is a backup of your keys, not of your whole wallet state.
+  The CLI shows it right after it creates the wallet file, before any later
+  startup step, and wipes it once shown. Library callers get it once from
+  `take_new_mnemonic`. It is a backup of your keys, not of your whole wallet state.
   See "What a restore brings back" below.
 - **Test builds** (`cfg(test)` / the `integration-test` feature) reduce
   PBKDF2 to 1 iteration for speed. Never use such a build with real funds.

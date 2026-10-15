@@ -16,14 +16,15 @@ use crate::{
 use super::{backup::RestoreOptions, error::WalletError, fidelity::FidelityBond};
 
 use bitcoin::{bip32::Xpriv, Network, OutPoint, ScriptBuf};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Write as _,
     fs::File,
     io::{BufWriter, Write},
     path::Path,
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin};
 
@@ -50,7 +51,7 @@ pub(crate) enum MasterKey {
     Sealed(EncryptedData),
 }
 
-pub(crate) fn erase_xpriv(key: &mut Xpriv) {
+fn erase_xpriv(key: &mut Xpriv) {
     key.private_key.non_secure_erase();
     let chain_code: &mut [u8; 32] = key.chain_code.as_mut();
     chain_code.zeroize();
@@ -73,12 +74,28 @@ impl Drop for SecretXpriv {
     }
 }
 
+// Same text as `Xpriv`'s own impl, which goes through serde's growing and
+// unwiped `to_string`. Base58 of the 82-byte key is at most 112 characters.
+impl Serialize for SecretXpriv {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut text = Zeroizing::new(String::with_capacity(112));
+        write!(text, "{}", self.0).expect("writing to a String cannot fail");
+        serializer.serialize_str(&text)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretXpriv {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Xpriv::deserialize(deserializer).map(Self)
+    }
+}
+
 impl MasterKey {
     /// Seals a plaintext key in place, erasing the plaintext copy. No-op if
     /// the key is already sealed.
     pub(crate) fn seal(&mut self, key: &KeyMaterial) -> Result<(), WalletError> {
         if let Self::Plaintext(xpriv) = self {
-            let data = encrypt_struct(xpriv, key)
+            let data = encrypt_struct(SecretXpriv(*xpriv), key)
                 .map_err(|e| WalletError::General(format!("master key sealing failed: {e:?}")))?;
             *self = Self::Sealed(data);
         }
@@ -564,6 +581,12 @@ mod tests {
         let seed: [u8; 16] = thread_rng().gen();
         let xpriv = Xpriv::new_master(Network::Bitcoin, &seed).unwrap();
         let material = KeyMaterial::new_ephemeral();
+
+        // The wiped encoding writes the same bytes, so older sealed keys still open.
+        assert_eq!(
+            serde_cbor::to_vec(&SecretXpriv(xpriv)).unwrap(),
+            serde_cbor::to_vec(&xpriv).unwrap()
+        );
 
         let mut key = MasterKey::Plaintext(xpriv);
         key.seal(&material).unwrap();

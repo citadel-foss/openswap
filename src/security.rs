@@ -17,7 +17,7 @@ use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::utill;
-use std::{fs, path::Path};
+use std::{fs, io, path::Path};
 
 /// Errors returned while loading or decrypting sensitive data.
 #[derive(Debug)]
@@ -287,6 +287,20 @@ pub struct EncryptedData {
     pbkdf2_salt: PBKDF2Salt,
 }
 
+/// Counts the bytes written to it, to size a buffer before filling it.
+struct ByteCount(usize);
+
+impl io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Encrypts a serializable struct using AES-256-GCM encryption and CBOR serialization.
 ///
 /// This function applies the following transformation pipeline:
@@ -305,8 +319,11 @@ pub fn encrypt_struct<T: Serialize>(
     enc_material: &KeyMaterial,
 ) -> Result<EncryptedData, EncryptError> {
     // Serialize wallet data to bytes. `Zeroizing` wipes the plaintext buffer
-    // on drop so no serialized copy of the secret survives in freed heap.
-    let packed_store = Zeroizing::new(serde_cbor::ser::to_vec(&plain_struct)?);
+    // on drop, and sizing it first means no growth frees an unwiped copy.
+    let mut size = ByteCount(0);
+    serde_cbor::to_writer(&mut size, &plain_struct)?;
+    let mut packed_store = Zeroizing::new(Vec::with_capacity(size.0));
+    serde_cbor::to_writer(&mut *packed_store, &plain_struct)?;
 
     // QA: AES-GCM nonce reuse across wallet saves or backup restoration leaks
     // relationships between plaintexts encrypted under the same key.
