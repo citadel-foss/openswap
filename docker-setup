@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="openswap"
 BITCOIN_IMAGE_NAME="bitcoin-mutinynet"
 CONFIG_FILE="$SCRIPT_DIR/.docker-config"
+WALLET_SECRET_FILE="$SCRIPT_DIR/.docker-wallet-passphrase"
 VERSION_FILE="$SCRIPT_DIR/docker/bitcoin-mutinynet.version"
 
 DEFAULT_BITCOIN_DATADIR="/home/openswap/.bitcoin"
@@ -44,8 +45,22 @@ print_error() {
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
+        if grep -q '^WALLET_PASSPHRASE=' "$CONFIG_FILE"; then
+            [ -f "$WALLET_SECRET_FILE" ] || save_wallet_passphrase
+            sed -i '/^WALLET_PASSPHRASE=/d' "$CONFIG_FILE"
+        fi
         print_info "Loaded configuration from $CONFIG_FILE"
     fi
+    [ ! -f "$WALLET_SECRET_FILE" ] || WALLET_PASSPHRASE=$(<"$WALLET_SECRET_FILE")
+}
+
+save_wallet_passphrase() {
+    (
+        umask 077
+        touch "$WALLET_SECRET_FILE"
+        chmod 600 "$WALLET_SECRET_FILE"
+        printf '%s' "$WALLET_PASSPHRASE" > "$WALLET_SECRET_FILE"
+    )
 }
 
 save_config() {
@@ -70,8 +85,7 @@ EXTERNAL_BITCOIND_HOST="$EXTERNAL_BITCOIND_HOST"
 EXTERNAL_TOR_HOST="$EXTERNAL_TOR_HOST"
 BITCOIN_WALLET_NAME="$BITCOIN_WALLET_NAME"
 EOF
-    # %q keeps the passphrase byte-exact when load_config sources the file.
-    printf 'WALLET_PASSPHRASE=%q\n' "$WALLET_PASSPHRASE" >> "$CONFIG_FILE"
+    save_wallet_passphrase
     print_success "Configuration saved to $CONFIG_FILE"
 }
 
@@ -589,15 +603,12 @@ start_stack() {
         # A fresh regtest node reports initial sync until its first block, which never comes on its own.
         [[ "$BITCOIN_NETWORK" == "regtest" ]] || wait_for_ibd_complete
         
-        start_makerd
     else
-        if docker compose up -d; then
-            start_makerd
-        else
-            print_error "Failed to start OpenSwap stack"
-            exit 1
+        if [[ "$COMPOSE_PROFILES" == *"internal-tor"* ]]; then
+            docker compose up -d tor
         fi
     fi
+    start_makerd
 }
 
 stop_stack() {
@@ -677,6 +688,19 @@ wait_for_ibd_complete() {
 start_makerd() {
     setup_env
     print_info "Starting makerd service..."
+    local service="makerd"
+    [[ "$COMPOSE_PROFILES" != *"internal-tor"* ]] || service="makerd-internal"
+
+    if ! docker compose run --rm --no-deps --entrypoint sh "$service" \
+        -c 'test -f "/home/openswap/.openswap/maker/wallets/${BITCOIN_WALLET_NAME:-openswap-maker}"'; then
+        if [[ ! -t 0 || ! -t 1 ]]; then
+            print_error "A new maker wallet needs an interactive terminal to show its seed."
+            exit 1
+        fi
+        print_info "Creating maker wallet; write down the seed shown in this terminal."
+        docker compose -f docker-compose.yml -f docker/compose-init.yml run --rm --no-deps \
+            -e MAKER_INIT_ONLY=1 "$service"
+    fi
     
     if docker compose up -d; then
         print_success "makerd started successfully!"

@@ -110,7 +110,9 @@ The setup script will prompt for:
 4. **Maker Wallet**:
    - Wallet passphrase. The maker wallet is always encrypted, so makerd needs it on every start.
 
-Configuration is saved to `.docker-config` and reused on subsequent runs. The file holds your RPC password and wallet passphrase, so the script makes it readable only by you.
+The script saves your settings and RPC password in `.docker-config`. It keeps the wallet passphrase in a separate 0600 `.docker-wallet-passphrase` file. It passes the passphrase to the maker as a Docker secret. Keep both files private. On your next run, the script moves any older wallet passphrase out of `.docker-config`.
+
+On the first start, run `./docker-setup start` in a terminal. The script creates the wallet in an attached container with Docker logging disabled. Write down the seed phrase shown there. The script then starts the maker in the background. A new wallet refuses to start without a terminal, before it writes a wallet file.
 
 ## Building Docker Images
 
@@ -145,7 +147,16 @@ Run the maker daemon with persistent data storage:
 # Using the setup script (recommended)
 ./docker-setup start
 
-# Or manually, using the Tor and bitcoind on your host
+# First create a new wallet in a terminal, without Docker logs
+docker run --rm -it --log-driver none -e OPENSWAP_SEED_LOG_FREE=1 \
+  --network host \
+  -v openswap-maker-data:/home/openswap/.openswap \
+  openswap/openswap:latest makerd \
+    -r 127.0.0.1:38332 \
+    -a user:password \
+    -p <wallet-passphrase> init-wallet
+
+# Then run the maker in the background
 docker run -d \
   --name openswap-makerd \
   --network host \
@@ -156,7 +167,7 @@ docker run -d \
     -p <wallet-passphrase>
 ```
 
-The container shares your host network. That way makerd reaches Tor and `bitcoind` on your machine. Makerd always encrypts its wallet. You must set its passphrase with `-p`. Add `-t <tor-password>` if your Tor control port uses a password.
+The container shares your host network. That way makerd reaches Tor and `bitcoind` on your machine. Makerd always encrypts its wallet. You must set its passphrase with `-p`. Add `-t <tor-password>` if your Tor control port uses a password. The direct `docker run` commands expose `-p` in command arguments; use the setup script to pass it as a Docker secret.
 
 **Ports:**
 - `6102`: Maker network port for openswap protocol

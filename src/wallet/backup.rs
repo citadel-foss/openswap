@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, str::FromStr};
 use zeroize::Zeroizing;
 
+/// The way back from a wallet file that cannot be used.
+pub const RESTORE_FROM_MNEMONIC_HINT: &str =
+    "restore the wallet from its seed phrase with `restore --mnemonic`";
+
 /// Shown before every restore, since no seed or backup holds open swap keys.
 pub const RESTORE_OPEN_SWAPS_WARNING: &str =
     "A restore cannot recover swaps still in progress (including Lightning swaps): \
@@ -291,6 +295,26 @@ impl Wallet {
         Ok(wallet)
     }
 
+    /// Restores from an owned backup and drops its secrets before syncing.
+    pub fn restore_owned_with(
+        wallet_backup: WalletBackup,
+        wallet_path: &Path,
+        backend_config: &BackendConfig,
+        restored_enc_material: KeyMaterial,
+        options: RestoreOptions,
+    ) -> Result<Wallet, WalletError> {
+        let mut wallet = Self::restore_prepared(
+            &wallet_backup,
+            wallet_path,
+            backend_config,
+            restored_enc_material,
+            options,
+        )?;
+        drop(wallet_backup);
+        wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
+        Ok(wallet)
+    }
+
     /// Creates the encrypted wallet before the scan, so owned restore secrets
     /// can be dropped before syncing.
     pub(crate) fn restore_prepared(
@@ -470,16 +494,13 @@ impl Wallet {
             pending_gaps: None,
         };
 
-        let mut wallet = Wallet::restore_prepared(
-            &backup,
+        Wallet::restore_owned_with(
+            backup,
             wallet_path,
             backend_config,
             restored_enc_material,
             options,
-        )?;
-        drop(backup);
-        wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
-        Ok(wallet)
+        )
     }
 
     /// Checks a seed phrase's words and checksum.
@@ -567,15 +588,13 @@ impl Wallet {
             }
         };
         let hints = options.bond_hints.clone();
-        let mut wallet = Wallet::restore_prepared(
-            &backup,
+        let wallet = Wallet::restore_owned_with(
+            backup,
             restored_path,
             backend,
             restore_enc_material,
             options,
         )?;
-        drop(backup);
-        wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
         println!("Wallet restore succeeded!");
         wallet.print_restored_bonds(&hints);
         Ok(())

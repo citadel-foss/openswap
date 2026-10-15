@@ -5,6 +5,9 @@ target/
 # Ignore git and development files
 .git
 .gitignore
+agent-artifacts/
+.docker-config
+.docker-wallet-passphrase
 # Keep README.md as it's needed by src/lib.rs
 # *.md
 docs/

@@ -63,6 +63,7 @@ WORKDIR /app
 ENV PATH="/app/bin:$PATH"
 
 ENV OPENSWAP_DATA_DIR="/home/openswap/.openswap"
+ENV OPENSWAP_DOCKER=1
 
 
 

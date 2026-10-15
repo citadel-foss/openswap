@@ -10,4 +10,5 @@ Cargo.lock
 docker-compose.generated.yml
 torrc.generated
 .docker-config
+.docker-wallet-passphrase
 .DS_Store

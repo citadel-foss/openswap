@@ -6,6 +6,7 @@
 use std::{
     cmp::max,
     fmt::Display,
+    io::{self, IsTerminal},
     path::PathBuf,
     str::FromStr,
     thread,
@@ -450,6 +451,15 @@ pub struct Balances {
     pub spendable: Amount,
 }
 
+fn require_seed_terminal(docker: bool, terminal: bool, log_free: bool) -> Result<(), WalletError> {
+    if docker && !(terminal && log_free) {
+        return Err(WalletError::General(
+            "New Docker wallets need an interactive terminal with Docker logging disabled".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Wallet {
     /// Initialize the wallet at a given path.
     ///
@@ -668,6 +678,11 @@ impl Wallet {
         if path.exists() {
             return Ok(());
         }
+        require_seed_terminal(
+            std::env::var_os("OPENSWAP_DOCKER").is_some(),
+            io::stdout().is_terminal(),
+            std::env::var_os("OPENSWAP_SEED_LOG_FREE").is_some(),
+        )?;
         let mut wallet = Self::load_or_init(
             path,
             AnyBlockchain::from_config(backend)?,
@@ -5000,6 +5015,13 @@ mod prevout_contract_tests {
             wallet.take_new_mnemonic().is_none(),
             "the phrase must be dropped from the wallet after the first take"
         );
+    }
+
+    #[test]
+    fn docker_seed_refuses_non_terminal_output() {
+        assert!(require_seed_terminal(true, false, true).is_err());
+        assert!(require_seed_terminal(true, true, false).is_err());
+        assert!(require_seed_terminal(true, true, true).is_ok());
     }
 
     #[test]

@@ -81,6 +81,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Create the wallet and show its seed, then exit. Used by Docker setup.
+    #[clap(hide = true)]
+    InitWallet,
     /// Restore the wallet from a backup file or its seed phrase, then exit.
     ///
     /// `--mnemonic` prompts for the phrase at a hidden prompt. Stop every
@@ -158,6 +161,7 @@ fn main() -> Result<(), MakerError> {
         }),
     };
 
+    let init_only = matches!(&args.command, Some(Commands::InitWallet));
     match args.command {
         Some(Commands::Restore {
             backup_file,
@@ -179,6 +183,7 @@ fn main() -> Result<(), MakerError> {
             config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
             return MakerServer::backup_wallet(config, output);
         }
+        Some(Commands::InitWallet) => {}
         None => {}
     }
 
@@ -201,6 +206,9 @@ fn main() -> Result<(), MakerError> {
         &config.backend,
         wallet_password.as_deref().cloned(),
     )?;
+    if init_only {
+        return Ok(());
+    }
     config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
     let maker = Arc::new(MakerServer::init(config)?);
 

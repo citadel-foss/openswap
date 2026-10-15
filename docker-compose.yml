@@ -81,11 +81,15 @@ services:
 
         echo "[DEBUG] Running: makerd -r $${BITCOIN_RPC_HOST} -z $${BITCOIN_ZMQ_ADDR} -w \"$$WALLET_NAME\""
 
-        exec makerd -t "$${TOR_AUTH_PASSWORD}" -r $${BITCOIN_RPC_HOST} -z $${BITCOIN_ZMQ_ADDR} -a $${BITCOIN_RPC_AUTH} -w "$$WALLET_NAME" -p "$${WALLET_PASSPHRASE}"
+        set -- makerd -t "$${TOR_AUTH_PASSWORD}" -r $${BITCOIN_RPC_HOST} -z $${BITCOIN_ZMQ_ADDR} -a $${BITCOIN_RPC_AUTH} -w "$$WALLET_NAME" -p "$$(cat /run/secrets/wallet_passphrase)"
+        [ "$${MAKER_INIT_ONLY:-0}" != 1 ] || set -- "$$@" init-wallet
+        exec "$$@"
     ports:
       - "${MAKERD_RPC_PORT:-6103}:${MAKERD_RPC_PORT:-6103}"
     volumes:
       - maker-data:/home/openswap/.openswap
+    secrets: &makerd-secrets
+      - wallet_passphrase
     environment: &makerd-env
       - RUST_LOG=${RUST_LOG:-info}
       - MAKER_NETWORK_PORT=${MAKERD_PORT:-6102}
@@ -101,7 +105,6 @@ services:
       - BITCOIN_RPC_HOST=${BITCOIN_RPC_HOST}
       - BITCOIN_RPC_AUTH=${BITCOIN_RPC_AUTH:-user:password}
       - BITCOIN_ZMQ_ADDR=${BITCOIN_ZMQ_ADDR}
-      - WALLET_PASSPHRASE=${WALLET_PASSPHRASE}
       - BITCOIN_WALLET_NAME=${BITCOIN_WALLET_NAME:-openswap-maker}
     restart: unless-stopped
 
@@ -113,6 +116,7 @@ services:
     command: *makerd-command
     volumes:
       - maker-data:/home/openswap/.openswap
+    secrets: *makerd-secrets
     environment: *makerd-env
     restart: unless-stopped
     depends_on:
@@ -125,6 +129,10 @@ volumes:
     driver: local
   maker-data:
     driver: local
+
+secrets:
+  wallet_passphrase:
+    environment: WALLET_PASSPHRASE
 
 networks:
   default:
