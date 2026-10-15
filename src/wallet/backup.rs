@@ -129,6 +129,10 @@ pub struct WalletBackup {
     /// Change addresses handed out, including ones never funded.
     #[serde(default)]
     pub(super) internal_index: u32,
+    /// Gaps of a restore still in progress, so restoring this backup scans
+    /// at least as wide as the unfinished one would have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) pending_gaps: Option<(u32, u32)>,
 }
 impl From<&Wallet> for WalletBackup {
     fn from(wallet: &Wallet) -> Self {
@@ -159,6 +163,11 @@ impl From<&Wallet> for WalletBackup {
             swept_incoming_swapcoins: wallet.store.swept_incoming_swapcoins.clone(),
             external_index: wallet.store.external_index,
             internal_index: wallet.store.internal_index,
+            pending_gaps: wallet
+                .store
+                .pending_restore
+                .as_ref()
+                .map(|o| (o.address_gap, o.bond_gap)),
         }
     }
 }
@@ -238,6 +247,10 @@ impl Wallet {
         mut options: RestoreOptions,
     ) -> Result<Wallet, WalletError> {
         options.bond_hints.extend(&wallet_backup.fidelity_bonds);
+        if let Some((address_gap, bond_gap)) = wallet_backup.pending_gaps {
+            options.address_gap = options.address_gap.max(address_gap);
+            options.bond_gap = options.bond_gap.max(bond_gap);
+        }
         for (name, gap, min) in [
             ("address", options.address_gap, ADDRESS_IMPORT_COUNT),
             ("bond", options.bond_gap, 1),
@@ -390,6 +403,7 @@ impl Wallet {
             swept_incoming_swapcoins: HashSet::new(),
             external_index: 0,
             internal_index: 0,
+            pending_gaps: None,
         };
 
         Wallet::restore_with(
@@ -634,6 +648,7 @@ mod tests {
             swept_incoming_swapcoins: HashSet::new(),
             external_index: 0,
             internal_index: 0,
+            pending_gaps: None,
         }
     }
 
@@ -665,6 +680,8 @@ mod tests {
         });
         let pending = BondHint { index: 7, locktime };
         wallet.store.pending_restore = Some(RestoreOptions {
+            address_gap: 500,
+            bond_gap: 40,
             bond_hints: vec![pending],
             ..Default::default()
         });
@@ -685,6 +702,7 @@ mod tests {
         );
         assert_eq!(v2.swept_incoming_swapcoins, swept);
         assert_eq!((v2.external_index, v2.internal_index), (30, 7));
+        assert_eq!(v2.pending_gaps, Some((500, 40)));
 
         let (v1, _) =
             load_sensitive_struct::<BackupV1, SerdeJson>(&v2_path, password.clone()).unwrap();
@@ -704,6 +722,7 @@ mod tests {
         assert_eq!(read.master_key, v1.master_key);
         assert!(read.fidelity_bonds.is_empty() && read.swept_incoming_swapcoins.is_empty());
         assert_eq!((read.external_index, read.internal_index), (0, 0));
+        assert_eq!(read.pending_gaps, None);
     }
 
     /// Each kind of open swap lands in its own count; a fresh wallet has none.
