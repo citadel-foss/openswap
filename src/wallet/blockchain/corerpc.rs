@@ -252,6 +252,24 @@ impl CoreRPC {
         Ok(self.rpc.get_block_header_info(block_hash)?.height as u64)
     }
 
+    /// Confirmations of `txid` on the active chain; `None` when Core does not
+    /// know it. A reorged-out transaction stays indexed under its stale block,
+    /// and Core reports it with 0 confirmations, like a mempool one.
+    pub(crate) fn tx_confirmations(&self, txid: &Txid) -> Result<Option<u32>, WalletError> {
+        match self.rpc.get_raw_transaction_info(txid, None) {
+            Ok(info) => Ok(Some(info.confirmations.unwrap_or(0))),
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -5 => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether the txindex has caught up with the chain. Until it has, Core
+    /// cannot find every mined transaction.
+    pub(crate) fn txindex_synced(&self) -> Result<bool, WalletError> {
+        let indexes: Value = self.rpc.call("getindexinfo", &[])?;
+        Ok(indexes["txindex"]["synced"].as_bool().unwrap_or(false))
+    }
+
     /// The node's `incrementalrelayfee` in sat/vB: what a replacement must
     /// add over the tx it replaces. `None` when the node does not report one.
     pub(crate) fn incremental_relay_feerate(&self) -> Result<Option<f64>, WalletError> {
