@@ -815,6 +815,11 @@ impl Wallet {
             if taken.contains(&hint.index) {
                 continue;
             }
+            // The CLI refuses these; skip one saved by an older build or the API.
+            if hint.index >= 1 << 31 {
+                log::warn!("Skipping bond hint {hint:?}: index is not below 2^31");
+                continue;
+            }
             match self.find_bond(hint.index, &[hint.locktime], txs)? {
                 Some(bond) => {
                     taken.insert(hint.index);
@@ -1220,6 +1225,17 @@ mod test {
             (2, vec![], vec![1]),
             (3, vec![wrong_locktime], vec![1, 4]),
             (3, vec![wrong_locktime, hint], vec![1, 4, 9, 12]),
+            (
+                3,
+                vec![
+                    BondHint {
+                        index: 1 << 31,
+                        ..hint
+                    },
+                    hint,
+                ],
+                vec![1, 4, 9, 12],
+            ),
         ] {
             wallet.store.pending_restore = Some(RestoreOptions {
                 bond_gap,

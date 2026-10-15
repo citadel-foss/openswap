@@ -1005,7 +1005,7 @@ mod tests {
 
     #[test]
     fn bond_hint_rejects_malformed_values() {
-        for bad in ["3", "x:1", "3:y", ":"] {
+        for bad in ["3", "x:1", "3:y", ":", "2147483648:900000"] {
             assert!(bad.parse::<BondHint>().is_err());
         }
     }

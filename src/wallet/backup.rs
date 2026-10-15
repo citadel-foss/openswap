@@ -69,8 +69,13 @@ impl FromStr for BondHint {
 
     fn from_str(s: &str) -> Result<Self, String> {
         let (index, locktime) = s.split_once(':').ok_or("expected INDEX:LOCKTIME")?;
+        let index: u32 = index.parse().map_err(|e| format!("bad index: {e}"))?;
+        // Bond keys are normal (unhardened) children: the index must be below 2^31.
+        if index >= 1 << 31 {
+            return Err(format!("bad index: {index} is not below 2^31"));
+        }
         Ok(BondHint {
-            index: index.parse().map_err(|e| format!("bad index: {e}"))?,
+            index,
             locktime: LockTime::from_consensus(
                 locktime.parse().map_err(|e| format!("bad locktime: {e}"))?,
             ),
