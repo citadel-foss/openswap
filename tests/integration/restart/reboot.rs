@@ -585,14 +585,26 @@ fn taproot_maker_finishes_when_its_incoming_was_refunded(world: &mut World, para
 /// retrying a sweep with nothing left to spend, and its record must name that
 /// sweep exactly once.
 #[world_test(
-    backend = BitcoindBackend,
     maker_behaviors = [Normal, Normal],
     takers = [CrashBeforeRecovery],
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
-    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+    swap(protocol = protocol, sats = 500_000, makers = 2, tx_count = 3),
+    cases = [
+        taproot_maker_settles_an_incoming_its_own_sweep_spent(
+            backend = BitcoindBackend,
+            protocol = ProtocolVersion::Taproot,
+        ),
+        /// A Legacy hashlock sweep spends the contract output too, and on
+        /// Electrum the settling spend is read from the indexer.
+        legacy_electrum_maker_settles_an_incoming_its_own_sweep_spent(
+            backend = ElectrumBackend,
+            protocol = ProtocolVersion::Legacy,
+        ),
+    ],
 )]
-fn taproot_maker_settles_an_incoming_its_own_sweep_spent(world: &mut World, params: SwapParams) {
+fn run_maker_settles_an_incoming_its_own_sweep_spent(world: &mut World, params: SwapParams) {
     world.mine(1);
+    world.framework().wait_for_electrs_tip();
 
     let summary = world
         .taker_mut()
@@ -669,6 +681,9 @@ fn taproot_maker_settles_an_incoming_its_own_sweep_spent(world: &mut World, para
             })
         };
 
+        // Wait on both: the phase is written last, after the coins are
+        // removed, but a tracker that kept the sweep says CleanedUp before
+        // the restored coins are gone.
         wait_until!(
             Duration::from_secs(180),
             every Duration::from_secs(2),
@@ -677,10 +692,9 @@ fn taproot_maker_settles_an_incoming_its_own_sweep_spent(world: &mut World, para
                 let wallet = restarted.wallet.read().unwrap();
                 wallet.get_incoming_swapcoins_count() == 0
                     && wallet.get_outgoing_swapcoins_count() == 0
-            }
+            } && recovery(&restarted).map(|r| r.phase) == Some(MakerRecoveryPhase::CleanedUp)
         );
         let mut state = recovery(&restarted).expect("the swap's record survives");
-        assert_eq!(state.phase, MakerRecoveryPhase::CleanedUp);
         state.incoming_swept.sort();
         assert_eq!(
             state.incoming_swept, sweeps,
