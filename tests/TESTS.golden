@@ -7,6 +7,7 @@ openswap maker::api::lightning_config_tests::lightning_settings_round_trip_throu
 openswap maker::api::tests::advertised_min_swap_is_the_smallest_passing_round_amount
 openswap maker::api::tests::init_rejects_zero_required_confirms
 openswap maker::api::tests::maker_config_checks_file_values
+openswap maker::api::tests::maker_config_debug_hides_wallet_password
 openswap maker::api::tests::maker_config_network_round_trips_only_once_confirmed
 openswap maker::api::tests::maker_config_rejects_fidelity_amount_below_the_discovery_floor
 openswap maker::api::tests::maker_init_refuses_bad_fee_pcts
@@ -68,6 +69,7 @@ openswap protocol::lightning_messages::tests::new_top_level_variants_round_trip
 openswap security::tests::decrypts_legacy_ciphertext_using_material_nonce
 openswap security::tests::encryption_rotates_nonce_for_same_key_material
 openswap taker::api::tests::init_taker_config_persists_lightning_settings
+openswap taker::api::tests::taker_config_debug_hides_wallet_password
 openswap taker::background_services::tests::dead_keepalive_socket_is_dropped_and_retried_immediately
 openswap taker::background_services::tests::stalled_handshake_is_bounded_by_the_dial_timeout
 openswap taker::background_services::tests::unreachable_peer_backs_off_instead_of_being_dropped
@@ -184,6 +186,7 @@ openswap wallet::api::mempool_deferral_tests::stuck_recovery_stays_when_a_replac
 openswap wallet::api::mempool_deferral_tests::stuck_refund_of_a_claimed_swap_is_replaced
 openswap wallet::api::prevout_contract_tests::cached_contract_is_idempotent_immutable_and_persistent
 openswap wallet::api::prevout_contract_tests::cached_contract_matches_only_the_approved_script
+openswap wallet::api::prevout_contract_tests::docker_seed_refuses_non_terminal_output
 openswap wallet::api::prevout_contract_tests::new_mnemonic_is_yielded_once_then_dropped
 openswap wallet::api::prevout_contract_tests::proof_of_funding_rejects_missing_cached_contract
 openswap wallet::api::recovery_address_tests::first_recovery_creates_an_address
@@ -195,7 +198,7 @@ openswap wallet::api::restore_history_probe_tests::restore_probe_bridges_a_long_
 openswap wallet::api::restore_history_probe_tests::restore_probe_reports_a_window_cut_off_by_the_cap
 openswap wallet::api::restore_history_probe_tests::resumed_restore_checks_the_window_before_syncing
 openswap wallet::api::restore_history_probe_tests::sync_does_not_enter_the_backend_after_shutdown
-openswap wallet::api::restore_history_probe_tests::window_cap_is_not_retried
+openswap wallet::api::restore_history_probe_tests::window_cap_and_old_core_are_not_retried
 openswap wallet::api::swap_reservation_tests::a_reservation_survives_a_wallet_reload
 openswap wallet::api::swap_reservation_tests::only_a_spendable_coin_no_swap_holds_can_be_claimed
 openswap wallet::api::timelock_reconcile_tests::core_classifies_our_confirmed_recovery_as_recovered
@@ -208,9 +211,11 @@ openswap wallet::api::timelock_reconcile_tests::electrum_skips_an_unconfirmed_sp
 openswap wallet::api::timelock_reconcile_tests::replacement_increment_comes_from_the_backend
 openswap wallet::api::utxo_corroboration_tests::cached_utxo_refresh_preserves_transaction_value_and_script
 openswap wallet::api::utxo_corroboration_tests::fabricated_utxo_fails_corroboration
+openswap wallet::backup::tests::backup_debug_redacts_master_key
 openswap wallet::backup::tests::backup_needs_a_reachable_backend
 openswap wallet::backup::tests::backup_v2_keeps_new_fields_and_reads_v1_both_ways
 openswap wallet::backup::tests::max_watch_index_overflow_is_the_window_cap
+openswap wallet::backup::tests::mnemonic_normalization_preserves_restore_words
 openswap wallet::backup::tests::open_swaps_summary_counts_each_kind
 openswap wallet::backup::tests::restore_options_survive_the_wallet_file_format
 openswap wallet::backup::tests::restore_rejects_bad_options_before_touching_the_backend
@@ -218,6 +223,8 @@ openswap wallet::backup::tests::restore_rejects_traversal_in_backup_file_name
 openswap wallet::blockchain::corerpc::tests::estimate_feerate_forwards_target_and_converts
 openswap wallet::blockchain::corerpc::tests::imported_range_covers_legacy_wallet_without_listdescriptors
 openswap wallet::blockchain::corerpc::tests::imported_range_covers_needs_the_range_to_start_at_zero
+openswap wallet::blockchain::corerpc::tests::prepare_backend_wallet_refuses_core_before_v22
+openswap wallet::blockchain::corerpc::tests::restore_refuses_core_before_v22_without_a_wallet_file
 openswap wallet::blockchain::electrum::tests::a_cached_tip_below_the_mined_height_is_read_again
 openswap wallet::blockchain::electrum::tests::a_changed_tip_drops_script_answers_and_headers
 openswap wallet::blockchain::electrum::tests::a_full_tx_cache_starts_over

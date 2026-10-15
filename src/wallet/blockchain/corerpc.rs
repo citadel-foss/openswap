@@ -266,6 +266,15 @@ impl CoreRPC {
         &self.config.wallet_name
     }
 
+    /// Older nodes lack `listdescriptors` and `tr()`, so sync would fail
+    /// and retry forever, whatever kind of wallet the node holds.
+    pub(crate) fn require_v22(&self) -> Result<(), WalletError> {
+        if self.rpc.version()? < 220_000 {
+            return Err(WalletError::CoreTooOld);
+        }
+        Ok(())
+    }
+
     /// Connect and subscribe the ZMQ notification socket up front.
     ///
     /// The watchtower calls this **before** its startup mempool scan so the SUB
@@ -482,11 +491,7 @@ impl Blockchain for CoreRPC {
     /// Load the watch-only wallet on the node, creating it if absent. Refuses
     /// Core older than v22; only invoked on the Core sync path.
     fn prepare_backend_wallet(&self, wallet_name: &str) -> Result<(), WalletError> {
-        // Older nodes lack `listdescriptors` and `tr()`, so sync would fail
-        // and retry forever, whatever kind of wallet the node holds.
-        if self.rpc.version()? < 220_000 {
-            return Err(WalletError::CoreTooOld);
-        }
+        self.require_v22()?;
         if self.rpc.list_wallets()?.contains(&wallet_name.to_string()) {
             log::debug!("wallet already loaded: {wallet_name}");
         } else if list_wallet_dir(&self.rpc)?.contains(&wallet_name.to_string()) {
@@ -647,6 +652,11 @@ mod tests {
     };
 
     use super::*;
+    use crate::{
+        security::KeyMaterial,
+        wallet::{BackendConfig, Wallet},
+    };
+    use zeroize::Zeroizing;
 
     /// Serves one canned reply per JSON-RPC method, failing on any other.
     fn mock_core(
@@ -743,6 +753,37 @@ mod tests {
             Err(WalletError::CoreTooOld)
         ));
         assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
+    }
+
+    /// The restore's backend probe refuses Core 0.21, so no wallet file is left.
+    #[test]
+    fn restore_refuses_core_before_v22_without_a_wallet_file() {
+        let info = json!({ "chain": "regtest", "blocks": 0, "headers": 0,
+            "bestblockhash": "0".repeat(64), "difficulty": 0.0,
+            "mediantime": 0, "verificationprogress": 1.0, "initialblockdownload": false,
+            "chainwork": "00", "size_on_disk": 0, "pruned": false, "warnings": "" });
+        let (core, server) = mock_core(vec![
+            ("getblockchaininfo", info),
+            // Asked once by `get_blockchain_info` itself, once by the v22 gate.
+            ("getnetworkinfo", json!({ "version": 210100 })),
+            ("getnetworkinfo", json!({ "version": 210100 })),
+        ]);
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("w");
+        let err = Wallet::restore_from_mnemonic(
+            Zeroizing::new("abandon ".repeat(11) + "about"),
+            &path,
+            &BackendConfig::CoreRpc(core.config.clone()),
+            Default::default(),
+            KeyMaterial::new_ephemeral(),
+        )
+        .expect_err("Core 0.21 must be refused");
+        assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
+        assert!(!path.exists());
+        assert_eq!(
+            server.join().unwrap(),
+            ["getblockchaininfo", "getnetworkinfo", "getnetworkinfo"]
+        );
     }
 
     #[test]

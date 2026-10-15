@@ -189,11 +189,16 @@ impl Wallet {
     pub(crate) fn require_backend(
         blockchain: &AnyBlockchain,
     ) -> Result<GetBlockchainInfoResult, WalletError> {
-        blockchain.get_blockchain_info().map_err(|e| {
+        let info = blockchain.get_blockchain_info().map_err(|e| {
             WalletError::General(format!(
                 "backup and restore need a reachable Bitcoin Core or Electrum backend: {e}"
             ))
-        })
+        })?;
+        // Refuse old Core here, before a restore writes its wallet file.
+        if let AnyBlockchain::CoreRPC(core) = blockchain {
+            core.require_v22()?;
+        }
+        Ok(info)
     }
 
     /// Creates a backup of the wallet and writes it to the given path.
