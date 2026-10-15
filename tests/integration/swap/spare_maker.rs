@@ -132,18 +132,21 @@ fn legacy_middle_maker_drops_before_sender_sigs(world: &mut World) {
     );
 
     // Maker 1 dropped the connection. We cannot tell its failure from our own
-    // link failing, so nothing about it may be recorded as its fault.
+    // link failing, so nothing about it may be recorded as its fault. Every
+    // maker must still be tracked: a missing entry would skip the check.
     let standings = world.taker().inner().fetch_offers().unwrap().all_makers();
     for maker in world.makers() {
         let address = maker.address();
-        if let Some(standing) = standings.iter().find(|m| m.address.to_string() == address) {
-            assert!(
-                !matches!(standing.state, MakerState::Banned(_)),
-                "a dropped connection must blame nobody, but {} is {:?}",
-                address,
-                standing.state
-            );
-        }
+        let standing = standings
+            .iter()
+            .find(|m| m.address.to_string() == address)
+            .unwrap_or_else(|| panic!("the taker no longer tracks maker {}", address));
+        assert!(
+            !matches!(standing.state, MakerState::Banned(_)),
+            "a dropped connection must blame nobody, but {} is {:?}",
+            address,
+            standing.state
+        );
     }
 }
 
