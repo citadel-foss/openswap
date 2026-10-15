@@ -836,16 +836,28 @@ impl Wallet {
                 LockTime::from_height(parse_fidelity_op_return(data)?.expires_at_height).ok()
             })
             .collect();
-        let mut end = taken.iter().max().map_or(0, |index| index + 1) + options.bond_gap;
-        let mut index = 0;
-        while index < end {
-            if !taken.contains(&index) {
-                if let Some(bond) = self.find_bond(index, &announced, txs)? {
-                    end = end.max(index + 1 + options.bond_gap);
-                    bonds.push(bond);
+        // Scan from 0, and past each known bond, until `bond_gap` indexes in a
+        // row find nothing. A high bond only opens a gap-sized window past
+        // itself; the keys between it and the low run are never derived.
+        let mut starts: Vec<u32> = std::iter::once(0)
+            .chain(taken.iter().map(|index| index.saturating_add(1)))
+            .collect();
+        starts.sort_unstable();
+        let mut scanned_to = 0;
+        for start in starts {
+            let mut end = start.saturating_add(options.bond_gap);
+            let mut index = start.max(scanned_to);
+            while index < end {
+                if !taken.contains(&index) {
+                    if let Some(bond) = self.find_bond(index, &announced, txs)? {
+                        end = end.max(index.saturating_add(1).saturating_add(options.bond_gap));
+                        taken.insert(index);
+                        bonds.push(bond);
+                    }
                 }
+                index += 1;
             }
-            index += 1;
+            scanned_to = scanned_to.max(end);
         }
         bonds.sort_by_key(|bond| bond.bond_index);
         Ok(bonds)
@@ -1250,6 +1262,33 @@ mod test {
                 .collect();
             assert_eq!(found, expected, "gap {bond_gap}");
         }
+        // A matched hint far out scans only a window past itself: deriving
+        // every key up to 2^30 would never finish.
+        let far = 1 << 30;
+        let mut far_txs = txs.to_vec();
+        far_txs.push(bond_tx(&wallet, far, lock_time(1005), false));
+        far_txs.push(bond_tx(&wallet, far + 2, lock_time(1006), true));
+        wallet.store.pending_restore = Some(RestoreOptions {
+            bond_gap: 3,
+            bond_hints: vec![BondHint {
+                index: far,
+                locktime: lock_time(1005),
+            }],
+            ..Default::default()
+        });
+        let found: Vec<u32> = wallet
+            .find_bonds(&far_txs)
+            .unwrap()
+            .iter()
+            .map(|bond| bond.bond_index)
+            .collect();
+        assert_eq!(found, vec![1, 4, far, far + 2]);
+        wallet.store.pending_restore = Some(RestoreOptions {
+            bond_gap: 3,
+            bond_hints: vec![hint],
+            ..Default::default()
+        });
+
         wallet.store.fidelity_bond = wallet.find_bonds(&txs).unwrap();
         assert!(
             wallet.find_bonds(&txs).unwrap().is_empty(),

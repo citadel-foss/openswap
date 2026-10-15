@@ -556,7 +556,8 @@ impl Blockchain for CoreRPC {
             .into_iter()
             .find(|listed| listed.desc == descriptor)
             .and_then(|listed| listed.range)
-            .is_some_and(|[_, end]| end >= last_index))
+            // Like the legacy check, coverage must start at index 0.
+            .is_some_and(|[start, end]| start == 0 && end >= last_index))
     }
 
     fn import_descriptors(&self, requests: &[Value]) -> Result<(), WalletError> {
@@ -702,6 +703,33 @@ mod tests {
         })
         .unwrap();
         (core, server)
+    }
+
+    #[test]
+    fn imported_range_covers_needs_the_range_to_start_at_zero() {
+        let desc = "wpkh(xpub/0/*)#abcd1234";
+        for (range, last_index, expected) in [
+            ([20, 200], 100, false),
+            ([0, 200], 100, true),
+            ([0, 99], 100, false),
+        ] {
+            let (core, server) = mock_core(vec![
+                (
+                    "getwalletinfo",
+                    json!({ "walletname": "w", "descriptors": true }),
+                ),
+                (
+                    "listdescriptors",
+                    json!({ "wallet_name": "w", "descriptors": [{ "desc": desc, "range": range }] }),
+                ),
+            ]);
+            assert_eq!(
+                core.imported_range_covers(desc, last_index).unwrap(),
+                expected,
+                "range {range:?}, last index {last_index}"
+            );
+            server.join().unwrap();
+        }
     }
 
     #[test]
