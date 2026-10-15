@@ -201,7 +201,7 @@ fn assert_ffi_restores_funded_wallet(
         Some(data_dir.to_path_buf()),
         "from-phrase".to_string(),
         backend.clone(),
-        phrase.clone(),
+        phrase.as_str().to_owned(),
         password.clone(),
         RestoreOptions::default(),
     );
@@ -210,7 +210,7 @@ fn assert_ffi_restores_funded_wallet(
         Some(data_dir.to_path_buf()),
         "from-phrase".to_string(),
         backend.clone(),
-        phrase.clone(),
+        phrase.as_str().to_owned(),
         password.clone(),
         RestoreOptions::default(),
     );
@@ -245,7 +245,6 @@ fn assert_ffi_restores_funded_wallet(
         assert!(data_dir.join("wallets").join(name).exists(), "{}", name);
     }
     let km = KeyMaterial::new_from_password(password).unwrap();
-    let phrase = Zeroizing::new(phrase);
     let mut restored_wallets = Vec::new();
     for name in ["lib-phrase", "lib-backup"] {
         let path = data_dir.join("wallets").join(name);

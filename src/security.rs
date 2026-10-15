@@ -195,11 +195,11 @@ impl KeyMaterial {
     ///
     /// The passphrase string is zeroized after key derivation.
     pub fn new_from_password(enc_password: Option<String>) -> Option<Self> {
-        enc_password.map(|mut pwd| {
+        enc_password.map(|pwd| {
+            let pwd = Zeroizing::new(pwd);
             let pbkdf2_salt = random::<PBKDF2Salt>();
             let key =
                 pbkdf2_hmac_array::<Sha256, 32>(pwd.as_bytes(), &pbkdf2_salt, PBKDF2_ITERATIONS);
-            pwd.zeroize();
             KeyMaterial {
                 key,
                 nonce: Aes256Gcm::generate_nonce(&mut OsRng).into(),
@@ -221,13 +221,11 @@ impl KeyMaterial {
             Ok(None)
         } else {
             let pbkdf2_salt = random::<PBKDF2Salt>();
-            let mut enc_password = enc_password;
             let key = pbkdf2_hmac_array::<Sha256, 32>(
                 enc_password.as_bytes(),
                 &pbkdf2_salt,
                 PBKDF2_ITERATIONS,
             );
-            enc_password.zeroize();
             Ok(Some(KeyMaterial {
                 key,
                 nonce: Aes256Gcm::generate_nonce(&mut OsRng).into(),
@@ -255,10 +253,10 @@ impl KeyMaterial {
     /// This is used when decrypting existing wallet data, where the nonce
     /// and the salt have already been read from disk and are available.
     /// The passphrase string is zeroized after key derivation.
-    pub fn existing(mut password: String, nonce: EncryptionNonce, pbkdf2_salt: PBKDF2Salt) -> Self {
+    pub fn existing(password: String, nonce: EncryptionNonce, pbkdf2_salt: PBKDF2Salt) -> Self {
+        let password = Zeroizing::new(password);
         let key =
             pbkdf2_hmac_array::<Sha256, 32>(password.as_bytes(), &pbkdf2_salt, PBKDF2_ITERATIONS);
-        password.zeroize();
         KeyMaterial {
             key,
             nonce,
@@ -384,17 +382,18 @@ pub fn load_sensitive_struct<T: DeserializeOwned, F: SerdeFormat>(
     file: &Path,
     password: Option<String>,
 ) -> Result<(T, Option<KeyMaterial>), SecurityError> {
-    let content = fs::read(file)?;
+    let content = Zeroizing::new(fs::read(file)?);
 
+    let password = password.map(Zeroizing::new);
     let password = match password {
-        Some(encryption_password) if !encryption_password.is_empty() => {
+        Some(mut encryption_password) if !encryption_password.is_empty() => {
             let encrypted_struct = F::from_slice::<EncryptedData>(&content).map_err(|err| {
                 SecurityError::Format(format!(
                     "expected encrypted file {file:?} because a password was supplied: {err}"
                 ))
             })?;
             let enc_material = KeyMaterial::existing(
-                encryption_password,
+                std::mem::take(&mut *encryption_password),
                 encrypted_struct.nonce,
                 encrypted_struct.pbkdf2_salt,
             );
@@ -409,12 +408,12 @@ pub fn load_sensitive_struct<T: DeserializeOwned, F: SerdeFormat>(
         Ok(unencrypted_struct) => (unencrypted_struct, None),
         Err(unencrypted_err) => match F::from_slice::<EncryptedData>(&content) {
             Ok(encrypted_struct) => {
-                let encryption_password = match password {
+                let mut encryption_password = match password {
                     Some(p) => p,
                     None => return Err(SecurityError::PasswordRequired),
                 };
                 let enc_material = KeyMaterial::existing(
-                    encryption_password,
+                    std::mem::take(&mut *encryption_password),
                     encrypted_struct.nonce,
                     encrypted_struct.pbkdf2_salt,
                 );

@@ -18,6 +18,7 @@ use std::{
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use zeroize::Zeroizing;
 
 /// A simple command line app to operate as openswap client.
 ///
@@ -30,7 +31,7 @@ use std::{
 /// For more detailed usage information, please refer: <https://github.com/citadel-foss/openswap/blob/master/docs/taker.md>
 ///
 /// This is early beta, and there are known and unknown bugs. Please report issues at: <https://github.com/citadel-foss/openswap/issues>
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[clap(version = option_env ! ("CARGO_PKG_VERSION").unwrap_or("unknown"),
 author = option_env ! ("CARGO_PKG_AUTHORS").unwrap_or(""))]
 struct Cli {
@@ -429,7 +430,8 @@ fn display_offer(
 }
 
 fn main() -> Result<(), TakerError> {
-    let args = Cli::parse();
+    let mut args = Cli::parse();
+    let mut wallet_password = args.password.take().map(Zeroizing::new);
     setup_taker_logger(
         LevelFilter::from_str(&args.verbosity).unwrap(),
         matches!(
@@ -514,7 +516,7 @@ fn main() -> Result<(), TakerError> {
         tor_auth_password: args.tor_auth.clone().or_else(|| {
             (!file_config.tor_auth_password.is_empty()).then_some(file_config.tor_auth_password)
         }),
-        password: args.password.clone(),
+        password: wallet_password.as_mut().map(|p| std::mem::take(&mut **p)),
         wallet_name: wallet_name.clone(),
         ..TakerInitConfig::default()
     }

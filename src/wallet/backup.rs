@@ -1,4 +1,4 @@
-use std::{collections::HashSet, env, ffi::OsStr, fs, io::Write, path::PathBuf};
+use std::{borrow::Cow, collections::HashSet, env, ffi::OsStr, fs, io::Write, path::PathBuf};
 
 use crate::{
     security::{encrypt_struct, load_sensitive_struct, KeyMaterial, SecurityError, SerdeJson},
@@ -9,7 +9,7 @@ use crate::{
 use super::{
     api::{ADDRESS_IMPORT_COUNT, MAX_WATCH_WINDOW, RESTORE_ADDRESS_GAP},
     blockchain::{AnyBlockchain, BackendConfig},
-    storage::WalletStore,
+    storage::{erase_xpriv, SecretXpriv, WalletStore},
 };
 use bip39::Mnemonic;
 use bitcoin::{absolute::LockTime, bip32::Xpriv, Network, ScriptBuf};
@@ -22,6 +22,15 @@ use zeroize::Zeroizing;
 pub const RESTORE_OPEN_SWAPS_WARNING: &str =
     "A restore cannot recover swaps still in progress (including Lightning swaps): \
      their keys are not in a seed phrase or backup. Finish or refund them on the old wallet first.";
+
+fn parse_mnemonic(phrase: &str) -> Result<Mnemonic, WalletError> {
+    let mut normalized = Cow::Borrowed(phrase);
+    Mnemonic::normalize_utf8_cow(&mut normalized);
+    match normalized {
+        Cow::Borrowed(words) => Ok(Mnemonic::parse_normalized(words)?),
+        Cow::Owned(words) => Ok(Mnemonic::parse_normalized(&Zeroizing::new(words))?),
+    }
+}
 
 /// How far a restore searches. Saved in the wallet file until the first scan
 /// finishes, so a restore cut short resumes with the same options.
@@ -100,7 +109,7 @@ pub struct OpenSwapsSummary {
 /// This struct captures the essential elements of a wallet's state, including
 /// its network, master key, creation time, and file name. It is serializable
 /// and can be persisted to disk or transferred for backup purposes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct WalletBackup {
     /// Network the wallet operates on.
     pub(crate) network: Network, //Can be asked to the user, but is nice to save
@@ -130,6 +139,19 @@ pub struct WalletBackup {
     /// at least as wide as the unfinished one would have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) pending_gaps: Option<(u32, u32)>,
+}
+impl std::fmt::Debug for WalletBackup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalletBackup")
+            .field("master_key", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for WalletBackup {
+    fn drop(&mut self) {
+        erase_xpriv(&mut self.master_key);
+    }
 }
 impl From<&Wallet> for WalletBackup {
     fn from(wallet: &Wallet) -> Self {
@@ -262,6 +284,26 @@ impl Wallet {
         wallet_path: &Path,
         backend_config: &BackendConfig,
         restored_enc_material: KeyMaterial,
+        options: RestoreOptions,
+    ) -> Result<Wallet, WalletError> {
+        let mut wallet = Self::restore_prepared(
+            wallet_backup,
+            wallet_path,
+            backend_config,
+            restored_enc_material,
+            options,
+        )?;
+        wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
+        Ok(wallet)
+    }
+
+    /// Creates the encrypted wallet before the scan, so owned restore secrets
+    /// can be dropped before syncing.
+    pub(crate) fn restore_prepared(
+        wallet_backup: &WalletBackup,
+        wallet_path: &Path,
+        backend_config: &BackendConfig,
+        restored_enc_material: KeyMaterial,
         mut options: RestoreOptions,
     ) -> Result<Wallet, WalletError> {
         options.bond_hints.extend(&wallet_backup.fidelity_bonds);
@@ -387,7 +429,6 @@ impl Wallet {
             locked_utxos: std::collections::HashSet::new(),
         };
         tmp_wallet.seal_master_key()?;
-        tmp_wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
 
         Ok(tmp_wallet)
     }
@@ -419,17 +460,16 @@ impl Wallet {
                 )))
             }
         };
-        let mut mnemonic = Mnemonic::parse(phrase.as_str())?;
-
-        let network = Self::require_backend(&AnyBlockchain::from_config(backend_config)?)?.chain;
-        let master_key = Wallet::master_key_from_mnemonic(&mnemonic, network);
-        // Wipe the words as soon as the key exists, not after the chain scan.
-        zeroize::Zeroize::zeroize(&mut mnemonic);
+        let mnemonic = parse_mnemonic(phrase.as_str())?;
         drop(phrase);
-        let master_key = master_key?;
+        let seed = Zeroizing::new(mnemonic.to_seed(""));
+        drop(mnemonic);
+        let network = Self::require_backend(&AnyBlockchain::from_config(backend_config)?)?.chain;
+        let master_key = SecretXpriv(Xpriv::new_master(network, seed.as_slice())?);
+        drop(seed);
         let backup = WalletBackup {
             network,
-            master_key,
+            master_key: master_key.0,
             wallet_birthday: None,
             file_name,
             fidelity_bonds: Vec::new(),
@@ -438,19 +478,23 @@ impl Wallet {
             internal_index: 0,
             pending_gaps: None,
         };
+        drop(master_key);
 
-        Wallet::restore_with(
+        let mut wallet = Wallet::restore_prepared(
             &backup,
             wallet_path,
             backend_config,
             restored_enc_material,
             options,
-        )
+        )?;
+        drop(backup);
+        wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
+        Ok(wallet)
     }
 
-    /// Checks a seed phrase's words and checksum before anything else is asked.
+    /// Checks a seed phrase's words and checksum.
     pub fn validate_mnemonic(phrase: &str) -> Result<(), WalletError> {
-        Mnemonic::parse(phrase)?;
+        parse_mnemonic(phrase)?;
         Ok(())
     }
 
@@ -492,29 +536,6 @@ impl Wallet {
             restored_path.file_name()
         );
 
-        let backup = match load_sensitive_struct::<WalletBackup, SerdeJson>(backup_file_path, None)
-        {
-            // Cleartext (legacy) backups are not supported.
-            Ok((_, None)) => {
-                return Err(WalletError::General(format!(
-                    "wallet backup {backup_file_path:?} is unencrypted; \
-                     cleartext backups are not supported"
-                )))
-            }
-            Ok((backup, Some(_))) => backup,
-            Err(SecurityError::PasswordRequired) => {
-                let password = prompt_password("Enter encryption passphrase: ".to_string())
-                    .map_err(|e| WalletError::General(format!("failed to read passphrase: {e}")))?;
-                load_sensitive_struct::<WalletBackup, SerdeJson>(backup_file_path, Some(password))
-                    .map_err(|e| WalletError::General(format!("wallet backup load failed: {e}")))?
-                    .0
-            }
-            Err(err) => {
-                return Err(WalletError::General(format!(
-                    "wallet backup load failed: {err}"
-                )))
-            }
-        };
         let restore_enc_material = KeyMaterial::new_interactive(Some(
             "Enter restored wallet encryption passphrase: ".to_string(),
         ))
@@ -527,14 +548,42 @@ impl Wallet {
             )
         })?;
 
+        let backup = match load_sensitive_struct::<WalletBackup, SerdeJson>(backup_file_path, None)
+        {
+            // Cleartext (legacy) backups are not supported.
+            Ok((_, None)) => {
+                return Err(WalletError::General(format!(
+                    "wallet backup {backup_file_path:?} is unencrypted; \
+                     cleartext backups are not supported"
+                )))
+            }
+            Ok((backup, Some(_))) => backup,
+            Err(SecurityError::PasswordRequired) => {
+                let mut password = prompt_password("Enter encryption passphrase: ".to_string())
+                    .map_err(|e| WalletError::General(format!("failed to read passphrase: {e}")))?;
+                load_sensitive_struct::<WalletBackup, SerdeJson>(
+                    backup_file_path,
+                    Some(std::mem::take(&mut *password)),
+                )
+                .map_err(|e| WalletError::General(format!("wallet backup load failed: {e}")))?
+                .0
+            }
+            Err(err) => {
+                return Err(WalletError::General(format!(
+                    "wallet backup load failed: {err}"
+                )))
+            }
+        };
         let hints = options.bond_hints.clone();
-        let wallet = Wallet::restore_with(
+        let mut wallet = Wallet::restore_prepared(
             &backup,
             restored_path,
             backend,
             restore_enc_material,
             options,
         )?;
+        drop(backup);
+        wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
         println!("Wallet restore succeeded!");
         wallet.print_restored_bonds(&hints);
         Ok(())
@@ -548,11 +597,7 @@ impl Wallet {
         options: RestoreOptions,
     ) -> Result<(), WalletError> {
         println!("{RESTORE_OPEN_SWAPS_WARNING}");
-        let phrase = Zeroizing::new(
-            prompt_password("Enter seed phrase: ".to_string())
-                .map_err(|e| WalletError::General(format!("failed to read seed phrase: {e}")))?,
-        );
-        Wallet::validate_mnemonic(&phrase)?;
+        Self::require_backend(&AnyBlockchain::from_config(backend)?)?;
         let restore_enc_material = KeyMaterial::new_interactive(Some(
             "Enter restored wallet encryption passphrase: ".to_string(),
         ))
@@ -564,6 +609,9 @@ impl Wallet {
                     .to_string(),
             )
         })?;
+
+        let phrase = prompt_password("Enter seed phrase: ".to_string())
+            .map_err(|e| WalletError::General(format!("failed to read seed phrase: {e}")))?;
 
         let hints = options.bond_hints.clone();
         let wallet = Wallet::restore_from_mnemonic(
@@ -685,6 +733,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn backup_debug_redacts_master_key() {
+        let backup = dummy_backup("wallet");
+        let printed = format!("{backup:?}");
+        assert!(printed.contains("<redacted>"));
+        assert!(!printed.contains(&backup.master_key.to_string()));
+    }
+
+    #[test]
+    fn mnemonic_normalization_preserves_restore_words() {
+        let phrase = Zeroizing::new(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                .replace(' ', "\u{00a0}"),
+        );
+        assert_eq!(
+            parse_mnemonic(&phrase).unwrap(),
+            Mnemonic::parse("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap()
+        );
+    }
+
     /// The backup as v0.2.3 and v1 write and read it.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct BackupV1 {
@@ -743,7 +811,7 @@ mod tests {
             network: v2.network,
             master_key: v2.master_key,
             wallet_birthday: v2.wallet_birthday,
-            file_name: v2.file_name,
+            file_name: v2.file_name.clone(),
         };
         assert_eq!(v1, expected);
 

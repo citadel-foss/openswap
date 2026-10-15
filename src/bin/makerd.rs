@@ -7,6 +7,7 @@ use openswap::{
     wallet::{BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions},
 };
 use std::{path::PathBuf, sync::Arc};
+use zeroize::Zeroizing;
 
 /// OpenSwap Maker Server
 ///
@@ -21,7 +22,7 @@ use std::{path::PathBuf, sync::Arc};
 /// For more detailed usage information, please refer the [Maker Doc]<https://github.com/citadel-foss/openswap/blob/master/docs/makerd.md>
 ///
 /// This is early beta, and there are known and unknown bugs. Please report issues in the [Project Issue Board]<https://github.com/citadel-foss/openswap/issues>
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[clap(version = option_env ! ("CARGO_PKG_VERSION").unwrap_or("unknown"),
 author = option_env ! ("CARGO_PKG_AUTHORS").unwrap_or(""))]
 struct Cli {
@@ -132,7 +133,8 @@ fn main() -> Result<(), MakerError> {
     // operator's wallet and fidelity bond.
     let wallet_name = args.wallet_name.unwrap_or_else(|| "maker".to_string());
     config.wallet_name = wallet_name.clone();
-    config.password = args.password;
+    let mut wallet_password = args.password.map(Zeroizing::new);
+    config.password = None;
     if let Some(tor_auth) = args.tor_auth {
         config.tor_auth_password = tor_auth;
     }
@@ -174,7 +176,10 @@ fn main() -> Result<(), MakerError> {
             };
             return MakerServer::restore_wallet(&config, backup_file.as_deref(), options);
         }
-        Some(Commands::Backup { output }) => return MakerServer::backup_wallet(config, output),
+        Some(Commands::Backup { output }) => {
+            config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
+            return MakerServer::backup_wallet(config, output);
+        }
         None => {}
     }
 
@@ -191,6 +196,7 @@ fn main() -> Result<(), MakerError> {
     config.rpc_port = rpc_port;
     config.write_to_file(&config_path)?;
 
+    config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
     let maker = Arc::new(MakerServer::init(config)?);
 
     // Display and consume the mnemonic phrase. On failure, create a new wallet to get a new phrase.

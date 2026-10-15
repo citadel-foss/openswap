@@ -17,6 +17,7 @@ use std::{
 };
 
 use bitcoin::{bip32::ChainCode, Amount, Network, OutPoint, PublicKey, Transaction, Txid};
+use zeroize::Zeroizing;
 
 use crate::{
     blocklist::AddressBlocklist,
@@ -263,7 +264,7 @@ struct CompletedHandover {
 }
 
 /// Maker Server configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MakerServerConfig {
     /// Data directory for the Maker.
     pub data_dir: PathBuf,
@@ -321,6 +322,15 @@ pub struct MakerServerConfig {
     pub ldk_api_key_path: Option<String>,
     /// Path to the LDK Server TLS certificate.
     pub ldk_tls_cert_path: Option<String>,
+}
+
+impl std::fmt::Debug for MakerServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MakerServerConfig")
+            .field("wallet_name", &self.wallet_name)
+            .field("password", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for MakerServerConfig {
@@ -846,6 +856,7 @@ impl MakerServer {
         mut config: MakerServerConfig,
         output: Option<PathBuf>,
     ) -> Result<(), MakerError> {
+        let mut password = config.password.take().map(Zeroizing::new);
         let path = config.data_dir.join("wallets").join(&config.wallet_name);
         if !path.exists() {
             return Err(WalletError::General(format!("no wallet at {path:?} to back up")).into());
@@ -853,7 +864,11 @@ impl MakerServer {
         // Probe first so a down backend gets the clear backup error, not a load error.
         let blockchain = AnyBlockchain::from_config(&config.backend)?;
         Wallet::require_backend(&blockchain)?;
-        let wallet = Wallet::load(&path, blockchain, config.password.take())?;
+        let wallet = Wallet::load(
+            &path,
+            blockchain,
+            password.as_mut().map(|p| std::mem::take(&mut **p)),
+        )?;
         Wallet::backup_interactive(&wallet, output)?;
         Ok(())
     }
@@ -861,6 +876,7 @@ impl MakerServer {
     /// Initialize a maker server. The backend (Bitcoin Core or Electrum) is
     /// resolved from `config` via [`MakerServerConfig::backend`].
     pub fn init(mut config: MakerServerConfig) -> Result<Self, MakerError> {
+        let mut password = config.password.take().map(Zeroizing::new);
         // Configs built in code skip `MakerServerConfig::new`, so check here too.
         check_fee_pcts(config.amount_relative_fee_pct, config.time_relative_fee_pct)
             .map_err(|e| MakerError::Wallet(WalletError::General(e)))?;
@@ -890,7 +906,11 @@ impl MakerServer {
         // Take the passphrase out of the config: the wallet keeps the derived
         // key material, so the cleartext passphrase must not linger in the
         // long-lived server config.
-        let mut wallet = Wallet::load_or_init(&wallet_path, blockchain, config.password.take())?;
+        let mut wallet = Wallet::load_or_init(
+            &wallet_path,
+            blockchain,
+            password.as_mut().map(|p| std::mem::take(&mut **p)),
+        )?;
         let data_dir = config.data_dir.clone();
         log::info!("Sync at:----MakerServer init----");
         wallet.sync_and_save(&shutdown)?;
@@ -3889,6 +3909,15 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn maker_config_debug_hides_wallet_password() {
+        let config = MakerServerConfig {
+            password: Some("wallet-secret".to_string()),
+            ..MakerServerConfig::default()
+        };
+        assert!(!format!("{config:?}").contains("wallet-secret"));
+    }
 
     /// Non-finite or below-minimum fidelity feerates clamp to the relay
     /// minimum; a valid value is kept. A plain `<` comparison would let

@@ -34,7 +34,7 @@ use bitcoind::bitcoincore_rpc::bitcoincore_rpc_json::{ListUnspentResultEntry, Sc
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::{
     lock_debug,
@@ -57,7 +57,7 @@ use super::{
     backup::RestoreOptions,
     blockchain::{AnyBlockchain, Blockchain, HdOrigin},
     error::WalletError,
-    storage::{AddressType, WalletStore},
+    storage::{AddressType, SecretXpriv, WalletStore},
     swapcoin::{contract_timelock, WatchOnlySwapCoin},
 };
 
@@ -93,8 +93,8 @@ pub struct SecretMnemonic(Mnemonic);
 
 impl SecretMnemonic {
     /// Callers must not log or persist the result.
-    pub fn words(&self) -> String {
-        self.0.to_string()
+    pub fn words(&self) -> Zeroizing<String> {
+        Zeroizing::new(self.0.to_string())
     }
 }
 
@@ -150,21 +150,9 @@ impl PartialEq for Wallet {
         //self.store == other.store
         //avoided filename
         self.store.network == other.store.network &&
-        // Compare master keys by plaintext (each unsealed with its own
-        // passphrase), not by sealed bytes, so wallets sealed under
-        // different passphrases/nonces still compare equal. Both sides must
-        // unseal: `plaintext_with` maps a decryption failure to `None`, and
-        // `None == None` would report a false match.
-        matches!(
-            (
-                self.store.master_key.plaintext_with(&self.store_enc_material),
-                other
-                    .store
-                    .master_key
-                    .plaintext_with(&other.store_enc_material),
-            ),
-            (Some(a), Some(b)) if a == b
-        ) &&
+        // Compare the unsealed keys inside their wipe-on-return scopes.
+        self.with_master_key(|a| other.with_master_key(|b| Ok(a == b)))
+            .unwrap_or(false) &&
         self.store.external_index == other.store.external_index &&
         self.store.internal_index == other.store.internal_index &&
         self.store.offer_maxsize == other.store.offer_maxsize &&
@@ -465,10 +453,6 @@ impl Wallet {
     ) -> Result<Self, WalletError> {
         let network = blockchain.get_blockchain_info()?.chain;
 
-        // Generate Master key
-        let mnemonic = Mnemonic::generate(12)?;
-        let master_key = Self::master_key_from_mnemonic(&mnemonic, network)?;
-
         // Initialise wallet
         let file_name = path
             .file_name()
@@ -479,17 +463,20 @@ impl Wallet {
             .to_string();
 
         let wallet_birthday = blockchain.get_block_count()?;
+        let mnemonic = Mnemonic::generate(12)?;
+        let master_key = SecretXpriv(Self::master_key_from_mnemonic(&mnemonic, network)?);
         // WalletStore::init seals the master key before the first write, so
         // the plaintext key never reaches disk.
         let store = WalletStore::init(
             file_name,
             path,
             network,
-            master_key,
+            master_key.0,
             Some(wallet_birthday),
             None,
             &store_enc_material,
         )?;
+        drop(master_key);
         log::info!(
             "Wallet birth_height = {wallet_birthday}, last_synced_height = {:?}",
             store.last_synced_height
@@ -548,33 +535,33 @@ impl Wallet {
         blockchain: AnyBlockchain,
         password: Option<String>,
     ) -> Result<Self, WalletError> {
-        let password = password.filter(|p| !p.is_empty());
-
-        let (mut store, store_enc_material) =
-            match WalletStore::read_from_disk(path, password.clone()) {
-                Ok((store, Some(material))) => (store, material),
-                // Cleartext wallet files are not supported at all.
-                Ok((_, None)) => {
-                    return Err(WalletError::General(format!(
-                        "wallet file {path:?} is unencrypted; \
-                         cleartext wallet files are not supported"
-                    )))
-                }
-                // Encrypted file, no passphrase supplied. Report how to supply
-                // one instead of failing decryption with an empty passphrase.
-                Err(WalletError::Security(SecurityError::PasswordRequired)) => {
-                    return Err(WalletError::General(format!(
-                        "wallet file {path:?} is encrypted; \
-                         provide the wallet passphrase via -p/--PASSWORD"
-                    )))
-                }
-                Err(e) => return Err(e),
-            };
-        // Wipe the cleartext passphrase; only the derived key material is kept.
-        if let Some(mut p) = password {
-            p.zeroize();
+        let mut password = password.map(Zeroizing::new);
+        if password.as_ref().is_some_and(|p| p.is_empty()) {
+            password = None;
         }
 
+        let (mut store, store_enc_material) = match WalletStore::read_from_disk(
+            path,
+            password.as_mut().map(|p| std::mem::take(&mut **p)),
+        ) {
+            Ok((store, Some(material))) => (store, material),
+            // Cleartext wallet files are not supported at all.
+            Ok((_, None)) => {
+                return Err(WalletError::General(format!(
+                    "wallet file {path:?} is unencrypted; \
+                         cleartext wallet files are not supported"
+                )))
+            }
+            // Encrypted file, no passphrase supplied. Report how to supply
+            // one instead of failing decryption with an empty passphrase.
+            Err(WalletError::Security(SecurityError::PasswordRequired)) => {
+                return Err(WalletError::General(format!(
+                    "wallet file {path:?} is encrypted; \
+                         provide the wallet passphrase via -p/--PASSWORD"
+                )))
+            }
+            Err(e) => return Err(e),
+        };
         if let AnyBlockchain::CoreRPC(core) = &blockchain {
             if core.wallet_name() != store.file_name {
                 return Err(WalletError::General(format!(
@@ -641,15 +628,16 @@ impl Wallet {
             wallet
         } else {
             // wallet doesn't exists at the given path, create a new one
-            let Some(password) = password.filter(|p| !p.is_empty()) else {
+            let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
                 return Err(WalletError::General(
                     "a passphrase is required to create a wallet; \
                      cleartext wallet files are not supported"
                         .to_string(),
                 ));
             };
-            let store_enc_material = KeyMaterial::new_from_password(Some(password))
-                .expect("a non-empty passphrase always yields key material");
+            let store_enc_material =
+                KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
+                    .expect("a non-empty passphrase always yields key material");
 
             let wallet = Wallet::init(path, blockchain, store_enc_material)?;
 
@@ -699,13 +687,11 @@ impl Wallet {
     ) -> Result<T, WalletError> {
         let secp = crate::utill::global_secp();
         self.with_master_key(|master_key| {
-            let mut account = master_key.derive_priv(
+            let account = SecretXpriv(master_key.derive_priv(
                 secp,
                 &Self::get_derivation_path(address_type, self.store.network),
-            )?;
-            let result = f(&account);
-            account.private_key.non_secure_erase();
-            result
+            )?);
+            f(&account.0)
         })
     }
 
@@ -4977,10 +4963,8 @@ mod prevout_contract_tests {
         let mut wallet = test_wallet(&temp_dir.path().join("wallet.cbor"));
         wallet.new_mnemonic = Some(SecretMnemonic(Mnemonic::parse(TEST_PHRASE).unwrap()));
 
-        assert_eq!(
-            wallet.take_new_mnemonic().map(|m| m.words()).as_deref(),
-            Some(TEST_PHRASE)
-        );
+        let words: Zeroizing<String> = wallet.take_new_mnemonic().unwrap().words();
+        assert_eq!(words.as_str(), TEST_PHRASE);
         assert!(
             wallet.take_new_mnemonic().is_none(),
             "the phrase must be dropped from the wallet after the first take"

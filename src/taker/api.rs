@@ -27,6 +27,7 @@ use bitcoin::{
     Amount, OutPoint, PublicKey, Transaction,
 };
 use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
+use zeroize::Zeroizing;
 
 use crate::{
     blocklist::{AddOutcome, AddressBlocklist, BlocklistEntry},
@@ -160,7 +161,7 @@ pub(crate) const CONFIRMATION_HEIGHT_TOLERANCE: u32 = 6;
 pub(crate) const CONFIRMATION_HEIGHT_TOLERANCE: u32 = 150;
 
 /// Taker configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TakerInitConfig {
     /// Data directory path.
     pub data_dir: Option<PathBuf>,
@@ -189,6 +190,15 @@ pub struct TakerInitConfig {
     pub ldk_api_key_path: Option<String>,
     /// Path to the LDK Server TLS certificate.
     pub ldk_tls_cert_path: Option<String>,
+}
+
+impl std::fmt::Debug for TakerInitConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TakerInitConfig")
+            .field("wallet_name", &self.wallet_name)
+            .field("password", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for TakerInitConfig {
@@ -684,6 +694,7 @@ impl Taker {
 
     /// Initialize a new taker. The backend is resolved from `config` via [`TakerInitConfig::backend`].
     pub fn init(mut config: TakerInitConfig) -> Result<Self, TakerError> {
+        let mut password = config.password.take().map(Zeroizing::new);
         // Init the Wallet
         let wallet_name = config.wallet_name.clone();
 
@@ -709,7 +720,11 @@ impl Taker {
         // Take the passphrase out of the config: the wallet keeps the derived
         // key material, so the cleartext passphrase must not linger in the
         // long-lived server config.
-        let wallet = Wallet::load_or_init(&wallet_path, blockchain, config.password.take())?;
+        let wallet = Wallet::load_or_init(
+            &wallet_path,
+            blockchain,
+            password.as_mut().map(|p| std::mem::take(&mut **p)),
+        )?;
         // Validate the blocklist on startup when screening is enabled.
         if config.check_blocklist.unwrap_or(false) {
             AddressBlocklist::load(&data_dir, wallet.store.network)?;
@@ -4203,6 +4218,15 @@ pub enum TakerBehavior {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn taker_config_debug_hides_wallet_password() {
+        let config = TakerInitConfig {
+            password: Some("wallet-secret".to_string()),
+            ..TakerInitConfig::default()
+        };
+        assert!(!format!("{config:?}").contains("wallet-secret"));
+    }
 
     /// The CLI rebuilds `TakerInitConfig` from `config.toml` on every launch,
     /// so anything `init_taker_config` fails to write is lost at the next

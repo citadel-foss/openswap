@@ -39,23 +39,25 @@ pub fn restore_wallet_from_backup_gui_app(
     password: Option<String>,
     options: RestoreOptions,
 ) -> Result<(), WalletError> {
-    let Some(password) = password.filter(|p| !p.is_empty()) else {
+    let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
         return Err(WalletError::General(
             "a passphrase is required; cleartext wallet files are not supported".to_string(),
         ));
     };
-    let (backup, encryption_material) =
-        match load_sensitive_struct::<WalletBackup, SerdeJson>(&backup_file_path, Some(password)) {
-            Ok((backup, Some(material))) => (backup, material),
-            Ok((_, None)) => {
-                unreachable!("a supplied passphrase either decrypts or errors")
-            }
-            Err(err) => {
-                return Err(WalletError::General(format!(
-                    "wallet backup load failed: {err}"
-                )))
-            }
-        };
+    let (backup, encryption_material) = match load_sensitive_struct::<WalletBackup, SerdeJson>(
+        &backup_file_path,
+        Some(std::mem::take(&mut *password)),
+    ) {
+        Ok((backup, Some(material))) => (backup, material),
+        Ok((_, None)) => {
+            unreachable!("a supplied passphrase either decrypts or errors")
+        }
+        Err(err) => {
+            return Err(WalletError::General(format!(
+                "wallet backup load failed: {err}"
+            )))
+        }
+    };
     // A nameless path resolves to the backup's filename inside `Wallet::restore_with`.
     let wallets_dir = data_dir
         .map(Ok)
@@ -68,13 +70,15 @@ pub fn restore_wallet_from_backup_gui_app(
         None => wallets_dir,
     };
 
-    Wallet::restore_with(
+    let mut wallet = Wallet::restore_prepared(
         &backup,
         &restored_wallet_path,
         &backend,
         encryption_material,
         options,
     )?;
+    drop(backup);
+    wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
     Ok(())
 }
 
@@ -92,11 +96,13 @@ pub fn restore_wallet_from_mnemonic_gui_app(
     options: RestoreOptions,
 ) -> Result<(), WalletError> {
     let phrase = Zeroizing::new(phrase);
-    let Some(material) = KeyMaterial::new_from_password(password.filter(|p| !p.is_empty())) else {
+    let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
         return Err(WalletError::General(
             "a passphrase is required; cleartext wallet files are not supported".to_string(),
         ));
     };
+    let material = KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
+        .expect("a non-empty passphrase always yields key material");
     let wallet_path = data_dir
         .map(Ok)
         .unwrap_or_else(get_taker_dir)?
@@ -164,14 +170,14 @@ impl Wallet {
         destination_path: String,
         password: Option<String>,
     ) -> Result<(), WalletError> {
-        let Some(password) = password.filter(|p| !p.is_empty()) else {
+        let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
             return Err(WalletError::General(
                 "a passphrase is required for wallet backups; \
                  cleartext backups are not supported"
                     .to_string(),
             ));
         };
-        let km = KeyMaterial::new_from_password(Some(password))
+        let km = KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
             .expect("a non-empty passphrase always yields key material");
         let backup_path = Path::new(&destination_path);
         self.backup(backup_path, km)?;
