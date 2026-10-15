@@ -88,7 +88,8 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   codes and signing key pairs are wiped when they go out of scope, also on
   errors. But `Xpriv` is `Copy`, so earlier copies may persist on the
   stack/in registers, and `non_secure_erase` explicitly permits the compiler
-  to leave copies. Library internals (key derivation, AES) keep their own.
+  to leave copies. Library internals (key derivation, base58 decoding, AES)
+  keep their own.
 - **Passphrase theft** (keyloggers, phishing the prompt, reading the
   environment of the process) is out of scope — an attacker with the
   passphrase has the wallet.

@@ -479,9 +479,8 @@ impl Blockchain for CoreRPC {
         Ok(per_kvb.to_sat() as f64 / 1000.0)
     }
 
-    /// Load the watch-only wallet on the node, creating it if absent. Ported
-    /// verbatim from the pre-refactor `Wallet::sync` Core bootstrap so behaviour
-    /// is unchanged; only invoked on the Core sync path.
+    /// Load the watch-only wallet on the node, creating it if absent. Refuses
+    /// Core older than v22; only invoked on the Core sync path.
     fn prepare_backend_wallet(&self, wallet_name: &str) -> Result<(), WalletError> {
         // Older nodes lack `listdescriptors` and `tr()`, so sync would fail
         // and retry forever, whatever kind of wallet the node holds.

@@ -425,7 +425,7 @@ impl Wallet {
         })
     }
 
-    /// Restores a `Wallet` from its BIP39 seed phrase, via [`Wallet::restore_with`].
+    /// Restores a `Wallet` from its BIP39 seed phrase, via `Wallet::restore_prepared`.
     ///
     /// `options.birthday` is a floor on the Bitcoin Core rescan — `None` scans from
     /// genesis, and the effective start may be up to 2h of blocks later. Electrum
@@ -452,7 +452,7 @@ impl Wallet {
                 )))
             }
         };
-        // Probe first, so no seed or key is held through a slow or failing backend.
+        // Probe first, so no parsed seed or key is held through a slow or failing backend.
         let network = Self::require_backend(&AnyBlockchain::from_config(backend_config)?)?.chain;
         let mnemonic = parse_mnemonic(phrase.as_str())?;
         drop(phrase);

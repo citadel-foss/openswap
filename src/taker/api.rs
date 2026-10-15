@@ -3973,7 +3973,7 @@ impl Taker {
         fs::create_dir_all(&wallets_dir)?;
 
         match backup_file {
-            // A nameless path resolves to the backup's filename inside `Wallet::restore_with`.
+            // A nameless path resolves to the backup's filename inside `Wallet::restore_prepared`.
             Some(file) => {
                 let path = match wallet_file_name {
                     Some(name) => wallets_dir.join(name),

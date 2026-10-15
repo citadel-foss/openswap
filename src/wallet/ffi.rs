@@ -60,7 +60,7 @@ pub fn restore_wallet_from_backup_gui_app(
             )))
         }
     };
-    // A nameless path resolves to the backup's filename inside `Wallet::restore_with`.
+    // A nameless path resolves to the backup's filename inside `Wallet::restore_prepared`.
     let wallets_dir = data_dir
         .map(Ok)
         .unwrap_or_else(get_taker_dir)?

@@ -664,10 +664,15 @@ impl Wallet {
         backend: &BackendConfig,
         password: Option<String>,
     ) -> Result<(), WalletError> {
+        let mut password = password.map(Zeroizing::new);
         if path.exists() {
             return Ok(());
         }
-        let mut wallet = Self::load_or_init(path, AnyBlockchain::from_config(backend)?, password)?;
+        let mut wallet = Self::load_or_init(
+            path,
+            AnyBlockchain::from_config(backend)?,
+            password.as_mut().map(|p| std::mem::take(&mut **p)),
+        )?;
         if let Some(mnemonic) = wallet.take_new_mnemonic() {
             print_new_wallet_seed(&mnemonic).inspect_err(|e| {
                 log::error!(
@@ -4431,7 +4436,7 @@ impl Wallet {
             self.max_watch_index(KeychainKind::External)?,
             self.max_watch_index(KeychainKind::Internal)?,
         );
-        // A resumed restore never passed `restore_with`'s check; a plain wallet
+        // A resumed restore never passed `restore_prepared`'s check; a plain wallet
         // keeps syncing as it did before the cap existed.
         if self.store.pending_restore.is_some() {
             Self::check_watch_window(prev_window)?;
