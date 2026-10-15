@@ -213,7 +213,7 @@ fn last_hop_expensive_spare_aborts_instead_of_repricing(world: &mut World, param
     // spendable is pinned from a real run: 3 funding txs + 3 timelock refunds
     // at 1 sat/vB.
     assert_balances!(world, since before; {
-        taker: { spendable: 14_998_662, swap: 0, contract: 0, fidelity: 0 },
+        taker: { spendable: 14_998_629, swap: 0, contract: 0, fidelity: 0 },
         makers: { swap: 0, contract: 0, fidelity: BOND, gain: 0 },
     });
 
@@ -266,7 +266,7 @@ fn last_hop_equal_priced_spare_completes(world: &mut World, params: SwapParams) 
     // both selected hops use the cheap fee schedule for the taker; hop 0 earns
     // the default schedule, the spare earns the cheap one.
     assert_balances!(world; {
-        taker: { spendable: 14_996_805, contract: 0, fidelity: 0 },
+        taker: { spendable: 14_996_772, contract: 0, fidelity: 0 },
         makers: { spendable: [15_000_005, 14_999_757, 14_999_968], contract: 0, fidelity: BOND },
     });
 

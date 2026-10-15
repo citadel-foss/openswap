@@ -235,7 +235,8 @@ The pieces:
   `world.framework()` reaches anything the world does not wrap.
 - **Handles**: `world.taker()` / `world.makers()[i]` wrap one taker or maker
   (`sync`, `balances`, `prepare`, `start`, `await_recovery`); `.inner()` is
-  the `Taker` or `MakerServer` underneath.
+  the `Taker` or `MakerServer` underneath. `world.maker_mut(i)` changes a
+  maker's config before its server starts.
 - **Teardown**: `world.finish()` drops the takers, shuts the makers down,
   stops the framework and joins the block generator, in that order. `Drop` runs
   the same teardown when a test panics, so a failure cleans up too.
@@ -382,6 +383,10 @@ fn reconnects_after_the_connection_drops(node: &mut Node) {
     // ..
 }
 ```
+
+`keypool = n` sets bitcoind's keypool before it starts, and
+`node.backend_config::<B>(wallet_name)` is the wallet backend for the node, so
+a body generic over `B` runs on either backend (see `wallet/backup.rs`).
 
 `wallet/electrum_transport.rs`, `wallet/backup.rs`, `cli/taker.rs`, the
 `lightning/swap_*.rs` chain tests and `fidelity::spending::mempool_only_spend_reads_as_spent`

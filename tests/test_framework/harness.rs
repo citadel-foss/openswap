@@ -40,8 +40,9 @@ use openswap::{
 
 use super::{
     actors::{
-        fund_makers, fund_makers_default, fund_taker, fund_taker_default, spawn_makers,
-        sync_maker_wallets, verify_maker_pre_swap_balances, wait_for_makers_setup,
+        fund_maker_from_one_address, fund_makers, fund_makers_default, fund_taker,
+        fund_taker_default, sole_regular_utxo_address, spawn_makers, sync_maker_wallets,
+        verify_maker_pre_swap_balances, wait_for_makers_setup,
     },
     backend::TestBackend,
     expect::WorldBalances,
@@ -350,6 +351,38 @@ impl World {
             utxo_value,
             address_type,
         )
+    }
+
+    /// [`fund_maker_from_one_address`] on maker `index`: every UTXO pays one
+    /// fresh address, so its later swap funding traces back to one script.
+    pub fn fund_maker_from_one_address(
+        &self,
+        index: usize,
+        utxo_count: u32,
+        utxo_value: Amount,
+        address_type: AddressType,
+    ) {
+        fund_maker_from_one_address(
+            &self.makers[index].server,
+            self.bitcoind(),
+            utxo_count,
+            utxo_value,
+            address_type,
+        );
+    }
+
+    /// [`sole_regular_utxo_address`] of maker `index`: the source of its swap
+    /// funding once fidelity setup has consolidated its deposits.
+    pub fn sole_regular_utxo_address(&self, index: usize) -> bitcoin::Address {
+        sole_regular_utxo_address(&self.makers[index].server)
+    }
+
+    /// Maker `index`'s server, to change its config before it starts. Only
+    /// while nothing else holds it: before its server thread runs.
+    #[track_caller]
+    pub fn maker_mut(&mut self, index: usize) -> &mut MakerServer {
+        Arc::get_mut(&mut self.makers[index].server)
+            .expect("the maker is shared; change it before its server starts")
     }
 
     /// Starts every maker server, waits up to `setup_timeout_secs` for their
@@ -715,7 +748,13 @@ impl TakerHandle {
         self.taker.log_tracker_state();
     }
 
-    /// Polls [`Taker::is_recovery_complete`] every 5s, panicking once
+    /// [`Taker::wait_for_recovery`]: blocks until every unresolved contract is
+    /// recovered; `false` means some are left with nothing retrying them.
+    pub fn wait_for_recovery(&mut self) -> bool {
+        self.taker.wait_for_recovery()
+    }
+
+    /// Polls [`Taker::is_recovery_complete`] every [`POLL`], panicking once
     /// `timeout` has passed without it.
     #[track_caller]
     pub fn await_recovery(&self, timeout: Duration) {

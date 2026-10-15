@@ -5,6 +5,7 @@ mod contract_breach;
 mod electrum;
 mod legacy_hashlock;
 mod maker_abort;
+mod refund_fee_bump;
 // `restart::watchtower_liveness` runs its timelock-only recovery body.
 pub(crate) mod skip_funding;
 mod taker_abort;

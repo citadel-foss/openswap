@@ -11,7 +11,10 @@ use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::MakerServer,
     protocol::common_messages::ProtocolVersion,
-    taker::{error::TakerError, SwapParams, TakerBehavior},
+    taker::{
+        error::TakerError, MakerState, SwapParams, TakerBehavior, UnavailableReason,
+        UnavailableState,
+    },
     utill::{MAX_TX_COUNT, MIN_RELAY_FEE_RATE},
     wallet::{min_contract_value_sats, AddressType, Destination},
 };
@@ -86,6 +89,31 @@ fn maker_rejects_out_of_bounds_swap_details(world: &mut World) {
     );
     info!("Above-maximum request rejected by the offerbook filter");
 
+    // ---- 2b. One sat over max: maker 0 is declared the send amount less our funding fee, so it is still in range ----
+    // The filter must use that declared amount, so selection succeeds and
+    // CloseEarly is what stops the swap.
+    let smallest_max = world
+        .makers()
+        .iter()
+        .map(|maker| maker.balances().regular)
+        .min()
+        .unwrap();
+    world.taker_mut().set_behavior(TakerBehavior::CloseEarly);
+    let err = world
+        .taker_mut()
+        .prepare(
+            SwapParams::new(ProtocolVersion::Taproot, smallest_max + Amount::ONE_SAT, 2)
+                .with_tx_count(1)
+                .with_required_confirms(1),
+        )
+        .expect_err("CloseEarly must abort prepare_swap");
+    assert!(
+        format!("{:?}", err).contains("Closing early after maker selection"),
+        "the offerbook filter must use the declared amount, got: {:?}",
+        err
+    );
+    world.taker_mut().set_behavior(TakerBehavior::Normal);
+
     // ---- 3. Below minimum, past the filter: our own planner refuses the contract ----
     let err = world
         .taker_mut()
@@ -118,11 +146,13 @@ fn maker_rejects_out_of_bounds_swap_details(world: &mut World) {
                 .with_preferred_makers(preferred.clone()),
         )
         .expect_err("negotiation must refuse an amount over the maker's maximum");
+    // Maker 0 is declared the amount less the taker's own funding fee: one
+    // split spends all four 0.05 BTC coins, 97 + 68 x 4 = 369 sats at 1 sat/vB.
     let msg = format!("{:?}", err);
     assert!(
         msg.contains(&format!(
             "Send amount ({} sats) exceeds maker 0 max_size",
-            above_max.to_sat()
+            above_max.to_sat() - 369
         )),
         "Expected the negotiation max_size guard, got: {}",
         msg
@@ -249,6 +279,14 @@ fn low_swap_liquidity(world: &mut World, params: SwapParams) {
     // Mine a block to confirm the drain, then sync maker wallet
     world.mine(1);
     world.makers()[0].sync();
+    // The offerbook may still hold the offer fetched before the drain: it is
+    // not refetched while younger than OFFER_MAX_AGE_BEFORE_REFRESH (10s in
+    // tests). Poll the maker so selection sees the drained max_size=0 offer.
+    world
+        .taker()
+        .inner()
+        .poll_maker(world.makers()[0].address())
+        .expect("re-poll of the drained maker should answer");
 
     info!("Maker should be halted due to low swap liquidity");
 
@@ -259,6 +297,25 @@ fn low_swap_liquidity(world: &mut World, params: SwapParams) {
         .taker_mut()
         .prepare(params.clone())
         .expect_err("Swap should have failed due to insufficient maker liquidity");
+    assert!(
+        matches!(err, TakerError::NotEnoughMakersInOfferBook),
+        "Expected NotEnoughMakersInOfferBook, got: {:?}",
+        err
+    );
+    // The refusal must come from the drained maker: its max=0 offer cannot
+    // price any amount, so the offerbook sidelines it.
+    let drained = world.maker_standing(0);
+    assert!(
+        matches!(
+            drained,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::UnpriceableOffer,
+                ..
+            })
+        ),
+        "the drained maker must be out for an unpriceable offer, got {:?}",
+        drained
+    );
     info!("OpenSwap failed as expected: {err:?}");
 
     info!("Adding sufficient funds to maker to perform a swap and avoid low swap liquidity");
@@ -363,8 +420,85 @@ fn one_utxo_taker_completes_degraded_swap(world: &mut World) {
     assert_log!(world; { has "with 1 funding txs" });
 }
 
+/// A coin the saved hop-0 plan relies on leaves the wallet between
+/// `prepare_swap` and `start_swap`. Funding refuses the stale plan before
+/// anything is signed or broadcast, and a fresh `prepare_swap` plans from the
+/// coins left and completes.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        // Two coins of different sizes: the plan takes the smallest that covers
+        // the swap, so the 0.01 BTC coin is the planned one.
+        fund_taker(1, Amount::from_btc(0.01).unwrap(), AddressType::P2TR),
+        fund_taker(1, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
+        fund_makers_default(),
+        spawn_ready_makers_and_mine(),
+    ],
+)]
+fn stale_hop0_plan_fails_safely_and_a_fresh_prepare_recovers(world: &mut World) {
+    let planned_value = Amount::from_btc(0.01).unwrap();
+    let spare_value = Amount::from_btc(0.05).unwrap();
+    let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    let stale = world
+        .taker_mut()
+        .prepare(params.clone())
+        .expect("prepare_swap should succeed");
+
+    // Spend the planned coin away before the swap starts.
+    let secp = Secp256k1::new();
+    let keypair = bitcoin::key::Keypair::from_secret_key(&secp, &SecretKey::new(&mut OsRng));
+    let addr = Address::p2tr(&secp, keypair.x_only_public_key().0, None, Network::Regtest);
+    {
+        let mut wallet = world.taker().inner().get_wallet().write().unwrap();
+        let planned: Vec<_> = wallet
+            .list_descriptor_utxo_spend_info()
+            .into_iter()
+            .filter(|(utxo, _)| utxo.amount == planned_value)
+            .collect();
+        assert_eq!(planned.len(), 1, "exactly one 0.01 BTC coin to spend");
+        let tx = wallet
+            .spend_from_wallet(MIN_RELAY_FEE_RATE, Destination::Sweep(addr), &planned)
+            .unwrap();
+        world.bitcoind().client.send_raw_transaction(&tx).unwrap();
+    }
+    world.mine(1);
+    world.taker().sync();
+
+    // The funding claim checks the plan before anything is signed, so it is
+    // the one that refuses a coin that has left the wallet.
+    let err = world
+        .taker_mut()
+        .start(&stale.swap_id)
+        .expect_err("a plan whose coin has left the wallet must not fund");
+    assert!(
+        format!("{err:?}").contains("A planned funding input is no longer free"),
+        "Expected the stale-plan refusal, got: {:?}",
+        err
+    );
+    // Nothing was signed or broadcast: only the spare coin is left, untouched.
+    assert_balances!(world; { taker: { regular: spare_value, contract: 0 } });
+
+    let report = world
+        .taker_mut()
+        .swap(params)
+        .expect("a fresh prepare_swap plans from the coins left and completes");
+    world.taker().sync();
+    let after = world.taker().balances();
+    assert_taker_report_exact(
+        &report,
+        Amount::from_sat(500_000),
+        spare_value.checked_sub(after.spendable).unwrap(),
+    );
+}
+
 /// The maker forwards 1,075 sats. Two splits net to 372 each, under the 485
 /// taproot floor, but one split nets to 910, so admission must re-plan with one.
+/// The taker sends 2,130 so that, less its two 165 sat funding fees, maker 0
+/// is declared 1,800.
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal],
@@ -372,7 +506,7 @@ fn one_utxo_taker_completes_degraded_swap(world: &mut World) {
     setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
 )]
 fn maker_degrades_split_count_when_netting_breaks_the_floor(world: &mut World) {
-    let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(1_800), 1)
+    let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(2_130), 1)
         .with_tx_count(2)
         .with_required_confirms(1);
     world
@@ -380,6 +514,26 @@ fn maker_degrades_split_count_when_netting_breaks_the_floor(world: &mut World) {
         .prepare(params)
         .expect("admission must fall back to one split");
     assert_log!(world; { has "with 1 funding split(s)" });
+}
+
+/// The taker's own hop nets its funding fees too. 1,900 sats in three splits
+/// nets to 468/468/469, under the 485 sat taproot floor; two splits net to
+/// 785/785, so the taker must re-plan with two instead of failing.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+)]
+fn taker_degrades_split_count_when_netting_breaks_the_floor(world: &mut World) {
+    let params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(1_900), 1)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+    world
+        .taker_mut()
+        .prepare(params)
+        .expect("the taker must fall back to two splits");
+    assert_log!(world; { has "retrying with 2 split(s)" });
 }
 
 /// Admission plans but reserves nothing: coins are claimed only at funding, so a

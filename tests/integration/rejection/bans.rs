@@ -272,7 +272,7 @@ fn wrong_handover_key_bans_the_last_maker(world: &mut World, params: SwapParams)
     );
     world.mine(1);
     world.taker().sync();
-    assert_balances!(world; { taker: { regular: 14_499_692, swap: 497_369, contract: 0 } });
+    assert_balances!(world; { taker: { regular: 14_500_000, swap: 497_039, contract: 0 } });
 
     info!("Wrong handover key test completed successfully!");
 }

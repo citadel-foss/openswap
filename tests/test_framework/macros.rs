@@ -29,9 +29,9 @@ macro_rules! wait_logged {
 /// // .. the swap ..
 /// world.sync_all();
 /// assert_balances!(world, since before; {
-///     taker:   { regular: 14_499_538, swap: 496_447, contract: 0, fidelity: 0, loss: 4_015 },
-///     makers:  { regular: [14_500_865, 14_502_398], contract: 0, fidelity: BOND, gain: [658, 621] },
-///     maker 1: { swap: 497_980 },
+///     taker:   { regular: 14_500_000, swap: 495_952, contract: 0, fidelity: 0, loss: 4_048 },
+///     makers:  { regular: [14_501_360, 14_502_893], contract: 0, fidelity: BOND, gain: [658, 621] },
+///     maker 1: { swap: 497_485 },
 /// });
 /// ```
 ///

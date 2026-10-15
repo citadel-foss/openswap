@@ -149,14 +149,14 @@ fn run_maker_partial_broadcast<B: TestBackend>(
     cases = [
         taker_recovers_partial_broadcast_with_spare_maker(
             backend = BitcoindBackend,
-            expected_spendable = 14_999_554,
+            expected_spendable = 14_999_543,
         ),
         /// The same partial batch on Electrum: the backend can lag the session's own
         /// broadcast, so only the recorded phase keeps the spare maker unused and
         /// the recovery material intact.
         taker_recovers_partial_broadcast_with_spare_maker_electrum(
             backend = ElectrumBackend,
-            expected_spendable = 14_999_554,
+            expected_spendable = 14_999_543,
         ),
     ],
 )]
@@ -217,6 +217,12 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker(
         2,
         "both splits' swapcoins must survive — no substitution cleanup"
     );
+    // Split 1 was accepted, so its inputs are free; split 2 failed and might
+    // still land, so its inputs stay claimed until recovery settles the swap.
+    assert!(
+        world.taker().inner().reserved_inputs().unwrap() > 0,
+        "a failed broadcast must keep its inputs claimed"
+    );
 
     // Recovery reclaims the on-chain split once its timelock matures.
     wait_until!(
@@ -224,6 +230,11 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker(
         every Duration::from_secs(5),
         "taker recovery to complete",
         world.taker().inner().is_recovery_complete()
+    );
+    assert_eq!(
+        world.taker().inner().reserved_inputs().unwrap(),
+        0,
+        "recovery must release the claim of the swap it settled"
     );
 
     world.mine(1);

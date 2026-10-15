@@ -38,7 +38,7 @@ struct SpareMakerExpect {
             protocol = ProtocolVersion::Legacy,
             prepare_failure = "Failed to prepare openswap",
             expected = &SpareMakerExpect {
-                taker_spendable: 14995985,
+                taker_spendable: 14995952,
                 maker_spendable: [14999757, 15000378, 15000415],
             },
         ),
@@ -59,7 +59,7 @@ struct SpareMakerExpect {
             protocol = ProtocolVersion::Taproot,
             prepare_failure = "Failed to prepare Taproot openswap",
             expected = &SpareMakerExpect {
-                taker_spendable: 14996327,
+                taker_spendable: 14996294,
                 maker_spendable: [15000415, 14999757, 15000378],
             },
         ),
@@ -126,7 +126,7 @@ fn legacy_middle_maker_drops_before_sender_sigs(world: &mut World) {
         ProtocolVersion::Legacy,
         "Failed to prepare openswap",
         &SpareMakerExpect {
-            taker_spendable: 14995985,
+            taker_spendable: 14995952,
             maker_spendable: [15000415, 14999757, 15000378],
         },
     );

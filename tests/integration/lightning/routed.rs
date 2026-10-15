@@ -13,8 +13,9 @@ use std::{sync::Arc, time::Duration};
 use bitcoin::Amount;
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
+    blocklist::BlocklistError,
     lightning::{LightningBackend, MockLightningBackend},
-    taker::lightning_swap::LnRoutedSwapParams,
+    taker::{error::TakerError, lightning_swap::LnRoutedSwapParams},
     wallet::AddressType,
 };
 
@@ -121,5 +122,73 @@ fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) 
         outcomes.is_empty(),
         "no pending lightning swaps should remain, got: {:?}",
         outcomes
+    );
+}
+
+/// With screening on, the taker must refuse to claim hop 2 when the second
+/// maker funds it from a listed address. Not claiming keeps the preimage
+/// private, so hop 1 can only come back to the taker through its refund.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [(ln1, ln2) = routed_nodes()],
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    check_blocklist,
+    maker_lightning = [ln1, ln2],
+    setup = [
+        fund_taker(3, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        // Only the second maker's source is listed; the first's funding is
+        // the same shape so both makers start alike.
+        fund_maker_from_one_address(0, 4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        fund_maker_from_one_address(1, 4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        start_makers(120),
+    ],
+)]
+fn lightning_routed_swap_refuses_blocklisted_second_hop(world: &mut World) {
+    let blocked_address = world.sole_regular_utxo_address(1);
+    world
+        .taker()
+        .inner()
+        .add_blocklist_entry(
+            blocked_address.to_string(),
+            Some("second hop source".to_string()),
+        )
+        .unwrap();
+
+    let first_maker = world.makers()[0].address();
+    let second_maker = world.makers()[1].address();
+    let taker = world.taker_mut().inner_mut();
+    match taker.lightning_swap_routed(LnRoutedSwapParams {
+        amount: Amount::from_sat(40_000),
+        first_maker: Some(first_maker),
+        second_maker: Some(second_maker),
+        locktime: Some(60),
+        min_confirmations: 1,
+    }) {
+        Err(TakerError::Blocklist(BlocklistError::BlockedAddress { entry, .. })) => {
+            assert_eq!(entry.address, blocked_address.to_string());
+        }
+        Err(other) => panic!("expected blocked-address error, got {:?}", other),
+        Ok(report) => panic!(
+            "the taker claimed hop 2 funded from a blocked address: {:?}",
+            report
+        ),
+    }
+
+    // Hop 2 was refused before its outpoint was recorded, so recovery drops
+    // it unclaimed. Hop 1 refunds once its timelock matures.
+    let history = recover_all_lightning_swaps(taker, Duration::from_secs(300));
+    assert!(
+        history
+            .iter()
+            .any(|line| line.ends_with("-out: no on-chain commitment; forgotten")),
+        "hop 2 must be dropped unclaimed, got: {:?}",
+        history
+    );
+    assert!(
+        history.iter().any(|line| line.contains("-in: ")
+            && (line.contains("recovered via") || line.contains("already resolved"))),
+        "hop 1 must be refunded, got: {:?}",
+        history
     );
 }

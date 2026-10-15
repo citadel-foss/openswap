@@ -6,7 +6,7 @@
 //! recovery. Exercise the complete protocol, restart both makers from the same
 //! wallets, and prove that neither protocol leaves recovery material behind.
 
-use bitcoin::Amount;
+use bitcoin::{Amount, Network};
 use openswap::{
     maker::{MakerBehavior, MakerServer},
     protocol::common_messages::ProtocolVersion,
@@ -16,6 +16,14 @@ use openswap::{
 use crate::test_framework::*;
 
 use std::{sync::Arc, time::Duration};
+
+/// The `network` line `init` records in the maker's `config.toml`.
+fn recorded_network(maker: &MakerServer) -> Option<String> {
+    std::fs::read_to_string(maker.data_dir.join("config.toml"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("network = ").map(str::to_string))
+}
 
 #[world_test(
     backend = BitcoindBackend,
@@ -53,6 +61,15 @@ fn run_successful_swap_restart(world: &mut World, protocol: ProtocolVersion) {
         })
     );
 
+    // The first `init` records the wallet's network for readers that
+    // can't unlock the wallet.
+    for maker in world.makers() {
+        assert_eq!(
+            recorded_network(maker.inner()).as_deref(),
+            Some("\"regtest\"")
+        );
+    }
+
     let configs = world
         .makers()
         .iter()
@@ -60,6 +77,10 @@ fn run_successful_swap_restart(world: &mut World, protocol: ProtocolVersion) {
             let mut config = maker.inner().config.clone();
             // Initialization consumes the configured passphrase.
             config.password = Some("integration-test".to_string());
+            // What `MakerServerConfig::new` yields for a stale
+            // `network = "signet"`: the wallet must win on restart.
+            config.network = Network::Signet;
+            config.network_confirmed = true;
             config
         })
         .collect::<Vec<_>>();
@@ -72,6 +93,13 @@ fn run_successful_swap_restart(world: &mut World, protocol: ProtocolVersion) {
             .into_iter()
             .map(|config| Arc::new(MakerServer::init(config).unwrap())),
     );
+    for maker in world.makers() {
+        assert_eq!(maker.inner().config.network, Network::Regtest);
+        assert_eq!(
+            recorded_network(maker.inner()).as_deref(),
+            Some("\"regtest\"")
+        );
+    }
     world.start_makers_without_sync(120);
 
     for maker in world.makers() {

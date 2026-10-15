@@ -3,12 +3,14 @@
 //! point, and its golden balances pin how that drop point settles.
 //! `taproot_drop_at_ack_response` drops before any funding, so nothing needs
 //! recovering; `maker_recovers_swap_past_refund_deadline` has the taker stall
-//! instead.
+//! instead. The input-claim tests check that a dropped or refused swap's coins
+//! stay out of the next plan.
 
-use bitcoin::Amount;
+use bitcoin::{Amount, OutPoint};
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
+    taker::{SwapParams, Taker, TakerBehavior},
 };
 
 use crate::test_framework::*;
@@ -44,8 +46,8 @@ struct TakerAbortExpect {
             expected = &TakerAbortExpect {
                 maker_regular: [14999757; 2],
                 maker_loss: None,
-                taker_regular: 14999118,
-                taker_loss: 882,
+                taker_regular: 14999085,
+                taker_loss: 915,
             },
         ),
         /// Taker aborts after receiving maker's contract response (Taproot).
@@ -58,8 +60,8 @@ struct TakerAbortExpect {
             expected = &TakerAbortExpect {
                 maker_regular: [14998875, 14999757],
                 maker_loss: Some([882, 0]),
-                taker_regular: 14999118,
-                taker_loss: 882,
+                taker_regular: 14999085,
+                taker_loss: 915,
             },
         ),
         /// Taker drops after full setup, before the private-key handover (Taproot).
@@ -72,8 +74,8 @@ struct TakerAbortExpect {
             expected = &TakerAbortExpect {
                 maker_regular: [14998875, 14998875],
                 maker_loss: Some([882, 882]),
-                taker_regular: 14499538,
-                taker_loss: 500462,
+                taker_regular: 14500000,
+                taker_loss: 500000,
             },
         ),
     ],
@@ -204,10 +206,10 @@ fn legacy_drop_after_funding(world: &mut World, params: SwapParams) {
     // Makers should have recovered via timelock
     world.sync_makers();
     assert_balances!(world, since before; {
-        taker: { regular: 14_499_538, swap: 495_997, contract: 0, fidelity: 0, loss: 4_465 },
+        taker: { regular: 14_500_000, swap: 495_502, contract: 0, fidelity: 0, loss: 4_498 },
         makers: {
-            regular: [14_500_865, 14_502_398],
-            swap: [499_100, 497_530],
+            regular: [14_501_360, 14_502_893],
+            swap: [498_605, 497_035],
             contract: 0,
             fidelity: BOND,
             spendable: [14_999_965, 14_999_928],
@@ -341,4 +343,129 @@ fn taproot_drop_at_ack_response(world: &mut World) {
 
     world.taker().inner().log_tracker_state();
     info!("Taproot drop-at-ack-response test completed successfully!");
+}
+
+/// A dropped swap's funding inputs are spent, but the wallet's coin cache only
+/// learns that at the next sync. Until then, a new plan must skip them.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [DropAfterFundsBroadcast],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+    cases = [
+        legacy_new_plan_skips_inputs_of_a_dropped_swap(protocol = ProtocolVersion::Legacy),
+        taproot_new_plan_skips_inputs_of_a_dropped_swap(protocol = ProtocolVersion::Taproot),
+    ],
+)]
+fn new_plan_skips_inputs_of_a_dropped_swap(world: &mut World, protocol: ProtocolVersion) {
+    // One split, so the dropped swap spends one coin and leaves two.
+    let amount = Amount::from_sat(500_000);
+    let params = SwapParams::new(protocol, amount, 2)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    let summary = world.taker_mut().prepare(params).expect("prepare");
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
+        .expect_err("the taker drops after funding");
+
+    // Same planner, same pool: without the lock it picks the coin just spent.
+    let plan = world
+        .taker()
+        .inner()
+        .get_wallet()
+        .read()
+        .unwrap()
+        .plan_funding(amount, 1, 1.0, u32::MAX, None, None, None, protocol)
+        .expect("two coins are still unspent");
+    for outpoint in plan.iter().flat_map(|split| &split.utxos) {
+        let unspent = world
+            .bitcoind()
+            .client
+            .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+            .unwrap();
+        assert!(
+            unspent.is_some(),
+            "planned {}, already spent by the dropped swap",
+            outpoint
+        );
+    }
+}
+
+/// Another swap claims the planned coins after `prepare_swap`. `start_swap`
+/// must refuse before signing: nothing spent, no claim added, the other claim
+/// untouched. That claim has no swap behind it, so a restart frees it.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+    cases = [
+        legacy_start_refuses_planned_coins_another_swap_claimed(protocol = ProtocolVersion::Legacy),
+        taproot_start_refuses_planned_coins_another_swap_claimed(protocol = ProtocolVersion::Taproot),
+    ],
+)]
+fn start_refuses_planned_coins_another_swap_claimed(world: &mut World, protocol: ProtocolVersion) {
+    let params = SwapParams::new(protocol, Amount::from_sat(500_000), 2)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    let summary = world.taker_mut().prepare(params).expect("prepare");
+
+    // Claim every coin, so whichever ones the plan took are held.
+    let wallet = world.taker().inner().get_wallet().clone();
+    let coins: Vec<OutPoint> = wallet
+        .read()
+        .unwrap()
+        .list_descriptor_utxo_spend_info()
+        .iter()
+        .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+        .collect();
+    wallet
+        .write()
+        .unwrap()
+        .reserve_swap_locks_for_test("other-swap", &coins)
+        .unwrap();
+
+    let err = world
+        .taker_mut()
+        .start(&summary.swap_id)
+        .expect_err("a planned coin another swap holds must stop the swap");
+    assert!(
+        format!("{err:?}").contains("no longer free"),
+        "unexpected refusal: {:?}",
+        err
+    );
+    assert_eq!(
+        world.taker().inner().reserved_inputs().unwrap(),
+        coins.len(),
+        "the refusal must claim nothing and leave the other claim as it was"
+    );
+    assert_eq!(
+        wallet.read().unwrap().get_outgoing_swapcoins_count(),
+        0,
+        "nothing may be signed for a refused swap"
+    );
+    for outpoint in &coins {
+        let unspent = world
+            .bitcoind()
+            .client
+            .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+            .unwrap();
+        assert!(
+            unspent.is_some(),
+            "{} was spent by a refused swap",
+            outpoint
+        );
+    }
+
+    drop(wallet);
+    world.drop_takers();
+    let restarted = Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0))
+        .expect("restarted taker should open the same wallet");
+    assert_eq!(
+        restarted.reserved_inputs().unwrap(),
+        0,
+        "a claim no unfinished swap owns must not survive a restart"
+    );
+    world.adopt_taker(restarted);
 }

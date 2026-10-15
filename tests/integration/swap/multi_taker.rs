@@ -30,20 +30,20 @@ struct MultiTakerExpect {
         legacy_sequential_swaps(
             protocol = ProtocolVersion::Legacy,
             expected = &MultiTakerExpect {
-                taker_spendable: [14995985, 14995985],
-                taker_fee: [4015, 4015],
-                maker_regular: [14001973, 14005039],
-                maker_swap: [999100, 995960],
+                taker_spendable: [14995952, 14995952],
+                taker_fee: [4048, 4048],
+                maker_regular: [14002963, 14006029],
+                maker_swap: [998110, 994970],
                 maker_fee: [1316, 1242],
             },
         ),
         taproot_sequential_swaps(
             protocol = ProtocolVersion::Taproot,
             expected = &MultiTakerExpect {
-                taker_spendable: [14996327, 14996327],
-                taker_fee: [3673, 3673],
-                maker_regular: [14001745, 14004583],
-                maker_swap: [999328, 996416],
+                taker_spendable: [14996294, 14996294],
+                taker_fee: [3706, 3706],
+                maker_regular: [14002735, 14005573],
+                maker_swap: [998338, 995426],
                 maker_fee: [1316, 1242],
             },
         ),

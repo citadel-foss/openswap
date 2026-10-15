@@ -25,7 +25,9 @@ fn maker_rejects_new_swaps_after_watcher_exit(world: &mut World) {
     maker.watch_service.stop_watcher_for_test();
     assert!(!maker.watch_service.is_alive());
 
+    // The taker only sees "rejected", so the maker's log names the reason.
     for protocol in [ProtocolVersion::Legacy, ProtocolVersion::Taproot] {
+        let mark = log_mark(world);
         let result = world.taker_mut().prepare(
             SwapParams::new(protocol, Amount::from_sat(500_000), 1)
                 .with_tx_count(1)
@@ -39,6 +41,7 @@ fn maker_rejects_new_swaps_after_watcher_exit(world: &mut World) {
             ),
             other => panic!("unexpected admission result: {:?}", other),
         }
+        assert_log!(world, since mark; { count("because the watchtower is down") == 1 });
     }
 }
 

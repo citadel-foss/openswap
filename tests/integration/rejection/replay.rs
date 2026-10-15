@@ -427,3 +427,30 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding(world: &mut World) 
         "neither swap may complete: the loser is rejected, the winner's counterpart is gone"
     );
 }
+
+/// The maker holds each funding step open while the taker sends the same
+/// message again on a second connection. Each duplicate must be refused and
+/// the first handler's swap must still complete: Legacy refuses a duplicate
+/// proof of funding and contract sigs, Taproot a duplicate contract data.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [PauseInFundingStep],
+    takers = [RaceFundingStep],
+    setup = [fund_taker_default(4), fund_makers_default(), start_makers(120), mine(1)],
+)]
+fn maker_refuses_a_concurrent_funding_step(world: &mut World) {
+    for (protocol, duplicates) in [(ProtocolVersion::Legacy, 2), (ProtocolVersion::Taproot, 1)] {
+        let mark = log_mark(world);
+        let params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
+            .with_tx_count(1)
+            .with_required_confirms(1);
+        world
+            .taker_mut()
+            .swap(params)
+            .expect("the first handler's swap must complete");
+        // Every duplicate funding step must be refused.
+        assert_log!(world, since mark; {
+            count("Funding for this swap is already in progress") == duplicates,
+        });
+    }
+}

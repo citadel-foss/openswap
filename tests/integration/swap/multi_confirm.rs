@@ -142,11 +142,11 @@ fn run_multi_confirm_swap(
 
     // Waiting longer must not change what the swap costs.
     let (taker_swap, taker_loss, maker_regular, maker_swap) = match protocol {
-        ProtocolVersion::Legacy => (496_447, 4_015, [14_500_865, 14_502_398], [499_550, 497_980]),
-        ProtocolVersion::Taproot => (496_789, 3_673, [14_500_751, 14_502_170], [499_664, 498_208]),
+        ProtocolVersion::Legacy => (495_952, 4_048, [14_501_360, 14_502_893], [499_055, 497_485]),
+        ProtocolVersion::Taproot => (496_294, 3_706, [14_501_246, 14_502_665], [499_169, 497_713]),
     };
     assert_balances!(world, since before; {
-        taker: { regular: 14_499_538, swap: taker_swap, contract: 0, fidelity: 0, loss: taker_loss },
+        taker: { regular: 14_500_000, swap: taker_swap, contract: 0, fidelity: 0, loss: taker_loss },
         makers: {
             regular: maker_regular,
             swap: maker_swap,

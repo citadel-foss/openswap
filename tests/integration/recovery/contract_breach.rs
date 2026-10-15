@@ -460,7 +460,7 @@ fn taproot_maker_broadcasts_contract(world: &mut World) {
     // earns a fee here; each maker only pays for its own recovery. The taker
     // recovered its own funding, so it only pays the recovery fees too.
     assert_balances!(world, since before; {
-        taker: { regular: 14999706, swap: 0, contract: 0, fidelity: 0, loss: 294 },
+        taker: { regular: 14999695, swap: 0, contract: 0, fidelity: 0, loss: 305 },
         makers: { regular: [14999463, 14999463], swap: 0, contract: 0, fidelity: BOND, loss: 294 },
     });
 
@@ -566,7 +566,7 @@ fn taker_broadcasts_contract_before_handover(world: &mut World, params: SwapPara
     world.wait_makers_settled(timelock_recovery_wait::<BitcoindBackend>());
     world.sync_makers();
     assert_balances!(world; {
-        makers: { regular: [14500865, 14502398], swap: [499100, 497530], contract: 0 },
+        makers: { regular: [14501360, 14502893], swap: [498605, 497035], contract: 0 },
     });
 }
 

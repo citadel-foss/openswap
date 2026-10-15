@@ -2,6 +2,7 @@
 //!
 //! Also pins the fee every swap tx pays at the negotiated 1 sat/vB.
 
+use bitcoin::Amount;
 use openswap::taker::SwapParams;
 
 use crate::test_framework::*;
@@ -33,7 +34,7 @@ fn taproot_two_maker_swap_completes(world: &mut World, params: SwapParams) {
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
     // Prepare and execute the swap
-    world
+    let report = world
         .taker_mut()
         .swap(params)
         .expect("Taproot openswap should complete successfully");
@@ -48,28 +49,25 @@ fn taproot_two_maker_swap_completes(world: &mut World, params: SwapParams) {
     world.sync_makers();
 
     assert_balances!(world, since before; {
-        taker: { regular: 14_499_538, swap: 496_789, contract: 0, fidelity: 0, loss: 3_673 },
+        taker: { regular: 14_500_000, swap: 496_294, contract: 0, fidelity: 0, loss: 3_706 },
         makers: {
-            regular: [14_500_751, 14_502_170],
-            swap: [499_664, 498_208],
+            regular: [14_501_246, 14_502_665],
+            swap: [499_169, 497_713],
             contract: 0,
             fidelity: BOND,
             gain: [658, 621],
         },
     });
+    assert_taker_report_exact(&report, Amount::from_sat(500_000), Amount::from_sat(3_706));
 
-    // Every swap tx must pay the negotiated 1 sat/vB: funding txs price their
-    // real vsize; sweeps pay the 112 vB taproot key-path model they were built
-    // at. A completed swap mines 9 funding txs (3 splits x 3 parties), 9 sweeps.
+    // Every swap tx must pay the negotiated 1 sat/vB: maker funding txs price
+    // their real vsize; the taker's own pay the 165 vB one-input model out of
+    // the send amount, at or above their real vsize; sweeps pay the 112 vB
+    // taproot key-path model they were built at.
+    // A completed swap mines 9 funding txs (3 splits x 3 parties), 9 sweeps.
     let bitcoind = world.bitcoind();
     let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[9, 9]);
-    for txid in &depths[0] {
-        let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
-        assert_eq!(
-            fee, vsize as u64,
-            "funding tx {txid} must pay exactly 1 sat/vB"
-        );
-    }
+    assert_taker_funding_pays_model(bitcoind, &depths[0], 1, 3);
     for txid in &depths[1] {
         let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
         assert_eq!(fee, 112, "sweep tx {txid} must pay the 112 vB model");

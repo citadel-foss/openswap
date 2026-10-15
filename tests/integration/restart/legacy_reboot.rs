@@ -128,8 +128,8 @@ fn maker_reboot_preserves_funded_swapcoins(world: &mut World, taker_original_bal
     // only its own refunded funding.
     assert_balances!(world; {
         maker: {
-            regular: 14_502_398,
-            swap: 497_530,
+            regular: 14_502_893,
+            swap: 497_035,
             contract: 0,
             fidelity: BOND,
             spendable: 14_999_928,

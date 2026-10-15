@@ -230,22 +230,31 @@ fn funding_race_has_one_winner(world: &mut World) {
             .with_preferred_makers(vec![maker_address.clone()])
     };
 
-    // Barrier-start both takers: the tightest sequencing the framework
-    // offers, so both admissions plan over the same coins.
+    // Both admissions must succeed; only funding may race. Admitting first,
+    // on this thread, means a failed admission panics here instead of
+    // stranding the other taker at the barrier. The maker claims coins only
+    // at funding, so both plans still draw the same inputs.
+    let swap_ids: Vec<String> = world
+        .takers_mut()
+        .iter_mut()
+        .map(|taker| {
+            taker
+                .prepare(swap_params())
+                .expect("both takers must be admitted before the race")
+                .swap_id
+        })
+        .collect();
     let start = Arc::new(Barrier::new(2));
     let results = [AtomicU8::new(RESULT_PENDING), AtomicU8::new(RESULT_PENDING)];
 
     thread::scope(|s| {
-        for (i, taker) in world.takers_mut().iter_mut().enumerate() {
+        for (i, (taker, swap_id)) in world.takers_mut().iter_mut().zip(&swap_ids).enumerate() {
             let barrier = start.clone();
             let result = &results[i];
-            let params = swap_params();
             s.spawn(move || {
                 barrier.wait();
-                info!("Taker {} entering the admission race", i + 1);
-                let outcome = taker
-                    .prepare(params)
-                    .and_then(|summary| taker.start(&summary.swap_id));
+                info!("Taker {} entering the funding race", i + 1);
+                let outcome = taker.start(swap_id);
                 match outcome {
                     Ok(report) => {
                         info!("Taker {} won the race: {:?}", i + 1, report);

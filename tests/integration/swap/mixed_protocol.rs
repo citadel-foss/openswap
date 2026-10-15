@@ -116,15 +116,15 @@ fn legacy_and_taproot_swaps_run_together(world: &mut World) {
 
     assert_balances!(world, since before; {
         takers: {
-            regular: [14_499_538, 14_299_538],
-            swap: [496_447, 696_704],
+            regular: [14_500_000, 14_300_000],
+            swap: [495_952, 696_209],
             contract: 0,
             fidelity: 0,
-            loss: [4_015, 3_758],
+            loss: [4_048, 3_791],
         },
         makers: {
-            regular: [302_152, 305_139],
-            swap: [1_199_214, 1_196_138],
+            regular: [303_142, 306_129],
+            swap: [1_198_224, 1_195_148],
             contract: 0,
             fidelity: BOND,
             gain: [1_366, 1_277],

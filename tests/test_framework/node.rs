@@ -16,7 +16,7 @@ use std::{
 use bip39::rand;
 use bitcoind::{bitcoincore_rpc::Auth, BitcoinD};
 use electrsd::ElectrsD;
-use openswap::wallet::{CoreRpcConfig, ElectrumConfig};
+use openswap::wallet::{BackendConfig, CoreRpcConfig, ElectrumConfig};
 
 use super::{
     backend::TestBackend,
@@ -28,12 +28,22 @@ use super::{
     },
 };
 
-/// Collects what [`Node::build`](NodeBuilder::build) takes: only the backend.
+/// Collects what [`Node::build`](NodeBuilder::build) takes: the backend and
+/// bitcoind's keypool size.
 pub struct NodeBuilder<B> {
     backend: PhantomData<fn() -> B>,
+    keypool: Option<u32>,
 }
 
 impl<B: TestBackend> NodeBuilder<B> {
+    /// Sets bitcoind's `keypool`. Core pads every descriptor range a wallet
+    /// imports with it (1000 by default), which can hide a restore that stops
+    /// short.
+    pub fn keypool(mut self, size: u32) -> Self {
+        self.keypool = Some(size);
+        self
+    }
+
     /// Starts bitcoind, and electrs if `B` reads through Electrum, with the
     /// test's logger writing under the node's temp dir.
     #[must_use = "dropping the Node stops it at once"]
@@ -42,6 +52,16 @@ impl<B: TestBackend> NodeBuilder<B> {
         setup_test_logger(&temp_dir);
         log::info!("temporary directory : {}", temp_dir.display());
         log::info!("test: {}", thread::current().name().unwrap_or("<unnamed>"));
+
+        if let Some(size) = self.keypool {
+            // bitcoind reads it from its datadir, `.bitcoin` under the temp dir.
+            fs::create_dir_all(temp_dir.join(".bitcoin")).unwrap();
+            fs::write(
+                temp_dir.join(".bitcoin/bitcoin.conf"),
+                format!("keypool={size}\n"),
+            )
+            .unwrap();
+        }
 
         // A freed OS port can be taken before bitcoind binds it, so retry.
         let (bitcoind, zmq_addr) = (0..3)
@@ -98,6 +118,7 @@ impl Node {
     pub fn builder<B: TestBackend>() -> NodeBuilder<B> {
         NodeBuilder {
             backend: PhantomData,
+            keypool: None,
         }
     }
 
@@ -119,6 +140,20 @@ impl Node {
     /// RPC access to the node; `wallet_name` is left at its default.
     pub fn rpc_config(&self) -> CoreRpcConfig {
         self.rpc_config.clone()
+    }
+
+    /// `B`'s wallet backend on this node, with `wallet_name` as Core's wallet:
+    /// Core keeps one wallet per name. `B` must be the backend the node was
+    /// built over, so an Electrum one has its electrs.
+    #[track_caller]
+    pub fn backend_config<B: TestBackend>(&self, wallet_name: &str) -> BackendConfig {
+        let rpc_config = CoreRpcConfig {
+            wallet_name: wallet_name.to_string(),
+            ..self.rpc_config()
+        };
+        B::make_backend_config(&rpc_config, &self.zmq_addr, &mut || {
+            format!("tcp://{}", self.electrsd().electrum_url)
+        })
     }
 
     /// The electrs serving this node.

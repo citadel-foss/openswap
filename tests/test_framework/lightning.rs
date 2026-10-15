@@ -4,7 +4,10 @@ use std::{thread, time::Duration};
 
 use bitcoin::{secp256k1::PublicKey, Amount, Txid};
 use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
-use openswap::lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest};
+use openswap::{
+    lightning::{LightningBackend, MockLightningBackend, OpenChannelRequest},
+    taker::Taker,
+};
 
 use super::procs::bitcoind::{generate_blocks, send_to_address};
 
@@ -85,4 +88,25 @@ pub(crate) fn open_ready_channel(
         .unwrap();
     node.simulate_channel_ready(&channel);
     let _ = node.poll_event().unwrap();
+}
+
+/// Runs the taker's Lightning recovery every 5s until no record remains and
+/// returns every outcome line seen on the way. Fails after `timeout`.
+pub(crate) fn recover_all_lightning_swaps(taker: &mut Taker, timeout: Duration) -> Vec<String> {
+    let mut history = Vec::new();
+    wait_until!(
+        timeout,
+        every Duration::from_secs(5),
+        "every Lightning swap record to resolve",
+        {
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            for outcome in &outcomes {
+                log::info!("lightning recovery: {outcome}");
+            }
+            let done = outcomes.is_empty();
+            history.extend(outcomes);
+            done
+        }
+    );
+    history
 }

@@ -54,7 +54,7 @@ fn legacy_two_maker_swap_completes(world: &mut World) {
     world.mine(1);
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
 
-    world
+    let report = world
         .taker_mut()
         .swap(swap_params)
         .expect("OpenSwap should complete successfully");
@@ -66,28 +66,25 @@ fn legacy_two_maker_swap_completes(world: &mut World) {
     world.sync_makers();
 
     assert_balances!(world, since before; {
-        taker: { regular: 14_499_538, swap: 496_447, contract: 0, fidelity: 0, loss: 4_015 },
+        taker: { regular: 14_500_000, swap: 495_952, contract: 0, fidelity: 0, loss: 4_048 },
         makers: {
-            regular: [14_500_865, 14_502_398],
-            swap: [499_550, 497_980],
+            regular: [14_501_360, 14_502_893],
+            swap: [499_055, 497_485],
             contract: 0,
             fidelity: BOND,
             gain: [658, 621],
         },
     });
+    assert_taker_report_exact(&report, Amount::from_sat(500_000), Amount::from_sat(4_048));
 
-    // Every swap tx must pay the negotiated 1 sat/vB: funding txs price their
-    // real vsize; sweeps pay the 150 vB legacy spend model they were built at.
+    // Every swap tx must pay the negotiated 1 sat/vB: maker funding txs price
+    // their real vsize; the taker's own pay the 165 vB one-input model out of
+    // the send amount, at or above their real vsize; sweeps pay the 150 vB
+    // legacy spend model they were built at.
     // A completed swap mines 9 funding txs (3 splits x 3 parties) and 9 sweeps.
     let bitcoind = world.bitcoind();
     let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[9, 9]);
-    for txid in &depths[0] {
-        let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
-        assert_eq!(
-            fee, vsize as u64,
-            "funding tx {txid} must pay exactly 1 sat/vB"
-        );
-    }
+    assert_taker_funding_pays_model(bitcoind, &depths[0], 1, 3);
     for txid in &depths[1] {
         let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
         assert_eq!(fee, 150, "sweep tx {txid} must pay the 150 vB model");
@@ -128,14 +125,14 @@ fn legacy_two_maker_swap_completes(world: &mut World) {
     cases = [
         taproot_swap_at_custom_feerate(
             protocol = ProtocolVersion::Taproot,
-            expected_fee_paid = 3846,
+            expected_fee_paid = 3912,
             sweep_vsize_model = 112,
         ),
         /// Same 3 sats/vB swap on Legacy: funding txs price their real vsize and the
         /// multisig contract sweeps pay the 150 vB model at the negotiated rate.
         legacy_swap_at_custom_feerate(
             protocol = ProtocolVersion::Legacy,
-            expected_fee_paid = 4302,
+            expected_fee_paid = 4368,
             sweep_vsize_model = 150,
         ),
     ],
@@ -173,19 +170,13 @@ fn run_swap_with_custom_feerate(
         "a 3 sat/vB swap must cost clearly more than the floor rate"
     );
 
-    // Same per-kind check at the negotiated 3 sat/vB: funding txs price their
-    // real vsize; the sweeps pay the protocol's fixed vsize model.
+    // Same per-kind check at the negotiated 3 sat/vB: maker funding txs price
+    // their real vsize; the taker's own pay the 165 vB one-input model; the
+    // sweeps pay the protocol's fixed vsize model.
     // 1 maker x 2 splits: 4 funding txs (2 taker + 2 maker), 4 sweeps.
     let bitcoind = world.bitcoind();
     let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[4, 4]);
-    for txid in &depths[0] {
-        let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
-        assert_eq!(
-            fee,
-            vsize as u64 * 3,
-            "funding tx {txid} must pay exactly 3 sat/vB"
-        );
-    }
+    assert_taker_funding_pays_model(bitcoind, &depths[0], 3, 2);
     for txid in &depths[1] {
         let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
         assert_eq!(
@@ -279,7 +270,7 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait(world: &mut World) {
     // cannot see it and these stay plain asserts.
     assert_eq!(
         taker_balances.spendable.to_sat(),
-        14998326,
+        14998304,
         "Taker spendable balance mismatch"
     );
     assert_eq!(
@@ -309,4 +300,41 @@ fn taproot_swap_survives_unconfirmed_confirmation_wait(world: &mut World) {
     // The taker left the world above; dropping it first keeps the world's
     // teardown order.
     drop(taker);
+}
+
+/// Between signing its hop-0 funding and broadcasting it, the taker's wallet
+/// is asked to pay from the planned coins through the public API. The funding
+/// claim must refuse that payment, so the swap still completes and leaves no
+/// claim behind.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [PayFromPlannedCoinsBeforeBroadcast],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+    cases = [
+        legacy_payment_cannot_take_planned_funding_coins(protocol = ProtocolVersion::Legacy),
+        taproot_payment_cannot_take_planned_funding_coins(protocol = ProtocolVersion::Taproot),
+    ],
+)]
+fn run_payment_cannot_take_planned_funding_coins(world: &mut World, protocol: ProtocolVersion) {
+    let swap_params = SwapParams::new(protocol, Amount::from_sat(500_000), 1)
+        .with_tx_count(2)
+        .with_required_confirms(1);
+    world
+        .taker_mut()
+        .swap(swap_params)
+        .expect("the claimed funding must still reach the network");
+
+    assert_log!(world; {
+        has "Test behavior: payment from planned funding coins refused by funding claim",
+        // A sent payment spent coins the signed funding needs.
+        lacks "Test behavior: payment from planned funding coins sent",
+        // It must be the funding claim that refused, not anything else.
+        lacks "payment from planned funding coins refused for another reason",
+    });
+    assert_eq!(
+        world.taker().inner().reserved_inputs().unwrap(),
+        0,
+        "a completed swap must leave no claim behind"
+    );
 }

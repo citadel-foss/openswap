@@ -76,10 +76,10 @@ fn maker_drops_after_sweep(world: &mut World) {
     // maker 2 swept before dropping. Their wallets were synced after the
     // shutdown above and are read as they stand.
     assert_balances!(world, since before; {
-        taker: { regular: 14_499_538, swap: 495_997, contract: 0, fidelity: 0, loss: 4_465 },
+        taker: { regular: 14_500_000, swap: 495_502, contract: 0, fidelity: 0, loss: 4_498 },
         makers: {
-            regular: [14_500_865, 14_502_398],
-            swap: [499_550, 497_980],
+            regular: [14_501_360, 14_502_893],
+            swap: [499_055, 497_485],
             contract: 0,
             fidelity: BOND,
             gain: [658, 621],

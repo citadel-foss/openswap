@@ -42,20 +42,20 @@ struct ExpectedBalances {
 }
 
 const LEGACY_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14499538,
-    taker_swap: 495997,
-    taker_spendable_diff: 4465,
-    maker_regular: [14500865, 14502398],
-    maker_swap: [499100, 497530],
+    taker_regular: 14500000,
+    taker_swap: 495502,
+    taker_spendable_diff: 4498,
+    maker_regular: [14501360, 14502893],
+    maker_swap: [498605, 497035],
     maker_spendable: [14999965, 14999928],
 };
 
 const TAPROOT_EXPECTED: ExpectedBalances = ExpectedBalances {
-    taker_regular: 14499538,
-    taker_swap: 496660,
-    taker_spendable_diff: 3802,
-    maker_regular: [14500751, 14502170],
-    maker_swap: [499535, 498079],
+    taker_regular: 14500000,
+    taker_swap: 496165,
+    taker_spendable_diff: 3835,
+    maker_regular: [14501246, 14502665],
+    maker_swap: [499040, 497584],
     maker_spendable: [15000286, 15000249],
 };
 
@@ -254,7 +254,7 @@ fn sweeps_after_breach(world: &mut World, params: SwapParams) {
         swapcoins_left, 0,
         "Every incoming swapcoin should be swept out of the wallet"
     );
-    assert_balances!(world; { taker: { regular: 14_499_538, swap: 495_997 } });
+    assert_balances!(world; { taker: { regular: 14_500_000, swap: 495_502 } });
 
     // Recovery sweeps sit at depth 2 (they spend the broadcast contract txs).
     // Each pays the relay floor at the 150 vB legacy spend model — the

@@ -36,6 +36,49 @@ pub fn assert_taker_report_exact(report: &TakerReport, send_amount: Amount, wall
     );
 }
 
+/// The vsize the taker's own funding txs are priced at: one input, whatever
+/// they really spend, paid out of the send amount.
+pub const TAKER_FUNDING_VSIZE_MODEL: u64 = 165;
+
+/// Checks a swap's funding txs at `sat_per_vb`: a maker's pays its real vsize,
+/// the taker's pay [`TAKER_FUNDING_VSIZE_MODEL`] at or above their real vsize,
+/// and exactly `taker_txs` of them are the taker's.
+#[track_caller]
+pub fn assert_taker_funding_pays_model(
+    bitcoind: &BitcoinD,
+    funding_txids: &[Txid],
+    sat_per_vb: u64,
+    taker_txs: usize,
+) {
+    let mut taker_funding = 0;
+    for txid in funding_txids {
+        let (fee, vsize) = tx_fee_and_vsize(bitcoind, txid);
+        if fee == vsize as u64 * sat_per_vb {
+            continue;
+        }
+        assert_eq!(
+            fee,
+            TAKER_FUNDING_VSIZE_MODEL * sat_per_vb,
+            "funding tx {} must pay {} sat/vB or the {} vB model at that rate",
+            txid,
+            sat_per_vb,
+            TAKER_FUNDING_VSIZE_MODEL
+        );
+        assert!(
+            vsize as u64 <= TAKER_FUNDING_VSIZE_MODEL,
+            "taker funding tx {} exceeds its {} vB model",
+            txid,
+            TAKER_FUNDING_VSIZE_MODEL
+        );
+        taker_funding += 1;
+    }
+    assert_eq!(
+        taker_funding, taker_txs,
+        "only the taker's {} funding txs pay the model",
+        taker_txs
+    );
+}
+
 /// Fee and vsize of a transaction the node knows, derived from the chain:
 /// prevout values minus output values, never the wallet's own books.
 pub fn tx_fee_and_vsize(bitcoind: &BitcoinD, txid: &Txid) -> (u64, usize) {

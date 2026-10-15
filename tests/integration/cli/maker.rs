@@ -126,10 +126,10 @@ fn rpc_server(world: &mut World) {
     world.sync_makers();
 
     assert_balances!(world, since before; {
-        taker: { regular: 14_499_538, swap: 496_789, contract: 0, fidelity: 0, loss: 3_673 },
+        taker: { regular: 14_500_000, swap: 496_294, contract: 0, fidelity: 0, loss: 3_706 },
         makers: {
-            regular: [14_500_751, 14_502_170],
-            swap: [499_664, 498_208],
+            regular: [14_501_246, 14_502_665],
+            swap: [499_169, 497_713],
             contract: 0,
             fidelity: BOND,
             gain: [658, 621],

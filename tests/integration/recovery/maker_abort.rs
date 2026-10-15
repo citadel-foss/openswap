@@ -45,9 +45,9 @@ struct MakerAbortExpect {
             behavior = MakerBehavior::CloseAtProofOfFunding,
             failure = "Swap should fail due to Maker2 closing at ProofOfFunding",
             expected = &MakerAbortExpect {
-                taker_regular: 14998662,
+                taker_regular: 14998629,
                 taker_swap: 0,
-                taker_loss: 1338,
+                taker_loss: 1371,
                 maker_regular: [14998419, 14999757],
                 maker_swap: [0, 0],
                 maker_spendable: None,
@@ -59,9 +59,9 @@ struct MakerAbortExpect {
             behavior = MakerBehavior::CloseAtContractSigsForRecvrAndSender,
             failure = "Swap should fail due to Maker2 closing at RespContractSigsForRecvrAndSender",
             expected = &MakerAbortExpect {
-                taker_regular: 14998662,
+                taker_regular: 14998629,
                 taker_swap: 0,
-                taker_loss: 1338,
+                taker_loss: 1371,
                 maker_regular: [14998419, 14999757],
                 maker_swap: [0, 0],
                 maker_spendable: None,
@@ -73,11 +73,11 @@ struct MakerAbortExpect {
             behavior = MakerBehavior::CloseAtContractSigsForRecvr,
             failure = "Swap should fail due to Maker2 closing at ReqContractSigsForRecvr",
             expected = &MakerAbortExpect {
-                taker_regular: 14499538,
-                taker_swap: 495997,
-                taker_loss: 4465,
-                maker_regular: [14500865, 14502398],
-                maker_swap: [499100, 497530],
+                taker_regular: 14500000,
+                taker_swap: 495502,
+                taker_loss: 4498,
+                maker_regular: [14501360, 14502893],
+                maker_swap: [498605, 497035],
                 maker_spendable: Some([14999965, 14999928]),
             },
         ),
@@ -87,11 +87,11 @@ struct MakerAbortExpect {
             behavior = MakerBehavior::CloseAtHashPreimage,
             failure = "Swap should fail due to Maker2 closing at hash preimage handover",
             expected = &MakerAbortExpect {
-                taker_regular: 14499538,
-                taker_swap: 495997,
-                taker_loss: 4465,
-                maker_regular: [14500865, 14502398],
-                maker_swap: [499550, 497530],
+                taker_regular: 14500000,
+                taker_swap: 495502,
+                taker_loss: 4498,
+                maker_regular: [14501360, 14502893],
+                maker_swap: [499055, 497035],
                 maker_spendable: Some([15000415, 14999928]),
             },
         ),
@@ -101,11 +101,11 @@ struct MakerAbortExpect {
             behavior = MakerBehavior::CloseAfterSweep,
             failure = "Swap should fail due to Maker2 closing after sweep",
             expected = &MakerAbortExpect {
-                taker_regular: 14499538,
-                taker_swap: 496660,
-                taker_loss: 3802,
-                maker_regular: [14500751, 14502170],
-                maker_swap: [499664, 498208],
+                taker_regular: 14500000,
+                taker_swap: 496165,
+                taker_loss: 3835,
+                maker_regular: [14501246, 14502665],
+                maker_swap: [499169, 497713],
                 maker_spendable: Some([15000415, 15000378]),
             },
         ),
@@ -266,11 +266,11 @@ fn taproot_drop_at_private_key_handover(world: &mut World) {
 
     abort.recover();
     abort.assert_recovered(&MakerAbortExpect {
-        taker_regular: 14499538,
-        taker_swap: 496660,
-        taker_loss: 3802,
-        maker_regular: [14500751, 14502170],
-        maker_swap: [499664, 498079],
+        taker_regular: 14500000,
+        taker_swap: 496165,
+        taker_loss: 3835,
+        maker_regular: [14501246, 14502665],
+        maker_swap: [499169, 497584],
         maker_spendable: Some([15000415, 15000249]),
     });
 }
@@ -346,9 +346,9 @@ fn taproot_drop_at_contract_sigs_exchange(world: &mut World) {
     );
 
     abort.assert_recovered(&MakerAbortExpect {
-        taker_regular: 14999118,
+        taker_regular: 14999085,
         taker_swap: 0,
-        taker_loss: 882,
+        taker_loss: 915,
         maker_regular: [14998875, 14999757],
         maker_swap: [0, 0],
         maker_spendable: None,

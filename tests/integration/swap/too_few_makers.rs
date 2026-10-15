@@ -5,7 +5,10 @@
 //! No recovery is needed - balances should remain unchanged.
 
 use bitcoin::Amount;
-use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
+use openswap::{
+    protocol::common_messages::ProtocolVersion,
+    taker::{error::TakerError, SwapParams},
+};
 
 use crate::test_framework::*;
 
@@ -43,15 +46,15 @@ fn taproot_swap_fails_before_funding(world: &mut World) {
     world.mine(1);
 
     // prepare_swap should FAIL because only 1 maker is available for a 2-maker swap
-    let prepare_result = world.taker_mut().prepare(swap_params);
+    let err = world.taker_mut().prepare(swap_params).expect_err(
+        "prepare_swap should fail because only 1 maker is available for a 2-maker swap",
+    );
     assert!(
-        prepare_result.is_err(),
-        "prepare_swap should fail because only 1 maker is available for a 2-maker swap"
+        matches!(err, TakerError::NotEnoughMakersInOfferBook),
+        "Expected NotEnoughMakersInOfferBook, got: {:?}",
+        err
     );
-    info!(
-        "Prepare failed as expected: {:?}",
-        prepare_result.err().unwrap()
-    );
+    info!("Prepare failed as expected: {:?}", err);
 
     // Sync taker wallet and verify balance is unchanged
     world.taker().sync();
