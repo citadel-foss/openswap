@@ -96,6 +96,10 @@ pub enum WalletError {
         cap: u32,
     },
 
+    /// Bitcoin Core is older than v22.0, the first with `listdescriptors`
+    /// and `tr()` descriptors. Retrying cannot help.
+    CoreTooOld,
+
     /// Represents an error related to protocol violations or unexpected protocol behavior.
     Protocol(ProtocolError),
 
@@ -285,6 +289,7 @@ impl std::fmt::Display for WalletError {
                 f,
                 "watch window ends at index {window}, past the cap {cap}; if restoring, lower --address-gap"
             ),
+            WalletError::CoreTooOld => write!(f, "Bitcoin Core v22.0 or newer is required"),
             WalletError::Protocol(e) => write!(f, "Protocol error: {}", e),
             WalletError::Fidelity(e) => write!(f, "Fidelity error: {}", e),
             WalletError::Locktime(e) => write!(f, "Locktime conversion error: {}", e),

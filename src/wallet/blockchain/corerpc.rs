@@ -550,7 +550,14 @@ impl Blockchain for CoreRPC {
         struct Descriptors {
             descriptors: Vec<Listed>,
         }
-        let listed: Descriptors = self.rpc.call("listdescriptors", &[])?;
+        // -32601: no such method. Core 0.21 has descriptor wallets but not this call.
+        let listed: Descriptors = match self.rpc.call("listdescriptors", &[]) {
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -32601 => {
+                return Err(WalletError::CoreTooOld)
+            }
+            listed => listed?,
+        };
+        // Core lists the range end inclusive, so `end == last_index` covers it.
         Ok(listed
             .descriptors
             .into_iter()
@@ -684,7 +691,12 @@ mod tests {
                         .1
                         .clone();
                     seen.push(method);
-                    let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result, "error": null })
+                    // A canned `{"error": ..}` is sent as Core's error reply.
+                    let (result, error) = match result.get("error") {
+                        Some(error) => (Value::Null, error.clone()),
+                        None => (result, Value::Null),
+                    };
+                    let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result, "error": error })
                         .to_string();
                     write!(
                         writer,
@@ -708,9 +720,11 @@ mod tests {
     #[test]
     fn imported_range_covers_needs_the_range_to_start_at_zero() {
         let desc = "wpkh(xpub/0/*)#abcd1234";
+        // `listdescriptors` reports both ends inclusive (`range_end - 1` in Core).
         for (range, last_index, expected) in [
             ([20, 200], 100, false),
             ([0, 200], 100, true),
+            ([0, 100], 100, true),
             ([0, 99], 100, false),
         ] {
             let (core, server) = mock_core(vec![
@@ -730,6 +744,26 @@ mod tests {
             );
             server.join().unwrap();
         }
+    }
+
+    /// Core 0.21 makes descriptor wallets but has no `listdescriptors`.
+    #[test]
+    fn imported_range_covers_reports_core_without_listdescriptors() {
+        let (core, server) = mock_core(vec![
+            (
+                "getwalletinfo",
+                json!({ "walletname": "w", "descriptors": true }),
+            ),
+            (
+                "listdescriptors",
+                json!({ "error": { "code": -32601, "message": "Method not found" } }),
+            ),
+        ]);
+        assert!(matches!(
+            core.imported_range_covers("wpkh(xpub/0/*)", 99),
+            Err(WalletError::CoreTooOld)
+        ));
+        server.join().unwrap();
     }
 
     #[test]

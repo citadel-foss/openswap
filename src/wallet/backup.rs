@@ -18,10 +18,6 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, str::FromStr};
 use zeroize::Zeroizing;
 
-/// The way back from a wallet file that cannot be used.
-pub const RESTORE_FROM_MNEMONIC_HINT: &str =
-    "restore the wallet from its seed phrase with `restore --mnemonic`";
-
 /// Shown before every restore, since no seed or backup holds open swap keys.
 pub const RESTORE_OPEN_SWAPS_WARNING: &str =
     "A restore cannot recover swaps still in progress (including Lightning swaps): \

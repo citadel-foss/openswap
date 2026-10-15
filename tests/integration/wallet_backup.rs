@@ -598,6 +598,21 @@ fn encwallet_encbackup_encrestore() {
     // restore passphrase.
     assert_wallet_file_encrypted(&restored_wallet_file, "integration-test");
 
+    // Loading a file with no saved tip resumes a restore, rerunning its probe.
+    for path in [&original_wallet, &restored_wallet_file] {
+        let (saved, _) = load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(
+            path,
+            Some("integration-test".to_string()),
+        )
+        .unwrap();
+        let serde_cbor::Value::Map(saved) = saved else {
+            panic!("wallet file is not a map")
+        };
+        let field = |name: &str| saved[&serde_cbor::Value::Text(name.to_string())].clone();
+        assert!(matches!(field("last_synced_height"), serde_cbor::Value::Integer(h) if h > 0));
+        assert_eq!(field("pending_restore"), serde_cbor::Value::Null);
+    }
+
     // A nameless restore path resolves to the backup's original filename
     // instead of colliding with the wallets directory itself.
     let nameless_dir = root_dir.join("nameless-restore");

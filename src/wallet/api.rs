@@ -4588,12 +4588,14 @@ impl Wallet {
         }
     }
 
-    /// Errors a retry cannot fix: shutdown, or a watch window past the cap,
-    /// which is fixed by the wallet's counters and gap.
+    /// Errors a retry cannot fix: shutdown, a watch window past the cap
+    /// (fixed by the wallet's counters and gap), or a too-old Bitcoin Core.
     fn sync_error_is_final(e: &WalletError) -> bool {
         matches!(
             e,
-            WalletError::Interrupted(_) | WalletError::WatchWindowCap { .. }
+            WalletError::Interrupted(_)
+                | WalletError::WatchWindowCap { .. }
+                | WalletError::CoreTooOld
         )
     }
 
@@ -5306,14 +5308,16 @@ mod restore_history_probe_tests {
         ));
     }
 
-    /// A window past the cap is final: `sync_no_fail` must not retry it forever.
+    /// A window past the cap or a too-old Core is final: `sync_no_fail` must
+    /// not retry it forever.
     #[test]
-    fn window_cap_is_not_retried() {
+    fn window_cap_and_old_core_are_not_retried() {
         let cap = WalletError::WatchWindowCap {
             window: MAX_WATCH_WINDOW + 1,
             cap: MAX_WATCH_WINDOW,
         };
         assert!(Wallet::sync_error_is_final(&cap));
+        assert!(Wallet::sync_error_is_final(&WalletError::CoreTooOld));
         assert!(!Wallet::sync_error_is_final(&WalletError::General(
             "rpc down".into()
         )));
