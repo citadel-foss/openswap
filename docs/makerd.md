@@ -105,7 +105,7 @@ A randomly generated authentication token written by `makerd` on startup and rem
 
 ## Backing Up and Restoring the Wallet
 
-Both commands run on their own and then exit. They do not start the maker. Stop `makerd` before you use them. Pass the same `-d`, `-w` and blockchain flags you use to run the maker.
+Both commands run on their own and then exit. They do not start the maker. Both need the chain backend (Bitcoin Core or Electrum) running and reachable, and stop with an error if it is not. Stop `makerd` before you use them. Pass the same `-d`, `-w` and blockchain flags you use to run the maker.
 
 ### Backup
 
@@ -138,7 +138,7 @@ A restore cannot bring back swaps in progress or pending refunds. It does find c
 Options:
 
 - `--birthday <HEIGHT>`: the first block to scan from. Pick one before the wallet's first transaction.
-- `--address-gap <N>`: unused addresses in a row that end the search. Default 100, lowest 20, highest 100000.
+- `--address-gap <N>`: unused addresses in a row that end the search. Default 100, lowest 20, highest 100000. The gap plus the highest used address number must stay within 100000, or the restore stops with an error.
 - `--bond-hint <INDEX:LOCKTIME>`: a bond made without an announcement. `makerd` always announces its bonds, so you rarely need this. You can repeat it.
 
 After the restore, the command lists the bond indexes it found. It also names each hint that found no bond.

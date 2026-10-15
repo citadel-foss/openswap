@@ -850,7 +850,9 @@ impl MakerServer {
         if !path.exists() {
             return Err(WalletError::General(format!("no wallet at {path:?} to back up")).into());
         }
+        // Probe first so a down backend gets the clear backup error, not a load error.
         let blockchain = AnyBlockchain::from_config(&config.backend)?;
+        Wallet::require_backend(&blockchain)?;
         let wallet = Wallet::load(&path, blockchain, config.password.take())?;
         Wallet::backup_interactive(&wallet, output)?;
         Ok(())

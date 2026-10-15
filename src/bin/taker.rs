@@ -278,6 +278,7 @@ enum Commands {
     /// Backups contain the master key and are always encrypted; you will be
     /// prompted interactively to enter a passphrase.
     ///
+    /// Needs the Bitcoin Core or Electrum backend running.
     ///
     #[clap(verbatim_doc_comment)]
     Backup,

@@ -103,7 +103,8 @@ enum Commands {
     },
     /// Write an encrypted backup of the existing wallet, then exit.
     ///
-    /// Run it with the maker stopped. Open swaps are not in a backup.
+    /// Run it with the maker stopped and the Bitcoin Core or Electrum backend
+    /// running. Open swaps are not in a backup.
     Backup {
         /// Backup file. Default: `<wallet>-backup.json` in the current directory.
         #[clap(long, short = 'o')]

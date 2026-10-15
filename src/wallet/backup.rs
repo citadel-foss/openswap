@@ -13,6 +13,7 @@ use super::{
 };
 use bip39::Mnemonic;
 use bitcoin::{absolute::LockTime, bip32::Xpriv, Network, ScriptBuf};
+use bitcoind::bitcoincore_rpc::json::GetBlockchainInfoResult;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, str::FromStr};
 use zeroize::Zeroizing;
@@ -172,12 +173,33 @@ impl From<&Wallet> for WalletBackup {
     }
 }
 impl Wallet {
+    /// Backup and restore need the live chain backend; there is no offline backup.
+    pub(crate) fn require_backend(
+        blockchain: &AnyBlockchain,
+    ) -> Result<GetBlockchainInfoResult, WalletError> {
+        blockchain.get_blockchain_info().map_err(|e| {
+            WalletError::General(format!(
+                "backup and restore need a reachable Bitcoin Core or Electrum backend: {e}"
+            ))
+        })
+    }
+
     /// Creates a backup of the wallet and writes it to the given path.
     ///
     /// The backup is saved as a `.json` file, encrypted with the provided
     /// key material. Backups are always encrypted: they contain the master
     /// key, so a cleartext-on-disk form is not supported by design.
     pub fn backup(&self, path: &Path, backup_enc_material: KeyMaterial) -> Result<(), WalletError> {
+        Self::require_backend(&self.blockchain)?;
+        self.write_backup(path, backup_enc_material)
+    }
+
+    /// The file-only part of [`Wallet::backup`], for tests with no backend.
+    pub(crate) fn write_backup(
+        &self,
+        path: &Path,
+        backup_enc_material: KeyMaterial,
+    ) -> Result<(), WalletError> {
         let mut backup_path = path.join("");
         backup_path.set_extension("json");
 
@@ -261,6 +283,18 @@ impl Wallet {
                 )));
             }
         }
+        // The watch window starts at the highest handed-out index, so a gap
+        // inside the range can still push its end past the cap.
+        let window = wallet_backup
+            .external_index
+            .max(wallet_backup.internal_index)
+            .saturating_add(options.address_gap - 1);
+        if window > MAX_WATCH_WINDOW {
+            return Err(WalletError::WatchWindowCap {
+                window,
+                cap: MAX_WATCH_WINDOW,
+            });
+        }
 
         // Directories and nameless paths restore under the backup's filename.
         // That name is untrusted input: accept exactly one normal component,
@@ -310,7 +344,7 @@ impl Wallet {
         let blockchain = AnyBlockchain::from_config(&backend_config_test)?;
 
         // Refuse to restore against a backend on a different chain.
-        let chain = blockchain.get_blockchain_info()?.chain;
+        let chain = Self::require_backend(&blockchain)?.chain;
         if chain != wallet_backup.network {
             return Err(WalletError::General(format!(
                 "backend chain `{chain}` does not match backup network `{}`",
@@ -391,9 +425,7 @@ impl Wallet {
         };
         let mut mnemonic = Mnemonic::parse(phrase.as_str())?;
 
-        let network = AnyBlockchain::from_config(backend_config)?
-            .get_blockchain_info()?
-            .chain;
+        let network = Self::require_backend(&AnyBlockchain::from_config(backend_config)?)?.chain;
         let master_key = Wallet::master_key_from_mnemonic(&mnemonic, network);
         // Wipe the words as soon as the key exists, not after the chain scan.
         zeroize::Zeroize::zeroize(&mut mnemonic);
@@ -625,7 +657,7 @@ impl Wallet {
 mod tests {
     use super::*;
     use crate::wallet::{
-        api::test_support::test_wallet,
+        api::{test_support::test_wallet, KeychainKind},
         storage::{
             LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap, SwapReservation,
         },
@@ -698,7 +730,7 @@ mod tests {
         let password = Some("backup password".to_string());
         let km = KeyMaterial::new_from_password(password.clone()).unwrap();
         let v2_path = dir.path().join("v2.json");
-        wallet.backup(&v2_path, km.clone()).unwrap();
+        wallet.write_backup(&v2_path, km.clone()).unwrap();
         let (v2, _) =
             load_sensitive_struct::<WalletBackup, SerdeJson>(&v2_path, password.clone()).unwrap();
         assert_eq!(
@@ -885,6 +917,66 @@ mod tests {
                 err
             );
         }
+
+        // The window ends at `highest index + gap - 1`: index 2 puts it one past
+        // the cap, index 1 sits on it and passes (then fails at the backend).
+        let path = dir.path().join("windowed");
+        let mut backup = dummy_backup("wallet");
+        for (external_index, window) in [(2, Some(MAX_WATCH_WINDOW + 1)), (1, None)] {
+            backup.external_index = external_index;
+            let err = Wallet::restore_with(
+                &backup,
+                &path,
+                &backend,
+                KeyMaterial::new_ephemeral(),
+                RestoreOptions {
+                    address_gap: MAX_WATCH_WINDOW,
+                    ..Default::default()
+                },
+            )
+            .expect_err("no backend runs here");
+            match (window, err) {
+                (Some(window), WalletError::WatchWindowCap { window: got, cap }) => {
+                    assert_eq!((got, cap), (window, MAX_WATCH_WINDOW));
+                    assert!(!path.exists(), "the file must not be created");
+                }
+                (None, err) => assert!(!matches!(err, WalletError::WatchWindowCap { .. })),
+                (Some(_), err) => panic!("expected the window cap, got {}", err),
+            }
+        }
+    }
+
+    /// With no node behind it, the backup refuses with the backend error.
+    #[test]
+    fn backup_needs_a_reachable_backend() {
+        let dir = tempdir().unwrap();
+        let wallet = test_wallet(&dir.path().join("wallet"));
+        let km = KeyMaterial::new_from_password(Some("pw".to_string())).unwrap();
+        let err = wallet
+            .backup(&dir.path().join("b.json"), km)
+            .expect_err("no backend runs here");
+        assert!(
+            err.to_string()
+                .contains("reachable Bitcoin Core or Electrum"),
+            "{}",
+            err
+        );
+        assert!(!dir.path().join("b.json").exists());
+    }
+
+    /// A counter near `u32::MAX` must report the cap, not overflow the window.
+    #[test]
+    fn max_watch_index_overflow_is_the_window_cap() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        wallet.store.external_index = u32::MAX;
+        assert!(matches!(
+            wallet.max_watch_index(KeychainKind::External),
+            Err(WalletError::WatchWindowCap {
+                window: u32::MAX,
+                cap: MAX_WATCH_WINDOW
+            })
+        ));
     }
 
     /// The checkpoint lives in the wallet file: hints must survive it, and a

@@ -532,6 +532,8 @@ $ taker backup
 
 The backup is created in the current working directory as `<wallet_name>-backup.json`. Backups contain the master key and are always encrypted — you will be prompted interactively for a passphrase.
 
+Backup and restore both need your Bitcoin Core or Electrum backend running and reachable. They stop with an error if it is not.
+
 A backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. If swaps are open, `taker backup` prints how many. Finish them first, and copy `<wallet_name>_swap_report.json` by hand. See [wallet security](wallet-security.md) for the full list.
 
 ### Restoring a Wallet
@@ -561,7 +563,7 @@ A restore refuses to overwrite an existing wallet. Pick a new name or move the o
 Three options control how far the restore searches:
 
 - `--birthday <HEIGHT>`: the first block to scan from. Pick a block before your wallet's first transaction. The default is the backup's birthday, or block 0 for a phrase. A late birthday skips older coins.
-- `--address-gap <N>`: how many unused addresses in a row end the search. The default is 100. The lowest value is 20 and the highest is 100000. Raise it if you used many addresses without receiving coins.
+- `--address-gap <N>`: how many unused addresses in a row end the search. The default is 100. The lowest value is 20 and the highest is 100000. The gap plus your highest used address number must stay within 100000, or the restore stops with an error. Raise it if you used many addresses without receiving coins.
 - `--bond-hint <INDEX:LOCKTIME>`: a fidelity bond made without an announcement. You can repeat it. The restore checks each hint against the chain.
 
 After the restore, the command lists the bond indexes it found. It also names each hint that found no bond. Check that hint for a typo.

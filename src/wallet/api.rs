@@ -2625,6 +2625,13 @@ impl Wallet {
                 }
                 probe += 1;
             }
+            // Cut off by the cap, not by a full empty run: funds past it would be missed.
+            if empty_run < restore.address_gap {
+                return Err(WalletError::WatchWindowCap {
+                    window: next.saturating_add(restore.address_gap) - 1,
+                    cap: MAX_WATCH_WINDOW,
+                });
+            }
         }
         Ok(next)
     }
@@ -2647,7 +2654,11 @@ impl Wallet {
             .pending_restore
             .as_ref()
             .map_or(ADDRESS_IMPORT_COUNT, |restore| restore.address_gap);
-        Ok(used + gap - 1)
+        used.checked_add(gap - 1)
+            .ok_or(WalletError::WatchWindowCap {
+                window: u32::MAX,
+                cap: MAX_WATCH_WINDOW,
+            })
     }
 
     /// Gets the next external address from the HD keychain. Saves the wallet to disk
@@ -4388,6 +4399,16 @@ impl Wallet {
         Ok(())
     }
 
+    fn check_watch_window(window: (u32, u32)) -> Result<(), WalletError> {
+        match window.0.max(window.1) {
+            window if window > MAX_WATCH_WINDOW => Err(WalletError::WatchWindowCap {
+                window,
+                cap: MAX_WATCH_WINDOW,
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Rolling gap limit, shared by both sync paths: a wider watch window can
     /// reveal UTXOs at higher indices, which widens the window again (e.g.
     /// after a seed restore) — repeat `pass` until the window stops moving.
@@ -4400,6 +4421,11 @@ impl Wallet {
             self.max_watch_index(KeychainKind::External)?,
             self.max_watch_index(KeychainKind::Internal)?,
         );
+        // A resumed restore never passed `restore_with`'s check; a plain wallet
+        // keeps syncing as it did before the cap existed.
+        if self.store.pending_restore.is_some() {
+            Self::check_watch_window(prev_window)?;
+        }
         for _ in 0..MAX_SYNC_PASSES {
             Self::check_shutdown(shutdown)?;
             pass(self)?;
@@ -4415,11 +4441,7 @@ impl Wallet {
             if window == prev_window {
                 return Ok(());
             }
-            if window.0.max(window.1) > MAX_WATCH_WINDOW {
-                return Err(WalletError::General(format!(
-                    "Watch window {window:?} exceeds cap {MAX_WATCH_WINDOW}"
-                )));
-            }
+            Self::check_watch_window(window)?;
             prev_window = window;
         }
         Err(WalletError::General(format!(
@@ -4559,13 +4581,20 @@ impl Wallet {
             Self::check_shutdown(shutdown)?;
             match self.sync(shutdown) {
                 Ok(()) => return Ok(()),
-                Err(WalletError::Interrupted(reason)) => {
-                    return Err(WalletError::Interrupted(reason));
-                }
+                Err(e) if Self::sync_error_is_final(&e) => return Err(e),
                 Err(e) => log::error!("Blockchain sync failed. Retrying. | {e:?}"),
             }
             Self::wait_for_shutdown(shutdown, HEART_BEAT_INTERVAL)?;
         }
+    }
+
+    /// Errors a retry cannot fix: shutdown, or a watch window past the cap,
+    /// which is fixed by the wallet's counters and gap.
+    fn sync_error_is_final(e: &WalletError) -> bool {
+        matches!(
+            e,
+            WalletError::Interrupted(_) | WalletError::WatchWindowCap { .. }
+        )
     }
 
     /// Returns a typed interruption so shutdown never enters the outer retry path.
@@ -5211,6 +5240,85 @@ mod restore_history_probe_tests {
         assert_eq!(wallet.find_hd_next_index(external).unwrap(), 0);
     }
 
+    /// The probe stops at the cap. A full empty run ending exactly on it passes;
+    /// one address short, it reports the cap instead of missing coins past it.
+    /// A cached coin starts the probe near the cap, so the run stays short.
+    #[test]
+    fn restore_probe_reports_a_window_cut_off_by_the_cap() {
+        let temp_dir = tempdir().unwrap();
+        let external = KeychainKind::External;
+        let gap = ADDRESS_IMPORT_COUNT;
+        for (next, expected) in [
+            (MAX_WATCH_WINDOW - gap + 1, Ok(MAX_WATCH_WINDOW - gap + 1)),
+            (MAX_WATCH_WINDOW - gap + 2, Err(MAX_WATCH_WINDOW + 1)),
+        ] {
+            let url = start_stub(StdHashSet::new());
+            let mut wallet = stub_wallet(&temp_dir.path().join(format!("w{next}")), url);
+            wallet.store.pending_restore = Some(RestoreOptions {
+                address_gap: gap,
+                ..Default::default()
+            });
+            let coin = ListUnspentResultEntry {
+                txid: bitcoin::Txid::all_zeros(),
+                vout: 0,
+                address: None,
+                label: None,
+                redeem_script: None,
+                witness_script: None,
+                script_pub_key: ScriptBuf::new(),
+                amount: Amount::from_sat(1_000),
+                confirmations: 1,
+                spendable: true,
+                solvable: true,
+                descriptor: Some(format!("wpkh([00000000/0/{}])", next - 1)),
+                safe: true,
+            };
+            let spend = UTXOSpendInfo::SeedCoin {
+                path: format!("m/0/{}", next - 1),
+                input_value: coin.amount,
+                address_type: AddressType::P2WPKH,
+            };
+            wallet
+                .store
+                .utxo_cache
+                .insert(OutPoint::new(coin.txid, 0), (coin, spend));
+            match (wallet.find_hd_next_index(external), expected) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want),
+                (Err(WalletError::WatchWindowCap { window, cap }), Err(want)) => {
+                    assert_eq!((window, cap), (want, MAX_WATCH_WINDOW))
+                }
+                (got, want) => panic!("next {}: got {:?}, want {:?}", next, got, want),
+            }
+        }
+    }
+
+    /// A restore resumed from a file never passed the start check, so the
+    /// first sync pass must reject a window already past the cap.
+    #[test]
+    fn resumed_restore_checks_the_window_before_syncing() {
+        let temp_dir = tempdir().unwrap();
+        let url = start_stub(StdHashSet::new());
+        let mut wallet = stub_wallet(&temp_dir.path().join("wallet.cbor"), url);
+        wallet.store.external_index = MAX_WATCH_WINDOW - 50;
+        assert!(matches!(
+            wallet.sync_no_rescan(&crate::utill::NO_SHUTDOWN),
+            Err(WalletError::WatchWindowCap { window, .. }) if window == MAX_WATCH_WINDOW + 49
+        ));
+    }
+
+    /// A window past the cap is final: `sync_no_fail` must not retry it forever.
+    #[test]
+    fn window_cap_is_not_retried() {
+        let cap = WalletError::WatchWindowCap {
+            window: MAX_WATCH_WINDOW + 1,
+            cap: MAX_WATCH_WINDOW,
+        };
+        assert!(Wallet::sync_error_is_final(&cap));
+        assert!(!Wallet::sync_error_is_final(&WalletError::General(
+            "rpc down".into()
+        )));
+    }
+
     /// A file from an older restore has no saved options and resumes at the
     /// default gap of 100, which misses index 150; the saved gap of 200 finds it.
     #[test]
@@ -5319,7 +5427,7 @@ mod restore_history_probe_tests {
         let password = "backup password".to_string();
         let backup = temp_dir.path().join("backup.json");
         let km = KeyMaterial::new_from_password(Some(password.clone())).unwrap();
-        wallet.backup(&backup, km).unwrap();
+        wallet.write_backup(&backup, km).unwrap();
 
         let data_dir = temp_dir.path().join("fresh");
         restore_wallet_from_backup_gui_app(

@@ -87,6 +87,15 @@ pub enum WalletError {
     /// Waiting was interrupted by an external signal (shutdown/abort).
     Interrupted(&'static str),
 
+    /// The address window to watch ends past the absolute cap.
+    /// Fixed by the counters and gap, so retrying cannot help.
+    WatchWindowCap {
+        /// Last index the window would watch.
+        window: u32,
+        /// Highest index any window may reach.
+        cap: u32,
+    },
+
     /// Represents an error related to protocol violations or unexpected protocol behavior.
     Protocol(ProtocolError),
 
@@ -272,6 +281,10 @@ impl std::fmt::Display for WalletError {
                 write!(f, "Transactions never broadcast: {txids:?}")
             }
             WalletError::Interrupted(reason) => write!(f, "Interrupted: {}", reason),
+            WalletError::WatchWindowCap { window, cap } => write!(
+                f,
+                "watch window ends at index {window}, past the cap {cap}; if restoring, lower --address-gap"
+            ),
             WalletError::Protocol(e) => write!(f, "Protocol error: {}", e),
             WalletError::Fidelity(e) => write!(f, "Fidelity error: {}", e),
             WalletError::Locktime(e) => write!(f, "Locktime conversion error: {}", e),
