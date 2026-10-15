@@ -48,6 +48,9 @@ pub struct Watcher<R: Role> {
     /// Core block hashes whose height lookup failed. Retried on every loop pass
     /// without retaining full blocks in memory.
     pending_block_discovery: Vec<BlockHash>,
+    /// Watches to re-check against the backend after notifications were lost.
+    /// Retried on every loop pass until each lookup completes.
+    pending_reconcile: Vec<OutPoint>,
     /// Set by `WatchService::shutdown`; long scans check it per iteration so a
     /// deep rescan cannot stall the join.
     shutdown: Arc<AtomicBool>,
@@ -130,6 +133,7 @@ impl<R: Role> Watcher<R> {
             nostr_tor_config,
             pending_subscribes: Vec::new(),
             pending_block_discovery: Vec::new(),
+            pending_reconcile: Vec::new(),
             shutdown,
             tip: Arc::new(AtomicU64::new(0)),
             _role: PhantomData,
@@ -491,6 +495,7 @@ impl<R: Role> Watcher<R> {
         if self.shutdown.load(Ordering::Relaxed) {
             return;
         }
+        self.reconcile_watches();
         // Split the field borrows so both retry queues can retain in place.
         let Self {
             blockchain,
@@ -558,6 +563,62 @@ impl<R: Role> Watcher<R> {
         });
     }
 
+    /// Re-check queued watches against the backend after lost notifications,
+    /// recording any spend found. The first failed lookup ends the pass with
+    /// the rest still queued, so a node that cannot answer costs one call per
+    /// pass instead of stalling the loop for a call per watch.
+    fn reconcile_watches(&mut self) {
+        if self.pending_reconcile.is_empty() {
+            return;
+        }
+        let watches = match self.registry.list_watches() {
+            Ok(watches) => watches,
+            Err(e) => {
+                log::error!("registry lock poisoned, cannot re-check watches: {e:?}");
+                return;
+            }
+        };
+        let Self {
+            blockchain,
+            registry,
+            pending_reconcile,
+            shutdown,
+            ..
+        } = self;
+        let mut failed = false;
+        pending_reconcile.retain(|outpoint| {
+            if failed || shutdown.load(Ordering::Relaxed) {
+                return true;
+            }
+            // Unwatched since it was queued: nothing left to check.
+            let Some(watch) = watches.iter().find(|watch| watch.outpoint == *outpoint) else {
+                return false;
+            };
+            let recorded =
+                lookup_spend(blockchain, outpoint, &watch.script_pubkey).and_then(|spend| {
+                    let Some((tx, in_block)) = spend else {
+                        return Ok(());
+                    };
+                    // Most re-checks only confirm a spend already on record.
+                    if watch.spent_tx.as_ref() != Some(&tx) || watch.in_block != in_block {
+                        log::warn!(
+                            "recovered missed spend of {outpoint}: {} (confirmed={in_block})",
+                            tx.compute_txid()
+                        );
+                    }
+                    process_transaction(&tx, registry, in_block)
+                });
+            match recorded {
+                Ok(()) => false,
+                Err(e) => {
+                    log::error!("re-check of {outpoint} after lost notifications failed: {e:?}");
+                    failed = true;
+                    true
+                }
+            }
+        });
+    }
+
     /// Scan the node mempool into the registry.
     fn process_mempool(&mut self) -> Result<(), WatcherError> {
         let txids = self
@@ -588,6 +649,20 @@ impl<R: Role> Watcher<R> {
         match ev {
             // Blocks are going unheard, so the height can no longer be trusted.
             WatchEvent::Unreachable => self.tip.store(0, Ordering::Release),
+            // A lost notification may have been a watched spend, so watches are
+            // re-checked against the backend on the next retry pass. A spend
+            // already recorded as confirmed has nothing left to learn.
+            WatchEvent::Missed => match self.registry.list_watches() {
+                Ok(watches) => {
+                    for watch in watches {
+                        let confirmed = watch.in_block && watch.spent_tx.is_some();
+                        if !confirmed && !self.pending_reconcile.contains(&watch.outpoint) {
+                            self.pending_reconcile.push(watch.outpoint);
+                        }
+                    }
+                }
+                Err(e) => log::error!("registry lock poisoned, cannot re-check watches: {e:?}"),
+            },
             WatchEvent::TxSeen { raw_tx } => {
                 if let Ok(tx) = deserialize::<Transaction>(&raw_tx) {
                     if let Err(e) = process_transaction(&tx, &mut self.registry, false) {
@@ -656,20 +731,45 @@ impl<R: Role> Watcher<R> {
     }
 }
 
+/// The transaction the backend reports spending `outpoint`, and whether it is
+/// mined. Mined matters: a confirmed spend may carry the only copy of a
+/// preimage, and only a confirmed record is protected from mempool rivals.
+fn lookup_spend(
+    blockchain: &AnyBlockchain,
+    outpoint: &OutPoint,
+    script_pubkey: &ScriptBuf,
+) -> Result<Option<(Transaction, bool)>, WatcherError> {
+    let Some(tx) = blockchain.spending_transaction(outpoint, script_pubkey, None)? else {
+        return Ok(None);
+    };
+    let in_block = blockchain.tx_block_height(&tx.compute_txid())?.is_some();
+    Ok(Some((tx, in_block)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bitcoin::{
         consensus::{encode::serialize_hex, serialize},
         constants::genesis_block,
+        hashes::Hash,
+        Sequence, TxIn, Txid, Witness,
     };
     use serde_json::{json, Value};
     use std::{
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
+        sync::Mutex,
+        time::{Duration, Instant},
     };
 
-    use crate::wallet::{blockchain::BlockRef, CoreRPC, CoreRpcConfig};
+    use crate::{
+        wallet::{
+            blockchain::{BlockRef, ZmqPublisher},
+            CoreRPC, CoreRpcConfig,
+        },
+        watch_tower::service::MakerRole,
+    };
 
     struct DiscoveryRole;
 
@@ -903,5 +1003,306 @@ mod tests {
         // A reconnect replays the tip after the last unwatch; it must stay withdrawn.
         watcher.handle_event(block(8));
         assert_eq!(watcher.tip.load(Ordering::Acquire), 0);
+    }
+
+    /// Serves Core JSON-RPC from `answer` on every connection and records each
+    /// method called; an `Err` becomes an RPC error. Runs until the test
+    /// process exits.
+    fn mock_core_rpc(
+        answer: impl Fn(&str, &Value) -> Result<Value, String> + Send + Sync + 'static,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Core RPC");
+        let url = listener.local_addr().unwrap().to_string();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let answer = Arc::new(answer);
+        let server_calls = calls.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let (answer, calls) = (answer.clone(), server_calls.clone());
+                thread::spawn(move || {
+                    let mut writer = stream.try_clone().expect("clone Core RPC stream");
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        let mut content_length = 0;
+                        loop {
+                            line.clear();
+                            reader.read_line(&mut line).unwrap();
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some((name, value)) = line.split_once(':') {
+                                if name.eq_ignore_ascii_case("content-length") {
+                                    content_length = value.trim().parse().unwrap();
+                                }
+                            }
+                        }
+                        let mut body = vec![0; content_length];
+                        reader.read_exact(&mut body).unwrap();
+                        let request: Value = serde_json::from_slice(&body).unwrap();
+                        let method = request["method"].as_str().unwrap();
+                        calls.lock().unwrap().push(method.to_string());
+                        let (result, error) = match answer(method, &request["params"]) {
+                            Ok(result) => (result, Value::Null),
+                            Err(message) => {
+                                (Value::Null, json!({ "code": -1, "message": message }))
+                            }
+                        };
+                        let response =
+                            json!({ "result": result, "error": error, "id": request["id"] })
+                                .to_string();
+                        write!(
+                            writer,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                            response.len(),
+                            response
+                        )
+                        .unwrap();
+                        writer.flush().unwrap();
+                        line.clear();
+                    }
+                });
+            }
+        });
+        (url, calls)
+    }
+
+    fn spend(outpoint: OutPoint) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: Vec::new(),
+        }
+    }
+
+    /// `getrawtransaction <txid> true` for a transaction sitting in the mempool.
+    fn verbose_mempool_tx(tx: &Transaction) -> Value {
+        json!({
+            "hex": serialize_hex(tx),
+            "txid": tx.compute_txid(),
+            "hash": tx.compute_wtxid(),
+            "size": serialize(tx).len(),
+            "vsize": tx.vsize(),
+            "version": tx.version.0,
+            "locktime": tx.lock_time.to_consensus_u32(),
+            "vin": tx.input.iter().map(|input| json!({
+                "txid": input.previous_output.txid,
+                "vout": input.previous_output.vout,
+                "sequence": input.sequence.0,
+            })).collect::<Vec<_>>(),
+            "vout": [],
+        })
+    }
+
+    /// Answers a Core node whose mempool holds `mempool`, the only spends it knows.
+    fn mempool_core(
+        mempool: Vec<Transaction>,
+    ) -> impl Fn(&str, &Value) -> Result<Value, String> + Send + Sync + 'static {
+        move |method, params| match method {
+            "gettxspendingprevout" => {
+                let prevout = &params[0][0];
+                let outpoint = OutPoint::new(
+                    serde_json::from_value(prevout["txid"].clone()).unwrap(),
+                    prevout["vout"].as_u64().unwrap() as u32,
+                );
+                let spender = mempool
+                    .iter()
+                    .find(|tx| tx.input.iter().any(|i| i.previous_output == outpoint))
+                    .map(Transaction::compute_txid);
+                Ok(
+                    json!([{ "txid": outpoint.txid, "vout": outpoint.vout, "spendingtxid": spender }]),
+                )
+            }
+            "getrawtransaction" => {
+                let txid: Txid = serde_json::from_value(params[0].clone()).unwrap();
+                let tx = mempool
+                    .iter()
+                    .find(|tx| tx.compute_txid() == txid)
+                    .expect("only mempool spends are looked up");
+                Ok(if params[1] == json!(true) {
+                    verbose_mempool_tx(tx)
+                } else {
+                    json!(serialize_hex(tx))
+                })
+            }
+            method => panic!("unexpected Core RPC method: {}", method),
+        }
+    }
+
+    fn core_watcher(config: &CoreRpcConfig) -> Watcher<MakerRole> {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        Watcher::new(
+            AnyBlockchain::CoreRPC(CoreRPC::new(config).unwrap()),
+            FileRegistry::new(),
+            rx,
+            Vec::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn recorded_spend<R: Role>(watcher: &Watcher<R>, outpoint: OutPoint) -> Option<Transaction> {
+        watcher
+            .registry
+            .list_watches()
+            .unwrap()
+            .into_iter()
+            .find(|watch| watch.outpoint == outpoint)
+            .and_then(|watch| watch.spent_tx)
+    }
+
+    /// Core dropped `rawtx` seq 1, the spend of a watched outpoint. The gap in
+    /// the sequence numbers is the only trace of it, so the watcher must
+    /// re-check its watches against Core and record the spend found there.
+    #[test]
+    fn missed_zmq_spend_is_recorded_after_a_sequence_gap() {
+        let missed_outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let seen_outpoint = OutPoint::new(Txid::from_byte_array([2; 32]), 0);
+        let missed_spend = spend(missed_outpoint);
+        let seen_spend = spend(seen_outpoint);
+        let unrelated = spend(OutPoint::new(Txid::from_byte_array([9; 32]), 0));
+
+        // Core's mempool holds both spends.
+        let (url, calls) =
+            mock_core_rpc(mempool_core(vec![missed_spend.clone(), seen_spend.clone()]));
+        let publisher = ZmqPublisher::bind("tcp://127.0.0.1:*");
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            zmq_addr: publisher.addr.clone(),
+            ..CoreRpcConfig::default()
+        });
+        for outpoint in [missed_outpoint, seen_outpoint] {
+            watcher.handle_command(WatcherCommand::RegisterWatchRequest {
+                outpoint,
+                script_pubkey: ScriptBuf::new(),
+            });
+        }
+        publisher.wait_for_subscriber(|| watcher.drain_events());
+
+        publisher.publish("rawtx", &serialize(&unrelated), 0);
+        // Seq 1, `missed_spend`, never reaches the watcher.
+        publisher.publish("rawtx", &serialize(&seen_spend), 2);
+
+        // Event-loop passes until the message after the gap is processed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while recorded_spend(&watcher, seen_outpoint).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "rawtx seq 2 never reached the watcher"
+            );
+            watcher.drain_events();
+            watcher.retry_pending_work();
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            recorded_spend(&watcher, missed_outpoint),
+            Some(missed_spend.clone()),
+            "the spend Core dropped from the ZMQ feed must be recovered from Core"
+        );
+
+        // Answered from the registry, without asking Core again.
+        let calls_before = calls.lock().unwrap().len();
+        let (reply_tx, reply_rx) = crossbeam_channel::unbounded();
+        watcher.handle_command(WatcherCommand::WatchRequest {
+            outpoint: missed_outpoint,
+            reply: reply_tx,
+        });
+        match reply_rx.try_recv() {
+            Ok(WatcherEvent::UtxoSpent { spending_tx, .. }) => {
+                assert_eq!(spending_tx, Some(missed_spend))
+            }
+            other => panic!("expected the recorded spend, got {:?}", other),
+        }
+        assert_eq!(calls.lock().unwrap().len(), calls_before);
+    }
+
+    /// A node that cannot answer must not hold up the event loop for a lookup
+    /// per watch: the first failure ends the pass, and every queued watch is
+    /// re-checked on a later pass.
+    #[test]
+    fn failed_reconcile_stays_queued_and_retries() {
+        let outpoints = [1, 2, 3].map(|n| OutPoint::new(Txid::from_byte_array([n; 32]), 0));
+        let spends = outpoints.map(spend);
+        let node_up = Arc::new(AtomicBool::new(false));
+        let answer = mempool_core(spends.to_vec());
+        let (url, calls) = mock_core_rpc({
+            let node_up = node_up.clone();
+            move |method, params| {
+                if !node_up.load(Ordering::Relaxed) {
+                    return Err("Loading block index".to_string());
+                }
+                answer(method, params)
+            }
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        for outpoint in outpoints {
+            watcher.handle_command(WatcherCommand::RegisterWatchRequest {
+                outpoint,
+                script_pubkey: ScriptBuf::new(),
+            });
+        }
+
+        watcher.handle_event(WatchEvent::Missed);
+        watcher.retry_pending_work();
+        assert_eq!(calls.lock().unwrap().len(), 1, "one failed lookup per pass");
+        assert_eq!(watcher.pending_reconcile.len(), outpoints.len());
+        assert!(outpoints
+            .iter()
+            .all(|outpoint| recorded_spend(&watcher, *outpoint).is_none()));
+
+        node_up.store(true, Ordering::Relaxed);
+        watcher.retry_pending_work();
+        assert!(watcher.pending_reconcile.is_empty());
+        for (outpoint, spend) in outpoints.iter().zip(spends) {
+            assert_eq!(recorded_spend(&watcher, *outpoint), Some(spend));
+        }
+    }
+
+    /// A spend already recorded as confirmed has nothing left to learn, and an
+    /// unwatched outpoint nothing to protect: neither may cost a lookup.
+    #[test]
+    fn reconcile_skips_confirmed_spends_and_unwatched_outpoints() {
+        let confirmed = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let unwatched = OutPoint::new(Txid::from_byte_array([2; 32]), 0);
+        let (url, calls) = mock_core_rpc(|method, _| Err(format!("unexpected {}", method)));
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        watcher
+            .registry
+            .upsert_watch(&crate::watch_tower::registry_storage::WatchRequest {
+                outpoint: confirmed,
+                script_pubkey: ScriptBuf::new(),
+                in_block: true,
+                spent_tx: Some(spend(confirmed)),
+            })
+            .unwrap();
+        watcher.handle_command(WatcherCommand::RegisterWatchRequest {
+            outpoint: unwatched,
+            script_pubkey: ScriptBuf::new(),
+        });
+
+        watcher.handle_event(WatchEvent::Missed);
+        watcher.handle_command(WatcherCommand::Unwatch {
+            outpoint: unwatched,
+            script_pubkey: ScriptBuf::new(),
+        });
+        watcher.retry_pending_work();
+
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(watcher.pending_reconcile.is_empty());
+        assert_eq!(recorded_spend(&watcher, confirmed), Some(spend(confirmed)));
     }
 }
