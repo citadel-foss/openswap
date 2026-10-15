@@ -2010,8 +2010,11 @@ impl Wallet {
         for (keychain, descriptor) in self.get_wallet_descriptors(address_type)? {
             // Core may have grown the range past ours, and a re-import must
             // cover it, so only import when the window has outgrown it.
-            let imported_end = self.blockchain.imported_range_end(&descriptor)?;
-            if !matches!(imported_end, Some(end) if end >= self.max_watch_index(keychain)?) {
+            let last_index = self.max_watch_index(keychain)?;
+            if !self
+                .blockchain
+                .imported_range_covers(&descriptor, last_index)?
+            {
                 unimported.push(descriptor);
             }
         }

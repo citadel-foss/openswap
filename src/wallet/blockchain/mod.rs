@@ -297,10 +297,14 @@ pub trait Blockchain: Send + Sync + 'static {
     fn prepare_backend_wallet(&self, _wallet_name: &str) -> Result<(), WalletError> {
         Ok(())
     }
-    /// Last index of `descriptor`'s imported range, `None` if not imported.
+    /// Whether `descriptor` is imported up to `last_index`.
     /// Defaults to an error on Electrum (never reached: the sync path early-returns first).
-    fn imported_range_end(&self, _descriptor: &str) -> Result<Option<u32>, WalletError> {
-        Err(unsupported("imported_range_end"))
+    fn imported_range_covers(
+        &self,
+        _descriptor: &str,
+        _last_index: u32,
+    ) -> Result<bool, WalletError> {
+        Err(unsupported("imported_range_covers"))
     }
     /// Import descriptor request objects and trigger a rescan, failing if any
     /// descriptor is rejected. Defaults to a no-op (Electrum pre-derives and
@@ -674,10 +678,14 @@ impl Blockchain for AnyBlockchain {
             AnyBlockchain::Electrum(b) => b.prepare_backend_wallet(wallet_name),
         }
     }
-    fn imported_range_end(&self, descriptor: &str) -> Result<Option<u32>, WalletError> {
+    fn imported_range_covers(
+        &self,
+        descriptor: &str,
+        last_index: u32,
+    ) -> Result<bool, WalletError> {
         match self {
-            AnyBlockchain::CoreRPC(b) => b.imported_range_end(descriptor),
-            AnyBlockchain::Electrum(b) => b.imported_range_end(descriptor),
+            AnyBlockchain::CoreRPC(b) => b.imported_range_covers(descriptor, last_index),
+            AnyBlockchain::Electrum(b) => b.imported_range_covers(descriptor, last_index),
         }
     }
     fn import_descriptors(&self, requests: &[Value]) -> Result<(), WalletError> {
