@@ -9,7 +9,9 @@ use std::{
 pub const POLL: Duration = Duration::from_millis(250);
 
 /// Calls `check` every `every` until it returns `Some`, and returns that value.
-/// Fails after `timeout`, naming `what` it waited for.
+/// Fails after `timeout`, naming `what` it waited for. A sleep never runs past
+/// the deadline, so the last check comes at the deadline, not up to `every`
+/// after it.
 #[track_caller]
 pub fn wait_for<T>(
     timeout: Duration,
@@ -22,19 +24,24 @@ pub fn wait_for<T>(
         if let Some(value) = check() {
             return value;
         }
+        let elapsed = start.elapsed();
         assert!(
-            start.elapsed() < timeout,
+            elapsed < timeout,
             "timed out after {:?} waiting for: {}",
             timeout,
             what
         );
-        thread::sleep(every);
+        thread::sleep(every.min(timeout - elapsed));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, time::Duration};
+    use std::{
+        cell::Cell,
+        panic,
+        time::{Duration, Instant},
+    };
 
     use super::wait_for;
 
@@ -61,6 +68,25 @@ mod tests {
             Duration::from_millis(10),
             "something that never happens",
             || None,
+        );
+    }
+
+    #[test]
+    fn a_long_interval_does_not_sleep_past_the_timeout() {
+        let start = Instant::now();
+        let result = panic::catch_unwind(|| {
+            wait_for::<()>(
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+                "something that never happens",
+                || None,
+            )
+        });
+        assert!(result.is_err(), "the wait must time out");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the wait slept a whole interval past its timeout: {:?}",
+            start.elapsed()
         );
     }
 }

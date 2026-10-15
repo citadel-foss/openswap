@@ -77,8 +77,9 @@
 //! every case is a `#[test]` of that name. Every case names the same
 //! arguments; they are bound as locals before `build()`, so keys can use them
 //! (`takers = [behavior]`), and the body takes the ones it needs by name. A
-//! case's own `///` docs and attributes go to its test; the body's non-doc
-//! attributes go to every case. `backend = ElectrumBackend` in a case is not
+//! case's own `///` docs and attributes go to its test; the body's other
+//! attributes go to every case, except lint attributes (`allow`, `expect`,
+//! ...), which stay on the body. `backend = ElectrumBackend` in a case is not
 //! a local: it builds that case's world on its own backend.
 //!
 //! `bind = [name = value, (a, b) = value, ...]` makes locals before `build()`
@@ -389,19 +390,28 @@ fn expand(args: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
     };
 
     // Docs stay on the shared body; every other attribute goes to each case.
-    // A `cfg` also stays on the body so both compile out together, and a lint
-    // attribute (`allow`, `deny`, ...) too, since it is about the body's code.
+    // A `cfg` goes to both, so they compile out together. A lint attribute
+    // (`allow`, `expect`, ...) goes to the body alone: it is about the body's
+    // code, which no case repeats, so an `expect` on a case would go
+    // unfulfilled.
     let body_name = body.sig.ident.clone();
     let (docs, shared): (Vec<_>, Vec<_>) = std::mem::take(&mut body.attrs)
         .into_iter()
         .partition(|attr| attr.path().is_ident("doc"));
-    body.attrs = docs.clone();
-    let on_body = |attr: &&Attribute| {
-        ["cfg", "allow", "warn", "deny", "forbid", "expect"]
+    let is_lint = |attr: &Attribute| {
+        ["allow", "warn", "deny", "forbid", "expect"]
             .iter()
             .any(|name| attr.path().is_ident(name))
     };
-    body.attrs.extend(shared.iter().filter(on_body).cloned());
+    let (lints, shared): (Vec<_>, Vec<_>) = shared.into_iter().partition(|attr| is_lint(attr));
+    body.attrs = docs.clone();
+    body.attrs.extend(
+        shared
+            .iter()
+            .filter(|attr| attr.path().is_ident("cfg"))
+            .cloned(),
+    );
+    body.attrs.extend(lints);
     let mut tests = Vec::new();
     for case in cases {
         if case.name == body_name {
@@ -928,11 +938,11 @@ mod tests {
     }
 
     #[test]
-    fn a_lint_attribute_stays_on_the_shared_body() {
+    fn a_lint_attribute_stays_on_the_shared_body_alone() {
         let tokens = expand(
             quote!(backend = BitcoindBackend, cases = [a(n = 1), b(n = 2)],),
             quote!(
-                #[allow(clippy::too_many_arguments)]
+                #[expect(clippy::too_many_arguments)]
                 #[ignore]
                 fn run_guard(world: &mut World, n: u32) {}
             ),
@@ -943,13 +953,21 @@ mod tests {
             .find("fn run_guard (world")
             .expect("the shared body is emitted");
         assert!(
-            tokens[..body].ends_with("# [allow (clippy :: too_many_arguments)] "),
+            tokens[..body].ends_with("# [expect (clippy :: too_many_arguments)] "),
             "the lint must stay on the body: {tokens}"
         );
         assert!(
             !tokens[..body].contains("# [ignore]"),
             "`ignore` belongs to the generated tests: {tokens}"
         );
+        // A case never runs the body's code, so an `expect` there would be
+        // unfulfilled under `-D warnings`.
+        assert_eq!(
+            tokens.matches("# [expect").count(),
+            1,
+            "the lint must not reach the generated tests: {tokens}"
+        );
+        assert_eq!(tokens.matches("# [ignore]").count(), 2, "{tokens}");
     }
 
     #[test]

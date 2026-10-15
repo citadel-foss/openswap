@@ -93,7 +93,6 @@ fn fidelity_limit_violation(world: &mut World) {
     maker.config.write_to_file(&config_path).unwrap();
 
     // Change maker config fidelity_timelock to an unacceptable value
-    // (must happen before test_framework.stop() which deletes the temp directory)
     let mut contents = fs::read_to_string(&config_path).unwrap();
     contents = contents.replace("fidelity_timelock = 950", "fidelity_timelock = 100");
     fs::write(&config_path, contents).unwrap();

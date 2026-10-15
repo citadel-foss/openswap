@@ -54,29 +54,6 @@ pub fn spawn_makers(makers: &[Arc<MakerServer>]) -> Vec<JoinHandle<()>> {
         .collect::<Vec<_>>()
 }
 
-/// Spawns all makers, waits for their setup, then mines one block.
-#[allow(dead_code)]
-pub fn spawn_ready_makers_and_mine(
-    makers: &[Arc<MakerServer>],
-    bitcoind: &bitcoind::BitcoinD,
-) -> Vec<JoinHandle<()>> {
-    let maker_threads = spawn_makers(makers);
-    wait_for_makers_setup(makers, 120);
-    generate_blocks(bitcoind, 1);
-    maker_threads
-}
-
-/// Stops every maker server and joins its thread, in maker order.
-#[allow(dead_code)]
-pub fn shutdown_makers(makers: &[Arc<MakerServer>], maker_threads: Vec<JoinHandle<()>>) {
-    makers
-        .iter()
-        .for_each(|maker| maker.shutdown.store(true, Relaxed));
-    maker_threads
-        .into_iter()
-        .for_each(|thread| thread.join().unwrap());
-}
-
 /// Syncs every maker's wallet against the backend and saves it.
 #[allow(dead_code)]
 pub fn sync_maker_wallets(makers: &[Arc<MakerServer>]) {
