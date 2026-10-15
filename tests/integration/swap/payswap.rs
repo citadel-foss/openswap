@@ -381,6 +381,7 @@ fn negotiation_guards_abort_before_funding(world: &mut World) {
     let spare_maker = world.makers()[1].address();
     let payment_amount = Amount::from_sat(100_000);
     let mempool_before = world.bitcoind().client.get_raw_mempool().unwrap();
+    let before = world.balances();
 
     let receiver = world
         .bitcoind()
@@ -393,7 +394,7 @@ fn negotiation_guards_abort_before_funding(world: &mut World) {
         .prepare(
             SwapParams::new(ProtocolVersion::Taproot, payment_amount, 1)
                 .with_required_confirms(1)
-                .with_preferred_makers(vec![failing_maker, spare_maker.clone()])
+                .with_preferred_makers(vec![failing_maker.clone(), spare_maker.clone()])
                 .with_payment_address(receiver.as_unchecked().clone()),
         )
         .expect_err("PaySwap must not substitute a spare after negotiation failure");
@@ -414,6 +415,14 @@ fn negotiation_guards_abort_before_funding(world: &mut World) {
         .fetch_offers()
         .unwrap()
         .all_makers();
+    // The loop below passes vacuously without the maker that closed the
+    // connection, so require its entry first.
+    assert!(
+        standings
+            .iter()
+            .any(|m| m.address.to_string() == failing_maker),
+        "the taker no longer tracks the maker that closed the connection"
+    );
     for standing in &standings {
         assert!(
             !matches!(standing.state, MakerState::Banned(_)),
@@ -448,4 +457,8 @@ fn negotiation_guards_abort_before_funding(world: &mut World) {
         mempool_before,
         "negotiation guards must abort before any funding transaction is broadcast"
     );
+    // The mempool check misses a funding tx the block generator already mined,
+    // so also check that neither taker spent anything or holds a contract.
+    world.sync_all();
+    assert_balances!(world, since before; { takers: { contract: 0, loss: 0 } });
 }
