@@ -423,14 +423,10 @@ impl WalletStore {
         prepare(&mut store);
         store.master_key.seal(store_enc_material)?;
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Exclusive create: fails with `AlreadyExists` instead of truncating a
-        // wallet that appeared since the caller checked the path.
-        File::create_new(path)?;
-
-        store.write_to_disk(path, store_enc_material)?;
+        // No-clobber: fails with `AlreadyExists` instead of replacing a wallet
+        // that appeared since the caller checked the path, and never leaves
+        // an empty or partial file there if the write fails.
+        store.write_file(path, store_enc_material, true)?;
 
         Ok(store)
     }
@@ -446,27 +442,21 @@ impl WalletStore {
         path: &Path,
         store_enc_material: &KeyMaterial,
     ) -> Result<(), WalletError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.write_file(path, store_enc_material, false)
+    }
 
+    fn write_file(
+        &self,
+        path: &Path,
+        store_enc_material: &KeyMaterial,
+        no_clobber: bool,
+    ) -> Result<(), WalletError> {
         let encrypted = encrypt_struct(self, store_enc_material)
             .map_err(|e| WalletError::General(format!("wallet store encryption failed: {e:?}")))?;
-
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-        let mut writer = BufWriter::new(&mut tmp);
-        serde_cbor::to_writer(&mut writer, &encrypted)?;
-        // `Drop for BufWriter` discards flush errors, so flush explicitly:
-        // a swallowed error would rename a truncated wallet over the good one.
-        writer.flush()?;
-        drop(writer);
-        tmp.as_file().sync_all()?;
-        tmp.persist(path)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        // Without this the rename itself may not survive a crash.
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        write_atomic(path, no_clobber, |writer| {
+            serde_cbor::to_writer(writer, &encrypted)?;
+            Ok(())
+        })
     }
 
     /// Reads from a path (errors if path doesn't exist).
@@ -483,12 +473,63 @@ impl WalletStore {
     }
 }
 
+/// Writes `path` through a fsynced tempfile in the same directory, then
+/// renames it into place (refusing an existing file when `no_clobber`).
+/// A failure at any step leaves `path` as it was.
+fn write_atomic(
+    path: &Path,
+    no_clobber: bool,
+    write: impl FnOnce(&mut BufWriter<&mut tempfile::NamedTempFile>) -> Result<(), WalletError>,
+) -> Result<(), WalletError> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut writer = BufWriter::new(&mut tmp);
+    write(&mut writer)?;
+    // `Drop for BufWriter` discards flush errors, so flush explicitly:
+    // a swallowed error would rename a truncated wallet over the good one.
+    writer.flush()?;
+    drop(writer);
+    tmp.as_file().sync_all()?;
+    if no_clobber {
+        tmp.persist_noclobber(path)
+    } else {
+        tmp.persist(path)
+    }
+    .map_err(|e| e.error)?;
+    // Without this the rename itself may not survive a crash.
+    #[cfg(not(windows))]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::SecurityError;
     use bip39::rand::{thread_rng, Rng};
     use bitcoind::tempfile::tempdir;
+
+    #[test]
+    fn failed_first_write_leaves_no_wallet_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let failed = write_atomic(&path, true, |_| Err(WalletError::General("cut".into())));
+        assert!(failed.is_err());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "neither the wallet nor a tempfile may remain"
+        );
+
+        // So a retry writes it, and a second no-clobber write refuses to replace it.
+        write_atomic(&path, true, |w| Ok(w.write_all(b"first")?)).unwrap();
+        assert!(write_atomic(&path, true, |w| Ok(w.write_all(b"second")?)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    }
 
     #[test]
     fn test_write_and_read_wallet_to_disk() {

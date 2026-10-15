@@ -509,7 +509,8 @@ impl Wallet {
         mnemonic: &Mnemonic,
         network: Network,
     ) -> Result<Xpriv, WalletError> {
-        Ok(Xpriv::new_master(network, &mnemonic.to_seed(""))?)
+        let seed = zeroize::Zeroizing::new(mnemonic.to_seed(""));
+        Ok(Xpriv::new_master(network, seed.as_slice())?)
     }
 
     /// `Some` at most once; always `None` for loaded or restored wallets.

@@ -389,14 +389,19 @@ impl Wallet {
                 )))
             }
         };
-        let mnemonic = Mnemonic::parse(phrase.as_str())?;
+        let mut mnemonic = Mnemonic::parse(phrase.as_str())?;
 
         let network = AnyBlockchain::from_config(backend_config)?
             .get_blockchain_info()?
             .chain;
+        let master_key = Wallet::master_key_from_mnemonic(&mnemonic, network);
+        // Wipe the words as soon as the key exists, not after the chain scan.
+        zeroize::Zeroize::zeroize(&mut mnemonic);
+        drop(phrase);
+        let master_key = master_key?;
         let backup = WalletBackup {
             network,
-            master_key: Wallet::master_key_from_mnemonic(&mnemonic, network)?,
+            master_key,
             wallet_birthday: None,
             file_name,
             fidelity_bonds: Vec::new(),
