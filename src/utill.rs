@@ -940,8 +940,11 @@ pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
 pub fn print_new_wallet_seed(mnemonic: &SecretMnemonic) -> io::Result<()> {
     let mut out = lock_debug!(io::stdout().lock());
     writeln!(out, "\n========== New Wallet Seed Phrase ==========")?;
-    let words = mnemonic.words();
-    writeln!(out, "{}", words.as_str())?;
+    // A whole line skips stdout's buffer, which would keep an unwiped copy.
+    // `words()` reserves the byte for the newline, so this does not reallocate.
+    let mut words = mnemonic.words();
+    words.push('\n');
+    out.write_all(words.as_bytes())?;
     writeln!(
         out,
         "\nWrite these words down and store them offline. They will not be shown again."

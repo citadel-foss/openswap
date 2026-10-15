@@ -72,15 +72,13 @@ pub fn restore_wallet_from_backup_gui_app(
         None => wallets_dir,
     };
 
-    let mut wallet = Wallet::restore_prepared(
-        &backup,
+    Wallet::restore_owned_with(
+        backup,
         &restored_wallet_path,
         &backend,
         encryption_material,
         options,
     )?;
-    drop(backup);
-    wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
     Ok(())
 }
 

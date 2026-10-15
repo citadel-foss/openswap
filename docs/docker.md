@@ -167,7 +167,7 @@ docker run -d \
     -p <wallet-passphrase>
 ```
 
-The container shares your host network. That way makerd reaches Tor and `bitcoind` on your machine. Makerd always encrypts its wallet. You must set its passphrase with `-p`. Add `-t <tor-password>` if your Tor control port uses a password. The direct `docker run` commands expose `-p` in command arguments; use the setup script to pass it as a Docker secret.
+The container shares your host network. That way makerd reaches Tor and `bitcoind` on your machine. Makerd always encrypts its wallet. You must set its passphrase with `-p`. Add `-t <tor-password>` if your Tor control port uses a password. The direct `docker run` commands store `-p` in the container settings, where `docker inspect` shows it. The setup script passes it as a Docker secret instead.
 
 **Ports:**
 - `6102`: Maker network port for openswap protocol
@@ -197,8 +197,8 @@ Run taker operations:
 # Using the setup script
 ./docker-setup taker --help
 
-# Or manually
-docker run --rm -it \
+# Or manually; a new wallet shows its seed only without Docker logs
+docker run --rm -it --log-driver none -e OPENSWAP_SEED_LOG_FREE=1 \
   -v openswap-taker-data:/home/openswap/.openswap \
   --network host \
   openswap/openswap:latest taker --help
@@ -206,7 +206,7 @@ docker run --rm -it \
 
 ## Docker Compose Setup
 
-The setup script uses a standard `docker-compose.yml` with environment variables and profiles. For a complete setup with all services:
+The setup script uses a standard `docker-compose.yml` with environment variables and profiles. It needs Docker Compose v2.6.0 or later, which can read the wallet passphrase secret from the environment. For a complete setup with all services:
 
 ```bash
 # Start all services (Bitcoin Core, Tor, Makerd)

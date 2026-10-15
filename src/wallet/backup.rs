@@ -18,10 +18,6 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, str::FromStr};
 use zeroize::Zeroizing;
 
-/// The way back from a wallet file that cannot be used.
-pub const RESTORE_FROM_MNEMONIC_HINT: &str =
-    "restore the wallet from its seed phrase with `restore --mnemonic`";
-
 /// Shown before every restore, since no seed or backup holds open swap keys.
 pub const RESTORE_OPEN_SWAPS_WARNING: &str =
     "A restore cannot recover swaps still in progress (including Lightning swaps): \
@@ -317,7 +313,7 @@ impl Wallet {
 
     /// Creates the encrypted wallet before the scan, so owned restore secrets
     /// can be dropped before syncing.
-    pub(crate) fn restore_prepared(
+    fn restore_prepared(
         wallet_backup: &WalletBackup,
         wallet_path: &Path,
         backend_config: &BackendConfig,
@@ -449,7 +445,7 @@ impl Wallet {
         })
     }
 
-    /// Restores a `Wallet` from its BIP39 seed phrase, via `Wallet::restore_prepared`.
+    /// Restores a `Wallet` from its BIP39 seed phrase, via [`Wallet::restore_owned_with`].
     ///
     /// `options.birthday` is a floor on the Bitcoin Core rescan — `None` scans from
     /// genesis, and the effective start may be up to 2h of blocks later. Electrum

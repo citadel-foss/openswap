@@ -699,7 +699,7 @@ start_makerd() {
         fi
         print_info "Creating maker wallet; write down the seed shown in this terminal."
         docker compose -f docker-compose.yml -f docker/compose-init.yml run --rm --no-deps \
-            -e MAKER_INIT_ONLY=1 "$service"
+            -e MAKER_INIT_ONLY=1 "$service" || { print_error "Wallet creation failed"; exit 1; }
     fi
     
     if docker compose up -d; then
@@ -752,7 +752,9 @@ run_command() {
                 docker exec $tty openswap-bitcoind bitcoin-cli $BITCOIN_NETWORK_ARG "$@"
             fi
             ;;
-        *) docker run --rm $tty --network host "openswap/${IMAGE_NAME}:latest" "$cmd" "$@" ;;
+        # Attached runs may create a wallet; keep its seed out of Docker's logs.
+        *) docker run --rm $tty --log-driver none -e OPENSWAP_SEED_LOG_FREE=1 --network host \
+            "openswap/${IMAGE_NAME}:latest" "$cmd" "$@" ;;
     esac
 }
 

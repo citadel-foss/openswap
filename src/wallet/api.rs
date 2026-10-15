@@ -454,7 +454,9 @@ pub struct Balances {
 fn require_seed_terminal(docker: bool, terminal: bool, log_free: bool) -> Result<(), WalletError> {
     if docker && !(terminal && log_free) {
         return Err(WalletError::General(
-            "New Docker wallets need an interactive terminal with Docker logging disabled".into(),
+            "New Docker wallets need an interactive terminal with Docker logging disabled; \
+             run once with `docker run -it --log-driver none -e OPENSWAP_SEED_LOG_FREE=1`"
+                .into(),
         ));
     }
     Ok(())
