@@ -12,7 +12,7 @@ use openswap::wallet::{Blockchain, Electrum, ElectrumConfig};
 #[allow(dead_code)]
 pub(crate) fn init_electrsd(bitcoind: &BitcoinD, datadir: &std::path::Path) -> ElectrsD {
     let exe = electrsd::exe_path().expect(
-        "no electrs binary available: set ELECTRS_EXEC or enable the electrs_0_9_11 feature",
+        "no electrs binary available: run `export ELECTRS_EXEC=\"$(tests/install_electrs.sh)\"`",
     );
     let mut conf = electrsd::Conf::default();
     let electrs_dir = datadir.join("electrs");

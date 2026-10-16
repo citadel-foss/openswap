@@ -64,6 +64,9 @@ jobs:
       - name: Add nostr-rs-relay to PATH
         run: echo "$HOME/.nostr-relay-bin" >> "$GITHUB_PATH"
 
+      - name: Install electrs
+        uses: ./.github/actions/electrs
+
       - name: Run cargo-llvm-cov
         # Surface electrs stderr in a failing test's output, or a hung electrum
         # test leaves no evidence of what the server was doing. No
@@ -188,6 +191,9 @@ jobs:
 
       - name: Add nostr-rs-relay to PATH
         run: echo "$HOME/.nostr-relay-bin" >> "$GITHUB_PATH"
+
+      - name: Install electrs
+        uses: ./.github/actions/electrs
 
       # Ubuntu's tor package starts its own instance; stop it so ours owns the
       # ports and we control the control-port auth.
