@@ -20,7 +20,7 @@
 mod corerpc;
 mod electrum;
 
-pub use corerpc::{CoreRPC, CoreRpcConfig};
+pub use corerpc::{CoreRPC, CoreRpcConfig, MIN_CORE_VERSION};
 #[cfg(test)]
 pub(crate) use electrum::SCRIPT_CACHE_TTL;
 pub use electrum::{Electrum, ElectrumConfig, WATCHER_READ_TIMEOUT_DIRECT_SECS};

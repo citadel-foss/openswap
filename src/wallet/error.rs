@@ -96,6 +96,13 @@ pub enum WalletError {
         cap: u32,
     },
 
+    /// The Bitcoin Core node is older than the RPCs the wallet calls.
+    /// Retrying cannot help; the node must be upgraded.
+    UnsupportedNode {
+        /// The node's `getnetworkinfo` version, e.g. 230200 for 23.2.
+        version: u64,
+    },
+
     /// Represents an error related to protocol violations or unexpected protocol behavior.
     Protocol(ProtocolError),
 
@@ -284,6 +291,13 @@ impl std::fmt::Display for WalletError {
             WalletError::WatchWindowCap { window, cap } => write!(
                 f,
                 "watch window ends at index {window}, past the cap {cap}; if restoring, lower --address-gap"
+            ),
+            WalletError::UnsupportedNode { version } => write!(
+                f,
+                "Bitcoin Core {}.{} is too old; OpenSwap needs Bitcoin Core {}.0 or newer",
+                version / 10_000,
+                version / 100 % 100,
+                crate::wallet::MIN_CORE_VERSION / 10_000
             ),
             WalletError::Protocol(e) => write!(f, "Protocol error: {}", e),
             WalletError::Fidelity(e) => write!(f, "Fidelity error: {}", e),

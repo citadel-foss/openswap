@@ -8,8 +8,8 @@ use std::{
 };
 
 use bitcoin::{
-    address::NetworkUnchecked, block::Header, Address, Amount, Block, BlockHash, Network, OutPoint,
-    Script, Transaction, Txid,
+    address::NetworkUnchecked, block::Header, Address, Block, BlockHash, Network, OutPoint, Script,
+    Transaction, Txid,
 };
 use bitcoind::bitcoincore_rpc::{
     json::{
@@ -23,6 +23,11 @@ use serde_json::{json, Value};
 
 use super::{BlockRef, Blockchain, FeePriority, WatchEvent};
 use crate::{lock_debug, wallet::error::WalletError};
+
+/// Oldest Bitcoin Core the wallet runs against: `gettxspendingprevout`
+/// arrived in 24.0, after `listdescriptors` (22.0) and the
+/// `include_immature_coinbase` argument of `getreceivedbyaddress` (23.0).
+pub const MIN_CORE_VERSION: u64 = 240_000;
 
 /// Configuration for connecting to a Bitcoin Core node via JSON-RPC + ZMQ.
 #[derive(Debug, Clone)]
@@ -204,6 +209,20 @@ impl CoreRPC {
         Self::new(&self.config)
     }
 
+    /// Refuses a node too old for the RPCs the wallet calls. Without this, a
+    /// missing RPC surfaces as a sync error that is retried forever.
+    fn check_version(&self) -> Result<(), WalletError> {
+        #[derive(Deserialize)]
+        struct NetworkInfo {
+            version: u64,
+        }
+        let NetworkInfo { version } = self.rpc.call("getnetworkinfo", &[])?;
+        if version < MIN_CORE_VERSION {
+            return Err(WalletError::UnsupportedNode { version });
+        }
+        Ok(())
+    }
+
     /// Returns the active-chain height for a block received through ZMQ.
     pub(crate) fn block_height(&self, block_hash: &BlockHash) -> Result<u64, WalletError> {
         Ok(self.rpc.get_block_header_info(block_hash)?.height as u64)
@@ -281,6 +300,7 @@ impl CoreRPC {
     /// a missing txindex or a dead ZMQ feed only surfaces mid-swap — as a false
     /// rebroadcast failure or a silently blind watchtower.
     pub fn check_node_requirements(&self) -> Result<(), WalletError> {
+        self.check_version()?;
         // getindexinfo lists "txindex" only when the node runs -txindex=1.
         let indexes: Value = self.rpc.call("getindexinfo", &[])?;
         if indexes.get("txindex").is_none() {
@@ -463,8 +483,14 @@ impl Blockchain for CoreRPC {
             .map_err(|e| WalletError::General(e.to_string()))?;
         // The transaction list hides change outputs; the received total
         // still counts an address after it is emptied.
-        match self.rpc.get_received_by_address(&address, Some(0)) {
-            Ok(received) => Ok(received > Amount::ZERO),
+        // Immature coinbase counts too, or a fresh mining payout address would
+        // read as unused and be handed out again.
+        let received: Result<f64, _> = self.rpc.call(
+            "getreceivedbyaddress",
+            &[json!(address.to_string()), json!(0), json!(true)],
+        );
+        match received {
+            Ok(btc) => Ok(btc > 0.0),
             // -4: not imported yet. The gap loop imports the wider range and asks again.
             Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -4 => Ok(false),
             Err(e) => Err(e.into()),
@@ -483,29 +509,26 @@ impl Blockchain for CoreRPC {
     /// verbatim from the pre-refactor `Wallet::sync` Core bootstrap so behaviour
     /// is unchanged; only invoked on the Core sync path.
     fn prepare_backend_wallet(&self, wallet_name: &str) -> Result<(), WalletError> {
+        // Every Core sync starts here, including restores that skip the
+        // startup checks.
+        self.check_version()?;
         if self.rpc.list_wallets()?.contains(&wallet_name.to_string()) {
             log::debug!("wallet already loaded: {wallet_name}");
         } else if list_wallet_dir(&self.rpc)?.contains(&wallet_name.to_string()) {
             self.rpc.load_wallet(wallet_name)?;
             log::debug!("wallet loaded: {wallet_name}");
         } else {
-            // pre-0.21 uses legacy wallets
-            if self.rpc.version()? < 210_000 {
-                self.rpc
-                    .create_wallet(wallet_name, Some(true), None, None, None)?;
-            } else {
-                // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/issues/225 is
-                // still open, so we issue the call directly to request a descriptor wallet.
-                let args = [
-                    Value::String(wallet_name.to_string()),
-                    Value::Bool(true),  // Disable Private Keys
-                    Value::Bool(false), // Create a blank wallet
-                    Value::Null,        // Optional Passphrase
-                    Value::Bool(false), // Avoid Reuse
-                    Value::Bool(true),  // Descriptor Wallet
-                ];
-                let _: Value = self.rpc.call("createwallet", &args)?;
-            }
+            // https://github.com/rust-bitcoin/rust-bitcoincore-rpc/issues/225 is
+            // still open, so we issue the call directly to request a descriptor wallet.
+            let args = [
+                Value::String(wallet_name.to_string()),
+                Value::Bool(true),  // Disable Private Keys
+                Value::Bool(false), // Create a blank wallet
+                Value::Null,        // Optional Passphrase
+                Value::Bool(false), // Avoid Reuse
+                Value::Bool(true),  // Descriptor Wallet
+            ];
+            let _: Value = self.rpc.call("createwallet", &args)?;
             log::debug!("wallet created: {wallet_name}");
         }
         Ok(())
@@ -712,6 +735,9 @@ mod tests {
             ([20, 200], 100, false),
             ([0, 200], 100, true),
             ([0, 99], 100, false),
+            // Core lists `range_end - 1`, so the listed end is the last
+            // imported index and covers it.
+            ([0, 100], 100, true),
         ] {
             let (core, server) = mock_core(vec![
                 (
@@ -728,6 +754,22 @@ mod tests {
                 expected,
                 "range {range:?}, last index {last_index}"
             );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_node_older_than_24_is_refused() {
+        for (version, supported) in [(230_000, false), (240_000, true), (280_100, true)] {
+            let (core, server) = mock_core(vec![("getnetworkinfo", json!({ "version": version }))]);
+            match core.check_version() {
+                Ok(()) => assert!(supported, "{} must be refused", version),
+                Err(WalletError::UnsupportedNode { version: got }) => {
+                    assert!(!supported, "{} must be accepted", version);
+                    assert_eq!(got, version);
+                }
+                Err(e) => panic!("unexpected error for {}: {:?}", version, e),
+            }
             server.join().unwrap();
         }
     }

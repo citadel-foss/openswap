@@ -695,3 +695,124 @@ fn run_restore_v023<B: TestBackend>(node: &mut Node) {
     let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
     assert_restores_v023_wallet(&backend, &dir, node, &km);
 }
+
+/// The saved wallet's `last_synced_height` and `pending_restore`, read straight
+/// from the encrypted file.
+fn saved_sync_state(path: &Path, password: &str) -> (serde_cbor::Value, serde_cbor::Value) {
+    let (store, _) =
+        load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(path, Some(password.to_string()))
+            .unwrap();
+    let serde_cbor::Value::Map(fields) = store else {
+        panic!("wallet store is not a map");
+    };
+    let field = |name: &str| {
+        fields
+            .get(&serde_cbor::Value::Text(name.to_string()))
+            .cloned()
+            .unwrap_or(serde_cbor::Value::Null)
+    };
+    (field("last_synced_height"), field("pending_restore"))
+}
+
+/// A synced Core wallet saves its tip, so reloading it does not look like an
+/// unfinished restore and rerun the restore scan.
+#[world_test(backend = BitcoindBackend, keypool = 1)]
+fn core_sync_saves_its_tip(node: &mut Node) {
+    let path = node.temp_dir().join("wallets").join("core-tip");
+    let rpc_config = CoreRpcConfig {
+        wallet_name: "core-tip".to_string(),
+        ..node.rpc_config()
+    };
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    let mut wallet = Wallet::init(
+        &path,
+        AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap()),
+        km.clone(),
+    )
+    .unwrap();
+    let addr = wallet.get_next_external_address(AddressType::P2TR).unwrap();
+    send_and_mine(node.bitcoind(), &addr, 0.01, 1).unwrap();
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+
+    let (tip, pending) = saved_sync_state(&path, "integration-test");
+    assert!(
+        matches!(tip, serde_cbor::Value::Integer(height) if height > 0),
+        "a synced Core wallet must save its tip, got {:?}",
+        tip
+    );
+    assert_eq!(pending, serde_cbor::Value::Null);
+
+    // A finished restore must save its tip too.
+    let backup_file = node.temp_dir().join("wallets").join("core-tip-backup.json");
+    wallet.backup(&backup_file, km.clone()).unwrap();
+    let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
+        &backup_file,
+        Some("integration-test".to_string()),
+    )
+    .unwrap();
+    let restored = node.temp_dir().join("wallets").join("core-tip-restored");
+    Wallet::restore(
+        &backup,
+        &restored,
+        &BackendConfig::CoreRpc(rpc_config.clone()),
+        km,
+    )
+    .unwrap();
+    let (tip, pending) = saved_sync_state(&restored, "integration-test");
+    assert!(
+        matches!(tip, serde_cbor::Value::Integer(height) if height > 0),
+        "a restored Core wallet must save its tip, got {:?}",
+        tip
+    );
+    assert_eq!(pending, serde_cbor::Value::Null);
+}
+
+/// A fresh mining payout is immature coinbase: no spendable coin, and Core's
+/// received total skips it unless asked. The restore must still count the
+/// address as used and not hand it out again.
+#[world_test(backend = BitcoindBackend, keypool = 1)]
+fn core_restore_skips_an_immature_payout_address(node: &mut Node) {
+    let wallets = node.temp_dir().join("wallets");
+    let path = wallets.join("payout");
+    let rpc_config = CoreRpcConfig {
+        wallet_name: "payout".to_string(),
+        ..node.rpc_config()
+    };
+    let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
+    let mut wallet = Wallet::init(
+        &path,
+        AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap()),
+        km.clone(),
+    )
+    .unwrap();
+    let backup_file = wallets.join("payout-backup.json");
+    wallet.backup(&backup_file, km.clone()).unwrap();
+
+    let payout = wallet
+        .get_next_external_address(AddressType::P2WPKH)
+        .unwrap();
+    node.bitcoind()
+        .client
+        .generate_to_address(1, &payout)
+        .unwrap();
+    wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
+    assert_eq!(*wallet.get_external_index(), 1);
+
+    let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
+        &backup_file,
+        Some("integration-test".to_string()),
+    )
+    .unwrap();
+    let restored = Wallet::restore(
+        &backup,
+        &wallets.join("payout-restored"),
+        &BackendConfig::CoreRpc(rpc_config.clone()),
+        km,
+    )
+    .unwrap();
+    assert_eq!(
+        *restored.get_external_index(),
+        1,
+        "the payout address must not be handed out again"
+    );
+}

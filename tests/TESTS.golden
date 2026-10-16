@@ -215,6 +215,8 @@ openswap wallet::backup::tests::open_swaps_summary_counts_each_kind
 openswap wallet::backup::tests::restore_options_survive_the_wallet_file_format
 openswap wallet::backup::tests::restore_rejects_bad_options_before_touching_the_backend
 openswap wallet::backup::tests::restore_rejects_traversal_in_backup_file_name
+openswap wallet::backup::tests::seed_from_phrase_derives_the_same_master_key
+openswap wallet::blockchain::corerpc::tests::a_node_older_than_24_is_refused
 openswap wallet::blockchain::corerpc::tests::estimate_feerate_forwards_target_and_converts
 openswap wallet::blockchain::corerpc::tests::imported_range_covers_legacy_wallet_without_listdescriptors
 openswap wallet::blockchain::corerpc::tests::imported_range_covers_needs_the_range_to_start_at_zero
@@ -556,6 +558,8 @@ openswap::integration test_framework::logs::tests::each_fixture_gets_its_own_log
 openswap::integration test_framework::wait::tests::a_long_interval_does_not_sleep_past_the_timeout
 openswap::integration test_framework::wait::tests::fails_after_the_timeout_naming_what_it_waited_for
 openswap::integration test_framework::wait::tests::returns_the_first_value_the_check_yields
+openswap::integration wallet::backup::core_restore_skips_an_immature_payout_address
+openswap::integration wallet::backup::core_sync_saves_its_tip
 openswap::integration wallet::backup::encwallet_encbackup_encrestore
 openswap::integration wallet::backup::encwallet_encbackup_encrestore_electrum
 openswap::integration wallet::backup::ffi_restore_from_mnemonic_and_backup_funded

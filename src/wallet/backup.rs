@@ -18,10 +18,6 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, str::FromStr};
 use zeroize::Zeroizing;
 
-/// The way back from a wallet file that cannot be used.
-pub const RESTORE_FROM_MNEMONIC_HINT: &str =
-    "restore the wallet from its seed phrase with `restore --mnemonic`";
-
 /// Shown before every restore, since no seed or backup holds open swap keys.
 pub const RESTORE_OPEN_SWAPS_WARNING: &str =
     "A restore cannot recover swaps still in progress (including Lightning swaps): \
@@ -414,6 +410,33 @@ impl Wallet {
         options: RestoreOptions,
         restored_enc_material: KeyMaterial,
     ) -> Result<Wallet, WalletError> {
+        Wallet::restore_from_seed(
+            Wallet::seed_from_phrase(phrase)?,
+            wallet_path,
+            backend_config,
+            options,
+            restored_enc_material,
+        )
+    }
+
+    /// The BIP39 seed (empty passphrase) of `phrase`. The phrase and its parsed
+    /// words are wiped before this returns, so only the seed outlives it.
+    fn seed_from_phrase(phrase: Zeroizing<String>) -> Result<Zeroizing<[u8; 64]>, WalletError> {
+        // `Mnemonic` wipes its words on drop.
+        let mnemonic = Mnemonic::parse(phrase.as_str())?;
+        drop(phrase);
+        Ok(Zeroizing::new(mnemonic.to_seed("")))
+    }
+
+    /// [`Wallet::restore_from_mnemonic`] from an already derived seed, which is
+    /// wiped once the master key exists, before the chain scan.
+    fn restore_from_seed(
+        seed: Zeroizing<[u8; 64]>,
+        wallet_path: &Path,
+        backend_config: &BackendConfig,
+        options: RestoreOptions,
+        restored_enc_material: KeyMaterial,
+    ) -> Result<Wallet, WalletError> {
         // A phrase carries no wallet name, so the path must name the file.
         let file_name = match wallet_path.file_name().and_then(|name| name.to_str()) {
             Some(name) if !wallet_path.is_dir() => name.to_string(),
@@ -423,17 +446,12 @@ impl Wallet {
                 )))
             }
         };
-        let mut mnemonic = Mnemonic::parse(phrase.as_str())?;
-
         let network = Self::require_backend(&AnyBlockchain::from_config(backend_config)?)?.chain;
-        let master_key = Wallet::master_key_from_mnemonic(&mnemonic, network);
-        // Wipe the words as soon as the key exists, not after the chain scan.
-        zeroize::Zeroize::zeroize(&mut mnemonic);
-        drop(phrase);
-        let master_key = master_key?;
+        let master_key = Xpriv::new_master(network, seed.as_slice());
+        drop(seed);
         let backup = WalletBackup {
             network,
-            master_key,
+            master_key: master_key?,
             wallet_birthday: None,
             file_name,
             fidelity_bonds: Vec::new(),
@@ -556,7 +574,8 @@ impl Wallet {
             prompt_password("Enter seed phrase: ".to_string())
                 .map_err(|e| WalletError::General(format!("failed to read seed phrase: {e}")))?,
         );
-        Wallet::validate_mnemonic(&phrase)?;
+        // Checks the words, and keeps only the seed through the next prompt.
+        let seed = Wallet::seed_from_phrase(phrase)?;
         let restore_enc_material = KeyMaterial::new_interactive(Some(
             "Enter restored wallet encryption passphrase: ".to_string(),
         ))
@@ -570,13 +589,8 @@ impl Wallet {
         })?;
 
         let hints = options.bond_hints.clone();
-        let wallet = Wallet::restore_from_mnemonic(
-            phrase,
-            restored_path,
-            backend,
-            options,
-            restore_enc_material,
-        )?;
+        let wallet =
+            Wallet::restore_from_seed(seed, restored_path, backend, options, restore_enc_material)?;
         println!("Wallet restore succeeded!");
         wallet.print_restored_bonds(&hints);
         Ok(())
@@ -673,6 +687,23 @@ mod tests {
     };
     use bitcoind::tempfile::tempdir;
     use std::collections::BTreeMap;
+
+    /// The early-wiped seed must give the same master key the phrase always
+    /// did, or a restore would open a different wallet.
+    #[test]
+    fn seed_from_phrase_derives_the_same_master_key() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                      abandon abandon abandon about";
+        let mnemonic = Mnemonic::parse(phrase).unwrap();
+        let seed = Wallet::seed_from_phrase(Zeroizing::new(phrase.to_string())).unwrap();
+        for network in [Network::Bitcoin, Network::Signet, Network::Regtest] {
+            assert_eq!(
+                Xpriv::new_master(network, seed.as_slice()).unwrap(),
+                Wallet::master_key_from_mnemonic(&mnemonic, network).unwrap()
+            );
+        }
+        assert!(Wallet::seed_from_phrase(Zeroizing::new("not a seed phrase".to_string())).is_err());
+    }
 
     fn dummy_backup(file_name: &str) -> WalletBackup {
         let seed: [u8; 16] = thread_rng().gen();

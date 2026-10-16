@@ -4588,12 +4588,14 @@ impl Wallet {
         }
     }
 
-    /// Errors a retry cannot fix: shutdown, or a watch window past the cap,
-    /// which is fixed by the wallet's counters and gap.
+    /// Errors a retry cannot fix: shutdown, a watch window past the cap,
+    /// which is fixed by the wallet's counters and gap, or a node too old.
     fn sync_error_is_final(e: &WalletError) -> bool {
         matches!(
             e,
-            WalletError::Interrupted(_) | WalletError::WatchWindowCap { .. }
+            WalletError::Interrupted(_)
+                | WalletError::WatchWindowCap { .. }
+                | WalletError::UnsupportedNode { .. }
         )
     }
 
