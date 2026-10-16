@@ -284,13 +284,33 @@ impl CoreRPC {
         &self,
         outpoint: &OutPoint,
     ) -> Result<Option<Transaction>, WalletError> {
+        match self.mempool_spending_transaction(outpoint)? {
+            Some(tx) => Ok(Some(tx)),
+            None => self.mined_spending_transaction(outpoint),
+        }
+    }
+
+    /// The mempool transaction spending `outpoint`.
+    pub(crate) fn mempool_spending_transaction(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<Transaction>, WalletError> {
         let spends: Vec<SpendingPrevout> = self.rpc.call(
             "gettxspendingprevout",
             &[json!([{ "txid": outpoint.txid, "vout": outpoint.vout }])],
         )?;
-        if let Some(txid) = spends.first().and_then(|spend| spend.spendingtxid) {
-            return self.get_raw_transaction(&txid, None).map(Some);
+        match spends.first().and_then(|spend| spend.spendingtxid) {
+            Some(txid) => self.get_raw_transaction(&txid, None).map(Some),
+            None => Ok(None),
         }
+    }
+
+    /// The transaction spending `outpoint` in a block of the active chain,
+    /// found by scanning from the funding block.
+    pub(crate) fn mined_spending_transaction(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<Transaction>, WalletError> {
         if self
             .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))?
             .is_some()
