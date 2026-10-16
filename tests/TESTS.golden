@@ -220,6 +220,7 @@ openswap wallet::backup::tests::open_swaps_summary_counts_each_kind
 openswap wallet::backup::tests::restore_options_survive_the_wallet_file_format
 openswap wallet::backup::tests::restore_rejects_bad_options_before_touching_the_backend
 openswap wallet::backup::tests::restore_rejects_traversal_in_backup_file_name
+openswap wallet::blockchain::corerpc::tests::backup_refuses_core_before_v22_without_a_backup_file
 openswap wallet::blockchain::corerpc::tests::estimate_feerate_forwards_target_and_converts
 openswap wallet::blockchain::corerpc::tests::imported_range_covers_legacy_wallet_without_listdescriptors
 openswap wallet::blockchain::corerpc::tests::imported_range_covers_needs_the_range_to_start_at_zero

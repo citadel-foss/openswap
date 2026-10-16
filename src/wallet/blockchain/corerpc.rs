@@ -654,7 +654,7 @@ mod tests {
     use super::*;
     use crate::{
         security::KeyMaterial,
-        wallet::{BackendConfig, Wallet},
+        wallet::{api::test_support::test_wallet, AnyBlockchain, BackendConfig, Wallet},
     };
     use zeroize::Zeroizing;
 
@@ -755,19 +755,24 @@ mod tests {
         assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
     }
 
-    /// The restore's backend probe refuses Core 0.21, so no wallet file is left.
-    #[test]
-    fn restore_refuses_core_before_v22_without_a_wallet_file() {
+    /// A Core 0.21 node answering only the backup/restore backend probe.
+    fn mock_core_v21() -> (CoreRPC, thread::JoinHandle<Vec<String>>) {
         let info = json!({ "chain": "regtest", "blocks": 0, "headers": 0,
             "bestblockhash": "0".repeat(64), "difficulty": 0.0,
             "mediantime": 0, "verificationprogress": 1.0, "initialblockdownload": false,
             "chainwork": "00", "size_on_disk": 0, "pruned": false, "warnings": "" });
-        let (core, server) = mock_core(vec![
+        mock_core(vec![
             ("getblockchaininfo", info),
             // Asked once by `get_blockchain_info` itself, once by the v22 gate.
             ("getnetworkinfo", json!({ "version": 210100 })),
             ("getnetworkinfo", json!({ "version": 210100 })),
-        ]);
+        ])
+    }
+
+    /// The restore's backend probe refuses Core 0.21, so no wallet file is left.
+    #[test]
+    fn restore_refuses_core_before_v22_without_a_wallet_file() {
+        let (core, server) = mock_core_v21();
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let path = dir.path().join("w");
         let err = Wallet::restore_from_mnemonic(
@@ -778,6 +783,25 @@ mod tests {
             KeyMaterial::new_ephemeral(),
         )
         .expect_err("Core 0.21 must be refused");
+        assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
+        assert!(!path.exists());
+        assert_eq!(
+            server.join().unwrap(),
+            ["getblockchaininfo", "getnetworkinfo", "getnetworkinfo"]
+        );
+    }
+
+    /// The backup's backend probe refuses Core 0.21, so no backup file is left.
+    #[test]
+    fn backup_refuses_core_before_v22_without_a_backup_file() {
+        let (core, server) = mock_core_v21();
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("w"));
+        wallet.blockchain = AnyBlockchain::CoreRPC(core);
+        let path = dir.path().join("backup.json");
+        let err = wallet
+            .backup(&path, KeyMaterial::new_ephemeral())
+            .expect_err("Core 0.21 must be refused");
         assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
         assert!(!path.exists());
         assert_eq!(
