@@ -602,7 +602,7 @@ impl<R: Role> Watcher<R> {
             match reconcile_watch(core, registry, watch) {
                 Ok(true) => false,
                 Ok(false) => {
-                    log::info!("Core cannot yet tell whether {outpoint} was spent, will re-check");
+                    log::info!("Core cannot fully answer for {outpoint} yet, will re-check");
                     stopped = true;
                     true
                 }
@@ -745,43 +745,46 @@ fn reconcile_watch(
         .spent_tx
         .as_ref()
         .map(|tx| (tx.compute_txid(), watch.in_block));
-    if let Some((txid, true)) = recorded {
-        // Still confirmed, unless a reorg replaced its block and the
-        // notifications that would have undone the record were lost.
+    if let Some((txid, in_block)) = recorded {
         match core.tx_confirmations(&txid)? {
-            Some(confirmations) if confirmations > 0 => return Ok(true),
-            // A syncing txindex cannot find a mined spend, which proves
-            // nothing: keep the confirmed mark and ask again later.
+            // Still confirmed, unless a reorg replaced its block and the
+            // notifications that would have undone the record were lost.
+            Some(confirmations) if confirmations > 0 && in_block => return Ok(true),
+            // A syncing txindex cannot find every mined transaction, which
+            // proves nothing: keep the record as it is and ask again later.
             None if !core.txindex_synced()? => return Ok(false),
             _ => {}
         }
-        log::warn!(
-            "Core does not report recorded spend {txid} of {outpoint} as confirmed, re-checking"
-        );
-        // Only the confirmed mark goes, so a spend found below can replace
-        // the record. The transaction stays: it may carry the only copy of a
-        // preimage.
-        registry.upsert_watch(&WatchRequest {
-            in_block: false,
-            ..watch.clone()
-        })?;
-        recorded = Some((txid, false));
-    }
-    match lookup_spend(core, &outpoint)? {
-        Spend::Found(tx, in_block) => {
-            // Most re-checks only confirm a spend already on record.
-            if recorded != Some((tx.compute_txid(), in_block)) {
-                log::warn!(
-                    "recovered missed spend of {outpoint}: {} (confirmed={in_block})",
-                    tx.compute_txid()
-                );
-            }
-            process_transaction(&tx, registry, in_block)?;
-            Ok(true)
+        if in_block {
+            log::warn!(
+                "Core does not report recorded spend {txid} of {outpoint} as confirmed, re-checking"
+            );
+            // Only the confirmed mark goes, so a spend found below can replace
+            // the record. The transaction stays: it may carry the only copy of
+            // a preimage.
+            registry.upsert_watch(&WatchRequest {
+                in_block: false,
+                ..watch.clone()
+            })?;
+            recorded = Some((txid, false));
         }
-        Spend::None => Ok(true),
-        Spend::Unknown => Ok(false),
     }
+    let (tx, in_block, settled) = match lookup_spend(core, &outpoint)? {
+        Spend::Found(tx, in_block) => (tx, in_block, true),
+        // Recorded now for its preimage, marked confirmed on a later pass.
+        Spend::FoundUnindexed(tx) => (tx, false, false),
+        Spend::None => return Ok(true),
+        Spend::Unknown => return Ok(false),
+    };
+    // Most re-checks only confirm a spend already on record.
+    if recorded != Some((tx.compute_txid(), in_block)) {
+        log::warn!(
+            "recovered missed spend of {outpoint}: {} (confirmed={in_block})",
+            tx.compute_txid()
+        );
+    }
+    process_transaction(&tx, registry, in_block)?;
+    Ok(settled)
 }
 
 /// What Core can say about the spend of a watched outpoint.
@@ -790,6 +793,9 @@ enum Spend {
     /// confirmed spend may carry the only copy of a preimage, and only a
     /// confirmed record is protected from mempool rivals.
     Found(Transaction, bool),
+    /// A spending transaction the block scan found in a block the syncing
+    /// txindex has not reached, so Core cannot report its confirmations yet.
+    FoundUnindexed(Transaction),
     /// No spend exists.
     None,
     /// Core cannot tell yet.
@@ -802,10 +808,11 @@ enum Spend {
 /// exist. The second case covers contracts that were never broadcast.
 fn lookup_spend(core: &CoreRPC, outpoint: &OutPoint) -> Result<Spend, WatcherError> {
     if let Some(tx) = core.spending_transaction(outpoint)? {
-        let mined = core
-            .tx_confirmations(&tx.compute_txid())?
-            .is_some_and(|c| c > 0);
-        return Ok(Spend::Found(tx, mined));
+        return Ok(match core.tx_confirmations(&tx.compute_txid())? {
+            Some(confirmations) => Spend::Found(tx, confirmations > 0),
+            None if !core.txindex_synced()? => Spend::FoundUnindexed(tx),
+            None => Spend::Found(tx, false),
+        });
     }
     if core
         .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))?
@@ -1189,6 +1196,8 @@ mod tests {
         /// Transactions Core still indexes under a block a reorg replaced.
         reorged_out: Vec<Transaction>,
         txindex_syncing: bool,
+        /// While syncing, the txindex holds only blocks below this height.
+        indexed_below: usize,
     }
 
     impl Node {
@@ -1220,14 +1229,21 @@ mod tests {
             if let Some(tx) = self.mempool.iter().find(|tx| tx.compute_txid() == txid) {
                 return Some((tx, None));
             }
-            if self.txindex_syncing {
-                return None;
-            }
-            for (height, block) in self.chain.iter().enumerate() {
+            // The txindex fills in height order, so while it syncs it holds
+            // only the lower blocks.
+            let indexed = if self.txindex_syncing {
+                self.indexed_below.min(self.chain.len())
+            } else {
+                self.chain.len()
+            };
+            for (height, block) in self.chain[..indexed].iter().enumerate() {
                 if let Some(tx) = block.txdata.iter().find(|tx| tx.compute_txid() == txid) {
                     let confirmations = self.tip() - height as u64 + 1;
                     return Some((tx, Some((block.block_hash(), confirmations))));
                 }
+            }
+            if self.txindex_syncing {
+                return None;
             }
             // Core reports a transaction whose block was reorged out with 0
             // confirmations, under the stale block's hash.
@@ -1743,6 +1759,55 @@ mod tests {
         assert_eq!(recorded_spend(&watcher, outpoint), Some(mined));
         assert!(is_recorded_confirmed(&watcher, outpoint));
         assert_eq!(watcher.pending_reconcile, [outpoint]);
+    }
+
+    /// A syncing txindex can hold the funding block but not the spender's, so
+    /// the block scan finds a mined spend whose confirmations Core cannot
+    /// report yet. The spend is recorded at once, and the watch stays queued
+    /// without scanning again until it can be marked confirmed.
+    #[test]
+    fn spend_found_ahead_of_the_txindex_is_confirmed_once_indexed() {
+        let funding = spend(OutPoint::new(Txid::from_byte_array([9; 32]), 0));
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let mined = spend(outpoint);
+        let node = Arc::new(Mutex::new(Node::default()));
+        {
+            let mut node = node.lock().unwrap();
+            node.mine(Vec::new());
+            node.mine(vec![funding]);
+            node.mine(vec![mined.clone()]);
+            node.txindex_syncing = true;
+            node.indexed_below = 2;
+        }
+        let (url, calls) = mock_node(&node);
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        watcher.handle_command(WatcherCommand::RegisterWatchRequest {
+            outpoint,
+            script_pubkey: ScriptBuf::new(),
+        });
+
+        watcher.handle_event(WatchEvent::Missed);
+        watcher.retry_pending_work();
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(mined.clone()));
+        assert!(!is_recorded_confirmed(&watcher, outpoint));
+        assert_eq!(watcher.pending_reconcile, [outpoint]);
+
+        let scanned = calls.lock().unwrap().len();
+        watcher.retry_pending_work();
+        assert!(
+            !calls.lock().unwrap()[scanned..].contains(&"getblock".to_string()),
+            "a pass during the sync must not scan blocks again"
+        );
+        assert_eq!(watcher.pending_reconcile, [outpoint]);
+
+        node.lock().unwrap().txindex_syncing = false;
+        watcher.retry_pending_work();
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(mined));
+        assert!(is_recorded_confirmed(&watcher, outpoint));
+        assert!(watcher.pending_reconcile.is_empty());
     }
 
     /// The spend is mined and gone from the mempool, but Core's txindex is
