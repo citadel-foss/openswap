@@ -247,6 +247,9 @@ fn main() -> Result<(), MakerError> {
     config.write_to_file(&config_path)?;
 
     let wallet_path = config.data_dir.join("wallets").join(&config.wallet_name);
+    // Held until exit, so `show-seed` and `attach-seed` don't write under us.
+    let _wallet_in_use = seed_cli::WalletInUse::shared(&wallet_path)
+        .map_err(|_| MakerError::General("could not lock the wallet file"))?;
     Wallet::init_interactive(
         &wallet_path,
         &config.backend,

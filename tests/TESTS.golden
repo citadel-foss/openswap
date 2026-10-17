@@ -316,8 +316,10 @@ openswap wallet::seed::tests::offline_open_reads_the_seed_without_writing
 openswap wallet::seed::tests::seal_checks_the_key_for_every_phrase_length
 openswap wallet::seed::tests::words_are_sized_once
 openswap wallet::seed_cli::tests::answers_match_the_exact_word_only
+openswap wallet::seed_cli::tests::in_use_sentinel_sits_next_to_the_wallet_file
 openswap wallet::seed_cli::tests::quiz_never_asks_for_more_words_than_exist
 openswap wallet::seed_cli::tests::quiz_positions_are_distinct_sorted_and_in_range
+openswap wallet::seed_cli::tests::seed_commands_write_only_when_no_process_runs_on_the_wallet
 openswap wallet::spend::tests::exact_spend_refuses_a_fee_below_the_real_size
 openswap wallet::spend::tests::exact_spend_refuses_dust_change
 openswap wallet::spend::tests::exact_spend_refuses_inputs_below_the_spend
