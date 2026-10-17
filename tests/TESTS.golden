@@ -312,6 +312,7 @@ openswap wallet::spend::tests::exact_spend_with_no_change
 openswap wallet::spend::tests::exact_spend_with_the_smallest_change
 openswap wallet::storage::tests::encrypted_wallet_without_password_says_password_required
 openswap wallet::storage::tests::failed_first_write_leaves_no_wallet_file
+openswap wallet::storage::tests::maker_swap_debug_redacts_the_preimage
 openswap wallet::storage::tests::reads_encrypted_wallet_when_password_is_supplied
 openswap wallet::storage::tests::sealed_master_key_roundtrips
 openswap wallet::storage::tests::sealed_master_key_survives_encrypted_store_roundtrip

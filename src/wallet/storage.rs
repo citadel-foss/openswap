@@ -342,7 +342,7 @@ pub enum LnMakerPhase {
 /// still reach the money. Without it a restarted swap-in maker cannot sweep
 /// the HTLC it already paid for, and a restarted swap-out maker cannot
 /// refund the HTLC it already funded.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct LnMakerSwapRecord {
     /// Direction of the swap.
     pub direction: LnMakerDirection,
@@ -392,6 +392,27 @@ pub struct LnMakerSwapRecord {
     /// taker's CSV refund window starts. Swap-out: the chain tip when the
     /// maker broadcast its funding.
     pub funding_height: Option<u32>,
+}
+
+/// Redacted like [`LnPendingSwap`]: `Wallet` formats its store.
+impl std::fmt::Debug for LnMakerSwapRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LnMakerSwapRecord")
+            .field("direction", &self.direction)
+            .field("phase", &self.phase)
+            .field("payment_hash", &self.payment_hash)
+            .field("amount", &self.amount)
+            .field("fee", &self.fee)
+            .field("locktime", &self.locktime)
+            .field("min_confirmations", &self.min_confirmations)
+            .field("preimage", &self.preimage.map(|_| "<redacted>"))
+            .field("refund_txid", &self.refund_txid)
+            .field("accepted_height", &self.accepted_height)
+            .field("funding_outpoint", &self.funding_outpoint)
+            .field("funding_value", &self.funding_value)
+            .field("funding_height", &self.funding_height)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Taker-side recovery record for a Lightning submarine swap.
@@ -589,6 +610,11 @@ mod tests {
     use super::*;
     use crate::security::{is_encrypted_cbor, SecurityError};
     use bip39::rand::{thread_rng, Rng};
+    use bitcoin::{
+        hashes::{sha256, Hash},
+        secp256k1::SecretKey,
+        Amount,
+    };
     use bitcoind::tempfile::tempdir;
 
     #[test]
@@ -678,6 +704,33 @@ mod tests {
         let debug = format!("{read:?}");
         assert!(debug.contains("sealed_mnemonic: Some(SealedSecret(<sealed>))"));
         assert!(!debug.contains(&mnemonic.to_string()));
+    }
+
+    #[test]
+    fn maker_swap_debug_redacts_the_preimage() {
+        let preimage = [0xab; 32];
+        let record = LnMakerSwapRecord {
+            direction: LnMakerDirection::SwapIn,
+            phase: LnMakerPhase::InPaid,
+            payment_hash: sha256::Hash::hash(&preimage),
+            amount: Amount::from_sat(50_000),
+            fee: Amount::from_sat(500),
+            locktime: 144,
+            min_confirmations: 1,
+            redeemscript: ScriptBuf::new(),
+            privkey: SecretKey::from_slice(&[1; 32]).unwrap(),
+            invoice: String::new(),
+            preimage: Some(preimage),
+            refund_txid: None,
+            accepted_height: None,
+            payout_script: None,
+            funding_outpoint: None,
+            funding_value: None,
+            funding_height: None,
+        };
+        let debug = format!("{record:?}");
+        assert!(debug.contains("preimage: Some(\"<redacted>\")"));
+        assert!(!debug.contains("171"), "a preimage byte leaked: {}", debug);
     }
 
     #[test]
