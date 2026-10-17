@@ -7,7 +7,7 @@
 //! allowing seamless support for both encrypted and unencrypted files.
 
 use aes_gcm::{
-    aead::{Aead, OsRng},
+    aead::{Aead, OsRng, Payload},
     AeadCore, Aes256Gcm, Key, KeyInit,
 };
 use bip39::rand::random;
@@ -287,6 +287,100 @@ pub struct EncryptedData {
     pbkdf2_salt: PBKDF2Salt,
 }
 
+/// The only [`EncryptedDataV2`] version this build reads and writes.
+const ENCRYPTED_DATA_VERSION: u32 = 2;
+
+/// Version 2 container. It has no `encrypted_payload`, so older readers refuse
+/// it instead of loading it and saving back a copy without the fields they
+/// don't know. `version` and `requires` are cleartext, bound to the ciphertext.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EncryptedDataV2 {
+    version: u32,
+    /// Features a reader must support before it may open the file.
+    requires: Vec<String>,
+    nonce: EncryptionNonce,
+    pbkdf2_salt: PBKDF2Salt,
+    ciphertext: Vec<u8>,
+}
+
+/// Reads just the version, so a newer container is refused whatever its shape.
+#[derive(Deserialize)]
+struct ContainerVersion {
+    version: u32,
+}
+
+/// The cleartext header as authenticated data: editing it fails decryption.
+fn header_aad(version: u32, requires: &[String]) -> Result<Vec<u8>, serde_cbor::Error> {
+    serde_cbor::to_vec(&(version, requires))
+}
+
+/// Settings of the key that sealed a [`SealedSecret`], stored next to it.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+enum Kdf {
+    Pbkdf2Sha256 { iterations: u32, salt: PBKDF2Salt },
+}
+
+/// A secret sealed under its own key, derived from the password on every call
+/// and never kept. Holding the unlocked wallet is not enough to open it.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct SealedSecret {
+    kdf: Kdf,
+    nonce: EncryptionNonce,
+    ciphertext: Vec<u8>,
+}
+
+/// Redacted: nothing about the sealed secret belongs in logs.
+impl std::fmt::Debug for SealedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SealedSecret(<sealed>)")
+    }
+}
+
+impl SealedSecret {
+    /// Seals `secret` under a key derived from `password` with a fresh salt.
+    pub fn seal<T: Serialize>(secret: &T, password: &str) -> Result<Self, EncryptError> {
+        let salt = random::<PBKDF2Salt>();
+        let key = Zeroizing::new(pbkdf2_hmac_array::<Sha256, 32>(
+            password.as_bytes(),
+            &salt,
+            PBKDF2_ITERATIONS,
+        ));
+        let (nonce, ciphertext) = seal_cbor(secret, &key, &[])?;
+        Ok(Self {
+            kdf: Kdf::Pbkdf2Sha256 {
+                iterations: PBKDF2_ITERATIONS,
+                salt,
+            },
+            nonce,
+            ciphertext,
+        })
+    }
+
+    /// Opens the secret with `password`. A wrong password fails authentication.
+    pub fn open<T: DeserializeOwned>(&self, password: &str) -> Result<T, SecurityError> {
+        let Kdf::Pbkdf2Sha256 { iterations, salt } = &self.kdf;
+        // Above our own count a hand-edited file could stall the process.
+        if !(1..=PBKDF2_ITERATIONS).contains(iterations) {
+            return Err(SecurityError::Format(format!(
+                "sealed secret uses {iterations} PBKDF2 iterations; this build accepts 1 to {PBKDF2_ITERATIONS}"
+            )));
+        }
+        let key = Zeroizing::new(pbkdf2_hmac_array::<Sha256, 32>(
+            password.as_bytes(),
+            salt,
+            *iterations,
+        ));
+        open_cbor(&self.nonce, &self.ciphertext, &key, &[])
+    }
+}
+
+/// Whether CBOR `content` is an encrypted container of any version.
+pub fn is_encrypted_cbor(content: &[u8]) -> bool {
+    serde_cbor::from_slice::<ContainerVersion>(content).is_ok()
+        || serde_cbor::from_slice::<EncryptedData>(content).is_ok()
+}
+
 /// Counts the bytes written to it, to size a buffer before filling it.
 struct ByteCount(usize);
 
@@ -318,32 +412,77 @@ pub fn encrypt_struct<T: Serialize>(
     plain_struct: T,
     enc_material: &KeyMaterial,
 ) -> Result<EncryptedData, EncryptError> {
-    // Serialize wallet data to bytes. `Zeroizing` wipes the plaintext buffer
-    // on drop, and sizing it first means no growth frees an unwiped copy.
+    let (nonce, encrypted_payload) = seal_cbor(&plain_struct, &enc_material.key, &[])?;
+    Ok(EncryptedData {
+        nonce,
+        encrypted_payload,
+        pbkdf2_salt: enc_material.pbkdf2_salt,
+    })
+}
+
+/// Like [`encrypt_struct`], but writes the version 2 container.
+pub fn encrypt_struct_v2<T: Serialize>(
+    plain_struct: &T,
+    enc_material: &KeyMaterial,
+) -> Result<EncryptedDataV2, EncryptError> {
+    let requires = Vec::new();
+    let aad = header_aad(ENCRYPTED_DATA_VERSION, &requires)?;
+    let (nonce, ciphertext) = seal_cbor(plain_struct, &enc_material.key, &aad)?;
+    Ok(EncryptedDataV2 {
+        version: ENCRYPTED_DATA_VERSION,
+        requires,
+        nonce,
+        pbkdf2_salt: enc_material.pbkdf2_salt,
+        ciphertext,
+    })
+}
+
+/// CBOR-encodes `plain` and encrypts it with AES-256-GCM under a fresh nonce.
+fn seal_cbor<T: Serialize>(
+    plain: &T,
+    key: &EncryptionKey,
+    aad: &[u8],
+) -> Result<(EncryptionNonce, Vec<u8>), EncryptError> {
+    // `Zeroizing` wipes the plaintext buffer on drop, and sizing it first
+    // means no growth frees an unwiped copy.
     let mut size = ByteCount(0);
-    serde_cbor::to_writer(&mut size, &plain_struct)?;
-    let mut packed_store = Zeroizing::new(Vec::with_capacity(size.0));
-    serde_cbor::to_writer(&mut *packed_store, &plain_struct)?;
+    serde_cbor::to_writer(&mut size, plain)?;
+    let mut packed = Zeroizing::new(Vec::with_capacity(size.0));
+    serde_cbor::to_writer(&mut *packed, plain)?;
 
     // QA: AES-GCM nonce reuse across wallet saves or backup restoration leaks
     // relationships between plaintexts encrypted under the same key.
-    let material_nonce = Aes256Gcm::generate_nonce(&mut OsRng).into();
-    let pbkdf2_salt = enc_material.pbkdf2_salt;
-    let nonce = aes_gcm::Nonce::from(material_nonce);
-    let key = Key::<Aes256Gcm>::from(enc_material.key);
+    let nonce: EncryptionNonce = Aes256Gcm::generate_nonce(&mut OsRng).into();
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*key));
+    let payload = Payload {
+        msg: packed.as_ref(),
+        aad,
+    };
+    let ciphertext = cipher.encrypt(&aes_gcm::Nonce::from(nonce), payload)?;
+    Ok((nonce, ciphertext))
+}
 
-    // Create AES-GCM cipher instance.
-    let cipher = Aes256Gcm::new(&key);
-
-    // Encrypt the serialized wallet bytes.
-    let encrypted_payload = cipher.encrypt(&nonce, packed_store.as_ref())?;
-
-    // Package encrypted data with nonce for storage.
-    Ok(EncryptedData {
-        nonce: material_nonce,
-        encrypted_payload,
-        pbkdf2_salt,
-    })
+/// Reverses [`seal_cbor`]. Fails on a wrong key or edited `aad`.
+fn open_cbor<T: DeserializeOwned>(
+    nonce: &EncryptionNonce,
+    ciphertext: &[u8],
+    key: &EncryptionKey,
+    aad: &[u8],
+) -> Result<T, SecurityError> {
+    let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*key));
+    let payload = Payload {
+        msg: ciphertext,
+        aad,
+    };
+    // `Zeroizing` wipes the plaintext buffer on drop so no serialized copy of
+    // the secret survives in freed heap.
+    let plaintext_cbor = Zeroizing::new(
+        cipher
+            .decrypt(&aes_gcm::Nonce::from(*nonce), payload)
+            .map_err(|_| SecurityError::Decryption)?,
+    );
+    // Borrows the `Zeroizing` buffer, so no un-wiped copy is made.
+    Ok(utill::deserialize_from_cbor::<T>(&plaintext_cbor)?)
 }
 
 /// Decrypts an [`EncryptedData`] struct and deserializes the inner struct.
@@ -357,26 +496,12 @@ pub fn decrypt_struct<T: DeserializeOwned>(
     encrypted_struct: EncryptedData,
     enc_material: &KeyMaterial,
 ) -> Result<T, SecurityError> {
-    // Deserialize the outer EncryptedWalletStore wrapper.
-
-    let nonce_vec = encrypted_struct.nonce;
-
-    // Reconstruct AES-GCM cipher from the provided key and stored nonce.
-    let key = Key::<Aes256Gcm>::from(enc_material.key);
-    let cipher = Aes256Gcm::new(&key);
-    let nonce = aes_gcm::Nonce::from(nonce_vec);
-
-    // Decrypt the inner CBOR bytes. `Zeroizing` wipes the plaintext buffer on
-    // drop so no serialized copy of the secret survives in freed heap.
-    let plaintext_cbor = Zeroizing::new(
-        cipher
-            .decrypt(&nonce, encrypted_struct.encrypted_payload.as_ref())
-            .map_err(|_| SecurityError::Decryption)?,
-    );
-
-    // Deserialize the inner CBOR into the original type (borrows the
-    // `Zeroizing` buffer, so no un-wiped copy is made).
-    Ok(utill::deserialize_from_cbor::<T>(&plaintext_cbor)?)
+    open_cbor(
+        &encrypted_struct.nonce,
+        &encrypted_struct.encrypted_payload,
+        &enc_material.key,
+        &[],
+    )
 }
 /// Loads a sensitive struct from a file, supporting both encrypted and plaintext formats.
 ///
@@ -388,6 +513,9 @@ pub fn decrypt_struct<T: DeserializeOwned>(
 /// 2. **Encrypted:** If that fails, attempts to deserialize as [`EncryptedData`].
 ///    If no password was supplied, returns [`SecurityError::PasswordRequired`]
 ///    so the caller can obtain one (e.g. by prompting the user) and retry.
+///
+/// A versioned [`EncryptedDataV2`] file is recognised first and always needs a
+/// password; unknown versions or required features are refused.
 ///
 /// The deserialization format (CBOR or JSON) is defined by the [`SerdeFormat`] trait
 /// implementation passed via the type parameter `F`.
@@ -402,6 +530,10 @@ pub fn load_sensitive_struct<T: DeserializeOwned, F: SerdeFormat>(
     let content = Zeroizing::new(fs::read(file)?);
 
     let password = password.map(Zeroizing::new);
+    // Checked before the plaintext attempt: a versioned file is never plaintext.
+    if let Ok(ContainerVersion { version }) = F::from_slice::<ContainerVersion>(&content) {
+        return decrypt_v2::<T, F>(&content, file, version, password);
+    }
     let password = match password {
         Some(mut encryption_password) if !encryption_password.is_empty() => {
             let encrypted_struct = F::from_slice::<EncryptedData>(&content).map_err(|err| {
@@ -450,9 +582,162 @@ pub fn load_sensitive_struct<T: DeserializeOwned, F: SerdeFormat>(
     Ok((sensitive_struct, encryption_material))
 }
 
+/// Opens a versioned container, refusing versions and features this build lacks.
+fn decrypt_v2<T: DeserializeOwned, F: SerdeFormat>(
+    content: &[u8],
+    file: &Path,
+    version: u32,
+    password: Option<Zeroizing<String>>,
+) -> Result<(T, Option<KeyMaterial>), SecurityError> {
+    if version != ENCRYPTED_DATA_VERSION {
+        return Err(SecurityError::Format(format!(
+            "{file:?} has format version {version}; this build reads version \
+             {ENCRYPTED_DATA_VERSION}, so it may need a newer openswap"
+        )));
+    }
+    let data = F::from_slice::<EncryptedDataV2>(content)
+        .map_err(|err| SecurityError::Format(format!("invalid encrypted file {file:?}: {err}")))?;
+    if !data.requires.is_empty() {
+        return Err(SecurityError::Format(format!(
+            "{file:?} needs features this build lacks: {:?}",
+            data.requires
+        )));
+    }
+    let Some(mut password) = password.filter(|p| !p.is_empty()) else {
+        return Err(SecurityError::PasswordRequired);
+    };
+    let enc_material =
+        KeyMaterial::existing(std::mem::take(&mut *password), data.nonce, data.pbkdf2_salt);
+    let aad = header_aad(data.version, &data.requires)?;
+    let decrypted = open_cbor(&data.nonce, &data.ciphertext, &enc_material.key, &aad)?;
+    Ok((decrypted, Some(enc_material)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoind::tempfile::tempdir;
+
+    #[test]
+    fn v2_container_is_refused_by_old_readers() {
+        let material = KeyMaterial::new_from_password(Some("test password".to_string())).unwrap();
+        let v2 =
+            serde_cbor::to_vec(&encrypt_struct_v2(&"wallet state", &material).unwrap()).unwrap();
+        let v1 = serde_cbor::to_vec(&encrypt_struct("wallet state", &material).unwrap()).unwrap();
+
+        // Older builds parse wallet files only as `EncryptedData`.
+        assert!(serde_cbor::from_slice::<EncryptedData>(&v2).is_err());
+        assert!(is_encrypted_cbor(&v2));
+        assert!(is_encrypted_cbor(&v1));
+        assert!(!is_encrypted_cbor(
+            &serde_cbor::to_vec(&"wallet state").unwrap()
+        ));
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        for bytes in [&v1, &v2] {
+            fs::write(&path, bytes).unwrap();
+            let (read, read_material) =
+                load_sensitive_struct::<String, SerdeCbor>(&path, Some("test password".into()))
+                    .unwrap();
+            assert_eq!(read, "wallet state");
+            assert_eq!(read_material.unwrap().key, material.key);
+        }
+        let wrong = load_sensitive_struct::<String, SerdeCbor>(&path, Some("wrong".into()));
+        assert!(matches!(wrong, Err(SecurityError::Decryption)));
+        for password in [None, Some(String::new())] {
+            let missing = load_sensitive_struct::<String, SerdeCbor>(&path, password);
+            assert!(matches!(missing, Err(SecurityError::PasswordRequired)));
+        }
+    }
+
+    #[test]
+    fn v2_container_refuses_unknown_versions_and_edited_headers() {
+        let material = KeyMaterial::new_from_password(Some("test password".to_string())).unwrap();
+        let data = encrypt_struct_v2(&"wallet state", &material).unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let load = |data: &EncryptedDataV2| {
+            fs::write(&path, serde_cbor::to_vec(data).unwrap()).unwrap();
+            load_sensitive_struct::<String, SerdeCbor>(&path, Some("test password".into()))
+        };
+
+        let newer = EncryptedDataV2 {
+            version: 3,
+            ..data.clone()
+        };
+        assert!(matches!(load(&newer), Err(SecurityError::Format(e)) if e.contains("version 3")));
+        // A newer layout is refused by its version alone, whatever else it holds.
+        fs::write(
+            &path,
+            serde_cbor::to_vec(&ContainerVersionOnly { version: 3 }).unwrap(),
+        )
+        .unwrap();
+        let shapeless = load_sensitive_struct::<String, SerdeCbor>(&path, Some("x".into()));
+        assert!(matches!(shapeless, Err(SecurityError::Format(e)) if e.contains("version 3")));
+
+        let needs_more = EncryptedDataV2 {
+            requires: vec!["future-feature".to_string()],
+            ..data.clone()
+        };
+        assert!(
+            matches!(load(&needs_more), Err(SecurityError::Format(e)) if e.contains("future-feature"))
+        );
+
+        // The header is authenticated: a requirement stripped by hand fails decryption.
+        let aad = header_aad(2, &["future-feature".to_string()]).unwrap();
+        let (nonce, ciphertext) = seal_cbor(&"wallet state", &material.key, &aad).unwrap();
+        let stripped = EncryptedDataV2 {
+            nonce,
+            ciphertext,
+            ..data
+        };
+        assert!(matches!(load(&stripped), Err(SecurityError::Decryption)));
+    }
+
+    #[derive(Serialize)]
+    struct ContainerVersionOnly {
+        version: u32,
+    }
+
+    #[test]
+    fn sealed_secret_needs_the_password_on_every_open() {
+        let sealed = SealedSecret::seal(&"seed entropy", "wallet password").unwrap();
+        assert_eq!(
+            sealed.open::<String>("wallet password").unwrap(),
+            "seed entropy"
+        );
+        for wrong in ["wrong", ""] {
+            assert!(matches!(
+                sealed.open::<String>(wrong),
+                Err(SecurityError::Decryption)
+            ));
+        }
+        assert_eq!(format!("{sealed:?}"), "SealedSecret(<sealed>)");
+
+        // Every seal draws its own salt and nonce.
+        let again = SealedSecret::seal(&"seed entropy", "wallet password").unwrap();
+        let (Kdf::Pbkdf2Sha256 { salt: a, .. }, Kdf::Pbkdf2Sha256 { salt: b, .. }) =
+            (&sealed.kdf, &again.kdf);
+        assert_ne!(a, b);
+        assert_ne!(sealed.nonce, again.nonce);
+
+        // The stored iteration count survives a serde round trip and is bounded.
+        let read: SealedSecret =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&sealed).unwrap()).unwrap();
+        assert_eq!(read, sealed);
+        for iterations in [0, PBKDF2_ITERATIONS + 1] {
+            let Kdf::Pbkdf2Sha256 { salt, .. } = sealed.kdf;
+            let edited = SealedSecret {
+                kdf: Kdf::Pbkdf2Sha256 { iterations, salt },
+                ..sealed.clone()
+            };
+            assert!(matches!(
+                edited.open::<String>("wallet password"),
+                Err(SecurityError::Format(_))
+            ));
+        }
+    }
 
     #[test]
     fn encryption_rotates_nonce_for_same_key_material() {
