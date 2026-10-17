@@ -121,7 +121,10 @@ fn assert_ffi_restores_funded_wallet(
 ) {
     let bitcoind = node.bitcoind();
     let km = KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap();
-    let phrase = wallet.take_new_mnemonic().unwrap().words();
+    let phrase = wallet
+        .get_wallet_mnemonic(Zeroizing::new("integration-test".to_string()))
+        .unwrap()
+        .words();
     wallet.backup(&data_dir.join("backup"), km).unwrap();
     for address_type in [AddressType::P2WPKH, AddressType::P2TR] {
         let external = wallet.get_next_external_address(address_type).unwrap();
@@ -194,7 +197,7 @@ fn assert_ffi_restores_funded_wallet(
                 &path,
                 &backend,
                 RestoreOptions::default(),
-                km.clone(),
+                Zeroizing::new("integration-test".to_string()),
             )
         } else {
             Wallet::restore(&backup, &path, &backend, km.clone())
@@ -270,7 +273,7 @@ fn assert_restores_v023_wallet(backend: &BackendConfig, dir: &Path, node: &Node,
         &dir.join("v023-phrase"),
         &named(backend, "v023-phrase"),
         options(),
-        km.clone(),
+        Zeroizing::new("integration-test".to_string()),
     )
     .unwrap();
     assert_eq!(from_phrase.list_descriptor_utxo_spend_info().len(), 16);
@@ -463,7 +466,7 @@ fn encwallet_encbackup_encrestore(node: &mut Node) {
     let mut wallet = Wallet::init(
         &original_wallet,
         AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap()),
-        km.clone(),
+        Zeroizing::new("integration-test".to_string()),
     )
     .unwrap();
 
@@ -560,7 +563,7 @@ fn encwallet_encbackup_encrestore_electrum(node: &mut Node) {
     let mut wallet = Wallet::init(
         &original_wallet,
         AnyBlockchain::Electrum(Electrum::new(&electrum_cfg).unwrap()),
-        km.clone(),
+        Zeroizing::new("integration-test".to_string()),
     )
     .unwrap();
 
@@ -626,7 +629,7 @@ fn original_wallet<B: TestBackend>(
     let wallet = Wallet::init(
         &dir.join("original-wallet"),
         AnyBlockchain::from_config(&backend).unwrap(),
-        km.clone(),
+        Zeroizing::new("integration-test".to_string()),
     )
     .unwrap();
     (dir, backend, wallet, km)

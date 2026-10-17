@@ -263,6 +263,20 @@ impl KeyMaterial {
             pbkdf2_salt,
         }
     }
+
+    /// Whether `password` derives this key, as trial-decrypting the file would.
+    pub(crate) fn matches_password(&self, password: &str) -> bool {
+        let key = Zeroizing::new(pbkdf2_hmac_array::<Sha256, 32>(
+            password.as_bytes(),
+            &self.pbkdf2_salt,
+            PBKDF2_ITERATIONS,
+        ));
+        // Constant time, so the comparison leaks nothing about the key.
+        key.iter()
+            .zip(self.key)
+            .fold(0, |diff, (a, b)| diff | (a ^ b))
+            == 0
+    }
 }
 
 /// Wrapper struct for storing an encrypted data on disk.

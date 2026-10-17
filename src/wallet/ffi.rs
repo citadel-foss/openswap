@@ -96,20 +96,18 @@ pub fn restore_wallet_from_mnemonic_gui_app(
     options: RestoreOptions,
 ) -> Result<(), WalletError> {
     let phrase = Zeroizing::new(phrase);
-    let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
+    let Some(password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
         return Err(WalletError::General(
             "a passphrase is required; cleartext wallet files are not supported".to_string(),
         ));
     };
-    let material = KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
-        .expect("a non-empty passphrase always yields key material");
     let wallet_path = data_dir
         .map(Ok)
         .unwrap_or_else(get_taker_dir)?
         .join("wallets")
         .join(wallet_file_name);
 
-    Wallet::restore_from_mnemonic(phrase, &wallet_path, &backend, options, material)?;
+    Wallet::restore_from_mnemonic(phrase, &wallet_path, &backend, options, password)?;
     Ok(())
 }
 

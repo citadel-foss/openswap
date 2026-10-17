@@ -94,8 +94,8 @@ fn wallet_commands(node: &mut Node) {
     info!("Funding taker with 3 UTXOs of 1 BTC each");
     // Fund the taker with 3 utxos of 1 BTC each.
     for _ in 0..3 {
-        // The command that creates the wallet prints the seed phrase before its
-        // result, so the address is the last line.
+        // The command that creates the wallet may print a seed backup notice
+        // before its result, so the address is the last line.
         let output = taker_cli.execute(&["get-new-address"]);
         let taker_address = output.lines().last().unwrap();
 

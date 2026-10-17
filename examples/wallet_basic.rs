@@ -25,6 +25,7 @@ use openswap::{
     utill::MIN_RELAY_FEE_RATE,
     wallet::{AddressType, AnyBlockchain, CoreRPC, CoreRpcConfig, Destination, Wallet},
 };
+use zeroize::Zeroizing;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== OpenSwap Wallet Basic Example ===");
@@ -88,11 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(wallet_path.parent().unwrap())?;
 
     let backend = AnyBlockchain::CoreRPC(CoreRPC::new(&rpc_config).unwrap());
-    // Wallet files are always encrypted; a passphrase is required.
-    let enc_material =
-        openswap::security::KeyMaterial::new_from_password(Some("example-password".to_string()))
-            .unwrap();
-    let mut wallet = Wallet::init(&wallet_path, backend, enc_material).unwrap();
+    // Wallet files are always encrypted; a passphrase is required. It also
+    // seals the seed phrase, which `get_wallet_mnemonic` shows with it.
+    let password = Zeroizing::new("example-password".to_string());
+    let mut wallet = Wallet::init(&wallet_path, backend, password).unwrap();
 
     // Replace the `backend` and `Wallet::init` lines above with these to drive
     // the same wallet through an electrs server instead of bitcoind RPC.
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //         url: "tcp://127.0.0.1:60401".to_string(),
     //     };
     //     let backend = AnyBlockchain::Electrum(Electrum::new(&electrum_config).unwrap());
-    //     let mut wallet = Wallet::init(&wallet_path, backend, enc_material).unwrap();
+    //     let mut wallet = Wallet::init(&wallet_path, backend, password).unwrap();
 
     println!("Wallet initialized successfully!");
 

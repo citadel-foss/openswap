@@ -100,6 +100,19 @@ pub enum WalletError {
     /// and `tr()` descriptors. Retrying cannot help.
     CoreTooOld,
 
+    /// The wallet stores no seed phrase: it predates sealed phrases or was
+    /// restored from a backup without one.
+    MnemonicUnavailable,
+
+    /// The password is not this wallet's password.
+    WrongPassword,
+
+    /// The seed phrase does not derive this wallet's master key.
+    MnemonicMismatch,
+
+    /// The wallet already stores a seed phrase; it is never replaced.
+    MnemonicAlreadyStored,
+
     /// Represents an error related to protocol violations or unexpected protocol behavior.
     Protocol(ProtocolError),
 
@@ -290,6 +303,19 @@ impl std::fmt::Display for WalletError {
                 "watch window ends at index {window}, past the cap {cap}; if restoring, lower --address-gap"
             ),
             WalletError::CoreTooOld => write!(f, "Bitcoin Core v22.0 or newer is required"),
+            WalletError::MnemonicUnavailable => write!(
+                f,
+                "this wallet has no stored seed phrase; attach your original phrase, \
+                 keep an encrypted wallet backup, or sweep the funds to a new wallet"
+            ),
+            WalletError::WrongPassword => write!(f, "wrong wallet password"),
+            WalletError::MnemonicMismatch => {
+                write!(f, "the seed phrase does not match this wallet's master key")
+            }
+            WalletError::MnemonicAlreadyStored => write!(
+                f,
+                "this wallet already stores a seed phrase; it is never replaced"
+            ),
             WalletError::Protocol(e) => write!(f, "Protocol error: {}", e),
             WalletError::Fidelity(e) => write!(f, "Fidelity error: {}", e),
             WalletError::Locktime(e) => write!(f, "Locktime conversion error: {}", e),

@@ -105,7 +105,6 @@ enum SeedPolicy {
 /// The seed phrase as BIP39 entropy, wiped on drop. All fields have a fixed
 /// size, so serde never grows a buffer and frees an unwiped copy.
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the seed API"))]
 pub(crate) struct SecretEntropy {
     #[zeroize(skip)]
     policy: SeedPolicy,
@@ -113,7 +112,6 @@ pub(crate) struct SecretEntropy {
     bytes: [u8; 32],
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the seed API"))]
 impl SecretEntropy {
     pub(crate) fn from_mnemonic(mnemonic: &Mnemonic) -> Result<Self, WalletError> {
         let (array, len) = mnemonic.to_entropy_array();
@@ -457,7 +455,9 @@ impl WalletStore {
     /// Initialize a store at a path (if path already exists, it will overwrite it).
     ///
     /// The master key is sealed with `store_enc_material` before the first
-    /// write, so the plaintext key never reaches disk.
+    /// write, so the plaintext key never reaches disk. Wallets with no seed
+    /// phrase exist only in tests now.
+    #[cfg(test)]
     pub(crate) fn init(
         file_name: String,
         path: &Path,
@@ -480,8 +480,9 @@ impl WalletStore {
         )
     }
 
-    /// Like [`WalletStore::init`], but `prepare` fills in extra state before
-    /// the first durable write, so no partial store ever reaches disk.
+    /// Initialize a store at a path that must not exist yet. `prepare` fills
+    /// in extra state before the first durable write, so no partial store
+    /// ever reaches disk. The master key is sealed before that write.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn init_with(
         file_name: String,

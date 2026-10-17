@@ -55,12 +55,11 @@ pub(crate) fn global_secp() -> &'static Secp256k1<All> {
 
 use crate::{
     error::NetError,
-    lock_debug,
     protocol::{
         common_messages::ProtocolVersion, contract::derive_maker_pubkey_and_nonce,
         error::ProtocolError,
     },
-    wallet::{SecretMnemonic, UTXOSpendInfo, WalletError},
+    wallet::{UTXOSpendInfo, WalletError},
 };
 
 const INPUT_CHARSET: &str =
@@ -934,23 +933,6 @@ pub fn prompt_password(message: String) -> io::Result<Zeroizing<String>> {
     Ok(Zeroizing::new(
         String::from_utf8(std::mem::take(&mut *password)).expect("typed characters are UTF-8"),
     ))
-}
-
-/// Writes a new wallet's seed phrase to stdout, shown once at wallet creation.
-/// Returns write errors instead of panicking like `println!`.
-pub fn print_new_wallet_seed(mnemonic: &SecretMnemonic) -> io::Result<()> {
-    let mut out = lock_debug!(io::stdout().lock());
-    writeln!(out, "\n========== New Wallet Seed Phrase ==========")?;
-    // A whole line skips stdout's buffer, which would keep an unwiped copy.
-    // `words()` reserves the byte for the newline, so this does not reallocate.
-    let mut words = mnemonic.words();
-    words.push('\n');
-    out.write_all(words.as_bytes())?;
-    writeln!(
-        out,
-        "\nWrite these words down and store them offline. They will not be shown again."
-    )?;
-    out.flush()
 }
 
 /// Publish `local_port` as an ephemeral Tor onion service via `ADD_ONION`.

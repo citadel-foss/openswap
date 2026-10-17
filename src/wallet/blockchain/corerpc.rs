@@ -780,7 +780,7 @@ mod tests {
             &path,
             &BackendConfig::CoreRpc(core.config.clone()),
             Default::default(),
-            KeyMaterial::new_ephemeral(),
+            Zeroizing::new("pass".to_string()),
         )
         .expect_err("Core 0.21 must be refused");
         assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
@@ -791,7 +791,7 @@ mod tests {
         );
     }
 
-    /// A new CLI wallet refuses Core 0.21 before its file and seed are written.
+    /// A new CLI wallet refuses Core 0.21 before its file and sealed seed are written.
     #[test]
     fn init_interactive_refuses_core_before_v22_without_a_wallet_file() {
         let (core, server) = mock_core_v21();

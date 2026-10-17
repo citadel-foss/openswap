@@ -1,7 +1,9 @@
 use std::{borrow::Cow, collections::HashSet, env, ffi::OsStr, fs, io::Write, path::PathBuf};
 
 use crate::{
-    security::{encrypt_struct, load_sensitive_struct, KeyMaterial, SecurityError, SerdeJson},
+    security::{
+        encrypt_struct, load_sensitive_struct, KeyMaterial, SealedSecret, SecurityError, SerdeJson,
+    },
     utill::prompt_password,
     wallet::{Blockchain, Wallet, WalletError},
 };
@@ -9,6 +11,7 @@ use crate::{
 use super::{
     api::{ADDRESS_IMPORT_COUNT, MAX_WATCH_WINDOW, RESTORE_ADDRESS_GAP},
     blockchain::{AnyBlockchain, BackendConfig},
+    seed::seal_mnemonic,
     storage::{SecretXpriv, WalletStore},
 };
 use bip39::Mnemonic;
@@ -23,7 +26,7 @@ pub const RESTORE_OPEN_SWAPS_WARNING: &str =
     "A restore cannot recover swaps still in progress (including Lightning swaps): \
      their keys are not in a seed phrase or backup. Finish or refund them on the old wallet first.";
 
-fn parse_mnemonic(phrase: &str) -> Result<Mnemonic, WalletError> {
+pub(super) fn parse_mnemonic(phrase: &str) -> Result<Mnemonic, WalletError> {
     let mut normalized = Cow::Borrowed(phrase);
     Mnemonic::normalize_utf8_cow(&mut normalized);
     match normalized {
@@ -291,6 +294,7 @@ impl Wallet {
             backend_config,
             restored_enc_material,
             options,
+            None,
         )?;
         wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
         Ok(wallet)
@@ -304,12 +308,32 @@ impl Wallet {
         restored_enc_material: KeyMaterial,
         options: RestoreOptions,
     ) -> Result<Wallet, WalletError> {
+        Self::restore_owned_sealed(
+            wallet_backup,
+            wallet_path,
+            backend_config,
+            restored_enc_material,
+            options,
+            None,
+        )
+    }
+
+    /// Like [`Wallet::restore_owned_with`], also storing `sealed_mnemonic`.
+    fn restore_owned_sealed(
+        wallet_backup: WalletBackup,
+        wallet_path: &Path,
+        backend_config: &BackendConfig,
+        restored_enc_material: KeyMaterial,
+        options: RestoreOptions,
+        sealed_mnemonic: Option<SealedSecret>,
+    ) -> Result<Wallet, WalletError> {
         let mut wallet = Self::restore_prepared(
             &wallet_backup,
             wallet_path,
             backend_config,
             restored_enc_material,
             options,
+            sealed_mnemonic,
         )?;
         drop(wallet_backup);
         wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
@@ -317,13 +341,14 @@ impl Wallet {
     }
 
     /// Creates the encrypted wallet before the scan, so owned restore secrets
-    /// can be dropped before syncing.
+    /// can be dropped before syncing. `sealed_mnemonic` goes into the first write.
     fn restore_prepared(
         wallet_backup: &WalletBackup,
         wallet_path: &Path,
         backend_config: &BackendConfig,
         restored_enc_material: KeyMaterial,
         mut options: RestoreOptions,
+        sealed_mnemonic: Option<SealedSecret>,
     ) -> Result<Wallet, WalletError> {
         options.bond_hints.extend(&wallet_backup.fidelity_bonds);
         if let Some((address_gap, bond_gap)) = wallet_backup.pending_gaps {
@@ -436,6 +461,7 @@ impl Wallet {
                 store.swept_incoming_swapcoins = wallet_backup.swept_incoming_swapcoins.clone();
                 store.external_index = wallet_backup.external_index;
                 store.internal_index = wallet_backup.internal_index;
+                store.sealed_mnemonic = sealed_mnemonic;
             },
         )?;
 
@@ -445,7 +471,6 @@ impl Wallet {
             wallet_file_path: wallet_path.to_path_buf(),
             store,
             store_enc_material: restored_enc_material,
-            new_mnemonic: None,
             locked_utxos: std::collections::HashSet::new(),
         })
     }
@@ -461,13 +486,23 @@ impl Wallet {
     /// the regular coin pool. Bonds are found by their OP_RETURN or a
     /// [`BondHint`], until `options.bond_gap` indexes in a row find none. Live swap
     /// keys are per-swap `OsRng` and unrecoverable from any seed.
+    ///
+    /// `password` encrypts the new wallet file and seals the phrase in it, so
+    /// [`Wallet::get_wallet_mnemonic`] can show it again.
     pub fn restore_from_mnemonic(
         phrase: Zeroizing<String>,
         wallet_path: &Path,
         backend_config: &BackendConfig,
         options: RestoreOptions,
-        restored_enc_material: KeyMaterial,
+        password: Zeroizing<String>,
     ) -> Result<Wallet, WalletError> {
+        if password.is_empty() {
+            return Err(WalletError::General(
+                "wallet restore failed: a passphrase is required; \
+                 cleartext wallet files are not supported"
+                    .to_string(),
+            ));
+        }
         // A phrase carries no wallet name, so the path must name the file.
         let file_name = match wallet_path.file_name().and_then(|name| name.to_str()) {
             Some(name) if !wallet_path.is_dir() => name.to_string(),
@@ -479,10 +514,14 @@ impl Wallet {
         };
         // Probe first, so no parsed seed or key is held through a slow or failing backend.
         let network = Self::require_backend(&AnyBlockchain::from_config(backend_config)?)?.chain;
+        let restored_enc_material = KeyMaterial::new_from_password(Some(password.to_string()))
+            .expect("a passphrase always yields key material");
         let mnemonic = parse_mnemonic(phrase.as_str())?;
         drop(phrase);
         let master_key = SecretXpriv(Self::master_key_from_mnemonic(&mnemonic, network)?);
+        let sealed_mnemonic = seal_mnemonic(&mnemonic, &master_key.0, network, &password)?;
         drop(mnemonic);
+        drop(password);
         let backup = WalletBackup {
             network,
             master_key,
@@ -495,12 +534,13 @@ impl Wallet {
             pending_gaps: None,
         };
 
-        Wallet::restore_owned_with(
+        Wallet::restore_owned_sealed(
             backup,
             wallet_path,
             backend_config,
             restored_enc_material,
             options,
+            Some(sealed_mnemonic),
         )
     }
 
@@ -610,29 +650,25 @@ impl Wallet {
     ) -> Result<(), WalletError> {
         println!("{RESTORE_OPEN_SWAPS_WARNING}");
         Self::require_backend(&AnyBlockchain::from_config(backend)?)?;
-        let restore_enc_material = KeyMaterial::new_interactive(Some(
-            "Enter restored wallet encryption passphrase: ".to_string(),
-        ))
-        .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?
-        .ok_or_else(|| {
-            WalletError::General(
+        let password = prompt_password("Enter restored wallet encryption passphrase: ".to_string())
+            .map_err(|e| {
+                WalletError::General(format!("encryption passphrase prompt failed: {e}"))
+            })?;
+        // Refused here too, before the user types the phrase for nothing.
+        if password.is_empty() {
+            return Err(WalletError::General(
                 "wallet restore failed: a passphrase is required; \
                  cleartext wallet files are not supported"
                     .to_string(),
-            )
-        })?;
+            ));
+        }
 
         let phrase = prompt_password("Enter seed phrase: ".to_string())
             .map_err(|e| WalletError::General(format!("failed to read seed phrase: {e}")))?;
 
         let hints = options.bond_hints.clone();
-        let wallet = Wallet::restore_from_mnemonic(
-            phrase,
-            restored_path,
-            backend,
-            options,
-            restore_enc_material,
-        )?;
+        let wallet =
+            Wallet::restore_from_mnemonic(phrase, restored_path, backend, options, password)?;
         println!("Wallet restore succeeded!");
         wallet.print_restored_bonds(&hints);
         Ok(())
@@ -968,7 +1004,7 @@ mod tests {
             dir.path(),
             &backend,
             RestoreOptions::default(),
-            KeyMaterial::new_ephemeral(),
+            Zeroizing::new("test-password".to_string()),
         )
         .expect_err("a directory is not a wallet file");
         assert!(

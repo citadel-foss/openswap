@@ -9,6 +9,7 @@ pub mod ffi;
 mod fidelity;
 pub(crate) mod funding;
 mod report;
+mod seed;
 mod spend;
 mod storage;
 pub(crate) mod swapcoin;
@@ -17,9 +18,7 @@ pub(crate) use api::{
     contract_and_timelock_vsize, infer_address_type, p2tr_min_non_dust_sats,
     payment_settlement_budget_sats, wait_for_tx_confirmation, SpendKind,
 };
-pub use api::{
-    min_contract_value_sats, Balances, RecoveryOutcome, SecretMnemonic, UTXOSpendInfo, Wallet,
-};
+pub use api::{min_contract_value_sats, Balances, RecoveryOutcome, UTXOSpendInfo, Wallet};
 pub use backup::{
     BondHint, OpenSwapsSummary, RestoreOptions, WalletBackup, RESTORE_OPEN_SWAPS_WARNING,
 };
@@ -38,5 +37,6 @@ pub use report::{
     MakerFeeInfo, MakerReport, PaymentResult, RecoveryReport, ReportUtxo, SwapRole, SwapStatus,
     TakerReport,
 };
+pub use seed::SecretMnemonic;
 pub use spend::Destination;
 pub use storage::{AddressType, LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap};
