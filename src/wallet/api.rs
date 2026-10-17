@@ -6,7 +6,6 @@
 use std::{
     cmp::max,
     fmt::Display,
-    io::{self, IsTerminal},
     path::PathBuf,
     str::FromStr,
     thread,
@@ -429,17 +428,6 @@ pub struct Balances {
     pub spendable: Amount,
 }
 
-fn require_seed_terminal(docker: bool, terminal: bool, log_free: bool) -> Result<(), WalletError> {
-    if docker && !(terminal && log_free) {
-        return Err(WalletError::General(
-            "New Docker wallets need an interactive terminal with Docker logging disabled; \
-             run once with `docker run -it --log-driver none -e OPENSWAP_SEED_LOG_FREE=1`"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
 impl Wallet {
     /// Initialize the wallet at a given path.
     ///
@@ -613,13 +601,15 @@ impl Wallet {
                 .pending_restore
                 .get_or_insert_with(RestoreOptions::default);
         }
-        Ok(Self {
+        let wallet = Self {
             blockchain,
             wallet_file_path: path.to_path_buf(),
             store,
             store_enc_material,
             locked_utxos: HashSet::new(),
-        })
+        };
+        wallet.warn_if_seed_not_backed_up();
+        Ok(wallet)
     }
 
     /// Loads an existing wallet from the given path or initializes a new one if none exists.
@@ -671,11 +661,6 @@ impl Wallet {
         if path.exists() {
             return Ok(());
         }
-        require_seed_terminal(
-            std::env::var_os("OPENSWAP_DOCKER").is_some(),
-            io::stdout().is_terminal(),
-            std::env::var_os("OPENSWAP_SEED_LOG_FREE").is_some(),
-        )?;
         // `Wallet::init` refuses old Core before a wallet file and seed are written.
         let mut wallet = Self::load_or_init(
             path,
@@ -4989,13 +4974,6 @@ mod swap_reservation_tests {
 mod prevout_contract_tests {
     use super::{test_support::test_wallet, *};
     use bitcoind::tempfile::tempdir;
-
-    #[test]
-    fn docker_seed_refuses_non_terminal_output() {
-        assert!(require_seed_terminal(true, false, true).is_err());
-        assert!(require_seed_terminal(true, true, false).is_err());
-        assert!(require_seed_terminal(true, true, true).is_ok());
-    }
 
     #[test]
     fn proof_of_funding_rejects_missing_cached_contract() {

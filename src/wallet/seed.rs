@@ -4,6 +4,7 @@
 
 use bip39::Mnemonic;
 use bitcoin::{bip32::Xpriv, Network};
+use std::{collections::HashSet, path::Path};
 use zeroize::Zeroizing;
 
 use crate::security::{SealedSecret, SecurityError};
@@ -11,13 +12,18 @@ use crate::security::{SealedSecret, SecurityError};
 use super::{
     api::Wallet,
     backup::parse_mnemonic,
+    blockchain::{AnyBlockchain, BackendConfig, CoreRpcConfig},
     error::WalletError,
-    storage::{SecretEntropy, SecretXpriv},
+    storage::{SecretEntropy, SecretXpriv, WalletStore},
 };
 
 /// Shown when a wallet is created. The words themselves are never printed.
 pub(super) const SEED_NOT_BACKED_UP: &str =
     "Seed phrase not backed up yet; run `show-seed` and write it down";
+
+/// Shown while a wallet has no stored phrase and no confirmed backup.
+pub(super) const SEED_NOT_STORED: &str = "No seed phrase stored and none confirmed as backed up; \
+     run `attach-seed` with your original phrase, or keep an encrypted backup";
 
 /// A BIP39 seed phrase, wiped on drop. No `Clone`, `Debug`, `Display` or
 /// `Serialize`; [`SecretMnemonic::words`] is the only reader.
@@ -89,6 +95,38 @@ pub(super) fn seal_entropy(
 }
 
 impl Wallet {
+    /// Opens an existing wallet file with no backend, for the offline seed
+    /// commands. It never syncs and never writes; the backend it holds is
+    /// inert and must not be used.
+    pub fn open_offline(path: &Path, password: Zeroizing<String>) -> Result<Self, WalletError> {
+        if !path.exists() {
+            return Err(WalletError::General(format!(
+                "no wallet file at {path:?}; a wallet must exist to read its seed"
+            )));
+        }
+        if password.is_empty() {
+            return Err(WalletError::WrongPassword);
+        }
+        let (mut store, material) = WalletStore::read_from_disk(path, Some(password.to_string()))
+            .map_err(|e| match e {
+            WalletError::Security(SecurityError::Decryption) => WalletError::WrongPassword,
+            e => e,
+        })?;
+        let store_enc_material = material.ok_or_else(|| {
+            WalletError::General("cleartext wallet files are not supported".to_string())
+        })?;
+        store.master_key.seal(&store_enc_material)?;
+        let blockchain =
+            AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default()))?;
+        Ok(Self {
+            blockchain,
+            wallet_file_path: path.to_path_buf(),
+            store,
+            store_enc_material,
+            locked_utxos: HashSet::new(),
+        })
+    }
+
     /// The wallet's seed phrase, for the user to write down. Local only:
     /// never send it over RPC or the network.
     ///
@@ -158,6 +196,18 @@ impl Wallet {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Logs the not-backed-up warning, if it applies. Called on every load.
+    pub(super) fn warn_if_seed_not_backed_up(&self) {
+        if self.store.seed_backed_up {
+            return;
+        }
+        if self.store.sealed_mnemonic.is_some() {
+            log::warn!("{SEED_NOT_BACKED_UP}");
+        } else {
+            log::warn!("{SEED_NOT_STORED}");
+        }
     }
 
     /// Whether the user has confirmed writing the seed phrase down.
@@ -330,5 +380,37 @@ mod tests {
         let (saved, _) =
             WalletStore::read_from_disk(&path, Some("test-password".to_string())).unwrap();
         assert!(saved.seed_backed_up);
+    }
+
+    #[test]
+    fn offline_open_reads_the_seed_without_writing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let mut wallet = legacy_wallet(&path, PHRASE);
+        wallet
+            .attach_wallet_mnemonic(password("test-password"), password(PHRASE))
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        for wrong in ["", "wrong-password"] {
+            let err = Wallet::open_offline(&path, password(wrong)).err().unwrap();
+            assert!(matches!(err, WalletError::WrongPassword), "{}", err);
+        }
+        let offline = Wallet::open_offline(&path, password("test-password")).unwrap();
+        let words = offline
+            .get_wallet_mnemonic(password("test-password"))
+            .unwrap()
+            .words();
+        assert_eq!(words.as_str(), PHRASE);
+        assert!(!offline.seed_backed_up());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn offline_open_needs_an_existing_wallet_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing");
+        assert!(Wallet::open_offline(&path, password("test-password")).is_err());
+        assert!(!path.exists());
     }
 }

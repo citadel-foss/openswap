@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use openswap::{
     maker::{bind_port_retry, start_server, MakerError, MakerServer, MakerServerConfig},
     utill::{parse_proxy_auth, setup_maker_logger},
-    wallet::{BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions, Wallet},
+    wallet::{
+        seed_cli, BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions, Wallet,
+    },
 };
 use std::{path::PathBuf, sync::Arc};
 use zeroize::Zeroizing;
@@ -104,6 +106,17 @@ enum Commands {
         #[clap(long)]
         bond_hint: Vec<BondHint>,
     },
+    /// Show the wallet's seed phrase and confirm you wrote it down, then exit.
+    ///
+    /// Works offline on an existing wallet file: no backend is needed and the
+    /// maker does not start. The passphrase is asked at a hidden prompt, never
+    /// taken from `-p`. Runs only with stdout on a terminal. In Docker:
+    /// `docker exec -it openswap-makerd makerd show-seed --wallet openswap-maker`.
+    ShowSeed,
+    /// Store the original seed phrase in a wallet that has none, then exit.
+    ///
+    /// Asks for the passphrase and the phrase at hidden prompts.
+    AttachSeed,
     /// Write an encrypted backup of the existing wallet, then exit.
     ///
     /// Run it with the maker stopped and the Bitcoin Core or Electrum backend
@@ -124,6 +137,26 @@ fn main() -> Result<(), MakerError> {
         Some(dir) => dir,
         None => openswap::utill::get_maker_dir()?,
     };
+
+    // Offline: no config file, backend or maker start.
+    if matches!(
+        args.command,
+        Some(Commands::ShowSeed | Commands::AttachSeed)
+    ) {
+        if args.password.is_some() {
+            return Err(MakerError::General(
+                "seed commands never take the passphrase on the command line; \
+                 leave out -p and type it at the prompt",
+            ));
+        }
+        let name = args.wallet_name.as_deref().unwrap_or("maker");
+        let path = data_dir.join("wallets").join(name);
+        match args.command {
+            Some(Commands::ShowSeed) => seed_cli::show_seed(&path)?,
+            _ => seed_cli::attach_seed(&path)?,
+        }
+        return Ok(());
+    }
 
     // Load static settings from config file (auto-creates defaults if missing)
     let config_path = data_dir.join("config.toml");
@@ -183,6 +216,7 @@ fn main() -> Result<(), MakerError> {
             config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
             return MakerServer::backup_wallet(config, output);
         }
+        Some(Commands::ShowSeed | Commands::AttachSeed) => unreachable!("handled above"),
         Some(Commands::InitWallet) => {}
         None => {}
     }

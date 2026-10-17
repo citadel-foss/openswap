@@ -10,6 +10,7 @@ mod fidelity;
 pub(crate) mod funding;
 mod report;
 mod seed;
+pub mod seed_cli;
 mod spend;
 mod storage;
 pub(crate) mod swapcoin;

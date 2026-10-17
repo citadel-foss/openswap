@@ -10,7 +10,7 @@ use openswap::{
         TakerConfig, TakerInitConfig,
     },
     utill::{parse_proxy_auth, setup_taker_logger, MAX_TX_COUNT, UTXO},
-    wallet::{AddressType, BondHint, CoreRpcConfig, RestoreOptions, Wallet},
+    wallet::{seed_cli, AddressType, BondHint, CoreRpcConfig, RestoreOptions, Wallet},
 };
 use serde_json::{json, to_string_pretty};
 use std::{
@@ -317,6 +317,19 @@ enum Commands {
         #[clap(long)]
         bond_hint: Vec<BondHint>,
     },
+    /// Show the wallet's seed phrase and confirm you wrote it down.
+    ///
+    /// Works offline on an existing wallet file: no backend is needed and
+    /// nothing syncs. The passphrase is asked at a hidden prompt, never taken
+    /// from `-p`. Runs only with stdout on a terminal. Re-type the words it
+    /// asks for to record the backup.
+    ShowSeed,
+    /// Store the original seed phrase in a wallet that has none.
+    ///
+    /// For wallets made before phrases were stored. Asks for the passphrase
+    /// and the phrase at hidden prompts, and accepts only the phrase that
+    /// derives this wallet's key.
+    AttachSeed,
     /// Verify the deniability proof for a specific swap.
     VerifyDeniability {
         /// The swap ID to verify.
@@ -463,6 +476,22 @@ fn main() -> Result<(), TakerError> {
         Some(dir) => dir,
         None => openswap::utill::get_taker_dir()?,
     };
+    // Offline: no config file, backend or wallet sync.
+    if matches!(args.command, Commands::ShowSeed | Commands::AttachSeed) {
+        if wallet_password.is_some() {
+            return Err(TakerError::General(
+                "seed commands never take the passphrase on the command line; \
+                 leave out -p and type it at the prompt"
+                    .to_string(),
+            ));
+        }
+        let path = data_dir.join("wallets").join(&wallet_name);
+        match args.command {
+            Commands::ShowSeed => seed_cli::show_seed(&path)?,
+            _ => seed_cli::attach_seed(&path)?,
+        }
+        return Ok(());
+    }
     // Static settings live in the file (auto-created with defaults if missing).
     // Read it here, before the backend bakes the proxy address in, so a
     // non-default `socks_port` reaches Tor instead of being silently ignored.
@@ -930,7 +959,7 @@ fn main() -> Result<(), TakerError> {
             let wallet = lock_debug!(taker.get_wallet().read()).unwrap();
             Wallet::backup_interactive(&wallet, None)?;
         }
-        Commands::Restore { .. } => {
+        Commands::Restore { .. } | Commands::ShowSeed | Commands::AttachSeed => {
             // Handled above before taker init
             unreachable!()
         }
