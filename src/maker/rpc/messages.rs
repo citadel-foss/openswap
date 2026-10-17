@@ -180,3 +180,17 @@ impl Display for RpcMsgResp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The RPC socket has no way to read the seed: the seed is only handed
+    /// out by local calls that need the wallet password.
+    #[test]
+    fn no_rpc_variant_carries_the_seed() {
+        let source = include_str!("messages.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap().to_lowercase();
+        for word in ["mnemonic", "seed", "entropy", "sealed", "xpriv"] {
+            assert!(!production.contains(word), "RPC messages mention {}", word);
+        }
+    }
+}

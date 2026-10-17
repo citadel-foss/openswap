@@ -5454,6 +5454,25 @@ mod restore_history_probe_tests {
         assert!(!loaded.seed_backed_up());
     }
 
+    /// Once `init` returns, its first write already holds the phrase, so any
+    /// failure after it leaves a wallet whose seed can still be read offline.
+    #[test]
+    fn seed_is_readable_offline_right_after_init() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("new-wallet");
+        let url = start_stub(StdHashSet::new());
+        let backend = AnyBlockchain::Electrum(Electrum::new(&electrum_config(url)).unwrap());
+        let password = || Zeroizing::new("test-password".to_string());
+
+        let created = Wallet::init(&path, backend, password()).unwrap();
+        let words = created.get_wallet_mnemonic(password()).unwrap().words();
+        drop(created);
+
+        let offline = Wallet::open_offline(&path, password()).unwrap();
+        let read = offline.get_wallet_mnemonic(password()).unwrap().words();
+        assert_eq!(read, words);
+    }
+
     /// Restore stores the phrase it was given, whatever its length.
     #[test]
     fn restore_from_mnemonic_seals_the_phrase() {

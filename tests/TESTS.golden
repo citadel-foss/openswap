@@ -27,6 +27,7 @@ openswap maker::handlers::tests::swap_id_must_be_16_hex_characters
 openswap maker::handlers::tests::taproot_refund_deadline_is_exact_at_the_boundary
 openswap maker::legacy_verification::tests::locktime_that_overflows_the_refund_step_is_rejected
 openswap maker::legacy_verification::tests::normal_locktime_is_accepted
+openswap maker::rpc::messages::tests::no_rpc_variant_carries_the_seed
 openswap maker::rpc::server::tests::rpc_cookie_is_random_and_authenticated
 openswap maker::rpc::server::tests::send_to_address_clears_the_relay_floor_over_rpc
 openswap maker::rpc::server::tests::send_to_address_rejects_unusable_rates_over_rpc
@@ -207,6 +208,7 @@ openswap wallet::api::restore_history_probe_tests::restore_from_mnemonic_uses_th
 openswap wallet::api::restore_history_probe_tests::restore_probe_bridges_a_long_run_of_emptied_addresses
 openswap wallet::api::restore_history_probe_tests::restore_probe_reports_a_window_cut_off_by_the_cap
 openswap wallet::api::restore_history_probe_tests::resumed_restore_checks_the_window_before_syncing
+openswap wallet::api::restore_history_probe_tests::seed_is_readable_offline_right_after_init
 openswap wallet::api::restore_history_probe_tests::sync_does_not_enter_the_backend_after_shutdown
 openswap wallet::api::restore_history_probe_tests::window_cap_and_old_core_are_not_retried
 openswap wallet::api::swap_reservation_tests::a_reservation_survives_a_wallet_reload
@@ -325,6 +327,7 @@ openswap wallet::spend::tests::exact_spend_with_the_smallest_change
 openswap wallet::storage::tests::encrypted_wallet_without_password_says_password_required
 openswap wallet::storage::tests::failed_first_write_leaves_no_wallet_file
 openswap wallet::storage::tests::maker_swap_debug_redacts_the_preimage
+openswap wallet::storage::tests::old_new_old_sequence_never_loses_the_sealed_phrase
 openswap wallet::storage::tests::reads_encrypted_wallet_when_password_is_supplied
 openswap wallet::storage::tests::sealed_master_key_roundtrips
 openswap wallet::storage::tests::sealed_master_key_survives_encrypted_store_roundtrip

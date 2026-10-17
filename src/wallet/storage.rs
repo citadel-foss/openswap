@@ -766,6 +766,35 @@ mod tests {
         assert_eq!(upgraded, store);
     }
 
+    /// An older build reads a version 1 file, a new build upgrades it on its
+    /// first write, and from then on the older build refuses the file at parse
+    /// time, so it never saves over the sealed phrase.
+    #[test]
+    fn old_new_old_sequence_never_loses_the_sealed_phrase() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let password = "wallet password";
+        let material = KeyMaterial::new_from_password(Some(password.to_string())).unwrap();
+        let mut store = test_store(&path, &material);
+        let mnemonic = bip39::Mnemonic::generate(12).unwrap();
+        let entropy = SecretEntropy::from_mnemonic(&mnemonic).unwrap();
+        store.sealed_mnemonic = Some(SealedSecret::seal(&entropy, password).unwrap());
+
+        let v1 = encrypt_struct(&store, &material).unwrap();
+        std::fs::write(&path, serde_cbor::to_vec(&v1).unwrap()).unwrap();
+        assert!(serde_cbor::from_slice::<EncryptedData>(&std::fs::read(&path).unwrap()).is_ok());
+
+        let (read, read_material) =
+            WalletStore::read_from_disk(&path, Some(password.to_string())).unwrap();
+        read.write_to_disk(&path, &read_material.unwrap()).unwrap();
+        let v2_bytes = std::fs::read(&path).unwrap();
+        assert!(serde_cbor::from_slice::<EncryptedData>(&v2_bytes).is_err());
+
+        let (again, _) = WalletStore::read_from_disk(&path, Some(password.to_string())).unwrap();
+        assert_eq!(again.sealed_mnemonic, store.sealed_mnemonic);
+        assert_eq!(std::fs::read(&path).unwrap(), v2_bytes);
+    }
+
     #[test]
     fn test_write_and_read_wallet_to_disk() {
         let temp_dir = tempdir().unwrap();
