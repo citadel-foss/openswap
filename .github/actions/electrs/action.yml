@@ -1,0 +1,15 @@
+name: Install electrs
+description: >-
+  Downloads the checksum-pinned electrs 0.9.11 binary with
+  tests/install_electrs.sh and exports ELECTRS_EXEC, which the Electrum
+  integration tests read. Replaces electrsd's `download` feature, which needs
+  the yanked `zip` 0.6.
+runs:
+  using: composite
+  steps:
+    - name: Install electrs
+      shell: bash
+      run: |
+        exe="$(tests/install_electrs.sh "$RUNNER_TEMP/electrs")"
+        "$exe" --version
+        echo "ELECTRS_EXEC=$exe" >> "$GITHUB_ENV"

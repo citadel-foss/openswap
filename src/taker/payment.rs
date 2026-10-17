@@ -236,6 +236,15 @@ impl Taker {
             return Ok(None);
         };
 
+        // The route solver prices one per-hop mining fee, so an uneven route
+        // has no exact gross; refuse it rather than misprice a hop.
+        let hop_tx_counts = params.hop_tx_counts();
+        if hop_tx_counts.iter().any(|&count| count != hop_tx_counts[0]) {
+            return Err(TakerError::General(format!(
+                "A payment swap needs one transaction count for every hop, got {hop_tx_counts:?}"
+            )));
+        }
+
         let network = self.read_wallet()?.store.network;
         let address = unchecked_address.require_network(network).map_err(|e| {
             TakerError::General(format!(
@@ -251,7 +260,9 @@ impl Taker {
     /// is unknown until that ack arrives, so the ceiling is what must fit.
     pub(crate) fn payment_check_dust_floor(&self) -> Result<(), TakerError> {
         let swap = self.swap_state()?;
-        check_payment_dust_floor(swap.payment.as_ref(), swap.params.tx_count)
+        // The last hop's maximum caps the settlement outputs.
+        let settlement_count = swap.params.hop_tx_counts()[swap.params.maker_count];
+        check_payment_dust_floor(swap.payment.as_ref(), settlement_count)
     }
 
     /// Solve the payment route after maker selection and before negotiation:
@@ -263,7 +274,8 @@ impl Taker {
             let swap = self.swap_state()?;
             (
                 swap.params.send_amount,
-                swap.params.tx_count as u64,
+                // Uniform on a payment route (checked at prepare entry).
+                u64::from(swap.params.hop_tx_counts()[0]),
                 swap.params.max_input_budget,
                 swap.params.protocol,
                 swap.makers.len(),

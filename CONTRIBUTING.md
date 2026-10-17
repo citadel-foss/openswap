@@ -113,6 +113,8 @@ cargo test
 
 # Full integration tests (required for most changes)
 # needs nostr-rs-relay on PATH (cargo install nostr-rs-relay)
+# and electrs for the Electrum tests:
+export ELECTRS_EXEC="$(tests/install_electrs.sh)"
 cargo nextest run --features integration-test
 ```
 

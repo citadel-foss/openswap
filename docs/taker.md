@@ -405,6 +405,8 @@ Options:
           Sets the swap amount in sats [default: 20000]
       --tx-count <TX_COUNT>
           Maximum contracts the swap may split into; bounded because every split costs both sides allocation and keygen work [default: 2]
+      --tx-counts <TX_COUNTS>
+          Per-hop maximums (Taproot only), e.g. `1,3,1`: makers + 1 entries, the first capping the taker's own funding and each next one a maker's forwarding. Overrides `--tx-count`
       --max-input-budget <MAX_INPUT_BUDGET>
           Maximum inputs per forwarding tx whose fee the taker covers [default: 2]
       --feerate <FEERATE>
@@ -423,7 +425,7 @@ Options:
           Print help
 ```
 
-The `--tx-count`, `--max-input-budget`, and `--feerate` parameters are explained in [the fee policy](./fee-policy.md).
+The `--tx-count`, `--tx-counts`, `--max-input-budget`, and `--feerate` parameters are explained in [the fee policy](./fee-policy.md).
 
 By default, the command opens an interactive UTXO picker so you can choose which coins fund the swap; pass `--auto-select` to let the wallet pick them automatically.
 
