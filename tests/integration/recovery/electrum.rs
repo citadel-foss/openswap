@@ -11,23 +11,25 @@
 //! `get_tx_out` confirmation gating, and header-by-hash resolution.
 //!
 //! The Taker drops the connection after broadcasting all the funding transactions.
-//! The Makers identify this and wait for a timeout (60s in test) for the Taker to come back.
+//! The Makers identify this and wait for a timeout (30s in test) for the Taker to come back.
 //! If the Taker doesn't return, the Makers broadcast the contract transactions and reclaim
 //! their funds via timelock.
 //!
 //! The Taker after coming live again will see unfinished openswaps in its wallet.
 //! It can reclaim funds via broadcasting contract transactions and claiming via timelock.
 
-use bitcoin::Amount;
+use bitcoin::{Amount, OutPoint};
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     protocol::common_messages::ProtocolVersion,
     taker::{error::TakerError, SwapParams},
 };
 
+use super::refund_fee_bump::mempool_spender;
 use crate::test_framework::*;
 
 use log::info;
-use std::{thread, time::Duration};
+use std::{fs, time::Duration};
 
 /// Exact post-recovery balances for one protocol run. Fees differ between the
 /// Legacy and Taproot transaction shapes (and locktime values), so each
@@ -322,7 +324,6 @@ fn discards_only_on_confirmed_spend(world: &mut World, params: SwapParams) {
     // Hold the chain still: maker 0's hashlock sweep of the taker's outgoing
     // contracts now sits in the mempool as an unconfirmed spend.
     world.framework().set_block_gen_paused(true);
-    thread::sleep(Duration::from_secs(10));
 
     let outgoing_swapcoins = || {
         world
@@ -333,9 +334,87 @@ fn discards_only_on_confirmed_spend(world: &mut World, params: SwapParams) {
             .unwrap()
             .get_outgoing_swapcoins_count()
     };
-    let surviving = outgoing_swapcoins();
+    let contracts: Vec<OutPoint> = world
+        .taker()
+        .inner()
+        .get_wallet()
+        .read()
+        .unwrap()
+        .outgoing_refund_targets()
+        .into_iter()
+        .map(|(outpoint, _, _)| outpoint)
+        .collect();
     assert_eq!(
-        surviving, 3,
+        contracts.len(),
+        3,
+        "the taker must hold its 3 outgoing contracts"
+    );
+    // Every contract must be spent in the mempool alone, or a pass would keep
+    // the coins whatever it makes of a mempool spend.
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(1),
+        "maker 0's sweep of every outgoing contract to reach the mempool",
+        contracts
+            .iter()
+            .all(|op| mempool_spender(world.bitcoind(), op).is_some())
+    );
+
+    // A pass only runs on a new tip. Mine one empty block: the loop runs a
+    // pass while the sweep stays unconfirmed.
+    let mark = log_mark(&world);
+    let miner = world.bitcoind().client.get_new_address(None, None).unwrap();
+    let block: serde_json::Value = world
+        .bitcoind()
+        .client
+        .call(
+            "generateblock",
+            &[
+                serde_json::json!(miner.assume_checked().to_string()),
+                serde_json::json!([]),
+            ],
+        )
+        .unwrap();
+    world.framework().wait_for_electrs_tip();
+    // A pass for the previous tip can still be finishing after `mark`; only
+    // the one at the empty block's height counts.
+    let block_hash: bitcoin::BlockHash = block["hash"].as_str().unwrap().parse().unwrap();
+    let height = world
+        .bitcoind()
+        .client
+        .get_block_header_info(&block_hash)
+        .unwrap()
+        .height;
+    let pass = format!("Recovery loop: contracts still unresolved at height {height},");
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(1),
+        "a recovery pass on the empty block",
+        fs::read_to_string(world.taker_log_path())
+            .unwrap_or_default()
+            .get(mark as usize..)
+            .is_some_and(|new| new.contains(&pass))
+    );
+    assert!(
+        contracts
+            .iter()
+            .all(|op| mempool_spender(world.bitcoind(), op).is_some()),
+        "the sweep must still be unconfirmed when the pass ran"
+    );
+    assert_eq!(
+        world
+            .taker()
+            .inner()
+            .get_wallet()
+            .read()
+            .unwrap()
+            .get_incoming_swapcoins_count(),
+        0,
+        "the incoming sweeps must be settled, so only the outgoing spend is pending"
+    );
+    assert_eq!(
+        outgoing_swapcoins(),
+        3,
         "Outgoing swapcoins must survive a mempool-only spend of their contracts"
     );
 

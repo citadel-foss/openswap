@@ -225,6 +225,7 @@ fn run_violation_with_blocked_funding(world: &mut World, protocol: ProtocolVersi
 /// Route `maker_count` makers and list the funding source of the maker at
 /// route position `blocked_maker`. The taker must refuse its own incoming
 /// funding, but respect an intermediate recipient's choice to disable screening.
+/// `maker_regular` pins each maker's regular balance after a rejection.
 #[world_test(
     backend = BitcoindBackend,
     makers = maker_count,
@@ -234,21 +235,27 @@ fn run_violation_with_blocked_funding(world: &mut World, protocol: ProtocolVersi
     cases = [
         taker_rejects_legacy_funding_from_blocked_address(
             protocol = ProtocolVersion::Legacy, maker_count = 1, blocked_maker = 0,
+            maker_regular = Some(vec![14999642]),
         ),
         taker_rejects_taproot_funding_from_blocked_address(
             protocol = ProtocolVersion::Taproot, maker_count = 1, blocked_maker = 0,
+            maker_regular = Some(vec![14999348]),
         ),
         taker_ignores_legacy_intermediate_funding_when_receiving_maker_disables_screening(
             protocol = ProtocolVersion::Legacy, maker_count = 2, blocked_maker = 0,
+            maker_regular = None,
         ),
         taker_ignores_taproot_intermediate_funding_when_receiving_maker_disables_screening(
             protocol = ProtocolVersion::Taproot, maker_count = 2, blocked_maker = 0,
+            maker_regular = None,
         ),
         taker_rejects_legacy_final_funding_on_multihop_route(
             protocol = ProtocolVersion::Legacy, maker_count = 2, blocked_maker = 1,
+            maker_regular = Some(vec![14999196, 14999642]),
         ),
         taker_rejects_taproot_final_funding_on_multihop_route(
             protocol = ProtocolVersion::Taproot, maker_count = 2, blocked_maker = 1,
+            maker_regular = Some(vec![14999348, 14999348]),
         ),
     ],
 )]
@@ -257,6 +264,7 @@ fn run_taker_screening(
     protocol: ProtocolVersion,
     maker_count: usize,
     blocked_maker: usize,
+    maker_regular: Option<Vec<u64>>,
 ) {
     let reject_final_funding = blocked_maker + 1 == maker_count;
     if !reject_final_funding {
@@ -322,7 +330,11 @@ fn run_taker_screening(
         makers: { contract: 0, fidelity: BOND },
     });
     if reject_final_funding {
-        assert_balances!(world; { makers: { swap: 0 } });
+        // Nothing reached a maker's swap wallet, so spendable is its regular
+        // balance: the coins it started with minus fidelity and recovery fees.
+        assert_balances!(world; {
+            makers: { regular: maker_regular, swap: 0, spendable: maker_regular },
+        });
     } else {
         let balances = world.balances();
         assert!(balances.takers[0].swap > Amount::ZERO);

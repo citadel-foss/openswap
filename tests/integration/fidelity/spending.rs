@@ -1,9 +1,9 @@
 //! Spending around fidelity bonds. Regular sends never select expired bond
-//! UTXOs, while redemption and new bond creation can consume them.
+//! UTXOs; only redemption consumes them.
 //! `mempool_only_spend_reads_as_spent` pins the backend answer the maker's
 //! funding check relies on: a spend still in the mempool reads as spent.
 
-use bitcoin::{absolute::LockTime, Amount};
+use bitcoin::{absolute::LockTime, Amount, OutPoint};
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     utill::MIN_RELAY_FEE_RATE,
@@ -63,7 +63,10 @@ fn mempool_only_spend_reads_as_spent(node: &mut Node) {
 ///
 /// - Creates a fidelity bond and lets it expire by advancing blockchain height
 /// - Verifies that regular transactions never select expired fidelity bond UTXOs for spending
-/// - Confirms that new fidelity bond creation can properly consume expired fidelity bond UTXOs
+/// - Confirms that redemption consumes the expired fidelity bond UTXO
+/// - Confirms that a new fidelity bond can be created after the redemption. Bond
+///   creation selects coins like a regular send, so it never consumes the
+///   expired bond itself; redemption must come first.
 #[world_test(
     backend = BitcoindBackend,
     makers = 1,
@@ -153,6 +156,12 @@ fn bond_spending(world: &mut World) {
 
         (fidelity_utxo.txid, fidelity_utxo.vout, fidelity_utxo.amount)
     };
+    let fidelity_outpoint = OutPoint::new(fidelity_utxo_info.0, fidelity_utxo_info.1);
+    assert_eq!(
+        maker.wallet.read().unwrap().get_fidelity_bonds()[fidelity_index as usize].outpoint(),
+        fidelity_outpoint,
+        "the tracked UTXO must be the bond's outpoint"
+    );
 
     let check_fidelity_utxo_integrity = |iteration: usize| {
         let wallet = maker.wallet.read().unwrap();
@@ -200,7 +209,7 @@ fn bond_spending(world: &mut World) {
             .get_new_address(None, None)
             .unwrap()
             .assume_checked();
-        let tx_result = {
+        let tx = {
             let mut wallet = maker.wallet.write().unwrap();
             let selected_utxos = wallet
                 .coin_select(
@@ -211,6 +220,11 @@ fn bond_spending(world: &mut World) {
                     None,
                 )
                 .unwrap();
+            assert!(
+                !selected_utxos.is_empty(),
+                "regular transaction #{} must select coins",
+                i + 1
+            );
 
             for (_utxo, spend_info) in &selected_utxos {
                 if spend_info.to_string().contains("fidelity-bond") {
@@ -218,40 +232,32 @@ fn bond_spending(world: &mut World) {
                 }
             }
 
-            if selected_utxos.is_empty() {
-                Ok(None)
-            } else {
-                let destination = Destination::Multi {
-                    outputs: vec![(external_addr, Amount::from_sat(REGULAR_TX_AMOUNT))],
-                    op_return_data: None,
-                    change_address_type: AddressType::P2TR,
-                };
-                match wallet.spend_from_wallet(MIN_RELAY_FEE_RATE, destination, &selected_utxos) {
-                    Ok(tx) => Ok(Some(tx)),
-                    Err(e) => Err(e),
-                }
-            }
+            let destination = Destination::Multi {
+                outputs: vec![(external_addr, Amount::from_sat(REGULAR_TX_AMOUNT))],
+                op_return_data: None,
+                change_address_type: AddressType::P2TR,
+            };
+            wallet
+                .spend_from_wallet(MIN_RELAY_FEE_RATE, destination, &selected_utxos)
+                .unwrap()
         };
 
-        match tx_result {
-            Ok(Some(tx)) => {
-                bitcoind.client.send_raw_transaction(&tx).unwrap();
-                generate_blocks(bitcoind, 1);
-                maker
-                    .wallet
-                    .write()
-                    .unwrap()
-                    .sync_and_save(&openswap::utill::NO_SHUTDOWN)
-                    .unwrap();
-                log::info!("Regular transaction #{} completed successfully", i + 1);
-            }
-            Ok(None) => {
-                log::info!("Regular transaction #{} - no UTXOs selected", i + 1);
-            }
-            Err(e) => {
-                log::warn!("Regular transaction #{} failed: {:?}", i + 1, e);
-            }
-        }
+        assert!(
+            tx.input
+                .iter()
+                .all(|input| input.previous_output != fidelity_outpoint),
+            "FAILED: regular transaction #{} spends the fidelity bond UTXO!",
+            i + 1
+        );
+        bitcoind.client.send_raw_transaction(&tx).unwrap();
+        generate_blocks(bitcoind, 1);
+        maker
+            .wallet
+            .write()
+            .unwrap()
+            .sync_and_save(&openswap::utill::NO_SHUTDOWN)
+            .unwrap();
+        log::info!("Regular transaction #{} completed successfully", i + 1);
 
         // Check fidelity UTXO integrity after each transaction attempt
         check_fidelity_utxo_integrity(i + 1);

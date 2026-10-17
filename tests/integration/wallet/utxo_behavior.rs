@@ -10,10 +10,10 @@ use log::info;
 use openswap::{
     protocol::common_messages::ProtocolVersion,
     taker::SwapParams,
-    utill::MIN_RELAY_FEE_RATE,
-    wallet::{AddressType, WalletError},
+    utill::{funding_fee_policy_sats, sweep_fee_policy_sats, MIN_RELAY_FEE_RATE},
+    wallet::{AddressType, UTXOSpendInfo, WalletError},
 };
-use std::{thread, time::Duration};
+use std::{collections::HashSet, thread, time::Duration};
 
 use crate::test_framework::*;
 
@@ -232,6 +232,14 @@ fn separated_utxo_coin_selection(world: &mut World) {
             !selection_1.is_empty(),
             "Test Case 1: Expected non-empty selection"
         );
+        // Regular is tried first, so swapping the pool order would pull swap coins here.
+        assert!(
+            selection_1
+                .iter()
+                .all(|(_, info)| matches!(info, UTXOSpendInfo::SeedCoin { .. })),
+            "Test Case 1: Expected only regular (SeedCoin) UTXOs, got {:?}",
+            selection_1
+        );
 
         // Test Case 2: regular < target < swap (should use only swap UTXOs)
         let target_2 = Amount::from_sat(28000000); // 28M sats
@@ -253,6 +261,13 @@ fn separated_utxo_coin_selection(world: &mut World) {
         assert!(
             !selection_2.is_empty(),
             "Test Case 2: Expected non-empty selection"
+        );
+        assert!(
+            selection_2
+                .iter()
+                .all(|(_, info)| matches!(info, UTXOSpendInfo::SweptCoin { .. })),
+            "Test Case 2: Expected only swap (SweptCoin) UTXOs, got {:?}",
+            selection_2
         );
 
         // Test Case 3: target > max(regular, swap) but < (regular + swap) (should fail - no mixing)
@@ -321,6 +336,13 @@ fn separated_utxo_coin_selection(world: &mut World) {
         );
 
         let selection_3_retry = result_3_retry.unwrap();
+        assert!(
+            selection_3_retry
+                .iter()
+                .all(|(_, info)| matches!(info, UTXOSpendInfo::SeedCoin { .. })),
+            "Test Case 3 retry: Expected only regular (SeedCoin) UTXOs, got {:?}",
+            selection_3_retry
+        );
         println!(
             "Successfully selected {} UTXOs with additional regular funds",
             selection_3_retry.len()
@@ -541,7 +563,7 @@ fn manual_coinselection(world: &mut World) {
     2c    | Both Enough      | amount < regular total < swap total     | 500,000  | None   | Ok -> Chooses R by default
     2d    | Not Enough Swap  | amount > swap total                     | 1,000,000| S      | Error -> insufficient funds
     2e    | Not Enough Reg   | amount > regular total                  | 1,000,000| R      | Error -> insufficient funds
-    2f    | Mixed            | amount < (regular + swap)               | 1,200,000| R + S  | Error -> Cannot be mixed
+    2f    | Mixed            | amount < (regular + swap)               | 900,000  | R + S  | Error -> Cannot be mixed
     -----------------------------------------------------------------------------------------------------------------------
 
     Legend:
@@ -612,6 +634,37 @@ fn manual_coinselection(world: &mut World) {
                 for (utxo, spend_info) in &selection {
                     println!(" - {} sats ({})", utxo.amount.to_sat(), spend_info);
                 }
+                // Manual selection pins the pool; with none, regular is tried first.
+                let expect_swept = selection_type == "S";
+                assert!(
+                    selection.iter().all(|(_, info)| if expect_swept {
+                        matches!(info, UTXOSpendInfo::SweptCoin { .. })
+                    } else {
+                        matches!(info, UTXOSpendInfo::SeedCoin { .. })
+                    }),
+                    "{}: expected only {} UTXOs, got {:?}",
+                    test_name,
+                    if expect_swept { "swap" } else { "regular" },
+                    selection
+                );
+                // Same fee model as coin_select: base tx + inputs + one P2TR
+                // target output, at the relay feerate in sats per weight unit.
+                let weight: u64 = 42
+                    + selection
+                        .iter()
+                        .map(|(_, info)| 164 + info.estimate_witness_size() as u64)
+                        .sum::<u64>()
+                    + (8 + 1 + 34) * 4;
+                let fee = (weight as f64 * MIN_RELAY_FEE_RATE / 4.0).ceil() as u64;
+                let total: u64 = selection.iter().map(|(u, _)| u.amount.to_sat()).sum();
+                assert!(
+                    total >= target_amount.to_sat() + fee,
+                    "{}: selected {} sats do not cover target {} + fee {}",
+                    test_name,
+                    total,
+                    target_amount.to_sat(),
+                    fee
+                );
             }
             (Err(e), "Error") => {
                 // Each error case names its own reason; any other error is a bug.
@@ -655,9 +708,11 @@ fn manual_coinselection(world: &mut World) {
 }
 
 /// A maker with fragmented liquidity cannot fund the requested 3 splits within
-/// the input budget, so the planner degrades to 1 split (7 inputs, the excess
-/// over the budget is maker-paid) and the swap still completes. The taker's
-/// log line "3 receivers, 1 senders" pins the degradation.
+/// the input budget, so the planner degrades to 1 split (6 inputs, the excess
+/// over the budget is maker-paid) and the swap still completes. On chain the
+/// maker's one funding tx gathers 6 coins, yet its contract output equals
+/// the forwardable amount less only the 2-input budget fee: the taker
+/// reimburses the budget and the maker pays the excess.
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal],
@@ -681,6 +736,7 @@ fn manual_coinselection(world: &mut World) {
 )]
 fn run_degraded_split_swap(world: &mut World, protocol: ProtocolVersion, params: SwapParams) {
     let swap_start_height = chain_tip(world.bitcoind()) + 1;
+    let max_input_budget = params.max_input_budget;
 
     world
         .taker_mut()
@@ -690,39 +746,112 @@ fn run_degraded_split_swap(world: &mut World, protocol: ProtocolVersion, params:
     let taker_balance = world.taker().balances();
     info!("Degraded-split taker balance: {:?}", taker_balance);
 
+    // The makers sweep their incoming coins after the taker returns; shutting
+    // down first could abort those sweeps and starve the wait below.
+    world.wait_makers_settled(Duration::from_secs(120));
     world.shutdown_makers();
-    let bitcoind = world.bitcoind();
-    match protocol {
-        ProtocolVersion::Legacy => {
-            assert_log!(world; { has "3 receivers, 1 senders" });
-        }
-        ProtocolVersion::Taproot => {
-            // The "receivers, senders" line is Legacy-only, so the degradation
-            // shows on-chain instead. Count alone would not prove the split:
-            // the taker's 3 splits spend one 0.05 BTC UTXO each, while the
-            // maker's single funding tx must gather its fragmented pool.
-            let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[4]);
-            let input_counts: Vec<usize> = depths[0]
-                .iter()
-                .map(|txid| {
-                    bitcoind
-                        .client
-                        .get_raw_transaction(txid, None)
-                        .unwrap()
-                        .input
-                        .len()
-                })
-                .collect();
-            assert_eq!(
-                input_counts.iter().filter(|&&n| n == 1).count(),
-                3,
-                "the taker must fund with 3 single-input splits: {input_counts:?}"
-            );
-            assert!(
-                input_counts.iter().any(|&n| n > 1),
-                "the maker's one funding tx must gather multiple inputs: {:?}",
-                input_counts
-            );
-        }
+    if protocol == ProtocolVersion::Legacy {
+        // Legacy also reports the message shape: 3 incoming, 1 outgoing.
+        assert_log!(world; { has "3 receivers, 1 senders" });
     }
+
+    // 4 funding txs (3 taker splits + 1 maker split), each contract swept
+    // once. The contract outputs are the funding outputs the sweeps spend;
+    // the rest is change.
+    let bitcoind = world.bitcoind();
+    let depths = wait_for_tx_depths(bitcoind, swap_start_height, &[4, 4]);
+    let swept: HashSet<OutPoint> = depths[1]
+        .iter()
+        .flat_map(|txid| {
+            bitcoind
+                .client
+                .get_raw_transaction(txid, None)
+                .unwrap()
+                .input
+                .into_iter()
+                .map(|input| input.previous_output)
+        })
+        .collect();
+    let contract_outputs = |txid: &bitcoin::Txid| -> Vec<u64> {
+        let tx = bitcoind.client.get_raw_transaction(txid, None).unwrap();
+        tx.output
+            .iter()
+            .enumerate()
+            .filter(|(vout, _)| swept.contains(&OutPoint::new(*txid, *vout as u32)))
+            .map(|(_, out)| out.value.to_sat())
+            .collect()
+    };
+    let input_count = |txid: &bitcoin::Txid| {
+        bitcoind
+            .client
+            .get_raw_transaction(txid, None)
+            .unwrap()
+            .input
+            .len()
+    };
+
+    // The taker's 3 splits spend one 0.05 BTC UTXO each; the maker's single
+    // split must gather 6 coins of its fragmented pool: the 400k coin plus
+    // five 20k ones reach the ~498k forwardable, four would not.
+    let (maker_funding, taker_funding): (Vec<_>, Vec<_>) =
+        depths[0].iter().partition(|txid| input_count(txid) > 1);
+    assert_eq!(
+        taker_funding.len(),
+        3,
+        "the taker must fund with 3 single-input splits"
+    );
+    assert_eq!(maker_funding.len(), 1, "the maker must fund 1 split");
+    let maker_funding = maker_funding[0];
+    assert_eq!(
+        input_count(maker_funding),
+        6,
+        "the maker's one split must spend 6 pool coins"
+    );
+
+    // Forwardable, as the maker computes it: incoming less the service fee
+    // (single hop, so the REFUND_LOCKTIME_BASE of 150 blocks) and the sweep
+    // price of the 3 incoming contracts.
+    let incoming: u64 = taker_funding
+        .iter()
+        .map(|txid| {
+            let outputs = contract_outputs(txid);
+            assert_eq!(outputs.len(), 1, "each taker split carries one contract");
+            outputs[0]
+        })
+        .sum();
+    let config = &world.makers()[0].inner().config;
+    let service_fee = (config.base_fee as f64
+        + incoming as f64 * config.amount_relative_fee_pct / 100.0
+        + incoming as f64 * 150.0 * config.time_relative_fee_pct / 100.0)
+        .ceil() as u64;
+    let sweep_fee = 3 * sweep_fee_policy_sats(protocol, MIN_RELAY_FEE_RATE).unwrap();
+    let forwardable = incoming - service_fee - sweep_fee;
+
+    // The taker reimburses the funding fee only up to the input budget, so
+    // the contract output is forwardable less the 2-input fee, not the
+    // 6-input one; the maker's change pays the rest.
+    let budget_fee = funding_fee_policy_sats(
+        max_input_budget as usize,
+        max_input_budget,
+        MIN_RELAY_FEE_RATE,
+    )
+    .unwrap();
+    let maker_contract = contract_outputs(maker_funding);
+    assert_eq!(
+        maker_contract,
+        vec![forwardable - budget_fee],
+        "maker contract must be forwardable {forwardable} less the {max_input_budget}-input fee {budget_fee}"
+    );
+    let (actual_fee, _) = tx_fee_and_vsize(bitcoind, maker_funding);
+    assert!(
+        actual_fee > budget_fee,
+        "the 6-input funding tx must cost more ({}) than the reimbursed {}",
+        actual_fee,
+        budget_fee
+    );
+    info!(
+        "Degraded split: incoming {incoming}, forwardable {forwardable}, maker contract {}, \
+         reimbursed fee {budget_fee}, actual fee {actual_fee}",
+        maker_contract[0]
+    );
 }

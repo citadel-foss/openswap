@@ -27,6 +27,18 @@ use std::{
 const RESULT_PENDING: u8 = 0;
 const RESULT_SUCCESS: u8 = 1;
 const RESULT_FAILED: u8 = 2;
+/// Failed at prepare: the maker turned the swap away before anything funded.
+const RESULT_REJECTED: u8 = 3;
+
+/// The balances after one outcome of the race, which either taker can win.
+struct RaceExpect {
+    /// Each taker's spendable loss: the winner's swap fees, and the loser's
+    /// whole swap amount, locked in its funded outgoing contract (which pays
+    /// the funding fee) until the timelock refunds it. A loser rejected at
+    /// prepare funded nothing and loses nothing.
+    taker_loss: [u64; 2],
+    maker_spendable: [u64; 2],
+}
 
 #[world_test(
     backend = BitcoindBackend,
@@ -36,19 +48,34 @@ const RESULT_FAILED: u8 = 2;
         legacy_limited_liquidity(
             protocol = ProtocolVersion::Legacy,
             maker_count = 2,
-            expected_maker_spendable = [1250473, 1250436],
+            taker1_wins = &RaceExpect {
+                taker_loss: [4048, 900_000],
+                maker_spendable: [1250473, 1250436],
+            },
+            taker2_wins = &RaceExpect {
+                taker_loss: [500_000, 3724],
+                maker_spendable: [1250572, 1250505],
+            },
         ),
         taproot_limited_liquidity(
             protocol = ProtocolVersion::Taproot,
             maker_count = 2,
-            expected_maker_spendable = [1250473, 1250436],
+            taker1_wins = &RaceExpect {
+                taker_loss: [3706, 900_000],
+                maker_spendable: [1250473, 1250436],
+            },
+            taker2_wins = &RaceExpect {
+                taker_loss: [500_000, 3458],
+                maker_spendable: [1250572, 1250505],
+            },
         ),
     ],
 )]
 fn concurrent_takers(
     world: &mut World,
     protocol: ProtocolVersion,
-    expected_maker_spendable: [u64; 2],
+    taker1_wins: &RaceExpect,
+    taker2_wins: &RaceExpect,
 ) {
     // Fund each taker thrice with one 0.05 BTC UTXO (0.15 total), one per call so
     // each lands on a distinct address.
@@ -73,6 +100,10 @@ fn concurrent_takers(
     );
 
     world.mine(1);
+    for taker in world.takers() {
+        taker.sync();
+    }
+    let before = world.balances();
 
     // Use atomics for thread-safe result tracking
     let result1 = AtomicU8::new(RESULT_PENDING);
@@ -106,7 +137,7 @@ fn concurrent_takers(
                 },
                 Err(e) => {
                     warn!("Taker 1 {:?} prepare failed: {:?}", protocol, e);
-                    r1.store(RESULT_FAILED, Relaxed);
+                    r1.store(RESULT_REJECTED, Relaxed);
                 }
             }
         });
@@ -134,7 +165,7 @@ fn concurrent_takers(
                 },
                 Err(e) => {
                     warn!("Taker 2 {:?} prepare failed: {:?}", protocol, e);
-                    r2.store(RESULT_FAILED, Relaxed);
+                    r2.store(RESULT_REJECTED, Relaxed);
                 }
             }
         });
@@ -154,7 +185,8 @@ fn concurrent_takers(
     );
 
     // With limited liquidity, we expect one to succeed and one to fail.
-    // Both are admitted; the loser's maker runs out of coins at funding.
+    // Usually both are admitted and the loser's maker runs out of coins at
+    // funding; under load the loser can instead be refused at prepare.
     assert_eq!(success_count, 1, "Exactly one taker should succeed");
     assert_log!(world; { has "InsufficientLiquidity" });
     assert_eq!(
@@ -180,9 +212,24 @@ fn concurrent_takers(
     // With the lower fee schedule, the earned maker fee does not fully offset
     // on-chain spend costs in this limited-liquidity scenario.
     let winner_contract = [r1, r2].map(|r| (r == RESULT_SUCCESS).then_some(0u64));
-    assert_balances!(world; {
-        takers: { contract: winner_contract },
-        makers: { contract: 0, spendable: expected_maker_spendable },
+    // The 3s stagger usually lets taker 1 fund first, but under load taker 2
+    // can win; each outcome has its own goldens.
+    // The loser can also be turned away at prepare, before it funds.
+    let expected = match (r1, r2) {
+        (RESULT_SUCCESS, RESULT_FAILED | RESULT_REJECTED) => taker1_wins,
+        (RESULT_FAILED | RESULT_REJECTED, RESULT_SUCCESS) => taker2_wins,
+        outcome => panic!("exactly one taker must win the race: {:?}", outcome),
+    };
+    let taker_loss: [u64; 2] = std::array::from_fn(|i| {
+        if [r1, r2][i] == RESULT_REJECTED {
+            0
+        } else {
+            expected.taker_loss[i]
+        }
+    });
+    assert_balances!(world, since before; {
+        takers: { contract: winner_contract, loss: taker_loss },
+        makers: { contract: 0, spendable: expected.maker_spendable },
     });
 
     info!(

@@ -12,7 +12,10 @@ use bitcoin::{
 };
 use openswap::{
     lightning::{InvoiceParams, LightningBackend, MockLightningBackend, Preimage},
-    maker::handlers::{handle_message, ConnectionState},
+    maker::{
+        handlers::{handle_message, ConnectionState, Maker as _},
+        lightning_handlers::LnDirection,
+    },
     protocol::{
         common_messages::{MakerToTakerMessage, TakerHello, TakerToMakerMessage},
         lightning_messages::{
@@ -91,10 +94,9 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
         .unwrap(),
     );
     match reply {
-        LightningMakerMessage::Reject(reject) => assert!(
-            reject.reason.contains("swap-out"),
-            "rejection should name the direction, got: {}",
-            reject.reason
+        LightningMakerMessage::Reject(reject) => assert_eq!(
+            reject.reason, "maker is not currently serving swap-out swaps",
+            "rejection should name the unserved direction"
         ),
         other => panic!("expected a swap-out rejection, got {}", other),
     }
@@ -132,6 +134,10 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
         LightningMakerMessage::SwapInAccept(accept) => assert_eq!(accept.swap_id, swap_id),
         other => panic!("expected SwapInAccept, got {}", other),
     }
+    let original = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .expect("the accepted swap-in is stored");
 
     // ---- Hostile terms are refused ----
     // A peer that asks for zero confirmations wants the maker to act on a
@@ -216,11 +222,32 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
         .unwrap(),
     );
     match reply {
-        LightningMakerMessage::Reject(reject) => assert!(
-            reject.reason.contains("already in progress"),
-            "a duplicate swap id should be refused, got: {}",
-            reject.reason
+        LightningMakerMessage::Reject(reject) => assert_eq!(
+            reject.reason, "a swap with this id is already in progress",
+            "a duplicate swap id should be refused"
         ),
         other => panic!("expected a duplicate-id rejection, got {}", other),
     }
+    // The refusal left the live swap-in's record, branch key included, as it
+    // was. Every field but `updated_at`, a watchdog pacing hint.
+    let stored = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .expect("the original swap is still stored");
+    assert_eq!(stored.direction, LnDirection::SwapIn);
+    assert_eq!(stored.phase, original.phase);
+    assert_eq!(stored.payment_hash, original.payment_hash);
+    assert_eq!(stored.amount, original.amount);
+    assert_eq!(stored.fee, original.fee);
+    assert_eq!(stored.locktime, original.locktime);
+    assert_eq!(stored.min_confirmations, original.min_confirmations);
+    assert_eq!(stored.htlc, original.htlc);
+    assert_eq!(stored.privkey, original.privkey);
+    assert_eq!(stored.invoice, original.invoice);
+    assert_eq!(stored.preimage, original.preimage);
+    assert_eq!(stored.refund_txid, original.refund_txid);
+    assert_eq!(stored.accepted_height, original.accepted_height);
+    assert_eq!(stored.payout_script, original.payout_script);
+    assert_eq!(stored.funding, original.funding);
+    assert_eq!(stored.funding_height, original.funding_height);
 }

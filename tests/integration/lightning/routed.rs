@@ -106,14 +106,31 @@ fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) 
 
     // Maker 1 must have bounded the Lightning route's CLTV budget rather
     // than paying with LDK's 1008-block default: its own refund window is
-    // only `locktime` blocks away.
+    // only `locktime` blocks away. Hop 1's locktime is the requested 60 plus
+    // the taker's 48-block routed-hop margin, and the maker budgets what is
+    // left of it after the funding's age, minus its 12-block safety margin.
+    // The age at payment time lies between zero and the funding's age now.
     let bound = ln1
         .last_pay_cltv_bound()
         .expect("first maker must bound its route CLTV");
+    let funding_info = bitcoind
+        .client
+        .get_raw_transaction_info(&report.funding_outpoint.txid, None)
+        .unwrap();
+    let funding_height = bitcoind
+        .client
+        .get_block_header_info(&funding_info.blockhash.expect("hop 1 funding confirmed"))
+        .unwrap()
+        .height as u32;
+    let age_now = bitcoind.client.get_block_count().unwrap() as u32 - funding_height;
+    let max_bound = 60 + 48 - 12;
     assert!(
-        bound < 1008 && bound > 0,
-        "route CLTV bound {} must be derived from the hop's locktime",
-        bound
+        bound <= max_bound && bound >= max_bound.saturating_sub(age_now),
+        "route CLTV bound {} must be hop 1's remaining locktime minus the margin \
+         (between {} and {})",
+        bound,
+        max_bound.saturating_sub(age_now),
+        max_bound
     );
 
     // Both hops resolved: no recovery records left behind.

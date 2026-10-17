@@ -53,8 +53,14 @@ enum Ending {
 ///
 /// The last maker completes the contract exchange, then broadcasts its outgoing
 /// contract transactions and closes the connection; each case's ending decides
-/// how the swap settles from there. This is the only scenario driving the
-/// taker's breach detector, so `tor_maker_broadcasts_contract` runs it over Tor too.
+/// how the swap settles from there. `tor_maker_broadcasts_contract` runs it over
+/// Tor and asserts the same balances.
+///
+/// The taker's breach detector cannot see this breach: it watches only the
+/// taker's own funding, and the faulty maker is the last hop. It fires on the
+/// taker's own recovery broadcast instead, so only
+/// `breach_detected_after_watcher_exit` waits for it, to show the direct-query
+/// fallback still runs once the watcher is gone.
 #[world_test(
     makers = behaviors.len(),
     maker_behaviors = behaviors,
@@ -117,7 +123,7 @@ enum Ending {
             expect_direct_breach_detection = false,
             ending = Ending::MiddleMakerDies,
         ),
-        /// Malicious contract broadcast over Tor, exercising the taker's breach detector.
+        /// Malicious contract broadcast over Tor.
         #[ignore = "requires a bootstrapped tor and OPENSWAP_TOR_IT=1"]
         tor_maker_broadcasts_contract(
             backend = TorElectrumBackend,
@@ -340,6 +346,8 @@ fn run_contract_breach<B: TestBackend>(
     ],
 )]
 fn taker_broadcasts_contract_after_full_setup(world: &mut World) {
+    let before = world.balances();
+
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -360,16 +368,23 @@ fn taker_broadcasts_contract_after_full_setup(world: &mut World) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     world.taker().log_tracker_state();
 
-    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-    // 135s at 5 blocks/3s; 300s bounds the wait.
+    // 135s at 5 blocks/3s. Even back to back that is 165s, so 300s leaves about
+    // 135s of margin.
     // Makers recover their outgoing funds via timelock, losing some to the taker
     // maliciously broadcasting contracts.
     info!("Waiting for makers to recover their outgoing funds via timelock...");
     world.wait_makers_settled(Duration::from_secs(300));
     world.sync_makers();
-    assert_balances!(world; {
-        makers: { regular: [14998419, 14998419], swap: 0, contract: 0, fidelity: BOND },
+    assert_balances!(world, since before; {
+        makers: {
+            regular: [14998419, 14998419],
+            swap: 0,
+            contract: 0,
+            fidelity: BOND,
+            loss: [1338, 1338],
+        },
     });
 
     // Wait for taker's background recovery loop to finish
@@ -381,8 +396,11 @@ fn taker_broadcasts_contract_after_full_setup(world: &mut World) {
     world.mine(1);
     world.taker().sync();
 
-    // Only the contract and fidelity balances are asserted here.
-    assert_balances!(world; { taker: { contract: 0, fidelity: 0 } });
+    // As in `taproot_drop_after_full_setup`, the makers refund whole and the
+    // taker absorbs the swap amount: nothing comes back to its swap wallet.
+    assert_balances!(world, since before; {
+        taker: { regular: 14500000, swap: 0, contract: 0, fidelity: 0, loss: 500000 },
+    });
 
     world.taker().log_tracker_state();
     info!("Malice1 test completed successfully!");
@@ -432,9 +450,10 @@ fn taproot_maker_broadcasts_contract(world: &mut World) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     world.taker().log_tracker_state();
 
-    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-    // 135s at 5 blocks/3s; 300s bounds the wait.
+    // 135s at 5 blocks/3s. Even back to back that is 165s, so 300s leaves about
+    // 135s of margin.
     info!("Waiting for makers to recover their contracts...");
     world.wait_makers_settled(Duration::from_secs(300));
     world.sync_makers();

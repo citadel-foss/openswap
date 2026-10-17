@@ -48,9 +48,10 @@ fn maker_drops_after_sweep(world: &mut World) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     world.taker().log_tracker_state();
 
-    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-    // 135s at 5 blocks/3s; 300s bounds the wait.
+    // 135s at 5 blocks/3s. Even back to back that is 165s, so 300s leaves about
+    // 135s of margin.
     info!("Waiting for makers to recover their contracts...");
     world.wait_makers_settled(Duration::from_secs(300));
     world.sync_makers();
