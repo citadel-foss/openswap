@@ -535,7 +535,7 @@ To back up the selected wallet (use `-w` to pick a non-default wallet), run:
 $ taker backup
 ```
 
-The backup is created in the current working directory as `<wallet_name>-backup.json`. Backups contain the master key and are always encrypted — you will be prompted interactively for a passphrase.
+The backup is created in the current working directory as `<wallet_name>-backup.json`. Backups contain the master key and are always encrypted. The command asks for two passphrases at hidden prompts. First it asks for your current wallet passphrase, even though the wallet is already unlocked: that fresh entry authorizes putting the seed phrase into the backup. Then it asks for a backup passphrase, which encrypts only the backup file.
 
 Backup and restore both need your Bitcoin Core or Electrum backend running and reachable. They stop with an error if it is not.
 
@@ -549,7 +549,7 @@ A new wallet seals its seed phrase in the wallet file and prints nothing. The ta
 $ taker -w <wallet_name> show-seed
 ```
 
-The command works offline and asks for the passphrase at a hidden prompt, never from `-p` or `--password-file`. It prints only to a terminal, not a pipe. Write the words down, then re-type the words it asks for.
+The command works offline and asks for the passphrase at a hidden prompt, never from `-p` or `--password-file`. It prints only to a terminal, not a pipe. Write the words down, then re-type the words it asks for. The command records the confirmation only when no other `taker` command is running on this wallet, and says so if it cannot. Wait for the other command to finish, then run `show-seed` again.
 
 A wallet made before phrases were stored has none, and `show-seed` says so. It never invents one. If you still have the original phrase, store it with `taker -w <wallet_name> attach-seed`. It accepts only the phrase that derives this wallet's key. Otherwise keep an encrypted backup, or sweep the coins to a new wallet.
 

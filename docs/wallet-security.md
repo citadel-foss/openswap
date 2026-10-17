@@ -130,9 +130,16 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   `--password-file`. The command prints only when stdout is a terminal and
   refuses a pipe or a redirect. It then asks you to re-type a few random
   words before it records the backup as confirmed. Showing the words alone
-  does not count.
-- **Docker.** The container prints no seed. Use `exec`:
-  `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`.
+  does not count. Only that last step writes, and only while no `makerd` or
+  `taker` runs on the wallet: each holds a shared lock on `<wallet>.lock`,
+  and the write takes the exclusive one on a fresh read of the file. A running
+  daemon would otherwise overwrite the change with its older state.
+  `attach-seed` is refused for the same reason.
+- **Docker.** The container prints no seed. Use `exec` to see the words:
+  `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`. To
+  record the confirmation or run `attach-seed`, stop the maker and use
+  `docker compose run --rm --no-deps --entrypoint makerd makerd -w
+  openswap-maker show-seed`.
 - **Per-call password (library).** `Wallet::get_wallet_mnemonic` takes the
   current wallet password on every call. A wrong or empty one fails. The
   phrase is opened just in time and nothing is cached. `take_new_mnemonic` is

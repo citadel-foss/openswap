@@ -113,7 +113,7 @@ Both commands run on their own and then exit. They do not start the maker. Both 
 $ makerd --password-file <path> backup -o maker-backup.json
 ```
 
-`--password-file` (or `-p`) is the wallet's own passphrase, needed to open the encrypted wallet and to read its seed phrase into the backup; it goes before `backup`. The command then asks for a backup password, which is separate: it encrypts only the backup file. It writes an encrypted file. Without `-o`, the file is `<wallet>-backup.json` in the current directory. The file always ends in `.json`: `-o maker.bak` writes `maker.json`. The log shows the path written. The command needs an existing wallet. It never creates one.
+`--password-file` (or `-p`) is the wallet's own passphrase. It only unlocks the wallet file at startup; it does not authorize the seed export. The command then asks for two more passphrases at hidden prompts. First it asks for the current wallet passphrase again, which opens the seed phrase to put it into the backup. Then it asks for a backup password, which is separate: it encrypts only the backup file. It writes an encrypted file. Without `-o`, the file is `<wallet>-backup.json` in the current directory. The file always ends in `.json`: `-o maker.bak` writes `maker.json`. The log shows the path written. The command needs an existing wallet. It never creates one.
 
 The backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. Finish open swaps first. Copy `<wallet>_swap_report.json` by hand. There is no backup command in `maker-cli`.
 
@@ -307,7 +307,7 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   $ makerd -w maker show-seed
   ```
 
-  The command works offline, asks for the passphrase at a hidden prompt, and refuses unless stdout is a terminal. In Docker, use `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`.
+  The command works offline, asks for the passphrase at a hidden prompt, and refuses unless stdout is a terminal. It shows the words and never writes while the maker runs. To record the confirmation, stop the maker first: it holds the wallet and would overwrite the change. In Docker, `docker exec -it openswap-makerd makerd -w openswap-maker show-seed` shows the words. To confirm, run `docker compose stop makerd`, then `docker compose run --rm --no-deps --entrypoint makerd makerd -w openswap-maker show-seed`, then start the maker again. With internal Tor the service is `makerd-internal`.
 
 - **Configuration File**: If no `config` file exists, `makerd` will create a default `config.toml` file at `$HOME/.openswap/maker/config.toml`:
 
