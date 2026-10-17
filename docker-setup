@@ -699,7 +699,7 @@ start_makerd() {
         print_warning "Seed not backed up yet. Once makerd is running, run:"
         print_warning "  docker exec -it openswap-makerd makerd -w ${BITCOIN_WALLET_NAME:-openswap-maker} show-seed"
         print_warning "It shows the words only. To record the confirmation, stop makerd first and run:"
-        print_warning "  docker compose run --rm --no-deps --entrypoint makerd $service -w ${BITCOIN_WALLET_NAME:-openswap-maker} show-seed"
+        print_warning "  docker compose -f docker-compose.yml -f docker/compose-seed.yml run --rm --no-deps --entrypoint makerd $service -w ${BITCOIN_WALLET_NAME:-openswap-maker} show-seed"
     fi
     
     if docker compose up -d; then

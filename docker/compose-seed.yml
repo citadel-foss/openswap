@@ -1,0 +1,10 @@
+# `show-seed` and `attach-seed` print or read the seed phrase; keep their
+# terminal output out of Docker's logs. Use with `docker compose run`:
+#   docker compose -f docker-compose.yml -f docker/compose-seed.yml run ...
+services:
+  makerd:
+    logging:
+      driver: none
+  makerd-internal:
+    logging:
+      driver: none

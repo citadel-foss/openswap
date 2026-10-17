@@ -125,21 +125,25 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   own key from the wallet password: a second blob next to the sealed master
   key. Loading a wallet never opens it.
 - **`show-seed`.** `taker show-seed` and `makerd show-seed` read the wallet
-  file offline. No backend is needed, nothing syncs and the file is never
-  written. The password comes from a hidden prompt, never from `-p` or
-  `--password-file`. The command prints only when stdout is a terminal and
+  file offline. No backend is needed, nothing syncs and the file is written
+  only by the confirmation step below. The password comes from a hidden
+  prompt, never from `-p` or `--password-file`. The command prints only when
+  stdout is a terminal and
   refuses a pipe or a redirect. It then asks you to re-type a few random
   words before it records the backup as confirmed. Showing the words alone
-  does not count. Only that last step writes, and only while no `makerd` or
-  `taker` runs on the wallet: each holds a shared lock on `<wallet>.lock`,
-  and the write takes the exclusive one on a fresh read of the file. A running
-  daemon would otherwise overwrite the change with its older state.
-  `attach-seed` is refused for the same reason.
+  does not count. Only that last step writes, and only while nothing else has
+  the wallet open: every open wallet (`makerd`, `taker`, the GUI or any
+  library caller) holds a shared lock on `<wallet>.lock`, and the write takes
+  the exclusive one on a fresh read of the file. A running process would
+  otherwise overwrite the change with its older state. `attach-seed` is
+  refused for the same reason.
 - **Docker.** The container prints no seed. Use `exec` to see the words:
   `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`. To
   record the confirmation or run `attach-seed`, stop the maker and use
-  `docker compose run --rm --no-deps --entrypoint makerd makerd -w
-  openswap-maker show-seed`.
+  `docker compose -f docker-compose.yml -f docker/compose-seed.yml run --rm
+  --no-deps --entrypoint makerd makerd -w openswap-maker show-seed`. The
+  extra file turns off Docker's logging for that run; a plain `docker compose
+  run` would copy every word into Docker's logs.
 - **Per-call password (library).** `Wallet::get_wallet_mnemonic` takes the
   current wallet password on every call. A wrong or empty one fails. The
   phrase is opened just in time and nothing is cached. `take_new_mnemonic` is
