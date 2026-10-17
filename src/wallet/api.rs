@@ -685,9 +685,14 @@ impl Wallet {
             io::stdout().is_terminal(),
             std::env::var_os("OPENSWAP_SEED_LOG_FREE").is_some(),
         )?;
+        // Refuse old Core before a wallet file and seed are written.
+        let blockchain = AnyBlockchain::from_config(backend)?;
+        if let AnyBlockchain::CoreRPC(core) = &blockchain {
+            core.require_v22()?;
+        }
         let mut wallet = Self::load_or_init(
             path,
-            AnyBlockchain::from_config(backend)?,
+            blockchain,
             password.as_mut().map(|p| std::mem::take(&mut **p)),
         )?;
         if let Some(mnemonic) = wallet.take_new_mnemonic() {

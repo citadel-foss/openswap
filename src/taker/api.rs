@@ -1094,8 +1094,8 @@ impl Taker {
         &self.wallet
     }
 
-    /// The config this taker was built from, so a caller can rebuild an
-    /// identical one after a shutdown.
+    /// The config this taker was built from. To rebuild after a shutdown,
+    /// provide the wallet password again in `TakerInitConfig::password`.
     pub fn config(&self) -> &TakerInitConfig {
         &self.config
     }

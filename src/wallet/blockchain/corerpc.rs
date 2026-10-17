@@ -791,6 +791,23 @@ mod tests {
         );
     }
 
+    /// A new CLI wallet refuses Core 0.21 before its file and seed are written.
+    #[test]
+    fn init_interactive_refuses_core_before_v22_without_a_wallet_file() {
+        let (core, server) = mock_core(vec![("getnetworkinfo", json!({ "version": 210100 }))]);
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("w");
+        let err = Wallet::init_interactive(
+            &path,
+            &BackendConfig::CoreRpc(core.config.clone()),
+            Some("pass".to_string()),
+        )
+        .expect_err("Core 0.21 must be refused");
+        assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
+        assert!(!path.exists());
+        assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
+    }
+
     /// The backup's backend probe refuses Core 0.21, so no backup file is left.
     #[test]
     fn backup_refuses_core_before_v22_without_a_backup_file() {
