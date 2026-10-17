@@ -857,11 +857,28 @@ impl Drop for RawModeGuard {
         let _ = disable_raw_mode();
     }
 }
+const PASSWORD_FILE_MAX: usize = 4096;
+
 /// Reads a wallet password from a file, dropping one trailing newline.
 /// Keeps the secret off the command line, where `/proc` shows it.
 pub fn read_password_file(path: &std::path::Path) -> io::Result<Zeroizing<String>> {
-    let mut password = Zeroizing::new(String::new());
-    fs::File::open(path)?.read_to_string(&mut password)?;
+    // Fixed capacity: a growing buffer would leave unwiped copies behind.
+    let mut raw = Zeroizing::new(Vec::with_capacity(PASSWORD_FILE_MAX + 1));
+    fs::File::open(path)?
+        .take(PASSWORD_FILE_MAX as u64 + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() > PASSWORD_FILE_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "password file is too large",
+        ));
+    }
+    let mut password =
+        Zeroizing::new(String::from_utf8(std::mem::take(&mut *raw)).map_err(|e| {
+            let mut bytes = e.into_bytes();
+            bytes.zeroize();
+            io::Error::new(io::ErrorKind::InvalidData, "password file is not UTF-8")
+        })?);
     if password.ends_with('\n') {
         password.pop();
         if password.ends_with('\r') {
@@ -1340,6 +1357,8 @@ mod tests {
         assert_eq!(*read("secret\n\n").unwrap(), "secret\n");
         assert!(read("").is_err());
         assert!(read("\n").is_err());
+        assert!(read(&"x".repeat(PASSWORD_FILE_MAX + 1)).is_err());
+        assert!(read(&"x".repeat(PASSWORD_FILE_MAX)).is_ok());
         assert!(read_password_file(&dir.path().join("missing")).is_err());
     }
 

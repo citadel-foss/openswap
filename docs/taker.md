@@ -146,7 +146,7 @@ If you build the taker with `--features lightning`, it also has the `ln-swap-in`
   - Pass your custom values using the `-r` and `-a` options, like this:
 
 ```bash
-  $ ./taker -r 127.0.0.1:38332 -a myuser:mypass -p my-wallet-passphrase <SUBCOMMAND>
+  $ ./taker -r 127.0.0.1:38332 -a myuser:mypass --password-file ./wallet.pass <SUBCOMMAND>
 ```
 
 > **Note:** Every `taker` command opens the encrypted wallet, so `-p` is required on each invocation. The tutorial's bare `taker <SUBCOMMAND>` examples assume it is supplied.

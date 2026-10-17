@@ -51,8 +51,8 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
 - The passphrase is supplied via `--password-file <path>` (or `-p`/`--PASSWORD`)
   on every start. Prefer the file: an argv password is visible to other users
   in `/proc/<pid>/cmdline`. The Docker setup passes its 0600 Compose secret
-  this way. There is no environment-variable fallback and nothing is persisted: a restart
-  always requires an operator to present the passphrase.
+  this way. There is no environment-variable fallback and nothing is
+  persisted: a restart always requires an operator to present the passphrase.
 
 ## Threat model
 
