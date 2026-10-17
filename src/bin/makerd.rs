@@ -111,7 +111,7 @@ enum Commands {
     /// Works offline on an existing wallet file: no backend is needed and the
     /// maker does not start. The passphrase is asked at a hidden prompt, never
     /// taken from `-p`. Runs only with stdout on a terminal. In Docker:
-    /// `docker exec -it openswap-makerd makerd show-seed --wallet openswap-maker`.
+    /// `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`.
     ShowSeed,
     /// Store the original seed phrase in a wallet that has none, then exit.
     ///
@@ -262,6 +262,17 @@ mod tests {
     #[test]
     fn plain_makerd_has_no_subcommand() {
         assert!(parse(&["-w", "m"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn seed_commands_take_the_wallet_flag_the_docs_print() {
+        let cli = parse(&["-w", "openswap-maker", "show-seed"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::ShowSeed)));
+        assert_eq!(cli.wallet_name.as_deref(), Some("openswap-maker"));
+        assert!(matches!(
+            parse(&["attach-seed"]).unwrap().command,
+            Some(Commands::AttachSeed)
+        ));
     }
 
     #[test]

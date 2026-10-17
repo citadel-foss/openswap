@@ -298,16 +298,13 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   $ ./makerd -a user:password -r 127.0.0.1:38332 -p my-wallet-passphrase
   ```
 
-  On creation, the wallet's mnemonic seed phrase is displayed once on the terminal — back it up securely before continuing:
+  On creation, the wallet's seed phrase is sealed in the wallet file and not printed. `makerd` warns on every start until you back it up. Run `makerd -w <wallet> show-seed` in a terminal, write the words down, and re-type the words it asks for:
 
   ```bash
-  INFO openswap::wallet::api - New Wallet created at : "$HOME/.openswap/maker/wallets/maker"
-
-  ========== New Wallet Seed Phrase ==========
-  harvest trust catalog degree oxygen business crawl enemy hamster music this idle
-
-  Write these words down and store them offline. They will not be shown again.
+  $ makerd -w maker show-seed
   ```
+
+  The command works offline, asks for the passphrase at a hidden prompt, and refuses unless stdout is a terminal. In Docker, use `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`.
 
 - **Configuration File**: If no `config` file exists, `makerd` will create a default `config.toml` file at `$HOME/.openswap/maker/config.toml`:
 

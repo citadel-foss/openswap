@@ -697,7 +697,7 @@ start_makerd() {
         docker compose run --rm --no-deps \
             -e MAKER_INIT_ONLY=1 "$service" || { print_error "Wallet creation failed"; exit 1; }
         print_warning "Seed not backed up yet. Once makerd is running, run:"
-        print_warning "  docker exec -it openswap-makerd makerd show-seed --wallet openswap-maker"
+        print_warning "  docker exec -it openswap-makerd makerd -w openswap-maker show-seed"
     fi
     
     if docker compose up -d; then

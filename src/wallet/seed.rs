@@ -116,6 +116,7 @@ impl Wallet {
             WalletError::General("cleartext wallet files are not supported".to_string())
         })?;
         store.master_key.seal(&store_enc_material)?;
+        // Building the client opens no connection, and nothing here calls it.
         let blockchain =
             AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default()))?;
         Ok(Self {

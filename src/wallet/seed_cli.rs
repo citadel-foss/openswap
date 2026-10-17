@@ -36,7 +36,7 @@ fn answer_matches(words: &str, position: usize, answer: &str) -> bool {
     words
         .split(' ')
         .nth(position)
-        .is_some_and(|word| word == answer.trim().to_lowercase())
+        .is_some_and(|word| word.eq_ignore_ascii_case(answer.trim()))
 }
 
 /// Shows the wallet's seed phrase on the terminal. While the wallet isn't

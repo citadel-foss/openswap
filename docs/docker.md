@@ -112,7 +112,7 @@ The setup script will prompt for:
 
 The script saves your settings and RPC password in `.docker-config`. It keeps the wallet passphrase in a separate 0600 `.docker-wallet-passphrase` file. It passes the passphrase to the maker as a Docker secret. Keep both files private. On your next run, the script moves any older wallet passphrase out of `.docker-config`.
 
-On the first start, run `./docker-setup start` in a terminal. The script creates the wallet in an attached container with Docker logging disabled. Write down the seed phrase shown there. The script then starts the maker in the background. A new wallet refuses to start without a terminal, before it writes a wallet file.
+On the first start, run `./docker-setup start`. The script creates the wallet and starts the maker in the background. It prints no seed phrase. Once the maker runs, show the seed and confirm your backup: `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`. The command needs a terminal and asks for the passphrase at a hidden prompt. The maker warns in its log until you confirm.
 
 ## Building Docker Images
 
@@ -147,8 +147,8 @@ Run the maker daemon with persistent data storage:
 # Using the setup script (recommended)
 ./docker-setup start
 
-# First create a new wallet in a terminal, without Docker logs
-docker run --rm -it --log-driver none -e OPENSWAP_SEED_LOG_FREE=1 \
+# First create the wallet (no seed is printed)
+docker run --rm \
   --network host \
   -v openswap-maker-data:/home/openswap/.openswap \
   openswap/openswap:latest makerd \
@@ -197,8 +197,8 @@ Run taker operations:
 # Using the setup script
 ./docker-setup taker --help
 
-# Or manually; a new wallet shows its seed only without Docker logs
-docker run --rm -it --log-driver none -e OPENSWAP_SEED_LOG_FREE=1 \
+# Or manually
+docker run --rm \
   -v openswap-taker-data:/home/openswap/.openswap \
   --network host \
   openswap/openswap:latest taker --help
