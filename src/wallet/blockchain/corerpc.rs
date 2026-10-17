@@ -794,7 +794,7 @@ mod tests {
     /// A new CLI wallet refuses Core 0.21 before its file and seed are written.
     #[test]
     fn init_interactive_refuses_core_before_v22_without_a_wallet_file() {
-        let (core, server) = mock_core(vec![("getnetworkinfo", json!({ "version": 210100 }))]);
+        let (core, server) = mock_core_v21();
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let path = dir.path().join("w");
         let err = Wallet::init_interactive(
@@ -805,7 +805,31 @@ mod tests {
         .expect_err("Core 0.21 must be refused");
         assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
         assert!(!path.exists());
-        assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
+        assert_eq!(
+            server.join().unwrap(),
+            ["getblockchaininfo", "getnetworkinfo", "getnetworkinfo"]
+        );
+    }
+
+    /// Library callers (`MakerServer::init`, `Taker::init`) create wallets
+    /// through `load_or_init`; Core 0.21 is refused there too, with no file.
+    #[test]
+    fn load_or_init_refuses_core_before_v22_without_a_wallet_file() {
+        let (core, server) = mock_core_v21();
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("w");
+        let err = Wallet::load_or_init(
+            &path,
+            AnyBlockchain::CoreRPC(core),
+            Some("pass".to_string()),
+        )
+        .expect_err("Core 0.21 must be refused");
+        assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
+        assert!(!path.exists());
+        assert_eq!(
+            server.join().unwrap(),
+            ["getblockchaininfo", "getnetworkinfo", "getnetworkinfo"]
+        );
     }
 
     /// The backup's backend probe refuses Core 0.21, so no backup file is left.

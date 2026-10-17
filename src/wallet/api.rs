@@ -473,6 +473,11 @@ impl Wallet {
         store_enc_material: KeyMaterial,
     ) -> Result<Self, WalletError> {
         let network = blockchain.get_blockchain_info()?.chain;
+        // Refuse old Core before a seed is generated or a wallet file is
+        // written, whichever caller creates the wallet.
+        if let AnyBlockchain::CoreRPC(core) = &blockchain {
+            core.require_v22()?;
+        }
 
         // Initialise wallet
         let file_name = path
@@ -685,14 +690,10 @@ impl Wallet {
             io::stdout().is_terminal(),
             std::env::var_os("OPENSWAP_SEED_LOG_FREE").is_some(),
         )?;
-        // Refuse old Core before a wallet file and seed are written.
-        let blockchain = AnyBlockchain::from_config(backend)?;
-        if let AnyBlockchain::CoreRPC(core) = &blockchain {
-            core.require_v22()?;
-        }
+        // `Wallet::init` refuses old Core before a wallet file and seed are written.
         let mut wallet = Self::load_or_init(
             path,
-            blockchain,
+            AnyBlockchain::from_config(backend)?,
             password.as_mut().map(|p| std::mem::take(&mut **p)),
         )?;
         if let Some(mnemonic) = wallet.take_new_mnemonic() {
