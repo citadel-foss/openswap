@@ -20,6 +20,8 @@
 mod corerpc;
 mod electrum;
 
+#[cfg(test)]
+pub(crate) use corerpc::tests::ZmqPublisher;
 pub use corerpc::{CoreRPC, CoreRpcConfig};
 #[cfg(test)]
 pub(crate) use electrum::SCRIPT_CACHE_TTL;
@@ -107,6 +109,10 @@ pub enum WatchEvent {
     BlockConnected(BlockRef),
     /// The server stopped answering, so block events may go missing until it does.
     Unreachable,
+    /// Notifications were detectably lost (a ZMQ sequence gap, a garbled
+    /// message, or a dropped socket), so watched outpoints must be re-checked
+    /// against the backend. Bitcoin Core only.
+    Missed,
 }
 
 /// Resolved backend selector. Built from the user's init config (the single

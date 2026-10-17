@@ -2,6 +2,8 @@
 //! a lazily-connected ZMQ subscriber for block/tx notifications.
 
 use std::{
+    collections::HashMap,
+    convert::TryFrom,
     net::{TcpStream, ToSocketAddrs},
     sync::Mutex,
     time::Duration,
@@ -71,17 +73,37 @@ impl Default for CoreRpcConfig {
 /// wallet's `CoreRPC` instance never does either, so it never opens a socket.
 /// The socket sits behind a `Mutex` so `CoreRPC` stays `Sync` (a bare
 /// `zmq::Socket` is not).
+///
+/// ZMQ drops messages silently (a full queue, a reconnect, a Core restart),
+/// so the subscriber checks Core's per-topic sequence numbers and flags any
+/// loss it can detect. A loss Core never numbers, such as a topic Core stops
+/// publishing, stays invisible here.
 struct ZmqSubscriber {
     addr: String,
-    socket: Mutex<Option<zmq::Socket>>,
+    state: Mutex<ZmqState>,
+}
+
+#[derive(Default)]
+struct ZmqState {
+    socket: Option<zmq::Socket>,
+    /// Last sequence number seen per topic. Kept when the socket is rebuilt,
+    /// so the first message after a reconnect is still checked against it.
+    last_sequence: HashMap<String, u32>,
+    /// Notifications were lost since the watcher last asked.
+    missed: bool,
 }
 
 impl ZmqSubscriber {
     fn new(addr: String) -> Self {
         Self {
             addr,
-            socket: Mutex::new(None),
+            state: Mutex::new(ZmqState::default()),
         }
+    }
+
+    /// Whether notifications were lost since the last call; clears the flag.
+    fn take_missed(&self) -> bool {
+        lock_debug!(self.state.lock()).is_ok_and(|mut state| std::mem::take(&mut state.missed))
     }
 
     /// Connect and subscribe to `rawtx`/`rawblock` if not already connected.
@@ -93,9 +115,9 @@ impl ZmqSubscriber {
     /// scan backstop the handshake window — without it, a transaction landing in
     /// that gap could be missed by both the scan and the ZMQ feed.
     fn ensure_connected(&self) -> Result<(), WalletError> {
-        let mut guard = lock_debug!(self.socket.lock())
+        let mut guard = lock_debug!(self.state.lock())
             .map_err(|_| WalletError::Zmq("ZMQ socket mutex poisoned".to_string()))?;
-        if guard.is_some() {
+        if guard.socket.is_some() {
             return Ok(());
         }
         let ctx = zmq::Context::new();
@@ -111,12 +133,13 @@ impl ZmqSubscriber {
         socket
             .set_subscribe(b"rawblock")
             .map_err(|e| WalletError::Zmq(format!("ZMQ subscribe rawblock: {e}")))?;
-        *guard = Some(socket);
+        guard.socket = Some(socket);
         Ok(())
     }
 
     /// Read the next raw ZMQ multipart message `(topic, payload)`, non-blocking.
-    /// Connects the SUB socket on first call. `None` means nothing was queued.
+    /// Connects the SUB socket on first call. `None` means nothing was queued,
+    /// or a message was lost, which [`Self::take_missed`] then reports.
     ///
     /// A transport error drops the socket so the next call reconnects —
     /// otherwise a dead socket would stay installed and notifications would
@@ -126,32 +149,52 @@ impl ZmqSubscriber {
             log::warn!("ZMQ connect {}: {e:?}", self.addr);
             return None;
         }
-        let mut guard = lock_debug!(self.socket.lock()).ok()?;
-        let received = {
-            let socket = guard.as_ref()?;
-            socket.recv_multipart(zmq::DONTWAIT)
-        };
-        let msg = match received {
+        let mut guard = lock_debug!(self.state.lock()).ok()?;
+        let state = &mut *guard;
+        let received = state.socket.as_ref()?.recv_multipart(zmq::DONTWAIT);
+        let mut msg = match received {
             Ok(msg) => msg,
             // The only non-failure outcome of a DONTWAIT recv: the queue is
             // empty right now. The socket stays healthy.
             Err(zmq::Error::EAGAIN) => return None,
             Err(e) => {
-                *guard = None;
+                // Whatever Core publishes before the reconnect is lost.
+                state.socket = None;
+                state.missed = true;
                 log::warn!("ZMQ recv {}: {e}", self.addr);
                 return None;
             }
         };
-        // Core publishes topic/body/sequence, so a shorter message is malformed.
-        if msg.len() < 2 {
+        // Core sends topic, body, and a 4-byte little-endian sequence number
+        // that counts each topic's messages separately.
+        let sequence = match msg.as_slice() {
+            [_, _, sequence] => <[u8; 4]>::try_from(sequence.as_slice())
+                .ok()
+                .map(u32::from_le_bytes),
+            _ => None,
+        };
+        let Some(sequence) = sequence else {
+            state.missed = true;
             log::warn!(
-                "ZMQ recv {}: malformed message with {} frames",
+                "ZMQ recv {}: malformed message with {} frames, treating it as lost",
                 self.addr,
                 msg.len()
             );
             return None;
+        };
+        let body = msg.swap_remove(1);
+        let topic = String::from_utf8_lossy(&msg[0]).to_string();
+        // `wrapping_add` keeps Core's u32::MAX -> 0 rollover continuous. Any
+        // other jump, including a reset to 0 when Core restarts, lost messages.
+        if let Some(last) = state.last_sequence.insert(topic.clone(), sequence) {
+            if sequence != last.wrapping_add(1) {
+                state.missed = true;
+                log::warn!(
+                    "ZMQ {topic} sequence went from {last} to {sequence}: notifications were lost or Core restarted"
+                );
+            }
         }
-        Some((String::from_utf8_lossy(&msg[0]).to_string(), msg[1].clone()))
+        Some((topic, body))
     }
 }
 
@@ -209,6 +252,24 @@ impl CoreRPC {
         Ok(self.rpc.get_block_header_info(block_hash)?.height as u64)
     }
 
+    /// Confirmations of `txid` on the active chain; `None` when Core does not
+    /// know it. A reorged-out transaction stays indexed under its stale block,
+    /// and Core reports it with 0 confirmations, like a mempool one.
+    pub(crate) fn tx_confirmations(&self, txid: &Txid) -> Result<Option<u32>, WalletError> {
+        match self.rpc.get_raw_transaction_info(txid, None) {
+            Ok(info) => Ok(Some(info.confirmations.unwrap_or(0))),
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -5 => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether the txindex has caught up with the chain. Until it has, Core
+    /// cannot find every mined transaction.
+    pub(crate) fn txindex_synced(&self) -> Result<bool, WalletError> {
+        let indexes: Value = self.rpc.call("getindexinfo", &[])?;
+        Ok(indexes["txindex"]["synced"].as_bool().unwrap_or(false))
+    }
+
     /// The node's `incrementalrelayfee` in sat/vB: what a replacement must
     /// add over the tx it replaces. `None` when the node does not report one.
     pub(crate) fn incremental_relay_feerate(&self) -> Result<Option<f64>, WalletError> {
@@ -223,13 +284,33 @@ impl CoreRPC {
         &self,
         outpoint: &OutPoint,
     ) -> Result<Option<Transaction>, WalletError> {
+        match self.mempool_spending_transaction(outpoint)? {
+            Some(tx) => Ok(Some(tx)),
+            None => self.mined_spending_transaction(outpoint),
+        }
+    }
+
+    /// The mempool transaction spending `outpoint`.
+    pub(crate) fn mempool_spending_transaction(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<Transaction>, WalletError> {
         let spends: Vec<SpendingPrevout> = self.rpc.call(
             "gettxspendingprevout",
             &[json!([{ "txid": outpoint.txid, "vout": outpoint.vout }])],
         )?;
-        if let Some(txid) = spends.first().and_then(|spend| spend.spendingtxid) {
-            return self.get_raw_transaction(&txid, None).map(Some);
+        match spends.first().and_then(|spend| spend.spendingtxid) {
+            Some(txid) => self.get_raw_transaction(&txid, None).map(Some),
+            None => Ok(None),
         }
+    }
+
+    /// The transaction spending `outpoint` in a block of the active chain,
+    /// found by scanning from the funding block.
+    pub(crate) fn mined_spending_transaction(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<Transaction>, WalletError> {
         if self
             .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))?
             .is_some()
@@ -598,7 +679,15 @@ impl Blockchain for CoreRPC {
     }
 
     fn poll_event(&self) -> Option<WatchEvent> {
-        let (topic, payload) = self.zmq.recv_event()?;
+        // A loss flagged while reading the previous message is reported
+        // before the next one, so the drain that read it also reports it.
+        if self.zmq.take_missed() {
+            return Some(WatchEvent::Missed);
+        }
+        let Some((topic, payload)) = self.zmq.recv_event() else {
+            // A garbled message or failed read yields no message, only the loss.
+            return self.zmq.take_missed().then_some(WatchEvent::Missed);
+        };
         match topic.as_str() {
             "rawtx" => Some(WatchEvent::TxSeen { raw_tx: payload }),
             "rawblock" => Some(WatchEvent::BlockConnected(BlockRef {
@@ -640,11 +729,13 @@ fn list_wallet_dir(client: &Client) -> Result<Vec<String>, WalletError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
+        collections::HashSet,
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
         thread,
+        time::Instant,
     };
 
     use super::*;
@@ -752,6 +843,165 @@ mod tests {
             ["getwalletinfo", "deriveaddresses", "getaddressinfo"],
             "a legacy wallet must not reach listdescriptors"
         );
+    }
+
+    /// Stands in for Core's ZMQ publisher.
+    pub(crate) struct ZmqPublisher {
+        socket: zmq::Socket,
+        pub(crate) addr: String,
+    }
+
+    impl ZmqPublisher {
+        pub(crate) fn bind(endpoint: &str) -> Self {
+            // XPUB rather than PUB: it reports incoming subscriptions, so a
+            // test can wait out the slow-joiner handshake instead of sleeping.
+            let socket = zmq::Context::new().socket(zmq::XPUB).unwrap();
+            socket.bind(endpoint).unwrap();
+            let addr = socket.get_last_endpoint().unwrap().unwrap();
+            Self { socket, addr }
+        }
+
+        /// Blocks until both topic subscriptions arrive; nothing published
+        /// after that is lost to the handshake. `poll` must call into the
+        /// subscriber: a SUB socket connects lazily and, after a reconnect,
+        /// only re-sends its subscriptions while its owner keeps calling it.
+        pub(crate) fn wait_for_subscriber(&self, mut poll: impl FnMut()) {
+            self.socket.set_rcvtimeo(50).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut topics = HashSet::new();
+            while topics.len() < 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "subscriber did not subscribe within 10s"
+                );
+                poll();
+                if let Ok(frame) = self.socket.recv_bytes(0) {
+                    if frame.first() == Some(&1) {
+                        topics.insert(frame[1..].to_vec());
+                    }
+                }
+            }
+        }
+
+        /// Publishes Core's three-frame message: topic, body, LE `u32` sequence.
+        pub(crate) fn publish(&self, topic: &str, body: &[u8], sequence: u32) {
+            self.send(&[topic.as_bytes(), body, &sequence.to_le_bytes()]);
+        }
+
+        pub(crate) fn send(&self, frames: &[&[u8]]) {
+            self.socket
+                .send_multipart(frames.iter().copied(), 0)
+                .unwrap();
+        }
+    }
+
+    /// A Core backend subscribed to `publisher`. The RPC side is never used.
+    fn subscribed_core(publisher: &ZmqPublisher) -> CoreRPC {
+        let core = CoreRPC::new(&CoreRpcConfig {
+            zmq_addr: publisher.addr.clone(),
+            ..CoreRpcConfig::default()
+        })
+        .unwrap();
+        publisher.wait_for_subscriber(|| assert!(core.poll_event().is_none()));
+        core
+    }
+
+    /// Polls until `messages` notifications have arrived, plus one more poll
+    /// to catch a loss flagged by the last of them. Returns the event kinds.
+    fn poll_kinds(core: &CoreRPC, messages: usize) -> Vec<&'static str> {
+        let kind = |event: &WatchEvent| match event {
+            WatchEvent::TxSeen { .. } => "tx",
+            WatchEvent::BlockConnected(_) => "block",
+            WatchEvent::Missed => "missed",
+            WatchEvent::Unreachable => "unreachable",
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut kinds = Vec::new();
+        while kinds.iter().filter(|k| **k != "missed").count() < messages {
+            assert!(Instant::now() < deadline, "only got {:?}", kinds);
+            match core.poll_event() {
+                Some(event) => kinds.push(kind(&event)),
+                None => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        kinds.extend(core.poll_event().as_ref().map(kind));
+        kinds
+    }
+
+    #[test]
+    fn zmq_sequence_gap_is_reported() {
+        let publisher = ZmqPublisher::bind("tcp://127.0.0.1:*");
+        let core = subscribed_core(&publisher);
+        for sequence in [0, 1, 3] {
+            publisher.publish("rawtx", b"tx", sequence);
+        }
+        assert_eq!(poll_kinds(&core, 3), ["tx", "tx", "tx", "missed"]);
+    }
+
+    #[test]
+    fn zmq_sequence_wraparound_is_not_a_gap() {
+        let publisher = ZmqPublisher::bind("tcp://127.0.0.1:*");
+        let core = subscribed_core(&publisher);
+        // The first message only sets the baseline, wherever Core's count is.
+        for sequence in [u32::MAX - 1, u32::MAX, 0, 1] {
+            publisher.publish("rawtx", b"tx", sequence);
+        }
+        assert_eq!(poll_kinds(&core, 4), ["tx", "tx", "tx", "tx"]);
+    }
+
+    #[test]
+    fn zmq_sequence_reset_is_reported() {
+        let publisher = ZmqPublisher::bind("tcp://127.0.0.1:*");
+        let core = subscribed_core(&publisher);
+        // A restarted Core counts from 0 again.
+        for sequence in [5, 6, 0] {
+            publisher.publish("rawblock", b"block", sequence);
+        }
+        assert_eq!(poll_kinds(&core, 3), ["block", "block", "block", "missed"]);
+    }
+
+    #[test]
+    fn zmq_topics_are_sequenced_independently() {
+        let publisher = ZmqPublisher::bind("tcp://127.0.0.1:*");
+        let core = subscribed_core(&publisher);
+        publisher.publish("rawtx", b"tx", 0);
+        publisher.publish("rawblock", b"block", 0);
+        publisher.publish("rawtx", b"tx", 1);
+        publisher.publish("rawblock", b"block", 1);
+        publisher.publish("rawtx", b"tx", 2);
+        assert_eq!(poll_kinds(&core, 5), ["tx", "block", "tx", "block", "tx"]);
+
+        publisher.publish("rawblock", b"block", 3);
+        assert_eq!(poll_kinds(&core, 1), ["block", "missed"]);
+    }
+
+    #[test]
+    fn zmq_malformed_message_is_reported_as_missed() {
+        let publisher = ZmqPublisher::bind("tcp://127.0.0.1:*");
+        let core = subscribed_core(&publisher);
+        publisher.publish("rawtx", b"tx", 0);
+        // No sequence frame, then a sequence frame of the wrong width.
+        publisher.send(&[b"rawtx", b"tx"]);
+        publisher.send(&[b"rawtx", b"tx", &[1, 0, 0]]);
+        publisher.publish("rawtx", b"tx", 1);
+        assert_eq!(poll_kinds(&core, 2), ["tx", "missed", "missed", "tx"]);
+    }
+
+    #[test]
+    fn zmq_publisher_restart_is_reported() {
+        let publisher = ZmqPublisher::bind("tcp://127.0.0.1:*");
+        let core = subscribed_core(&publisher);
+        publisher.publish("rawtx", b"tx", 0);
+        publisher.publish("rawtx", b"tx", 1);
+        assert_eq!(poll_kinds(&core, 2), ["tx", "tx"]);
+
+        // Core restarts on the same endpoint; libzmq reconnects on its own.
+        let addr = publisher.addr.clone();
+        drop(publisher);
+        let publisher = ZmqPublisher::bind(&addr);
+        publisher.wait_for_subscriber(|| assert!(core.poll_event().is_none()));
+        publisher.publish("rawtx", b"tx", 0);
+        assert_eq!(poll_kinds(&core, 1), ["tx", "missed"]);
     }
 
     #[test]
