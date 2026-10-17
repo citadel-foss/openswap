@@ -3,6 +3,8 @@
 //! and send-to-address, verifying correct wallet behavior through the command-line interface.
 
 use bitcoin::{address::NetworkChecked, Address, Amount};
+use openswap::wallet::Wallet;
+use zeroize::Zeroizing;
 
 use serde_json::{json, Value};
 use std::{
@@ -93,10 +95,25 @@ fn wallet_commands(node: &mut Node) {
 
     info!("Funding taker with 3 UTXOs of 1 BTC each");
     // Fund the taker with 3 utxos of 1 BTC each.
-    for _ in 0..3 {
-        // The command that creates the wallet may print a seed backup notice
-        // before its result, so the address is the last line.
+    for i in 0..3 {
         let output = taker_cli.execute(&["get-new-address"]);
+        if i == 0 {
+            // The first call created the wallet. Its output is the address
+            // alone, with none of the seed words.
+            let wallet = Wallet::open_offline(
+                &taker_cli.data_dir.join("wallets").join("test_wallet"),
+                Zeroizing::new("integration-test".to_string()),
+            )
+            .unwrap();
+            let phrase = wallet
+                .get_wallet_mnemonic(Zeroizing::new("integration-test".to_string()))
+                .unwrap()
+                .words();
+            assert_eq!(output.lines().count(), 1, "{output}");
+            for word in phrase.split(' ') {
+                assert!(!output.split_whitespace().any(|w| w == word));
+            }
+        }
         let taker_address = output.lines().last().unwrap();
 
         let taker_address: Address<NetworkChecked> =
