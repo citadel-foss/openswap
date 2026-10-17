@@ -183,8 +183,8 @@ impl Display for RpcMsgResp {
 
 #[cfg(test)]
 mod tests {
-    /// The RPC socket has no way to read the seed: the seed is only handed
-    /// out by local calls that need the wallet password.
+    /// A guard on this file only: no message here is named for the seed. The
+    /// seed is only handed out by local calls that need the wallet password.
     #[test]
     fn no_rpc_variant_carries_the_seed() {
         let source = include_str!("messages.rs");

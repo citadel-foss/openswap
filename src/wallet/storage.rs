@@ -788,6 +788,7 @@ mod tests {
             WalletStore::read_from_disk(&path, Some(password.to_string())).unwrap();
         read.write_to_disk(&path, &read_material.unwrap()).unwrap();
         let v2_bytes = std::fs::read(&path).unwrap();
+        // The old build's refusal is modelled by its v1 parser, not a real run.
         assert!(serde_cbor::from_slice::<EncryptedData>(&v2_bytes).is_err());
 
         let (again, _) = WalletStore::read_from_disk(&path, Some(password.to_string())).unwrap();
