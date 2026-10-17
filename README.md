@@ -74,6 +74,8 @@ Extensive functional testing simulates various protocol edge cases:
 ```console
 # needs nostr-rs-relay on PATH (cargo install nostr-rs-relay)
 # and cargo-nextest (cargo install cargo-nextest --locked)
+# and electrs for the Electrum tests:
+export ELECTRS_EXEC="$(tests/install_electrs.sh)"
 cargo nextest run --features integration-test
 ```
 

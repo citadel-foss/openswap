@@ -24,7 +24,7 @@ What a run needs:
 | --- | --- |
 | bitcoind 28.1 | downloaded once into `bin/`; `BITCOIND_TARBALL_FILE` points at a local tarball, `BITCOIND_DOWNLOAD_ENDPOINT` at a mirror |
 | nostr-rs-relay | `nostr-rs-relay` on `PATH`, or `OPENSWAP_TEST_NOSTR_RELAY_BIN` |
-| electrs 0.9.11 | the `electrsd` crate's bundled binary, or `ELECTRS_EXEC` |
+| electrs 0.9.11 | `ELECTRS_EXEC`, set with `export ELECTRS_EXEC="$(tests/install_electrs.sh)"` |
 | tor (Tor lane only) | a bootstrapped tor on control port 9051 / SOCKS 9050, `OPENSWAP_TOR_IT=1`, and `OPENSWAP_TOR_PASSWORD` if the control port needs one |
 
 `ELECTRS_LOG=1` prints electrs' stderr. Logs go to the test's `debug.log` and
