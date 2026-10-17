@@ -48,8 +48,10 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
 - `KeyMaterial` (the derived key) is zeroized on drop and its `Debug` output
   is redacted. `MasterKey`'s `Debug` is likewise redacted — before this
   change, `{:?}` on a wallet printed the master xpriv to logs.
-- The passphrase is supplied via `-p`/`--PASSWORD` on every start. There is
-  no environment-variable fallback and nothing is persisted: a restart
+- The passphrase is supplied via `--password-file <path>` (or `-p`/`--PASSWORD`)
+  on every start. Prefer the file: an argv password is visible to other users
+  in `/proc/<pid>/cmdline`. The Docker setup passes its 0600 Compose secret
+  this way. There is no environment-variable fallback and nothing is persisted: a restart
   always requires an operator to present the passphrase.
 
 ## Threat model

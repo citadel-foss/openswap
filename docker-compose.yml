@@ -81,7 +81,7 @@ services:
 
         echo "[DEBUG] Running: makerd -r $${BITCOIN_RPC_HOST} -z $${BITCOIN_ZMQ_ADDR} -w \"$$WALLET_NAME\""
 
-        set -- makerd -t "$${TOR_AUTH_PASSWORD}" -r $${BITCOIN_RPC_HOST} -z $${BITCOIN_ZMQ_ADDR} -a $${BITCOIN_RPC_AUTH} -w "$$WALLET_NAME" -p "$$(cat /run/secrets/wallet_passphrase)"
+        set -- makerd -t "$${TOR_AUTH_PASSWORD}" -r $${BITCOIN_RPC_HOST} -z $${BITCOIN_ZMQ_ADDR} -a $${BITCOIN_RPC_AUTH} -w "$$WALLET_NAME" --password-file /run/secrets/wallet_passphrase
         [ "$${MAKER_INIT_ONLY:-0}" != 1 ] || set -- "$$@" init-wallet
         exec "$$@"
     ports:

@@ -150,6 +150,7 @@ openswap taker::swap_tracker::tests::test_update_and_save
 openswap taker::taproot_verification::tests::rejects_wrong_internal_key
 openswap utill::tests::capped_fee_steps_down_until_the_output_relays
 openswap utill::tests::fee_at_rate_sats_rounds_fractional_rates_up
+openswap utill::tests::password_file_drops_one_trailing_newline
 openswap utill::tests::test_generate_maker_keys
 openswap utill::tests::test_hd_path_from_descriptor
 openswap utill::tests::test_hd_path_from_descriptor_failure_cases
@@ -375,11 +376,13 @@ openswap watch_tower::watcher::tests::block_heights_are_published_until_nothing_
 openswap watch_tower::watcher::tests::core_height_failure_queues_and_retries_block_discovery
 openswap watch_tower::watcher::tests::core_retry_removes_block_orphaned_by_reorg
 openswap watch_tower::watcher::tests::successful_core_retry_processes_and_removes_pending_block
+openswap::bin/makerd tests::password_file_excludes_the_argv_password
 openswap::bin/makerd tests::plain_makerd_has_no_subcommand
 openswap::bin/makerd tests::restore_and_backup_read_their_options
 openswap::bin/makerd tests::restore_needs_exactly_one_source
 openswap::bin/makerd tests::seed_commands_take_the_wallet_flag_the_docs_print
 openswap::bin/taker tests::bond_hint_rejects_malformed_values
+openswap::bin/taker tests::password_file_excludes_the_argv_password
 openswap::bin/taker tests::restore_needs_exactly_one_source
 openswap::bin/taker tests::restore_reads_options_and_keeps_wallet_name_unset
 openswap::integration cli::maker::rpc_server

@@ -104,7 +104,10 @@ Options:
           Sets the taker wallet's name. If the wallet file already exists, it will load that wallet. Default: taker-wallet
 
   -p, --PASSWORD <PASSWORD>
-          Password for the encryption of the wallet. Required when creating a new wallet (wallet files are always encrypted) and to open an encrypted one
+          Password for the encryption of the wallet. Required when creating a new wallet (wallet files are always encrypted) and to open an encrypted one. Visible to other users in /proc while the process runs; prefer `--password-file`
+
+      --password-file <PASSWORD_FILE>
+          Read the wallet password from this file (one trailing newline is dropped). Keeps the password off the command line
 
   -v, --verbosity <VERBOSITY>
           Sets the verbosity level of debug.log file

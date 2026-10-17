@@ -234,7 +234,10 @@ Options:
           Optional wallet name. If the wallet exists, load the wallet, else create a new wallet with the given name. Default: maker
 
   -p, --PASSWORD <PASSWORD>
-          Password for the encryption of the wallet. Required when creating a new wallet (wallet files are always encrypted) and to open an encrypted one
+          Password for the encryption of the wallet. Required when creating a new wallet (wallet files are always encrypted) and to open an encrypted one. Visible to other users in /proc while the process runs; prefer `--password-file`
+
+      --password-file <PASSWORD_FILE>
+          Read the wallet password from this file (one trailing newline is dropped). Keeps the password off the command line
 
   -h, --help
           Print help (see a summary with '-h')

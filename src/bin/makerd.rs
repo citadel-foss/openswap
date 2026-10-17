@@ -74,9 +74,18 @@ struct Cli {
     pub(crate) wallet_name: Option<String>,
     /// Password for the encryption of the wallet. Required when creating a
     /// new wallet (wallet files are always encrypted) and to open an
-    /// encrypted one.
+    /// encrypted one. Visible to other users in /proc while the process
+    /// runs; prefer `--password-file`.
     #[clap(name = "PASSWORD", long, short = 'p')]
     pub password: Option<String>,
+    /// Read the wallet password from this file (one trailing newline is
+    /// dropped). Keeps the password off the command line.
+    #[clap(
+        name = "PASSWORD_FILE",
+        long = "password-file",
+        conflicts_with = "PASSWORD"
+    )]
+    pub password_file: Option<PathBuf>,
     #[clap(subcommand)]
     command: Option<Commands>,
 }
@@ -143,10 +152,10 @@ fn main() -> Result<(), MakerError> {
         args.command,
         Some(Commands::ShowSeed | Commands::AttachSeed)
     ) {
-        if args.password.is_some() {
+        if args.password.is_some() || args.password_file.is_some() {
             return Err(MakerError::General(
                 "seed commands never take the passphrase on the command line; \
-                 leave out -p and type it at the prompt",
+                 leave out -p and --password-file and type it at the prompt",
             ));
         }
         let name = args.wallet_name.as_deref().unwrap_or("maker");
@@ -168,7 +177,10 @@ fn main() -> Result<(), MakerError> {
     // operator's wallet and fidelity bond.
     let wallet_name = args.wallet_name.unwrap_or_else(|| "maker".to_string());
     config.wallet_name = wallet_name.clone();
-    let mut wallet_password = args.password.map(Zeroizing::new);
+    let mut wallet_password = match &args.password_file {
+        Some(file) => Some(openswap::utill::read_password_file(file)?),
+        None => args.password.map(Zeroizing::new),
+    };
     config.password = None;
     if let Some(tor_auth) = args.tor_auth {
         config.tor_auth_password = tor_auth;
@@ -273,6 +285,13 @@ mod tests {
             parse(&["attach-seed"]).unwrap().command,
             Some(Commands::AttachSeed)
         ));
+    }
+
+    #[test]
+    fn password_file_excludes_the_argv_password() {
+        let cli = parse(&["--password-file", "/run/secrets/pw"]).unwrap();
+        assert_eq!(cli.password_file, Some(PathBuf::from("/run/secrets/pw")));
+        assert!(parse(&["-p", "x", "--password-file", "pw"]).is_err());
     }
 
     #[test]

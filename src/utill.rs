@@ -857,6 +857,26 @@ impl Drop for RawModeGuard {
         let _ = disable_raw_mode();
     }
 }
+/// Reads a wallet password from a file, dropping one trailing newline.
+/// Keeps the secret off the command line, where `/proc` shows it.
+pub fn read_password_file(path: &std::path::Path) -> io::Result<Zeroizing<String>> {
+    let mut password = Zeroizing::new(String::new());
+    fs::File::open(path)?.read_to_string(&mut password)?;
+    if password.ends_with('\n') {
+        password.pop();
+        if password.ends_with('\r') {
+            password.pop();
+        }
+    }
+    if password.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "password file is empty",
+        ));
+    }
+    Ok(password)
+}
+
 /// Returns the current time as seconds since the Unix epoch.
 /// Prompts the user for a password using the given prompt string.
 /// Temporarily disables canonical mode and echo to mask each typed
@@ -1305,6 +1325,23 @@ mod tests {
     use crate::protocol::common_messages::{MakerHello, MakerToTakerMessage, ProtocolVersion};
 
     use super::*;
+
+    #[test]
+    fn password_file_drops_one_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |content: &str| {
+            let path = dir.path().join("pw");
+            fs::write(&path, content).unwrap();
+            read_password_file(&path)
+        };
+        assert_eq!(*read("secret").unwrap(), "secret");
+        assert_eq!(*read("secret\n").unwrap(), "secret");
+        assert_eq!(*read("secret\r\n").unwrap(), "secret");
+        assert_eq!(*read("secret\n\n").unwrap(), "secret\n");
+        assert!(read("").is_err());
+        assert!(read("\n").is_err());
+        assert!(read_password_file(&dir.path().join("missing")).is_err());
+    }
 
     #[test]
     fn capped_fee_steps_down_until_the_output_relays() {

@@ -84,9 +84,19 @@ struct Cli {
 
     /// Password for the encryption of the wallet. Required when creating a
     /// new wallet (wallet files are always encrypted) and to open an
-    /// encrypted one.
+    /// encrypted one. Visible to other users in /proc while the process
+    /// runs; prefer `--password-file`.
     #[clap(name = "PASSWORD", long, short = 'p')]
     pub password: Option<String>,
+
+    /// Read the wallet password from this file (one trailing newline is
+    /// dropped). Keeps the password off the command line.
+    #[clap(
+        name = "PASSWORD_FILE",
+        long = "password-file",
+        conflicts_with = "PASSWORD"
+    )]
+    pub password_file: Option<PathBuf>,
 
     /// Sets the verbosity level of debug.log file
     #[arg(long, short = 'v', value_parser = ["off", "error", "warn", "info", "debug", "trace"], default_value = "info")]
@@ -478,10 +488,10 @@ fn main() -> Result<(), TakerError> {
     };
     // Offline: no config file, backend or wallet sync.
     if matches!(args.command, Commands::ShowSeed | Commands::AttachSeed) {
-        if wallet_password.is_some() {
+        if wallet_password.is_some() || args.password_file.is_some() {
             return Err(TakerError::General(
                 "seed commands never take the passphrase on the command line; \
-                 leave out -p and type it at the prompt"
+                 leave out -p and --password-file and type it at the prompt"
                     .to_string(),
             ));
         }
@@ -491,6 +501,9 @@ fn main() -> Result<(), TakerError> {
             _ => seed_cli::attach_seed(&path)?,
         }
         return Ok(());
+    }
+    if let Some(file) = &args.password_file {
+        wallet_password = Some(openswap::utill::read_password_file(file)?);
     }
     // Static settings live in the file (auto-created with defaults if missing).
     // Read it here, before the backend bakes the proxy address in, so a
@@ -1001,6 +1014,13 @@ mod tests {
                 .unwrap();
         assert!(material.is_some());
         assert_eq!(backup.file_name, "w1");
+    }
+
+    #[test]
+    fn password_file_excludes_the_argv_password() {
+        let cli = parse(&["--password-file", "/run/secrets/pw", "fetch-offers"]).unwrap();
+        assert_eq!(cli.password_file, Some(PathBuf::from("/run/secrets/pw")));
+        assert!(parse(&["-p", "x", "--password-file", "pw", "fetch-offers"]).is_err());
     }
 
     #[test]
