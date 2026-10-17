@@ -125,6 +125,7 @@ impl Wallet {
             store,
             store_enc_material,
             locked_utxos: HashSet::new(),
+            _in_use: None,
         })
     }
 

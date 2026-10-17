@@ -466,6 +466,7 @@ impl Wallet {
             KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
                 .expect("a passphrase always yields key material");
 
+        let in_use = super::seed_cli::WalletInUse::shared(wallet_path)?;
         // Initialise wallet
         // Counters and swept tags go into the first write, so a restore cut
         // short resumes with them rather than with defaults.
@@ -492,6 +493,7 @@ impl Wallet {
             store,
             store_enc_material: restored_enc_material,
             locked_utxos: std::collections::HashSet::new(),
+            _in_use: Some(in_use),
         })
     }
 

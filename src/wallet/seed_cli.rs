@@ -14,10 +14,10 @@ use zeroize::Zeroizing;
 use super::{api::Wallet, error::WalletError};
 use crate::utill::prompt_password;
 
-/// Held, shared, by every process that runs on a wallet file for as long as it
-/// runs. `show-seed` and `attach-seed` write only under the exclusive lock, on
-/// a fresh read, so they never overwrite a live daemon's newer state and the
-/// daemon's next save never erases what they wrote.
+/// Held, shared, by every `Wallet` built by init, load or restore, for as long
+/// as it lives. `show-seed` and `attach-seed` write only under the exclusive
+/// lock, on a fresh read, so they never overwrite a live owner's newer state
+/// and the owner's next save never erases what they wrote.
 pub struct WalletInUse {
     _file: File,
 }
@@ -51,7 +51,7 @@ impl WalletInUse {
     }
 
     /// Takes the wallet for writing, or `None` if any process runs on it.
-    fn exclusive_if_idle(wallet_path: &Path) -> Result<Option<Self>, WalletError> {
+    pub(crate) fn exclusive_if_idle(wallet_path: &Path) -> Result<Option<Self>, WalletError> {
         let failed = |e: io::Error| WalletError::General(format!("wallet lock failed: {e}"));
         let file = open_sentinel(wallet_path).map_err(failed)?;
         match file.try_lock() {

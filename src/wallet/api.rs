@@ -58,6 +58,7 @@ use super::{
     blockchain::{AnyBlockchain, BackendConfig, Blockchain, HdOrigin},
     error::WalletError,
     seed::{seal_mnemonic, SEED_NOT_BACKED_UP},
+    seed_cli::WalletInUse,
     storage::{AddressType, SecretXpriv, WalletStore},
     swapcoin::{contract_timelock, WatchOnlySwapCoin},
 };
@@ -100,6 +101,9 @@ pub struct Wallet {
     pub(crate) store_enc_material: KeyMaterial,
     /// Wallet-side set of outpoints excluded from coin selection.
     pub(crate) locked_utxos: HashSet<OutPoint>,
+    /// Shared lock on the wallet file for this owner's lifetime, so the
+    /// offline seed commands never write under it. `None` only offline.
+    pub(crate) _in_use: Option<WalletInUse>,
 }
 
 /// Manual impl: `AnyBlockchain` (and the encryption material) carry no useful
@@ -472,6 +476,7 @@ impl Wallet {
         let sealed_mnemonic = seal_mnemonic(&mnemonic, &master_key.0, network, &password)?;
         drop(mnemonic);
         drop(password);
+        let in_use = WalletInUse::shared(path)?;
         // WalletStore::init seals the master key before the first write, so
         // the plaintext key never reaches disk. The phrase is in that write.
         let store = WalletStore::init_with(
@@ -496,6 +501,7 @@ impl Wallet {
             store,
             store_enc_material,
             locked_utxos: HashSet::new(),
+            _in_use: Some(in_use),
         })
     }
 
@@ -543,6 +549,8 @@ impl Wallet {
             password = None;
         }
 
+        // Taken before the read, so a seed command can't write after it.
+        let in_use = WalletInUse::shared(path)?;
         let (mut store, store_enc_material) = match WalletStore::read_from_disk(
             path,
             password.as_mut().map(|p| std::mem::take(&mut **p)),
@@ -607,6 +615,7 @@ impl Wallet {
             store,
             store_enc_material,
             locked_utxos: HashSet::new(),
+            _in_use: Some(in_use),
         };
         wallet.warn_if_seed_not_backed_up();
         Ok(wallet)
@@ -4813,6 +4822,7 @@ pub(crate) mod test_support {
             store,
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
+            _in_use: None,
         }
     }
 }
@@ -5188,6 +5198,7 @@ mod restore_history_probe_tests {
             store,
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
+            _in_use: None,
         }
     }
 
@@ -5452,6 +5463,52 @@ mod restore_history_probe_tests {
             Wallet::master_key_from_mnemonic(&mnemonic, bitcoin::Network::Regtest).unwrap()
         );
         assert!(!loaded.seed_backed_up());
+    }
+
+    /// Every library owner holds the wallet lock while it lives, so the seed
+    /// commands refuse to write under it. The offline reader holds nothing.
+    #[test]
+    fn live_library_wallet_blocks_seed_command_writes() {
+        use crate::wallet::seed_cli::WalletInUse;
+
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet");
+        let url = start_stub(StdHashSet::new());
+        let backend =
+            || AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+        let password = || Zeroizing::new("test-password".to_string());
+        let idle = || WalletInUse::exclusive_if_idle(&path).unwrap().is_some();
+
+        let created = Wallet::init(&path, backend(), password()).unwrap();
+        assert!(!idle());
+        drop(created);
+        assert!(idle());
+
+        let loaded =
+            Wallet::load_or_init(&path, backend(), Some("test-password".to_string())).unwrap();
+        assert!(!idle());
+        let offline = Wallet::open_offline(&path, password()).unwrap();
+        drop(loaded);
+        assert!(idle());
+        drop(offline);
+
+        let phrase = Mnemonic::generate(12).unwrap().to_string();
+        let restored_path = temp_dir.path().join("restored");
+        let restored = Wallet::restore_from_mnemonic(
+            Zeroizing::new(phrase),
+            &restored_path,
+            &BackendConfig::Electrum(electrum_config(url.clone())),
+            RestoreOptions::default(),
+            password(),
+        )
+        .unwrap();
+        assert!(WalletInUse::exclusive_if_idle(&restored_path)
+            .unwrap()
+            .is_none());
+        drop(restored);
+        assert!(WalletInUse::exclusive_if_idle(&restored_path)
+            .unwrap()
+            .is_some());
     }
 
     /// A malformed blocklist aborts `Taker::init` immediately after the
@@ -5898,6 +5955,7 @@ mod timelock_reconcile_tests {
             store,
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
+            _in_use: None,
         }
     }
 
