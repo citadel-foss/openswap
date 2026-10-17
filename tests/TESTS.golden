@@ -266,6 +266,7 @@ openswap wallet::blockchain::electrum::tests::url_host_strips_scheme_and_port
 openswap wallet::blockchain::tests::watcher_config_fails_fast_only_on_a_direct_link
 openswap wallet::blockchain::tests::watcher_config_keeps_an_explicit_timeout
 openswap wallet::ffi::tests::an_unset_rate_pays_exactly_the_relay_floor
+openswap wallet::ffi::tests::gui_seed_calls_need_the_password_every_time
 openswap wallet::ffi::tests::the_floor_and_the_default_clear_the_rate_check
 openswap wallet::ffi::tests::unusable_fee_rates_are_refused
 openswap wallet::fidelity::test::a_forged_proof_is_named_as_forgery

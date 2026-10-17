@@ -186,6 +186,41 @@ impl Wallet {
         Ok(())
     }
 
+    /// The seed phrase for GUI/FFI applications to show the user. Wraps
+    /// [`Wallet::get_wallet_mnemonic`]: ask for the current wallet password
+    /// every time. The returned words are wiped on drop; copies the GUI
+    /// makes are not, so dispose of them once the user has written them down.
+    pub fn get_wallet_mnemonic_gui_app(
+        &self,
+        password: Option<String>,
+    ) -> Result<Zeroizing<String>, WalletError> {
+        let password = Zeroizing::new(password.unwrap_or_default());
+        Ok(self.get_wallet_mnemonic(password)?.words())
+    }
+
+    /// Stores the user's original phrase in a wallet that has none. Wraps
+    /// [`Wallet::attach_wallet_mnemonic`].
+    pub fn attach_wallet_mnemonic_gui_app(
+        &mut self,
+        password: Option<String>,
+        phrase: String,
+    ) -> Result<(), WalletError> {
+        let phrase = Zeroizing::new(phrase);
+        let password = Zeroizing::new(password.unwrap_or_default());
+        self.attach_wallet_mnemonic(password, phrase)
+    }
+
+    /// Records that the user wrote the seed phrase down, after the GUI has
+    /// shown it and checked a few re-typed words. Wraps
+    /// [`Wallet::confirm_seed_backup`].
+    pub fn confirm_seed_backup_gui_app(
+        &mut self,
+        password: Option<String>,
+    ) -> Result<(), WalletError> {
+        let password = Zeroizing::new(password.unwrap_or_default());
+        self.confirm_seed_backup(password)
+    }
+
     /// Checks whether wallet is encrypted or not.
     pub fn is_wallet_encrypted(wallet_path: &Path) -> Result<bool, WalletError> {
         if !wallet_path.exists() {
@@ -254,7 +289,7 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::api::test_support::test_wallet;
+    use crate::wallet::api::test_support::{test_wallet, test_wallet_with_key};
     use bitcoin::{
         secp256k1::{Keypair, Secp256k1, SecretKey},
         Address, Network,
@@ -301,6 +336,48 @@ mod tests {
                 err
             );
         }
+    }
+
+    /// Every GUI seed call needs the wallet password; a missing one is wrong.
+    #[test]
+    fn gui_seed_calls_need_the_password_every_time() {
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon \
+                              abandon abandon abandon abandon abandon about";
+        let dir = tempdir().unwrap();
+        let key = Wallet::master_key_from_mnemonic(
+            &bip39::Mnemonic::parse(PHRASE).unwrap(),
+            Network::Regtest,
+        )
+        .unwrap();
+        let mut wallet = test_wallet_with_key(&dir.path().join("wallet"), key);
+        let password = || Some("test-password".to_string());
+
+        assert!(matches!(
+            wallet.get_wallet_mnemonic_gui_app(password()),
+            Err(WalletError::MnemonicUnavailable)
+        ));
+        assert!(matches!(
+            wallet.attach_wallet_mnemonic_gui_app(None, PHRASE.to_string()),
+            Err(WalletError::WrongPassword)
+        ));
+        wallet
+            .attach_wallet_mnemonic_gui_app(password(), PHRASE.to_string())
+            .unwrap();
+        for wrong in [None, Some("wrong-password".to_string())] {
+            assert!(matches!(
+                wallet.get_wallet_mnemonic_gui_app(wrong.clone()),
+                Err(WalletError::WrongPassword)
+            ));
+            assert!(matches!(
+                wallet.confirm_seed_backup_gui_app(wrong),
+                Err(WalletError::WrongPassword)
+            ));
+        }
+        let words = wallet.get_wallet_mnemonic_gui_app(password()).unwrap();
+        assert_eq!(words.as_str(), PHRASE);
+        assert!(!wallet.seed_backed_up());
+        wallet.confirm_seed_backup_gui_app(password()).unwrap();
+        assert!(wallet.seed_backed_up());
     }
 
     #[test]
