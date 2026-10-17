@@ -166,6 +166,46 @@ fn wallet_commands(node: &mut Node) {
     info!("Taker CLI test completed successfully!");
 }
 
+/// `show-seed` is the only way to read the seed, so it must refuse a piped
+/// stdout and a passphrase on argv, and leave the wallet file untouched.
+#[world_test(backend = BitcoindBackend)]
+fn show_seed_refuses_pipes_and_argv_passwords(node: &mut Node) {
+    let taker_cli = TakerCli::new(node);
+    taker_cli.execute(&["get-new-address"]);
+    let data_dir = taker_cli.data_dir.to_str().unwrap();
+    let wallet_file = taker_cli.data_dir.join("wallets").join("test_wallet");
+    let before = fs::read(&wallet_file).unwrap();
+
+    let refused = |bin: &str, args: &[&str], needle: &str| {
+        let output = Command::new(bin).args(args).output().unwrap();
+        assert!(!output.status.success(), "{:?}", args);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(needle), "{:?}: {}", args, stderr);
+    };
+
+    // Stdout is a pipe here, and the passphrase is never read from argv.
+    let taker = env!("CARGO_BIN_EXE_taker");
+    let base = ["--data-directory", data_dir, "--WALLET", "test_wallet"];
+    let piped: Vec<&str> = base.iter().copied().chain(["show-seed"]).collect();
+    refused(taker, &piped, "terminal");
+    let argv: Vec<&str> = base
+        .iter()
+        .copied()
+        .chain(["--PASSWORD", "integration-test", "show-seed"])
+        .collect();
+    refused(taker, &argv, "command line");
+
+    let maker_dir = node.temp_dir().join("makerd");
+    let maker_dir = maker_dir.to_str().unwrap();
+    refused(
+        env!("CARGO_BIN_EXE_makerd"),
+        &["-d", maker_dir, "-p", "integration-test", "show-seed"],
+        "command line",
+    );
+
+    assert_eq!(fs::read(&wallet_file).unwrap(), before);
+}
+
 /// The CLI is the only place a maker's standing is put into words, so a state
 /// the binary stops printing would go unnoticed everywhere else.
 #[world_test(backend = BitcoindBackend)]

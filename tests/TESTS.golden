@@ -383,6 +383,7 @@ openswap::bin/taker tests::bond_hint_rejects_malformed_values
 openswap::bin/taker tests::restore_needs_exactly_one_source
 openswap::bin/taker tests::restore_reads_options_and_keeps_wallet_name_unset
 openswap::integration cli::maker::rpc_server
+openswap::integration cli::taker::show_seed_refuses_pipes_and_argv_passwords
 openswap::integration cli::taker::taker_cli_shows_maker_states
 openswap::integration cli::taker::wallet_commands
 openswap::integration fidelity::creation::bond_creation_and_redemption
