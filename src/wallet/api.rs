@@ -5454,23 +5454,46 @@ mod restore_history_probe_tests {
         assert!(!loaded.seed_backed_up());
     }
 
-    /// Once `init` returns, its first write already holds the phrase, so any
-    /// failure after it leaves a wallet whose seed can still be read offline.
+    /// A malformed blocklist aborts `Taker::init` immediately after the
+    /// wallet's first write. Its seed must survive that failed startup.
     #[test]
-    fn seed_is_readable_offline_right_after_init() {
+    fn seed_is_readable_after_taker_init_fails() {
+        use crate::{
+            blocklist::{blocklist_path, BlocklistError},
+            taker::{error::TakerError, Taker, TakerInitConfig},
+        };
+
         let temp_dir = tempdir().unwrap();
-        let path = temp_dir.path().join("new-wallet");
+        let data_dir = temp_dir.path().join("taker");
+        let path = data_dir.join("wallets").join("new-wallet");
         let url = start_stub(StdHashSet::new());
-        let backend = AnyBlockchain::Electrum(Electrum::new(&electrum_config(url)).unwrap());
         let password = || Zeroizing::new("test-password".to_string());
+        std::fs::write(blocklist_path(&data_dir), "{not valid json").unwrap();
+        assert!(!path.exists());
 
-        let created = Wallet::init(&path, backend, password()).unwrap();
-        let words = created.get_wallet_mnemonic(password()).unwrap().words();
-        drop(created);
+        let err = Taker::init(TakerInitConfig {
+            data_dir: Some(data_dir),
+            wallet_name: "new-wallet".to_string(),
+            backend: BackendConfig::Electrum(electrum_config(url)),
+            password: Some("test-password".to_string()),
+            check_blocklist: Some(true),
+            ..Default::default()
+        })
+        .err()
+        .expect("the blocklist must abort startup after the wallet was created");
+        assert!(matches!(err, TakerError::Blocklist(BlocklistError::IO(_))));
 
+        let first_write = std::fs::read(&path).unwrap();
         let offline = Wallet::open_offline(&path, password()).unwrap();
-        let read = offline.get_wallet_mnemonic(password()).unwrap().words();
-        assert_eq!(read, words);
+        let words = offline.get_wallet_mnemonic(password()).unwrap().words();
+        assert_eq!(words.split(' ').count(), 12);
+        let mnemonic = Mnemonic::parse(words.as_str()).unwrap();
+        assert_eq!(
+            offline.with_master_key(|key| Ok(*key)).unwrap(),
+            Wallet::master_key_from_mnemonic(&mnemonic, bitcoin::Network::Regtest).unwrap()
+        );
+        assert!(!offline.seed_backed_up());
+        assert_eq!(std::fs::read(&path).unwrap(), first_write);
     }
 
     /// Restore stores the phrase it was given, whatever its length.

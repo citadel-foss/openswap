@@ -200,25 +200,27 @@ fn show_seed_refuses_pipes_and_argv_passwords(node: &mut Node) {
         assert!(stderr.contains(needle), "{:?}: {}", args, stderr);
     };
 
-    // Stdout is a pipe here, and the passphrase is never read from argv.
-    let taker = env!("CARGO_BIN_EXE_taker");
-    let base = ["--data-directory", data_dir, "--WALLET", "test_wallet"];
-    let piped: Vec<&str> = base.iter().copied().chain(["show-seed"]).collect();
-    refused(taker, &piped, "terminal");
-    let argv: Vec<&str> = base
-        .iter()
-        .copied()
-        .chain(["--PASSWORD", "integration-test", "show-seed"])
-        .collect();
-    refused(taker, &argv, "command line");
-
-    let maker_dir = node.temp_dir().join("makerd");
-    let maker_dir = maker_dir.to_str().unwrap();
-    refused(
-        env!("CARGO_BIN_EXE_makerd"),
-        &["-d", maker_dir, "-p", "integration-test", "show-seed"],
-        "command line",
-    );
+    // Both binaries can read this wallet offline. A pipe is refused, and
+    // neither argv passwords nor password files may authorize seed commands.
+    let base = ["-d", data_dir, "-w", "test_wallet"];
+    for bin in [env!("CARGO_BIN_EXE_taker"), env!("CARGO_BIN_EXE_makerd")] {
+        let piped: Vec<&str> = base.iter().copied().chain(["show-seed"]).collect();
+        refused(bin, &piped, "terminal");
+        for command in ["show-seed", "attach-seed"] {
+            for credential in [
+                ["--PASSWORD", "integration-test"],
+                ["--password-file", "must-not-be-read"],
+            ] {
+                let argv: Vec<&str> = base
+                    .iter()
+                    .copied()
+                    .chain(credential)
+                    .chain([command])
+                    .collect();
+                refused(bin, &argv, "command line");
+            }
+        }
+    }
 
     assert_eq!(fs::read(&wallet_file).unwrap(), before);
 }

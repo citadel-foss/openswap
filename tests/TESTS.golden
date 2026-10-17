@@ -208,7 +208,7 @@ openswap wallet::api::restore_history_probe_tests::restore_from_mnemonic_uses_th
 openswap wallet::api::restore_history_probe_tests::restore_probe_bridges_a_long_run_of_emptied_addresses
 openswap wallet::api::restore_history_probe_tests::restore_probe_reports_a_window_cut_off_by_the_cap
 openswap wallet::api::restore_history_probe_tests::resumed_restore_checks_the_window_before_syncing
-openswap wallet::api::restore_history_probe_tests::seed_is_readable_offline_right_after_init
+openswap wallet::api::restore_history_probe_tests::seed_is_readable_after_taker_init_fails
 openswap wallet::api::restore_history_probe_tests::sync_does_not_enter_the_backend_after_shutdown
 openswap wallet::api::restore_history_probe_tests::window_cap_and_old_core_are_not_retried
 openswap wallet::api::swap_reservation_tests::a_reservation_survives_a_wallet_reload
