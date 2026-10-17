@@ -394,6 +394,7 @@ openswap watch_tower::watcher::tests::core_height_failure_queues_and_retries_blo
 openswap watch_tower::watcher::tests::core_retry_removes_block_orphaned_by_reorg
 openswap watch_tower::watcher::tests::failed_reconcile_stays_queued_and_retries
 openswap watch_tower::watcher::tests::failing_watch_does_not_starve_the_queue
+openswap watch_tower::watcher::tests::funding_lookup_racing_the_end_of_the_txindex_sync_stays_queued
 openswap watch_tower::watcher::tests::mempool_rival_cannot_replace_a_confirmed_spend_while_the_txindex_syncs
 openswap watch_tower::watcher::tests::missed_zmq_spend_is_recorded_after_a_sequence_gap
 openswap watch_tower::watcher::tests::never_broadcast_outpoint_leaves_the_queue
@@ -401,7 +402,9 @@ openswap watch_tower::watcher::tests::orphaned_spend_is_kept_until_its_replaceme
 openswap watch_tower::watcher::tests::reorged_out_spend_gives_way_to_the_spend_on_chain
 openswap watch_tower::watcher::tests::replaced_mempool_spend_is_recovered_while_the_txindex_syncs
 openswap watch_tower::watcher::tests::spend_found_ahead_of_the_txindex_is_confirmed_once_indexed
+openswap watch_tower::watcher::tests::spend_found_as_the_txindex_finishes_syncing_is_recorded_as_confirmed
 openswap watch_tower::watcher::tests::spend_leaving_the_mempool_mid_lookup_is_not_recorded_as_confirmed
+openswap watch_tower::watcher::tests::spend_reorged_out_during_the_txindex_sync_gives_way_to_the_mempool_spend
 openswap watch_tower::watcher::tests::spender_displaced_by_a_mined_rival_mid_lookup_is_not_recorded_as_confirmed
 openswap watch_tower::watcher::tests::successful_core_retry_processes_and_removes_pending_block
 openswap watch_tower::watcher::tests::undecided_watch_does_not_starve_the_queue
