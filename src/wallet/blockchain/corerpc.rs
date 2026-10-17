@@ -723,7 +723,7 @@ impl Blockchain for CoreRPC {
     }
 
     fn chain_name(&self) -> Result<String, WalletError> {
-        let name = self.rpc.get_blockchain_info()?.chain.to_string();
+        let name = super::chain_name_for(self.rpc.get_blockchain_info()?.chain).to_string();
         super::validate_chain_name(&name)?;
         Ok(name)
     }
@@ -870,14 +870,35 @@ pub(crate) mod tests {
         assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
     }
 
-    /// A Core 0.21 node answering only the backup/restore backend probe.
-    fn mock_core_v21() -> (CoreRPC, thread::JoinHandle<Vec<String>>) {
-        let info = json!({ "chain": "regtest", "blocks": 0, "headers": 0,
+    fn blockchain_info(chain: &str) -> Value {
+        json!({ "chain": chain, "blocks": 0, "headers": 0,
             "bestblockhash": "0".repeat(64), "difficulty": 0.0,
             "mediantime": 0, "verificationprogress": 1.0, "initialblockdownload": false,
-            "chainwork": "00", "size_on_disk": 0, "pruned": false, "warnings": "" });
+            "chainwork": "00", "size_on_disk": 0, "pruned": false, "warnings": "" })
+    }
+
+    #[test]
+    fn chain_name_maps_every_network() {
+        for (network, chain) in [
+            (Network::Bitcoin, "main"),
+            (Network::Testnet, "test"),
+            (Network::Testnet4, "testnet4"),
+            (Network::Signet, "signet"),
+            (Network::Regtest, "regtest"),
+        ] {
+            let (core, server) = mock_core(vec![
+                ("getblockchaininfo", blockchain_info(chain)),
+                ("getnetworkinfo", json!({ "version": 280100 })),
+            ]);
+            assert_eq!(core.chain_name().unwrap(), chain, "{network:?}");
+            server.join().unwrap();
+        }
+    }
+
+    /// A Core 0.21 node answering only the backup/restore backend probe.
+    fn mock_core_v21() -> (CoreRPC, thread::JoinHandle<Vec<String>>) {
         mock_core(vec![
-            ("getblockchaininfo", info),
+            ("getblockchaininfo", blockchain_info("regtest")),
             // Asked once by `get_blockchain_info` itself, once by the v22 gate.
             ("getnetworkinfo", json!({ "version": 210100 })),
             ("getnetworkinfo", json!({ "version": 210100 })),
