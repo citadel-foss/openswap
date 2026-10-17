@@ -655,6 +655,10 @@ fn run_maker_settles_an_incoming_its_own_sweep_spent(world: &mut World, params: 
     let mut sweeps = recovery(&victim).unwrap().incoming_swept;
     sweeps.sort();
     assert!(!sweeps.is_empty(), "Maker2 recorded no hashlock sweep");
+    assert!(
+        sweeps.windows(2).all(|pair| pair[0] != pair[1]),
+        "Maker2 recorded a hashlock sweep more than once"
+    );
     // Test builds stop a maker once its recovery is done.
     world.shutdown_maker(1);
     drop(victim);
