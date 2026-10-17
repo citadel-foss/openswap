@@ -273,7 +273,7 @@ impl KeyMaterial {
         ));
         // Constant time, so the comparison leaks nothing about the key.
         key.iter()
-            .zip(self.key)
+            .zip(self.key.iter())
             .fold(0, |diff, (a, b)| diff | (a ^ b))
             == 0
     }
