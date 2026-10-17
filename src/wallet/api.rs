@@ -462,6 +462,37 @@ fn require_seed_terminal(docker: bool, terminal: bool, log_free: bool) -> Result
     Ok(())
 }
 
+/// Shows a new wallet's seed phrase with `show`. If that fails, nobody saw
+/// the phrase, so the wallet file just written is removed and a rerun creates
+/// a fresh wallet with a new phrase. A loaded wallet has no phrase to show.
+fn show_new_seed_or_remove(
+    wallet: &mut Wallet,
+    show: impl FnOnce(&SecretMnemonic) -> io::Result<()>,
+) -> Result<(), WalletError> {
+    let Some(mnemonic) = wallet.take_new_mnemonic() else {
+        return Ok(());
+    };
+    let Err(e) = show(&mnemonic) else {
+        return Ok(());
+    };
+    drop(mnemonic);
+    let path = &wallet.wallet_file_path;
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            log::error!(
+                "Failed to display the new wallet seed phrase: {e}. \
+                 Removed the new wallet at {path:?}; run again to create a new one."
+            );
+            Err(WalletError::IO(e))
+        }
+        Err(remove_error) => Err(WalletError::General(format!(
+            "failed to display the new wallet seed phrase: {e}; could not remove \
+             the new wallet at {path:?} ({remove_error}); delete it and run again \
+             to get a new phrase"
+        ))),
+    }
+}
+
 impl Wallet {
     /// Initialize the wallet at a given path.
     ///
@@ -701,14 +732,7 @@ impl Wallet {
             AnyBlockchain::from_config(backend)?,
             password.as_mut().map(|p| std::mem::take(&mut **p)),
         )?;
-        if let Some(mnemonic) = wallet.take_new_mnemonic() {
-            print_new_wallet_seed(&mnemonic).inspect_err(|e| {
-                log::error!(
-                    "Failed to display new wallet seed phrase: {e}. \
-                     Delete the wallet and re-create it to get a new phrase."
-                );
-            })?;
-        }
+        show_new_seed_or_remove(&mut wallet, print_new_wallet_seed)?;
         // Save a tip, or the next load resumes this wallet as an unfinished restore.
         wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)
     }
@@ -5028,6 +5052,43 @@ mod prevout_contract_tests {
             wallet.take_new_mnemonic().is_none(),
             "the phrase must be dropped from the wallet after the first take"
         );
+    }
+
+    /// A seed phrase nobody saw must not stay behind in a wallet file.
+    #[test]
+    fn failed_seed_display_removes_the_new_wallet() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet.cbor");
+        let mut wallet = test_wallet(&path);
+        wallet.new_mnemonic = Some(SecretMnemonic(Mnemonic::generate(12).unwrap()));
+        assert!(path.exists());
+
+        let err = show_new_seed_or_remove(&mut wallet, |_| Err(io::Error::other("closed")))
+            .expect_err("a failed display must be reported");
+        assert!(matches!(err, WalletError::IO(_)), "{}", err);
+        assert!(!path.exists(), "the unseen wallet must be removed");
+    }
+
+    /// A shown phrase, or a loaded wallet without one, keeps the wallet file.
+    #[test]
+    fn shown_seed_or_loaded_wallet_keeps_the_wallet_file() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet.cbor");
+        let mut wallet = test_wallet(&path);
+        wallet.new_mnemonic = Some(SecretMnemonic(Mnemonic::generate(12).unwrap()));
+        let mut shown = 0;
+        show_new_seed_or_remove(&mut wallet, |_| {
+            shown += 1;
+            Ok(())
+        })
+        .unwrap();
+        show_new_seed_or_remove(&mut wallet, |_| {
+            shown += 1;
+            Err(io::Error::other("must not be called"))
+        })
+        .unwrap();
+        assert_eq!(shown, 1);
+        assert!(path.exists());
     }
 
     #[test]
