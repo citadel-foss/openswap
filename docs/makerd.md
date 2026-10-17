@@ -113,7 +113,7 @@ Both commands run on their own and then exit. They do not start the maker. Both 
 $ makerd --password-file <path> backup -o maker-backup.json
 ```
 
-`-p` is the wallet's own passphrase, needed to open the encrypted wallet; it goes before `backup`. The command then asks for a backup password, which is separate: it encrypts only the backup file. It writes an encrypted file. Without `-o`, the file is `<wallet>-backup.json` in the current directory. The file always ends in `.json`: `-o maker.bak` writes `maker.json`. The log shows the path written. The command needs an existing wallet. It never creates one.
+`--password-file` (or `-p`) is the wallet's own passphrase, needed to open the encrypted wallet and to read its seed phrase into the backup; it goes before `backup`. The command then asks for a backup password, which is separate: it encrypts only the backup file. It writes an encrypted file. Without `-o`, the file is `<wallet>-backup.json` in the current directory. The file always ends in `.json`: `-o maker.bak` writes `maker.json`. The log shows the path written. The command needs an existing wallet. It never creates one.
 
 The backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. Finish open swaps first. Copy `<wallet>_swap_report.json` by hand. There is no backup command in `maker-cli`.
 

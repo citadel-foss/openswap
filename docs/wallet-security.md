@@ -105,16 +105,72 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
 - **No cleartext formats**: unencrypted wallet files and unencrypted backups
   are rejected, not migrated. The project is pre-launch, so no legacy
   plaintext compatibility path exists.
-- **The BIP39 mnemonic** is shown once at wallet creation — record it offline.
-  The CLI shows it right after it creates the wallet file, before any later
-  startup step, and wipes it once shown. Library callers get it once from
-  `take_new_mnemonic`. It is a backup of your keys, not of your whole wallet state.
-  See "What a restore brings back" below.
+- **The BIP39 seed phrase** is sealed in the wallet file, in the same first
+  write that creates it. Nothing prints it at creation. Until you confirm a
+  backup, every start and CLI command warns "seed not backed up". Read it
+  with `show-seed` (see "The seed phrase" below). It is a backup of your
+  keys, not of your whole wallet state. See "What a restore brings back" below.
 - **Test builds** (`cfg(test)` / the `integration-test` feature) reduce
   PBKDF2 to 1 iteration for speed. Never use such a build with real funds.
 - **FFI**: `backup_wallet_gui_app`, `restore_wallet_gui_app` and the
   `Result`-returning `restore_wallet_from_backup_gui_app` and
   `restore_wallet_from_mnemonic_gui_app` all require a password; `is_wallet_encrypted` reports whether a file is encrypted.
+  `get_wallet_mnemonic_gui_app`, `attach_wallet_mnemonic_gui_app` and
+  `confirm_seed_backup_gui_app` are the GUI's seed calls. A GUI should force
+  show-and-confirm right after it creates a wallet.
+
+## The seed phrase
+
+- **Stored sealed.** The phrase is kept as BIP39 entropy, encrypted under its
+  own key from the wallet password: a second blob next to the sealed master
+  key. Loading a wallet never opens it.
+- **`show-seed`.** `taker show-seed` and `makerd show-seed` read the wallet
+  file offline. No backend is needed, nothing syncs and the file is never
+  written. The password comes from a hidden prompt, never from `-p` or
+  `--password-file`. The command prints only when stdout is a terminal and
+  refuses a pipe or a redirect. It then asks you to re-type a few random
+  words before it records the backup as confirmed. Showing the words alone
+  does not count.
+- **Docker.** The container prints no seed. Use `exec`:
+  `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`.
+- **Per-call password (library).** `Wallet::get_wallet_mnemonic` takes the
+  current wallet password on every call. A wrong or empty one fails. The
+  phrase is opened just in time and nothing is cached. `take_new_mnemonic` is
+  gone: nothing hands out the phrase at creation. Library callers show it
+  with `get_wallet_mnemonic`, then call `confirm_seed_backup`.
+- **Limits of wiping.** The words come back in a `Zeroizing<String>` that is
+  wiped on drop. Copies outside Rust are not wiped: a GUI string, terminal
+  scrollback, the clipboard, a screenshot, a core dump or swap. Dispose of
+  them once the user has written the words down.
+- **No RPC.** No maker RPC message carries the seed, so a stolen RPC cookie
+  cannot read it.
+- **`MnemonicUnavailable`.** A wallet with no stored phrase returns this
+  error. That covers wallets made before this change, v0.2.3 wallets and
+  wallets restored from a backup that has none. OpenSwap never generates a
+  phrase for an existing key. Run `attach-seed` with the original phrase,
+  keep an encrypted backup, or sweep the coins to a new wallet.
+- **Attach.** `attach-seed` (and `attach_wallet_mnemonic`) accepts a phrase
+  only if it derives the wallet's master key. It refuses a wrong phrase and
+  never overwrites a stored one.
+- **Backups.** A backup of a wallet with a stored phrase carries it inside
+  the backup's own encryption. Making the backup needs the current wallet
+  password. A restore seals the phrase again under the new wallet's password.
+  Old backups still restore, with the phrase unavailable.
+
+## Wallet file format version 2
+
+Storing the phrase needs a new file format. Older builds ignore fields they
+do not know, and would delete the sealed phrase on their next save. So the
+wallet file now uses a version 2 container that older builds cannot parse.
+They fail at load and never save.
+
+- The new build reads version 1 and version 2 files and refuses a higher
+  version. Loading never writes. The first save after a load writes version 2.
+- **Downgrade is not supported.** Once a new build has saved a wallet, an
+  older build refuses it. Keep an encrypted backup before you upgrade. To go
+  back, restore that backup with the older build.
+- A future password-change feature must re-encrypt the store and the sealed
+  phrase in one atomic write.
 
 ## What a restore brings back
 

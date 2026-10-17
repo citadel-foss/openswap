@@ -541,6 +541,18 @@ Backup and restore both need your Bitcoin Core or Electrum backend running and r
 
 A backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. If swaps are open, `taker backup` prints how many. Finish them first, and copy `<wallet_name>_swap_report.json` by hand. See [wallet security](wallet-security.md) for the full list.
 
+### Your Seed Phrase
+
+A new wallet seals its seed phrase in the wallet file and prints nothing. The taker warns on every command until you confirm a backup. Show the phrase and confirm it:
+
+```bash
+$ taker -w <wallet_name> show-seed
+```
+
+The command works offline and asks for the passphrase at a hidden prompt, never from `-p` or `--password-file`. It prints only to a terminal, not a pipe. Write the words down, then re-type the words it asks for.
+
+A wallet made before phrases were stored has none, and `show-seed` says so. It never invents one. If you still have the original phrase, store it with `taker -w <wallet_name> attach-seed`. It accepts only the phrase that derives this wallet's key. Otherwise keep an encrypted backup, or sweep the coins to a new wallet.
+
 ### Restoring a Wallet
 
 You can restore from a backup file or from your seed phrase.
