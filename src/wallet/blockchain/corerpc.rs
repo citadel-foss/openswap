@@ -861,7 +861,11 @@ mod tests {
         wallet.blockchain = AnyBlockchain::CoreRPC(core);
         let path = dir.path().join("backup.json");
         let err = wallet
-            .backup(&path, KeyMaterial::new_ephemeral())
+            .backup(
+                &path,
+                Zeroizing::new("test-password".to_string()),
+                KeyMaterial::new_ephemeral(),
+            )
             .expect_err("Core 0.21 must be refused");
         assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
         assert!(!path.exists());

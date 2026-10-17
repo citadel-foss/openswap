@@ -5076,8 +5076,12 @@ mod prevout_contract_tests {
 #[cfg(test)]
 mod restore_history_probe_tests {
     use super::*;
-    use crate::wallet::{
-        blockchain::Electrum, ffi::restore_wallet_from_backup_gui_app, BackendConfig,
+    use crate::{
+        security::{load_sensitive_struct, SerdeJson},
+        wallet::{
+            blockchain::Electrum, ffi::restore_wallet_from_backup_gui_app, storage::SecretEntropy,
+            BackendConfig, WalletBackup,
+        },
     };
     use bitcoin::{
         consensus::encode::serialize_hex,
@@ -5523,7 +5527,9 @@ mod restore_history_probe_tests {
         let password = "backup password".to_string();
         let backup = temp_dir.path().join("backup.json");
         let km = KeyMaterial::new_from_password(Some(password.clone())).unwrap();
-        wallet.write_backup(&backup, km).unwrap();
+        wallet
+            .write_backup(&backup, Zeroizing::new("test-password".to_string()), km)
+            .unwrap();
 
         let data_dir = temp_dir.path().join("fresh");
         restore_wallet_from_backup_gui_app(
@@ -5539,6 +5545,84 @@ mod restore_history_probe_tests {
             .join("wallets")
             .join(&wallet.store.file_name)
             .is_file());
+    }
+
+    /// A backup takes the phrase only past the current wallet password, and a
+    /// restore seals it again under the new wallet's own password. A backup
+    /// without one restores with none; one whose phrase doesn't derive its
+    /// key is refused before any file is written.
+    #[test]
+    fn backup_carries_the_phrase_to_the_restored_wallet() {
+        let temp_dir = tempdir().unwrap();
+        let backend = BackendConfig::Electrum(electrum_config(start_stub(StdHashSet::new())));
+        let password = |text: &str| Zeroizing::new(text.to_string());
+        let wallet = Wallet::init(
+            &temp_dir.path().join("source"),
+            AnyBlockchain::from_config(&backend).unwrap(),
+            password("test-password"),
+        )
+        .unwrap();
+        let phrase = wallet
+            .get_wallet_mnemonic(password("test-password"))
+            .unwrap()
+            .words();
+
+        let backup_file = temp_dir.path().join("backup.json");
+        let backup_gui = |wallet_password: Option<&str>| {
+            wallet.backup_wallet_gui_app(
+                backup_file.display().to_string(),
+                Some("backup password".to_string()),
+                wallet_password.map(str::to_string),
+            )
+        };
+        for wrong in [None, Some(""), Some("wrong-password")] {
+            let err = backup_gui(wrong).unwrap_err();
+            assert!(matches!(err, WalletError::WrongPassword), "{}", err);
+        }
+        assert!(!backup_file.exists());
+        backup_gui(Some("test-password")).unwrap();
+        let (mut backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
+            &backup_file,
+            Some("backup password".to_string()),
+        )
+        .unwrap();
+
+        let restore = |backup: &WalletBackup, name: &str| {
+            Wallet::restore_with(
+                backup,
+                &temp_dir.path().join(name),
+                &backend,
+                password("new-password"),
+                RestoreOptions::default(),
+            )
+        };
+        let restored = restore(&backup, "restored").unwrap();
+        let read = restored.get_wallet_mnemonic(password("new-password"));
+        assert_eq!(read.unwrap().words(), phrase);
+        assert!(matches!(
+            restored.get_wallet_mnemonic(password("test-password")),
+            Err(WalletError::WrongPassword)
+        ));
+        let (saved, _) = WalletStore::read_from_disk(
+            &temp_dir.path().join("restored"),
+            Some("new-password".to_string()),
+        )
+        .unwrap();
+        assert_eq!(saved.sealed_mnemonic, restored.store.sealed_mnemonic);
+        assert_ne!(saved.sealed_mnemonic, wallet.store.sealed_mnemonic);
+
+        let other = Mnemonic::generate(12).unwrap();
+        backup.mnemonic = Some(SecretEntropy::from_mnemonic(&other).unwrap());
+        let err = restore(&backup, "mismatched").unwrap_err();
+        assert!(matches!(err, WalletError::MnemonicMismatch), "{}", err);
+        assert!(!temp_dir.path().join("mismatched").exists());
+
+        backup.mnemonic = None;
+        let old = restore(&backup, "old").unwrap();
+        assert!(matches!(
+            old.get_wallet_mnemonic(password("new-password")),
+            Err(WalletError::MnemonicUnavailable)
+        ));
     }
 
     /// Proves a stopped sync returns before making its first backend request.

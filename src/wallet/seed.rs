@@ -68,9 +68,23 @@ pub(super) fn seal_mnemonic(
     network: Network,
     password: &str,
 ) -> Result<SealedSecret, WalletError> {
-    let entropy = SecretEntropy::from_mnemonic(mnemonic)?;
+    seal_entropy(
+        &SecretEntropy::from_mnemonic(mnemonic)?,
+        master_key,
+        network,
+        password,
+    )
+}
+
+/// Like [`seal_mnemonic`], for a phrase already held as entropy.
+pub(super) fn seal_entropy(
+    entropy: &SecretEntropy,
+    master_key: &Xpriv,
+    network: Network,
+    password: &str,
+) -> Result<SealedSecret, WalletError> {
     require_same_key(&entropy.to_mnemonic()?, master_key, network)?;
-    SealedSecret::seal(&entropy, password)
+    SealedSecret::seal(entropy, password)
         .map_err(|e| WalletError::General(format!("seed phrase sealing failed: {e:?}")))
 }
 
@@ -117,10 +131,7 @@ impl Wallet {
         if self.store.sealed_mnemonic.is_some() {
             return Err(WalletError::MnemonicAlreadyStored);
         }
-        // There is no sealed phrase to check it against, so check the file key.
-        if password.is_empty() || !self.store_enc_material.matches_password(&password) {
-            return Err(WalletError::WrongPassword);
-        }
+        self.require_file_password(&password)?;
         let mnemonic = parse_mnemonic(&phrase)?;
         drop(phrase);
         let sealed = self.with_master_key(|master_key| {
@@ -152,6 +163,29 @@ impl Wallet {
     /// Whether the user has confirmed writing the seed phrase down.
     pub fn seed_backed_up(&self) -> bool {
         self.store.seed_backed_up
+    }
+
+    /// The password check every master-key export passes. Returns the stored
+    /// seed entropy, if any, for the export to carry.
+    pub(super) fn unlock_export(
+        &self,
+        password: Zeroizing<String>,
+    ) -> Result<Option<SecretEntropy>, WalletError> {
+        if self.store.sealed_mnemonic.is_none() {
+            self.require_file_password(&password)?;
+            return Ok(None);
+        }
+        let mnemonic = self.get_wallet_mnemonic(password)?;
+        SecretEntropy::from_mnemonic(&mnemonic.0).map(Some)
+    }
+
+    /// For wallets with no sealed phrase to check `password` against: checks
+    /// it against the file key instead.
+    fn require_file_password(&self, password: &str) -> Result<(), WalletError> {
+        if password.is_empty() || !self.store_enc_material.matches_password(password) {
+            return Err(WalletError::WrongPassword);
+        }
+        Ok(())
     }
 }
 

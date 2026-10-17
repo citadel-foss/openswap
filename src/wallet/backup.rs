@@ -1,9 +1,7 @@
 use std::{borrow::Cow, collections::HashSet, env, ffi::OsStr, fs, io::Write, path::PathBuf};
 
 use crate::{
-    security::{
-        encrypt_struct, load_sensitive_struct, KeyMaterial, SealedSecret, SecurityError, SerdeJson,
-    },
+    security::{encrypt_struct, load_sensitive_struct, KeyMaterial, SecurityError, SerdeJson},
     utill::prompt_password,
     wallet::{Blockchain, Wallet, WalletError},
 };
@@ -11,8 +9,8 @@ use crate::{
 use super::{
     api::{ADDRESS_IMPORT_COUNT, MAX_WATCH_WINDOW, RESTORE_ADDRESS_GAP},
     blockchain::{AnyBlockchain, BackendConfig},
-    seed::seal_mnemonic,
-    storage::{SecretXpriv, WalletStore},
+    seed::seal_entropy,
+    storage::{SecretEntropy, SecretXpriv, WalletStore},
 };
 use bip39::Mnemonic;
 use bitcoin::{absolute::LockTime, Network, ScriptBuf};
@@ -142,6 +140,11 @@ pub struct WalletBackup {
     /// at least as wide as the unfinished one would have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) pending_gaps: Option<(u32, u32)>,
+    /// The seed phrase, if the wallet stores one. The backup file is
+    /// encrypted under the backup password; a restore seals the phrase again
+    /// under the new wallet's own key. Older backups restore without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) mnemonic: Option<SecretEntropy>,
 }
 impl std::fmt::Debug for WalletBackup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -150,13 +153,15 @@ impl std::fmt::Debug for WalletBackup {
             .finish_non_exhaustive()
     }
 }
-impl From<&Wallet> for WalletBackup {
-    fn from(wallet: &Wallet) -> Self {
-        WalletBackup {
+impl WalletBackup {
+    /// Exports `wallet`'s master key and seed phrase. Needs the current
+    /// wallet password, entered fresh: holding the unlocked wallet is not
+    /// enough. This is not the password that will encrypt the backup.
+    pub fn new(wallet: &Wallet, wallet_password: Zeroizing<String>) -> Result<Self, WalletError> {
+        let mnemonic = wallet.unlock_export(wallet_password)?;
+        Ok(WalletBackup {
             network: (wallet.store.network),
-            master_key: wallet
-                .with_master_key(|master_key| Ok(SecretXpriv(*master_key)))
-                .expect("in-memory master key unsealing failed"),
+            master_key: wallet.with_master_key(|master_key| Ok(SecretXpriv(*master_key)))?,
             wallet_birthday: (wallet.store.wallet_birthday),
             file_name: (wallet.store.file_name.clone()),
             fidelity_bonds: wallet
@@ -184,7 +189,8 @@ impl From<&Wallet> for WalletBackup {
                 .pending_restore
                 .as_ref()
                 .map(|o| (o.address_gap, o.bond_gap)),
-        }
+            mnemonic,
+        })
     }
 }
 impl Wallet {
@@ -208,16 +214,24 @@ impl Wallet {
     ///
     /// The backup is saved as a `.json` file, encrypted with the provided
     /// key material. Backups are always encrypted: they contain the master
-    /// key, so a cleartext-on-disk form is not supported by design.
-    pub fn backup(&self, path: &Path, backup_enc_material: KeyMaterial) -> Result<(), WalletError> {
+    /// key and seed phrase, so a cleartext-on-disk form is not supported by
+    /// design. `wallet_password` is the current wallet password, checked as
+    /// in [`WalletBackup::new`].
+    pub fn backup(
+        &self,
+        path: &Path,
+        wallet_password: Zeroizing<String>,
+        backup_enc_material: KeyMaterial,
+    ) -> Result<(), WalletError> {
         Self::require_backend(&self.blockchain)?;
-        self.write_backup(path, backup_enc_material)
+        self.write_backup(path, wallet_password, backup_enc_material)
     }
 
     /// The file-only part of [`Wallet::backup`], for tests with no backend.
     pub(crate) fn write_backup(
         &self,
         path: &Path,
+        wallet_password: Zeroizing<String>,
         backup_enc_material: KeyMaterial,
     ) -> Result<(), WalletError> {
         let mut backup_path = path.join("");
@@ -225,7 +239,7 @@ impl Wallet {
 
         log::info!("Backing up to {backup_path:?}");
 
-        let backup = WalletBackup::from(self);
+        let backup = WalletBackup::new(self, wallet_password)?;
 
         let encrypted = encrypt_struct(backup, &backup_enc_material)
             .map_err(|e| WalletError::General(format!("wallet backup encryption failed: {e:?}")))?;
@@ -255,13 +269,13 @@ impl Wallet {
         wallet_backup: &WalletBackup,
         wallet_path: &Path,
         backend_config: &BackendConfig,
-        restored_enc_material: KeyMaterial,
+        password: Zeroizing<String>,
     ) -> Result<Wallet, WalletError> {
         Self::restore_with(
             wallet_backup,
             wallet_path,
             backend_config,
-            restored_enc_material,
+            password,
             RestoreOptions::default(),
         )
     }
@@ -281,20 +295,22 @@ impl Wallet {
     /// restored inside it under `wallet_backup.file_name`. The method
     /// initializes the wallet store, connects to the blockchain backend,
     /// syncs wallet data, and saves the state to disk.
+    ///
+    /// `password` encrypts the new wallet file. If the backup holds the seed
+    /// phrase, it is sealed under the new wallet's own key from `password`.
     pub fn restore_with(
         wallet_backup: &WalletBackup,
         wallet_path: &Path,
         backend_config: &BackendConfig,
-        restored_enc_material: KeyMaterial,
+        password: Zeroizing<String>,
         options: RestoreOptions,
     ) -> Result<Wallet, WalletError> {
         let mut wallet = Self::restore_prepared(
             wallet_backup,
             wallet_path,
             backend_config,
-            restored_enc_material,
+            password,
             options,
-            None,
         )?;
         wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
         Ok(wallet)
@@ -305,35 +321,15 @@ impl Wallet {
         wallet_backup: WalletBackup,
         wallet_path: &Path,
         backend_config: &BackendConfig,
-        restored_enc_material: KeyMaterial,
+        password: Zeroizing<String>,
         options: RestoreOptions,
-    ) -> Result<Wallet, WalletError> {
-        Self::restore_owned_sealed(
-            wallet_backup,
-            wallet_path,
-            backend_config,
-            restored_enc_material,
-            options,
-            None,
-        )
-    }
-
-    /// Like [`Wallet::restore_owned_with`], also storing `sealed_mnemonic`.
-    fn restore_owned_sealed(
-        wallet_backup: WalletBackup,
-        wallet_path: &Path,
-        backend_config: &BackendConfig,
-        restored_enc_material: KeyMaterial,
-        options: RestoreOptions,
-        sealed_mnemonic: Option<SealedSecret>,
     ) -> Result<Wallet, WalletError> {
         let mut wallet = Self::restore_prepared(
             &wallet_backup,
             wallet_path,
             backend_config,
-            restored_enc_material,
+            password,
             options,
-            sealed_mnemonic,
         )?;
         drop(wallet_backup);
         wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
@@ -341,15 +337,21 @@ impl Wallet {
     }
 
     /// Creates the encrypted wallet before the scan, so owned restore secrets
-    /// can be dropped before syncing. `sealed_mnemonic` goes into the first write.
+    /// can be dropped before syncing. The sealed phrase goes into the first write.
     fn restore_prepared(
         wallet_backup: &WalletBackup,
         wallet_path: &Path,
         backend_config: &BackendConfig,
-        restored_enc_material: KeyMaterial,
+        mut password: Zeroizing<String>,
         mut options: RestoreOptions,
-        sealed_mnemonic: Option<SealedSecret>,
     ) -> Result<Wallet, WalletError> {
+        if password.is_empty() {
+            return Err(WalletError::General(
+                "wallet restore failed: a passphrase is required; \
+                 cleartext wallet files are not supported"
+                    .to_string(),
+            ));
+        }
         options.bond_hints.extend(&wallet_backup.fidelity_bonds);
         if let Some((address_gap, bond_gap)) = wallet_backup.pending_gaps {
             options.address_gap = options.address_gap.max(address_gap);
@@ -446,6 +448,24 @@ impl Wallet {
         }
         let wallet_birthday = options.birthday.or(wallet_backup.wallet_birthday);
 
+        // The backup's phrase is sealed under this wallet's own key, never
+        // copied from the backup as ciphertext.
+        let sealed_mnemonic = wallet_backup
+            .mnemonic
+            .as_ref()
+            .map(|entropy| {
+                seal_entropy(
+                    entropy,
+                    &wallet_backup.master_key.0,
+                    wallet_backup.network,
+                    &password,
+                )
+            })
+            .transpose()?;
+        let restored_enc_material =
+            KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
+                .expect("a passphrase always yields key material");
+
         // Initialise wallet
         // Counters and swept tags go into the first write, so a restore cut
         // short resumes with them rather than with defaults.
@@ -514,14 +534,11 @@ impl Wallet {
         };
         // Probe first, so no parsed seed or key is held through a slow or failing backend.
         let network = Self::require_backend(&AnyBlockchain::from_config(backend_config)?)?.chain;
-        let restored_enc_material = KeyMaterial::new_from_password(Some(password.to_string()))
-            .expect("a passphrase always yields key material");
         let mnemonic = parse_mnemonic(phrase.as_str())?;
         drop(phrase);
         let master_key = SecretXpriv(Self::master_key_from_mnemonic(&mnemonic, network)?);
-        let sealed_mnemonic = seal_mnemonic(&mnemonic, &master_key.0, network, &password)?;
+        let entropy = SecretEntropy::from_mnemonic(&mnemonic)?;
         drop(mnemonic);
-        drop(password);
         let backup = WalletBackup {
             network,
             master_key,
@@ -532,16 +549,10 @@ impl Wallet {
             external_index: 0,
             internal_index: 0,
             pending_gaps: None,
+            mnemonic: Some(entropy),
         };
 
-        Wallet::restore_owned_sealed(
-            backup,
-            wallet_path,
-            backend_config,
-            restored_enc_material,
-            options,
-            Some(sealed_mnemonic),
-        )
+        Wallet::restore_owned_with(backup, wallet_path, backend_config, password, options)
     }
 
     /// Checks a seed phrase's words and checksum.
@@ -590,17 +601,18 @@ impl Wallet {
         );
         Self::require_backend(&AnyBlockchain::from_config(backend)?)?;
 
-        let restore_enc_material = KeyMaterial::new_interactive(Some(
+        let restore_password = prompt_password(
             "Enter restored wallet encryption passphrase: ".to_string(),
-        ))
-        .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?
-        .ok_or_else(|| {
-            WalletError::General(
+        )
+        .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?;
+        // Refused here too, before the user types the backup password for nothing.
+        if restore_password.is_empty() {
+            return Err(WalletError::General(
                 "wallet restore failed: a passphrase is required; \
                  cleartext wallet files are not supported"
                     .to_string(),
-            )
-        })?;
+            ));
+        }
 
         let backup = match load_sensitive_struct::<WalletBackup, SerdeJson>(backup_file_path, None)
         {
@@ -629,13 +641,8 @@ impl Wallet {
             }
         };
         let hints = options.bond_hints.clone();
-        let wallet = Wallet::restore_owned_with(
-            backup,
-            restored_path,
-            backend,
-            restore_enc_material,
-            options,
-        )?;
+        let wallet =
+            Wallet::restore_owned_with(backup, restored_path, backend, restore_password, options)?;
         println!("Wallet restore succeeded!");
         wallet.print_restored_bonds(&hints);
         Ok(())
@@ -697,8 +704,9 @@ impl Wallet {
     ///
     /// This is a user-friendly version of the [`Wallet::backup`] method, which:
     /// - Uses the current working directory as the backup location.
-    /// - Prompts the user for the encryption passphrase (backups contain the
-    ///   master key, so they are always encrypted).
+    /// - Prompts for the current wallet passphrase, even though the wallet is
+    ///   already open, then for the backup's own encryption passphrase
+    ///   (backups contain the master key, so they are always encrypted).
     ///
     /// # Behavior
     ///
@@ -721,15 +729,19 @@ impl Wallet {
             backup_name
         );
 
-        let backup_enc_material = KeyMaterial::new_interactive(None)
-            .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?
-            .ok_or_else(|| {
-                WalletError::General(
-                    "wallet backup failed: a passphrase is required; \
-                     cleartext backups are not supported"
-                        .to_string(),
-                )
-            })?;
+        let wallet_password = prompt_password("Enter current wallet passphrase: ".to_string())
+            .map_err(|e| WalletError::General(format!("failed to read passphrase: {e}")))?;
+        let backup_enc_material = KeyMaterial::new_interactive(Some(
+            "Enter new backup encryption passphrase: ".to_string(),
+        ))
+        .map_err(|e| WalletError::General(format!("encryption passphrase prompt failed: {e}")))?
+        .ok_or_else(|| {
+            WalletError::General(
+                "wallet backup failed: a passphrase is required; \
+                 cleartext backups are not supported"
+                    .to_string(),
+            )
+        })?;
 
         let backup_path = match output {
             Some(path) => path,
@@ -739,7 +751,7 @@ impl Wallet {
         }
         // `backup` swaps any extension for `.json`; log the file it really writes.
         .with_extension("json");
-        wallet.backup(&backup_path, backup_enc_material)?;
+        wallet.backup(&backup_path, wallet_password, backup_enc_material)?;
         log::info!("Wallet backup succeeded: {backup_path:?}");
         Ok(())
     }
@@ -767,6 +779,11 @@ mod tests {
     use bitcoind::tempfile::tempdir;
     use std::collections::BTreeMap;
 
+    /// `test_wallet`'s password.
+    fn test_password() -> Zeroizing<String> {
+        Zeroizing::new("test-password".to_string())
+    }
+
     fn dummy_backup(file_name: &str) -> WalletBackup {
         let seed: [u8; 16] = thread_rng().gen();
         WalletBackup {
@@ -779,6 +796,7 @@ mod tests {
             external_index: 0,
             internal_index: 0,
             pending_gaps: None,
+            mnemonic: None,
         }
     }
 
@@ -847,7 +865,9 @@ mod tests {
         let password = Some("backup password".to_string());
         let km = KeyMaterial::new_from_password(password.clone()).unwrap();
         let v2_path = dir.path().join("v2.json");
-        wallet.write_backup(&v2_path, km.clone()).unwrap();
+        wallet
+            .write_backup(&v2_path, test_password(), km.clone())
+            .unwrap();
         let (v2, _) =
             load_sensitive_struct::<WalletBackup, SerdeJson>(&v2_path, password.clone()).unwrap();
         assert_eq!(
@@ -972,13 +992,8 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         let backend = BackendConfig::CoreRpc(CoreRpcConfig::default());
         for bad in ["../escape", "/tmp/absolute", "nested/name"] {
-            let err = Wallet::restore(
-                &dummy_backup(bad),
-                &target,
-                &backend,
-                KeyMaterial::new_ephemeral(),
-            )
-            .expect_err("a traversal name must be rejected");
+            let err = Wallet::restore(&dummy_backup(bad), &target, &backend, test_password())
+                .expect_err("a traversal name must be rejected");
             assert!(
                 err.to_string().contains("not a plain file name"),
                 "{}: {}",
@@ -1022,7 +1037,7 @@ mod tests {
                 &dummy_backup("wallet"),
                 &dir.path().join("wallet"),
                 &backend,
-                KeyMaterial::new_ephemeral(),
+                test_password(),
                 RestoreOptions {
                     address_gap,
                     bond_gap,
@@ -1049,7 +1064,7 @@ mod tests {
                 &backup,
                 &path,
                 &backend,
-                KeyMaterial::new_ephemeral(),
+                test_password(),
                 RestoreOptions {
                     address_gap: MAX_WATCH_WINDOW,
                     ..Default::default()
@@ -1067,6 +1082,37 @@ mod tests {
         }
     }
 
+    /// A wallet with no stored phrase checks the password against its file
+    /// key, and its backup carries no phrase.
+    #[test]
+    fn backup_without_a_phrase_checks_the_file_password() {
+        let dir = tempdir().unwrap();
+        let wallet = test_wallet(&dir.path().join("wallet"));
+        let km = KeyMaterial::new_from_password(Some("backup password".to_string())).unwrap();
+        let path = dir.path().join("backup.json");
+        for wrong in ["", "wrong-password"] {
+            let err = wallet
+                .write_backup(&path, Zeroizing::new(wrong.to_string()), km.clone())
+                .unwrap_err();
+            assert!(matches!(err, WalletError::WrongPassword), "{}", err);
+            let err = WalletBackup::new(&wallet, Zeroizing::new(wrong.to_string())).unwrap_err();
+            assert!(matches!(err, WalletError::WrongPassword), "{}", err);
+        }
+        assert!(!path.exists());
+
+        wallet.write_backup(&path, test_password(), km).unwrap();
+        let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
+            &path,
+            Some("backup password".to_string()),
+        )
+        .unwrap();
+        assert!(backup.mnemonic.is_none());
+        assert_eq!(
+            backup.master_key.0,
+            wallet.with_master_key(|key| Ok(*key)).unwrap()
+        );
+    }
+
     /// With no node behind it, the backup refuses with the backend error.
     #[test]
     fn backup_needs_a_reachable_backend() {
@@ -1074,7 +1120,7 @@ mod tests {
         let wallet = test_wallet(&dir.path().join("wallet"));
         let km = KeyMaterial::new_from_password(Some("pw".to_string())).unwrap();
         let err = wallet
-            .backup(&dir.path().join("b.json"), km)
+            .backup(&dir.path().join("b.json"), test_password(), km)
             .expect_err("no backend runs here");
         assert!(
             err.to_string()

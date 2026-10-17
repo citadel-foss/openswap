@@ -39,18 +39,19 @@ pub fn restore_wallet_from_backup_gui_app(
     password: Option<String>,
     options: RestoreOptions,
 ) -> Result<(), WalletError> {
-    let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
+    let Some(password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
         return Err(WalletError::General(
             "a passphrase is required; cleartext wallet files are not supported".to_string(),
         ));
     };
     // Probe first, so the decrypted backup is not held through a failing backend.
     Wallet::require_backend(&AnyBlockchain::from_config(&backend)?)?;
-    let (backup, encryption_material) = match load_sensitive_struct::<WalletBackup, SerdeJson>(
+    // The loader wipes its copy; `password` still keys the restored wallet.
+    let backup = match load_sensitive_struct::<WalletBackup, SerdeJson>(
         &backup_file_path,
-        Some(std::mem::take(&mut *password)),
+        Some(String::clone(&password)),
     ) {
-        Ok((backup, Some(material))) => (backup, material),
+        Ok((backup, Some(_))) => backup,
         Ok((_, None)) => {
             unreachable!("a supplied passphrase either decrypts or errors")
         }
@@ -72,13 +73,7 @@ pub fn restore_wallet_from_backup_gui_app(
         None => wallets_dir,
     };
 
-    Wallet::restore_owned_with(
-        backup,
-        &restored_wallet_path,
-        &backend,
-        encryption_material,
-        options,
-    )?;
+    Wallet::restore_owned_with(backup, &restored_wallet_path, &backend, password, options)?;
     Ok(())
 }
 
@@ -151,23 +146,31 @@ impl Wallet {
     ///
     /// This is a ffi-only wrapper around [`Wallet::backup`] that derives the
     /// encryption material from the provided password. Backups contain the
-    /// master key and are always encrypted; a missing or empty password is
-    /// an error.
+    /// master key and seed phrase and are always encrypted; a missing or
+    /// empty password is an error.
     ///
     /// # Parameters
     ///
     /// - `destination_path`: Destination file path for the backup (`.json`)
     /// - `password`: Required password used to encrypt the backup
+    /// - `wallet_password`: The current wallet password, asked for on every
+    ///   backup. A missing or wrong one fails with [`WalletError::WrongPassword`].
     ///
     /// # Example
     ///
     /// ```ignore
-    /// wallet.backup_wallet_gui_app("/path/to/backup".to_string(), Some("my_password".to_string()))?;
+    /// wallet.backup_wallet_gui_app(
+    ///     "/path/to/backup".to_string(),
+    ///     Some("backup_password".to_string()),
+    ///     Some("wallet_password".to_string()),
+    /// )?;
     pub fn backup_wallet_gui_app(
         &self,
         destination_path: String,
         password: Option<String>,
+        wallet_password: Option<String>,
     ) -> Result<(), WalletError> {
+        let wallet_password = Zeroizing::new(wallet_password.unwrap_or_default());
         let Some(mut password) = password.map(Zeroizing::new).filter(|p| !p.is_empty()) else {
             return Err(WalletError::General(
                 "a passphrase is required for wallet backups; \
@@ -178,7 +181,7 @@ impl Wallet {
         let km = KeyMaterial::new_from_password(Some(std::mem::take(&mut *password)))
             .expect("a non-empty passphrase always yields key material");
         let backup_path = Path::new(&destination_path);
-        self.backup(backup_path, km)?;
+        self.backup(backup_path, wallet_password, km)?;
 
         Ok(())
     }

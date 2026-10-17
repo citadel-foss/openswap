@@ -12,10 +12,10 @@ use bitcoin::{absolute::LockTime, Amount};
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::{start_server, MakerServer},
-    security::KeyMaterial,
     utill::MIN_RELAY_FEE_RATE,
     wallet::{AddressType, Wallet, WalletBackup},
 };
+use zeroize::Zeroizing;
 
 use crate::test_framework::*;
 
@@ -119,17 +119,12 @@ fn bond_creation_and_redemption(world: &mut World) {
     let bond_txid = maker.wallet.read().unwrap().get_fidelity_bonds()[0]
         .outpoint()
         .txid;
-    let backup = WalletBackup::from(&*maker.wallet.read().unwrap());
+    let password = || Zeroizing::new("integration-test".to_string());
+    let backup = WalletBackup::new(&maker.wallet.read().unwrap(), password()).unwrap();
     let config = maker_restart_config(maker);
     let wallet_path = config.data_dir.join("wallets").join(&config.wallet_name);
     std::fs::remove_file(&wallet_path).unwrap();
-    Wallet::restore(
-        &backup,
-        &wallet_path,
-        &config.backend,
-        KeyMaterial::new_from_password(Some("integration-test".to_string())).unwrap(),
-    )
-    .unwrap();
+    Wallet::restore(&backup, &wallet_path, &config.backend, password()).unwrap();
     let restarted = Arc::new(MakerServer::init(config).unwrap());
     let restarted_clone = restarted.clone();
     let restarted_thread = thread::spawn(move || start_server(restarted_clone));

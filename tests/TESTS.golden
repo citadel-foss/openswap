@@ -198,6 +198,7 @@ openswap wallet::api::prevout_contract_tests::docker_seed_refuses_non_terminal_o
 openswap wallet::api::prevout_contract_tests::proof_of_funding_rejects_missing_cached_contract
 openswap wallet::api::recovery_address_tests::first_recovery_creates_an_address
 openswap wallet::api::recovery_address_tests::retry_reuses_the_stored_recovery_address
+openswap wallet::api::restore_history_probe_tests::backup_carries_the_phrase_to_the_restored_wallet
 openswap wallet::api::restore_history_probe_tests::backup_restore_into_a_fresh_data_dir
 openswap wallet::api::restore_history_probe_tests::interrupted_restore_finishes_before_wallet_is_loaded
 openswap wallet::api::restore_history_probe_tests::new_wallet_seals_its_phrase_in_the_first_write
@@ -223,6 +224,7 @@ openswap wallet::api::utxo_corroboration_tests::fabricated_utxo_fails_corroborat
 openswap wallet::backup::tests::backup_debug_redacts_master_key
 openswap wallet::backup::tests::backup_needs_a_reachable_backend
 openswap wallet::backup::tests::backup_v2_keeps_new_fields_and_reads_v1_both_ways
+openswap wallet::backup::tests::backup_without_a_phrase_checks_the_file_password
 openswap wallet::backup::tests::max_watch_index_overflow_is_the_window_cap
 openswap wallet::backup::tests::mnemonic_normalization_preserves_restore_words
 openswap wallet::backup::tests::open_swaps_summary_counts_each_kind
