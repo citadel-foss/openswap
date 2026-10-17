@@ -832,6 +832,26 @@ mod tests {
         );
     }
 
+    /// Loading an existing wallet refuses Core 0.21 before the file is opened,
+    /// and leaves the file untouched.
+    #[test]
+    fn load_or_init_refuses_core_before_v22_for_an_existing_wallet() {
+        let (core, server) = mock_core(vec![("getnetworkinfo", json!({ "version": 210100 }))]);
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("w");
+        drop(test_wallet(&path));
+        let before = std::fs::read(&path).unwrap();
+        let err = Wallet::load_or_init(
+            &path,
+            AnyBlockchain::CoreRPC(core),
+            Some("test-password".to_string()),
+        )
+        .expect_err("Core 0.21 must be refused");
+        assert!(matches!(err, WalletError::CoreTooOld), "{}", err);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
+    }
+
     /// The backup's backend probe refuses Core 0.21, so no backup file is left.
     #[test]
     fn backup_refuses_core_before_v22_without_a_backup_file() {

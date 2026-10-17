@@ -225,6 +225,7 @@ openswap wallet::blockchain::corerpc::tests::estimate_feerate_forwards_target_an
 openswap wallet::blockchain::corerpc::tests::imported_range_covers_legacy_wallet_without_listdescriptors
 openswap wallet::blockchain::corerpc::tests::imported_range_covers_needs_the_range_to_start_at_zero
 openswap wallet::blockchain::corerpc::tests::init_interactive_refuses_core_before_v22_without_a_wallet_file
+openswap wallet::blockchain::corerpc::tests::load_or_init_refuses_core_before_v22_for_an_existing_wallet
 openswap wallet::blockchain::corerpc::tests::load_or_init_refuses_core_before_v22_without_a_wallet_file
 openswap wallet::blockchain::corerpc::tests::prepare_backend_wallet_refuses_core_before_v22
 openswap wallet::blockchain::corerpc::tests::restore_refuses_core_before_v22_without_a_wallet_file

@@ -644,7 +644,12 @@ impl Wallet {
         password: Option<String>,
     ) -> Result<Wallet, WalletError> {
         let wallet = if path.exists() {
-            // wallet already exists, load the wallet
+            // wallet already exists, load the wallet. Refuse old Core first,
+            // as `Wallet::init` does for a new wallet, so callers that start
+            // without syncing get the minimum-version error up front.
+            if let AnyBlockchain::CoreRPC(core) = &blockchain {
+                core.require_v22()?;
+            }
             let mut wallet = Wallet::load(path, blockchain, password)?;
             if wallet.store.pending_restore.is_some() {
                 log::warn!("Wallet at {path:?} has an unfinished first scan; resuming it");
