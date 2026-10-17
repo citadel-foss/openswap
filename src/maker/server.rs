@@ -1935,7 +1935,10 @@ fn recover_from_swap(
             }
 
             // A contract still in the mempool is swept on a later pass. A contract
-            // the sender took back by timelock never will be, so it is settled too.
+            // the sender took back by timelock never will be, so it is settled too,
+            // and so is one an earlier hashlock sweep of ours already spent: a
+            // crash between that sweep and its cleanup leaves the coin on record
+            // with nothing left to sweep.
             let remaining: Vec<_> = {
                 let wallet = lock_debug!(maker.wallet.read())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -1947,57 +1950,83 @@ fn recover_from_swap(
                     })
                     .collect()
             };
-            let fully_swept = remaining.iter().all(|incoming| {
-                let outpoint = OutPoint::new(
-                    incoming.contract_tx.compute_txid(),
-                    incoming.get_contract_output_vout(),
-                );
-                incoming
-                    .contract_tx
-                    .output
-                    .get(outpoint.vout as usize)
-                    .is_some_and(|output| {
-                        chain
-                            .confirmed_spending_transaction(&outpoint, &output.script_pubkey)
-                            .inspect_err(|e| {
-                                log::warn!(
-                                    "[{}] Could not check {} for a sender refund: {:?}",
-                                    maker.config.network_port,
-                                    outpoint,
-                                    e
-                                )
-                            })
-                            .is_ok_and(|tx| tx.is_some_and(|tx| incoming.is_timelock_spend(&tx)))
-                    })
-            });
-            if fully_swept {
-                // With the preimage known the outgoing coins are the next hop's
-                // to claim, never ours to refund, so drop them with the incoming.
-                {
-                    let mut wallet = lock_debug!(maker.wallet.write())
-                        .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                    for incoming in &remaining {
-                        wallet.remove_incoming_swapcoin(
-                            &incoming.contract_tx.compute_txid().to_string(),
-                        );
+            // Each remaining coin's confirmed contract spend, or `None` while one
+            // is unspent or cannot be read. The contract pays only our hashlock or
+            // the sender's timelock, so any confirmed spend settles it.
+            let settling_spends: Option<Vec<_>> = remaining
+                .iter()
+                .map(|incoming| {
+                    let outpoint = OutPoint::new(
+                        incoming.contract_tx.compute_txid(),
+                        incoming.get_contract_output_vout(),
+                    );
+                    let output = incoming.contract_tx.output.get(outpoint.vout as usize)?;
+                    chain
+                        .confirmed_spending_transaction(&outpoint, &output.script_pubkey)
+                        .inspect_err(|e| {
+                            log::warn!(
+                                "[{}] Could not check {} for a settling spend: {:?}",
+                                maker.config.network_port,
+                                outpoint,
+                                e
+                            )
+                        })
+                        .ok()
+                        .flatten()
+                })
+                .collect();
+            // A spend that is not the sender's refund is an earlier sweep of ours.
+            // After a crash it may not be on the tracker yet: record it before
+            // the coins go, since startup closes a coinless record from the
+            // tracker alone. A sweep the tracker already holds is not added twice.
+            if let Some(spends) = settling_spends {
+                let mut swept = incoming_swept_txids.clone();
+                for (incoming, tx) in remaining.iter().zip(&spends) {
+                    let txid = tx.compute_txid();
+                    if !incoming.is_timelock_spend(tx) && !swept.contains(&txid) {
+                        swept.push(txid);
                     }
-                    for outgoing in &outgoing_swapcoins {
-                        // Wallet stores outgoing swapcoins keyed by contract txid.
-                        let key = outgoing.contract_tx.compute_txid().to_string();
-                        wallet.remove_outgoing_swapcoin(&key);
-                    }
-                    // A partly broadcast batch still holds its unsent inputs.
-                    wallet.release_swap_locks(&swap_id, None);
-                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
                 }
-                // An incoming the sender took back is a loss, not a recovery.
-                let report = (!incoming_swept_txids.is_empty())
-                    .then_some(("hashlock", &incoming_swept_txids[..]));
-                finish_swap(&maker, &swap_id, MakerSwapPhase::Recovered, report);
+                let recorded = swept == incoming_swept_txids
+                    || update_tracker(&maker, &swap_id, |r| {
+                        r.recovery.incoming_swept = swept.clone();
+                        r.recovery.phase = MakerRecoveryPhase::HashlockRecovered;
+                    });
+                if recorded {
+                    incoming_swept_txids = swept;
+                    // With the preimage known the outgoing coins are the next hop's
+                    // to claim, never ours to refund, so drop them with the incoming.
+                    {
+                        let mut wallet = lock_debug!(maker.wallet.write())
+                            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                        for incoming in &remaining {
+                            wallet.remove_incoming_swapcoin(
+                                &incoming.contract_tx.compute_txid().to_string(),
+                            );
+                        }
+                        for outgoing in &outgoing_swapcoins {
+                            // Wallet stores outgoing swapcoins keyed by contract txid.
+                            let key = outgoing.contract_tx.compute_txid().to_string();
+                            wallet.remove_outgoing_swapcoin(&key);
+                        }
+                        // A partly broadcast batch still holds its unsent inputs.
+                        wallet.release_swap_locks(&swap_id, None);
+                        wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                    }
+                    // An incoming the sender took back is a loss, not a recovery.
+                    let report = (!incoming_swept_txids.is_empty())
+                        .then_some(("hashlock", &incoming_swept_txids[..]));
+                    finish_swap(&maker, &swap_id, MakerSwapPhase::Recovered, report);
 
-                #[cfg(feature = "integration-test")]
-                maker.shutdown.store(true, Relaxed);
-                return Ok(());
+                    #[cfg(feature = "integration-test")]
+                    maker.shutdown.store(true, Relaxed);
+                    return Ok(());
+                }
+                log::warn!(
+                    "[{}] Could not record earlier sweeps of swap {}; retrying recovery",
+                    maker.config.network_port,
+                    swap_id
+                );
             }
         } else if current_height >= timelock_expiry && !incoming_swapcoins.is_empty() {
             // Refund only while incoming coins are left. They are saved before

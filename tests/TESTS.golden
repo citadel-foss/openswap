@@ -506,6 +506,7 @@ openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract
 openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract_data_in_flight_electrum
 openswap::integration restart::legacy_reboot::maker_reboot_preserves_funded_swapcoins
 openswap::integration restart::reboot::legacy_electrum_crash_after_contract_exchange
+openswap::integration restart::reboot::legacy_electrum_maker_settles_an_incoming_its_own_sweep_spent
 openswap::integration restart::reboot::legacy_electrum_restart_rebuilds_watches
 openswap::integration restart::reboot::orphan_reservation_is_released_on_restart
 openswap::integration restart::reboot::reservations_survive_a_maker_restart
@@ -513,6 +514,7 @@ openswap::integration restart::reboot::reservations_survive_a_maker_restart_elec
 openswap::integration restart::reboot::taproot_crash_after_contract_exchange
 openswap::integration restart::reboot::taproot_maker_finishes_when_its_incoming_was_refunded
 openswap::integration restart::reboot::taproot_maker_reboot_preserves_funded_swapcoins
+openswap::integration restart::reboot::taproot_maker_settles_an_incoming_its_own_sweep_spent
 openswap::integration restart::reboot::taproot_restart_rebuilds_watches
 openswap::integration restart::successful_swap::restart_removes_spent_outgoing_swapcoins_legacy
 openswap::integration restart::successful_swap::restart_removes_spent_outgoing_swapcoins_taproot

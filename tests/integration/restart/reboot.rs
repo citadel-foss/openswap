@@ -29,6 +29,7 @@ use crate::test_framework::*;
 
 use log::info;
 use std::{
+    fs,
     net::TcpStream,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
@@ -565,6 +566,148 @@ fn taproot_maker_finishes_when_its_incoming_was_refunded(world: &mut World, para
 
     restarted.shutdown.store(true, Relaxed);
     restarted_thread.join().unwrap();
+}
+
+/// Test: a maker restarts with an incoming its own hashlock sweep already spent.
+///
+/// ```text
+/// t=0   funding on chain; the taker drops before finalizing, so Maker2 holds
+///       its incoming with no preimage and no handed-over key; its wallet is
+///       copied here
+/// then  the taker restarts and claims by hashlock; Maker2 learns the
+///       preimage, sweeps its incoming and finishes
+/// then  Maker2 restarts on the copy, its tracker record reset to before the
+///       sweep: a crash between the sweep and its cleanup
+/// then  Maker2 restarts on the copy again, its tracker keeping the sweep
+/// ```
+///
+/// Each time Maker2 must settle the swap from its confirmed sweep instead of
+/// retrying a sweep with nothing left to spend, and its record must name that
+/// sweep exactly once.
+#[world_test(
+    maker_behaviors = [Normal, Normal],
+    takers = [CrashBeforeRecovery],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = protocol, sats = 500_000, makers = 2, tx_count = 3),
+    cases = [
+        taproot_maker_settles_an_incoming_its_own_sweep_spent(
+            backend = BitcoindBackend,
+            protocol = ProtocolVersion::Taproot,
+        ),
+        /// A Legacy hashlock sweep spends the contract output too, and on
+        /// Electrum the settling spend is read from the indexer.
+        legacy_electrum_maker_settles_an_incoming_its_own_sweep_spent(
+            backend = ElectrumBackend,
+            protocol = ProtocolVersion::Legacy,
+        ),
+    ],
+)]
+fn run_maker_settles_an_incoming_its_own_sweep_spent(world: &mut World, params: SwapParams) {
+    world.mine(1);
+    world.framework().wait_for_electrs_tip();
+
+    let summary = world
+        .taker_mut()
+        .prepare(params)
+        .expect("Prepare should succeed");
+    assert!(
+        world.taker_mut().start(&summary.swap_id).is_err(),
+        "Swap should fail because the taker crashes before finalization"
+    );
+
+    let mut taker_config = world.taker().inner().config().clone();
+    taker_config.password = Some("integration-test".to_string());
+
+    // Nobody knows the preimage yet, so Maker2 has built no sweep. Hold the
+    // wallet lock so no save lands mid-copy.
+    let victim = world.makers()[1].inner().clone();
+    let mut victim_config = victim.config.clone();
+    victim_config.password = Some("integration-test".to_string());
+    let wallet_path = victim_config
+        .data_dir
+        .join("wallets")
+        .join(&victim_config.wallet_name);
+    let snapshot = victim_config.data_dir.join("wallet-before-sweep");
+    {
+        let wallet = victim.wallet.read().unwrap();
+        assert!(wallet.get_incoming_swapcoins_count() > 0);
+        assert!(wallet.get_outgoing_swapcoins_count() > 0);
+        fs::copy(&wallet_path, &snapshot).unwrap();
+    }
+
+    // The taker's claim puts the preimage on chain, and Maker2 sweeps by it.
+    world.drop_takers();
+    world.adopt_taker(Taker::init(taker_config).expect("taker restart should succeed"));
+    let recovery = |maker: &MakerServer| {
+        maker
+            .swap_tracker
+            .lock()
+            .unwrap()
+            .get_record(&summary.swap_id)
+            .map(|record| record.recovery.clone())
+    };
+    wait_until!(
+        Duration::from_secs(300),
+        every Duration::from_secs(2),
+        "Maker2 to sweep its incoming by hashlock",
+        recovery(&victim).map(|r| r.phase) == Some(MakerRecoveryPhase::CleanedUp)
+    );
+    let mut sweeps = recovery(&victim).unwrap().incoming_swept;
+    sweeps.sort();
+    assert!(!sweeps.is_empty(), "Maker2 recorded no hashlock sweep");
+    assert!(
+        sweeps.windows(2).all(|pair| pair[0] != pair[1]),
+        "Maker2 recorded a hashlock sweep more than once"
+    );
+    // Test builds stop a maker once its recovery is done.
+    world.shutdown_maker(1);
+    drop(victim);
+
+    for reset_tracker in [true, false] {
+        info!("Restarting Maker2 on its wallet from before the sweep (tracker reset: {reset_tracker})");
+        fs::copy(&snapshot, &wallet_path).unwrap();
+        if reset_tracker {
+            let mut tracker = MakerSwapTracker::load_or_create(&victim_config.data_dir).unwrap();
+            let mut record = tracker.get_record(&summary.swap_id).unwrap().clone();
+            record.phase = MakerSwapPhase::Recovering;
+            record.recovery = MakerRecoveryState {
+                phase: MakerRecoveryPhase::Monitoring,
+                ..MakerRecoveryState::default()
+            };
+            tracker.save_record(&record).unwrap();
+        }
+
+        let restarted = Arc::new(MakerServer::init(victim_config.clone()).expect("maker restart"));
+        let restarted_thread = {
+            let maker_clone = restarted.clone();
+            thread::spawn(move || {
+                start_server(maker_clone).unwrap();
+            })
+        };
+
+        // Wait on both: the phase is written last, after the coins are
+        // removed, but a tracker that kept the sweep says CleanedUp before
+        // the restored coins are gone.
+        wait_until!(
+            Duration::from_secs(180),
+            every Duration::from_secs(2),
+            "Maker2 to stop retrying a sweep of an incoming it already swept",
+            {
+                let wallet = restarted.wallet.read().unwrap();
+                wallet.get_incoming_swapcoins_count() == 0
+                    && wallet.get_outgoing_swapcoins_count() == 0
+            } && recovery(&restarted).map(|r| r.phase) == Some(MakerRecoveryPhase::CleanedUp)
+        );
+        let mut state = recovery(&restarted).expect("the swap's record survives");
+        state.incoming_swept.sort();
+        assert_eq!(
+            state.incoming_swept, sweeps,
+            "the record must name the confirmed sweep, once"
+        );
+
+        restarted.shutdown.store(true, Relaxed);
+        restarted_thread.join().unwrap();
+    }
 }
 
 /// A maker that reserved inputs for a funding it never sent must still hold
