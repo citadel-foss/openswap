@@ -4,7 +4,7 @@
 //! for exposing swap functionality and reporting to other languages.
 
 use crate::{
-    security::{load_sensitive_struct, KeyMaterial, SerdeJson},
+    security::{is_encrypted_cbor, load_sensitive_struct, KeyMaterial, SerdeJson},
     utill::{get_taker_dir, is_unusable_fee_rate, parse_checked_address, MIN_RELAY_FEE_RATE},
     wallet::{
         infer_address_type, AddressType, Destination, RestoreOptions, Wallet, WalletBackup,
@@ -192,14 +192,7 @@ impl Wallet {
         }
 
         let content = std::fs::read(wallet_path).map_err(WalletError::IO)?;
-
-        // Try to deserialize as EncryptedData using CBOR
-        // If it succeeds, the wallet is encrypted
-        // If it fails, the wallet is plaintext
-        match serde_cbor::from_slice::<crate::security::EncryptedData>(&content) {
-            Ok(_) => Ok(true),   // Successfully parsed as EncryptedData = encrypted
-            Err(_) => Ok(false), // Failed to parse as EncryptedData = plaintext
-        }
+        Ok(is_encrypted_cbor(&content))
     }
 
     /// Returns a list of recent Incoming Transactions (bydefault last 10)

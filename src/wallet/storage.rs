@@ -1,20 +1,22 @@
 //! The Wallet Storage Interface.
 //!
-//! Wallet data is written to disk as AES-256-GCM-encrypted CBOR; there is no
-//! cleartext-on-disk wallet format by design (legacy cleartext files are
-//! still readable, for one-time migration by `Wallet::load`). The master key
-//! is additionally sealed individually, see [`MasterKey`].
+//! Wallet data is written to disk as AES-256-GCM-encrypted CBOR in the version
+//! 2 container; there is no cleartext-on-disk wallet format by design. Version
+//! 1 files still load, and the next save writes them as version 2. The master
+//! key and the seed phrase are each sealed again, see [`MasterKey`] and
+//! [`WalletStore::sealed_mnemonic`].
 
 use crate::{
     security::{
-        decrypt_struct, encrypt_struct, load_sensitive_struct, EncryptedData, KeyMaterial,
-        SerdeCbor,
+        decrypt_struct, encrypt_struct, encrypt_struct_v2, load_sensitive_struct, EncryptedData,
+        KeyMaterial, SealedSecret, SerdeCbor,
     },
     wallet::UTXOSpendInfo,
 };
 
 use super::{backup::RestoreOptions, error::WalletError, fidelity::FidelityBond};
 
+use bip39::Mnemonic;
 use bitcoin::{bip32::Xpriv, Network, OutPoint, ScriptBuf};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
@@ -24,7 +26,7 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin};
 
@@ -87,6 +89,59 @@ impl Serialize for SecretXpriv {
 impl<'de> Deserialize<'de> for SecretXpriv {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Xpriv::deserialize(deserializer).map(Self)
+    }
+}
+
+/// BIP39 entropy lengths in bytes, for 12, 15, 18, 21 and 24 words.
+const ENTROPY_LENGTHS: [usize; 5] = [16, 20, 24, 28, 32];
+
+/// How stored entropy turns back into the wallet's keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum SeedPolicy {
+    /// English words and an empty BIP39 passphrase.
+    Bip39EnglishEmptyPassphrase,
+}
+
+/// The seed phrase as BIP39 entropy, wiped on drop. All fields have a fixed
+/// size, so serde never grows a buffer and frees an unwiped copy.
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(not(test), expect(dead_code, reason = "used by the seed API"))]
+pub(crate) struct SecretEntropy {
+    #[zeroize(skip)]
+    policy: SeedPolicy,
+    len: u8,
+    bytes: [u8; 32],
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "used by the seed API"))]
+impl SecretEntropy {
+    pub(crate) fn from_mnemonic(mnemonic: &Mnemonic) -> Result<Self, WalletError> {
+        let (array, len) = mnemonic.to_entropy_array();
+        let array = Zeroizing::new(array);
+        if !ENTROPY_LENGTHS.contains(&len) {
+            return Err(WalletError::General(format!(
+                "seed entropy must be 16 to 32 bytes in steps of 4, not {len}"
+            )));
+        }
+        let mut entropy = Self {
+            policy: SeedPolicy::Bip39EnglishEmptyPassphrase,
+            len: len as u8,
+            bytes: [0; 32],
+        };
+        entropy.bytes[..len].copy_from_slice(&array[..len]);
+        Ok(entropy)
+    }
+
+    /// Rebuilds the canonical English words.
+    pub(crate) fn to_mnemonic(&self) -> Result<Mnemonic, WalletError> {
+        let SeedPolicy::Bip39EnglishEmptyPassphrase = self.policy;
+        let len = usize::from(self.len);
+        if !ENTROPY_LENGTHS.contains(&len) {
+            return Err(WalletError::General(format!(
+                "stored seed entropy has invalid length {len}"
+            )));
+        }
+        Ok(Mnemonic::from_entropy(&self.bytes[..len])?)
     }
 }
 
@@ -159,8 +214,8 @@ impl Serialize for MasterKey {
 
 /// On-disk representation: new wallet files store the sealed blob; legacy
 /// files store a plain [`Xpriv`], which deserializes into the transient
-/// [`MasterKey::Plaintext`] state for migration (`Wallet::load` reseals and
-/// rewrites the file encrypted right after loading).
+/// [`MasterKey::Plaintext`] state. `Wallet::load` reseals it in memory only;
+/// the file keeps the plain key until the next save.
 impl<'de> Deserialize<'de> for MasterKey {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -243,6 +298,14 @@ pub(crate) struct WalletStore {
     /// sweep or refund.
     #[serde(default)]
     pub(crate) ln_maker_swaps: HashMap<String, LnMakerSwapRecord>,
+
+    /// The seed phrase as [`SecretEntropy`], sealed under its own key from the
+    /// wallet password. Load, save, sync and signing never open it.
+    #[serde(default)]
+    pub(super) sealed_mnemonic: Option<SealedSecret>,
+    /// Set once the user has confirmed writing the seed phrase down.
+    #[serde(default)]
+    pub(super) seed_backed_up: bool,
 }
 
 /// Which side of a Lightning swap the maker is serving.
@@ -430,6 +493,8 @@ impl WalletStore {
             swap_locks: HashMap::new(),
             ln_pending_swaps: HashMap::new(),
             ln_maker_swaps: HashMap::new(),
+            sealed_mnemonic: None,
+            seed_backed_up: false,
         };
         drop(master_key);
         prepare(&mut store);
@@ -463,7 +528,8 @@ impl WalletStore {
         store_enc_material: &KeyMaterial,
         no_clobber: bool,
     ) -> Result<(), WalletError> {
-        let encrypted = encrypt_struct(self, store_enc_material)
+        // Always version 2, which upgrades a version 1 file on its first save.
+        let encrypted = encrypt_struct_v2(self, store_enc_material)
             .map_err(|e| WalletError::General(format!("wallet store encryption failed: {e:?}")))?;
         write_atomic(path, no_clobber, |writer| {
             serde_cbor::to_writer(writer, &encrypted)?;
@@ -471,7 +537,7 @@ impl WalletStore {
         })
     }
 
-    /// Reads from a path (errors if path doesn't exist).
+    /// Reads a version 1 or 2 file from a path (errors if path doesn't exist).
     /// If `password` is provided, attempts to decrypt the file using the
     /// provided key. Returns the deserialized `WalletStore` and the derived
     /// encryption material (`None` for a plaintext file).
@@ -521,7 +587,7 @@ fn write_atomic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::SecurityError;
+    use crate::security::{is_encrypted_cbor, SecurityError};
     use bip39::rand::{thread_rng, Rng};
     use bitcoind::tempfile::tempdir;
 
@@ -541,6 +607,109 @@ mod tests {
         write_atomic(&path, true, |w| Ok(w.write_all(b"first")?)).unwrap();
         assert!(write_atomic(&path, true, |w| Ok(w.write_all(b"second")?)).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    }
+
+    fn test_store(path: &Path, material: &KeyMaterial) -> WalletStore {
+        let seed: [u8; 16] = thread_rng().gen();
+        let xpriv = Xpriv::new_master(Network::Bitcoin, &seed).unwrap();
+        WalletStore::init(
+            "test_wallet".to_string(),
+            path,
+            Network::Bitcoin,
+            xpriv,
+            None,
+            None,
+            material,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn secret_entropy_roundtrips_every_phrase_length() {
+        for words in [12, 15, 18, 21, 24] {
+            let mnemonic = Mnemonic::generate(words).unwrap();
+            let entropy = SecretEntropy::from_mnemonic(&mnemonic).unwrap();
+            assert_eq!(usize::from(entropy.len), words * 4 / 3);
+
+            let sealed = SealedSecret::seal(&entropy, "wallet password").unwrap();
+            let opened: SecretEntropy = sealed.open("wallet password").unwrap();
+            assert_eq!(opened.to_mnemonic().unwrap(), mnemonic);
+        }
+
+        // A hand-edited length is refused instead of read past the entropy.
+        for len in [0, 17, 33] {
+            let edited = SecretEntropy {
+                policy: SeedPolicy::Bip39EnglishEmptyPassphrase,
+                len,
+                bytes: [7; 32],
+            };
+            assert!(edited.to_mnemonic().is_err());
+        }
+    }
+
+    #[test]
+    fn sealed_mnemonic_survives_save_and_load_unopened() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let password = "wallet password";
+        let material = KeyMaterial::new_from_password(Some(password.to_string())).unwrap();
+        let mut store = test_store(&path, &material);
+        assert!(store.sealed_mnemonic.is_none());
+        assert!(!store.seed_backed_up);
+
+        let mnemonic = Mnemonic::generate(24).unwrap();
+        let entropy = SecretEntropy::from_mnemonic(&mnemonic).unwrap();
+        store.sealed_mnemonic = Some(SealedSecret::seal(&entropy, password).unwrap());
+        store.seed_backed_up = true;
+        store.write_to_disk(&path, &material).unwrap();
+
+        let (read, _) = WalletStore::read_from_disk(&path, Some(password.to_string())).unwrap();
+        assert_eq!(read, store);
+        assert!(read.seed_backed_up);
+        let opened: SecretEntropy = read
+            .sealed_mnemonic
+            .as_ref()
+            .unwrap()
+            .open(password)
+            .unwrap();
+        assert_eq!(opened.to_mnemonic().unwrap(), mnemonic);
+
+        // `Wallet`'s Debug prints the store; no word or entropy may show.
+        let debug = format!("{read:?}");
+        assert!(debug.contains("sealed_mnemonic: Some(SealedSecret(<sealed>))"));
+        assert!(!debug.contains(&mnemonic.to_string()));
+    }
+
+    #[test]
+    fn version_1_file_loads_and_next_save_writes_version_2() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let password = "wallet password";
+        let material = KeyMaterial::new_from_password(Some(password.to_string())).unwrap();
+        let store = test_store(&path, &material);
+
+        // An older build's file: no seed fields, the version 1 container.
+        let serde_cbor::Value::Map(mut old) = serde_cbor::value::to_value(&store).unwrap() else {
+            panic!("store is not a map")
+        };
+        for field in ["sealed_mnemonic", "seed_backed_up"] {
+            old.remove(&serde_cbor::Value::Text(field.to_string()));
+        }
+        let v1 = encrypt_struct(serde_cbor::Value::Map(old), &material).unwrap();
+        std::fs::write(&path, serde_cbor::to_vec(&v1).unwrap()).unwrap();
+        let v1_bytes = std::fs::read(&path).unwrap();
+
+        let (read, read_material) =
+            WalletStore::read_from_disk(&path, Some(password.to_string())).unwrap();
+        assert_eq!(read, store);
+        assert_eq!(std::fs::read(&path).unwrap(), v1_bytes, "load never writes");
+
+        read.write_to_disk(&path, &read_material.unwrap()).unwrap();
+        let v2_bytes = std::fs::read(&path).unwrap();
+        assert!(serde_cbor::from_slice::<EncryptedData>(&v2_bytes).is_err());
+        assert!(is_encrypted_cbor(&v2_bytes));
+        let (upgraded, _) = WalletStore::read_from_disk(&path, Some(password.to_string())).unwrap();
+        assert_eq!(upgraded, store);
     }
 
     #[test]

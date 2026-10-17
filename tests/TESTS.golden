@@ -73,6 +73,9 @@ openswap protocol::lightning_messages::tests::lightning_offer_field_is_forward_a
 openswap protocol::lightning_messages::tests::new_top_level_variants_round_trip
 openswap security::tests::decrypts_legacy_ciphertext_using_material_nonce
 openswap security::tests::encryption_rotates_nonce_for_same_key_material
+openswap security::tests::sealed_secret_needs_the_password_on_every_open
+openswap security::tests::v2_container_is_refused_by_old_readers
+openswap security::tests::v2_container_refuses_unknown_versions_and_edited_headers
 openswap taker::api::tests::init_taker_config_persists_lightning_settings
 openswap taker::api::tests::taker_config_debug_hides_wallet_password
 openswap taker::background_services::tests::dead_keepalive_socket_is_dropped_and_retried_immediately
@@ -312,7 +315,10 @@ openswap wallet::storage::tests::failed_first_write_leaves_no_wallet_file
 openswap wallet::storage::tests::reads_encrypted_wallet_when_password_is_supplied
 openswap wallet::storage::tests::sealed_master_key_roundtrips
 openswap wallet::storage::tests::sealed_master_key_survives_encrypted_store_roundtrip
+openswap wallet::storage::tests::sealed_mnemonic_survives_save_and_load_unopened
+openswap wallet::storage::tests::secret_entropy_roundtrips_every_phrase_length
 openswap wallet::storage::tests::test_write_and_read_wallet_to_disk
+openswap wallet::storage::tests::version_1_file_loads_and_next_save_writes_version_2
 openswap wallet::swapcoin::timelock_spend_tests::legacy_hashlock_claim_is_not_ours
 openswap wallet::swapcoin::timelock_spend_tests::legacy_timelock_recovery_is_ours
 openswap wallet::swapcoin::timelock_spend_tests::taproot_hashlock_claim_is_not_ours
