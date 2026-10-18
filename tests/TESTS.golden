@@ -246,6 +246,7 @@ openswap wallet::blockchain::corerpc::tests::prepare_backend_wallet_refuses_core
 openswap wallet::blockchain::corerpc::tests::restore_refuses_core_before_v22_without_a_wallet_file
 openswap wallet::blockchain::corerpc::tests::zmq_malformed_message_is_reported_as_missed
 openswap wallet::blockchain::corerpc::tests::zmq_publisher_restart_is_reported
+openswap wallet::blockchain::corerpc::tests::zmq_receive_error_is_reported_and_reconnects
 openswap wallet::blockchain::corerpc::tests::zmq_sequence_gap_is_reported
 openswap wallet::blockchain::corerpc::tests::zmq_sequence_reset_is_reported
 openswap wallet::blockchain::corerpc::tests::zmq_sequence_wraparound_is_not_a_gap

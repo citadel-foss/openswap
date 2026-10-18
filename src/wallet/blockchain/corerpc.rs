@@ -1148,6 +1148,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn zmq_receive_error_is_reported_and_reconnects() {
+        let publisher = ZmqPublisher::bind("tcp://127.0.0.1:*");
+        let core = subscribed_core(&publisher);
+        // The replacement socket re-sends subscriptions the publisher may still
+        // hold for the old one; have them reported anyway.
+        publisher.socket.set_xpub_verbose(true).unwrap();
+        publisher.publish("rawtx", b"tx", 0);
+        assert_eq!(poll_kinds(&core, 1), ["tx"]);
+
+        // A PUB socket cannot receive, so the next read fails.
+        let broken = zmq::Context::new().socket(zmq::PUB).unwrap();
+        core.zmq.state.lock().unwrap().socket = Some(broken);
+        assert!(matches!(core.poll_event(), Some(WatchEvent::Missed)));
+
+        // The next poll connects a new socket and reports nothing further.
+        publisher.wait_for_subscriber(|| assert!(core.poll_event().is_none()));
+        publisher.publish("rawtx", b"tx", 1);
+        assert_eq!(poll_kinds(&core, 1), ["tx"]);
+    }
+
+    #[test]
     fn estimate_feerate_forwards_target_and_converts() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock core");
         let addr = listener.local_addr().unwrap();
