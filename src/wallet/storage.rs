@@ -1732,13 +1732,20 @@ mod tests {
             std::fs::write(&path, &bytes).unwrap();
             assert!(Wallet::is_wallet_encrypted(&path).unwrap());
             for password in [None, Some(String::new()), Some("wrong".into())] {
-                let error = WalletStore::read_from_disk(&path, password).unwrap_err();
-                if name == "ln-swap-in" && cfg!(feature = "lightning") {
-                    assert!(!matches!(error, WalletError::NeedsUpgrade(_)));
-                } else {
-                    assert!(matches!(error, WalletError::NeedsUpgrade(names) if names == [name]));
+                for result in [
+                    WalletStore::read_from_disk(&path, password.clone()).map(|_| ()),
+                    WalletStore::read_without_upgrade(&path, password).map(|_| ()),
+                ] {
+                    let error = result.unwrap_err();
+                    if name == "ln-swap-in" && cfg!(feature = "lightning") {
+                        assert!(!matches!(error, WalletError::NeedsUpgrade(_)));
+                    } else {
+                        assert!(
+                            matches!(error, WalletError::NeedsUpgrade(names) if names == [name])
+                        );
+                    }
+                    assert_eq!(std::fs::read(&path).unwrap(), bytes);
                 }
-                assert_eq!(std::fs::read(&path).unwrap(), bytes);
             }
         }
     }

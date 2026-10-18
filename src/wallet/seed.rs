@@ -485,21 +485,74 @@ mod tests {
         let source = serde_cbor::to_vec(&v1).unwrap();
         std::fs::write(&path, &source).unwrap();
         drop(original);
-        let _owner = super::super::seed_cli::WalletInUse::shared(&path).unwrap();
-        assert!(
-            super::super::seed_cli::WalletInUse::exclusive_if_idle(&path)
-                .unwrap()
-                .is_none()
-        );
+        let report_path = dir.path().join("wallet_swap_report.json");
+        let report = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed_swap_report.json");
+        std::fs::write(&report_path, report).unwrap();
 
         // Both seed commands use this read before obtaining their exclusive
-        // guard. It must stay read-only even for an unmigrated file.
-        let _ = Wallet::open_offline(&path, password("test-password"));
-        assert!(
-            std::fs::read(&path).unwrap() == source,
-            "an offline seed read rewrote the live owner's wallet"
-        );
-        assert!(!path.with_file_name("wallet.v023").exists());
+        // guard. Neither an owner nor another seed writer may be bypassed.
+        for exclusive in [false, true] {
+            let owner = if exclusive {
+                WalletInUse::exclusive_if_idle(&path).unwrap().unwrap()
+            } else {
+                WalletInUse::shared(&path).unwrap()
+            };
+            let err = Wallet::open_offline(&path, password("test-password")).unwrap_err();
+            assert!(matches!(err, WalletError::General(ref message) if message == IN_USE_MESSAGE));
+            assert!(
+                std::fs::read(&path).unwrap() == source,
+                "an offline seed read rewrote the live owner's wallet"
+            );
+            assert_eq!(std::fs::read(&report_path).unwrap(), report);
+            assert!(!path.with_file_name("wallet.v023").exists());
+            assert!(!report_path
+                .with_file_name("wallet_swap_report.json.v023")
+                .exists());
+            drop(owner);
+        }
+        assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn offline_upgrade_refusals_release_lock_and_preserve_inputs() {
+        let closed = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed.wallet");
+        let open = include_bytes!("../../tests/fixtures/compat/v0.2.3/open.wallet");
+        let report = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed_swap_report.json");
+        for refusal in ["password", "open swap", "report", "archive"] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("wallet");
+            let report_path = dir.path().join("wallet_swap_report.json");
+            let archive = dir.path().join("wallet.v023");
+            let source: &[u8] = if refusal == "open swap" { open } else { closed };
+            let report_bytes: &[u8] = if refusal == "report" {
+                b"bad json"
+            } else {
+                report
+            };
+            std::fs::write(&path, source).unwrap();
+            std::fs::write(&report_path, report_bytes).unwrap();
+            if refusal == "archive" {
+                std::fs::create_dir(&archive).unwrap();
+            }
+            let supplied = if refusal == "password" {
+                "wrong"
+            } else {
+                "compat-v023"
+            };
+            let err = Wallet::open_offline(&path, password(supplied)).unwrap_err();
+            if refusal == "password" {
+                assert!(matches!(err, WalletError::WrongPassword));
+            }
+            assert!(std::fs::read(&path).unwrap() == source, "{}", refusal);
+            assert_eq!(std::fs::read(&report_path).unwrap(), report_bytes);
+            assert!(!report_path
+                .with_file_name("wallet_swap_report.json.v023")
+                .exists());
+            if refusal != "archive" {
+                assert!(!archive.exists());
+            }
+            assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
+        }
     }
 
     #[test]
