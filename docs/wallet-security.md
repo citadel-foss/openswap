@@ -137,6 +137,12 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   the exclusive one on a fresh read of the file. A running process would
   otherwise overwrite the change with its older state. `attach-seed` is
   refused for the same reason.
+- **The lock file.** Opening a wallet creates an empty `<wallet>.lock` next
+  to it. So the wallets directory must be writable and on a filesystem with
+  file locks (some network mounts have none). Otherwise the wallet refuses to
+  open and names the lock file: running without the lock would let a seed
+  command overwrite a running wallet. Tools that list the wallets directory
+  should skip `*.lock` files. Don't delete one while a process uses the wallet.
 - **Docker.** The container prints no seed. Use `exec` to see the words:
   `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`. To
   record the confirmation or run `attach-seed`, stop the maker and use

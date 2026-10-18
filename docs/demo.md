@@ -218,7 +218,7 @@ Portal uses the same data folders as the OpenSwap command-line tools, so their w
 
 ```
 ~/.openswap/taker/
-├── wallets/            wallet files, plus one swap report per wallet
+├── wallets/            wallet files, plus a swap report and a .lock file per wallet
 ├── debug.log           application log
 ├── offerbook.json      cached marketplace state
 ├── swap_tracker.cbor   crash-resilient swap state, for recovery

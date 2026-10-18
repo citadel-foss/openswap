@@ -41,18 +41,30 @@ fn open_sentinel(wallet_path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// Fails closed: opening the wallet without the lock would let a seed command
+/// overwrite it.
+fn lock_failed(wallet_path: &Path, e: io::Error) -> WalletError {
+    WalletError::General(format!(
+        "could not lock {:?}: {e}; every open wallet holds this lock so that \
+         show-seed and attach-seed never overwrite it, so the wallets directory \
+         must be writable and support file locks",
+        in_use_path(wallet_path)
+    ))
+}
+
 impl WalletInUse {
     /// Marks the wallet as in use until dropped. Waits only while a seed
     /// command is writing.
-    pub fn shared(wallet_path: &Path) -> io::Result<Self> {
-        let file = open_sentinel(wallet_path)?;
-        file.lock_shared()?;
+    pub(crate) fn shared(wallet_path: &Path) -> Result<Self, WalletError> {
+        let failed = |e| lock_failed(wallet_path, e);
+        let file = open_sentinel(wallet_path).map_err(failed)?;
+        file.lock_shared().map_err(failed)?;
         Ok(Self { _file: file })
     }
 
     /// Takes the wallet for writing, or `None` if any process runs on it.
     pub(crate) fn exclusive_if_idle(wallet_path: &Path) -> Result<Option<Self>, WalletError> {
-        let failed = |e: io::Error| WalletError::General(format!("wallet lock failed: {e}"));
+        let failed = |e| lock_failed(wallet_path, e);
         let file = open_sentinel(wallet_path).map_err(failed)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { _file: file })),
