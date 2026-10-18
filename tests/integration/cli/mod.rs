@@ -1,4 +1,6 @@
-//! The `makerd` RPC server and the `taker` CLI.
+//! The `makerd` RPC server and signal handling, and the `taker` CLI.
 
 mod maker;
+#[cfg(unix)]
+mod makerd;
 mod taker;

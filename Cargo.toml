@@ -46,6 +46,10 @@ ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"], optional = true }
 lightning-invoice = { version = "0.32", features = ["std"], optional = true }
 
+# Already in the tree through crossterm, which also uses it only on unix.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
 [dev-dependencies]
 minreq = { version = "2.12.0", features = ["https"] }
 flate2 = {version = "1.0.35"}

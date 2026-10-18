@@ -208,8 +208,25 @@ const NOSTR_BROADCAST_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(not(feature = "integration-test"))]
 const NOSTR_BROADCAST_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
-/// Start the maker server.
+/// Start the maker server. Returns `Ok` when the stop flag ends it, and always
+/// joins the threads it started and saves the wallet on the way out.
 pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
+    let served = serve(Arc::clone(&maker));
+    if let Err(e) = &served {
+        if !e.is_shutdown() {
+            log::error!("[{}] Server failed: {:?}", maker.config.network_port, e);
+        }
+        // Threads started before the failure would otherwise run on.
+        maker.shutdown.store(true, Relaxed);
+    }
+    let stopped = shutdown_server(&maker);
+    match served {
+        Err(e) if !e.is_shutdown() => Err(e),
+        _ => stopped,
+    }
+}
+
+fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     log::info!("[{}] Starting maker server", maker.config.network_port);
 
     #[cfg(feature = "integration-test")]
@@ -441,6 +458,11 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         }
     }
 
+    Ok(())
+}
+
+/// Stops the watcher, joins every thread that can touch the wallet, then saves it.
+fn shutdown_server(maker: &MakerServer) -> Result<(), MakerError> {
     log::info!("[{}] Server shutting down...", maker.config.network_port);
 
     maker.watch_service.shutdown();
@@ -462,6 +484,10 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         if save_result.is_ok() { "ok" } else { "error" }
     );
     save_result?;
+    // Idle, these poll the flag every second; a blocked relay call is abandoned.
+    maker
+        .thread_pool
+        .join_wallet_free_threads(Duration::from_secs(2));
 
     log::info!("[{}] Server shutdown complete", maker.config.network_port);
 
@@ -575,7 +601,8 @@ fn spawn_nostr_broadcast_thread(maker: &Arc<MakerServer>) -> Result<(), MakerErr
         })
         .map_err(MakerError::IO)?;
 
-    maker.thread_pool.add_thread(handle)?;
+    // Reads only the fidelity proof and config, never the wallet.
+    maker.thread_pool.add_wallet_free_thread(handle)?;
 
     Ok(())
 }

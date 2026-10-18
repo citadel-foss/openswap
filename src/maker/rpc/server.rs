@@ -2,9 +2,12 @@ use std::{
     fs::{self, OpenOptions},
     io::{ErrorKind, Write},
     net::{TcpListener, TcpStream},
-    sync::{atomic::Ordering::Relaxed, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering::Relaxed},
+        Arc, Mutex,
+    },
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bitcoin::{
@@ -35,6 +38,63 @@ use crate::{
 use std::{path::Path, sync::RwLock};
 
 const RPC_COOKIE_FILE: &str = "rpc_cookie";
+
+/// How long a client may stay silent, or a reply may stay unsent.
+const RPC_IO_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Waits for the client's first byte in one-second slices, so an idle client
+/// cannot hold off shutdown. `Ok(false)`: shutdown came first.
+///
+/// Call it after parking the stream in [`MakerRpc::rpc_client`]: shutdown sets
+/// the flag before it closes the parked stream, so a stream parked too late to
+/// be closed fails the first check here.
+fn wait_for_request(stream: &TcpStream, shutdown: &AtomicBool) -> std::io::Result<bool> {
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    let deadline = Instant::now() + RPC_IO_TIMEOUT;
+    loop {
+        if shutdown.load(Relaxed) {
+            return Ok(false);
+        }
+        match stream.peek(&mut [0; 1]) {
+            // Data or EOF: `read_message` takes it from here.
+            Ok(_) => break,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    stream.set_read_timeout(Some(RPC_IO_TIMEOUT))?;
+    Ok(true)
+}
+
+/// Parks `stream` where shutdown can close it; `None` clears the slot.
+fn park_client<M: MakerRpc>(maker: &M, stream: Option<TcpStream>) {
+    if let Some(Ok(mut slot)) = maker.rpc_client().map(|slot| lock_debug!(slot.lock())) {
+        *slot = stream;
+    }
+}
+
+/// Answers one client. Returns false if shutdown came before its request.
+fn serve_client<M: MakerRpc>(maker: &Arc<M>, stream: &mut TcpStream, rpc_cookie: &str) -> bool {
+    let handled = match wait_for_request(stream, maker.shutdown()) {
+        Ok(true) => handle_request(maker, stream, rpc_cookie),
+        Ok(false) => return false,
+        Err(e) => Err(e.into()),
+    };
+    // Do not cause hard error if a rpc request fails
+    if let Err(e) = handled {
+        log::error!("Error processing RPC Request: {e:?}");
+        // Send the error back to client.
+        if let Err(e) = send_message(stream, &RpcMsgResp::ServerError(format!("{e:?}"))) {
+            log::error!("Error sending RPC response {e:?}");
+        };
+    }
+    true
+}
 
 fn write_rpc_cookie(data_dir: &Path) -> Result<String, MakerError> {
     let mut bytes = [0_u8; 32];
@@ -74,6 +134,11 @@ pub trait MakerRpc {
     fn data_dir(&self) -> &Path;
     fn config(&self) -> &MakerServerConfig;
     fn shutdown(&self) -> &ShutdownSignal;
+    /// Where the client being served is parked, so shutdown can close it
+    /// under a blocked read.
+    fn rpc_client(&self) -> Option<&Mutex<Option<TcpStream>>> {
+        None
+    }
     #[cfg(feature = "integration-test")]
     fn take_reserved_rpc_listener(&self) -> Option<TcpListener> {
         None
@@ -301,17 +366,12 @@ pub(crate) fn start_rpc_server<M: MakerRpc>(maker: Arc<M>) -> Result<(), MakerEr
         match listener.accept() {
             Ok((mut stream, addr)) => {
                 log::info!("Got RPC request from: {addr}");
-                stream.set_read_timeout(Some(Duration::from_secs(20)))?;
-                stream.set_write_timeout(Some(Duration::from_secs(20)))?;
-                // Do not cause hard error if a rpc request fails
-                if let Err(e) = handle_request(&maker, &mut stream, &rpc_cookie) {
-                    log::error!("Error processing RPC Request: {e:?}");
-                    // Send the error back to client.
-                    if let Err(e) =
-                        send_message(&mut stream, &RpcMsgResp::ServerError(format!("{e:?}")))
-                    {
-                        log::error!("Error sending RPC response {e:?}");
-                    };
+                stream.set_write_timeout(Some(RPC_IO_TIMEOUT))?;
+                park_client(&*maker, Some(stream.try_clone()?));
+                let served = serve_client(&maker, &mut stream, &rpc_cookie);
+                park_client(&*maker, None);
+                if !served {
+                    break;
                 }
             }
 

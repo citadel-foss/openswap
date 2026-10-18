@@ -68,6 +68,18 @@ pub enum MakerError {
     TorError(TorError),
     /// Watcher Service Error
     Watcher(WatcherError),
+    /// The server's stop flag ended a wait.
+    Shutdown,
+}
+
+impl MakerError {
+    /// Whether the stop flag, not a failure, ended the operation.
+    pub fn is_shutdown(&self) -> bool {
+        matches!(
+            self,
+            Self::Shutdown | Self::Wallet(WalletError::Interrupted("Shutdown requested"))
+        )
+    }
 }
 
 impl From<TorError> for MakerError {

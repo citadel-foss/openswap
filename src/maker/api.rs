@@ -633,6 +633,11 @@ name = \"{}\"
 /// peer waiting for an end that never comes.
 pub struct ThreadPool {
     threads: Mutex<Vec<PooledThread>>,
+    /// Threads that never take the wallet lock and may block on the network
+    /// for minutes, so the shutdown save does not wait for them.
+    wallet_free: Mutex<Vec<JoinHandle<()>>>,
+    /// The client the RPC thread is serving, closed with the connection sockets.
+    pub(crate) rpc_client: Mutex<Option<TcpStream>>,
     port: u16,
 }
 
@@ -644,6 +649,8 @@ impl ThreadPool {
     pub fn new(port: u16) -> Self {
         Self {
             threads: Mutex::new(Vec::new()),
+            wallet_free: Mutex::new(Vec::new()),
+            rpc_client: Mutex::new(None),
             port,
         }
     }
@@ -651,6 +658,37 @@ impl ThreadPool {
     /// Add a thread to the pool.
     pub fn add_thread(&self, handle: JoinHandle<()>) -> Result<(), MakerError> {
         self.push(handle, None)
+    }
+
+    /// Add a thread that never takes the wallet lock; see [`Self::join_wallet_free_threads`].
+    pub(crate) fn add_wallet_free_thread(&self, handle: JoinHandle<()>) -> Result<(), MakerError> {
+        lock_debug!(self.wallet_free.lock())
+            .map_err(|_| MakerError::General("thread pool lock poisoned"))?
+            .push(handle);
+        Ok(())
+    }
+
+    /// Joins the wallet-free threads that finish within `grace` and leaves the
+    /// rest running: one blocked in a network call cannot see the stop flag.
+    pub(crate) fn join_wallet_free_threads(&self, grace: Duration) {
+        let Ok(mut owned) = lock_debug!(self.wallet_free.lock()) else {
+            return;
+        };
+        let deadline = Instant::now() + grace;
+        for handle in std::mem::take(&mut *owned) {
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if handle.is_finished() {
+                self.join_thread(handle);
+            } else {
+                log::warn!(
+                    "[{}] Not waiting for blocked thread {:?}",
+                    self.port,
+                    handle.thread().name()
+                );
+            }
+        }
     }
 
     /// Add a connection thread, so shutdown can close the socket it reads from.
@@ -706,6 +744,9 @@ impl ThreadPool {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                 }
             }
+            if let Ok(Some(stream)) = lock_debug!(self.rpc_client.lock()).as_deref() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
 
             while let Some((thread, _)) = threads.pop() {
                 self.join_thread(thread);
@@ -726,17 +767,33 @@ impl ThreadPool {
 /// Latches the server stop request while allowing its backend abort arm to reset
 /// after every owned thread has joined.
 pub struct ShutdownSignal {
-    requested: AtomicBool,
+    requested: Arc<AtomicBool>,
     backend: Arc<AtomicBool>,
 }
 
+impl Default for ShutdownSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShutdownSignal {
-    /// Keeps construction private so both flags always start in the same state.
-    pub(crate) fn new() -> Self {
+    /// Both flags always start in the same state.
+    pub fn new() -> Self {
         Self {
-            requested: AtomicBool::new(false),
+            requested: Arc::new(AtomicBool::new(false)),
             backend: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Requests shutdown when the process receives `signal`, like
+    /// `store(true, _)`. The handler only sets the two atomics, which is
+    /// async-signal-safe; the server's loops poll them as for an RPC stop.
+    #[cfg(unix)]
+    pub fn stop_on_signal(&self, signal: std::os::raw::c_int) -> std::io::Result<()> {
+        signal_hook::flag::register(signal, Arc::clone(&self.requested))?;
+        signal_hook::flag::register(signal, Arc::clone(&self.backend))?;
+        Ok(())
     }
 
     /// Reads the terminal latch, which backend rearming never clears.
@@ -894,7 +951,16 @@ impl MakerServer {
 
     /// Initialize a maker server. The backend (Bitcoin Core or Electrum) is
     /// resolved from `config` via [`MakerServerConfig::backend`].
-    pub fn init(mut config: MakerServerConfig) -> Result<Self, MakerError> {
+    pub fn init(config: MakerServerConfig) -> Result<Self, MakerError> {
+        Self::init_with_shutdown(config, ShutdownSignal::new())
+    }
+
+    /// [`Self::init`] with a caller-owned stop flag, so a stop requested
+    /// during the startup sync already interrupts it.
+    pub fn init_with_shutdown(
+        mut config: MakerServerConfig,
+        shutdown: ShutdownSignal,
+    ) -> Result<Self, MakerError> {
         let mut password = config.password.take().map(Zeroizing::new);
         // Configs built in code skip `MakerServerConfig::new`, so check here too.
         check_fee_pcts(config.amount_relative_fee_pct, config.time_relative_fee_pct)
@@ -913,7 +979,6 @@ impl MakerServer {
         }
         let wallet_path = config.data_dir.join("wallets").join(&wallet_name);
         let wallet_lock = WalletInUse::for_daemon(&wallet_path)?;
-        let shutdown = ShutdownSignal::new();
         let backend_shutdown = shutdown.backend_flag();
         let blockchain =
             AnyBlockchain::from_config_with_shutdown(&config.backend, backend_shutdown.clone())
@@ -1148,7 +1213,7 @@ impl MakerServer {
                 ),
             }
             if !self.wait_for_shutdown(BOND_POLL_INTERVAL) {
-                return Err(MakerError::General("Shutdown requested"));
+                return Err(MakerError::Shutdown);
             }
         }
     }
@@ -1206,7 +1271,7 @@ impl MakerServer {
                 BOND_POLL_INTERVAL.as_secs()
             );
             if !self.wait_for_shutdown(BOND_POLL_INTERVAL) {
-                return Err(MakerError::General("Shutdown requested"));
+                return Err(MakerError::Shutdown);
             }
         }
     }
@@ -1294,7 +1359,7 @@ impl MakerServer {
                 break;
             }
             if !pending.is_empty() && !self.wait_for_shutdown(BOND_POLL_INTERVAL) {
-                return Err(MakerError::General("Shutdown requested"));
+                return Err(MakerError::Shutdown);
             }
         }
         Ok(())
@@ -1478,7 +1543,7 @@ impl MakerServer {
 
                             log::info!("Next sync in {} secs", SYNC_INTERVAL.as_secs());
                             if !self.wait_for_shutdown(SYNC_INTERVAL) {
-                                return Err(MakerError::General("Shutdown requested"));
+                                return Err(MakerError::Shutdown);
                             }
                         } else {
                             log::error!(
@@ -3848,6 +3913,10 @@ impl MakerRpc for MakerServer {
 
     fn shutdown(&self) -> &ShutdownSignal {
         &self.shutdown
+    }
+
+    fn rpc_client(&self) -> Option<&Mutex<Option<TcpStream>>> {
+        Some(&self.thread_pool.rpc_client)
     }
 
     #[cfg(feature = "integration-test")]

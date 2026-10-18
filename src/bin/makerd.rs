@@ -1,12 +1,16 @@
 use bitcoind::bitcoincore_rpc::Auth;
 use clap::{Parser, Subcommand};
 use openswap::{
-    maker::{bind_port_retry, start_server, MakerError, MakerServer, MakerServerConfig},
+    maker::{
+        bind_port_retry, start_server, MakerError, MakerServer, MakerServerConfig, ShutdownSignal,
+    },
     utill::{parse_proxy_auth, set_config_key, setup_maker_logger},
     wallet::{
         seed_cli, BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions, Wallet,
     },
 };
+#[cfg(unix)]
+use signal_hook::consts::{SIGINT, SIGTERM};
 use std::{path::PathBuf, sync::Arc};
 use zeroize::Zeroizing;
 
@@ -269,7 +273,25 @@ fn run() -> Result<(), MakerError> {
         return Ok(());
     }
     config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
-    let maker = Arc::new(MakerServer::init(config)?);
+
+    // SIGTERM (`docker stop`; PID 1 ignores it by default) and SIGINT stop
+    // the server like `maker-cli stop`. Installed only now, so Ctrl-C still
+    // aborts the prompts above.
+    let shutdown = ShutdownSignal::new();
+    #[cfg(unix)]
+    for signal in [SIGTERM, SIGINT] {
+        shutdown.stop_on_signal(signal)?;
+    }
+    let maker = match MakerServer::init_with_shutdown(config, shutdown) {
+        Ok(maker) => Arc::new(maker),
+        // Stopped before the server started: the wallet on disk is the last
+        // saved one, and dropping it released the lock.
+        Err(e) if e.is_shutdown() => {
+            log::info!("Shutdown requested during startup");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     start_server(maker)?;
 

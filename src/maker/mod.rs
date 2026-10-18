@@ -30,7 +30,7 @@ pub use rpc::{AuthenticatedRpcRequest, RpcMsgReq, RpcMsgResp};
 
 #[cfg(feature = "integration-test")]
 pub use api::MakerBehavior;
-pub use api::{MakerServer, MakerServerConfig};
+pub use api::{MakerServer, MakerServerConfig, ShutdownSignal};
 pub use handlers::{
     handle_message, ConnectionState, Maker as MakerTrait, MakerConfig as HandlerConfig, SwapPhase,
 };

@@ -562,6 +562,7 @@ openswap::bin/taker tests::password_file_excludes_the_argv_password
 openswap::bin/taker tests::restore_needs_exactly_one_source
 openswap::bin/taker tests::restore_reads_options_and_keeps_wallet_name_unset
 openswap::integration cli::maker::rpc_server
+openswap::integration cli::makerd::makerd_stops_cleanly_on_sigterm_and_sigint
 openswap::integration cli::taker::show_seed_refuses_pipes_and_argv_passwords
 openswap::integration cli::taker::taker_cli_shows_maker_states
 openswap::integration cli::taker::wallet_commands
