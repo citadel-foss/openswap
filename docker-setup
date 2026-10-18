@@ -772,6 +772,7 @@ run_seed_command() {
     wait "$seed_pid" || status=$?
     seed_pid=""
 
+    # A maker left down matters more than the seed command's status.
     restart_after_seed || exit 1
     trap - EXIT INT TERM HUP
     return "$status"
@@ -783,7 +784,8 @@ seed_interrupted() {
     local status=0
     trap '' INT TERM HUP
     if [ -n "$seed_pid" ]; then
-        docker stop "$seed_container" >/dev/null 2>&1 || true
+        # No container yet: stop the Compose launcher instead.
+        docker stop "$seed_container" >/dev/null 2>&1 || kill -TERM "$seed_pid" 2>/dev/null || true
         wait "$seed_pid" || status=$?
         docker rm -f "$seed_container" >/dev/null 2>&1 || true
     fi
