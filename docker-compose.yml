@@ -60,7 +60,10 @@ services:
       - sh
       - -c
       - |
-        sleep 15
+        # As PID 1 this shell ignores `docker stop`'s SIGTERM unless it traps
+        # it, and a trap only runs between commands, so the wait is interruptible.
+        trap 'echo "INFO: Shutdown requested during startup"; exit 0' TERM INT
+        sleep 15 & wait $$!
         mkdir -p /home/openswap/.openswap/maker
         
         cat > /home/openswap/.openswap/maker/config.toml << EOM
