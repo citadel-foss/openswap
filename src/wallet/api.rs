@@ -60,7 +60,7 @@ use super::{
     error::WalletError,
     report::{RecoveryReport, SwapRole},
     seed::{seal_mnemonic, SEED_NOT_BACKED_UP},
-    seed_cli::WalletInUse,
+    seed_cli::{WalletInUse, IN_USE_MESSAGE},
     storage::{AddressType, SecretXpriv, WalletStore},
     swapcoin::{contract_timelock, WatchOnlySwapCoin},
 };
@@ -552,9 +552,37 @@ impl Wallet {
         Self::load_with_lock(
             path,
             blockchain,
-            password.map(Zeroizing::new),
-            WalletInUse::shared(path)?,
+            password.clone().map(Zeroizing::new),
+            Self::shared_after_migration(path, password.as_deref())?,
         )
+    }
+
+    /// Takes the shared lock for a library load. An older file rewrites on
+    /// first read, which no running process may overlap, so it migrates
+    /// first under the exclusive lock, as `open_offline` does.
+    fn shared_after_migration(
+        path: &Path,
+        password: Option<&str>,
+    ) -> Result<WalletInUse, WalletError> {
+        let password = password.filter(|p| !p.is_empty()).map(str::to_owned);
+        if path.exists()
+            && matches!(
+                WalletStore::read_without_upgrade(path, password.clone()),
+                Ok(None)
+            )
+        {
+            let Some(_owner) = WalletInUse::exclusive_if_idle(path)? else {
+                return Err(WalletError::General(IN_USE_MESSAGE.to_string()));
+            };
+            match WalletStore::read_from_disk(path, password) {
+                // No passphrase: nothing was written, and the load reports it.
+                Err(WalletError::Security(SecurityError::PasswordRequired)) => {}
+                other => {
+                    other?;
+                }
+            }
+        }
+        WalletInUse::shared(path)
     }
 
     fn load_with_lock(
@@ -650,8 +678,8 @@ impl Wallet {
         Self::load_or_init_with_lock(
             path,
             blockchain,
-            password.map(Zeroizing::new),
-            WalletInUse::shared(path)?,
+            password.clone().map(Zeroizing::new),
+            Self::shared_after_migration(path, password.as_deref())?,
         )
     }
 
@@ -5575,6 +5603,40 @@ mod restore_history_probe_tests {
             Wallet::master_key_from_mnemonic(&mnemonic, bitcoin::Network::Regtest).unwrap()
         );
         assert!(!loaded.seed_backed_up());
+    }
+
+    /// A library load never migrates an older file while another process
+    /// holds the wallet; it migrates once the wallet is idle.
+    #[test]
+    fn library_load_migrates_only_when_no_process_holds_the_wallet() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("closed.wallet");
+        let original = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed.wallet");
+        std::fs::write(&path, original).unwrap();
+        let url = start_stub(StdHashSet::new());
+        let backend =
+            || AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+        let password = || Some("compat-v023".to_string());
+
+        let holder = WalletInUse::shared(&path).unwrap();
+        for error in [
+            Wallet::load(&path, backend(), password()).err().unwrap(),
+            Wallet::load_or_init(&path, backend(), password())
+                .err()
+                .unwrap(),
+        ] {
+            assert!(matches!(error, WalletError::General(ref message)
+                if message == crate::wallet::seed_cli::IN_USE_MESSAGE));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!path.with_file_name("closed.wallet.v023").exists());
+        drop(holder);
+
+        Wallet::load(&path, backend(), password()).unwrap();
+        assert_eq!(
+            std::fs::read(path.with_file_name("closed.wallet.v023")).unwrap(),
+            original
+        );
     }
 
     /// Every library owner holds the wallet lock while it lives, so the seed
