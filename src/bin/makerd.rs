@@ -92,7 +92,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Create the wallet and show its seed, then exit. Used by Docker setup.
+    /// Create the wallet (no seed is printed), then exit. Used by Docker setup.
     #[clap(hide = true)]
     InitWallet,
     /// Restore the wallet from a backup file or its seed phrase, then exit.
