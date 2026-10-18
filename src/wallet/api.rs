@@ -103,8 +103,8 @@ pub struct Wallet {
     pub(crate) store_enc_material: KeyMaterial,
     /// Wallet-side set of outpoints excluded from coin selection.
     pub(crate) locked_utxos: HashSet<OutPoint>,
-    /// Shared lock on the wallet file for this owner's lifetime, so the
-    /// offline seed commands never write under it. `None` only offline.
+    /// Shared for library wallets, exclusive for daemons, held for the
+    /// wallet's lifetime. `None` only offline.
     pub(crate) _in_use: Option<WalletInUse>,
 }
 
@@ -446,6 +446,15 @@ impl Wallet {
         blockchain: AnyBlockchain,
         password: Zeroizing<String>,
     ) -> Result<Self, WalletError> {
+        Self::init_with_lock(path, blockchain, password, WalletInUse::shared(path)?)
+    }
+
+    fn init_with_lock(
+        path: &Path,
+        blockchain: AnyBlockchain,
+        password: Zeroizing<String>,
+        in_use: WalletInUse,
+    ) -> Result<Self, WalletError> {
         if password.is_empty() {
             return Err(WalletError::General(
                 "a passphrase is required to create a wallet; \
@@ -478,7 +487,6 @@ impl Wallet {
         let sealed_mnemonic = seal_mnemonic(&mnemonic, &master_key.0, network, &password)?;
         drop(mnemonic);
         drop(password);
-        let in_use = WalletInUse::shared(path)?;
         // WalletStore::init seals the master key before the first write, so
         // the plaintext key never reaches disk. The phrase is in that write.
         let store = WalletStore::init_with(
@@ -540,13 +548,25 @@ impl Wallet {
         blockchain: AnyBlockchain,
         password: Option<String>,
     ) -> Result<Self, WalletError> {
-        let mut password = password.map(Zeroizing::new);
+        Self::load_with_lock(
+            path,
+            blockchain,
+            password.map(Zeroizing::new),
+            WalletInUse::shared(path)?,
+        )
+    }
+
+    fn load_with_lock(
+        path: &Path,
+        blockchain: AnyBlockchain,
+        mut password: Option<Zeroizing<String>>,
+        in_use: WalletInUse,
+    ) -> Result<Self, WalletError> {
         if password.as_ref().is_some_and(|p| p.is_empty()) {
             password = None;
         }
 
-        // Taken before the read, so a seed command can't write after it.
-        let in_use = WalletInUse::shared(path)?;
+        // The supplied guard is already held before reading or migrating.
         let (mut store, store_enc_material) =
             Self::read_store(path, password.as_mut().map(|p| std::mem::take(&mut **p)))?;
         // An older file may hold the key in plaintext; seal it before any backend call.
@@ -626,6 +646,22 @@ impl Wallet {
         blockchain: AnyBlockchain,
         password: Option<String>,
     ) -> Result<Wallet, WalletError> {
+        Self::load_or_init_with_lock(
+            path,
+            blockchain,
+            password.map(Zeroizing::new),
+            WalletInUse::shared(path)?,
+        )
+    }
+
+    /// Consumes an already-held guard, so daemon startup reads, migrates and
+    /// creates wallets under its one owner lock without taking a second fd.
+    pub(crate) fn load_or_init_with_lock(
+        path: &Path,
+        blockchain: AnyBlockchain,
+        password: Option<Zeroizing<String>>,
+        in_use: WalletInUse,
+    ) -> Result<Wallet, WalletError> {
         let wallet = if path.exists() {
             // wallet already exists, load the wallet. Refuse old Core first,
             // as `Wallet::init` does for a new wallet, so callers that start
@@ -633,7 +669,7 @@ impl Wallet {
             if let AnyBlockchain::CoreRPC(core) = &blockchain {
                 core.require_v22()?;
             }
-            let mut wallet = Wallet::load(path, blockchain, password)?;
+            let mut wallet = Self::load_with_lock(path, blockchain, password, in_use)?;
             if wallet.store.pending_restore.is_some() {
                 log::warn!("Wallet at {path:?} has an unfinished first scan; resuming it");
                 wallet.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
@@ -642,11 +678,8 @@ impl Wallet {
             wallet
         } else {
             // wallet doesn't exists at the given path, create a new one
-            let wallet = Wallet::init(
-                path,
-                blockchain,
-                Zeroizing::new(password.unwrap_or_default()),
-            )?;
+            let wallet =
+                Self::init_with_lock(path, blockchain, password.unwrap_or_default(), in_use)?;
 
             log::info!("New Wallet created at : {path:?}");
             wallet
@@ -5587,6 +5620,110 @@ mod restore_history_probe_tests {
         assert!(WalletInUse::exclusive_if_idle(&restored_path)
             .unwrap()
             .is_some());
+    }
+
+    /// Use a subprocess with a deadline: a second flock on the owner's fd
+    /// path would hang forever, rather than fail an ordinary assertion.
+    #[test]
+    fn owner_process_creates_and_loads_wallet_without_self_deadlock() {
+        use std::{
+            fs::{OpenOptions, TryLockError},
+            process::{Child, Command},
+            time::{Duration, Instant},
+        };
+
+        const CHILD_ENV: &str = "OPENSWAP_OWNER_WALLET_CHILD";
+        if let Some(path) = std::env::var_os(CHILD_ENV) {
+            let path = PathBuf::from(path);
+            let url = start_stub(StdHashSet::new());
+            let password = || Zeroizing::new("test-password".to_string());
+            let mut first_words = None;
+            for _ in 0..2 {
+                let owner = WalletInUse::owner(&path).unwrap();
+                let blockchain =
+                    AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+                // The same entry point used by maker and taker, with a real
+                // exclusive owner even in integration-test builds.
+                let mut wallet =
+                    Wallet::load_or_init_with_lock(&path, blockchain, Some(password()), owner)
+                        .unwrap();
+                let words = wallet.get_wallet_mnemonic(password()).unwrap().words();
+                assert_eq!(first_words.get_or_insert_with(|| words.clone()), &words);
+                // show-seed's confirmation and attach-seed share this gate.
+                assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_none());
+                let mut sentinel = path.as_os_str().to_os_string();
+                sentinel.push(".lock");
+                let reader = OpenOptions::new().write(true).open(sentinel).unwrap();
+                assert!(matches!(
+                    reader.try_lock_shared(),
+                    Err(TryLockError::WouldBlock)
+                ));
+                // A save replaces the wallet inode; ownership must survive it.
+                wallet.store.last_synced_height = Some(0);
+                wallet.save_to_disk().unwrap();
+                assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_none());
+                drop(wallet);
+                assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
+            }
+            return;
+        }
+
+        struct ChildProcess(Child);
+        impl Drop for ChildProcess {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = tempdir().unwrap();
+        let mut child = ChildProcess(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "wallet::api::restore_history_probe_tests::owner_process_creates_and_loads_wallet_without_self_deadlock",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, dir.path().join("wallet"))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "owner process failed: {}", status);
+                break;
+            }
+            assert!(Instant::now() < deadline, "owner wallet startup deadlocked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn failed_wallet_load_or_creation_releases_owner_lock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let url = start_stub(StdHashSet::new());
+        let backend =
+            || AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+        let open = |password| {
+            Wallet::load_or_init_with_lock(
+                &path,
+                backend(),
+                Some(Zeroizing::new(password)),
+                WalletInUse::owner(&path).unwrap(),
+            )
+        };
+        assert!(open(String::new()).is_err());
+        assert!(!path.exists());
+        assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
+        drop(open("test-password".to_string()).unwrap());
+        let original = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            open("wrong-password".to_string()),
+            Err(WalletError::Security(SecurityError::Decryption))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
     }
 
     /// A malformed blocklist aborts `Taker::init` immediately after the

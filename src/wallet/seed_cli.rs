@@ -14,10 +14,9 @@ use zeroize::Zeroizing;
 use super::{api::Wallet, error::WalletError};
 use crate::utill::prompt_password;
 
-/// Held, shared, by every `Wallet` built by init, load or restore, for as long
-/// as it lives. `show-seed` and `attach-seed` write only under the exclusive
-/// lock, on a fresh read, so they never overwrite a live owner's newer state
-/// and the owner's next save never erases what they wrote.
+/// Held by every online `Wallet` for its lifetime: exclusive for a running
+/// maker or taker, shared for library callers. Seed commands write only under
+/// an exclusive lock on a fresh read, so they cannot overwrite live state.
 pub struct WalletInUse {
     _file: File,
 }
@@ -53,13 +52,41 @@ fn lock_failed(wallet_path: &Path, e: io::Error) -> WalletError {
 }
 
 impl WalletInUse {
-    /// Marks the wallet as in use until dropped. Waits only while a seed
-    /// command is writing.
+    /// Marks a library wallet as in use until dropped. Waits while a daemon
+    /// owns the wallet or a seed command is writing.
     pub(crate) fn shared(wallet_path: &Path) -> Result<Self, WalletError> {
         let failed = |e| lock_failed(wallet_path, e);
         let file = open_sentinel(wallet_path).map_err(failed)?;
         file.lock_shared().map_err(failed)?;
         Ok(Self { _file: file })
+    }
+
+    /// Single running owner per wallet. The returned guard must be passed
+    /// into wallet loading, never followed by a shared lock on another fd:
+    /// file locks on separate open file descriptions conflict even in-process.
+    pub(crate) fn owner(wallet_path: &Path) -> Result<Self, WalletError> {
+        let failed = |e| lock_failed(wallet_path, e);
+        let file = open_sentinel(wallet_path).map_err(failed)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                log::info!("Waiting for lock on {}", in_use_path(wallet_path).display());
+                file.lock().map_err(failed)?;
+            }
+            Err(TryLockError::Error(e)) => return Err(failed(e)),
+        }
+        Ok(Self { _file: file })
+    }
+
+    /// Integration restart tests construct the replacement daemon before
+    /// dropping the old one (e.g. World::restart_maker). Keep their shared
+    /// guard so seed commands still cannot write during those restarts.
+    pub(crate) fn for_daemon(wallet_path: &Path) -> Result<Self, WalletError> {
+        if cfg!(feature = "integration-test") {
+            Self::shared(wallet_path)
+        } else {
+            Self::owner(wallet_path)
+        }
     }
 
     /// Takes the wallet for writing, or `None` if any process runs on it.
@@ -202,7 +229,7 @@ mod tests {
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let wallet = dir.path().join("wallet");
         let running = WalletInUse::shared(&wallet).unwrap();
-        // Other daemons and commands may run on the wallet at the same time.
+        // Multiple library readers may share the wallet.
         let second = WalletInUse::shared(&wallet).unwrap();
         assert!(WalletInUse::exclusive_if_idle(&wallet).unwrap().is_none());
         drop(running);
@@ -212,6 +239,56 @@ mod tests {
         assert!(writer.is_some());
         assert!(WalletInUse::exclusive_if_idle(&wallet).unwrap().is_none());
         drop(writer);
+        assert!(WalletInUse::exclusive_if_idle(&wallet).unwrap().is_some());
+    }
+
+    #[test]
+    fn daemon_lock_mode_matches_restart_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = dir.path().join("wallet");
+        let owner = WalletInUse::for_daemon(&wallet).unwrap();
+        let reader = open_sentinel(&wallet).unwrap();
+        let shared = reader.try_lock_shared();
+        if cfg!(feature = "integration-test") {
+            // Restart tests retain the old daemon while constructing its replacement.
+            shared.unwrap();
+        } else {
+            assert!(matches!(shared, Err(TryLockError::WouldBlock)));
+        }
+        // Even the integration exemption must retain the seed-write barrier.
+        assert!(WalletInUse::exclusive_if_idle(&wallet).unwrap().is_none());
+        drop(reader);
+        drop(owner);
+        assert!(WalletInUse::exclusive_if_idle(&wallet).unwrap().is_some());
+    }
+
+    #[test]
+    fn owner_waits_for_library_readers_and_other_owners() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = dir.path().join("wallet");
+        for guard in [WalletInUse::shared, WalletInUse::owner] {
+            let running = guard(&wallet).unwrap();
+            let path = wallet.clone();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let waiter = thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let owner = WalletInUse::owner(&path).unwrap();
+                acquired_tx.send(owner).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(matches!(
+                acquired_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(running);
+            let owner = acquired_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(WalletInUse::exclusive_if_idle(&wallet).unwrap().is_none());
+            drop(owner);
+            waiter.join().unwrap();
+        }
         assert!(WalletInUse::exclusive_if_idle(&wallet).unwrap().is_some());
     }
 

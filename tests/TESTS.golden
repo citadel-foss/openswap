@@ -268,10 +268,12 @@ openswap wallet::api::recovery_address_tests::first_recovery_creates_an_address
 openswap wallet::api::recovery_address_tests::retry_reuses_the_stored_recovery_address
 openswap wallet::api::restore_history_probe_tests::backup_carries_the_phrase_to_the_restored_wallet
 openswap wallet::api::restore_history_probe_tests::backup_restore_into_a_fresh_data_dir
+openswap wallet::api::restore_history_probe_tests::failed_wallet_load_or_creation_releases_owner_lock
 openswap wallet::api::restore_history_probe_tests::init_interactive_checks_the_passphrase_of_an_existing_wallet
 openswap wallet::api::restore_history_probe_tests::interrupted_restore_finishes_before_wallet_is_loaded
 openswap wallet::api::restore_history_probe_tests::live_library_wallet_blocks_seed_command_writes
 openswap wallet::api::restore_history_probe_tests::new_wallet_seals_its_phrase_in_the_first_write
+openswap wallet::api::restore_history_probe_tests::owner_process_creates_and_loads_wallet_without_self_deadlock
 openswap wallet::api::restore_history_probe_tests::restore_from_mnemonic_seals_the_phrase
 openswap wallet::api::restore_history_probe_tests::restore_from_mnemonic_uses_the_phrase_key_and_gap
 openswap wallet::api::restore_history_probe_tests::restore_probe_bridges_a_long_run_of_emptied_addresses
@@ -421,7 +423,9 @@ openswap wallet::seed::tests::pre_port_v2_seed_remains_password_gated_after_rewr
 openswap wallet::seed::tests::seal_checks_the_key_for_every_phrase_length
 openswap wallet::seed::tests::words_are_sized_once
 openswap wallet::seed_cli::tests::answers_match_the_exact_word_only
+openswap wallet::seed_cli::tests::daemon_lock_mode_matches_restart_policy
 openswap wallet::seed_cli::tests::in_use_sentinel_sits_next_to_the_wallet_file
+openswap wallet::seed_cli::tests::owner_waits_for_library_readers_and_other_owners
 openswap wallet::seed_cli::tests::quiz_never_asks_for_more_words_than_exist
 openswap wallet::seed_cli::tests::quiz_positions_are_distinct_sorted_and_in_range
 openswap wallet::seed_cli::tests::seed_commands_write_only_when_no_process_runs_on_the_wallet

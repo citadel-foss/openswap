@@ -23,7 +23,6 @@ use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 use zeroize::Zeroizing;
 
 use crate::{
-    atomic_file::FileLock,
     blocklist::{AddOutcome, AddressBlocklist, BlocklistEntry},
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
@@ -43,6 +42,7 @@ use crate::{
         blockchain::BackendConnector,
         funding::{net_policy_fees, CreateFundingTxesResult, SplitPlan},
         p2tr_min_non_dust_sats,
+        seed_cli::WalletInUse,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig,
         MakerFeeInfo as ReportMakerFeeInfo, RecoveryOutcome, ReportUtxo, RestoreOptions,
@@ -609,9 +609,6 @@ pub struct Taker {
     /// Test behavior.
     #[cfg(feature = "integration-test")]
     pub behavior: TakerBehavior,
-    /// Keeps a second process off this wallet while this one runs. Last, so
-    /// it is released only after every other field has stopped.
-    _wallet_lock: Option<FileLock>,
 }
 
 impl Drop for Taker {
@@ -731,9 +728,7 @@ impl Taker {
             .unwrap_or_else(get_taker_dir)?;
         std::fs::create_dir_all(&data_dir)?;
         let wallet_path = data_dir.join("wallets").join(&wallet_name);
-        // `Wallet::load` takes its own shared lock on `<wallet>.lock`; an
-        // exclusive one taken here on another handle would block it forever.
-        let wallet_lock = None;
+        let wallet_lock = WalletInUse::for_daemon(&wallet_path)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let blockchain = AnyBlockchain::from_config_with_shutdown(&backend, shutdown.clone())?;
         // Misconfiguration (no txindex, dead ZMQ) must fail here, not mid-swap.
@@ -743,11 +738,8 @@ impl Taker {
         // Take the passphrase out of the config: the wallet keeps the derived
         // key material, so the cleartext passphrase must not linger in the
         // long-lived server config.
-        let wallet = Wallet::load_or_init(
-            &wallet_path,
-            blockchain,
-            password.as_mut().map(|p| std::mem::take(&mut **p)),
-        )?;
+        let wallet =
+            Wallet::load_or_init_with_lock(&wallet_path, blockchain, password.take(), wallet_lock)?;
         // Validate the blocklist on startup when screening is enabled.
         if config.check_blocklist.unwrap_or(false) {
             AddressBlocklist::load(&data_dir, wallet.store.network)?;
@@ -792,7 +784,6 @@ impl Taker {
             offer_sync_handle,
             ongoing_swap: None,
             live_swap: Arc::new(Mutex::new(None)),
-            _wallet_lock: wallet_lock,
             recovery_loop: None,
             breach_detector: None,
             #[cfg(feature = "lightning")]

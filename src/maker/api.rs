@@ -20,7 +20,6 @@ use bitcoin::{bip32::ChainCode, Amount, Network, OutPoint, PublicKey, Transactio
 use zeroize::Zeroizing;
 
 use crate::{
-    atomic_file::FileLock,
     blocklist::AddressBlocklist,
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
@@ -40,6 +39,7 @@ use crate::{
         blockchain::BackendConnector,
         funding::{fit_declared_shape, net_policy_fees, SplitPlan},
         min_contract_value_sats,
+        seed_cli::WalletInUse,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FeePriority,
         FidelityError, MakerReport, RecoveryOutcome, RestoreOptions, SwapRole, Wallet, WalletError,
@@ -830,9 +830,6 @@ pub struct MakerServer {
     /// Same handoff for the RPC port.
     #[cfg(feature = "integration-test")]
     pub reserved_rpc_listener: Mutex<Option<TcpListener>>,
-    /// Keeps a second daemon off this wallet while this one runs. Last, so
-    /// it is released only after every other field has stopped.
-    _wallet_lock: Option<FileLock>,
 }
 
 /// How long a derived Lightning offer is served before it is recomputed.
@@ -915,9 +912,7 @@ impl MakerServer {
             cfg.wallet_name = wallet_name.clone();
         }
         let wallet_path = config.data_dir.join("wallets").join(&wallet_name);
-        // `Wallet::load` takes its own shared lock on `<wallet>.lock`; an
-        // exclusive one taken here on another handle would block it forever.
-        let wallet_lock = None;
+        let wallet_lock = WalletInUse::for_daemon(&wallet_path)?;
         let shutdown = ShutdownSignal::new();
         let backend_shutdown = shutdown.backend_flag();
         let blockchain =
@@ -931,11 +926,8 @@ impl MakerServer {
         // Take the passphrase out of the config: the wallet keeps the derived
         // key material, so the cleartext passphrase must not linger in the
         // long-lived server config.
-        let mut wallet = Wallet::load_or_init(
-            &wallet_path,
-            blockchain,
-            password.as_mut().map(|p| std::mem::take(&mut **p)),
-        )?;
+        let mut wallet =
+            Wallet::load_or_init_with_lock(&wallet_path, blockchain, password.take(), wallet_lock)?;
         let data_dir = config.data_dir.clone();
         log::info!("Sync at:----MakerServer init----");
         wallet.sync_and_save(&shutdown)?;
@@ -1059,7 +1051,6 @@ impl MakerServer {
             completed_handovers: Mutex::new(HashMap::new()),
             thread_pool: Arc::new(ThreadPool::new(config.network_port)),
             data_dir,
-            _wallet_lock: wallet_lock,
             nostr_relays,
             #[cfg(feature = "lightning")]
             lightning,
@@ -3905,7 +3896,7 @@ pub(crate) mod tests {
     #[cfg(feature = "integration-test")]
     use super::MakerBehavior;
     use super::{
-        min_swap_amount, swap_cost_floor, BackendConnector, ConnectionState, FileLock, MakerError,
+        min_swap_amount, swap_cost_floor, BackendConnector, ConnectionState, MakerError,
         MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal, ThreadPool, WatchService,
         MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
     };
@@ -3913,8 +3904,8 @@ pub(crate) mod tests {
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
         utill::MIN_RELAY_FEE_RATE,
         wallet::{
-            swapcoin::OutgoingSwapCoin, test_wallet, FidelityError, WalletError,
-            MIN_FIDELITY_BOND_AMOUNT_SATS,
+            seed_cli::WalletInUse, swapcoin::OutgoingSwapCoin, test_wallet, FidelityError,
+            WalletError, MIN_FIDELITY_BOND_AMOUNT_SATS,
         },
         watch_tower::{service::answering, watcher::WatcherEvent},
     };
@@ -3996,9 +3987,11 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
+        let mut wallet = test_wallet(&path.join("wallet"));
+        wallet._in_use = Some(WalletInUse::owner(&path.join("wallet")).unwrap());
         Arc::new(MakerServer {
             backend: BackendConnector::new(config.backend.clone(), shutdown.backend_flag()),
-            wallet: Arc::new(RwLock::new(test_wallet(&path.join("wallet")))),
+            wallet: Arc::new(RwLock::new(wallet)),
             shutdown,
             is_setup_complete: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
@@ -4009,7 +4002,6 @@ pub(crate) mod tests {
             watch_service,
             thread_pool: Arc::new(ThreadPool::new(0)),
             data_dir: path.to_path_buf(),
-            _wallet_lock: Some(FileLock::acquire(&path.join("wallet.lock")).unwrap()),
             nostr_relays: Vec::new(),
             config,
             #[cfg(feature = "lightning")]

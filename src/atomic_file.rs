@@ -113,6 +113,7 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::seed_cli::WalletInUse;
     use std::{
         io::Read,
         process::{Child, Command, Stdio},
@@ -152,7 +153,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wallet = dir.path().join("wallet.cbor");
         let lock_path = dir.path().join("wallet.cbor.lock");
-        let owner = FileLock::acquire(&lock_path).unwrap();
+        let owner = WalletInUse::owner(&wallet).unwrap();
         let contender = OpenOptions::new().write(true).open(&lock_path).unwrap();
         assert!(matches!(
             contender.try_lock(),
@@ -172,7 +173,7 @@ mod tests {
             lock_path.exists(),
             "the sentinel inode must remain reusable"
         );
-        drop(FileLock::acquire(&lock_path).unwrap());
+        drop(WalletInUse::owner(&wallet).unwrap());
     }
 
     #[test]
@@ -180,7 +181,7 @@ mod tests {
         const CHILD_LOCK_ENV: &str = "OPENSWAP_COMPAT_WALLET_LOCK_CHILD";
         if let Some(path) = std::env::var_os(CHILD_LOCK_ENV) {
             let lock_path = Path::new(&path);
-            let _owner = FileLock::acquire(lock_path).unwrap();
+            let _owner = WalletInUse::owner(&lock_path.with_extension("")).unwrap();
             std::fs::write(lock_path.with_extension("ready"), b"locked").unwrap();
             let _ = std::io::stdin().read_exact(&mut [0]);
             return;
@@ -225,6 +226,6 @@ mod tests {
         wait_for_lock(&contender);
         contender.unlock().unwrap();
         assert!(lock_path.exists());
-        drop(FileLock::acquire(&lock_path).unwrap());
+        drop(WalletInUse::owner(&lock_path.with_extension("")).unwrap());
     }
 }
