@@ -293,6 +293,34 @@ mod tests {
     }
 
     #[test]
+    fn sentinel_open_failures_refuse_every_wallet_lock_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = dir.path().join("wallet");
+        let original = b"wallet bytes must remain untouched";
+        std::fs::write(&wallet, original).unwrap();
+        // A directory at the sentinel path fails on every platform, including
+        // when tests run as root and Unix mode bits cannot simulate denial.
+        let sentinel = in_use_path(&wallet);
+        std::fs::create_dir(&sentinel).unwrap();
+        for acquire in [
+            WalletInUse::shared,
+            WalletInUse::owner,
+            WalletInUse::for_daemon,
+        ] {
+            let error = acquire(&wallet).err().expect("opening the lock must fail");
+            assert!(error.to_string().contains("could not lock"));
+        }
+        // Seed commands must distinguish an I/O failure from an idle wallet.
+        assert!(WalletInUse::exclusive_if_idle(&wallet).is_err());
+        assert_eq!(std::fs::read(&wallet).unwrap(), original);
+        assert!(
+            sentinel.is_dir(),
+            "a lock failure must not replace the sentinel"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
     fn in_use_sentinel_sits_next_to_the_wallet_file() {
         assert_eq!(
             in_use_path(Path::new("/d/wallets/my.wallet")),

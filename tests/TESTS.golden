@@ -429,6 +429,7 @@ openswap wallet::seed_cli::tests::owner_waits_for_library_readers_and_other_owne
 openswap wallet::seed_cli::tests::quiz_never_asks_for_more_words_than_exist
 openswap wallet::seed_cli::tests::quiz_positions_are_distinct_sorted_and_in_range
 openswap wallet::seed_cli::tests::seed_commands_write_only_when_no_process_runs_on_the_wallet
+openswap wallet::seed_cli::tests::sentinel_open_failures_refuse_every_wallet_lock_mode
 openswap wallet::spend::tests::exact_spend_refuses_a_fee_below_the_real_size
 openswap wallet::spend::tests::exact_spend_refuses_dust_change
 openswap wallet::spend::tests::exact_spend_refuses_inputs_below_the_spend

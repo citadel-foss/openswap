@@ -5629,6 +5629,7 @@ mod restore_history_probe_tests {
         use std::{
             fs::{OpenOptions, TryLockError},
             process::{Child, Command},
+            sync::mpsc,
             time::{Duration, Instant},
         };
 
@@ -5664,6 +5665,93 @@ mod restore_history_probe_tests {
                 assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_none());
                 drop(wallet);
                 assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
+            }
+
+            // An ordinary library load must wait before reading the file;
+            // otherwise its later save could erase this owner's final state.
+            let blockchain =
+                AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+            let mut owner_wallet = Wallet::load_or_init_with_lock(
+                &path,
+                blockchain,
+                Some(password()),
+                WalletInUse::owner(&path).unwrap(),
+            )
+            .unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (loaded_tx, loaded_rx) = mpsc::channel();
+            let reader_path = path.clone();
+            let reader_url = url.clone();
+            let reader = std::thread::spawn(move || {
+                let blockchain =
+                    AnyBlockchain::Electrum(Electrum::new(&electrum_config(reader_url)).unwrap());
+                started_tx.send(()).unwrap();
+                loaded_tx
+                    .send(Wallet::load(
+                        &reader_path,
+                        blockchain,
+                        Some("test-password".into()),
+                    ))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(
+                loaded_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            owner_wallet.store.external_index = 37;
+            owner_wallet.save_to_disk().unwrap();
+            drop(owner_wallet);
+            let loaded = loaded_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.store.external_index, 37);
+            assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_none());
+            drop(loaded);
+            reader.join().unwrap();
+            assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
+
+            // The legacy migration branch must consume the same owner guard,
+            // rather than acquiring another handle while rewriting the file.
+            for (name, original, closed) in [
+                (
+                    "closed.wallet",
+                    include_bytes!("../../tests/fixtures/compat/v0.2.3/closed.wallet").as_slice(),
+                    true,
+                ),
+                (
+                    "open.wallet",
+                    include_bytes!("../../tests/fixtures/compat/v0.2.3/open.wallet").as_slice(),
+                    false,
+                ),
+            ] {
+                let legacy = path.with_file_name(name);
+                std::fs::write(&legacy, original).unwrap();
+                let blockchain =
+                    AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+                let result = Wallet::load_or_init_with_lock(
+                    &legacy,
+                    blockchain,
+                    Some(Zeroizing::new("compat-v023".to_string())),
+                    WalletInUse::owner(&legacy).unwrap(),
+                );
+                let archive = path.with_file_name(format!("{name}.v023"));
+                if closed {
+                    let wallet = result.unwrap();
+                    assert_eq!(std::fs::read(&archive).unwrap(), original);
+                    assert!(WalletInUse::exclusive_if_idle(&legacy).unwrap().is_none());
+                    assert!(matches!(
+                        wallet.get_wallet_mnemonic(Zeroizing::new("compat-v023".to_string())),
+                        Err(WalletError::MnemonicUnavailable)
+                    ));
+                    drop(wallet);
+                } else {
+                    assert!(result.unwrap_err().to_string().contains("open swaps"));
+                    assert_eq!(std::fs::read(&legacy).unwrap(), original);
+                    assert!(!archive.exists());
+                }
+                assert!(WalletInUse::exclusive_if_idle(&legacy).unwrap().is_some());
             }
             return;
         }
