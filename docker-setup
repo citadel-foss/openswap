@@ -752,7 +752,8 @@ run_command() {
                 docker exec $tty openswap-bitcoind bitcoin-cli $BITCOIN_NETWORK_ARG "$@"
             fi
             ;;
-        *) docker run --rm $tty --network host \
+        # Attached runs may print or read a seed phrase; keep it out of Docker's logs.
+        *) docker run --rm $tty --log-driver none --network host \
             "openswap/${IMAGE_NAME}:latest" "$cmd" "$@" ;;
     esac
 }
