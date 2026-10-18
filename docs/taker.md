@@ -126,7 +126,7 @@ If you build the taker with `--features lightning`, it also has the `ln-swap-in`
 
 ### Key Points About Command Arguments
 
-- The `-p` or `--PASSWORD` option sets the wallet encryption passphrase. It is **required** when creating a new wallet and to open an encrypted one — wallet files are always encrypted (see [wallet security](./wallet-security.md)). The passphrase must be supplied on every (re)start; it is never persisted.
+- The wallet passphrase creates and opens the wallet file, which is always encrypted (see [wallet security](./wallet-security.md)). Give it with `--password-file <FILE>` (one trailing newline is dropped) or with `-p`/`--PASSWORD`, never both. Prefer the file: other users on the machine can see `-p` in the process list. One of the two is **required** every time a command opens the wallet; the passphrase is never saved. `restore` instead asks for the new wallet's passphrase at a prompt. `show-seed` and `attach-seed` refuse both options and ask only at a hidden prompt.
 
 - The `-r` or `--ADDRESS:PORT` option specifies the Bitcoin Core RPC address and port. By default, this is set to `127.0.0.1:38332`.
 
@@ -149,7 +149,7 @@ If you build the taker with `--features lightning`, it also has the `ln-swap-in`
   $ ./taker -r 127.0.0.1:38332 -a myuser:mypass --password-file ./wallet.pass <SUBCOMMAND>
 ```
 
-> **Note:** Every `taker` command opens the encrypted wallet, so `-p` is required on each invocation. The tutorial's bare `taker <SUBCOMMAND>` examples assume it is supplied.
+> **Note:** Every `taker` command opens the encrypted wallet, so each invocation needs `--password-file` or `-p` (except `show-seed` and `attach-seed`, which prompt). The tutorial's bare `taker <SUBCOMMAND>` examples assume one is supplied.
 
 ## For this tutorial, we'll assume a custom configuration with port 38332. Output examples will reflect this setup.
 

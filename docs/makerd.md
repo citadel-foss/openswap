@@ -260,7 +260,7 @@ This will give you detailed information about the options and arguments availabl
 
 - The `-w` or `--WALLET` option selects the wallet file. The default wallet name is **`maker`**.
 
-- The `-p` or `--PASSWORD` option sets the wallet encryption passphrase. It is **required** when creating a new wallet and to open an encrypted one — wallet files are always encrypted (see [wallet security](./wallet-security.md)). The passphrase must be supplied on every (re)start; it is never persisted.
+- The wallet passphrase creates and opens the wallet file, which is always encrypted (see [wallet security](./wallet-security.md)). Give it with `--password-file <FILE>` (one trailing newline is dropped) or with `-p`/`--PASSWORD`, never both. Prefer the file: other users on the machine can see `-p` in the process list. One of the two is **required** on every start; the passphrase is never saved. `restore` instead asks for the new wallet's passphrase at a prompt. `show-seed` and `attach-seed` refuse both options and ask only at a hidden prompt.
 
 - #### If you're using the **default configuration**:
 
@@ -285,7 +285,7 @@ To start `makerd`, run the following command:
 $ ./makerd -a user:password -r 127.0.0.1:38332 --password-file ./wallet.pass
 ```
 
-This will launch `makerd` and connect it to the Bitcoin RPC core running on its RPC port, using the default data directory for `maker` located at `$HOME/.openswap/maker`. The `-p` passphrase is required every time: it opens (or creates) the encrypted wallet file.
+This will launch `makerd` and connect it to the Bitcoin RPC core running on its RPC port, using the default data directory for `maker` located at `$HOME/.openswap/maker`. The passphrase is required every time, from `--password-file` as here or from `-p`: it opens (or creates) the encrypted wallet file.
 
 **What happens next:**
 
@@ -295,7 +295,7 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   INFO openswap::wallet::api - Wallet file at "/path/to/maker" successfully loaded.
   ```
 
-- **New Wallet Creation**: If no wallet file is found, `makerd` will create a new wallet named `maker`. Wallet files are always encrypted, so a wallet passphrase must be supplied via `-p`/`--PASSWORD` when creating (and later opening) the wallet — restarts always require an operator to provide it:
+- **New Wallet Creation**: If no wallet file is found, `makerd` will create a new wallet named `maker`. Wallet files are always encrypted, so a wallet passphrase must be supplied via `--password-file` or `-p`/`--PASSWORD` when creating (and later opening) the wallet — restarts always require an operator to provide it:
 
   ```bash
   $ ./makerd -a user:password -r 127.0.0.1:38332 --password-file ./wallet.pass

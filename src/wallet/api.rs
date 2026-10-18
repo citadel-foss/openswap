@@ -568,7 +568,7 @@ impl Wallet {
             Err(WalletError::Security(SecurityError::PasswordRequired)) => {
                 return Err(WalletError::General(format!(
                     "wallet file {path:?} is encrypted; \
-                         provide the wallet passphrase via -p/--PASSWORD"
+                         provide the wallet passphrase via --password-file or -p"
                 )))
             }
             Err(e) => return Err(e),
