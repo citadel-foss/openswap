@@ -412,4 +412,78 @@ mod tests {
         assert!(Wallet::open_offline(&path, password("test-password")).is_err());
         assert!(!path.exists());
     }
+
+    #[test]
+    fn migrated_v1_wallet_can_attach_and_reopen_its_seed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let original = legacy_wallet(&path, PHRASE);
+        let v1 =
+            crate::security::encrypt_struct(&original.store, &original.store_enc_material).unwrap();
+        let source = serde_cbor::to_vec(&v1).unwrap();
+        std::fs::write(&path, &source).unwrap();
+        drop(original);
+
+        let (store, _) = WalletStore::read_from_disk(&path, Some("test-password".into())).unwrap();
+        assert!(store.sealed_mnemonic.is_none());
+        assert!(!store.seed_backed_up);
+        assert_eq!(
+            std::fs::read(path.with_file_name("wallet.v023")).unwrap(),
+            source
+        );
+        let mut migrated = Wallet::open_offline(&path, password("test-password")).unwrap();
+        assert!(matches!(
+            migrated.get_wallet_mnemonic(password("test-password")),
+            Err(WalletError::MnemonicUnavailable)
+        ));
+        migrated
+            .attach_wallet_mnemonic(password("test-password"), password(PHRASE))
+            .unwrap();
+        drop(migrated);
+
+        let reopened = Wallet::open_offline(&path, password("test-password")).unwrap();
+        assert_eq!(
+            reopened
+                .get_wallet_mnemonic(password("test-password"))
+                .unwrap()
+                .words()
+                .as_str(),
+            PHRASE
+        );
+        assert!(matches!(
+            reopened.get_wallet_mnemonic(password("wrong-password")),
+            Err(WalletError::WrongPassword)
+        ));
+        assert_eq!(
+            std::fs::read(path.with_file_name("wallet.v023")).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn offline_legacy_read_does_not_write_while_an_owner_runs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let original = legacy_wallet(&path, PHRASE);
+        let v1 =
+            crate::security::encrypt_struct(&original.store, &original.store_enc_material).unwrap();
+        let source = serde_cbor::to_vec(&v1).unwrap();
+        std::fs::write(&path, &source).unwrap();
+        drop(original);
+        let _owner = super::super::seed_cli::WalletInUse::shared(&path).unwrap();
+        assert!(
+            super::super::seed_cli::WalletInUse::exclusive_if_idle(&path)
+                .unwrap()
+                .is_none()
+        );
+
+        // Both seed commands use this read before obtaining their exclusive
+        // guard. It must stay read-only even for an unmigrated file.
+        let _ = Wallet::open_offline(&path, password("test-password"));
+        assert!(
+            std::fs::read(&path).unwrap() == source,
+            "an offline seed read rewrote the live owner's wallet"
+        );
+        assert!(!path.with_file_name("wallet.v023").exists());
+    }
 }

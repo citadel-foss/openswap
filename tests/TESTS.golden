@@ -407,7 +407,9 @@ openswap wallet::report::tests::report_schema_uses_swap_boundary_utxos_without_c
 openswap wallet::report::tests::reports_live_in_the_wallet_and_unreadable_ones_survive_a_save
 openswap wallet::seed::tests::attach_stores_only_the_matching_phrase_once
 openswap wallet::seed::tests::confirm_needs_the_password_and_a_stored_phrase
+openswap wallet::seed::tests::migrated_v1_wallet_can_attach_and_reopen_its_seed
 openswap wallet::seed::tests::mismatched_stored_phrase_is_refused_on_read
+openswap wallet::seed::tests::offline_legacy_read_does_not_write_while_an_owner_runs
 openswap wallet::seed::tests::offline_open_needs_an_existing_wallet_file
 openswap wallet::seed::tests::offline_open_reads_the_seed_without_writing
 openswap wallet::seed::tests::seal_checks_the_key_for_every_phrase_length
@@ -443,6 +445,7 @@ openswap wallet::storage::tests::legacy_upgrade_archives_exact_inputs_and_seals_
 openswap wallet::storage::tests::legacy_upgrade_refuses_before_creating_archives
 openswap wallet::storage::tests::maker_swap_debug_redacts_the_preimage
 openswap wallet::storage::tests::old_new_old_sequence_never_loses_the_sealed_phrase
+openswap wallet::storage::tests::pre_port_v2_preserves_opaque_seed_and_forward_fields_on_save
 openswap wallet::storage::tests::reads_encrypted_wallet_when_password_is_supplied
 openswap wallet::storage::tests::requires_aad_is_sorted_unique_names_joined_by_newline
 openswap wallet::storage::tests::sealed_master_key_roundtrips

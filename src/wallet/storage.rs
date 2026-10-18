@@ -2242,6 +2242,57 @@ mod tests {
     }
 
     #[test]
+    fn pre_port_v2_preserves_opaque_seed_and_forward_fields_on_save() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let material = KeyMaterial::new_from_password(Some(PASSWORD.into())).unwrap();
+        let mut store = test_store(&path, &material);
+        let entropy = SecretEntropy::from_mnemonic(&Mnemonic::generate(12).unwrap()).unwrap();
+        // Deliberately cannot be opened with the outer file's password. Load
+        // and save must copy the sealed blob without trying to decrypt it.
+        store.sealed_mnemonic = Some(SealedSecret::seal(&entropy, "other password").unwrap());
+        store.seed_backed_up = true;
+        store.pending_restore = Some(RestoreOptions {
+            address_gap: 321,
+            bond_gap: 37,
+            ..Default::default()
+        });
+        store
+            .extra
+            .insert("future_field".into(), Value::Bytes(vec![1, 2, 3]));
+        store
+            .reports
+            .insert("future_report".into(), vec![Value::Bool(true)]);
+        let seed_bytes = serde_cbor::to_vec(&store.sealed_mnemonic).unwrap();
+        let master_bytes = serde_cbor::to_vec(&store.master_key).unwrap();
+        let old = crate::security::encrypt_struct_v2(&store, &material).unwrap();
+        std::fs::write(&path, serde_cbor::to_vec(&old).unwrap()).unwrap();
+        assert!(Wallet::is_wallet_encrypted(&path).unwrap());
+
+        let (read, key) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+        assert_eq!(read, store);
+        read.write_to_disk(&path, &key).unwrap();
+        let (rewritten, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+        assert_eq!(rewritten, store);
+        assert_eq!(
+            serde_cbor::to_vec(&rewritten.sealed_mnemonic).unwrap(),
+            seed_bytes
+        );
+        assert_eq!(
+            serde_cbor::to_vec(&rewritten.master_key).unwrap(),
+            master_bytes
+        );
+        assert!(rewritten.seed_backed_up);
+        assert!(matches!(
+            rewritten
+                .sealed_mnemonic
+                .unwrap()
+                .open::<SecretEntropy>(PASSWORD),
+            Err(SecurityError::Decryption)
+        ));
+    }
+
+    #[test]
     fn maker_swap_debug_redacts_the_preimage() {
         let preimage = [0xab; 32];
         let record = LnMakerSwapRecord {
