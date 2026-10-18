@@ -99,7 +99,7 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
 ## Operational notes
 
 - **Mandatory passphrase**: `makerd`/`taker` require a wallet passphrase
-  (`-p`/`--PASSWORD`) both to create a new wallet and to open an existing
+  (`--password-file <path>` or `-p`/`--PASSWORD`) both to create a new wallet and to open an existing
   one. Running without one fails with a clear error, and a restart always
   requires an operator to supply it again.
 - **No cleartext formats**: unencrypted wallet files and unencrypted backups
