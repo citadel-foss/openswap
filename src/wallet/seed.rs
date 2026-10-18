@@ -440,18 +440,26 @@ mod tests {
             original.store.seed_backed_up = backed_up;
             let seed_bytes = serde_cbor::to_vec(&original.store.sealed_mnemonic).unwrap();
             let master_bytes = serde_cbor::to_vec(&original.store.master_key).unwrap();
-            // Use #1165's writer, so this exercises the old V2 read path
-            // followed by a save in the port's format.
+            // Use #1165's writer to exercise migration on the first open.
             let old = crate::security::encrypt_struct_v2(
                 &original.store,
                 &original.store_enc_material,
                 Vec::new(),
             )
             .unwrap();
-            std::fs::write(&path, serde_cbor::to_vec(&old).unwrap()).unwrap();
+            let source = serde_cbor::to_vec(&old).unwrap();
+            std::fs::write(&path, &source).unwrap();
             drop(original);
 
             let mut offline = Wallet::open_offline(&path, password("test-password")).unwrap();
+            assert_eq!(
+                std::fs::read(path.with_file_name("wallet.v2pre")).unwrap(),
+                source
+            );
+            assert!(!path.with_file_name("wallet.v023").exists());
+            let migrated: crate::security::EncryptedDataV2 =
+                serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(migrated.requires, [crate::security::WALLET_STORE_FORMAT]);
             assert_eq!(offline.seed_backed_up(), backed_up);
             assert_eq!(
                 offline
@@ -515,8 +523,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wallet");
         let original = legacy_wallet(&path, PHRASE);
-        let v1 =
-            crate::security::encrypt_struct(&original.store, &original.store_enc_material).unwrap();
+        // v0.2.3 / pre-seed stores did not serialize either seed field.
+        let serde_cbor::Value::Map(mut old) = serde_cbor::value::to_value(&original.store).unwrap()
+        else {
+            panic!("store is not a map")
+        };
+        old.remove(&serde_cbor::Value::Text("sealed_mnemonic".into()));
+        old.remove(&serde_cbor::Value::Text("seed_backed_up".into()));
+        let v1 = crate::security::encrypt_struct(
+            serde_cbor::Value::Map(old),
+            &original.store_enc_material,
+        )
+        .unwrap();
         let source = serde_cbor::to_vec(&v1).unwrap();
         std::fs::write(&path, &source).unwrap();
         drop(original);
@@ -559,40 +577,63 @@ mod tests {
 
     #[test]
     fn offline_legacy_read_does_not_write_while_an_owner_runs() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("wallet");
-        let original = legacy_wallet(&path, PHRASE);
-        let v1 =
-            crate::security::encrypt_struct(&original.store, &original.store_enc_material).unwrap();
-        let source = serde_cbor::to_vec(&v1).unwrap();
-        std::fs::write(&path, &source).unwrap();
-        drop(original);
-        let report_path = dir.path().join("wallet_swap_report.json");
-        let report = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed_swap_report.json");
-        std::fs::write(&report_path, report).unwrap();
-
-        // Both seed commands use this read before obtaining their exclusive
-        // guard. Neither an owner nor another seed writer may be bypassed.
-        for exclusive in [false, true] {
-            let owner = if exclusive {
-                WalletInUse::exclusive_if_idle(&path).unwrap().unwrap()
+        for v2 in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("wallet");
+            let original = legacy_wallet(&path, PHRASE);
+            let source = if v2 {
+                serde_cbor::to_vec(
+                    &crate::security::encrypt_struct_v2(
+                        &original.store,
+                        &original.store_enc_material,
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
             } else {
-                WalletInUse::shared(&path).unwrap()
+                serde_cbor::to_vec(
+                    &crate::security::encrypt_struct(&original.store, &original.store_enc_material)
+                        .unwrap(),
+                )
+                .unwrap()
             };
-            let err = Wallet::open_offline(&path, password("test-password")).unwrap_err();
-            assert!(matches!(err, WalletError::General(ref message) if message == IN_USE_MESSAGE));
-            assert!(
-                std::fs::read(&path).unwrap() == source,
-                "an offline seed read rewrote the live owner's wallet"
-            );
-            assert_eq!(std::fs::read(&report_path).unwrap(), report);
-            assert!(!path.with_file_name("wallet.v023").exists());
-            assert!(!report_path
-                .with_file_name("wallet_swap_report.json.v023")
-                .exists());
-            drop(owner);
+            std::fs::write(&path, &source).unwrap();
+            drop(original);
+            let report_path = dir.path().join("wallet_swap_report.json");
+            let report =
+                include_bytes!("../../tests/fixtures/compat/v0.2.3/closed_swap_report.json");
+            std::fs::write(&report_path, report).unwrap();
+
+            // Both seed commands use this read before obtaining their exclusive
+            // guard. Neither an owner nor another seed writer may be bypassed.
+            for exclusive in [false, true] {
+                let owner = if exclusive {
+                    WalletInUse::exclusive_if_idle(&path).unwrap().unwrap()
+                } else {
+                    WalletInUse::shared(&path).unwrap()
+                };
+                let err = Wallet::open_offline(&path, password("test-password")).unwrap_err();
+                assert!(
+                    matches!(err, WalletError::General(ref message) if message == IN_USE_MESSAGE)
+                );
+                assert!(
+                    std::fs::read(&path).unwrap() == source,
+                    "an offline seed read rewrote the live owner's wallet"
+                );
+                assert_eq!(std::fs::read(&report_path).unwrap(), report);
+                assert!(!path.with_file_name("wallet.v023").exists());
+                assert!(!path.with_file_name("wallet.v2pre").exists());
+                assert!(!report_path
+                    .with_file_name("wallet_swap_report.json.v023")
+                    .exists());
+                assert!(!report_path
+                    .with_file_name("wallet_swap_report.json.v2pre")
+                    .exists());
+                drop(owner);
+            }
+            assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
         }
-        assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
     }
 
     #[test]
@@ -600,40 +641,57 @@ mod tests {
         let closed = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed.wallet");
         let open = include_bytes!("../../tests/fixtures/compat/v0.2.3/open.wallet");
         let report = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed_swap_report.json");
-        for refusal in ["password", "open swap", "report", "archive"] {
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("wallet");
-            let report_path = dir.path().join("wallet_swap_report.json");
-            let archive = dir.path().join("wallet.v023");
-            let source: &[u8] = if refusal == "open swap" { open } else { closed };
-            let report_bytes: &[u8] = if refusal == "report" {
-                b"bad json"
-            } else {
-                report
-            };
-            std::fs::write(&path, source).unwrap();
-            std::fs::write(&report_path, report_bytes).unwrap();
-            if refusal == "archive" {
-                std::fs::create_dir(&archive).unwrap();
+        for v2 in [false, true] {
+            for refusal in ["password", "open swap", "report", "archive"] {
+                let dir = tempdir().unwrap();
+                let path = dir.path().join("wallet");
+                let report_path = dir.path().join("wallet_swap_report.json");
+                let suffix = if v2 { ".v2pre" } else { ".v023" };
+                let archive = dir.path().join(format!("wallet{suffix}"));
+                let source: &[u8] = if refusal == "open swap" { open } else { closed };
+                let report_bytes: &[u8] = if refusal == "report" {
+                    b"bad json"
+                } else {
+                    report
+                };
+                let source = if v2 {
+                    let (store, material) = crate::security::decrypt_with_password::<WalletStore>(
+                        serde_cbor::from_slice(source).unwrap(),
+                        "compat-v023".into(),
+                        &[],
+                    )
+                    .unwrap();
+                    serde_cbor::to_vec(
+                        &crate::security::encrypt_struct_v2(&store, &material, Vec::new()).unwrap(),
+                    )
+                    .unwrap()
+                } else {
+                    source.to_vec()
+                };
+                std::fs::write(&path, &source).unwrap();
+                std::fs::write(&report_path, report_bytes).unwrap();
+                if refusal == "archive" {
+                    std::fs::create_dir(&archive).unwrap();
+                }
+                let supplied = if refusal == "password" {
+                    "wrong"
+                } else {
+                    "compat-v023"
+                };
+                let err = Wallet::open_offline(&path, password(supplied)).unwrap_err();
+                if refusal == "password" {
+                    assert!(matches!(err, WalletError::WrongPassword));
+                }
+                assert!(std::fs::read(&path).unwrap() == source, "{}", refusal);
+                assert_eq!(std::fs::read(&report_path).unwrap(), report_bytes);
+                assert!(!report_path
+                    .with_file_name(format!("wallet_swap_report.json{suffix}"))
+                    .exists());
+                if refusal != "archive" {
+                    assert!(!archive.exists());
+                }
+                assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
             }
-            let supplied = if refusal == "password" {
-                "wrong"
-            } else {
-                "compat-v023"
-            };
-            let err = Wallet::open_offline(&path, password(supplied)).unwrap_err();
-            if refusal == "password" {
-                assert!(matches!(err, WalletError::WrongPassword));
-            }
-            assert!(std::fs::read(&path).unwrap() == source, "{}", refusal);
-            assert_eq!(std::fs::read(&report_path).unwrap(), report_bytes);
-            assert!(!report_path
-                .with_file_name("wallet_swap_report.json.v023")
-                .exists());
-            if refusal != "archive" {
-                assert!(!archive.exists());
-            }
-            assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
         }
     }
 

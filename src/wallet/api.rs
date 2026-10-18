@@ -541,8 +541,9 @@ impl Wallet {
     /// Load wallet data from file and connect to a blockchain backend.
     /// In case of core rpc, core wallet name, and wallet_id field in the file should match.
     ///
-    /// Wallet files are always encrypted; an unencrypted file is rejected.
-    /// Opening one requires the passphrase it was written with.
+    /// Wallet files are always written encrypted. Older files, including
+    /// legacy plaintext, migrate under the supplied lock before backend setup.
+    /// Opening an encrypted file requires the passphrase it was written with.
     pub(crate) fn load(
         path: &Path,
         blockchain: AnyBlockchain,

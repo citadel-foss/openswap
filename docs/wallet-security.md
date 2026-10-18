@@ -102,9 +102,9 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   (`--password-file <path>` or `-p`/`--PASSWORD`) both to create a new wallet and to open an existing
   one. Running without one fails with a clear error, and a restart always
   requires an operator to supply it again.
-- **No cleartext formats**: unencrypted wallet files and unencrypted backups
-  are rejected, not migrated. The project is pre-launch, so no legacy
-  plaintext compatibility path exists.
+- **Encrypted writes only**: legacy plaintext wallet files are accepted only
+  for the one-time migration described below. New wallets, saves and backups
+  are always encrypted; plaintext backups are rejected.
 - **The BIP39 seed phrase** is sealed in the wallet file, in the same first
   write that creates it. Nothing prints it at creation. Until you confirm a
   backup, every start and CLI command warns "seed not backed up". Read it
@@ -125,25 +125,27 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   own key from the wallet password: a second blob next to the sealed master
   key. Loading a wallet never opens it.
 - **`show-seed`.** `taker show-seed` and `makerd show-seed` read the wallet
-  file offline. No backend is needed, nothing syncs and the file is written
-  only by the confirmation step below. The password comes from a hidden
+  file offline. No backend is needed and nothing syncs. Older files first
+  go through the migration below. The password comes from a hidden
   prompt, never from `-p` or `--password-file`. The command prints only when
   stdout is a terminal and
   refuses a pipe or a redirect. It then asks you to re-type a few random
   words before it records the backup as confirmed. Showing the words alone
-  does not count. Only that last step writes, and only while nothing else has
-  the wallet open: every open wallet (`makerd`, `taker`, the GUI or any
-  library caller) holds a shared lock on `<wallet>.lock`, and the write takes
-  the exclusive one on a fresh read of the file. A running process would
-  otherwise overwrite the change with its older state. `attach-seed` is
-  refused for the same reason.
+  does not count. Confirmation writes only while nothing else has
+  the wallet open: `makerd` and `taker` hold an exclusive owner lock on
+  `<wallet>.lock` for their lifetime; GUI and library wallets hold a shared
+  lock on the same file. Seed writes take the exclusive lock on a fresh read.
+  A running process would otherwise overwrite the change with its older
+  state. `attach-seed` is refused for the same reason.
 - **The lock file.** Creating, loading or restoring a wallet creates an
   empty `<wallet>.lock` next to it. The one exception is
-  `Wallet::open_offline`, the read-only open the seed commands use: it takes
-  no lock, and only their write step takes the exclusive one. So the wallets
-  directory must be writable and on a filesystem with file locks (some
-  network mounts have none). Otherwise the wallet refuses to open and names the lock file: running without the lock would let a seed
-  command overwrite a running wallet. Tools that list the wallets directory
+  `Wallet::open_offline`, which the seed commands use: current-format reads
+  take no lock. An older file needs a one-time migration, so that open first
+  takes the exclusive lock or refuses if the wallet is in use. Seed writes
+  also take the exclusive lock. So the wallets directory must be writable
+  and on a filesystem with file locks (some network mounts have none).
+  Otherwise the wallet refuses to open and names the lock file: running
+  without the lock would let a seed command overwrite a running wallet. Tools that list the wallets directory
   should skip `*.lock` files. Don't delete one while a process uses the wallet.
 - **Docker.** The container prints no seed. Use `exec` to see the words:
   `docker exec -it openswap-makerd makerd -w <wallet> show-seed`, where
@@ -176,20 +178,71 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   password. A restore seals the phrase again under the new wallet's password.
   Old backups still restore, with the phrase unavailable.
 
-## Wallet file format version 2
+## Wallet file format and migration
 
-Storing the phrase needs a new file format. Older builds ignore fields they
-do not know, and would delete the sealed phrase on their next save. So the
-wallet file now uses a version 2 container that older builds cannot parse.
-They fail at load and never save.
+Every save writes one CBOR `EncryptedDataV2` container with `version: 2`.
+Its cleartext `requires` list is authenticated as AES-GCM associated data:
+CBOR of `(version, requires)`, preserving the exact order and duplicates.
+Readers check the version, then supported requirements, before decrypting.
+Unknown requirements need a newer openswap build.
+Unknown store and record fields are preserved through saves.
 
-- The new build reads version 1 and version 2 files and refuses a higher
-  version. Loading never writes. The first save after a load writes version 2.
-- **Downgrade is not supported.** Once a new build has saved a wallet, an
-  older build refuses it. Keep an encrypted backup before you upgrade. To go
-  back, restore that backup with the older build.
-- A future password-change feature must re-encrypt the store and the sealed
-  phrase in one atomic write.
+Every new file includes the `wallet-store-2` format requirement, along with
+requirements for the records it contains. Builds from the seed-hardening
+release (#1165) reject any nonempty `requires`, so they refuse this format
+rather than silently losing reports or unknown fields on save. Still older
+builds cannot parse the V2 container at all.
+
+```text
+EncryptedDataV2 {
+    version: 2,
+    requires: ["wallet-store-2", ...],
+    nonce, pbkdf2_salt,
+    ciphertext: encrypted WalletStore {
+        master_key: EncryptedData { ... },  // individually sealed
+        sealed_mnemonic: SealedSecret { ... } or None,
+        seed_backed_up,
+        reports, ...
+    }
+}
+```
+
+Opening an older wallet migrates it before any other save. This covers
+v0.2.3 and pre-#1137 bare version 1 files, legacy plaintext wallets, and
+#1165-era V2 files without `wallet-store-2`:
+
+1. Stop every older openswap process using the data directory. Finish or
+   refund all swaps with that older build before upgrading. Migration
+   refuses wallets with swapcoins, swap reservations or Lightning swaps,
+   and refuses unfinished or unreadable `maker_swap_tracker.cbor` /
+   `swap_tracker.cbor` files. Refusals leave the source files untouched.
+2. Under the wallet lock, migration imports the wallet's sibling
+   `<wallet>_swap_report.json`, including deniability proofs. An unreadable
+   or unsupported report refuses migration rather than losing it.
+3. The wallet and imported report are archived byte-for-byte, with `.v023`
+   appended for version 1/plaintext sources or `.v2pre` for unmarked V2.
+   Archives are private (`0600` on Unix), fsynced, and their directory is
+   synced before the atomic V2 replacement. A retry reuses an identical
+   archive and repairs its permissions; if the live source changed before
+   retry, its archive is atomically replaced with the current source.
+4. The new container includes the marker. The report JSON is deleted only
+   after the new wallet commits; a failed delete leaves a stale copy that
+   later loads do not import again. Tracker files stay in place: remove
+   them manually only after every wallet in the data directory is upgraded.
+
+Migration seals a plaintext master key; already-sealed keys are unchanged.
+It never opens the sealed seed blob. An unmarked V2 wallet keeps that blob
+and `seed_backed_up` unchanged, and `show-seed` still needs its password.
+Version 1/plaintext wallets normally have no phrase, so `show-seed` returns
+`MnemonicUnavailable`; use `attach-seed` with the matching original phrase.
+
+**Downgrade is not supported.** Keep encrypted backups and private archives
+before upgrading. Archives are snapshots of the old state, and a plaintext
+source's archive is also plaintext: protect it as a private key. Never run
+an older build against an archived snapshot after newer swaps have begun.
+Restoring an older encrypted backup still works and writes the new format
+with the marker. A future password-change feature must re-encrypt the store
+and sealed phrase in one atomic write.
 
 ## What a restore brings back
 
@@ -210,8 +263,9 @@ keys. A restore searches the chain for what those keys own.
   only in the wallet file.
 - Pending refunds from failed swaps.
 - Lightning swaps in progress. A restored wallet does not know about them.
-- Swap reports and deniability proofs. Copy the `<wallet>_swap_report.json`
-  file by hand.
+- Swap reports and deniability proofs. Preserve the original wallet file
+  and any legacy `<wallet>_swap_report.json`; migration imports the latter,
+  while a key backup or seed restore cannot reconstruct reports.
 - Tags on swept coins. A backup file carries them. A seed phrase does not.
 - A BIP39 passphrase. OpenSwap has none, so a restore uses an empty one.
 
@@ -226,22 +280,3 @@ keys. A restore searches the chain for what those keys own.
 
 A restore refuses to overwrite an existing wallet file. Restore under a new
 name or move the old file first.
-
-## File formats
-
-Wallet file (CBOR, the only supported form):
-
-```
-EncryptedData {                       // outer: whole-store encryption
-    nonce, pbkdf2_salt,
-    encrypted_payload: WalletStore {
-        ...
-        master_key: EncryptedData {   // inner: individually sealed master key
-            nonce, pbkdf2_salt,
-            encrypted_payload: Xpriv
-        },
-        ...
-    }
-}
-```
-

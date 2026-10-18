@@ -593,15 +593,23 @@ pub fn load_sensitive_struct<T: DeserializeOwned, F: SerdeFormat>(
     password: Option<String>,
 ) -> Result<(T, Option<KeyMaterial>), SecurityError> {
     let content = Zeroizing::new(fs::read(file)?);
+    load_sensitive_struct_from_slice::<T, F>(&content, file, password)
+}
 
+/// Loads a single file snapshot, so header inspection and decryption agree.
+pub(crate) fn load_sensitive_struct_from_slice<T: DeserializeOwned, F: SerdeFormat>(
+    content: &[u8],
+    file: &Path,
+    password: Option<String>,
+) -> Result<(T, Option<KeyMaterial>), SecurityError> {
     let password = password.map(Zeroizing::new);
     // Checked before the plaintext attempt: a versioned file is never plaintext.
-    if let Ok(ContainerVersion { version }) = F::from_slice::<ContainerVersion>(&content) {
-        return decrypt_v2::<T, F>(&content, file, version, password);
+    if let Ok(ContainerVersion { version }) = F::from_slice::<ContainerVersion>(content) {
+        return decrypt_v2::<T, F>(content, file, version, password);
     }
     let password = match password {
         Some(mut encryption_password) if !encryption_password.is_empty() => {
-            let encrypted_struct = F::from_slice::<EncryptedData>(&content).map_err(|err| {
+            let encrypted_struct = F::from_slice::<EncryptedData>(content).map_err(|err| {
                 SecurityError::Format(format!(
                     "expected encrypted file {file:?} because a password was supplied: {err}"
                 ))
@@ -618,9 +626,9 @@ pub fn load_sensitive_struct<T: DeserializeOwned, F: SerdeFormat>(
         password => password,
     };
 
-    let (sensitive_struct, encryption_material) = match F::from_slice::<T>(&content) {
+    let (sensitive_struct, encryption_material) = match F::from_slice::<T>(content) {
         Ok(unencrypted_struct) => (unencrypted_struct, None),
-        Err(unencrypted_err) => match F::from_slice::<EncryptedData>(&content) {
+        Err(unencrypted_err) => match F::from_slice::<EncryptedData>(content) {
             Ok(encrypted_struct) => {
                 let mut encryption_password = match password {
                     Some(p) => p,

@@ -458,6 +458,8 @@ openswap wallet::storage::tests::legacy_upgrade_refuses_before_creating_archives
 openswap wallet::storage::tests::maker_swap_debug_redacts_the_preimage
 openswap wallet::storage::tests::old_new_old_sequence_never_loses_the_sealed_phrase
 openswap wallet::storage::tests::pre_port_v2_preserves_opaque_seed_and_forward_fields_on_save
+openswap wallet::storage::tests::pre_port_v2_refuses_open_swaps_trackers_and_reports_untouched
+openswap wallet::storage::tests::pre_port_v2_report_import_retries_private_archives_before_commit
 openswap wallet::storage::tests::reads_encrypted_wallet_when_password_is_supplied
 openswap wallet::storage::tests::sealed_master_key_roundtrips
 openswap wallet::storage::tests::sealed_master_key_survives_encrypted_store_roundtrip
