@@ -396,3 +396,52 @@ INFO openswap::maker::rpc::server - [6103] RPC socket binding successful at 127.
 For detailed instructions on how to use the maker-cli, please refer to the [maker-cli demo](./maker-cli.md). This guide will provide a comprehensive overview of the available commands and features for operating your maker server effectively.
 
 ---
+
+## Upgrading and downgrading
+
+This release is a one-time break. After it, later releases stay compatible with each other.
+
+### Before you upgrade
+
+1. **Stop every v0.2.3 process** that uses this data directory. This includes `makerd` and any `taker` on the same wallet.
+2. Do not skip step 1. An old process that keeps running can overwrite the new swap keys. That can lose funds.
+3. Finish every open swap on v0.2.3. Start v0.2.3 once if a swap is half done. The new version refuses to upgrade a wallet with open work. It changes nothing and tells you why.
+
+### What the upgrade does
+
+1. The first start loads your old wallet and checks that nothing is open.
+2. It saves private copies of your old wallet and old swap report. They end in `.v023`. Only you can read them.
+3. It writes the new wallet file. Your swap reports move into it.
+4. It deletes the old report file.
+
+The new wallet file also keeps the swap state that older versions kept in tracker files.
+
+### After you upgrade
+
+1. Upgrade every wallet in this data directory.
+2. Then delete `maker_swap_tracker.cbor` and `swap_tracker.cbor` by hand. The software never deletes them. They hold swap secrets in clear text.
+3. Keep the `.v023` copies for as long as you may go back.
+
+### Going back
+
+v0.2.3 cannot open the new wallet. The `.v023` copies are only a snapshot from the moment of the upgrade. Any swap you started after that is missing from them. Restoring them over the new files **erases the keys for those swaps and can lose funds**.
+
+Go back only like this:
+
+1. Keep your daemons running until every swap you started after the upgrade has finished and is gone from the wallet. Pending refunds need them.
+2. Stop every daemon that uses this data directory.
+3. Make a fresh copy of the whole new wallet file and keep it.
+4. Restore the `.v023` copies.
+
+### Later releases
+
+- A newer wallet may need a feature your build does not have. Your build then refuses to open it and names the missing feature. Upgrade and try again.
+- The `require_features` setting lists features you insist on. Each one counts only in the swaps it belongs to. For example, `taproot` counts in Taproot swaps only. It does not turn Legacy swaps off, and no setting does. A name your node does not know counts in every swap. The list must sit on one line. That line takes no comment.
+- Changing the default of `require_features` in a later release counts as a break.
+
+### A coin that stays locked
+
+Before your node sends funding, it saves the coin as committed. Your node then keeps that coin until a timelock refund, or until a confirmed transaction spends its inputs elsewhere. A crash between the save and the send can leave a coin held this way. A failed send does the same, for example when your node loses its connection to the backend.
+
+- **If the funding reached the chain**, leave your node running. The refund frees the coin when its timelock matures.
+- **If the funding never left your node**, recovery sends the saved funding and then refunds it. This holds for Legacy and Taproot swaps alike. Leave your node running until the refund confirms. You pay the network fees of those transactions. Do not edit the wallet file.

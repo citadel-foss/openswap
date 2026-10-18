@@ -17,7 +17,7 @@ use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::utill;
-use std::{fs, io, path::Path};
+use std::{collections::BTreeSet, fs, io, path::Path};
 
 /// Errors returned while loading or decrypting sensitive data.
 #[derive(Debug)]
@@ -391,8 +391,12 @@ impl SealedSecret {
 
 /// Whether CBOR `content` is an encrypted container of any version.
 pub fn is_encrypted_cbor(content: &[u8]) -> bool {
+    is_versioned_container(content) || serde_cbor::from_slice::<EncryptedData>(content).is_ok()
+}
+
+/// Whether CBOR `content` is a versioned ([`EncryptedDataV2`] or newer) container.
+pub(crate) fn is_versioned_container(content: &[u8]) -> bool {
     serde_cbor::from_slice::<ContainerVersion>(content).is_ok()
-        || serde_cbor::from_slice::<EncryptedData>(content).is_ok()
 }
 
 /// Counts the bytes written to it, to size a buffer before filling it.
@@ -426,7 +430,18 @@ pub fn encrypt_struct<T: Serialize>(
     plain_struct: T,
     enc_material: &KeyMaterial,
 ) -> Result<EncryptedData, EncryptError> {
-    let (nonce, encrypted_payload) = seal_cbor(&plain_struct, &enc_material.key, &[])?;
+    encrypt_struct_with_aad(plain_struct, enc_material, &[])
+}
+
+/// [`encrypt_struct`] with associated data. `aad` is authenticated but not
+/// encrypted: decryption fails unless the same bytes are supplied. Used only
+/// by the wallet envelope.
+pub fn encrypt_struct_with_aad<T: Serialize>(
+    plain_struct: T,
+    enc_material: &KeyMaterial,
+    aad: &[u8],
+) -> Result<EncryptedData, EncryptError> {
+    let (nonce, encrypted_payload) = seal_cbor(&plain_struct, &enc_material.key, aad)?;
     Ok(EncryptedData {
         nonce,
         encrypted_payload,
@@ -510,13 +525,51 @@ pub fn decrypt_struct<T: DeserializeOwned>(
     encrypted_struct: EncryptedData,
     enc_material: &KeyMaterial,
 ) -> Result<T, SecurityError> {
+    decrypt_struct_with_aad(encrypted_struct, enc_material, &[])
+}
+
+/// [`decrypt_struct`] with the associated data the data was encrypted with.
+pub fn decrypt_struct_with_aad<T: DeserializeOwned>(
+    encrypted_struct: EncryptedData,
+    enc_material: &KeyMaterial,
+    aad: &[u8],
+) -> Result<T, SecurityError> {
     open_cbor(
         &encrypted_struct.nonce,
         &encrypted_struct.encrypted_payload,
         &enc_material.key,
-        &[],
+        aad,
     )
 }
+
+/// Derives the key for `encrypted` from `password` and decrypts it with `aad`.
+pub(crate) fn decrypt_with_password<T: DeserializeOwned>(
+    encrypted: EncryptedData,
+    password: String,
+    aad: &[u8],
+) -> Result<(T, KeyMaterial), SecurityError> {
+    let material = KeyMaterial::existing(password, encrypted.nonce, encrypted.pbkdf2_salt);
+    let decrypted = decrypt_struct_with_aad(encrypted, &material, aad)?;
+    Ok((decrypted, material))
+}
+
+/// Names an incompatible change to the wallet encryption or its KDF adds to
+/// the wallet's `requires`. A build that adds one keeps the old parameters and
+/// reader. None this release: the iteration count is a global constant.
+pub(crate) const FORMAT_NAMES: &[&str] = &[];
+
+/// The associated data that binds a file's cleartext `requires` names to its
+/// ciphertext: the sorted unique names joined by `"\n"`, as UTF-8. Frozen; an
+/// empty set is empty bytes, matching v0.2.3 files and master-key sealing.
+pub(crate) fn requires_aad<S: AsRef<str>>(names: &[S]) -> Vec<u8> {
+    let names: BTreeSet<&str> = names.iter().map(AsRef::as_ref).collect();
+    names
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes()
+}
+
 /// Loads a sensitive struct from a file, supporting both encrypted and plaintext formats.
 ///
 /// When a non-empty password is supplied, this function requires the file to
@@ -751,6 +804,61 @@ mod tests {
                 Err(SecurityError::Format(_))
             ));
         }
+    }
+
+    #[test]
+    fn compat_aad_vectors_and_legacy_ciphertext_are_frozen() {
+        assert_eq!(requires_aad::<&str>(&[]), b"");
+        assert_eq!(
+            requires_aad(&["taproot", "legacy", "taproot"]),
+            b"legacy\ntaproot"
+        );
+        assert_eq!(
+            requires_aad(&["x-v2", "x-v10", "x-v1"]),
+            b"x-v1\nx-v10\nx-v2"
+        );
+        let material = KeyMaterial::new_from_password(Some("compat-password".into())).unwrap();
+        let aad = requires_aad(&["taproot", "legacy"]);
+        let encrypted = encrypt_struct_with_aad("known payload", &material, &aad).unwrap();
+        assert_eq!(
+            decrypt_struct_with_aad::<String>(encrypted.clone(), &material, &aad).unwrap(),
+            "known payload"
+        );
+        assert!(matches!(
+            decrypt_struct::<String>(encrypted.clone(), &material),
+            Err(SecurityError::Decryption)
+        ));
+        for wrong in [
+            Vec::new(),
+            b"taproot".to_vec(),
+            b"legacy\ntaproot\n".to_vec(),
+        ] {
+            assert!(matches!(
+                decrypt_struct_with_aad::<String>(encrypted.clone(), &material, &wrong),
+                Err(SecurityError::Decryption)
+            ));
+        }
+        let old_compatible = encrypt_struct("old payload", &material).unwrap();
+        assert_eq!(
+            decrypt_struct_with_aad::<String>(old_compatible.clone(), &material, &[]).unwrap(),
+            "old payload"
+        );
+        let empty_aad = encrypt_struct_with_aad("helper payload", &material, &[]).unwrap();
+        assert_eq!(
+            decrypt_struct::<String>(empty_aad, &material).unwrap(),
+            "helper payload"
+        );
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(material.key));
+        let plain = cipher
+            .decrypt(
+                &aes_gcm::Nonce::from(old_compatible.nonce),
+                old_compatible.encrypted_payload.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_cbor::from_slice::<String>(&plain).unwrap(),
+            "old payload"
+        );
     }
 
     #[test]

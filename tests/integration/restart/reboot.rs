@@ -2,27 +2,20 @@
 //!
 //! A restarted node knows its live swaps only from what it persisted. This
 //! file proves each piece of that: funded swapcoins survive a maker reboot
-//! with no tracker record yet, startup rebuilds every contract watch, a
+//! using its wallet records, startup rebuilds every contract watch, a
 //! crash inside the contract-acceptance window loses nothing, and a coin
 //! claim that nothing on disk owns is freed.
 //!
 //! Route for the reboot case: Taker -> Maker1 (Normal) -> Maker2 (closes at
 //! handover) -> Taker. Maker2 broadcasts its funding transaction and persists
-//! unfinished swapcoins, then is restarted before idle recovery can write a
-//! tracker record. Startup recovery must not discard the persisted swapcoins
-//! merely because it cannot find a matching tracker record.
+//! unfinished swapcoins, then is restarted before idle recovery runs.
+//! Startup recovery must not discard the committed swapcoins.
 
 use openswap::{
-    maker::{
-        start_server,
-        swap_tracker::{
-            MakerRecoveryPhase, MakerRecoveryState, MakerSwapPhase, MakerSwapRecord,
-            MakerSwapTracker,
-        },
-        MakerBehavior, MakerServer,
-    },
+    maker::{start_server, MakerBehavior, MakerServer},
     protocol::common_messages::ProtocolVersion,
-    taker::{swap_tracker::SwapTracker, SwapParams, Taker, TakerBehavior},
+    taker::{SwapParams, Taker, TakerBehavior},
+    wallet::SwapRole,
 };
 
 use crate::test_framework::*;
@@ -37,10 +30,8 @@ use std::{
 };
 
 /// Test: maker reboot recovery preserves funded Taproot swapcoins. Maker2 funds
-/// its contracts, then drops at private key handover — before idle recovery can
-/// write a tracker record for the swap. On restart, startup recovery must keep
-/// or hashlock-recover those swapcoins instead of discarding them for want of a
-/// tracker.
+/// its contracts, then drops at private key handover before idle recovery runs.
+/// Startup recovery keeps or hashlock-recovers the committed coins.
 ///
 /// The coins come back via the hashlock path: the still-running taker sweeps
 /// Maker2's outgoing contract, revealing the preimage on-chain; the restarted
@@ -105,40 +96,46 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, watcher
     world.adopt_makers([Arc::new(restarted_server)]);
     world.spawn_makers();
 
-    let log_path = world.taker_log_path();
     // Recovery takes longer under parallel load; wait for the markers instead
     // of asserting at a fixed wall-clock point.
     if watcher_available {
         world.wait_for_makers_setup(120);
-        thread::sleep(Duration::from_secs(5));
-
-        let after_incoming = world.makers()[0]
-            .inner()
-            .wallet
-            .read()
-            .unwrap()
-            .get_incoming_swapcoins_count();
+        let restarted = world.makers()[0].inner();
         wait_logged!(
             world,
             "Incomplete swaps detected on startup",
             Duration::from_secs(120)
         );
         wait_logged!(world, "recover_from_swap started", Duration::from_secs(120));
-        wait_logged!(world, "Removed outgoing swapcoin", Duration::from_secs(120));
-        assert_log!(world; {
-            // Present means reboot recovery took the unsafe discard path.
-            lacks "Funding was never broadcast for swap",
-        });
-        let recovered_via_hashlock = std::fs::read_to_string(&log_path)
-            .unwrap()
-            .contains("incoming swapcoins via hashlock");
+        wait_logged!(
+            world,
+            &format!(
+                "[{}] Recovered {} incoming swapcoins via hashlock",
+                restarted.config.network_port, before_incoming
+            ),
+            Duration::from_secs(120)
+        );
+        // The sweep log precedes the atomic cleanup; wait for both sides to finish.
+        wait_until!(
+            Duration::from_secs(120),
+            every Duration::from_secs(2),
+            "reboot recovery to finish cleanup",
+            {
+                let wallet = restarted.wallet.read().unwrap();
+                wallet.get_incoming_swapcoins_count() == 0
+                    && wallet.get_outgoing_swapcoins_count() == 0
+            }
+        );
 
         world.shutdown_makers();
+        let wallet = world.makers()[0].inner().wallet.read().unwrap();
         assert!(
-            after_incoming > 0 || recovered_via_hashlock,
-            "maker reboot recovery lost funded incoming swapcoins without hashlock recovery; before={}, after={}",
-            before_incoming,
-            after_incoming
+            wallet.swap_reports().recovery.iter().any(|report| {
+                report.swap_id == summary.swap_id
+                    && report.recovery_type == "hashlock"
+                    && report.recovery_txids.len() == before_incoming
+            }),
+            "maker reboot recovery must record the incoming hashlock claims"
         );
     } else {
         let restarted = world.makers()[0].inner();
@@ -329,15 +326,7 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
 
     let log_path = world.taker_log_path();
 
-    // A crash can save the incoming coins before the tracker lists them. The
-    // restart must still find them from the wallet and claim them.
-    let taker_dir = world.temp_dir().join("taker1");
-    let mut tracker = SwapTracker::load_or_create(&taker_dir).unwrap();
-    let mut record = tracker.get_record(&summary.swap_id).unwrap().clone();
-    record.incoming_contract_txids.clear();
-    tracker.save_record(&record).unwrap();
-    drop(tracker);
-
+    // Recovery derives all saved incoming coins from the wallet.
     // ---- The taker restarts first: its sweep is what puts the preimage on chain.
     let taker_offset = log_mark(&world);
     info!("Restarting the taker with an empty watcher...");
@@ -459,7 +448,7 @@ fn run_restart_rebuilds_watches(world: &mut World, params: SwapParams) {
 /// ```
 ///
 /// Maker2 must still finish the swap instead of retrying the sweep forever. The
-/// same restart closes a record a crash left open with no coins behind it.
+/// wallet becomes empty only when the recovery cleanup is saved.
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal, CrashBeforeRecovery],
@@ -518,25 +507,6 @@ fn taproot_maker_finishes_when_its_incoming_was_refunded(world: &mut World, para
     // Only Maker2 stops; Maker1 keeps running.
     world.shutdown_maker(1);
 
-    // A crash between a finish's wallet save and its tracker save: the record
-    // still says recovering, and the wallet holds nothing for it.
-    let mut tracker = MakerSwapTracker::load_or_create(&victim_config.data_dir).unwrap();
-    tracker
-        .save_record(&MakerSwapRecord {
-            swap_id: "crashed-finish".to_string(),
-            protocol: ProtocolVersion::Taproot,
-            phase: MakerSwapPhase::Recovering,
-            swap_amount_sat: 0,
-            incoming_count: 0,
-            outgoing_count: 0,
-            funding_broadcast_txids: Vec::new(),
-            recovery: MakerRecoveryState::default(),
-            created_at: 0,
-            updated_at: 0,
-        })
-        .unwrap();
-    drop(tracker);
-
     info!("Restarting Maker2 after the preimage reached the chain...");
     let restarted = Arc::new(MakerServer::init(victim_config).expect("maker restart"));
     let restarted_thread = {
@@ -547,32 +517,18 @@ fn taproot_maker_finishes_when_its_incoming_was_refunded(world: &mut World, para
     };
     wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
 
-    let phase = |swap_id: &str| {
-        restarted
-            .swap_tracker
-            .lock()
-            .unwrap()
-            .get_record(swap_id)
-            .map(|record| record.recovery.phase)
-    };
-    assert_eq!(
-        phase("crashed-finish"),
-        Some(MakerRecoveryPhase::CleanedUp),
-        "startup left a finished record open"
-    );
-
     // Not cleaned up in time means Maker2 kept retrying a sweep of an incoming
     // its sender refunded.
     wait_until!(
         Duration::from_secs(180),
         every Duration::from_secs(2),
         "Maker2 to finish the swap whose incoming its sender refunded",
-        phase(&summary.swap_id) == Some(MakerRecoveryPhase::CleanedUp)
+        {
+            let wallet = restarted.wallet.read().unwrap();
+            wallet.get_incoming_swapcoins_count() == 0
+                && wallet.get_outgoing_swapcoins_count() == 0
+        }
     );
-    let wallet = restarted.wallet.read().unwrap();
-    assert_eq!(wallet.get_incoming_swapcoins_count(), 0);
-    assert_eq!(wallet.get_outgoing_swapcoins_count(), 0);
-    drop(wallet);
 
     restarted.shutdown.store(true, Relaxed);
     restarted_thread.join().unwrap();
@@ -586,14 +542,13 @@ fn taproot_maker_finishes_when_its_incoming_was_refunded(world: &mut World, para
 ///       copied here
 /// then  the taker restarts and claims by hashlock; Maker2 learns the
 ///       preimage, sweeps its incoming and finishes
-/// then  Maker2 restarts on the copy, its tracker record reset to before the
-///       sweep: a crash between the sweep and its cleanup
-/// then  Maker2 restarts on the copy again, its tracker keeping the sweep
+/// then  Maker2 restarts on the copy: a crash between the sweep and its cleanup
+/// then  Maker2 restarts on its settled wallet, keeping the sweep report
 /// ```
 ///
-/// Each time Maker2 must settle the swap from its confirmed sweep instead of
-/// retrying a sweep with nothing left to spend, and its record must name that
-/// sweep exactly once.
+/// Maker2 must settle the swap from its confirmed sweep instead of retrying a
+/// sweep with nothing left to spend. Both restarts must retain that sweep
+/// exactly once in the wallet's recovery reports.
 #[world_test(
     maker_behaviors = [Normal, Normal],
     takers = [CrashBeforeRecovery],
@@ -638,54 +593,66 @@ fn run_maker_settles_an_incoming_its_own_sweep_spent(world: &mut World, params: 
         .join("wallets")
         .join(&victim_config.wallet_name);
     let snapshot = victim_config.data_dir.join("wallet-before-sweep");
-    {
+    let before_incoming = {
         let wallet = victim.wallet.read().unwrap();
         assert!(wallet.get_incoming_swapcoins_count() > 0);
         assert!(wallet.get_outgoing_swapcoins_count() > 0);
         fs::copy(&wallet_path, &snapshot).unwrap();
-    }
+        wallet.get_incoming_swapcoins_count()
+    };
 
     // The taker's claim puts the preimage on chain, and Maker2 sweeps by it.
     world.drop_takers();
     world.adopt_taker(Taker::init(taker_config).expect("taker restart should succeed"));
-    let recovery = |maker: &MakerServer| {
+    let recovery_txids = |maker: &MakerServer| {
         maker
-            .swap_tracker
-            .lock()
+            .wallet
+            .read()
             .unwrap()
-            .get_record(&summary.swap_id)
-            .map(|record| record.recovery.clone())
+            .swap_reports()
+            .recovery
+            .into_iter()
+            .filter(|report| {
+                report.swap_id == summary.swap_id
+                    && report.role == SwapRole::Maker
+                    && report.recovery_type == "hashlock"
+            })
+            .flat_map(|report| report.recovery_txids)
+            .collect::<Vec<_>>()
     };
     wait_until!(
         Duration::from_secs(300),
         every Duration::from_secs(2),
         "Maker2 to sweep its incoming by hashlock",
-        recovery(&victim).map(|r| r.phase) == Some(MakerRecoveryPhase::CleanedUp)
+        {
+            let wallet = victim.wallet.read().unwrap();
+            wallet.get_incoming_swapcoins_count() == 0
+                && wallet.get_outgoing_swapcoins_count() == 0
+        }
     );
-    let mut sweeps = recovery(&victim).unwrap().incoming_swept;
+    let mut sweeps = recovery_txids(&victim);
     sweeps.sort();
-    assert!(!sweeps.is_empty(), "Maker2 recorded no hashlock sweep");
+    assert_eq!(
+        sweeps.len(),
+        before_incoming,
+        "Maker2 must record a hashlock sweep for every incoming contract"
+    );
     assert!(
         sweeps.windows(2).all(|pair| pair[0] != pair[1]),
         "Maker2 recorded a hashlock sweep more than once"
     );
     // Test builds stop a maker once its recovery is done.
     world.shutdown_maker(1);
+    let settled_snapshot = victim_config.data_dir.join("wallet-after-sweep");
+    fs::copy(&wallet_path, &settled_snapshot).unwrap();
     drop(victim);
 
-    for reset_tracker in [true, false] {
-        info!("Restarting Maker2 on its wallet from before the sweep (tracker reset: {reset_tracker})");
-        fs::copy(&snapshot, &wallet_path).unwrap();
-        if reset_tracker {
-            let mut tracker = MakerSwapTracker::load_or_create(&victim_config.data_dir).unwrap();
-            let mut record = tracker.get_record(&summary.swap_id).unwrap().clone();
-            record.phase = MakerSwapPhase::Recovering;
-            record.recovery = MakerRecoveryState {
-                phase: MakerRecoveryPhase::Monitoring,
-                ..MakerRecoveryState::default()
-            };
-            tracker.save_record(&record).unwrap();
-        }
+    // #1137 saves recovery reports and coin removal atomically. A retained
+    // report alongside stale coins is no longer a possible crash state; test
+    // both the pre-cleanup wallet and an idempotent settled-wallet restart.
+    for wallet_snapshot in [&snapshot, &settled_snapshot] {
+        info!("Restarting Maker2 on {}", wallet_snapshot.display());
+        fs::copy(wallet_snapshot, &wallet_path).unwrap();
 
         let restarted = Arc::new(MakerServer::init(victim_config.clone()).expect("maker restart"));
         let restarted_thread = {
@@ -695,9 +662,14 @@ fn run_maker_settles_an_incoming_its_own_sweep_spent(world: &mut World, params: 
             })
         };
 
-        // Wait on both: the phase is written last, after the coins are
-        // removed, but a tracker that kept the sweep says CleanedUp before
-        // the restored coins are gone.
+        if wallet_snapshot == &settled_snapshot {
+            // An already empty wallet must still run startup before we check
+            // that it kept the reports without recording the sweeps again.
+            wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+        }
+
+        // Coin removal and the recovery report share one wallet save, so an
+        // empty wallet replaces the old tracker's CleanedUp phase check.
         wait_until!(
             Duration::from_secs(180),
             every Duration::from_secs(2),
@@ -706,17 +678,17 @@ fn run_maker_settles_an_incoming_its_own_sweep_spent(world: &mut World, params: 
                 let wallet = restarted.wallet.read().unwrap();
                 wallet.get_incoming_swapcoins_count() == 0
                     && wallet.get_outgoing_swapcoins_count() == 0
-            } && recovery(&restarted).map(|r| r.phase) == Some(MakerRecoveryPhase::CleanedUp)
+            }
         );
-        let mut state = recovery(&restarted).expect("the swap's record survives");
-        state.incoming_swept.sort();
-        assert_eq!(
-            state.incoming_swept, sweeps,
-            "the record must name the confirmed sweep, once"
-        );
-
         restarted.shutdown.store(true, Relaxed);
         restarted_thread.join().unwrap();
+
+        let mut recorded_sweeps = recovery_txids(&restarted);
+        recorded_sweeps.sort();
+        assert_eq!(
+            recorded_sweeps, sweeps,
+            "the wallet reports must name each confirmed sweep, once"
+        );
     }
 }
 
@@ -725,14 +697,9 @@ fn run_maker_settles_an_incoming_its_own_sweep_spent(world: &mut World, params: 
 /// those inputs to another swap would invite a conflicting transaction.
 ///
 /// Route: Taker -> Maker1 (Normal) -> Maker2 (skips its funding broadcast and
-/// records nothing). Maker2 is restarted inside the grace, and must come back
-/// still holding what it reserved.
-/// No Legacy variant: its skip-error path only fails the swap after the
-/// response timeout, by which point the reservation is older than
-/// UNBROADCAST_DISCARD_GRACE — expiring it then is the intended behavior, so
-/// the survival invariant has nothing to pin there.
+/// saves the write-ahead commitment). Maker2 must keep what it reserved.
 #[world_test(
-    maker_behaviors = [Normal, SkipFundingBroadcastUnrecorded],
+    maker_behaviors = [Normal, SkipFundingBroadcast],
     takers = [Normal],
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
     swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
@@ -802,22 +769,12 @@ fn run_reservations_survive_restart(world: &mut World, params: SwapParams) {
         "startup recovery must not free inputs the planned funding can still spend"
     );
 
-    // The grace ages from the reservation, not the restart: past it, the swap
-    // is provably never funded and the reservation is released with it.
-    wait_until!(
-        openswap::utill::UNBROADCAST_DISCARD_GRACE + Duration::from_secs(60),
-        every Duration::from_secs(2),
-        "the restarted maker to discard the unbroadcast funding",
-        std::fs::read_to_string(&log_path)
-            .unwrap_or_default()
-            .get(log_offset as usize..)
-            .is_some_and(|tail| tail.contains("nothing to recover. Discarding swapcoins."))
-    );
-    let released = world.makers()[0].inner().reserved_inputs().unwrap();
-    assert_eq!(
-        released, 0,
-        "past the grace the never-funded swap must release its inputs"
-    );
+    // Absence from the chain never frees a committed transaction's inputs.
+    let restarted = world.makers()[0].inner();
+    let wallet = restarted.wallet.read().unwrap();
+    assert!(wallet.get_outgoing_swapcoins_count() > 0);
+    drop(wallet);
+    assert_eq!(restarted.reserved_inputs().unwrap(), before);
 }
 
 /// A maker that dies after claiming its funding coins, before it saves any

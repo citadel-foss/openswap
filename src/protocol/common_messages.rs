@@ -2,6 +2,7 @@
 
 use bitcoin::{bip32::ChainCode, hashes::sha256d::Hash, Amount, PublicKey};
 use serde::{Deserialize, Serialize};
+use serde_cbor::Value;
 
 use super::{
     legacy_messages::{
@@ -41,15 +42,22 @@ pub enum ProtocolVersion {
     Taproot,
 }
 
-/// Initial handshake from Taker to Maker.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct TakerHello;
+impl ProtocolVersion {
+    /// The feature name of this protocol's flow.
+    pub fn feature_name(self) -> &'static str {
+        match self {
+            ProtocolVersion::Legacy => "legacy",
+            ProtocolVersion::Taproot => "taproot",
+        }
+    }
+}
 
-/// Handshake response from Maker to Taker.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MakerHello {
-    /// Protocol versions this maker supports.
-    pub supported_protocols: Vec<ProtocolVersion>,
+/// First message on every connection, both ways. Frozen: it only ever gains
+/// defaulted fields, because it is how peers learn what changed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct Hello {
+    /// Feature names the sender supports.
+    pub features: Vec<String>,
 }
 
 /// Request for offer from Taker to Maker.
@@ -146,8 +154,9 @@ pub(crate) fn check_maker_name(name: &str) -> Result<(), String> {
 pub struct SwapDetails {
     /// Unique 8-byte ID to identify this swap.
     pub id: String,
-    /// Protocol version to use for this swap.
-    pub protocol_version: ProtocolVersion,
+    /// Exact feature names this swap uses: its protocol plus any feature that
+    /// changes it. Both sides keep them for every reconnect of the swap.
+    pub features: Vec<String>,
     /// Amount to swap in satoshis.
     pub amount: Amount,
     /// Maximum contract transactions this hop plans to send — a ceiling.
@@ -172,6 +181,16 @@ pub struct SwapDetails {
     /// offset, not the funding height, so it is fixed at negotiation and identical on both
     /// sides. Not bound to the real lock duration; assess the CSV transition as the real fix.
     pub refund_locktime_offset: u16,
+}
+
+impl SwapDetails {
+    /// The on-chain protocol these details pin, if any.
+    pub fn protocol(&self) -> Option<ProtocolVersion> {
+        [ProtocolVersion::Legacy, ProtocolVersion::Taproot]
+            .iter()
+            .copied()
+            .find(|p| self.features.iter().any(|f| f == p.feature_name()))
+    }
 }
 
 /// Acknowledgment of swap details from Maker.
@@ -226,8 +245,8 @@ pub struct PrivateKeyHandover {
 /// All messages sent from Taker to Maker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TakerToMakerMessage {
-    /// Initial handshake with version negotiation.
-    TakerHello(TakerHello),
+    /// Handshake; must be the first message on every connection.
+    Hello(Hello),
     /// Request maker's offer.
     GetOffer(GetOffer),
     /// Propose swap parameters (determines protocol path).
@@ -262,8 +281,8 @@ pub enum TakerToMakerMessage {
 /// All messages sent from Maker to Taker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MakerToTakerMessage {
-    /// Handshake response with version negotiation.
-    MakerHello(MakerHello),
+    /// Handshake reply, sent once the taker's Hello meets our requirements.
+    Hello(Hello),
     /// Maker's offer (fees, limits, fidelity bond).
     Offer(Box<Offer>),
     /// Acknowledgment of swap parameters.
@@ -287,15 +306,181 @@ pub enum MakerToTakerMessage {
     Unsupported(UnsupportedMessage),
 }
 
-/// Graceful rejection of a message family the receiver does not handle.
-///
-/// Both sides understand this variant from the release that introduced the
-/// Lightning family onward, so a capable-but-unconfigured peer can decline a
-/// request with a reason instead of a dropped connection.
+/// The variant name of an externally tagged message: a one-entry map's key or
+/// bare text. Lets a receiver name a message it can't decode.
+fn variant_name(value: &Value) -> Option<(&str, Option<&Value>)> {
+    match value {
+        Value::Text(name) => Some((name, None)),
+        Value::Map(map) if map.len() == 1 => match map.iter().next()? {
+            (Value::Text(name), body) => Some((name, Some(body))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Names a message we failed to decode, looking inside the `Lightning` family.
+/// `None` when even the name is unreadable.
+pub(crate) fn message_name(bytes: &[u8]) -> Option<String> {
+    let value: Value = serde_cbor::from_slice(bytes).ok()?;
+    let (name, body) = variant_name(&value)?;
+    match body.and_then(variant_name) {
+        Some((inner, _)) if name == "Lightning" => Some(format!("Lightning::{inner}")),
+        _ => Some(name.to_string()),
+    }
+}
+
+/// Graceful rejection of a message the receiver does not handle. Frozen like
+/// [`Hello`]. The sender closes the connection after it, and it is never answered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnsupportedMessage {
     /// Name of the message (family) that was rejected.
     pub what: String,
     /// Human-readable reason.
     pub reason: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utill::send_message;
+    use serde_cbor::value::to_value;
+    use std::{
+        collections::BTreeMap,
+        io::Read,
+        net::{TcpListener, TcpStream},
+    };
+
+    fn tagged(name: &str, body: Value) -> Vec<u8> {
+        serde_cbor::to_vec(&Value::Map(BTreeMap::from([(
+            Value::Text(name.to_string()),
+            body,
+        )])))
+        .unwrap()
+    }
+
+    #[test]
+    fn undecodable_messages_are_named_by_their_tag() {
+        let future = tagged("FutureThing", Value::Integer(7));
+        assert!(serde_cbor::from_slice::<TakerToMakerMessage>(&future).is_err());
+        assert_eq!(message_name(&future).as_deref(), Some("FutureThing"));
+
+        let bare = serde_cbor::to_vec(&Value::Text("FutureUnit".to_string())).unwrap();
+        assert_eq!(message_name(&bare).as_deref(), Some("FutureUnit"));
+
+        let nested = tagged(
+            "Lightning",
+            serde_cbor::from_slice(&tagged("SwapX", Value::Null)).unwrap(),
+        );
+        assert_eq!(message_name(&nested).as_deref(), Some("Lightning::SwapX"));
+
+        assert_eq!(message_name(&[0xff, 0x00]), None);
+        assert_eq!(message_name(&serde_cbor::to_vec(&7u8).unwrap()), None);
+    }
+
+    #[test]
+    fn hello_frame_starts_with_its_frozen_tag() {
+        let bytes = serde_cbor::to_vec(&TakerToMakerMessage::Hello(Hello::default())).unwrap();
+        assert_eq!(&bytes[..7], b"\xa1\x65Hello");
+    }
+
+    #[test]
+    fn compat_hello_and_unsupported_accept_future_fields_both_ways() {
+        for tag in ["Hello", "Unsupported"] {
+            let mut fields = BTreeMap::new();
+            if tag == "Hello" {
+                fields.insert(
+                    Value::Text("features".into()),
+                    Value::Array(vec![Value::Text("taproot".into())]),
+                );
+            } else {
+                fields.insert(
+                    Value::Text("what".into()),
+                    Value::Text("FutureThing".into()),
+                );
+                fields.insert(
+                    Value::Text("reason".into()),
+                    Value::Text("cannot decode".into()),
+                );
+            }
+            let baseline = Value::Map(fields.clone());
+            fields.insert(
+                Value::Text("future".into()),
+                Value::Map(BTreeMap::from([(
+                    Value::Text("nested".into()),
+                    Value::Bytes(vec![1, 2, 3]),
+                )])),
+            );
+            let bytes = tagged(tag, Value::Map(fields));
+            let taker: TakerToMakerMessage = serde_cbor::from_slice(&bytes).unwrap();
+            let maker: MakerToTakerMessage = serde_cbor::from_slice(&bytes).unwrap();
+            let frozen: Value = serde_cbor::from_slice(&tagged(tag, baseline)).unwrap();
+            assert_eq!(to_value(&taker).unwrap(), frozen);
+            assert_eq!(to_value(&maker).unwrap(), frozen);
+            assert_eq!(message_name(&bytes).as_deref(), Some(tag));
+        }
+    }
+
+    #[test]
+    fn compat_hello_frame_keeps_length_prefix_and_tag_both_ways() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut reader, _) = listener.accept().unwrap();
+        let hello = Hello {
+            features: vec!["taproot".into(), "future-v1".into()],
+        };
+        let taker = TakerToMakerMessage::Hello(hello.clone());
+        let maker = MakerToTakerMessage::Hello(hello.clone());
+        for bytes in [
+            serde_cbor::to_vec(&taker).unwrap(),
+            serde_cbor::to_vec(&maker).unwrap(),
+        ] {
+            send_message(
+                &mut sender,
+                &serde_cbor::from_slice::<Value>(&bytes).unwrap(),
+            )
+            .unwrap();
+            let mut prefix = [0; 4];
+            reader.read_exact(&mut prefix).unwrap();
+            assert_eq!(prefix, (bytes.len() as u32).to_be_bytes());
+            let mut body = vec![0; bytes.len()];
+            reader.read_exact(&mut body).unwrap();
+            assert_eq!(&body[..7], b"\xa1\x65Hello");
+            let TakerToMakerMessage::Hello(decoded) = serde_cbor::from_slice(&body).unwrap() else {
+                panic!()
+            };
+            assert_eq!(decoded, hello);
+        }
+    }
+
+    #[test]
+    fn compat_swap_details_keep_bitcoin_fields_and_ignore_future_fields() {
+        let details = SwapDetails {
+            id: "swap-compat".into(),
+            features: vec!["taproot".into()],
+            amount: Amount::from_sat(123_456),
+            tx_count: 3,
+            incoming_count: 2,
+            max_input_budget: 4,
+            feerate: 5,
+            timelock: 800_100,
+            refund_locktime_offset: 60,
+        };
+        let mut value = to_value(TakerToMakerMessage::SwapDetails(details.clone())).unwrap();
+        let Value::Map(outer) = &mut value else {
+            panic!()
+        };
+        let Value::Map(body) = outer.get_mut(&Value::Text("SwapDetails".into())).unwrap() else {
+            panic!()
+        };
+        assert!(!body.contains_key(&Value::Text("protocol_version".into())));
+        body.insert(Value::Text("future".into()), Value::Bool(true));
+        let TakerToMakerMessage::SwapDetails(decoded) =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&value).unwrap()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(decoded, details);
+        assert_eq!(decoded.protocol(), Some(ProtocolVersion::Taproot));
+    }
 }

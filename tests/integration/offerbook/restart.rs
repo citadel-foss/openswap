@@ -2,8 +2,8 @@
 //!
 //! The disk read path (`taker/offers.rs:362`) runs at every ordinary restart,
 //! and no other test touches it: a broken read path silently reselects makers
-//! the user removed, and the parse-failure fallback (`taker/offers.rs:371`)
-//! rewrites a corrupted book over the old file.
+//! the user removed, and an unreadable book must stop the taker rather than
+//! start empty and forgive every ban.
 //!
 //! Scenario:
 //! 1. Two makers announce; the taker syncs and holds both in its offerbook.
@@ -13,7 +13,7 @@
 //! 3. A fresh `Taker` opens the same data dir with the relay still down, so
 //!    the startup sync cannot re-upsert the removed maker before the check.
 //! 4. The removal must hold; a direct poll then rediscovers maker 0 without
-//!    the relay. A corrupted offerbook.json must be reset and rewritten.
+//!    the relay. A corrupted offerbook.json must stop the taker untouched.
 
 use bitcoin::Amount;
 use openswap::{taker::Taker, wallet::AddressType};
@@ -119,27 +119,15 @@ fn removal_survives_restart(world: &mut World) {
         listed
     );
 
-    // ---- 5. A corrupted book is reset and rewritten ----
+    // ---- 5. A corrupted book stops the taker and stays on disk ----
     let book_path = world.temp_dir().join("taker1").join("offerbook.json");
     drop(restarted);
     std::fs::write(&book_path, b"not json").unwrap();
-    let after_corruption = Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0))
-        .expect("taker should start over a corrupted offerbook");
-    let listed = listed_addresses(&after_corruption);
     assert!(
-        listed.is_empty(),
-        "corrupted book must reset to empty, got {:?}",
-        listed
+        Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0)).is_err(),
+        "a corrupted book must stop the taker, not forgive every ban"
     );
-    let raw = std::fs::read_to_string(&book_path).unwrap();
-    assert!(
-        raw.trim_start().starts_with('{'),
-        "the fallback must rewrite the corrupted file, got: {}",
-        raw
-    );
-
-    // The world drops the last taker at teardown, before stopping the framework.
-    world.adopt_taker(after_corruption);
+    assert_eq!(std::fs::read(&book_path).unwrap(), b"not json");
 
     world.shutdown_makers();
 

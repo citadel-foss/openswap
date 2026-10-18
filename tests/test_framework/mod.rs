@@ -8,7 +8,7 @@
 //! `openswap-<random u64>` directory under [`std::env::temp_dir()`], logged at startup.
 //! [TestFramework::stop] deletes it, as does `Drop for TestFramework` when `stop()` was never
 //! called, so the data is only there while the test runs. A failing test keeps it: teardown on
-//! the panic path leaves the logs, wallets and trackers for inspection. It also survives when
+//! the panic path leaves the logs and wallets for inspection. It also survives when
 //! teardown never runs, e.g. the process is killed.
 //!
 //! [World] wraps the same `init` call and owns what it returns: [MakerHandle]s, [TakerHandle]s
@@ -32,7 +32,6 @@ mod ports;
 mod procs;
 mod reports;
 mod timing;
-mod tracker;
 mod wait;
 mod world;
 
@@ -48,7 +47,6 @@ pub use self::{
     node::*,
     procs::{electrs::*, tor::*},
     reports::*,
-    tracker::*,
     wait::*,
     world::*,
 };

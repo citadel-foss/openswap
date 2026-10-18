@@ -17,7 +17,7 @@ use openswap::{
         lightning_handlers::LnDirection,
     },
     protocol::{
-        common_messages::{MakerToTakerMessage, TakerHello, TakerToMakerMessage},
+        common_messages::{Hello, MakerToTakerMessage, TakerToMakerMessage},
         lightning_messages::{
             LightningMakerMessage, LightningTakerMessage, LnSwapInRequest, LnSwapOutRequest,
         },
@@ -73,7 +73,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
     handle_message(
         &maker,
         &mut state,
-        TakerToMakerMessage::TakerHello(TakerHello),
+        TakerToMakerMessage::Hello(Hello::default()),
     )
     .unwrap();
 
@@ -89,6 +89,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
                 locktime: 60,
                 min_confirmations: 1,
                 taker_hashlock_pubkey: test_pubkey(0x31),
+                features: vec!["ln-swap-out".to_string()],
             })),
         )
         .unwrap(),
@@ -126,6 +127,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
                 locktime: 60,
                 min_confirmations: 1,
                 taker_timelock_pubkey: test_pubkey(0x41),
+                features: vec!["ln-swap-in".to_string()],
             })),
         )
         .unwrap(),
@@ -149,14 +151,14 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
             handle_message(
                 &maker,
                 &mut ConnectionState::default(),
-                TakerToMakerMessage::TakerHello(TakerHello),
+                TakerToMakerMessage::Hello(Hello::default()),
             )
             .and_then(|_| {
                 let mut state = ConnectionState::default();
                 handle_message(
                     &maker,
                     &mut state,
-                    TakerToMakerMessage::TakerHello(TakerHello),
+                    TakerToMakerMessage::Hello(Hello::default()),
                 )?;
                 handle_message(
                     &maker,
@@ -179,6 +181,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
                         locktime: 60,
                         min_confirmations: confirmations,
                         taker_timelock_pubkey: test_pubkey(0x42),
+                        features: vec!["ln-swap-in".to_string()],
                     })),
                 )
             })
@@ -203,7 +206,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
     handle_message(
         &maker,
         &mut state2,
-        TakerToMakerMessage::TakerHello(TakerHello),
+        TakerToMakerMessage::Hello(Hello::default()),
     )
     .unwrap();
     let reply = expect_ln(
@@ -217,6 +220,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
                 locktime: 60,
                 min_confirmations: 1,
                 taker_hashlock_pubkey: test_pubkey(0x31),
+                features: vec!["ln-swap-out".to_string()],
             })),
         )
         .unwrap(),

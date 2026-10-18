@@ -33,6 +33,7 @@ use crate::{
     lightning::{swap::SwapHtlc, ChannelInfo, LightningBackend, LnEvent, PaymentOutcome, Preimage},
     protocol::{
         common_messages::MakerToTakerMessage,
+        features::check_pins,
         lightning_messages::{
             LightningMakerMessage, LightningTakerMessage, LnHtlcFunded, LnReject, LnSwapInAccept,
             LnSwapInComplete, LnSwapInRequest, LnSwapOutAccept, LnSwapOutComplete,
@@ -462,6 +463,14 @@ fn payout_script<M: Maker>(
     Ok(script)
 }
 
+/// A request's pins must name exactly `flow` and meet our requirements for it.
+fn check_flow_pins<M: Maker>(maker: &Arc<M>, pins: &[String], flow: &str) -> Result<(), String> {
+    match check_pins(pins, &maker.get_config().require_features)? {
+        pinned if pinned == flow => Ok(()),
+        pinned => Err(format!("pins name {pinned}, not {flow}")),
+    }
+}
+
 /// Refuses a swap id that already has state, so a second connection cannot
 /// overwrite an in-flight swap's record — which holds the only copy of the
 /// branch key needed to sweep or refund its HTLC.
@@ -553,6 +562,7 @@ fn handle_swap_in_request<M: Maker>(
     req: LnSwapInRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     if let Err(reason) = swap_id_matches_hash(&req.swap_id, &req.payment_hash)
+        .and_then(|()| check_flow_pins(maker, &req.features, "ln-swap-in"))
         .and_then(|()| reject_if_swap_exists(maker, &req.swap_id))
     {
         return Ok(reject(&req.swap_id, reason));
@@ -980,6 +990,7 @@ fn handle_swap_out_request<M: Maker>(
     req: LnSwapOutRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     if let Err(reason) = swap_id_matches_hash(&req.swap_id, &req.payment_hash)
+        .and_then(|()| check_flow_pins(maker, &req.features, "ln-swap-out"))
         .and_then(|()| reject_if_swap_exists(maker, &req.swap_id))
     {
         return Ok(reject(&req.swap_id, reason));
@@ -1676,7 +1687,30 @@ fn watchdog_resolve_swap_out(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::maker::api::tests::compat_test_maker;
     use bitcoin::ScriptBuf;
+
+    #[test]
+    fn compat_lightning_pins_require_exact_direction_and_requirements() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec![]);
+        for flow in ["ln-swap-in", "ln-swap-out"] {
+            assert!(check_flow_pins(&maker, &[flow.into()], flow).is_ok());
+            for pins in [
+                vec![],
+                vec!["taproot".into()],
+                vec![flow.into(), flow.into()],
+                vec![flow.into(), "future-v1".into()],
+            ] {
+                assert!(check_flow_pins(&maker, &pins, flow).is_err());
+            }
+        }
+        assert!(check_flow_pins(&maker, &["ln-swap-in".into()], "ln-swap-out").is_err());
+        maker.watch_service.shutdown();
+        let maker = compat_test_maker(&dir.path().join("required"), vec!["future-v1".into()]);
+        assert!(check_flow_pins(&maker, &["ln-swap-out".into()], "ln-swap-out").is_err());
+        maker.watch_service.shutdown();
+    }
 
     fn sample_swap(direction: LnDirection, phase: LnMakerPhase) -> LnMakerSwap {
         let preimage = Preimage([0x33; 32]);

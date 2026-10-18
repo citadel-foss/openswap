@@ -9,7 +9,7 @@ use bitcoin::{
     Address, Amount, OutPoint, PublicKey, Script, ScriptBuf, Transaction, Txid, Witness,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::convert::TryInto;
+use std::{collections::BTreeSet, convert::TryInto};
 
 use crate::{
     protocol::{
@@ -23,7 +23,14 @@ use crate::{
     utill::fee_at_rate_sats,
 };
 
-use super::{contract_and_timelock_vsize, SpendKind, WalletError};
+use super::{contract_and_timelock_vsize, storage::Requires, SpendKind, WalletError};
+
+/// Every protocol here is read by every build since v0.2.3, so it needs no name.
+fn protocol_requires(protocol: &ProtocolVersion) {
+    match protocol {
+        ProtocolVersion::Legacy | ProtocolVersion::Taproot => {}
+    }
+}
 
 mod option_scalar_serde {
     use super::*;
@@ -124,6 +131,40 @@ pub struct IncomingSwapCoin {
     /// difference and can leave the sweep underpriced.
     #[serde(default = "default_negotiated_feerate")]
     pub negotiated_feerate: u64,
+}
+
+impl Requires for IncomingSwapCoin {
+    fn requires(&self, _out: &mut BTreeSet<&'static str>) {
+        let Self {
+            protocol,
+            my_privkey: _,
+            my_pubkey: _,
+            other_pubkey: _,
+            other_privkey: _,
+            contract_tx: _,
+            contract_txid: _,
+            hashlock_privkey: _,
+            funding_amount: _,
+            hash_preimage: _,
+            swap_id: _,
+            contract_redeemscript: _,
+            multisig_redeemscript: _,
+            hashlock_script: _,
+            timelock_script: _,
+            others_contract_sig: _,
+            tap_tweak: _,
+            internal_key: _,
+            spending_tx: _,
+            payment_target,
+            negotiated_feerate: _,
+        } = self;
+        protocol_requires(protocol);
+        if let Some(PaymentTarget {
+            script_pubkey: _,
+            amount: _,
+        }) = payment_target
+        {}
+    }
 }
 
 impl IncomingSwapCoin {
@@ -864,6 +905,49 @@ pub struct OutgoingSwapCoin {
     /// Negotiated swap feerate (sats/vB) at creation.
     #[serde(default = "default_negotiated_feerate")]
     pub negotiated_feerate: u64,
+    /// Saved `true` before any funding send, and never set back. A committed
+    /// coin's funding may be on the network, so it is never discarded for
+    /// looking unsent. Missing reads as `true`, the safe answer.
+    #[serde(default = "yes")]
+    pub committed: bool,
+    /// Saved `true` with the sweep of this swap's incoming coin, and never set
+    /// back. Our outgoing is then the first maker's to claim, not ours to
+    /// refund early. Missing reads as `true`, the safe answer.
+    #[serde(default = "yes")]
+    pub incoming_claimed: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Requires for OutgoingSwapCoin {
+    fn requires(&self, _out: &mut BTreeSet<&'static str>) {
+        let Self {
+            protocol,
+            my_privkey: _,
+            my_pubkey: _,
+            other_pubkey: _,
+            other_privkey: _,
+            funding_tx: _,
+            contract_tx: _,
+            timelock_privkey: _,
+            funding_amount: _,
+            hash_preimage: _,
+            swap_id: _,
+            contract_redeemscript: _,
+            hashlock_script: _,
+            timelock_script: _,
+            others_contract_sig: _,
+            tap_tweak: _,
+            internal_key: _,
+            recovery_address: _,
+            negotiated_feerate: _,
+            committed: _,
+            incoming_claimed: _,
+        } = self;
+        protocol_requires(protocol);
+    }
 }
 
 impl OutgoingSwapCoin {
@@ -903,6 +987,8 @@ impl OutgoingSwapCoin {
             internal_key: None,
             recovery_address: None,
             negotiated_feerate,
+            committed: false,
+            incoming_claimed: false,
         }
     }
 
@@ -935,6 +1021,8 @@ impl OutgoingSwapCoin {
             internal_key: None,
             recovery_address: None,
             negotiated_feerate,
+            committed: false,
+            incoming_claimed: false,
         }
     }
 
@@ -1343,6 +1431,22 @@ pub struct WatchOnlySwapCoin {
     pub timelock_script: Option<ScriptBuf>,
     /// The funding amount.
     pub funding_amount: Amount,
+}
+
+impl Requires for WatchOnlySwapCoin {
+    fn requires(&self, _out: &mut BTreeSet<&'static str>) {
+        let Self {
+            protocol,
+            sender_pubkey: _,
+            receiver_pubkey: _,
+            contract_tx: _,
+            contract_redeemscript: _,
+            hashlock_script: _,
+            timelock_script: _,
+            funding_amount: _,
+        } = self;
+        protocol_requires(protocol);
+    }
 }
 
 impl WatchOnlySwapCoin {

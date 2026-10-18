@@ -33,7 +33,7 @@ use openswap::{
         MakerBehavior, MakerError, MakerServer,
     },
     protocol::{
-        common_messages::{MakerToTakerMessage, TakerHello, TakerToMakerMessage},
+        common_messages::{Hello, MakerToTakerMessage, TakerToMakerMessage},
         lightning_messages::{
             LightningMakerMessage, LightningTakerMessage, LnHtlcFunded, LnSwapInRequest,
             LnSwapOutPaid, LnSwapOutRequest,
@@ -96,7 +96,7 @@ fn fund_swap_out(
     handle_message(
         maker,
         &mut state,
-        TakerToMakerMessage::TakerHello(TakerHello),
+        TakerToMakerMessage::Hello(Hello::default()),
     )
     .unwrap();
 
@@ -111,6 +111,7 @@ fn fund_swap_out(
                 locktime,
                 min_confirmations: 1,
                 taker_hashlock_pubkey,
+                features: vec!["ln-swap-out".to_string()],
             })),
         )
         .unwrap(),
@@ -583,7 +584,7 @@ fn forged_swap_in_funding_keeps_accepted_swap(world: &mut World, ln: Arc<MockLig
         handle_message(
             &maker,
             &mut state,
-            TakerToMakerMessage::TakerHello(TakerHello),
+            TakerToMakerMessage::Hello(Hello::default()),
         )
         .unwrap();
         let reply = handle_message(
@@ -879,7 +880,7 @@ fn swap_in_funded_handler_yields_to_swap_paid_during_wait(
     handle_message(
         &maker,
         &mut state,
-        TakerToMakerMessage::TakerHello(TakerHello),
+        TakerToMakerMessage::Hello(Hello::default()),
     )
     .unwrap();
     let accept = match expect_ln(
@@ -894,6 +895,7 @@ fn swap_in_funded_handler_yields_to_swap_paid_during_wait(
                 locktime,
                 min_confirmations: 1,
                 taker_timelock_pubkey,
+                features: vec!["ln-swap-in".to_string()],
             })),
         )
         .unwrap(),
@@ -939,7 +941,7 @@ fn swap_in_funded_handler_yields_to_swap_paid_during_wait(
         let result = handle_message(
             &handler_maker,
             &mut state,
-            TakerToMakerMessage::TakerHello(TakerHello),
+            TakerToMakerMessage::Hello(Hello::default()),
         )
         .and_then(|_| {
             handle_message(
@@ -2066,6 +2068,7 @@ fn swap_in_request(taker_ln: &MockLightningBackend, preimage: &Preimage) -> LnSw
                 .unwrap()
                 .public_key(&Secp256k1::new()),
         ),
+        features: vec!["ln-swap-in".to_string()],
     }
 }
 
@@ -2079,7 +2082,7 @@ fn send_swap_in_request(
     handle_message(
         maker,
         &mut state,
-        TakerToMakerMessage::TakerHello(TakerHello),
+        TakerToMakerMessage::Hello(Hello::default()),
     )
     .unwrap();
     handle_message(
@@ -2101,7 +2104,7 @@ fn announce_funding(
     let result = handle_message(
         maker,
         &mut state,
-        TakerToMakerMessage::TakerHello(TakerHello),
+        TakerToMakerMessage::Hello(Hello::default()),
     )
     .and_then(|_| {
         handle_message(

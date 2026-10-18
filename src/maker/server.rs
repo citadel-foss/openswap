@@ -12,18 +12,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin::{OutPoint, Txid};
+use bitcoin::OutPoint;
 
 #[cfg(not(feature = "integration-test"))]
 use crate::maker::rpc::server::MakerRpc;
 use crate::{
     lock_debug,
     maker::nostr::broadcast_bond_on_nostr,
-    protocol::common_messages::{MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage},
-    utill::{
-        HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE, UNBROADCAST_DISCARD_GRACE,
+    protocol::common_messages::{
+        message_name, MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage, UnsupportedMessage,
     },
-    wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, Wallet},
+    utill::{HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE},
+    wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, SwapRole, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
 
@@ -32,9 +32,6 @@ use super::{
     error::MakerError,
     handlers::{
         emit_maker_success_report, handle_message, ConnectionState, Maker, MAX_CONCURRENT_SWAPS,
-    },
-    swap_tracker::{
-        now_secs, MakerRecoveryPhase, MakerRecoveryState, MakerSwapPhase, MakerSwapRecord,
     },
 };
 
@@ -265,47 +262,6 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     // those waits. Recovery must not depend on being ready for new swaps.
     #[cfg(feature = "lightning")]
     spawn_lightning_threads(&maker)?;
-
-    // A crash between a finish's wallet save and its tracker save leaves a
-    // recovering record with no coins behind. Close it as the finish would have.
-    let recovering: Vec<_> = lock_debug!(maker.swap_tracker.lock())
-        .map_err(|_| MakerError::MutexPossion)?
-        .incomplete_swaps()
-        .into_iter()
-        .filter(|record| {
-            matches!(
-                record.phase,
-                MakerSwapPhase::Recovering | MakerSwapPhase::Completed
-            )
-        })
-        .map(|record| {
-            (
-                record.swap_id.clone(),
-                record.phase,
-                record.recovery.clone(),
-            )
-        })
-        .collect();
-    for (swap_id, phase, recovery) in recovering {
-        let wallet = lock_debug!(maker.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-        let settled = wallet.incoming_keys_for_swap(&swap_id).is_empty()
-            && wallet.outgoing_keys_for_swap(&swap_id).is_empty();
-        drop(wallet);
-        if settled {
-            let report = if !recovery.incoming_swept.is_empty() {
-                Some(("hashlock", &recovery.incoming_swept[..]))
-            } else {
-                (!recovery.outgoing_recovered.is_empty())
-                    .then_some(("timelock", &recovery.outgoing_recovered[..]))
-            };
-            let phase = match phase {
-                MakerSwapPhase::Completed => MakerSwapPhase::Completed,
-                _ => MakerSwapPhase::Recovered,
-            };
-            finish_swap(&maker, &swap_id, phase, report);
-        }
-    }
 
     // Check for unfinished swapcoins from a previous run and start recovery.
     {
@@ -663,8 +619,8 @@ fn handle_connection(
             break;
         }
 
-        let message = match read_message(&stream, permit.pending.then_some(pending_deadline)) {
-            Ok(msg) => msg,
+        let frame = match read_message(&stream, permit.pending.then_some(pending_deadline)) {
+            Ok(frame) => frame,
             Err(e) => {
                 // A read timeout is only a wakeup: keepalives arrive on separate
                 // connections and refresh the shared swap activity. Break only
@@ -682,6 +638,40 @@ fn handle_connection(
                 break;
             }
         };
+        let message = match serde_cbor::from_slice::<TakerToMakerMessage>(&frame) {
+            Ok(message) => message,
+            Err(e) => {
+                // Name what we can't read, so the taker can tell "unsupported"
+                // from "down". A refusal is never answered, or two peers loop.
+                let what = message_name(&frame).filter(|name| name != "Unsupported");
+                log::info!(
+                    "[{}] Cannot decode {:?}: {}",
+                    maker.config.network_port,
+                    what,
+                    e
+                );
+                if let Some(what) = what {
+                    let refusal = MakerToTakerMessage::Unsupported(UnsupportedMessage {
+                        what,
+                        reason: "cannot decode".to_string(),
+                    });
+                    let _ = send_message(&stream, &refusal);
+                }
+                break;
+            }
+        };
+
+        // Every connection opens with Hello, so a reconnect or keepalive can't
+        // skip the requirement check that Hello runs.
+        if state.phase == super::handlers::SwapPhase::AwaitingHello
+            && !matches!(message, TakerToMakerMessage::Hello(_))
+        {
+            log::debug!(
+                "[{}] First message was not Hello; closing",
+                maker.config.network_port
+            );
+            break;
+        }
 
         // Heartbeat connections carry a known swap id but intentionally keep a
         // lightweight local state. Recognize them without changing the protocol.
@@ -769,6 +759,8 @@ fn handle_connection(
                 maker.config.network_port
             );
         }
+        // We close after a refusal, so the taker never has to count them.
+        let refused = matches!(response, Some(MakerToTakerMessage::Unsupported(_)));
         if let Some(response) = response.filter(|_| send_response) {
             log::debug!(
                 "[{}] Sending response: {:?}",
@@ -786,6 +778,9 @@ fn handle_connection(
                     break;
                 }
             }
+        }
+        if refused {
+            break;
         }
 
         #[cfg(feature = "integration-test")]
@@ -944,28 +939,6 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                 maker.config.network_port,
                 idle.swap_id
             );
-
-            // Create a tracker record for this dropped swap.
-            let now = now_secs();
-            let record = MakerSwapRecord {
-                swap_id: idle.swap_id.clone(),
-                protocol: idle.protocol,
-                phase: MakerSwapPhase::TakerDropped,
-                swap_amount_sat: idle.swap_amount_sat,
-                incoming_count: idle.incoming_swapcoins.len(),
-                outgoing_count: idle.outgoing_swapcoins.len(),
-                funding_broadcast_txids: idle.funding_broadcast_txids.clone(),
-                recovery: MakerRecoveryState::default(),
-                created_at: now,
-                updated_at: now,
-            };
-
-            if let Err(e) = lock_debug!(maker.swap_tracker.lock())
-                .map_err(|_| MakerError::MutexPossion)?
-                .save_record(&record)
-            {
-                log::error!("Failed to save swap tracker record: {:?}", e);
-            }
 
             // A crashed process never reaches its idle recovery, so the contracts
             // stay unclaimed until a restart picks them up.
@@ -1268,60 +1241,6 @@ fn check_for_preimage(
     Ok(())
 }
 
-/// Update the Maker swap tracker with the given closure.
-///
-/// Locks the tracker, applies `f` to the record matching `swap_id`, then flushes.
-/// False when the change did not reach disk.
-fn update_tracker(
-    maker: &MakerServer,
-    swap_id: &str,
-    f: impl FnOnce(&mut super::swap_tracker::MakerSwapRecord),
-) -> bool {
-    let mut tracker = match lock_debug!(maker.swap_tracker.lock()) {
-        Ok(tracker) => tracker,
-        Err(_) => {
-            log::error!("Swap tracker lock poisoned, skipping update for {swap_id}");
-            return false;
-        }
-    };
-    if let Some(record) = tracker.get_record_mut(swap_id) {
-        f(record);
-        record.updated_at = super::swap_tracker::now_secs();
-        let cloned = record.clone();
-        if let Err(e) = tracker.save_record(&cloned) {
-            log::error!("Failed to flush swap tracker: {:?}", e);
-            return false;
-        }
-    }
-    true
-}
-
-/// Close a swap whose coins have all left the wallet on disk: its report,
-/// then its tracker record. Startup reruns this for a record a crash left open.
-fn finish_swap(
-    maker: &MakerServer,
-    swap_id: &str,
-    phase: MakerSwapPhase,
-    report: Option<(&str, &[Txid])>,
-) {
-    if let Some((recovery_type, txids)) = report {
-        let network = lock_debug!(maker.wallet.read())
-            .map(|w| w.store.network.to_string())
-            .unwrap_or_default();
-        RecoveryReport::emit_maker(
-            &maker.data_dir,
-            swap_id.to_string(),
-            network,
-            recovery_type.to_string(),
-            txids.iter().map(|txid| txid.to_string()).collect(),
-        );
-    }
-    update_tracker(maker, swap_id, |r| {
-        r.phase = phase;
-        r.recovery.phase = MakerRecoveryPhase::CleanedUp;
-    });
-}
-
 /// Recover maker funds after taker drops.
 ///
 /// Two recovery paths are tried in a loop:
@@ -1386,7 +1305,40 @@ fn recover_from_swap(
             if height.is_some() && tried_at != height {
                 tried_at = height;
                 match maker.sweep_incoming_swapcoins(&incoming_swapcoins) {
-                    Ok(_) => return Ok(()),
+                    Ok(_) => {
+                        let mut wallet = lock_debug!(maker.wallet.write())
+                            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                        let incoming = wallet.incoming_keys_for_swap(&swap_id);
+                        let refunded = wallet.swap_reports().recovery.iter().any(|report| {
+                            report.swap_id == swap_id
+                                && matches!(report.role, SwapRole::Maker)
+                                && report.recovery_type == "timelock"
+                                && !report.recovery_txids.is_empty()
+                        });
+                        let settled = incoming.is_empty()
+                            || (refunded
+                                && incoming.iter().all(|key| {
+                                    wallet.find_incoming_swapcoin(key).is_none_or(|coin| {
+                                        coin.other_privkey.is_none() && !coin.is_preimage_known()
+                                    })
+                                }));
+                        // An unsettled swap keeps its coins for the next restart,
+                        // as before; only a failed cleanup save retries here.
+                        if !settled {
+                            return Ok(());
+                        }
+                        let saved = wallet.remove_swap_coins_and_save(&swap_id, true, true);
+                        drop(wallet);
+                        match saved {
+                            Ok(()) => return Ok(()),
+                            Err(error) => {
+                                log::warn!(
+                                    "Cannot save cleanup for swap {swap_id}: {error:?}; retrying"
+                                );
+                                tried_at = None;
+                            }
+                        }
+                    }
                     Err(e) => log::warn!(
                         "[{}] Incoming sweep failed: {:?}; retrying on the next block",
                         maker.config.network_port,
@@ -1503,67 +1455,7 @@ fn recover_from_swap(
         }
         Ok(true)
     };
-    // A restart resumes both lists, so the reports keep txids from before it.
-    let (mut timelock_recovery_txids, mut incoming_swept_txids) =
-        lock_debug!(maker.swap_tracker.lock())
-            .map_err(|_| MakerError::MutexPossion)?
-            .get_record(&swap_id)
-            .map(|record| {
-                (
-                    record.recovery.outgoing_recovered.clone(),
-                    record.recovery.incoming_swept.clone(),
-                )
-            })
-            .unwrap_or_default();
-
-    // A restart reaches here with no record: the drain that would create one
-    // never ran. Create it aged from the reservation, so the unbroadcast grace
-    // runs from the event, not from the restart.
-    {
-        let record_missing = lock_debug!(maker.swap_tracker.lock())
-            .map_err(|_| MakerError::MutexPossion)?
-            .get_record(&swap_id)
-            .is_none();
-        if record_missing {
-            let created_at = lock_debug!(maker.wallet.read())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .reservation_created_at(&swap_id)
-                .unwrap_or_else(now_secs);
-            let now = now_secs();
-            let protocol = outgoing_swapcoins
-                .first()
-                .map(|sc| sc.protocol)
-                .or_else(|| incoming_swapcoins.first().map(|sc| sc.protocol))
-                .unwrap_or(ProtocolVersion::Taproot);
-            let record = MakerSwapRecord {
-                swap_id: swap_id.clone(),
-                protocol,
-                phase: MakerSwapPhase::TakerDropped,
-                swap_amount_sat: 0,
-                incoming_count: incoming_swapcoins.len(),
-                outgoing_count: outgoing_swapcoins.len(),
-                funding_broadcast_txids: Vec::new(),
-                recovery: MakerRecoveryState::default(),
-                created_at,
-                updated_at: now,
-            };
-            if let Err(e) = lock_debug!(maker.swap_tracker.lock())
-                .map_err(|_| MakerError::MutexPossion)?
-                .save_record(&record)
-            {
-                log::error!("Failed to save swap tracker record: {:?}", e);
-            }
-        }
-    }
-
-    // Tracker: Recovering + Monitoring
-    update_tracker(&maker, &swap_id, |r| {
-        r.phase = MakerSwapPhase::Recovering;
-        r.recovery.phase = MakerRecoveryPhase::Monitoring;
-    });
-
     let mut watchtower_down_logged = false;
-    let mut discard_deferred_logged = false;
     let mut last_block = None;
     let mut last_preimages_known = None;
     // Kept across passes, so each new block does not cost a fresh handshake.
@@ -1654,25 +1546,19 @@ fn recover_from_swap(
                 }
             }
 
-            // Record the outcome before the cleanup: startup finishes a cleanup
-            // a crash cut short with the phase it finds here.
-            if !update_tracker(&maker, &swap_id, |r| r.phase = MakerSwapPhase::Completed) {
+            let saved = {
+                let mut wallet = lock_debug!(maker.wallet.write())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                wallet.remove_swap_coins_and_save(&swap_id, false, true)
+            };
+            if let Err(error) = saved {
+                log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
+                last_block = None;
                 if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
                     break;
                 }
                 continue;
             }
-            {
-                let mut wallet = lock_debug!(maker.wallet.write())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                for outgoing in &outgoing_swapcoins {
-                    let key = outgoing.contract_tx.compute_txid().to_string();
-                    wallet.remove_outgoing_swapcoin(&key);
-                }
-                wallet.release_swap_locks(&swap_id, None);
-                wallet.save_to_disk().map_err(MakerError::Wallet)?;
-            }
-            finish_swap(&maker, &swap_id, MakerSwapPhase::Completed, None);
 
             let incoming = incoming_swapcoins.iter().map(|s| &s.contract_tx);
             let outgoing = outgoing_swapcoins.iter().map(|s| &s.contract_tx);
@@ -1698,122 +1584,32 @@ fn recover_from_swap(
             return Ok(());
         }
 
-        // True while the discard decision is still waiting on the grace. The
-        // swap is not finished until that is settled, whatever the contracts say.
-        let discard_pending;
-        // Discard only when every funding tx of the batch is positively unknown to
-        // the backend: an empty broadcast record can follow a crash before the
-        // first send was logged, and a failed query is not proof of absence.
+        // A committed batch can still confirm after its mempool view disappears.
+        // Only coins saved before the write-ahead commitment are never funded.
         {
-            // A send that never reached the record, or a backend that has not seen
-            // it yet, both read as "no broadcast". Funding already in flight is
-            // committed money, so age the record before believing that. Age is
-            // measured from creation: recovery progress refreshes `updated_at`,
-            // which would hold the grace open forever. Legacy hands its funding
-            // txs out unsigned, so only we can broadcast them, as with Taproot.
-            let unrecorded_for = lock_debug!(maker.swap_tracker.lock())
-                .map_err(|_| MakerError::MutexPossion)?
-                .get_record(&swap_id)
-                .filter(|r| r.funding_broadcast_txids.is_empty())
-                .map(|r| now_secs().saturating_sub(r.created_at));
-            let never_recorded =
-                unrecorded_for.is_some_and(|age| age >= UNBROADCAST_DISCARD_GRACE.as_secs());
-            discard_pending = unrecorded_for.is_some() && !never_recorded;
-            if let Some(age) = unrecorded_for.filter(|_| discard_pending) {
-                if !discard_deferred_logged {
-                    discard_deferred_logged = true;
-                    log::info!(
-                        "[{}] Swap {} shows no funding broadcast after {}s; keeping it until {}s",
-                        maker.config.network_port,
-                        swap_id,
-                        age,
-                        UNBROADCAST_DISCARD_GRACE.as_secs()
-                    );
-                }
-            }
-
-            if never_recorded && new_block {
-                // The maker's own sends: Legacy's funding txs (each outgoing
-                // contract spends one) or Taproot's contract txs. `None` when a
-                // Legacy contract tx has no input, so it proves nothing.
-                let batch_txids: Option<Vec<_>> = outgoing_swapcoins
-                    .iter()
-                    .map(|outgoing| match outgoing.protocol {
-                        ProtocolVersion::Legacy => outgoing
-                            .contract_tx
-                            .input
-                            .first()
-                            .map(|input| input.previous_output.txid),
-                        ProtocolVersion::Taproot => Some(outgoing.contract_tx.compute_txid()),
-                    })
-                    .collect();
-
-                let wallet = lock_debug!(maker.wallet.read())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                let mut all_unknown = batch_txids.is_some();
-                if let Some(txids) = &batch_txids {
-                    for txid in txids {
-                        // Nothing re-spawns this thread, so a failed query must not
-                        // end recovery. Keep the records and let the monitoring
-                        // loop below retry on the next block.
-                        match wallet.blockchain.is_tx_unknown(txid) {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                all_unknown = false;
-                                break;
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "[{}] Could not check funding tx {} for swap {}: {:?}; keeping swapcoins",
-                                    maker.config.network_port,
-                                    txid,
-                                    swap_id,
-                                    e
-                                );
-                                all_unknown = false;
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    log::error!(
-                        "[{}] Malformed outgoing swapcoin for swap {}: contract tx has no inputs; keeping swapcoins for recovery",
-                        maker.config.network_port,
-                        swap_id
-                    );
-                }
+            let mut wallet = lock_debug!(maker.wallet.write())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            let keys = wallet.outgoing_keys_for_swap(&swap_id);
+            let uncommitted = !keys.is_empty() && !wallet.swap_funding_committed(&swap_id);
+            if uncommitted {
+                log::info!(
+                    "[{}] Funding was never committed for swap {} — nothing to recover. Discarding swapcoins.",
+                    maker.config.network_port,
+                    swap_id
+                );
+                let saved = wallet.remove_swap_coins_and_save(&swap_id, true, true);
                 drop(wallet);
-
-                if all_unknown {
-                    log::info!(
-                        "[{}] Funding was never broadcast for swap {} — nothing to recover. Discarding swapcoins.",
-                        maker.config.network_port,
-                        swap_id
-                    );
-
-                    {
-                        let mut wallet = lock_debug!(maker.wallet.write())
-                            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                        for outgoing in &outgoing_swapcoins {
-                            let key = outgoing.contract_tx.compute_txid().to_string();
-                            wallet.remove_outgoing_swapcoin(&key);
-                        }
-                        for incoming in &incoming_swapcoins {
-                            let key = incoming.contract_tx.compute_txid().to_string();
-                            wallet.remove_incoming_swapcoin(&key);
-                        }
-                        // The swap is settled as never funded: its input
-                        // reservation goes with it, not at the 4h TTL.
-                        wallet.release_swap_locks(&swap_id, None);
-                        wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                if let Err(error) = saved {
+                    log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
+                    last_block = None;
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
                     }
-
-                    finish_swap(&maker, &swap_id, MakerSwapPhase::Recovered, None);
-
-                    #[cfg(feature = "integration-test")]
-                    maker.shutdown.store(true, Relaxed);
-                    return Ok(());
+                    continue;
                 }
+                #[cfg(feature = "integration-test")]
+                maker.shutdown.store(true, Relaxed);
+                return Ok(());
             }
         }
 
@@ -1938,11 +1734,12 @@ fn recover_from_swap(
                 .map(|swapcoin| swapcoin.contract_tx.compute_txid())
                 .collect();
 
-            let swept = Wallet::sweep_incoming_swapcoins(
+            let swept = Wallet::sweep_incoming_swapcoins_for_role(
                 &maker.wallet,
                 chain,
                 &maker.shutdown,
                 Some(&contract_txids),
+                SwapRole::Maker,
             )
             // Retry next pass. With the preimage known the timelock refund is never
             // an option: a hashlock claim and a refund must not both happen.
@@ -1961,13 +1758,6 @@ fn recover_from_swap(
                     maker.config.network_port,
                     swept.resolved.len()
                 );
-
-                // Tracker: HashlockRecovered
-                incoming_swept_txids.extend(swept.resolved.iter().map(|(_, txid)| *txid));
-                update_tracker(&maker, &swap_id, |r| {
-                    r.recovery.incoming_swept = incoming_swept_txids.clone();
-                    r.recovery.phase = MakerRecoveryPhase::HashlockRecovered;
-                });
             }
 
             // A contract still in the mempool is swept on a later pass. A contract
@@ -2012,57 +1802,71 @@ fn recover_from_swap(
                 })
                 .collect();
             // A spend that is not the sender's refund is an earlier sweep of ours.
-            // After a crash it may not be on the tracker yet: record it before
-            // the coins go, since startup closes a coinless record from the
-            // tracker alone. A sweep the tracker already holds is not added twice.
+            // Record it in the wallet's reports with the cleanup, so a crash cannot
+            // leave the coins gone without the report. Already recorded sweeps
+            // must not be added twice.
             if let Some(spends) = settling_spends {
-                let mut swept = incoming_swept_txids.clone();
-                for (incoming, tx) in remaining.iter().zip(&spends) {
-                    let txid = tx.compute_txid();
-                    if !incoming.is_timelock_spend(tx) && !swept.contains(&txid) {
-                        swept.push(txid);
-                    }
-                }
-                let recorded = swept == incoming_swept_txids
-                    || update_tracker(&maker, &swap_id, |r| {
-                        r.recovery.incoming_swept = swept.clone();
-                        r.recovery.phase = MakerRecoveryPhase::HashlockRecovered;
-                    });
-                if recorded {
-                    incoming_swept_txids = swept;
-                    // With the preimage known the outgoing coins are the next hop's
-                    // to claim, never ours to refund, so drop them with the incoming.
-                    {
-                        let mut wallet = lock_debug!(maker.wallet.write())
-                            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                        for incoming in &remaining {
-                            wallet.remove_incoming_swapcoin(
-                                &incoming.contract_tx.compute_txid().to_string(),
-                            );
+                let saved = {
+                    let mut wallet = lock_debug!(maker.wallet.write())
+                        .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                    let mut recorded: HashSet<_> = wallet
+                        .swap_reports()
+                        .recovery
+                        .into_iter()
+                        .filter(|report| {
+                            report.swap_id == swap_id
+                                && report.role == SwapRole::Maker
+                                && report.recovery_type == "hashlock"
+                        })
+                        .flat_map(|report| report.recovery_txids)
+                        .collect();
+                    let mut earlier_sweeps = Vec::new();
+                    for (incoming, tx) in remaining.iter().zip(&spends) {
+                        let txid = tx.compute_txid().to_string();
+                        if !incoming.is_timelock_spend(tx) && recorded.insert(txid.clone()) {
+                            earlier_sweeps.push(txid);
                         }
-                        for outgoing in &outgoing_swapcoins {
-                            // Wallet stores outgoing swapcoins keyed by contract txid.
-                            let key = outgoing.contract_tx.compute_txid().to_string();
-                            wallet.remove_outgoing_swapcoin(&key);
-                        }
-                        // A partly broadcast batch still holds its unsent inputs.
-                        wallet.release_swap_locks(&swap_id, None);
-                        wallet.save_to_disk().map_err(MakerError::Wallet)?;
                     }
-                    // An incoming the sender took back is a loss, not a recovery.
-                    let report = (!incoming_swept_txids.is_empty())
-                        .then_some(("hashlock", &incoming_swept_txids[..]));
-                    finish_swap(&maker, &swap_id, MakerSwapPhase::Recovered, report);
-
-                    #[cfg(feature = "integration-test")]
-                    maker.shutdown.store(true, Relaxed);
-                    return Ok(());
+                    let previous_reports = wallet.store.reports.clone();
+                    let saved = (|| {
+                        // A sender's refund is a loss, not our hashlock recovery.
+                        if !earlier_sweeps.is_empty() {
+                            RecoveryReport {
+                                swap_id: swap_id.clone(),
+                                role: SwapRole::Maker,
+                                node: maker
+                                    .data_dir
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .map(str::to_owned),
+                                recovery_type: "hashlock".to_string(),
+                                recovery_txids: earlier_sweeps,
+                                network: wallet.store.network.to_string(),
+                                timestamp: crate::utill::now_secs(),
+                            }
+                            .store_in_wallet(&mut wallet)?;
+                        }
+                        // With the preimage known the outgoing coins are the next
+                        // hop's to claim, never ours to refund. Cleanup releases
+                        // the swap's remaining funding locks as well.
+                        wallet.remove_swap_coins_and_save(&swap_id, true, true)
+                    })();
+                    if saved.is_err() {
+                        wallet.store.reports = previous_reports;
+                    }
+                    saved
+                };
+                if let Err(error) = saved {
+                    log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
+                    last_block = None;
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
+                    }
+                    continue;
                 }
-                log::warn!(
-                    "[{}] Could not record earlier sweeps of swap {}; retrying recovery",
-                    maker.config.network_port,
-                    swap_id
-                );
+                #[cfg(feature = "integration-test")]
+                maker.shutdown.store(true, Relaxed);
+                return Ok(());
             }
         } else if current_height >= timelock_expiry && !incoming_swapcoins.is_empty() {
             // Refund only while incoming coins are left. They are saved before
@@ -2075,11 +1879,6 @@ fn recover_from_swap(
                 current_height,
                 timelock_expiry
             );
-
-            // Tracker: TimelockWaiting
-            update_tracker(&maker, &swap_id, |r| {
-                r.recovery.phase = MakerRecoveryPhase::TimelockWaiting;
-            });
 
             let chain = chain.as_ref().expect("connection created for this branch");
 
@@ -2109,15 +1908,6 @@ fn recover_from_swap(
                     maker.config.network_port,
                     recovered.len()
                 );
-
-                // Tracker: TimelockRecovered
-                let recovered_txids: Vec<_> =
-                    recovered.resolved.iter().map(|(_, txid)| *txid).collect();
-                timelock_recovery_txids.extend(recovered_txids.iter().copied());
-                update_tracker(&maker, &swap_id, |r| {
-                    r.recovery.outgoing_recovered = timelock_recovery_txids.clone();
-                    r.recovery.phase = MakerRecoveryPhase::TimelockRecovered;
-                });
             }
 
             // The wallet keeps an outgoing coin the next hop claimed, so with none
@@ -2130,26 +1920,20 @@ fn recover_from_swap(
             let incoming_unclaimable = incoming_swapcoins
                 .iter()
                 .all(|incoming| incoming.other_privkey.is_none());
-            // A swap that never funded waits for its pending discard.
-            if outgoing_done && incoming_unclaimable && !discard_pending {
-                {
+            if outgoing_done && incoming_unclaimable {
+                let saved = {
                     let mut wallet = lock_debug!(maker.wallet.write())
                         .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-                    for incoming in &incoming_swapcoins {
-                        let key = incoming.contract_tx.compute_txid().to_string();
-                        wallet.remove_incoming_swapcoin(&key);
+                    wallet.remove_swap_coins_and_save(&swap_id, true, true)
+                };
+                if let Err(error) = saved {
+                    log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
+                    last_block = None;
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
                     }
-                    // A partly broadcast batch still holds its unsent inputs.
-                    wallet.release_swap_locks(&swap_id, None);
-                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
+                    continue;
                 }
-                finish_swap(
-                    &maker,
-                    &swap_id,
-                    MakerSwapPhase::Recovered,
-                    Some(("timelock", &timelock_recovery_txids)),
-                );
-
                 #[cfg(feature = "integration-test")]
                 maker.shutdown.store(true, Relaxed);
                 return Ok(());
@@ -2162,12 +1946,12 @@ fn recover_from_swap(
     Ok(())
 }
 
-/// Read a message, enforcing one absolute deadline until the connection proves
-/// that it belongs to an admitted swap.
+/// Read one message frame, enforcing one absolute deadline until the connection
+/// proves that it belongs to an admitted swap.
 fn read_message(
     stream: &TcpStream,
     pending_deadline: Option<Instant>,
-) -> Result<TakerToMakerMessage, MakerError> {
+) -> Result<Vec<u8>, MakerError> {
     let mut len_buf = [0u8; 4];
     read_exact_until(stream, &mut len_buf[..1], pending_deadline)?;
     let assembly_deadline = Instant::now() + MESSAGE_ASSEMBLY_TIMEOUT;
@@ -2183,11 +1967,7 @@ fn read_message(
 
     let mut buf = vec![0u8; len];
     read_exact_until(stream, &mut buf, deadline)?;
-
-    let message: TakerToMakerMessage = serde_cbor::from_slice(&buf)
-        .map_err(|_| MakerError::General("Failed to deserialize message"))?;
-
-    Ok(message)
+    Ok(buf)
 }
 
 fn read_exact_until(
@@ -2279,9 +2059,273 @@ pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::watch_tower::service::answering;
-    use bitcoin::hashes::Hash;
-    use std::io::Write;
+    use crate::{
+        maker::api::tests::compat_test_maker,
+        protocol::common_messages::{Hello, PrivateKeyHandover},
+        watch_tower::service::answering,
+    };
+    use bitcoin::{hashes::Hash, Txid};
+    use serde::{Deserialize, Serialize};
+    use serde_cbor::{value::to_value, Value};
+    use std::{
+        collections::BTreeMap,
+        io::{Read, Write},
+        net::Shutdown,
+    };
+
+    // The handshake variants and fields from v0.2.3 stay independent of
+    // the new enums so removing the deliberate refusal breaks this test.
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023TakerMessage {
+        TakerHello(()),
+        Unsupported { what: String, reason: String },
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    enum CompatV023MakerMessage {
+        MakerHello {
+            supported_protocols: Vec<ProtocolVersion>,
+        },
+        Unsupported {
+            what: String,
+            reason: String,
+        },
+    }
+
+    fn compat_connection_replies(
+        maker: &Arc<MakerServer>,
+        frames: &[Vec<u8>],
+        close_input: bool,
+    ) -> Vec<MakerToTakerMessage> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let maker = maker.clone();
+        let permit = ConnectionLimiter::new().try_acquire().unwrap();
+        let handler = thread::spawn(move || handle_connection(maker, Arc::new(server), permit));
+        for frame in frames {
+            client
+                .write_all(&(frame.len() as u32).to_be_bytes())
+                .unwrap();
+            client.write_all(frame).unwrap();
+        }
+        if close_input {
+            client.shutdown(Shutdown::Write).unwrap();
+        }
+        let mut replies = Vec::new();
+        loop {
+            let mut prefix = [0; 4];
+            match client.read_exact(&mut prefix) {
+                Ok(()) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    break
+                }
+                Err(e) => panic!("maker did not close after the frames: {}", e),
+            }
+            let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+            client.read_exact(&mut body).unwrap();
+            replies.push(serde_cbor::from_slice(&body).unwrap());
+        }
+        handler.join().unwrap().unwrap();
+        replies
+    }
+
+    #[test]
+    fn compat_v023_taker_gets_readable_refusal_and_connection_close() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec![]);
+        let old_hello = serde_cbor::to_vec(&CompatV023TakerMessage::TakerHello(())).unwrap();
+        let replies = compat_connection_replies(&maker, &[old_hello], false);
+        let [refusal] = replies.as_slice() else {
+            panic!("expected one refusal: {:?}", replies)
+        };
+        let old_refusal: CompatV023MakerMessage =
+            serde_cbor::from_slice(&serde_cbor::to_vec(refusal).unwrap()).unwrap();
+        assert!(matches!(
+            old_refusal,
+            CompatV023MakerMessage::Unsupported { what, reason }
+                if what == "TakerHello" && reason == "cannot decode"
+        ));
+        let hello = Hello::default();
+        for bytes in [
+            serde_cbor::to_vec(&TakerToMakerMessage::Hello(hello.clone())).unwrap(),
+            serde_cbor::to_vec(&MakerToTakerMessage::Hello(hello)).unwrap(),
+        ] {
+            assert!(serde_cbor::from_slice::<CompatV023TakerMessage>(&bytes).is_err());
+            assert!(serde_cbor::from_slice::<CompatV023MakerMessage>(&bytes).is_err());
+        }
+        let old_refusal = CompatV023TakerMessage::Unsupported {
+            what: "Hello".into(),
+            reason: "unsupported".into(),
+        };
+        assert!(compat_connection_replies(
+            &maker,
+            &[serde_cbor::to_vec(&old_refusal).unwrap()],
+            false,
+        )
+        .is_empty());
+        maker.watch_service.shutdown();
+    }
+
+    #[test]
+    fn compat_maker_gate_requires_hello_before_heartbeat_and_handover() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec![]);
+        let legacy = PrivateKeyHandover {
+            id: "cached-legacy".into(),
+            privkeys: vec![],
+        };
+        let taproot = PrivateKeyHandover {
+            id: "cached-taproot".into(),
+            privkeys: vec![],
+        };
+        for (protocol, request, response) in [
+            (
+                ProtocolVersion::Legacy,
+                legacy.clone(),
+                MakerToTakerMessage::LegacyPrivateKeyHandover(legacy.clone()),
+            ),
+            (
+                ProtocolVersion::Taproot,
+                taproot.clone(),
+                MakerToTakerMessage::TaprootPrivateKeyHandover(taproot.clone()),
+            ),
+        ] {
+            maker
+                .cache_completed_handover(protocol, request.clone(), &response)
+                .unwrap();
+            assert!(maker
+                .replay_completed_handover(protocol, &request)
+                .unwrap()
+                .is_some());
+        }
+        for message in [
+            TakerToMakerMessage::GetOffer(Default::default()),
+            TakerToMakerMessage::WaitingFundingConfirmation("unknown".into()),
+            TakerToMakerMessage::LegacyPrivateKeyHandover(legacy.clone()),
+            TakerToMakerMessage::TaprootPrivateKeyHandover(taproot.clone()),
+        ] {
+            assert!(compat_connection_replies(
+                &maker,
+                &[serde_cbor::to_vec(&message).unwrap()],
+                false
+            )
+            .is_empty());
+        }
+        let hello = serde_cbor::to_vec(&TakerToMakerMessage::Hello(Hello::default())).unwrap();
+        for (request, expected) in [
+            (
+                TakerToMakerMessage::LegacyPrivateKeyHandover(legacy.clone()),
+                MakerToTakerMessage::LegacyPrivateKeyHandover(legacy),
+            ),
+            (
+                TakerToMakerMessage::TaprootPrivateKeyHandover(taproot.clone()),
+                MakerToTakerMessage::TaprootPrivateKeyHandover(taproot),
+            ),
+        ] {
+            let replies = compat_connection_replies(
+                &maker,
+                &[hello.clone(), serde_cbor::to_vec(&request).unwrap()],
+                true,
+            );
+            assert_eq!(replies.len(), 2);
+            assert!(matches!(replies[0], MakerToTakerMessage::Hello(_)));
+            assert_eq!(to_value(&replies[1]).unwrap(), to_value(expected).unwrap());
+        }
+        let replies = compat_connection_replies(&maker, &[hello.clone(), hello], false);
+        assert!(matches!(
+            replies.as_slice(),
+            [MakerToTakerMessage::Hello(_)]
+        ));
+        maker.watch_service.shutdown();
+    }
+
+    #[test]
+    fn compat_maker_requirements_refuse_and_close_or_accept_higher_versions() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec!["x-v1".into()]);
+        for (features, accepted) in [
+            (vec!["x-v1", "x-v2"], true),
+            (vec!["x-v2"], true),
+            (vec!["x"], false),
+            (vec![], false),
+        ] {
+            let hello = TakerToMakerMessage::Hello(Hello {
+                features: features.into_iter().map(String::from).collect(),
+            });
+            let replies =
+                compat_connection_replies(&maker, &[serde_cbor::to_vec(&hello).unwrap()], accepted);
+            if accepted {
+                assert!(matches!(
+                    replies.as_slice(),
+                    [MakerToTakerMessage::Hello(_)]
+                ));
+            } else {
+                assert!(
+                    matches!(replies.as_slice(), [MakerToTakerMessage::Unsupported(refusal)] if refusal.what == "Hello" && refusal.reason.contains("x-v1"))
+                );
+            }
+        }
+        maker.watch_service.shutdown();
+    }
+
+    #[test]
+    fn compat_maker_decode_failure_names_future_variants_without_reply_loops() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec![]);
+        let hello = serde_cbor::to_vec(&TakerToMakerMessage::Hello(Hello::default())).unwrap();
+        let tagged =
+            |tag: &str, body: Value| Value::Map(BTreeMap::from([(Value::Text(tag.into()), body)]));
+        for (value, expected) in [
+            (Value::Text("FutureUnit".into()), Some("FutureUnit")),
+            (tagged("FutureBody", Value::Integer(7)), Some("FutureBody")),
+            (
+                tagged("Lightning", tagged("FutureLn", Value::Null)),
+                Some("Lightning::FutureLn"),
+            ),
+            (tagged("Unsupported", Value::Null), None),
+            (Value::Text("Unsupported".into()), None),
+            (Value::Integer(7), None),
+        ] {
+            let replies = compat_connection_replies(
+                &maker,
+                &[hello.clone(), serde_cbor::to_vec(&value).unwrap()],
+                false,
+            );
+            assert!(matches!(
+                replies.first(),
+                Some(MakerToTakerMessage::Hello(_))
+            ));
+            match expected {
+                Some(name) => assert!(
+                    matches!(&replies[1..], [MakerToTakerMessage::Unsupported(refusal)] if refusal.what == name && refusal.reason == "cannot decode")
+                ),
+                None => assert_eq!(replies.len(), 1),
+            }
+        }
+        let mut future_hello = to_value(TakerToMakerMessage::Hello(Hello::default())).unwrap();
+        let Value::Map(outer) = &mut future_hello else {
+            panic!()
+        };
+        let Value::Map(body) = outer.get_mut(&Value::Text("Hello".into())).unwrap() else {
+            panic!()
+        };
+        body.insert(Value::Text("future".into()), Value::Bool(true));
+        assert!(matches!(
+            compat_connection_replies(&maker, &[serde_cbor::to_vec(&future_hello).unwrap()], true)
+                .as_slice(),
+            [MakerToTakerMessage::Hello(_)]
+        ));
+        maker.watch_service.shutdown();
+    }
 
     /// The preimage check reads a spend's witness before it lets recovery
     /// refund. A watcher that cannot answer must stop the pass, or the

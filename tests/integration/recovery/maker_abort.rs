@@ -127,7 +127,6 @@ struct MakerAbort<'w> {
     world: &'w mut World,
     /// Every wallet's balances right after the taker was funded.
     before: WorldBalances,
-    tracker_logger: TrackerLoggerHandle,
 }
 
 impl<'w> MakerAbort<'w> {
@@ -147,9 +146,6 @@ impl<'w> MakerAbort<'w> {
         // Use post-fidelity, pre-swap balances as the correct baseline
         world.verify_maker_pre_swap_balances();
 
-        // Start periodic swap tracker logging (every 10s)
-        let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
-
         let swap_params = SwapParams::new(protocol, Amount::from_sat(500000), 2)
             .with_tx_count(3)
             .with_required_confirms(1);
@@ -165,18 +161,13 @@ impl<'w> MakerAbort<'w> {
         assert!(swap_result.is_err(), "{}", failure);
         info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
 
-        MakerAbort {
-            world,
-            before,
-            tracker_logger,
-        }
+        MakerAbort { world, before }
     }
 
     /// Waits out the timelocks, asserts both makers recovered their
     /// contracts, then waits for the taker's recovery loop.
     fn recover(&self) {
         let world = &*self.world;
-        world.taker().log_tracker_state();
 
         // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
         // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
@@ -204,11 +195,7 @@ impl<'w> MakerAbort<'w> {
     /// Mines the recovery txs, asserts every wallet's balances, and shuts the
     /// makers down.
     fn assert_recovered(self, expected: &MakerAbortExpect) {
-        let MakerAbort {
-            world,
-            before,
-            tracker_logger,
-        } = self;
+        let MakerAbort { world, before } = self;
 
         // Mine a block to confirm recovery txs, then sync the wallets
         world.mine(1);
@@ -232,10 +219,7 @@ impl<'w> MakerAbort<'w> {
             },
         });
 
-        world.taker().log_tracker_state();
-
         world.shutdown_makers();
-        tracker_logger.stop();
     }
 }
 

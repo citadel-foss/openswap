@@ -16,14 +16,15 @@ use bitcoin::{
 };
 use bitcoind::bitcoincore_rpc::json::GetTransactionResultDetailCategory;
 use serde::{Deserialize, Serialize};
+use serde_cbor::Value;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, BTreeSet, HashSet},
     convert::TryFrom,
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use super::{Destination, WalletError};
+use super::{storage::Requires, Destination, WalletError};
 
 // To (strongly) disincentivize Sybil behavior, the value assessment of the bond
 // is based on the (time value of the bond)^x here x is the bond_value_exponent,
@@ -319,7 +320,7 @@ fn calculate_fidelity_value(
 
 /// Structure describing a Fidelity Bond.
 /// Fidelity Bonds are described here : <https://github.com/JoinMarket-Org/joinmarket-clientserver/blob/master/docs/fidelity-bonds.md>
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, PartialOrd)]
 pub struct FidelityBond {
     pub(crate) outpoint: OutPoint,
     /// Fidelity Amount
@@ -340,6 +341,54 @@ pub struct FidelityBond {
     /// can ever confirm alongside the original and double-lock funds.
     #[serde(default)]
     pub(crate) tx: Option<Transaction>,
+    /// Fields a newer build wrote that this one doesn't know, written back
+    /// unchanged. Never rebuild a bond through a conversion that drops them.
+    #[serde(flatten)]
+    pub(crate) extra: BTreeMap<String, Value>,
+}
+
+/// Skips `extra`, which has no hash; equal bonds still hash equal.
+impl std::hash::Hash for FidelityBond {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self {
+            outpoint,
+            amount,
+            lock_time,
+            pubkey,
+            conf_height,
+            is_spent,
+            bond_index,
+            tx,
+            extra: _,
+        } = self;
+        (
+            outpoint,
+            amount,
+            lock_time,
+            pubkey,
+            conf_height,
+            is_spent,
+            bond_index,
+            tx,
+        )
+            .hash(state);
+    }
+}
+
+impl Requires for FidelityBond {
+    fn requires(&self, _out: &mut BTreeSet<&'static str>) {
+        let Self {
+            outpoint: _,
+            amount: _,
+            lock_time: _,
+            pubkey: _,
+            conf_height: _,
+            is_spent: _,
+            bond_index: _,
+            tx: _,
+            extra: _,
+        } = self;
+    }
 }
 
 impl FidelityBond {
@@ -679,6 +728,7 @@ impl Wallet {
                 is_spent: false,
                 bond_index: index,
                 tx: Some(tx),
+                extra: BTreeMap::new(),
             };
             self.store.fidelity_bond.push(bond);
             self.save_to_disk()?;
@@ -908,6 +958,7 @@ impl Wallet {
                     is_spent: false,
                     bond_index: index,
                     tx: Some(tx.clone()),
+                    extra: BTreeMap::new(),
                 })
             })
         }))
@@ -984,6 +1035,7 @@ mod test {
             is_spent: false,
             bond_index: 0,
             tx: None,
+            extra: BTreeMap::new(),
         };
 
         let cert_hash = bond.generate_cert_hash(addr, &tweakable_point);

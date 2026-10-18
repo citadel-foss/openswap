@@ -165,11 +165,7 @@ impl Taker {
             );
 
             // Connect to this maker
-            let mut stream = self.net_connect(&maker_address)?;
-            self.net_handshake(&mut stream)?;
-            self.swap_state_mut()?.makers[maker_idx]
-                .legacy_exchange_mut()?
-                .connected = true;
+            let stream = self.net_connect(&maker_address)?;
             drop(stream);
             // Determine our position
             let is_first_peer = maker_idx == 0;
@@ -292,9 +288,6 @@ impl Taker {
                 for (swapcoin, sig) in swap.outgoing_swapcoins.iter_mut().zip(sender_sigs) {
                     swapcoin.others_contract_sig = Some(sig);
                 }
-                let exch = self.swap_state_mut()?.makers[maker_idx].legacy_exchange_mut()?;
-                exch.sender_sigs_requested = true;
-                exch.sender_sigs_received = true;
             }
 
             if is_first_peer && !taker_funding_broadcast {
@@ -304,29 +297,9 @@ impl Taker {
                     ));
                 }
                 log::info!("Broadcasting funding transactions and waiting for confirmation");
-                {
-                    let mut wallet = self.write_wallet()?;
+                self.commit_outgoing_swapcoins()?;
 
-                    // Persist the outgoing swapcoins (now carrying the maker's
-                    // contract signatures) to disk BEFORE broadcasting the funding txs.
-                    // Without this, a crash after broadcast leaves the wallet
-                    // store missing `others_contract_sig`, blocking timelock recovery.
-                    for swapcoin in &self.swap_state()?.outgoing_swapcoins {
-                        wallet.add_outgoing_swapcoin(swapcoin);
-                    }
-                    wallet.save_to_disk()?;
-                }
-
-                // Persist the phase BEFORE the loop: with a split batch the second
-                // tx can fail with the first already in the mempool, and a partial
-                // batch must never read as never-broadcast.
-                // Point of no return. Persist nonces needed for legacy recovery.
                 taker_funding_broadcast = true;
-                self.swap_state_mut()?.makers[maker_idx]
-                    .legacy_exchange_mut()?
-                    .prev_funding_broadcast = true;
-                self.swap_state_mut()?.phase = super::api::SwapPhase::FundsBroadcast;
-                self.persist_swap(super::swap_tracker::SwapPhase::FundsBroadcast)?;
 
                 #[cfg(feature = "integration-test")]
                 let fail_second_broadcast =
@@ -349,8 +322,8 @@ impl Taker {
                         let funding_tx = swapcoin.funding_tx.as_ref().ok_or_else(|| {
                             TakerError::General("Outgoing swapcoin missing funding_tx".to_string())
                         })?;
-                        // A failed send keeps the claim: the tx may still land. Recovery
-                        // releases it once it judges the tx absent from the backend.
+                        // A failed send keeps the claim: the tx may still land.
+                        // Recovery resends it and refunds it.
                         wallet.send_tx(funding_tx).map_err(|e| {
                             TakerError::General(format!("Failed to broadcast funding tx: {:?}", e))
                         })?;
@@ -388,10 +361,6 @@ impl Taker {
                     )?
                 };
                 _taker_funding_confirmed = true;
-                self.swap_state_mut()?.makers[maker_idx]
-                    .legacy_exchange_mut()?
-                    .prev_funding_confirmed = true;
-                self.persist_progress()?;
 
                 // Register outgoing funding outpoints as sentinels with the breach detector.
                 // Each sentinel maps a funding outpoint to its expected contract txid.
@@ -508,12 +477,6 @@ impl Taker {
                     "Test: stopped after broadcasting handed-out funding".to_string(),
                 ));
             }
-            {
-                let exch = self.swap_state_mut()?.makers[maker_idx].legacy_exchange_mut()?;
-                exch.proof_of_funding_sent = true;
-                exch.maker_contracts_received = true;
-            }
-            self.persist_progress()?;
 
             // Verify the receiver contract txs are identical to the sender contract txs.
             // Both should produce the same txid (same outpoint, value, redeemscript).
@@ -595,13 +558,7 @@ impl Taker {
                 })();
 
                 match forward_result {
-                    Ok(sigs) => {
-                        let next_exch =
-                            self.swap_state_mut()?.makers[maker_idx + 1].legacy_exchange_mut()?;
-                        next_exch.sender_sigs_requested = true;
-                        next_exch.sender_sigs_received = true;
-                        sigs
-                    }
+                    Ok(sigs) => sigs,
                     Err(e) => {
                         // Next maker failed — try substituting with a spare.
                         let spare = self.take_eligible_spare()?;
@@ -621,9 +578,6 @@ impl Taker {
                     }
                 }
             };
-            self.swap_state_mut()?.makers[maker_idx]
-                .legacy_exchange_mut()?
-                .next_maker_sigs_obtained = true;
 
             let receivers_sigs = if is_first_peer {
                 log::info!("Signing receiver contracts (we are first peer)");
@@ -671,9 +625,6 @@ impl Taker {
                         .ok_or(ProtocolError::General("missing previous hop sender info"))?,
                 )?
             };
-            self.swap_state_mut()?.makers[maker_idx]
-                .legacy_exchange_mut()?
-                .prev_maker_sigs_obtained = true;
 
             #[cfg(feature = "integration-test")]
             if is_first_peer
@@ -696,10 +647,6 @@ impl Taker {
                 receivers_sigs,
                 senders_sigs,
             )?;
-            self.swap_state_mut()?.makers[maker_idx]
-                .legacy_exchange_mut()?
-                .combined_sigs_sent = true;
-            self.persist_progress()?;
 
             // Store this maker's outgoing info for next hop
             prev_senders_info = Some(senders_contract_txs_info.clone());
@@ -731,9 +678,6 @@ impl Taker {
                 self.swap_state_mut()?
                     .watchonly_swapcoins
                     .extend(watchonly_coins);
-                self.swap_state_mut()?.makers[maker_idx]
-                    .legacy_exchange_mut()?
-                    .watchonly_created = true;
             }
 
             // Wait for this maker's funding to be broadcast and confirmed
@@ -815,10 +759,6 @@ impl Taker {
             }
             prev_confirm_height = maker_confirm_height;
 
-            self.swap_state_mut()?.makers[maker_idx]
-                .legacy_exchange_mut()?
-                .maker_funding_confirmed = true;
-
             // Register this maker's funding outpoints as sentinels for subsequent waits.
             // Each sentinel maps a funding outpoint to its expected contract txid.
             let maker_sentinels: Vec<(bitcoin::OutPoint, bitcoin::Txid, bitcoin::ScriptBuf)> =
@@ -838,15 +778,6 @@ impl Taker {
             if let Some(ref detector) = self.breach_detector {
                 detector.add_sentinels(&self.watch_service, &maker_sentinels)?;
             }
-
-            // This maker's funding is the previous hop for the next maker.
-            if maker_idx + 1 < maker_count {
-                let next_exch =
-                    self.swap_state_mut()?.makers[maker_idx + 1].legacy_exchange_mut()?;
-                next_exch.prev_funding_broadcast = true;
-                next_exch.prev_funding_confirmed = true;
-            }
-            self.persist_progress()?;
 
             #[cfg(debug_assertions)]
             log::debug!(
@@ -956,9 +887,7 @@ impl Taker {
             self.persist_incoming_swapcoins()?;
         }
 
-        // SP6-L: All makers responded, incoming swapcoins created.
         // Breach detector keeps running through finalization.
-        self.persist_swap(super::swap_tracker::SwapPhase::ContractsExchanged)?;
 
         log::info!("Multi-hop Legacy swap contract exchange completed");
         Ok(())

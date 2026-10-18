@@ -107,14 +107,11 @@ impl Wallet {
         if password.is_empty() {
             return Err(WalletError::WrongPassword);
         }
-        let (mut store, material) = WalletStore::read_from_disk(path, Some(password.to_string()))
-            .map_err(|e| match e {
-            WalletError::Security(SecurityError::Decryption) => WalletError::WrongPassword,
-            e => e,
-        })?;
-        let store_enc_material = material.ok_or_else(|| {
-            WalletError::General("cleartext wallet files are not supported".to_string())
-        })?;
+        let (mut store, store_enc_material) =
+            WalletStore::read_from_disk(path, Some(password.to_string())).map_err(|e| match e {
+                WalletError::Security(SecurityError::Decryption) => WalletError::WrongPassword,
+                e => e,
+            })?;
         store.master_key.seal(&store_enc_material)?;
         // Building the client opens no connection, and nothing here calls it.
         let blockchain =

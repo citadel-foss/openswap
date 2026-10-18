@@ -93,20 +93,9 @@ fn legacy_two_maker_swap_completes(world: &mut World) {
 
     info!("Standard openswap test completed successfully!");
 
-    let taker_report_path = world
-        .temp_dir()
-        .join("taker1")
-        .join("wallets")
-        .join("taker1_swap_report.json");
-    assert_report_has_deniability_proofs(&taker_report_path, "taker", bitcoind, 1);
-
+    assert_wallet_has_deniability_proofs(world.taker().inner().get_wallet(), "taker", 1);
     for (i, maker) in world.makers().iter().enumerate() {
-        assert_report_has_deniability_proofs(
-            &maker.report_path(),
-            &format!("maker {i}"),
-            bitcoind,
-            1,
-        );
+        assert_wallet_has_deniability_proofs(&maker.inner().wallet, &format!("maker {i}"), 1);
     }
 }
 

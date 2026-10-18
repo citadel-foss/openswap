@@ -56,7 +56,9 @@ use rust_coinselect::{
 use super::{
     backup::RestoreOptions,
     blockchain::{AnyBlockchain, BackendConfig, Blockchain, HdOrigin},
+    deniability::verify_swap_proof,
     error::WalletError,
+    report::{RecoveryReport, SwapRole},
     seed::{seal_mnemonic, SEED_NOT_BACKED_UP},
     seed_cli::WalletInUse,
     storage::{AddressType, SecretXpriv, WalletStore},
@@ -519,19 +521,13 @@ impl Wallet {
         &self.store.file_name
     }
 
-    /// Verify the deniability proof for a specific swap in this wallet's report file.
+    /// Verify the deniability proof for a specific swap stored in this wallet.
     pub fn verify_deniability(&self, swap_id: &str) -> Result<bool, std::io::Error> {
-        let stem = self
-            .wallet_file_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| std::io::Error::other("wallet path has no valid file stem"))?;
-        let report_path = self
-            .wallet_file_path
-            .parent()
-            .ok_or_else(|| std::io::Error::other("wallet path has no parent directory"))?
-            .join(format!("{stem}_swap_report.json"));
-        crate::wallet::deniability::verify_deniability(&report_path, &self.blockchain, swap_id)
+        verify_swap_proof(
+            self.swap_reports().deniability_proofs,
+            &self.blockchain,
+            swap_id,
+        )
     }
 
     /// Load wallet data from file and connect to a blockchain backend.
@@ -601,19 +597,14 @@ impl Wallet {
         Ok(wallet)
     }
 
-    /// Reads and decrypts the wallet file at `path`, refusing a cleartext file
-    /// and a missing passphrase. Does not touch the backend.
+    /// Reads and decrypts the wallet file at `path`, refusing a missing
+    /// passphrase. Does not touch the backend.
     fn read_store(
         path: &Path,
         password: Option<String>,
     ) -> Result<(WalletStore, KeyMaterial), WalletError> {
         match WalletStore::read_from_disk(path, password) {
-            Ok((store, Some(material))) => Ok((store, material)),
-            // Cleartext wallet files are not supported at all.
-            Ok((_, None)) => Err(WalletError::General(format!(
-                "wallet file {path:?} is unencrypted; \
-                 cleartext wallet files are not supported"
-            ))),
+            Ok(loaded) => Ok(loaded),
             // Encrypted file, no passphrase supplied. Report how to supply
             // one instead of failing decryption with an empty passphrase.
             Err(WalletError::Security(SecurityError::PasswordRequired)) => {
@@ -752,9 +743,14 @@ impl Wallet {
         // Use contract txid as key to ensure each swapcoin has a unique entry,
         // even when multiple outgoing swapcoins share the same swap_id.
         let key = coin.contract_tx.compute_txid().to_string();
-        self.store
-            .outgoing_swapcoins
-            .insert(key.clone(), coin.clone());
+        let mut coin = coin.clone();
+        // Both flags only ever go to `true`: a stale copy re-inserted must not
+        // make a committed coin look unsent or forget a claimed incoming.
+        if let Some(stored) = self.store.outgoing_swapcoins.get(&key) {
+            coin.committed |= stored.committed;
+            coin.incoming_claimed |= stored.incoming_claimed;
+        }
+        self.store.outgoing_swapcoins.insert(key.clone(), coin);
         log::info!(
             "Added outgoing swapcoin to wallet store: {} (total: {})",
             key,
@@ -849,14 +845,6 @@ impl Wallet {
             .or_default()
             .extend(coins);
         log::info!("Added {} watch-only swapcoins for swap {}", count, swap_id);
-    }
-
-    /// Removes watch-only swapcoins for a given swap.
-    pub(crate) fn remove_watchonly_swapcoins(
-        &mut self,
-        swap_id: &str,
-    ) -> Option<Vec<super::swapcoin::WatchOnlySwapCoin>> {
-        self.store.watchonly_swapcoins.remove(swap_id)
     }
 
     /// True when this wallet talks to an Electrum server rather than Bitcoin Core.
@@ -970,19 +958,19 @@ impl Wallet {
     }
 
     /// Remove a outgoing swapcoin by contract txid.
-    pub(crate) fn remove_outgoing_swapcoin(&mut self, contract_txid: &str) {
-        if self
-            .store
-            .outgoing_swapcoins
-            .remove(contract_txid)
-            .is_some()
-        {
+    pub(crate) fn remove_outgoing_swapcoin(
+        &mut self,
+        contract_txid: &str,
+    ) -> Option<super::swapcoin::OutgoingSwapCoin> {
+        let coin = self.store.outgoing_swapcoins.remove(contract_txid);
+        if coin.is_some() {
             log::info!(
                 "Removed outgoing swapcoin: {} (remaining: {})",
                 contract_txid,
                 self.store.outgoing_swapcoins.len()
             );
         }
+        coin
     }
 
     /// Returns contract_txid keys of outgoing swapcoins matching a swap_id.
@@ -995,42 +983,129 @@ impl Wallet {
             .collect()
     }
 
-    fn check_funding_inputs_state(
+    pub(crate) fn swap_funding_committed(&self, swap_id: &str) -> bool {
+        self.store
+            .outgoing_swapcoins
+            .values()
+            .any(|coin| coin.swap_id.as_deref() == Some(swap_id) && coin.committed)
+    }
+
+    /// Keep retry state in memory when cleanup cannot be saved.
+    pub(crate) fn remove_swap_coins_and_save(
+        &mut self,
+        swap_id: &str,
+        remove_incoming: bool,
+        remove_outgoing: bool,
+    ) -> Result<(), WalletError> {
+        let incoming: Vec<_> = if remove_incoming {
+            self.incoming_keys_for_swap(swap_id)
+                .into_iter()
+                .filter_map(|key| {
+                    self.store
+                        .incoming_swapcoins
+                        .remove(&key)
+                        .map(|coin| (key, coin))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let outgoing: Vec<_> = if remove_outgoing {
+            self.outgoing_keys_for_swap(swap_id)
+                .into_iter()
+                .filter_map(|key| {
+                    self.store
+                        .outgoing_swapcoins
+                        .remove(&key)
+                        .map(|coin| (key, coin))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let watchonly = if remove_outgoing {
+            self.store.watchonly_swapcoins.remove(swap_id)
+        } else {
+            None
+        };
+        let reservation = self.store.swap_locks.remove(swap_id);
+        if let Err(error) = self.save_to_disk() {
+            self.store.incoming_swapcoins.extend(incoming);
+            self.store.outgoing_swapcoins.extend(outgoing);
+            if let Some(coins) = watchonly {
+                self.store
+                    .watchonly_swapcoins
+                    .insert(swap_id.to_owned(), coins);
+            }
+            if let Some(reservation) = reservation {
+                self.store
+                    .swap_locks
+                    .insert(swap_id.to_owned(), reservation);
+            }
+            return Err(error);
+        }
+        let mut remaining = self.store.outgoing_swapcoins.len() + outgoing.len();
+        for (key, _) in &outgoing {
+            remaining -= 1;
+            log::info!(
+                "Removed outgoing swapcoin: {} (remaining: {})",
+                key,
+                remaining
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether a confirmed transaction other than `tx` spends one of its
+    /// inputs, so `tx` can never confirm.
+    fn inputs_spent_elsewhere(
         chain: &AnyBlockchain,
         tx: &Transaction,
-    ) -> Result<(bool, bool), WalletError> {
-        let mut any_confirmed_spent = false;
-        let mut all_unspent = !tx.input.is_empty();
-
+    ) -> Result<bool, WalletError> {
         for input in &tx.input {
             let outpoint = input.previous_output;
-            let unspent = matches!(
-                chain.get_tx_out(&outpoint.txid, outpoint.vout, Some(true)),
-                Ok(Some(_))
-            );
-            if !unspent {
-                all_unspent = false;
-            }
-            match chain.get_raw_transaction(&outpoint.txid, None) {
-                Ok(parent_tx) => {
-                    if parent_tx.compute_txid() == outpoint.txid {
-                        if let Some(output) = parent_tx.output.get(outpoint.vout as usize) {
-                            if chain.is_confirmed_spend(&outpoint, &output.script_pubkey)? {
-                                any_confirmed_spent = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                // A genuinely absent parent has nothing to check. Any other
-                // failure — transport, protocol, a txid-mismatch guard — must
-                // reach the caller, not read as "input not confirmed spent".
-                Err(_) if chain.is_tx_unknown(&outpoint.txid)? => {}
+            let parent = match chain.get_raw_transaction(&outpoint.txid, None) {
+                Ok(tx) => tx,
+                Err(_) if chain.is_tx_unknown(&outpoint.txid)? => continue,
                 Err(e) => return Err(e),
+            };
+            if parent.compute_txid() != outpoint.txid {
+                continue;
+            }
+            if let Some(output) = parent.output.get(outpoint.vout as usize) {
+                if chain
+                    .confirmed_spending_transaction(&outpoint, &output.script_pubkey)?
+                    .is_some_and(|spender| spender.compute_txid() != tx.compute_txid())
+                {
+                    return Ok(true);
+                }
             }
         }
+        Ok(false)
+    }
 
-        Ok((any_confirmed_spent, all_unspent))
+    /// On-chain swaps with stored recovery or watch-only coins.
+    pub(crate) fn onchain_swap_ids(&self) -> HashSet<String> {
+        self.store
+            .incoming_swapcoins
+            .values()
+            .filter_map(|coin| coin.swap_id.clone())
+            .chain(
+                self.store
+                    .outgoing_swapcoins
+                    .values()
+                    .filter_map(|coin| coin.swap_id.clone()),
+            )
+            .chain(self.store.watchonly_swapcoins.keys().cloned())
+            .collect()
+    }
+
+    /// All persisted swaps that still own reservations.
+    pub(crate) fn swap_ids(&self) -> HashSet<String> {
+        let mut ids = self.onchain_swap_ids();
+        ids.extend(self.store.ln_pending_swaps.keys().cloned());
+        ids.extend(self.store.ln_maker_swaps.keys().cloned());
+        ids
     }
 
     /// Returns contract_txid keys of incoming swapcoins matching a swap_id.
@@ -1052,11 +1127,12 @@ impl Wallet {
         chain: &AnyBlockchain,
         swap_id: &str,
         swapcoin: &super::swapcoin::OutgoingSwapCoin,
-        funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
     ) -> Result<ContractChainState, WalletError> {
+        if !swapcoin.committed {
+            return Ok(ContractChainState::Discarded);
+        }
         let contract_txid = swapcoin.contract_tx.compute_txid();
         let contract_vout = swapcoin.get_contract_output_vout();
-
         if chain
             .get_tx_out(&contract_txid, contract_vout, Some(false))?
             .is_some()
@@ -1077,24 +1153,15 @@ impl Wallet {
             }
             return Ok(ContractChainState::OnChain);
         }
-
-        // The confirmed view has no such output: it was spent, or the
-        // contract tx was never broadcast.
         if chain.tx_block_height(&contract_txid)?.is_some() {
-            // Classify only a confirmed spend. On Electrum a mempool-spent
-            // output looks identical here, and such a spend can be evicted;
-            // the backend answers from the script's history instead.
             let outpoint = OutPoint::new(contract_txid, contract_vout);
             let script = &swapcoin.contract_tx.output[contract_vout as usize].script_pubkey;
-            if chain.is_confirmed_spend(&outpoint, script)? {
-                // The spend may be our own timelock recovery whose bookkeeping
-                // was lost to a crash or a failed confirmation wait. Look only at
-                // the mined spender: Electrum history can list an unconfirmed
-                // conflict, such as a replaced recovery, ahead of it.
-                if let Some(recovery) = chain
-                    .confirmed_spending_transaction(&outpoint, script)?
-                    .filter(|tx| swapcoin.is_own_timelock_spend(tx))
-                {
+            // Look only at the mined spender: Electrum history can list an
+            // unconfirmed conflict, such as a replaced recovery, ahead of it.
+            match chain.confirmed_spending_transaction(&outpoint, script)? {
+                // Our own timelock recovery whose bookkeeping was lost to a
+                // crash or a failed confirmation wait.
+                Some(recovery) if swapcoin.is_own_timelock_spend(&recovery) => {
                     let recovery_txid = recovery.compute_txid();
                     log::info!(
                         "Contract output for {} already spent by our confirmed timelock recovery {} — recording as resolved",
@@ -1105,185 +1172,72 @@ impl Wallet {
                 }
                 // The other side claimed it, and that spend may carry the preimage
                 // we still need. Keep the coin until the swap settles.
-                log::info!(
-                    "Contract output for {} claimed by a confirmed tx — keeping swapcoin",
-                    swap_id
-                );
-            } else if let Some(pending) = Self::pending_own_recovery(chain, swapcoin)? {
-                return Ok(ContractChainState::RecoveryPending(pending));
+                Some(_) => {
+                    log::info!(
+                        "Contract output for {} claimed by a confirmed tx — keeping swapcoin",
+                        swap_id
+                    );
+                }
+                None => {
+                    if let Some(pending) = Self::pending_own_recovery(chain, swapcoin)? {
+                        return Ok(ContractChainState::RecoveryPending(pending));
+                    }
+                }
             }
             return Ok(ContractChainState::NotYet);
         }
-
-        // The contract tx is not on-chain. For Taproot it IS the funding tx:
-        // if its wallet input is still unspent, the tx was never broadcast
-        // and the funds never left.
-        let input_outpoint = swapcoin.contract_tx.input[0].previous_output;
-        if swapcoin.protocol == crate::protocol::ProtocolVersion::Taproot {
-            let input_unspent = chain
-                .get_tx_out(&input_outpoint.txid, input_outpoint.vout, Some(true))?
-                .is_some();
-            if input_unspent {
-                log::info!(
-                    "Contract tx for {} was never broadcast — wallet UTXOs still unspent, discarding swapcoin",
-                    swap_id
-                );
-                return Ok(ContractChainState::Discarded);
+        let funding = if swapcoin.protocol == ProtocolVersion::Taproot {
+            Some(&swapcoin.contract_tx)
+        } else {
+            swapcoin.funding_tx.as_ref()
+        };
+        // An absent committed funding tx may still confirm from another node.
+        // Only a confirmed conflicting spend proves it cannot return: of a
+        // funding input, or of the funding output a legacy contract spends.
+        let funding_dead = match funding {
+            Some(funding) => {
+                chain.tx_block_height(&funding.compute_txid())?.is_none()
+                    && Self::inputs_spent_elsewhere(chain, funding)?
             }
+            None => false,
+        };
+        if funding_dead
+            || (swapcoin.protocol == ProtocolVersion::Legacy
+                && Self::inputs_spent_elsewhere(chain, &swapcoin.contract_tx)?)
+        {
+            log::info!(
+                "Funding for {} was confirmed spent elsewhere, discarding swapcoin",
+                swap_id
+            );
+            return Ok(ContractChainState::Discarded);
         }
-
-        // Legacy: the contract tx is pre-signed insurance that may never have
-        // been broadcast. Push it so the timelock output exists.
-        let signed_contract_tx = match swapcoin.create_signed_contract_tx() {
+        let signed_contract = match swapcoin.create_signed_contract_tx() {
             Ok(tx) => tx,
             Err(e) => {
-                // If the contract tx cannot be signed (e.g. missing maker's signature),
-                // check if the swapcoin can be safely discarded:
-                // 1. Funding transaction inputs were confirmed spent elsewhere, so funding
-                //    can never confirm.
-                // 2. Funding transaction is unknown to the mempool/chain, all its wallet
-                //    inputs are still unspent, it was never shared with the peer, and
-                //    the maker never signed our contract.
-                //
-                // An unknown tx with unspent inputs alone does not prove it was never
-                // broadcast: an evicted tx can still confirm from another node's
-                // mempool. The missing maker signature does. The taker persists that
-                // signature before broadcasting funding (`exchange_legacy`), so a coin
-                // the maker never signed was never broadcast by us, and unshared
-                // means no peer holds the signed funding tx either.
-                let maker_never_signed = swapcoin.others_contract_sig.is_none();
-                if let Some(ref funding_tx) = swapcoin.funding_tx {
-                    let funding_txid = funding_tx.compute_txid();
-                    let funding_confirmed = chain.tx_block_height(&funding_txid)?.is_some();
-
-                    if !funding_confirmed {
-                        let (any_confirmed_spent, all_unspent) =
-                            Self::check_funding_inputs_state(chain, funding_tx)?;
-
-                        if any_confirmed_spent {
-                            log::info!(
-                                "Contract tx for {} cannot be signed and funding tx inputs were spent — discarding swapcoin",
-                                swap_id
-                            );
-                            return Ok(ContractChainState::Discarded);
-                        }
-
-                        let funding_unknown = chain.is_tx_unknown(&funding_txid)?;
-                        if maker_never_signed
-                            && funding_unknown
-                            && all_unspent
-                            && !funding_shared_with_peer(swapcoin.swap_id.as_deref())
-                        {
-                            log::info!(
-                                "Contract tx for {} was never signed by the maker, funding tx is unknown, wallet inputs are unspent, and funding was never shared — discarding swapcoin",
-                                swap_id
-                            );
-                            return Ok(ContractChainState::Discarded);
-                        }
-                    }
-                } else if let Some(input) = swapcoin.contract_tx.input.first() {
-                    let input_outpoint = input.previous_output;
-                    let parent_tx = match chain.get_raw_transaction(&input_outpoint.txid, None) {
-                        Ok(tx) => Some(tx),
-                        // A genuinely absent parent has nothing to check here.
-                        // Any other failure — transport, protocol, a
-                        // txid-mismatch guard — must reach the caller, not
-                        // read as "nothing learned about this input".
-                        Err(_) if chain.is_tx_unknown(&input_outpoint.txid)? => None,
-                        Err(e) => return Err(e),
-                    };
-                    if let Some(parent_tx) = parent_tx {
-                        if parent_tx.compute_txid() == input_outpoint.txid {
-                            if let Some(output) = parent_tx.output.get(input_outpoint.vout as usize)
-                            {
-                                if chain
-                                    .is_confirmed_spend(&input_outpoint, &output.script_pubkey)?
-                                {
-                                    log::info!(
-                                        "Contract tx for {} cannot be signed and input outpoint was confirmed spent — discarding swapcoin",
-                                        swap_id,
-                                    );
-                                    return Ok(ContractChainState::Discarded);
-                                }
-                            }
-
-                            let parent_confirmed =
-                                chain.tx_block_height(&input_outpoint.txid)?.is_some();
-                            if !parent_confirmed {
-                                let (any_confirmed_spent, all_unspent) =
-                                    Self::check_funding_inputs_state(chain, &parent_tx)?;
-
-                                if any_confirmed_spent {
-                                    log::info!(
-                                        "Contract tx for {} cannot be signed and parent tx inputs were spent — discarding swapcoin",
-                                        swap_id
-                                    );
-                                    return Ok(ContractChainState::Discarded);
-                                }
-
-                                let parent_unknown = chain.is_tx_unknown(&input_outpoint.txid)?;
-                                if maker_never_signed
-                                    && parent_unknown
-                                    && all_unspent
-                                    && !funding_shared_with_peer(swapcoin.swap_id.as_deref())
-                                {
-                                    log::info!(
-                                        "Contract tx for {} was never signed by the maker, parent tx is unknown, wallet inputs are unspent, and funding was never shared — discarding swapcoin",
-                                        swap_id
-                                    );
-                                    return Ok(ContractChainState::Discarded);
-                                }
-                            }
-                        }
-                    }
-                }
-
                 log::warn!(
-                    "Failed to sign contract tx for {}: {:?} — skipping recovery",
+                    "Failed to sign contract tx for {}: {:?} — keeping committed coin",
                     swap_id,
                     e
                 );
                 return Ok(ContractChainState::NotYet);
             }
         };
-        if let Err(e) = chain.send_raw_transaction(&signed_contract_tx) {
-            // Derive the real state from the chain instead of parsing the
-            // error: the output showing up (mempool counts) means the tx was
-            // already on its way; the input being gone means it never confirms.
+        // A send that failed or never ran leaves a committed legacy funding
+        // unknown, and its contract can't go out without it. Only sent once
+        // the contract is signed, so the funds can always come back.
+        if let Some(funding) = funding.filter(|_| swapcoin.protocol == ProtocolVersion::Legacy) {
+            if chain.is_tx_unknown(&funding.compute_txid())? {
+                if let Err(e) = chain.send_raw_transaction(funding) {
+                    log::warn!("Failed to resend funding tx for {}: {:?}", swap_id, e);
+                }
+            }
+        }
+        if let Err(e) = chain.send_raw_transaction(&signed_contract) {
             if chain
                 .get_tx_out(&contract_txid, contract_vout, Some(true))?
                 .is_some()
             {
                 return Ok(ContractChainState::OnChain);
-            }
-            let input_gone = chain
-                .get_tx_out(&input_outpoint.txid, input_outpoint.vout, Some(true))?
-                .is_none();
-            if input_gone {
-                // If this coin's funding never left us, nothing can put it
-                // on-chain and the insurance is dead weight. A coin with no
-                // swap id predates the field, so it counts as shared.
-                if !funding_shared_with_peer(swapcoin.swap_id.as_deref()) {
-                    return Ok(ContractChainState::Discarded);
-                }
-                // The peer holds the funding fully signed and can broadcast it
-                // at any time. Discard only once it is permanently invalid:
-                // every input confirmed spent elsewhere (confirmed view — a
-                // mempool spend can still be evicted). No stored funding tx
-                // means we cannot prove that, so keep.
-                let Some(funding_tx) = &swapcoin.funding_tx else {
-                    return Ok(ContractChainState::NotYet);
-                };
-                for input in &funding_tx.input {
-                    let prev = input.previous_output;
-                    if chain
-                        .get_tx_out(&prev.txid, prev.vout, Some(false))?
-                        .is_some()
-                    {
-                        return Ok(ContractChainState::NotYet);
-                    }
-                }
-                return Ok(ContractChainState::Discarded);
             }
             log::warn!(
                 "Failed to broadcast contract tx for {}: {:?} — retrying next cycle",
@@ -1292,10 +1246,6 @@ impl Wallet {
             );
             return Ok(ContractChainState::NotYet);
         }
-        log::info!(
-            "Contract tx {} broadcast successfully",
-            signed_contract_tx.compute_txid()
-        );
         Ok(ContractChainState::OnChain)
     }
 
@@ -1324,24 +1274,34 @@ impl Wallet {
     /// The caller supplies the backend connection: the confirmation wait runs
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
     /// Without `swap_scope` every eligible outgoing swapcoin is considered.
+    /// The callback is ignored and kept so callers still compile; each coin's
+    /// saved `committed` flag now decides.
     pub fn recover_timelocked_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
         shutdown: &std::sync::atomic::AtomicBool,
         swap_scope: Option<&HashSet<String>>,
-        funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
+        _funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
     ) -> Result<RecoveryOutcome, WalletError> {
         let (refunds, discarded) = Self::broadcast_timelock_recoveries(
             wallet,
             chain,
             shutdown,
             swap_scope,
-            funding_shared_with_peer,
             &|_| false,
             &|_| false,
             &mut false,
         )?;
-        Ok(Self::finish_recoveries(wallet, chain, shutdown, Vec::new(), refunds, discarded)?.1)
+        Ok(Self::finish_recoveries(
+            wallet,
+            chain,
+            shutdown,
+            Vec::new(),
+            refunds,
+            discarded,
+            Some(SwapRole::Maker),
+        )?
+        .1)
     }
 
     /// Broadcasts every ready timelock refund without waiting on any of them.
@@ -1349,11 +1309,6 @@ impl Wallet {
     ///
     /// Feerates come from our own backend: the peer that abandoned the swap
     /// does not get to price our refund.
-    ///
-    /// `funding_shared_with_peer` answers per coin whether the peer may hold
-    /// its funding txs. Unshared funding can never land on-chain, so its
-    /// swapcoin is discardable; shared funding is kept until its inputs are
-    /// confirmed spent elsewhere.
     ///
     /// `claimed_by_hashlock` names swaps whose incoming coin we claimed. Their
     /// outgoing coins are the first maker's to claim with the preimage, so they
@@ -1369,7 +1324,6 @@ impl Wallet {
         chain: &AnyBlockchain,
         shutdown: &std::sync::atomic::AtomicBool,
         swap_scope: Option<&HashSet<String>>,
-        funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
         claimed_by_hashlock: &dyn Fn(&str) -> bool,
         claim_proven: &dyn Fn(&str) -> bool,
         synced: &mut bool,
@@ -1420,7 +1374,9 @@ impl Wallet {
         let mut to_recover = Vec::new();
 
         for (swap_id, swapcoin, timelock) in candidates {
-            if swapcoin.protocol == crate::protocol::ProtocolVersion::Taproot {
+            if !swapcoin.committed {
+                to_recover.push((swap_id, swapcoin, timelock));
+            } else if swapcoin.protocol == crate::protocol::ProtocolVersion::Taproot {
                 // Taproot uses CLTV (absolute height).
                 if current_height >= timelock {
                     log::info!(
@@ -1460,12 +1416,7 @@ impl Wallet {
             if let Err(e) = (|| -> Result<(), WalletError> {
                 let contract_txid = swapcoin.contract_tx.compute_txid();
                 let contract_vout = swapcoin.get_contract_output_vout();
-                match Self::ensure_contract_on_chain(
-                    chain,
-                    &swap_id,
-                    &swapcoin,
-                    funding_shared_with_peer,
-                )? {
+                match Self::ensure_contract_on_chain(chain, &swap_id, &swapcoin)? {
                     ContractChainState::OnChain => {}
                     ContractChainState::Discarded => {
                         discarded.push(swap_id.clone());
@@ -1718,6 +1669,7 @@ impl Wallet {
         sweeps: Vec<SentSpend>,
         refunds: Vec<SentSpend>,
         discarded: Vec<String>,
+        report_role: Option<SwapRole>,
     ) -> Result<(RecoveryOutcome, RecoveryOutcome), WalletError> {
         let txids: Vec<Txid> = sweeps
             .iter()
@@ -1737,31 +1689,78 @@ impl Wallet {
         let mut w = lock_debug!(wallet.write())
             .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
 
+        let previous_incoming = w.store.incoming_swapcoins.clone();
+        let previous_outgoing = w.store.outgoing_swapcoins.clone();
+        let previous_reports = w.store.reports.clone();
+        let mut reports: HashMap<(String, bool), Vec<String>> = HashMap::new();
         let mut incoming = RecoveryOutcome::default();
-        for (swap_id, contract_txid, txid) in sweeps {
+        for (key, contract_txid, txid) in sweeps {
             log::info!("Sweep transaction {} confirmed", txid);
-            w.remove_incoming_swapcoin(&swap_id);
-            incoming.resolved.push((contract_txid, txid));
+            if let Some(coin) = w.remove_incoming_swapcoin(&key) {
+                if let Some(id) = coin.swap_id {
+                    for outgoing in w.store.outgoing_swapcoins.values_mut() {
+                        if outgoing.swap_id.as_ref() == Some(&id) {
+                            outgoing.incoming_claimed = true;
+                        }
+                    }
+                    if coin.other_privkey.is_none() {
+                        reports
+                            .entry((id, true))
+                            .or_default()
+                            .push(txid.to_string());
+                    }
+                }
+                incoming.resolved.push((contract_txid, txid));
+            }
         }
-
         let mut outgoing = RecoveryOutcome::default();
-        for (swap_id, contract_txid, txid) in refunds {
+        for (key, contract_txid, txid) in refunds {
             log::info!("Timelock recovery tx {} confirmed", txid);
-            w.remove_outgoing_swapcoin(&swap_id);
-            outgoing.resolved.push((contract_txid, txid));
+            if let Some(coin) = w.remove_outgoing_swapcoin(&key) {
+                reports
+                    .entry((coin.swap_id.unwrap_or(key), false))
+                    .or_default()
+                    .push(txid.to_string());
+                outgoing.resolved.push((contract_txid, txid));
+            }
         }
         for id in &discarded {
-            if let Some(sc) = w.store.outgoing_swapcoins.get(id) {
+            if let Some(sc) = w.store.outgoing_swapcoins.remove(id) {
                 outgoing.discarded.push(sc.contract_tx.compute_txid());
             }
-            w.store.outgoing_swapcoins.remove(id);
         }
-
         if !incoming.is_empty() || !outgoing.is_empty() {
-            // The spends are mined and the coins are gone from memory: a failed
-            // save must not drop the outcome the caller records.
-            if let Err(e) = w.save_to_disk() {
-                log::warn!("Failed to persist recovery outcome: {:?}", e);
+            let saved = (|| -> Result<(), WalletError> {
+                if let Some(role) = report_role {
+                    for ((swap_id, hashlock), recovery_txids) in reports {
+                        RecoveryReport {
+                            swap_id,
+                            role,
+                            node: if role == SwapRole::Maker {
+                                w.wallet_file_path
+                                    .parent()
+                                    .and_then(Path::parent)
+                                    .and_then(Path::file_name)
+                                    .and_then(|n| n.to_str())
+                                    .map(str::to_owned)
+                            } else {
+                                None
+                            },
+                            recovery_type: if hashlock { "hashlock" } else { "timelock" }.into(),
+                            recovery_txids,
+                            network: w.store.network.to_string(),
+                            timestamp: now_secs(),
+                        }
+                        .store_in_wallet(&mut w)?;
+                    }
+                }
+                w.save_to_disk()
+            })();
+            if let Err(e) = saved {
+                w.store.incoming_swapcoins = previous_incoming;
+                w.store.outgoing_swapcoins = previous_outgoing;
+                w.store.reports = previous_reports;
+                return Err(e);
             }
             #[cfg(debug_assertions)]
             log::debug!(
@@ -1788,15 +1787,18 @@ impl Wallet {
     /// refund while its race is open. Returns the (incoming, outgoing) outcomes.
     ///
     /// A swap settles one way: a swap whose incoming coin we claim, now or in an
-    /// earlier pass (`incoming_claimed`), gets no refund unless it provably dangles.
+    /// earlier pass, gets no refund unless it provably dangles.
+    ///
+    /// Both callbacks are ignored and kept so callers still compile; the saved
+    /// `committed` and `incoming_claimed` flags now decide.
     pub fn recover_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
         shutdown: &std::sync::atomic::AtomicBool,
         contract_txids: &HashSet<Txid>,
         swap_ids: &HashSet<String>,
-        funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
-        incoming_claimed: &dyn Fn(&str) -> bool,
+        _funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
+        _incoming_claimed: &dyn Fn(&str) -> bool,
     ) -> Result<(RecoveryOutcome, RecoveryOutcome), WalletError> {
         // Both steps want a synced wallet; the pass syncs it once.
         let mut synced = false;
@@ -1815,18 +1817,33 @@ impl Wallet {
                 (Vec::new(), HashSet::new(), true)
             }
         };
+        let claimed: HashSet<String> = lock_debug!(wallet.read())
+            .map_err(|_| WalletError::General("wallet lock poisoned".into()))?
+            .store
+            .outgoing_swapcoins
+            .values()
+            .filter(|coin| coin.incoming_claimed)
+            .filter_map(|coin| coin.swap_id.clone())
+            .collect();
         let (refunds, discarded) = Self::broadcast_timelock_recoveries(
             wallet,
             chain,
             shutdown,
             Some(swap_ids),
-            funding_shared_with_peer,
-            &|swap_id| sweep_failed || claiming.contains(swap_id) || incoming_claimed(swap_id),
+            &|swap_id| sweep_failed || claiming.contains(swap_id) || claimed.contains(swap_id),
             // A failed sweep step holds every refund, but proves no claim.
-            &|swap_id| claiming.contains(swap_id) || incoming_claimed(swap_id),
+            &|swap_id| claiming.contains(swap_id) || claimed.contains(swap_id),
             &mut synced,
         )?;
-        Self::finish_recoveries(wallet, chain, shutdown, sweeps, refunds, discarded)
+        Self::finish_recoveries(
+            wallet,
+            chain,
+            shutdown,
+            sweeps,
+            refunds,
+            discarded,
+            Some(SwapRole::Taker),
+        )
     }
 
     /// Create a recovery transaction for a timelocked outgoing swapcoin.
@@ -2200,13 +2217,6 @@ impl Wallet {
             .sum()
     }
 
-    /// When this swap's inputs were reserved, if the reservation still exists.
-    /// Restart recovery reads it to age the unbroadcast grace from the event,
-    /// not from the restart.
-    pub(crate) fn reservation_created_at(&self, swap_id: &str) -> Option<u64> {
-        self.store.swap_locks.get(swap_id).map(|l| l.reserved_at)
-    }
-
     /// Checks if a UTXO belongs to fidelity bonds, and then returns corresponding UTXOSpendInfo
     fn check_if_fidelity(&self, utxo: &ListUnspentResultEntry) -> Option<UTXOSpendInfo> {
         self.store.fidelity_bond.iter().find_map(|bond| {
@@ -2549,7 +2559,7 @@ impl Wallet {
 
     /// Finds unfinished swapcoins.
     /// Incoming swapcoins remain unfinished until they are swept and removed.
-    /// Outgoing unfinished: `hash_preimage` is None.
+    /// Outgoing swapcoins remain unfinished until their cleanup is saved.
     pub(crate) fn find_unfinished_swapcoins(
         &self,
     ) -> (
@@ -2558,13 +2568,8 @@ impl Wallet {
     ) {
         let unfinished_incomings: Vec<_> =
             self.store.incoming_swapcoins.values().cloned().collect();
-        let unfinished_outgoings: Vec<_> = self
-            .store
-            .outgoing_swapcoins
-            .values()
-            .filter(|oc| oc.hash_preimage.is_none())
-            .cloned()
-            .collect();
+        let unfinished_outgoings: Vec<_> =
+            self.store.outgoing_swapcoins.values().cloned().collect();
         if !unfinished_incomings.is_empty() || !unfinished_outgoings.is_empty() {
             log::info!(
                 "Unfinished swaps - Incoming: {}, Outgoing: {}",
@@ -3605,7 +3610,38 @@ impl Wallet {
     ) -> Result<RecoveryOutcome, WalletError> {
         let (sweeps, _) =
             Self::broadcast_incoming_sweeps(wallet, chain, shutdown, contract_txids, &mut false)?;
-        Ok(Self::finish_recoveries(wallet, chain, shutdown, sweeps, Vec::new(), Vec::new())?.0)
+        Ok(Self::finish_recoveries(
+            wallet,
+            chain,
+            shutdown,
+            sweeps,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )?
+        .0)
+    }
+
+    /// Recovery sweeps record their report with the coin removal.
+    pub(crate) fn sweep_incoming_swapcoins_for_role(
+        wallet: &std::sync::RwLock<Wallet>,
+        chain: &AnyBlockchain,
+        shutdown: &std::sync::atomic::AtomicBool,
+        contract_txids: Option<&HashSet<Txid>>,
+        role: SwapRole,
+    ) -> Result<RecoveryOutcome, WalletError> {
+        let (sweeps, _) =
+            Self::broadcast_incoming_sweeps(wallet, chain, shutdown, contract_txids, &mut false)?;
+        Ok(Self::finish_recoveries(
+            wallet,
+            chain,
+            shutdown,
+            sweeps,
+            Vec::new(),
+            Vec::new(),
+            Some(role),
+        )?
+        .0)
     }
 
     /// Broadcasts every ready incoming sweep without waiting on any of them, and
@@ -5767,13 +5803,14 @@ mod timelock_reconcile_tests {
     use super::*;
     use crate::{
         protocol::contract::{create_contract_redeemscript, Hash160},
-        wallet::{blockchain::Electrum, swapcoin::OutgoingSwapCoin},
+        wallet::{blockchain::Electrum, swapcoin::OutgoingSwapCoin, test_wallet},
     };
     use bitcoin::{
         consensus::encode::serialize_hex, hashes::Hash, locktime::absolute::LockTime, BlockHash,
         TxIn,
     };
     use bitcoind::tempfile::tempdir;
+    use serde_cbor::{value::to_value as to_cbor_value, Value as CborValue};
     use std::{
         io::{BufRead, BufReader, Write as IoWrite},
         net::TcpListener,
@@ -5831,7 +5868,7 @@ mod timelock_reconcile_tests {
             50_000,
             redeemscript.to_p2wsh(),
         );
-        let coin = OutgoingSwapCoin::new_legacy(
+        let mut coin = OutgoingSwapCoin::new_legacy(
             key(1),
             pubkey(4),
             contract_tx,
@@ -5840,6 +5877,7 @@ mod timelock_reconcile_tests {
             Amount::from_sat(50_000),
             1,
         );
+        coin.committed = true;
         let recovery_spk = ScriptBuf::new_p2wpkh(&pubkey(5).wpubkey_hash().unwrap());
         let recovery_at = |value| {
             let unsigned = tx(
@@ -6048,6 +6086,118 @@ mod timelock_reconcile_tests {
     }
 
     #[test]
+    fn compat_coin_flags_default_to_safe_values_and_preserve_fresh_values() {
+        let (reference, _) = legacy_coin_and_recovery();
+        let legacy = OutgoingSwapCoin::new_legacy(
+            key(1),
+            pubkey(4),
+            reference.contract_tx.clone(),
+            reference.contract_redeemscript.clone().unwrap(),
+            key(3),
+            Amount::from_sat(50_000),
+            1,
+        );
+        let taproot = OutgoingSwapCoin::new_taproot(
+            key(3),
+            ScriptBuf::new(),
+            ScriptBuf::new(),
+            reference.contract_tx,
+            Amount::from_sat(50_000),
+            1,
+        );
+        for coin in [legacy, taproot] {
+            assert!(!coin.committed && !coin.incoming_claimed);
+            let current: OutgoingSwapCoin =
+                serde_cbor::from_slice(&serde_cbor::to_vec(&coin).unwrap()).unwrap();
+            assert_eq!(current, coin);
+            for omitted in [
+                vec!["committed"],
+                vec!["incoming_claimed"],
+                vec!["committed", "incoming_claimed"],
+            ] {
+                let mut old = to_cbor_value(&coin).unwrap();
+                let CborValue::Map(fields) = &mut old else {
+                    panic!("coin must serialize as a map")
+                };
+                for field in &omitted {
+                    fields.remove(&CborValue::Text((*field).into()));
+                }
+                let decoded: OutgoingSwapCoin =
+                    serde_cbor::from_slice(&serde_cbor::to_vec(&old).unwrap()).unwrap();
+                assert_eq!(decoded.committed, omitted.contains(&"committed"));
+                assert_eq!(
+                    decoded.incoming_claimed,
+                    omitted.contains(&"incoming_claimed")
+                );
+                assert_eq!(decoded.contract_tx, coin.contract_tx);
+            }
+        }
+    }
+
+    #[test]
+    fn compat_coin_flags_stay_monotonic_after_stale_reinsert_and_reload() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("wallet.cbor");
+        let mut wallet = test_wallet(&path);
+        let (mut original, _) = legacy_coin_and_recovery();
+        original.swap_id = Some("swap".into());
+        original.committed = false;
+        original.incoming_claimed = false;
+        wallet.add_outgoing_swapcoin(&original);
+        for ((committed, incoming_claimed), expected) in [
+            ((true, false), (true, false)),
+            ((false, true), (true, true)),
+            ((false, false), (true, true)),
+        ] {
+            let mut update = original.clone();
+            update.committed = committed;
+            update.incoming_claimed = incoming_claimed;
+            wallet.add_outgoing_swapcoin(&update);
+            wallet.save_to_disk().unwrap();
+            let (store, material) =
+                WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+            let coin = &store.outgoing_swapcoins[&original.contract_tx.compute_txid().to_string()];
+            assert_eq!((coin.committed, coin.incoming_claimed), expected);
+            wallet.store = store;
+            wallet.store_enc_material = material;
+        }
+        let saved =
+            &wallet.store.outgoing_swapcoins[&original.contract_tx.compute_txid().to_string()];
+        assert!(saved.committed && saved.incoming_claimed);
+    }
+
+    #[test]
+    fn cleanup_save_failure_preserves_coins_and_monotonic_flags() {
+        let (mut coin, recovery) = legacy_coin_and_recovery();
+        coin.swap_id = Some("swap".into());
+        let mut stale = coin.clone();
+        stale.committed = false;
+        coin.incoming_claimed = true;
+        coin.hash_preimage = Some([7; 32]);
+        let url = start_electrum_stub(coin.contract_tx.clone(), recovery);
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("wallet.cbor");
+        let mut wallet = stub_wallet(&path, electrum(&url));
+        wallet.add_outgoing_swapcoin(&coin);
+        wallet.add_outgoing_swapcoin(&stale);
+        let (_, outgoing) = wallet.find_unfinished_swapcoins();
+        assert_eq!(outgoing.len(), 1);
+        assert!(outgoing[0].committed && outgoing[0].incoming_claimed);
+        wallet.save_to_disk().unwrap();
+
+        // A directory at the destination forces the atomic replacement to fail.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(wallet
+            .remove_swap_coins_and_save("swap", true, true)
+            .is_err());
+        assert!(wallet.swap_funding_committed("swap"));
+        let (_, outgoing) = wallet.find_unfinished_swapcoins();
+        assert_eq!(outgoing.len(), 1);
+        assert!(outgoing[0].incoming_claimed);
+    }
+
+    #[test]
     fn electrum_records_our_confirmed_recovery_as_resolved() {
         let (coin, recovery) = legacy_coin_and_recovery();
         let url = start_electrum_stub(coin.contract_tx.clone(), recovery.clone());
@@ -6066,8 +6216,7 @@ mod timelock_reconcile_tests {
         let (coin, recovery, replaced) = legacy_coin_and_recoveries();
         let url =
             start_electrum_stub_with(coin.contract_tx.clone(), recovery.clone(), Some(replaced));
-        let state =
-            Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true).unwrap();
+        let state = Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin).unwrap();
         assert_eq!(
             state,
             ContractChainState::RecoveredByTimelock(recovery.compute_txid())
@@ -6085,8 +6234,7 @@ mod timelock_reconcile_tests {
             ScriptBuf::new_p2wpkh(&pubkey(6).wpubkey_hash().unwrap()),
         );
         let url = start_electrum_stub(coin.contract_tx.clone(), claim);
-        let state =
-            Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true).unwrap();
+        let state = Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin).unwrap();
         assert_eq!(state, ContractChainState::NotYet);
     }
 
@@ -6126,6 +6274,7 @@ mod timelock_reconcile_tests {
             Amount::from_sat(50_000),
             1,
         );
+        coin.committed = true;
         coin.internal_key = Some(xonly(5));
         coin.tap_tweak = Some(Scalar::ZERO);
         let unsigned = tx(
@@ -6141,8 +6290,7 @@ mod timelock_reconcile_tests {
     fn electrum_classifies_our_confirmed_taproot_recovery_as_recovered() {
         let (coin, recovery) = taproot_coin_and_recovery();
         let url = start_electrum_stub(coin.contract_tx.clone(), recovery.clone());
-        let state =
-            Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true).unwrap();
+        let state = Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin).unwrap();
         assert_eq!(
             state,
             ContractChainState::RecoveredByTimelock(recovery.compute_txid())
@@ -6343,7 +6491,7 @@ mod timelock_reconcile_tests {
     fn core_classifies_our_confirmed_recovery_as_recovered() {
         let (coin, recovery) = legacy_coin_and_recovery();
         let url = start_core_stub(coin.contract_tx.clone(), recovery.clone());
-        let state = Wallet::ensure_contract_on_chain(&core(url), "swap", &coin, &|_| true).unwrap();
+        let state = Wallet::ensure_contract_on_chain(&core(url), "swap", &coin).unwrap();
         assert_eq!(
             state,
             ContractChainState::RecoveredByTimelock(recovery.compute_txid())
@@ -6356,7 +6504,7 @@ mod timelock_reconcile_tests {
     fn core_classifies_our_unconfirmed_recovery_as_pending() {
         let (coin, recovery) = legacy_coin_and_recovery();
         let url = start_core_stub_with(coin.contract_tx.clone(), recovery.clone(), false);
-        let state = Wallet::ensure_contract_on_chain(&core(url), "swap", &coin, &|_| true).unwrap();
+        let state = Wallet::ensure_contract_on_chain(&core(url), "swap", &coin).unwrap();
         assert_eq!(state, ContractChainState::RecoveryPending(recovery));
     }
 
@@ -6371,7 +6519,7 @@ mod timelock_reconcile_tests {
             ScriptBuf::new_p2wpkh(&pubkey(6).wpubkey_hash().unwrap()),
         );
         let url = start_core_stub_with(coin.contract_tx.clone(), claim, false);
-        let state = Wallet::ensure_contract_on_chain(&core(url), "swap", &coin, &|_| true).unwrap();
+        let state = Wallet::ensure_contract_on_chain(&core(url), "swap", &coin).unwrap();
         assert_eq!(state, ContractChainState::NotYet);
     }
 
@@ -6430,6 +6578,7 @@ mod mempool_deferral_tests {
     struct StubChain {
         txs: HashMap<Txid, (Transaction, i64)>,
         broadcast: Vec<Txid>,
+        reject_broadcast: bool,
         /// Every fee estimate, in sat/vB.
         feerate: f64,
     }
@@ -6442,6 +6591,7 @@ mod mempool_deferral_tests {
                     .map(|(tx, height)| (tx.compute_txid(), ((*tx).clone(), *height)))
                     .collect(),
                 broadcast: Vec::new(),
+                reject_broadcast: false,
                 feerate: 1.0,
             }))
         }
@@ -6541,6 +6691,11 @@ mod mempool_deferral_tests {
                                 }
                             }
                             "blockchain.transaction.broadcast" => {
+                                if chain.reject_broadcast {
+                                    return json!({"jsonrpc": "2.0", "id": req["id"], "error": {
+                                        "code": -26, "message": "transaction temporarily rejected",
+                                    }});
+                                }
                                 let tx: Transaction = deserialize_hex(param).unwrap();
                                 let txid = tx.compute_txid();
                                 chain.txs.insert(txid, (tx, TIP));
@@ -6614,6 +6769,7 @@ mod mempool_deferral_tests {
             1,
         );
         coin.swap_id = Some(SWAP.to_string());
+        coin.committed = true;
         coin
     }
 
@@ -6709,6 +6865,209 @@ mod mempool_deferral_tests {
             .iter()
             .map(|txid| chain.txs[txid].0.clone())
             .collect()
+    }
+
+    #[test]
+    fn compat_committed_taproot_survives_absence_until_confirmation() {
+        let parent = tx(
+            OutPoint::null(),
+            100_000,
+            ScriptBuf::new_p2wpkh(&pubkey(9).wpubkey_hash().unwrap()),
+        );
+        let contract = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            50_000,
+            ScriptBuf::new_p2tr(
+                crate::utill::global_secp(),
+                pubkey(7).inner.x_only_public_key().0,
+                None,
+            ),
+        );
+        let mut coin = OutgoingSwapCoin::new_taproot(
+            key(6),
+            ScriptBuf::new(),
+            ScriptBuf::new(),
+            contract.clone(),
+            Amount::from_sat(50_000),
+            1,
+        );
+        coin.committed = true;
+        let chain = StubChain::with(&[(&parent, 50)]);
+        chain.lock().unwrap().reject_broadcast = true;
+        let url = start_electrum_stub(chain.clone());
+        let backend = electrum(&url);
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::NotYet
+        );
+        assert!(chain.lock().unwrap().broadcast.is_empty());
+        chain.lock().unwrap().reject_broadcast = false;
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::OnChain
+        );
+        {
+            let chain = chain.lock().unwrap();
+            let txid = contract.compute_txid();
+            assert_eq!(chain.broadcast, vec![txid]);
+            assert_eq!(chain.txs[&txid].0, contract);
+        }
+        coin.committed = false;
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::Discarded
+        );
+    }
+
+    #[test]
+    fn committed_legacy_resends_unknown_funding_before_its_contract() {
+        let parent = tx(OutPoint::null(), 100_000, ScriptBuf::new());
+        let funding = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            50_000,
+            ScriptBuf::new(),
+        );
+        let mut coin = outgoing_coin();
+        coin.contract_tx.input[0].previous_output = OutPoint::new(funding.compute_txid(), 0);
+        coin.funding_tx = Some(funding.clone());
+        let chain = StubChain::with(&[(&parent, 50)]);
+        let url = start_electrum_stub(chain.clone());
+        let backend = electrum(&url);
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::NotYet
+        );
+        assert!(chain.lock().unwrap().broadcast.is_empty());
+
+        let digest = secp256k1::Message::from_digest([1; 32]);
+        coin.others_contract_sig = Some(bitcoin::ecdsa::Signature::sighash_all(
+            crate::utill::global_secp().sign_ecdsa(&digest, &key(3)),
+        ));
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::OnChain
+        );
+        assert_eq!(
+            chain.lock().unwrap().broadcast,
+            vec![funding.compute_txid(), coin.contract_tx.compute_txid()]
+        );
+    }
+
+    #[test]
+    fn compat_incoming_claim_report_and_removal_save_together() {
+        for role in [SwapRole::Maker, SwapRole::Taker] {
+            let incoming = incoming_coin();
+            let outgoing = outgoing_coin();
+            let chain = StubChain::with(&[
+                (&incoming.contract_tx, 50),
+                (&outgoing.contract_tx, OUTGOING_HEIGHT),
+            ]);
+            let url = start_electrum_stub(chain.clone());
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("wallet.cbor");
+            let wallet = wallet_with(&path, &url, &incoming, Some(&outgoing));
+            let mut other = outgoing.clone();
+            other.swap_id = Some("other".into());
+            other.contract_tx.output[0].value = Amount::from_sat(49_999);
+            wallet.write().unwrap().add_outgoing_swapcoin(&other);
+            let swept = Wallet::sweep_incoming_swapcoins_for_role(
+                &wallet,
+                &electrum(&url),
+                &shutdown_after(60),
+                None,
+                role,
+            )
+            .unwrap();
+            assert_eq!(swept.resolved.len(), 1);
+            let (saved, _) =
+                WalletStore::read_from_disk(&path, Some("test-password".into())).unwrap();
+            assert!(saved.incoming_swapcoins.is_empty());
+            assert!(
+                saved.outgoing_swapcoins[&outgoing.contract_tx.compute_txid().to_string()]
+                    .incoming_claimed
+            );
+            assert!(
+                !saved.outgoing_swapcoins[&other.contract_tx.compute_txid().to_string()]
+                    .incoming_claimed
+            );
+            let mut snapshot = wallet.write().unwrap();
+            snapshot.store = saved;
+            let reports = snapshot.swap_reports();
+            assert_eq!(reports.recovery.len(), 1);
+            let report = &reports.recovery[0];
+            assert_eq!(report.swap_id, SWAP);
+            assert_eq!(report.role, role);
+            assert_eq!(report.recovery_type, "hashlock");
+            assert_eq!(report.recovery_txids, vec![swept.resolved[0].1.to_string()]);
+        }
+    }
+
+    #[test]
+    fn compat_failed_recovery_save_rolls_back_then_retries() {
+        let incoming = incoming_coin();
+        let outgoing = outgoing_coin();
+        let chain = StubChain::with(&[(&incoming.contract_tx, 50)]);
+        let url = start_electrum_stub(chain);
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("wallet.cbor");
+        let wallet = wallet_with(&path, &url, &incoming, Some(&outgoing));
+        let backend = electrum(&url);
+        let shutdown = shutdown_after(60);
+        let (sweeps, _) =
+            Wallet::broadcast_incoming_sweeps(&wallet, &backend, &shutdown, None, &mut false)
+                .unwrap();
+        assert_eq!(sweeps.len(), 1);
+        let before = {
+            let wallet = wallet.read().unwrap();
+            (
+                wallet.store.incoming_swapcoins.clone(),
+                wallet.store.outgoing_swapcoins.clone(),
+                wallet.store.reports.clone(),
+            )
+        };
+        let original_bytes = std::fs::read(&path).unwrap();
+        let saved_path = path.with_extension("saved");
+        std::fs::rename(&path, &saved_path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(Wallet::finish_recoveries(
+            &wallet,
+            &backend,
+            &shutdown,
+            sweeps.clone(),
+            Vec::new(),
+            Vec::new(),
+            Some(SwapRole::Taker)
+        )
+        .is_err());
+        {
+            let wallet = wallet.read().unwrap();
+            assert_eq!(wallet.store.incoming_swapcoins, before.0);
+            assert_eq!(wallet.store.outgoing_swapcoins, before.1);
+            assert_eq!(wallet.store.reports, before.2);
+        }
+        assert_eq!(std::fs::read(&saved_path).unwrap(), original_bytes);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved_path, &path).unwrap();
+        let recovered = Wallet::finish_recoveries(
+            &wallet,
+            &backend,
+            &shutdown,
+            sweeps,
+            Vec::new(),
+            Vec::new(),
+            Some(SwapRole::Taker),
+        )
+        .unwrap();
+        assert_eq!(recovered.0.resolved.len(), 1);
+        let (saved, _) = WalletStore::read_from_disk(&path, Some("test-password".into())).unwrap();
+        assert!(saved.incoming_swapcoins.is_empty());
+        assert!(saved
+            .outgoing_swapcoins
+            .values()
+            .all(|coin| coin.incoming_claimed));
+        let mut wallet = wallet.write().unwrap();
+        wallet.store = saved;
+        assert_eq!(wallet.swap_reports().recovery.len(), 1);
     }
 
     /// The taker side: its incoming contract is still in the mempool when its
@@ -6834,7 +7193,6 @@ mod mempool_deferral_tests {
                 &electrum(&url),
                 &shutdown_after(60),
                 None,
-                &|_| true,
                 &|swap_id| claimed && swap_id == SWAP,
                 &|_| false,
                 &mut false,
@@ -6890,8 +7248,7 @@ mod mempool_deferral_tests {
             let pending = pending_recovery(&coin);
             let chain = StubChain::with(&[(&coin.contract_tx, OUTGOING_HEIGHT), (&pending, 0)]);
             let url = start_electrum_stub(chain);
-            let state = Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true)
-                .unwrap();
+            let state = Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin).unwrap();
             assert_eq!(state, ContractChainState::RecoveryPending(pending));
         }
     }
@@ -6909,8 +7266,7 @@ mod mempool_deferral_tests {
         ]);
         let chain = StubChain::with(&[(&coin.contract_tx, OUTGOING_HEIGHT), (&claim, 0)]);
         let url = start_electrum_stub(chain);
-        let state =
-            Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true).unwrap();
+        let state = Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin).unwrap();
         assert_eq!(state, ContractChainState::NotYet);
     }
 
@@ -7022,7 +7378,7 @@ mod recovery_address_tests {
 
 #[cfg(test)]
 mod legacy_recovery_tests {
-    use super::*;
+    use super::{timelock_reconcile_tests::tx, *};
     use crate::wallet::{
         blockchain::{CoreRPC, CoreRpcConfig, Electrum},
         swapcoin::OutgoingSwapCoin,
@@ -7215,6 +7571,58 @@ mod legacy_recovery_tests {
                         let params = &req["params"];
 
                         let (status_code, resp_body) = match method {
+                            "gettxspendingprevout" => {
+                                let requested = &params[0][0];
+                                let spending = txs
+                                    .iter()
+                                    .find(|(tx, height, _)| {
+                                        height.is_none()
+                                            && tx.input.iter().any(|input| {
+                                                input.previous_output.txid.to_string()
+                                                    == requested["txid"]
+                                                        .as_str()
+                                                        .unwrap_or_default()
+                                                    && u64::from(input.previous_output.vout)
+                                                        == requested["vout"].as_u64().unwrap_or(0)
+                                            })
+                                    })
+                                    .map(|(tx, _, _)| tx.compute_txid());
+                                (
+                                    200,
+                                    json!({"id": id, "result": [{"txid": requested["txid"], "vout": requested["vout"], "spendingtxid": spending}], "error": null}),
+                                )
+                            }
+                            "getblockcount" => {
+                                let height = txs
+                                    .iter()
+                                    .filter_map(|(_, height, _)| *height)
+                                    .max()
+                                    .unwrap_or(0);
+                                (200, json!({"id": id, "result": height, "error": null}))
+                            }
+                            "getblockhash" => (
+                                200,
+                                json!({"id": id, "result": format!("{:064x}", params[0].as_u64().unwrap()), "error": null}),
+                            ),
+                            "getblock" => {
+                                let height =
+                                    u64::from_str_radix(params[0].as_str().unwrap(), 16).unwrap();
+                                let block = bitcoin::Block {
+                                    header: bitcoin::constants::genesis_block(
+                                        bitcoin::Network::Regtest,
+                                    )
+                                    .header,
+                                    txdata: txs
+                                        .iter()
+                                        .filter(|(_, h, _)| *h == Some(height))
+                                        .map(|(tx, _, _)| tx.clone())
+                                        .collect(),
+                                };
+                                (
+                                    200,
+                                    json!({"id": id, "result": serialize_hex(&block), "error": null}),
+                                )
+                            }
                             "getrawtransaction" => {
                                 let txid_req = params[0].as_str().unwrap_or_default();
                                 let verbose = params
@@ -7596,9 +8004,77 @@ mod legacy_recovery_tests {
             Amount::from_sat(50_000),
             1,
         );
+        sc.committed = true;
         sc.funding_tx = funding_tx;
         sc.others_contract_sig = None;
         sc
+    }
+
+    #[test]
+    fn compat_funding_inputs_distinguish_confirmed_conflicts_from_own_funding() {
+        let parent = tx(OutPoint::null(), 100_000, ScriptBuf::from_bytes(vec![0x51]));
+        let funding = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            50_000,
+            ScriptBuf::from_bytes(vec![0x52]),
+        );
+        let conflict = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            49_000,
+            ScriptBuf::from_bytes(vec![0x53]),
+        );
+        let mut coin = make_legacy_outgoing_swapcoin(Some(funding.clone()));
+        coin.contract_tx.input[0].previous_output = OutPoint::new(funding.compute_txid(), 0);
+        for (spender, height, expected) in [
+            (&funding, Some(11), ContractChainState::NotYet),
+            (&funding, None, ContractChainState::NotYet),
+            (&conflict, None, ContractChainState::NotYet),
+            (&conflict, Some(11), ContractChainState::Discarded),
+        ] {
+            for_both_backends(
+                vec![
+                    (parent.clone(), Some(10), false),
+                    (spender.clone(), height, true),
+                ],
+                |chain| {
+                    assert_eq!(
+                        Wallet::ensure_contract_on_chain(&chain, "committed", &coin).unwrap(),
+                        expected
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn compat_legacy_contract_funding_output_requires_a_confirmed_conflict() {
+        let funding = tx(OutPoint::null(), 100_000, ScriptBuf::from_bytes(vec![0x51]));
+        let conflict = tx(
+            OutPoint::new(funding.compute_txid(), 0),
+            49_000,
+            ScriptBuf::from_bytes(vec![0x53]),
+        );
+        for stored_funding in [None, Some(funding.clone())] {
+            let mut coin = make_legacy_outgoing_swapcoin(stored_funding);
+            coin.contract_tx.input[0].previous_output = OutPoint::new(funding.compute_txid(), 0);
+            for (height, expected) in [
+                (None, ContractChainState::NotYet),
+                (Some(11), ContractChainState::Discarded),
+            ] {
+                for_both_backends(
+                    vec![
+                        (funding.clone(), Some(10), false),
+                        (conflict.clone(), height, true),
+                    ],
+                    |chain| {
+                        assert_eq!(
+                            Wallet::ensure_contract_on_chain(&chain, "committed", &coin).unwrap(),
+                            expected
+                        );
+                    },
+                );
+            }
+        }
     }
 
     #[test]
@@ -7648,9 +8124,7 @@ mod legacy_recovery_tests {
         for_both_backends(
             vec![(parent_tx, Some(10), false), (spending_tx, Some(11), true)],
             |blockchain| {
-                let res =
-                    Wallet::ensure_contract_on_chain(&blockchain, "swap-spent", &sc, &|_| false)
-                        .unwrap();
+                let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-spent", &sc).unwrap();
                 assert_eq!(res, ContractChainState::Discarded);
             },
         );
@@ -7717,27 +8191,23 @@ mod legacy_recovery_tests {
             Amount::from_sat(50_000),
             1,
         );
+        sc.committed = true;
         sc.funding_tx = None;
         sc.others_contract_sig = None;
 
         for_both_backends(
             vec![(parent_tx, Some(10), false), (spending_tx, Some(11), true)],
             |blockchain| {
-                let res = Wallet::ensure_contract_on_chain(
-                    &blockchain,
-                    "swap-no-funding-spent",
-                    &sc,
-                    &|_| false,
-                )
-                .unwrap();
+                let res =
+                    Wallet::ensure_contract_on_chain(&blockchain, "swap-no-funding-spent", &sc)
+                        .unwrap();
                 assert_eq!(res, ContractChainState::Discarded);
             },
         );
     }
 
     #[test]
-    fn test_ensure_contract_unsigned_legacy_with_unspent_wallet_inputs_and_unshared_funding_is_discarded(
-    ) {
+    fn test_ensure_contract_uncommitted_legacy_is_discarded() {
         let parent_tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
@@ -7764,11 +8234,10 @@ mod legacy_recovery_tests {
             }],
         };
 
-        let sc = make_legacy_outgoing_swapcoin(Some(funding_tx));
+        let mut sc = make_legacy_outgoing_swapcoin(Some(funding_tx));
+        sc.committed = false;
         for_both_backends(vec![(parent_tx, Some(10), true)], |blockchain| {
-            let res =
-                Wallet::ensure_contract_on_chain(&blockchain, "swap-unspent", &sc, &|_| false)
-                    .unwrap();
+            let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-unspent", &sc).unwrap();
             assert_eq!(res, ContractChainState::Discarded);
         });
     }
@@ -7805,10 +8274,7 @@ mod legacy_recovery_tests {
         let sc = make_legacy_outgoing_swapcoin(Some(funding_tx));
         for_both_backends(vec![(parent_tx, Some(10), true)], |blockchain| {
             let res =
-                Wallet::ensure_contract_on_chain(&blockchain, "swap-unspent-shared", &sc, &|_| {
-                    true
-                })
-                .unwrap();
+                Wallet::ensure_contract_on_chain(&blockchain, "swap-unspent-shared", &sc).unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
     }
@@ -7855,8 +8321,7 @@ mod legacy_recovery_tests {
         sc.other_pubkey = None;
         for_both_backends(vec![(parent_tx, Some(10), true)], |blockchain| {
             let res =
-                Wallet::ensure_contract_on_chain(&blockchain, "swap-maker-signed", &sc, &|_| false)
-                    .unwrap();
+                Wallet::ensure_contract_on_chain(&blockchain, "swap-maker-signed", &sc).unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
     }
@@ -7865,9 +8330,7 @@ mod legacy_recovery_tests {
     fn test_ensure_contract_unsigned_legacy_with_no_funding_tx_and_no_onchain_input_is_not_yet() {
         let sc = make_legacy_outgoing_swapcoin(None);
         for_both_backends(vec![], |blockchain| {
-            let res =
-                Wallet::ensure_contract_on_chain(&blockchain, "swap-no-input", &sc, &|_| false)
-                    .unwrap();
+            let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-no-input", &sc).unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
     }
@@ -7904,13 +8367,9 @@ mod legacy_recovery_tests {
         for_both_backends(
             vec![(parent_tx, Some(10), true), (funding_tx, None, true)],
             |blockchain| {
-                let res = Wallet::ensure_contract_on_chain(
-                    &blockchain,
-                    "swap-mempool-funding",
-                    &sc,
-                    &|_| false,
-                )
-                .unwrap();
+                let res =
+                    Wallet::ensure_contract_on_chain(&blockchain, "swap-mempool-funding", &sc)
+                        .unwrap();
                 assert_eq!(res, ContractChainState::NotYet);
             },
         );
@@ -7961,15 +8420,13 @@ mod legacy_recovery_tests {
             Amount::from_sat(50_000),
             1,
         );
+        sc.committed = true;
         sc.funding_tx = None;
         sc.others_contract_sig = None;
 
         for_both_backends(vec![(parent_tx, None, true)], |blockchain| {
             let res =
-                Wallet::ensure_contract_on_chain(&blockchain, "swap-mempool-parent", &sc, &|_| {
-                    false
-                })
-                .unwrap();
+                Wallet::ensure_contract_on_chain(&blockchain, "swap-mempool-parent", &sc).unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
     }
@@ -8025,10 +8482,7 @@ mod legacy_recovery_tests {
             ],
             vec![(mismatched_txid, parent_tx)],
             |blockchain| {
-                let res =
-                    Wallet::ensure_contract_on_chain(&blockchain, "swap-mismatched", &sc, &|_| {
-                        false
-                    });
+                let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-mismatched", &sc);
                 // Electrum validates the returned txid and rejects the
                 // mismatch; that failure must reach the caller, not read as
                 // "nothing to check, keep waiting". Core's stub has no such
@@ -8106,6 +8560,7 @@ mod legacy_recovery_tests {
             Amount::from_sat(50_000),
             1,
         );
+        sc.committed = true;
         sc.funding_tx = None;
         sc.others_contract_sig = None;
 
@@ -8120,7 +8575,6 @@ mod legacy_recovery_tests {
                     &blockchain,
                     "swap-no-funding-mismatched",
                     &sc,
-                    &|_| false,
                 );
                 // Same split as the funded-mismatch case: Electrum's
                 // txid-validating fetch rejects the wrong transaction and

@@ -26,7 +26,6 @@ use crate::{
 use super::{
     api::{fund_all_or_nothing, spent_inputs, Hop0Plan, Taker},
     error::{breach_or_wallet_error, TakerError},
-    swap_tracker::SwapPhase,
 };
 
 #[cfg(feature = "integration-test")]
@@ -208,8 +207,7 @@ impl Taker {
     pub(crate) fn exchange_taproot(&mut self) -> Result<(), TakerError> {
         // Makers verify that contract txs are on-chain before creating their
         // own outgoing, so we must broadcast first.
-        self.swap_state_mut()?.phase = SwapPhase::FundsBroadcast;
-        self.persist_swap(SwapPhase::FundsBroadcast)?;
+        self.commit_outgoing_swapcoins()?;
         self.funding_broadcast()?;
 
         // Phase 2: Exchange contract data with makers.
@@ -228,10 +226,6 @@ impl Taker {
             // during confirmation can expire under the maker's admission deadline.
             // The separate route heartbeat keeps swap activity alive while waiting.
             let mut stream = self.net_connect(&maker_address)?;
-            self.net_handshake(&mut stream)?;
-            self.swap_state_mut()?.makers[i]
-                .taproot_exchange_mut()?
-                .connected = true;
 
             let (
                 pubkeys,
@@ -384,9 +378,6 @@ impl Taker {
                 &mut stream,
                 &TakerToMakerMessage::TaprootContractData(Box::new(contract_data.clone())),
             )?;
-            self.swap_state_mut()?.makers[i]
-                .taproot_exchange_mut()?
-                .contract_data_sent = true;
 
             #[cfg(feature = "integration-test")]
             if self.races_funding_step(&maker_address)? {
@@ -532,10 +523,6 @@ impl Taker {
                         }
                     }
 
-                    self.swap_state_mut()?.makers[i]
-                        .taproot_exchange_mut()?
-                        .maker_contract_received = true;
-
                     let is_last_maker = i == num_makers - 1;
                     if is_last_maker {
                         // Only the last maker's contract is addressed to the taker.
@@ -599,13 +586,6 @@ impl Taker {
                     .inspect_err(|e| self.note_withheld_funding(i, e))?;
 
                     received_contracts.push(*maker_contract);
-                    self.swap_state_mut()?.makers[i]
-                        .taproot_exchange_mut()?
-                        .swapcoins_created = true;
-                    self.swap_state_mut()?.makers[i]
-                        .taproot_exchange_mut()?
-                        .maker_funding_confirmed = true;
-                    self.persist_progress()?;
                     #[cfg(debug_assertions)]
                     log::debug!(
                         "[TAPROOT_HOP] Source: taker::taproot_swap::exchange_taproot | SwapID: {} | MakerIndex: {} | ContractTxs: {} | RequiredConfirms: {} | IncomingTotal: {} | WatchOnlyTotal: {}",
@@ -626,9 +606,6 @@ impl Taker {
             }
         }
 
-        // SP6-T: All makers responded, incoming/watchonly swapcoins created.
-        self.persist_swap(super::swap_tracker::SwapPhase::ContractsExchanged)?;
-
         Ok(())
     }
 
@@ -643,7 +620,6 @@ impl Taker {
         contract_data: &TaprootContractData,
     ) -> Result<Vec<u8>, TakerError> {
         let mut stream = self.net_connect(maker_address)?;
-        self.net_handshake(&mut stream)?;
         send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
         read_message(&mut stream)?;
         let details = self.current_swap_details(maker_idx)?;
@@ -800,8 +776,8 @@ impl Taker {
                 log::warn!("Test behavior: withholding the contract tx broadcast");
                 continue;
             }
-            // A failed send keeps the claim: the tx may still land. Recovery
-            // releases it once it judges the tx absent from the backend.
+            // A failed send keeps the claim: the tx may still land.
+            // Recovery resends it and refunds it.
             let txid = wallet.send_tx(&swapcoin.contract_tx).map_err(|e| {
                 TakerError::General(format!("Failed to broadcast contract tx: {:?}", e))
             })?;

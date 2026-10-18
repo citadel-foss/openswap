@@ -159,9 +159,6 @@ fn run_contract_breach<B: TestBackend>(
     world.verify_maker_pre_swap_balances();
     log::info!("Starting contract breach test...");
 
-    // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
-
     // Swap params for openswap (Legacy)
     let swap_params = SwapParams::new(
         ProtocolVersion::Legacy,
@@ -195,7 +192,6 @@ fn run_contract_breach<B: TestBackend>(
             Duration::from_secs(30),
         );
     }
-    world.taker().log_tracker_state();
 
     let log_path = world.taker_log_path();
     // A dead maker stays offline: it must never learn the preimage.
@@ -319,12 +315,9 @@ fn run_contract_breach<B: TestBackend>(
         },
     });
 
-    world.taker().log_tracker_state();
     info!("Malice2 test completed successfully!");
 
     world.shutdown_makers();
-
-    tracker_logger.stop();
 }
 
 /// Test: Taker maliciously broadcasts contract txs after full setup.
@@ -366,7 +359,6 @@ fn taker_broadcasts_contract_after_full_setup(world: &mut World) {
         "Swap should fail due to BroadcastContractAfterFullSetup behavior"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    world.taker().log_tracker_state();
 
     // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
@@ -402,7 +394,6 @@ fn taker_broadcasts_contract_after_full_setup(world: &mut World) {
         taker: { regular: 14500000, swap: 0, contract: 0, fidelity: 0, loss: 500000 },
     });
 
-    world.taker().log_tracker_state();
     info!("Malice1 test completed successfully!");
 }
 
@@ -427,9 +418,6 @@ fn taker_broadcasts_contract_after_full_setup(world: &mut World) {
 fn taproot_maker_broadcasts_contract(world: &mut World) {
     let before = world.balances();
 
-    // Start periodic swap tracker logging (every 10s)
-    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
-
     // Swap params for openswap (Taproot)
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(1)
@@ -448,7 +436,6 @@ fn taproot_maker_broadcasts_contract(world: &mut World) {
         "Swap should fail due to maker BroadcastContractAfterSetup behavior"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    world.taker().log_tracker_state();
 
     // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
@@ -489,10 +476,7 @@ fn taproot_maker_broadcasts_contract(world: &mut World) {
     // signal cannot attribute the breach to a maker.
     // assert_only_makers_banned(taker, &makers, &[1]);
 
-    world.taker().log_tracker_state();
     info!("Taproot maker malice test completed successfully!");
-
-    tracker_logger.stop();
 }
 
 /// Breach before maker 0 funds: maker 0 must not broadcast its funding txs.

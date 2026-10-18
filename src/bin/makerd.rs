@@ -2,7 +2,7 @@ use bitcoind::bitcoincore_rpc::Auth;
 use clap::{Parser, Subcommand};
 use openswap::{
     maker::{bind_port_retry, start_server, MakerError, MakerServer, MakerServerConfig},
-    utill::{parse_proxy_auth, setup_maker_logger},
+    utill::{parse_proxy_auth, set_config_key, setup_maker_logger},
     wallet::{
         seed_cli, BackendConfig, BondHint, CoreRpcConfig, ElectrumConfig, RestoreOptions, Wallet,
     },
@@ -194,7 +194,8 @@ fn run() -> Result<(), MakerError> {
         None => args.password.map(Zeroizing::new),
     };
     config.password = None;
-    if let Some(tor_auth) = args.tor_auth {
+    if let Some(tor_auth) = args.tor_auth.filter(|a| *a != config.tor_auth_password) {
+        set_config_key(&config_path, "tor_auth_password", &tor_auth)?;
         config.tor_auth_password = tor_auth;
     }
 
@@ -250,13 +251,13 @@ fn run() -> Result<(), MakerError> {
     if config.network_port == DEFAULT_NETWORK_PORT {
         let (_, port) = bind_port_retry(config.network_port)?;
         config.network_port = port;
-        config.write_to_file(&config_path)?;
+        set_config_key(&config_path, "network_port", &port.to_string())?;
     }
 
     // Discover and save RPC port to config
     let (_, rpc_port) = bind_port_retry(config.rpc_port)?;
     config.rpc_port = rpc_port;
-    config.write_to_file(&config_path)?;
+    set_config_key(&config_path, "rpc_port", &rpc_port.to_string())?;
 
     let wallet_path = config.data_dir.join("wallets").join(&config.wallet_name);
     Wallet::init_interactive(

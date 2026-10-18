@@ -1,6 +1,8 @@
 //! The OpenSwap Wallet (unsecured). Used by both the Taker and Maker.
 
 mod api;
+#[cfg(test)]
+pub(crate) use api::test_support::test_wallet;
 mod backup;
 pub(crate) mod blockchain;
 pub mod deniability;
@@ -41,3 +43,14 @@ pub use report::{
 pub use seed::SecretMnemonic;
 pub use spend::Destination;
 pub use storage::{AddressType, LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap};
+
+#[cfg(test)]
+pub(crate) use backup::compat_backup;
+#[cfg(test)]
+pub(crate) use report::{compat_reports, SwapReportFile};
+#[cfg(test)]
+pub(crate) use storage::compat_support::{
+    check_envelope, compat_assert_empty_extra, generate_storage,
+};
+#[cfg(test)]
+pub(crate) use storage::{SwapReservation, WalletStore};

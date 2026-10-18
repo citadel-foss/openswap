@@ -477,13 +477,16 @@ fn process_taproot_contract<M: Maker>(
                 "[{}] Test behavior: skipping Taproot funding broadcast",
                 maker.network_port()
             );
-            // The unrecorded variant leaves the record empty, so recovery sees
-            // the swap as never funded and the discard grace applies.
+            // The unrecorded variant leaves the coins uncommitted, so recovery
+            // sees the swap as never funded and discards it.
             if maker.behavior() == MakerBehavior::SkipFundingBroadcast {
                 state.funding_broadcast_txids = outgoing_swapcoins
                     .iter()
                     .map(|outgoing| outgoing.contract_tx.compute_txid())
                     .collect();
+                for outgoing in outgoing_swapcoins.iter_mut() {
+                    outgoing.committed = true;
+                }
             }
             state.phase = SwapPhase::AwaitingPrivateKeyHandover;
             for incoming in &incoming_swapcoins {
@@ -512,13 +515,21 @@ fn process_taproot_contract<M: Maker>(
 
     // Persist swapcoins before broadcasting contract txs. A later broadcast
     // failure can leave earlier Taproot contract txs on-chain, and the wallet
-    // needs these records for timelock recovery after a restart.
+    // needs these records for timelock recovery after a restart. Committed
+    // from here: recovery must never discard a coin whose send may be out.
     for incoming in &incoming_swapcoins {
         maker.save_incoming_swapcoin(incoming)?;
     }
-    for outgoing in &outgoing_swapcoins {
+    // A withholding maker never sends, so its recovery must not send either.
+    #[cfg(feature = "integration-test")]
+    let commit = maker.behavior() != MakerBehavior::WithholdFundingSilently;
+    #[cfg(not(feature = "integration-test"))]
+    let commit = true;
+    for outgoing in outgoing_swapcoins.iter_mut() {
+        outgoing.committed = commit;
         maker.save_outgoing_swapcoin(outgoing)?;
     }
+    state.outgoing_swapcoins = outgoing_swapcoins.clone();
 
     for (index, outgoing) in outgoing_swapcoins.iter().enumerate() {
         // The index only feeds the test hook below; touch it so production

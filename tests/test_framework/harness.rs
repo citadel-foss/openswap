@@ -18,7 +18,7 @@
 use std::{
     marker::PhantomData,
     mem,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -48,7 +48,6 @@ use super::{
     expect::WorldBalances,
     logs::end_test_log_group,
     procs::bitcoind::generate_blocks,
-    tracker::{spawn_tracker_logger, TrackerLoggerHandle},
     world::{MakerFeeOverride, TestFramework},
 };
 
@@ -505,11 +504,6 @@ impl World {
         generate_blocks(self.bitcoind(), n);
     }
 
-    /// [`spawn_tracker_logger`] over the first taker's data dir, `taker1`.
-    pub fn spawn_tracker_logger(&self, interval: Duration) -> TrackerLoggerHandle {
-        spawn_tracker_logger(self.temp_dir().join("taker1"), interval)
-    }
-
     /// Stops every started maker: signal all, then join each, propagating a
     /// maker thread's panic. For tests that stop the makers
     /// before the end; [`World::finish`] then skips them.
@@ -663,7 +657,7 @@ impl Drop for World {
 /// Why [`TakerHandle::swap`] failed: the stage, then the taker's error.
 pub struct SwapError {
     pub stage: &'static str,
-    pub error: TakerError,
+    pub error: Box<TakerError>,
 }
 
 impl std::fmt::Debug for SwapError {
@@ -710,14 +704,6 @@ impl MakerHandle {
             .get_balances()
             .expect("maker balances unreadable")
     }
-
-    /// `<data_dir>/wallets/<wallet_name>_swap_report.json`.
-    pub fn report_path(&self) -> PathBuf {
-        self.server.data_dir.join("wallets").join(format!(
-            "{}_swap_report.json",
-            self.server.config.wallet_name
-        ))
-    }
 }
 
 /// One taker.
@@ -741,11 +727,6 @@ impl TakerHandle {
     /// Sets the taker's test behavior for its next swap.
     pub fn set_behavior(&mut self, behavior: TakerBehavior) {
         self.taker.behavior = behavior;
-    }
-
-    /// [`Taker::log_tracker_state`].
-    pub fn log_tracker_state(&self) {
-        self.taker.log_tracker_state();
     }
 
     /// [`Taker::wait_for_recovery`]: blocks until every unresolved contract is
@@ -828,11 +809,11 @@ impl TakerHandle {
     pub fn swap(&mut self, params: SwapParams) -> Result<TakerReport, SwapError> {
         let summary = self.prepare(params).map_err(|error| SwapError {
             stage: "prepare",
-            error,
+            error: Box::new(error),
         })?;
         self.start(&summary.swap_id).map_err(|error| SwapError {
             stage: "start",
-            error,
+            error: Box::new(error),
         })
     }
 

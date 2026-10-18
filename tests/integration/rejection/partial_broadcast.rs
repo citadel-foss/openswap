@@ -4,74 +4,78 @@
 
 use bitcoin::Amount;
 use openswap::{
-    maker::{
-        start_server,
-        swap_tracker::{MakerSwapRecord, MakerSwapTracker},
-        MakerServer,
-    },
+    maker::{start_server, MakerServer},
     protocol::common_messages::ProtocolVersion,
-    taker::{
-        swap_tracker::{ExchangeProgress, SwapTracker},
-        SwapParams,
-    },
+    taker::SwapParams,
 };
 
 use crate::test_framework::*;
 
 use std::{
+    collections::HashSet,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
     time::Duration,
 };
 
-/// Poll the maker's swap tracker until the swap's timelock recovery has
-/// reclaimed an outgoing contract; panics after `timeout`.
-/// The phase field regresses to TimelockWaiting on later passes, so the
-/// recovered-txid list is the durable signal.
+/// Wait until the maker's timelock recovery reports, summed over all passes,
+/// hold `expected` refund txids and its outgoing swapcoins are down to `left`.
 fn wait_for_maker_timelock_recovery(
-    data_dir: &std::path::Path,
+    maker: &MakerServer,
     swap_id: &str,
+    expected: usize,
+    left: usize,
     timeout: Duration,
-) -> MakerSwapRecord {
+) -> Vec<String> {
     wait_for!(
         timeout,
         every Duration::from_secs(5),
         format!("maker timelock recovery of {}", swap_id),
-        MakerSwapTracker::load_or_create(data_dir)
-            .ok()
-            .and_then(|tracker| tracker.get_record(swap_id).cloned())
-            .filter(|record| !record.recovery.outgoing_recovered.is_empty())
+        {
+            let reports = maker.wallet.read().unwrap().swap_reports();
+            let txids: Vec<_> = reports
+                .recovery
+                .iter()
+                .filter(|report| report.swap_id == swap_id && report.recovery_type == "timelock")
+                .flat_map(|report| report.recovery_txids.clone())
+                .collect();
+            let cleaned = maker.wallet.read().unwrap().get_outgoing_swapcoins_count() == left;
+            (txids.len() >= expected && cleaned).then_some(txids)
+        }
     )
 }
 
 /// The maker's second funding broadcast fails with the first tx already sent.
 /// The partial batch must not read as never broadcast: recovery keeps the
-/// swap's material and reclaims the on-chain split via timelock.
+/// swap's material, sends the unsent split and reclaims both via timelock.
 #[world_test(
     maker_behaviors = [FailSecondBroadcast],
     takers = [Normal],
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120), mine(1)],
     swap(protocol = protocol, sats = 500_000, makers = 1),
     cases = [
+        /// The unsent split is sent, locked and refunded too: 446 sats of fees.
         maker_recovers_partial_broadcast_legacy(
             backend = BitcoindBackend,
             protocol = ProtocolVersion::Legacy,
-            expected_spendable = 14_999_311,
+            expected_spendable = 14_998_865,
         ),
+        /// The committed unsent split is sent and refunded too: 154 + 140 sats of fees.
         maker_recovers_partial_broadcast_taproot(
             backend = BitcoindBackend,
             protocol = ProtocolVersion::Taproot,
-            expected_spendable = 14_999_463,
+            expected_spendable = 14_999_169,
         ),
         maker_recovers_partial_broadcast_electrum(
             backend = ElectrumBackend,
             protocol = ProtocolVersion::Legacy,
-            expected_spendable = 14_999_311,
+            expected_spendable = 14_998_865,
         ),
     ],
 )]
 fn run_maker_partial_broadcast<B: TestBackend>(
     world: &mut World,
+    protocol: ProtocolVersion,
     expected_spendable: u64,
     params: SwapParams,
 ) {
@@ -90,39 +94,38 @@ fn run_maker_partial_broadcast<B: TestBackend>(
 
     // The 30s idle timeout starts recovery; the timelock path then needs the
     // maker's outgoing timelock (150 CSV blocks from the contract broadcast).
-    let record = wait_for_maker_timelock_recovery(
-        &world.makers()[0].inner().data_dir,
+    // Recovery sends the unsent split too. Legacy contracts both go out when
+    // recovery starts, but a block between the two broadcasts can give them
+    // different maturity, so their refunds may land in separate passes. A
+    // Taproot split went out with the swap, so the resent one comes back later.
+    let splits_left = match protocol {
+        ProtocolVersion::Legacy => 0,
+        ProtocolVersion::Taproot => 1,
+    };
+    let recovered = wait_for_maker_timelock_recovery(
+        world.makers()[0].inner(),
         &swap_id,
+        2 - splits_left,
+        splits_left,
         timelock_recovery_wait::<B>() + Duration::from_secs(120),
     );
 
-    // One tx of the two-tx batch was recorded before the failure — per-tx
-    // state, not a single end-of-batch flag.
     assert_eq!(
-        record.funding_broadcast_txids.len(),
-        1,
-        "exactly the first funding tx may be recorded as broadcast"
-    );
-    assert_eq!(
-        record.recovery.outgoing_recovered.len(),
-        1,
-        "the on-chain split must be timelock-recovered"
+        recovered.len(),
+        2 - splits_left,
+        "every sent split must be timelock-recovered"
     );
 
     // A partial batch must never be discarded as never broadcast.
     assert_log!(world; { lacks "nothing to recover. Discarding swapcoins" });
 
-    // The unsent split's inputs must return to the pool without a restart.
-    wait_until!(
-        Duration::from_secs(180),
-        every Duration::from_secs(2),
-        "recovery to release the unsent split's inputs",
-        world.makers()[0].inner().reserved_inputs().unwrap() == 0
+    let maker = world.makers()[0].inner();
+    assert_eq!(
+        maker.wallet.read().unwrap().get_outgoing_swapcoins_count(),
+        splits_left
     );
-
-    // Finished recovery stops the maker, and its exit rearms the wallet backend.
-    // Join without sending another stop, which would cancel our sync again.
-    world.join_makers();
+    assert_eq!(maker.reserved_inputs().unwrap() > 0, splits_left > 0);
+    world.shutdown_makers();
 
     world.mine(1);
     world.framework().wait_for_electrs_tip();
@@ -135,8 +138,8 @@ fn run_maker_partial_broadcast<B: TestBackend>(
 
 /// The taker's second funding broadcast fails with the first split already in
 /// the mempool and a spare maker available. Substitution would delete the
-/// on-chain split's recovery material, so the recorded phase — not the
-/// backend's answer — must route the taker to recovery instead.
+/// on-chain split's recovery material, so the saved committed flag must
+/// route the taker to recovery even if the backend has not seen the funding.
 #[world_test(
     maker_behaviors = [Normal, Normal],
     takers = [FailSecondFundingBroadcast],
@@ -147,16 +150,17 @@ fn run_maker_partial_broadcast<B: TestBackend>(
     ],
     swap(protocol = Legacy, sats = 500_000, makers = 1),
     cases = [
+        /// The unsent split is sent, locked and refunded too: 457 sats of fees.
         taker_recovers_partial_broadcast_with_spare_maker(
             backend = BitcoindBackend,
-            expected_spendable = 14_999_543,
+            expected_spendable = 14_999_086,
         ),
         /// The same partial batch on Electrum: the backend can lag the session's own
-        /// broadcast, so only the recorded phase keeps the spare maker unused and
+        /// broadcast, so only the committed flag keeps the spare maker unused and
         /// the recovery material intact.
         taker_recovers_partial_broadcast_with_spare_maker_electrum(
             backend = ElectrumBackend,
-            expected_spendable = 14_999_543,
+            expected_spendable = 14_999_086,
         ),
     ],
 )]
@@ -186,25 +190,13 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker(
         lacks "Re-initializing funding after maker substitution",
     });
 
-    let tracker = SwapTracker::load_or_create(&world.temp_dir().join("taker1")).unwrap();
-    let record = tracker
-        .get_record(&swap_id)
-        .expect("swap record must exist");
-    assert_eq!(
-        record.phase,
-        openswap::taker::swap_tracker::SwapPhase::Failed
-    );
-    assert_eq!(
-        record.failed_at_phase,
-        Some(openswap::taker::swap_tracker::SwapPhase::FundsBroadcast),
-        "the phase must be persisted before the broadcast loop"
-    );
     assert!(
-        matches!(
-            record.makers[0].exchange,
-            ExchangeProgress::Legacy(ref legacy) if legacy.prev_funding_broadcast
-        ),
-        "the broadcast milestone must be recorded before the loop, not after it"
+        !world
+            .temp_dir()
+            .join("taker1")
+            .join("swap_tracker.cbor")
+            .exists(),
+        "funding and recovery must only write the wallet"
     );
     assert_eq!(
         world
@@ -224,12 +216,20 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker(
         "a failed broadcast must keep its inputs claimed"
     );
 
-    // Recovery reclaims the on-chain split once its timelock matures.
+    // Recovery sends the unsent split too; the refunds may come in separate
+    // passes, so the reports are summed below.
     wait_until!(
         Duration::from_secs(360),
         every Duration::from_secs(5),
-        "taker recovery to complete",
-        world.taker().inner().is_recovery_complete()
+        "the splits to be recovered",
+        world
+            .taker()
+            .inner()
+            .get_wallet()
+            .read()
+            .unwrap()
+            .get_outgoing_swapcoins_count()
+            == 0
     );
     assert_eq!(
         world.taker().inner().reserved_inputs().unwrap(),
@@ -237,6 +237,23 @@ fn run_taker_recovers_partial_broadcast_with_spare_maker(
         "recovery must release the claim of the swap it settled"
     );
 
+    let refunds: HashSet<_> = world
+        .taker()
+        .inner()
+        .get_wallet()
+        .read()
+        .unwrap()
+        .swap_reports()
+        .recovery
+        .iter()
+        .filter(|report| report.swap_id == swap_id && report.recovery_type == "timelock")
+        .flat_map(|report| report.recovery_txids.clone())
+        .collect();
+    assert_eq!(
+        refunds.len(),
+        2,
+        "the confirmed refunds must be stored with the coin removal"
+    );
     world.mine(1);
     world.framework().wait_for_electrs_tip();
     world.taker().sync();

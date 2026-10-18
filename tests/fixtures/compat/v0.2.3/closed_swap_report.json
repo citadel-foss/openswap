@@ -1,0 +1,32 @@
+{
+  "taker": [],
+  "maker": {},
+  "recovery": [],
+  "deniability_proofs": [
+    {
+      "swap_id": "v023-proof-swap",
+      "role": "Taker",
+      "protocol": "Legacy",
+      "outgoing_swapcoin": "0606060606060606060606060606060606060606060606060606060606060606:0",
+      "proof": {
+        "Legacy": {
+          "funding_outpoint": "0505050505050505050505050505050505050505050505050505050505050505:0",
+          "htlc_redeemscript": "827ca91418bc1a114ccf9c052d3d23e28d3b0a9d1227434287632102531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe3370120006721024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076600011468b2757b88ac",
+          "multisig_redeemscript": "5221024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d076621031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f52ae",
+          "pub_mine_multi": "031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+          "pub_other_multi": "024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+          "pub_mine_hashlock": "02531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+          "sig_multi": {
+            "signature": "30440220650ddda88eb856567bd2cf41d7c495a27d76555a6b70ceea7ddc69bc78757802022004299552765b20d71dfea31d140b12be6540a92a6052234cdc1774fed407d7a7",
+            "sighash_type": "SIGHASH_ALL"
+          },
+          "sig_hashlock": {
+            "signature": "30440220432e9ab48eafde169b7c0a379983be0c0a170d3f3b2c2d98482e9b42a5777d3602202aebd81fe6c6a6e3379c0573550f1a875cb12f54249ab2bf1f1c0516d443b1d9",
+            "sighash_type": "SIGHASH_ALL"
+          }
+        }
+      },
+      "created_at": 123
+    }
+  ]
+}

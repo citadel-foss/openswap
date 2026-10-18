@@ -6,7 +6,6 @@
 use std::{
     collections::HashSet,
     net::TcpStream,
-    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
         mpsc, Arc, Mutex, RwLock,
@@ -19,19 +18,14 @@ use bitcoin::{OutPoint, ScriptBuf, Txid};
 
 use crate::{
     lock_debug,
-    protocol::{common_messages::TakerToMakerMessage, ProtocolVersion},
+    protocol::common_messages::TakerToMakerMessage,
     taker::{
         api::{connect_to_maker, handshake_with_maker, ConnectionType},
         error::TakerError,
     },
     utill::HEART_BEAT_INTERVAL,
-    wallet::{blockchain::BackendConnector, AnyBlockchain, Blockchain, RecoveryReport, Wallet},
+    wallet::{blockchain::BackendConnector, AnyBlockchain, Blockchain, Wallet, WalletError},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
-};
-
-use super::swap_tracker::{
-    funding_shared, incoming_claimed, ContractOutcome, ContractResolution, RecoveryPhase,
-    SwapTracker,
 };
 
 /// Interval between recovery retry attempts.
@@ -44,7 +38,7 @@ const RECOVERY_LOOP_INTERVAL: Duration = Duration::from_secs(10);
 /// (hashlock sweep + timelock recovery) until all contract UTXOs are resolved.
 ///
 /// Spawned at the end of `recover_active_swap()` or `init_recover_incomplete()`
-/// when some contracts remain unresolved (e.g. timelocks not yet mature).
+/// when contracts remain unresolved (e.g. timelocks not yet mature).
 pub(crate) struct RecoveryLoop {
     shutdown: Arc<AtomicBool>,
     complete: Arc<AtomicBool>,
@@ -54,15 +48,12 @@ pub(crate) struct RecoveryLoop {
 impl RecoveryLoop {
     /// Spawn the background recovery thread.
     ///
-    /// The tracker supplies the failed swaps that this loop may recover. The
-    /// scope is refreshed every pass so a live swap can never be selected just
-    /// because its swapcoins share the same wallet.
+    /// Each pass selects stored coins outside the active swap.
     pub(crate) fn start(
         wallet: Arc<RwLock<Wallet>>,
         backend: BackendConnector,
-        swap_tracker: Arc<Mutex<SwapTracker>>,
+        live_swap: Arc<Mutex<Option<String>>>,
         watch_service: WatchService,
-        data_dir: PathBuf,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let complete = Arc::new(AtomicBool::new(false));
@@ -82,21 +73,15 @@ impl RecoveryLoop {
                 // Set by a failed fallback height read on Electrum; see below.
                 let mut deferring = false;
                 while !shutdown_clone.load(Relaxed) {
-                    let scope = lock_debug!(swap_tracker.lock())
-                        .ok()
-                        .zip(lock_debug!(wallet.read()).ok())
-                        .and_then(|(mut tracker, w)| {
-                            tracker
-                                .recovery_scope_listing(&w)
-                                .inspect_err(|e| log::warn!("Recovery loop: scope: {:?}", e))
-                                .ok()
-                        });
+                    let scope = Self::scope(&live_swap, &wallet)
+                        .inspect_err(|e| log::warn!("Recovery loop: scope: {e}"))
+                        .ok();
                     let Some((swap_ids, incoming_contract_txids)) = scope else {
                         thread::park_timeout(RECOVERY_LOOP_INTERVAL);
                         continue;
                     };
                     if swap_ids.is_empty() {
-                        log::info!("Recovery loop: no failed swaps remain");
+                        log::info!("Recovery loop: no abandoned swaps remain");
                         complete_clone.store(true, Relaxed);
                         return;
                     }
@@ -171,8 +156,8 @@ impl RecoveryLoop {
                         &shutdown_clone,
                         &incoming_contract_txids,
                         &swap_ids,
-                        &|coin_swap| funding_shared(&swap_tracker, coin_swap),
-                        &|swap_id| incoming_claimed(&swap_tracker, &wallet, swap_id),
+                        &|_| true,
+                        &|_| false,
                     ) {
                         Ok((swept, recovered)) if !swept.is_empty() || !recovered.is_empty() => {
                             log::info!(
@@ -180,14 +165,6 @@ impl RecoveryLoop {
                                 swept.resolved.len(),
                                 recovered.len()
                             );
-                            if let Ok(mut tracker) = lock_debug!(swap_tracker.lock()) {
-                                Self::update_tracker_outcomes(
-                                    &mut tracker,
-                                    &swap_ids,
-                                    &swept,
-                                    &recovered,
-                                );
-                            }
                         }
                         Ok(_) => {}
                         Err(e) => log::debug!("Recovery loop: recovery pass: {:?}", e),
@@ -237,100 +214,26 @@ impl RecoveryLoop {
                         );
                     } else {
                         log::info!("Recovery loop: all contracts resolved");
-                        let mut saved = false;
-                        if let Ok(mut w) = lock_debug!(wallet.write()) {
-                            for swap_id in &swap_ids {
-                                // A sweep normally removes its incoming entry
-                                // after confirmation. If the process stops
-                                // after broadcast but before that removal, a
-                                // restarted recovery sees the outpoint spent
-                                // and arrives here with a stale incoming entry.
-                                // Since `all_resolved` is based on confirmed
-                                // spends, it is now safe to remove both sides.
-                                let incoming_keys = w.incoming_keys_for_swap(swap_id);
-                                for key in &incoming_keys {
-                                    w.remove_incoming_swapcoin(key);
-                                }
-                                let outgoing_keys = w.outgoing_keys_for_swap(swap_id);
-                                for key in &outgoing_keys {
-                                    w.remove_outgoing_swapcoin(key);
-                                }
-                                w.remove_watchonly_swapcoins(swap_id);
-                                // A partly broadcast batch still holds its
-                                // unsent inputs; the swap is settled now.
-                                w.release_swap_locks(swap_id, None);
-                            }
-                            saved = w
-                                .save_to_disk()
-                                .inspect_err(|e| log::warn!("Recovery loop: cleanup save: {:?}", e))
-                                .is_ok();
-                        }
-                        // Finished only once the removal is on disk: a restart
-                        // skips a CleanedUp swap and would keep its stale coins.
+                        // Every contract has a confirmed spend, so a stale incoming
+                        // entry left by a crash after its sweep goes with the rest.
+                        // A failed save keeps the coins for the next pass.
+                        let saved = lock_debug!(wallet.write()).is_ok_and(|mut w| {
+                            swap_ids.iter().all(|swap_id| {
+                                w.remove_swap_coins_and_save(swap_id, true, true)
+                                    .inspect_err(|e| {
+                                        log::warn!("Recovery loop: cleanup save: {:?}", e)
+                                    })
+                                    .is_ok()
+                            })
+                        });
                         if !saved {
                             last_tip = None;
                             thread::park_timeout(RECOVERY_LOOP_INTERVAL);
                             continue;
                         }
 
-                        if let Ok(mut tracker) = lock_debug!(swap_tracker.lock()) {
-                            // Emit recovery reports before marking as cleaned up
-                            for record in tracker
-                                .incomplete_swaps()
-                                .into_iter()
-                                .filter(|record| swap_ids.contains(&record.swap_id))
-                            {
-                                let network = lock_debug!(wallet.read())
-                                    .map(|w| w.store.network.to_string())
-                                    .unwrap_or_default();
-                                let all_outcomes = record
-                                    .recovery
-                                    .incoming
-                                    .iter()
-                                    .chain(record.recovery.outgoing.iter());
-                                let mut hashlock_txids: Vec<String> = Vec::new();
-                                let mut timelock_txids: Vec<String> = Vec::new();
-                                for o in all_outcomes {
-                                    if let Some(txid) = o.spending_txid {
-                                        match o.resolution {
-                                            ContractResolution::Hashlock => {
-                                                hashlock_txids.push(txid.to_string())
-                                            }
-                                            ContractResolution::Timelock => {
-                                                timelock_txids.push(txid.to_string())
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                if !hashlock_txids.is_empty() {
-                                    RecoveryReport::emit_taker(
-                                        &data_dir,
-                                        record.swap_id.clone(),
-                                        network.clone(),
-                                        "hashlock".to_string(),
-                                        hashlock_txids,
-                                    );
-                                }
-                                if !timelock_txids.is_empty() {
-                                    RecoveryReport::emit_taker(
-                                        &data_dir,
-                                        record.swap_id.clone(),
-                                        network,
-                                        "timelock".to_string(),
-                                        timelock_txids,
-                                    );
-                                }
-                            }
-
-                            for swap_id in &swap_ids {
-                                let _ = tracker.update_and_save(swap_id, |r| {
-                                    r.recovery.phase = RecoveryPhase::CleanedUp;
-                                });
-                            }
-                        }
-                        let more_failed_swaps = lock_debug!(swap_tracker.lock())
-                            .map(|tracker| !tracker.recovery_scope().0.is_empty())
+                        let more_failed_swaps = Self::scope(&live_swap, &wallet)
+                            .map(|(ids, _)| !ids.is_empty())
                             .unwrap_or(true);
                         if more_failed_swaps {
                             continue;
@@ -351,121 +254,35 @@ impl RecoveryLoop {
         })
     }
 
-    /// Match resolved contract txids against tracker records and update outcomes.
-    pub(crate) fn update_tracker_outcomes(
-        tracker: &mut SwapTracker,
-        recovery_scope: &HashSet<String>,
-        swept: &crate::wallet::RecoveryOutcome,
-        recovered: &crate::wallet::RecoveryOutcome,
-    ) {
-        let swap_ids: Vec<String> = tracker
-            .incomplete_swaps()
-            .iter()
-            .filter(|record| recovery_scope.contains(&record.swap_id))
-            .map(|r| r.swap_id.clone())
-            .collect();
-
-        for swap_id in swap_ids {
-            let mut changed = false;
-
-            let _ = tracker.update_and_save(&swap_id, |record| {
-                // Update incoming outcomes from sweep results
-                for (contract_txid, spending_txid) in &swept.resolved {
-                    if record.incoming_contract_txids.contains(contract_txid) {
-                        // Find existing outcome or add new one
-                        if let Some(outcome) = record
-                            .recovery
-                            .incoming
-                            .iter_mut()
-                            .find(|o| o.contract_txid == *contract_txid)
-                        {
-                            if outcome.resolution == ContractResolution::Unresolved {
-                                outcome.resolution = ContractResolution::Hashlock;
-                                outcome.spending_txid = Some(*spending_txid);
-                                changed = true;
-                            }
-                        } else {
-                            record.recovery.incoming.push(ContractOutcome {
-                                contract_txid: *contract_txid,
-                                resolution: ContractResolution::Hashlock,
-                                spending_txid: Some(*spending_txid),
-                            });
-                            changed = true;
-                        }
-                    }
-                }
-
-                // Update outgoing outcomes from timelock recovery results
-                for (contract_txid, spending_txid) in &recovered.resolved {
-                    if record.outgoing_contract_txids.contains(contract_txid) {
-                        if let Some(outcome) = record
-                            .recovery
-                            .outgoing
-                            .iter_mut()
-                            .find(|o| o.contract_txid == *contract_txid)
-                        {
-                            if outcome.resolution == ContractResolution::Unresolved {
-                                outcome.resolution = ContractResolution::Timelock;
-                                outcome.spending_txid = Some(*spending_txid);
-                                changed = true;
-                            }
-                        } else {
-                            record.recovery.outgoing.push(ContractOutcome {
-                                contract_txid: *contract_txid,
-                                resolution: ContractResolution::Timelock,
-                                spending_txid: Some(*spending_txid),
-                            });
-                            changed = true;
-                        }
-                    }
-                }
-                for contract_txid in &recovered.discarded {
-                    if record.outgoing_contract_txids.contains(contract_txid) {
-                        if let Some(outcome) = record
-                            .recovery
-                            .outgoing
-                            .iter_mut()
-                            .find(|o| o.contract_txid == *contract_txid)
-                        {
-                            if outcome.resolution == ContractResolution::Unresolved {
-                                outcome.resolution = ContractResolution::Discarded;
-                                changed = true;
-                            }
-                        } else {
-                            record.recovery.outgoing.push(ContractOutcome {
-                                contract_txid: *contract_txid,
-                                resolution: ContractResolution::Discarded,
-                                spending_txid: None,
-                            });
-                            changed = true;
-                        }
-                    }
-                }
-
-                // Advance recovery phase based on what was resolved
-                if changed {
-                    let all_incoming_done = record
-                        .recovery
-                        .incoming
-                        .iter()
-                        .all(|o| o.resolution != ContractResolution::Unresolved);
-                    let all_outgoing_done = record
-                        .recovery
-                        .outgoing
-                        .iter()
-                        .all(|o| o.resolution != ContractResolution::Unresolved);
-
-                    if all_outgoing_done && record.recovery.phase < RecoveryPhase::OutgoingRecovered
-                    {
-                        record.recovery.phase = RecoveryPhase::OutgoingRecovered;
-                    } else if all_incoming_done
-                        && record.recovery.phase < RecoveryPhase::IncomingRecovered
-                    {
-                        record.recovery.phase = RecoveryPhase::IncomingRecovered;
-                    }
-                }
-            });
+    /// Snapshot the wallet while the active swap cannot change ownership.
+    pub(crate) fn scope(
+        live_swap: &Mutex<Option<String>>,
+        wallet: &RwLock<Wallet>,
+    ) -> std::io::Result<(HashSet<String>, HashSet<Txid>)> {
+        let live = lock_debug!(live_swap.lock())
+            .map_err(|_| std::io::Error::other("live swap lock poisoned"))?;
+        let wallet = lock_debug!(wallet.read())
+            .map_err(|_| std::io::Error::other("wallet lock poisoned"))?;
+        let mut swap_ids = wallet.onchain_swap_ids();
+        if let Some(id) = live.as_ref() {
+            swap_ids.remove(id);
         }
+        let incoming_txids = wallet
+            .incoming_contract_outpoints(Some(&swap_ids))
+            .into_iter()
+            .map(|(outpoint, _)| outpoint.txid)
+            .collect();
+        Ok((swap_ids, incoming_txids))
+    }
+
+    /// A failed save keeps the swap excluded from recovery.
+    pub(crate) fn finish_handover(
+        wallet: &Wallet,
+        live: &mut Option<String>,
+    ) -> Result<(), WalletError> {
+        wallet.save_to_disk()?;
+        *live = None;
+        Ok(())
     }
 
     /// Check whether recovery is complete.
@@ -691,7 +508,7 @@ const RECONNECT_BACKOFF_MAX_TICKS: u32 = 8;
 /// Deadline for a heartbeat's own connect and hello exchange. Deliberately far
 /// below the maker's idle budget and unrelated to `MAKER_RESPONSE_TIMEOUT_SECS`,
 /// which is sized for block-bound contract replies: reconnects run on the shared
-/// heartbeat thread, so a maker that accepts TCP and then withholds `MakerHello`
+/// heartbeat thread, so a maker that accepts TCP and then withholds its `Hello`
 /// would otherwise stall the keepalives every other maker on the route depends on.
 #[cfg(not(feature = "integration-test"))]
 const HEARTBEAT_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -705,13 +522,13 @@ pub(crate) struct PeerDial {
     pub(crate) connection_type: ConnectionType,
     /// Tor SOCKS port, ignored for clearnet.
     pub(crate) socks_port: u16,
-    /// Protocol the maker must support for this swap.
-    pub(crate) protocol: ProtocolVersion,
 }
 
 /// One maker in the route, with its keepalive stream and reconnect state.
 struct HeartbeatPeer {
     address: String,
+    /// Names the maker's Hello must list for this swap.
+    needed: Vec<String>,
     /// `None` while disconnected and waiting to retry.
     stream: Option<TcpStream>,
     /// Ticks still to wait before the next connect attempt.
@@ -721,9 +538,10 @@ struct HeartbeatPeer {
 }
 
 impl HeartbeatPeer {
-    fn new(address: String) -> Self {
+    fn new((address, needed): (String, Vec<String>)) -> Self {
         Self {
             address,
+            needed,
             stream: None,
             retry_in: 0,
             backoff: RECONNECT_BACKOFF_MIN_TICKS,
@@ -744,7 +562,7 @@ impl HeartbeatPeer {
                 dial.socks_port,
                 dial_timeout,
             )
-            .and_then(|mut stream| handshake_with_maker(&mut stream, dial.protocol).map(|_| stream))
+            .and_then(|mut stream| handshake_with_maker(&mut stream, &self.needed).map(|_| stream))
             {
                 Ok(stream) => {
                     log::debug!("route heartbeat: connected to {}", self.address);
@@ -803,7 +621,7 @@ impl RouteHeartbeat {
     /// that is unreachable at start is retried instead of dropped from the route.
     pub(crate) fn start(
         swap_id: &str,
-        addresses: Vec<String>,
+        peers: Vec<(String, Vec<String>)>,
         dial: PeerDial,
     ) -> std::io::Result<Self> {
         let (stop, stop_rx) = mpsc::channel();
@@ -815,7 +633,7 @@ impl RouteHeartbeat {
             .name("Route heartbeat".to_string())
             .spawn(move || {
                 let mut peers: Vec<HeartbeatPeer> =
-                    addresses.into_iter().map(HeartbeatPeer::new).collect();
+                    peers.into_iter().map(HeartbeatPeer::new).collect();
                 loop {
                     for peer in peers.iter_mut() {
                         if stop_rx.try_recv().is_ok() {
@@ -855,17 +673,261 @@ impl Drop for RouteHeartbeat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::{
+        swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
+        test_wallet, LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap,
+    };
+    use bitcoin::{
+        absolute::LockTime,
+        hashes::{sha256, Hash},
+        secp256k1::{PublicKey as SecpPublicKey, Secp256k1, SecretKey},
+        transaction::Version,
+        Amount, PublicKey, Transaction, TxOut,
+    };
     use std::net::{Shutdown, TcpListener};
 
+    fn outgoing_for(id: &str, locktime: u32) -> OutgoingSwapCoin {
+        let key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let other = PublicKey::new(SecpPublicKey::from_secret_key(&Secp256k1::new(), &key));
+        let mut coin = OutgoingSwapCoin::new_legacy(
+            key,
+            other,
+            Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::from_consensus(locktime),
+                input: Vec::new(),
+                output: vec![TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            },
+            ScriptBuf::new(),
+            key,
+            Amount::from_sat(10_000),
+            1,
+        );
+        coin.swap_id = Some(id.to_owned());
+        coin
+    }
+
+    fn incoming_for(id: &str, locktime: u32) -> IncomingSwapCoin {
+        let outgoing = outgoing_for(id, locktime);
+        let key = outgoing.my_privkey.unwrap();
+        let mut coin = IncomingSwapCoin::new_legacy(
+            key,
+            outgoing.other_pubkey.unwrap(),
+            outgoing.contract_tx,
+            ScriptBuf::new(),
+            key,
+            outgoing.funding_amount,
+            1,
+        );
+        coin.swap_id = Some(id.to_owned());
+        coin
+    }
+
+    fn watchonly_for(id: &str, locktime: u32) -> WatchOnlySwapCoin {
+        let outgoing = outgoing_for(id, locktime);
+        WatchOnlySwapCoin::new_legacy(
+            outgoing.my_pubkey.unwrap(),
+            outgoing.other_pubkey.unwrap(),
+            outgoing.contract_tx,
+            ScriptBuf::new(),
+            outgoing.funding_amount,
+        )
+    }
+
+    #[test]
+    fn compat_recovery_scope_excludes_live_coins_until_durable_handover() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        wallet.add_outgoing_swapcoin(&outgoing_for("failed", 1));
+        let failed_incoming = incoming_for("failed", 3);
+        let failed_txid = failed_incoming.contract_tx.compute_txid();
+        wallet.add_incoming_swapcoin(&failed_incoming);
+        let wallet = RwLock::new(wallet);
+        let live = Mutex::new(Some("prepared".to_owned()));
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().0,
+            HashSet::from(["failed".to_owned()])
+        );
+        let live_incoming = incoming_for("prepared", 4);
+        let live_txid = live_incoming.contract_tx.compute_txid();
+        {
+            let mut wallet = wallet.write().unwrap();
+            wallet.add_outgoing_swapcoin(&outgoing_for("prepared", 2));
+            wallet.add_incoming_swapcoin(&live_incoming);
+            wallet.add_watchonly_swapcoins("prepared", vec![watchonly_for("prepared", 5)]);
+            wallet.save_to_disk().unwrap();
+        }
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().1,
+            HashSet::from([failed_txid])
+        );
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().0,
+            HashSet::from(["failed".to_owned()])
+        );
+        {
+            let mut guard = live.lock().unwrap();
+            let wallet = wallet.read().unwrap();
+            RecoveryLoop::finish_handover(&wallet, &mut guard).unwrap();
+        }
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().0,
+            HashSet::from(["failed".to_owned(), "prepared".to_owned()])
+        );
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().1,
+            HashSet::from([failed_txid, live_txid])
+        );
+    }
+
+    #[test]
+    fn compat_handover_save_failure_keeps_the_live_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let wallet = test_wallet(&path);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut live = Some("unsaved".to_owned());
+        assert!(RecoveryLoop::finish_handover(&wallet, &mut live).is_err());
+        assert_eq!(live.as_deref(), Some("unsaved"));
+        std::fs::remove_dir(path).unwrap();
+        RecoveryLoop::finish_handover(&wallet, &mut live).unwrap();
+        assert!(live.is_none());
+    }
+
+    #[test]
+    fn compat_recovery_scope_includes_watchonly_and_claim_ready_coins_but_excludes_lightning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let mut outgoing = outgoing_for("claimed-outgoing", 1);
+        outgoing.hash_preimage = Some([7; 32]);
+        outgoing.committed = true;
+        outgoing.incoming_claimed = true;
+        wallet.add_outgoing_swapcoin(&outgoing);
+        let mut incoming = incoming_for("incoming-only", 2);
+        incoming.other_privkey = incoming.my_privkey;
+        let incoming_txid = incoming.contract_tx.compute_txid();
+        wallet.add_incoming_swapcoin(&incoming);
+        wallet.add_watchonly_swapcoins("watchonly-only", vec![watchonly_for("watchonly-only", 3)]);
+        let key = SecretKey::from_slice(&[1; 32]).unwrap();
+        wallet.store.ln_pending_swaps.insert(
+            "pending-lightning".into(),
+            LnPendingSwap {
+                is_swap_in: true,
+                preimage: None,
+                redeemscript: ScriptBuf::new(),
+                locktime: 100,
+                privkey: key,
+                outpoint: None,
+                value: None,
+            },
+        );
+        wallet.store.ln_maker_swaps.insert(
+            "maker-lightning".into(),
+            LnMakerSwapRecord {
+                direction: LnMakerDirection::SwapIn,
+                phase: LnMakerPhase::InAccepted,
+                payment_hash: sha256::Hash::hash(&[1]),
+                amount: Amount::from_sat(10_000),
+                fee: Amount::ZERO,
+                locktime: 100,
+                min_confirmations: 1,
+                redeemscript: ScriptBuf::new(),
+                privkey: key,
+                invoice: "pending".into(),
+                preimage: None,
+                refund_txid: None,
+                accepted_height: None,
+                payout_script: None,
+                funding_outpoint: None,
+                funding_value: None,
+                funding_height: None,
+            },
+        );
+        let wallet = RwLock::new(wallet);
+        let live = Mutex::new(None);
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap(),
+            (
+                HashSet::from([
+                    "claimed-outgoing".to_owned(),
+                    "incoming-only".to_owned(),
+                    "watchonly-only".to_owned()
+                ]),
+                HashSet::from([incoming_txid]),
+            )
+        );
+        *live.lock().unwrap() = Some("watchonly-only".into());
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().0,
+            HashSet::from(["claimed-outgoing".to_owned(), "incoming-only".to_owned()])
+        );
+    }
+
+    #[test]
+    fn compat_unfunded_abort_preserves_scope_until_its_coin_removal_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let mut wallet = test_wallet(&path);
+        wallet.add_outgoing_swapcoin(&outgoing_for("failed", 1));
+        wallet.add_outgoing_swapcoin(&outgoing_for("prepared", 2));
+        wallet.add_incoming_swapcoin(&incoming_for("prepared", 3));
+        wallet.add_watchonly_swapcoins("prepared", vec![watchonly_for("prepared", 4)]);
+        wallet.save_to_disk().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let snapshot = dir.path().join("snapshot");
+        std::fs::rename(&path, &snapshot).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let wallet = RwLock::new(wallet);
+        let live = Mutex::new(Some("prepared".to_owned()));
+        {
+            let mut guard = live.lock().unwrap();
+            let mut wallet = wallet.write().unwrap();
+            assert!(wallet
+                .remove_swap_coins_and_save("prepared", true, true)
+                .is_err());
+            assert_eq!(guard.as_deref(), Some("prepared"));
+            assert_eq!(wallet.get_incoming_swapcoins_count(), 1);
+            assert_eq!(wallet.get_outgoing_swapcoins_count(), 2);
+            assert_eq!(wallet.watchonly_contract_outpoints().len(), 1);
+            assert!(RecoveryLoop::finish_handover(&wallet, &mut guard).is_err());
+        }
+        assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().0,
+            HashSet::from(["failed".to_owned()])
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(snapshot, &path).unwrap();
+        {
+            let mut guard = live.lock().unwrap();
+            let mut wallet = wallet.write().unwrap();
+            wallet
+                .remove_swap_coins_and_save("prepared", true, true)
+                .unwrap();
+            RecoveryLoop::finish_handover(&wallet, &mut guard).unwrap();
+            assert_eq!(wallet.get_incoming_swapcoins_count(), 0);
+            assert_eq!(wallet.get_outgoing_swapcoins_count(), 1);
+            assert!(wallet.watchonly_contract_outpoints().is_empty());
+        }
+        assert!(live.lock().unwrap().is_none());
+        assert_eq!(
+            RecoveryLoop::scope(&live, &wallet).unwrap().0,
+            HashSet::from(["failed".to_owned()])
+        );
+    }
+
     fn peer_on(address: &str) -> HeartbeatPeer {
-        HeartbeatPeer::new(address.to_string())
+        HeartbeatPeer::new((address.to_string(), Vec::new()))
     }
 
     fn test_dial() -> PeerDial {
         PeerDial {
             connection_type: ConnectionType::Clearnet,
             socks_port: 0,
-            protocol: ProtocolVersion::Taproot,
         }
     }
 
@@ -912,7 +974,7 @@ mod tests {
     /// the route is waiting its turn and its own idle budget is running.
     #[test]
     fn stalled_handshake_is_bounded_by_the_dial_timeout() {
-        // Accept connections but never answer MakerHello.
+        // Accept connections but never answer the Hello.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let _silent = thread::spawn(move || {
@@ -952,6 +1014,7 @@ mod tests {
 
         let mut peer = HeartbeatPeer {
             address,
+            needed: Vec::new(),
             stream: Some(stream),
             retry_in: 0,
             backoff: RECONNECT_BACKOFF_MAX_TICKS,

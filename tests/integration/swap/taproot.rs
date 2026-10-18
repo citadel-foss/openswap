@@ -82,18 +82,11 @@ fn taproot_two_maker_swap_completes(world: &mut World, params: SwapParams) {
 
     info!("All taproot swap tests completed successfully!");
 
-    let taker_report_path = world
-        .temp_dir()
-        .join("taker1")
-        .join("wallets")
-        .join("taker1_swap_report.json");
-    assert_report_has_deniability_proofs(&taker_report_path, "taproot taker", bitcoind, 1);
-
+    assert_wallet_has_deniability_proofs(world.taker().inner().get_wallet(), "taproot taker", 1);
     for (i, maker) in world.makers().iter().enumerate() {
-        assert_report_has_deniability_proofs(
-            &maker.report_path(),
+        assert_wallet_has_deniability_proofs(
+            &maker.inner().wallet,
             &format!("taproot maker {i}"),
-            bitcoind,
             1,
         );
     }

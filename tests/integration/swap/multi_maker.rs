@@ -3,10 +3,13 @@
 //! Setup: 1 taker and 4 makers, all Normal; Taproot (MuSig2), P2TR.
 //! The taker routes one swap through all 4 makers.
 
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
 use bitcoin::Amount;
-use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
+use openswap::{
+    maker::MakerServer, protocol::common_messages::ProtocolVersion, taker::SwapParams,
+    wallet::MakerReport,
+};
 
 use crate::test_framework::*;
 
@@ -127,9 +130,9 @@ fn taproot_fees_priced_on_each_makers_amount(world: &mut World) {
             .unwrap_or_else(|| panic!("no maker serves route address {}", quoted.address));
 
         // The maker records what it was declared and the fee it charged on it.
-        let maker_report = wait_for_maker_report(&maker.report_path(), &summary.swap_id);
-        let negotiated = maker_report["incoming_amount"].as_u64().unwrap();
-        let fee_earned = maker_report["fee_earned"].as_u64().unwrap();
+        let maker_report = wait_for_maker_report(maker.inner(), &summary.swap_id);
+        let negotiated = maker_report.incoming_amount;
+        let fee_earned = maker_report.fee_earned;
         info!("Maker {i}: negotiated {negotiated} sats, fee earned {fee_earned} sats");
 
         assert_eq!(
@@ -157,22 +160,19 @@ fn taproot_fees_priced_on_each_makers_amount(world: &mut World) {
 
 /// Waits for the maker's success report for `swap_id`; the maker writes it
 /// after its own sweep, which can land after the taker returns.
-fn wait_for_maker_report(path: &Path, swap_id: &str) -> serde_json::Value {
+fn wait_for_maker_report(maker: &MakerServer, swap_id: &str) -> MakerReport {
     wait_for!(
         Duration::from_secs(120),
         every Duration::from_secs(1),
-        format!("maker report for {} at {}", swap_id, path.display()),
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|file| {
-                file["maker"]
-                    .as_object()?
-                    .values()
-                    .filter_map(|reports| reports.as_array())
-                    .flatten()
-                    .find(|report| report["swap_id"] == swap_id)
-                    .cloned()
-            })
+        format!("maker report for {} in its wallet", swap_id),
+        maker
+            .wallet
+            .read()
+            .unwrap()
+            .swap_reports()
+            .maker
+            .into_values()
+            .flatten()
+            .find(|report| report.swap_id == swap_id)
     )
 }

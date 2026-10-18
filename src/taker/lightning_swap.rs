@@ -34,7 +34,8 @@ use crate::{
         invoice::verify_invoice, swap::SwapHtlc, InvoiceParams, LightningBackend, LnEvent, Preimage,
     },
     protocol::{
-        common_messages::{GetOffer, MakerToTakerMessage, Offer, TakerHello, TakerToMakerMessage},
+        common_messages::{GetOffer, MakerToTakerMessage, Offer, TakerToMakerMessage},
+        features::{choose_pins, unmet_for_flow},
         lightning_messages::{
             LightningMakerMessage, LightningOffer, LightningTakerMessage, LnHtlcFunded,
             LnSwapInRequest, LnSwapOutClaimed, LnSwapOutPaid, LnSwapOutRequest,
@@ -248,6 +249,8 @@ struct LnMakerConn {
     socket: TcpStream,
     address: String,
     ln_offer: LightningOffer,
+    /// Exact feature names this swap uses, sent in its request.
+    pins: Vec<String>,
 }
 
 impl LnMakerConn {
@@ -362,16 +365,15 @@ impl Taker {
         swap_in: bool,
         amount: Amount,
     ) -> Result<LnMakerConn, TakerError> {
-        let mut socket = self.net_connect(address)?;
-        send_message(&mut socket, &TakerToMakerMessage::TakerHello(TakerHello))
+        let flow = if swap_in { "ln-swap-in" } else { "ln-swap-out" };
+        let (mut socket, features) = self
+            .net_connect_with(address, &[flow.to_string()])
             .map_err(|e| general(format!("hello failed: {e:?}")))?;
-        let bytes =
-            read_message(&mut socket).map_err(|e| general(format!("hello reply: {e:?}")))?;
-        let msg: MakerToTakerMessage =
-            serde_cbor::from_slice(&bytes).map_err(|e| general(format!("bad hello: {e:?}")))?;
-        if !matches!(msg, MakerToTakerMessage::MakerHello(_)) {
-            return Err(general("expected MakerHello"));
-        }
+        let pins = choose_pins(flow, &features);
+        // Checked before anything is funded or paid.
+        unmet_for_flow(&self.require_features, &pins, flow).map_err(|missing| {
+            general(format!("maker cannot meet required features {missing:?}"))
+        })?;
 
         send_message(&mut socket, &TakerToMakerMessage::GetOffer(GetOffer))
             .map_err(|e| general(format!("get offer failed: {e:?}")))?;
@@ -403,6 +405,7 @@ impl Taker {
             socket,
             address: address.to_string(),
             ln_offer,
+            pins,
         })
     }
 
@@ -600,6 +603,7 @@ impl Taker {
             locktime,
             min_confirmations: params.min_confirmations,
             taker_timelock_pubkey: timelock_pubkey,
+            features: conn.pins.clone(),
         }))?;
         let accept = match conn.read_ln()? {
             LightningMakerMessage::SwapInAccept(accept) => accept,
@@ -706,6 +710,7 @@ impl Taker {
             locktime,
             min_confirmations: params.min_confirmations,
             taker_hashlock_pubkey: hashlock_pubkey,
+            features: conn.pins.clone(),
         }))?;
         let accept = match conn.read_ln()? {
             LightningMakerMessage::SwapOutAccept(accept) => accept,
@@ -891,6 +896,7 @@ impl Taker {
             locktime: out_locktime,
             min_confirmations: params.min_confirmations,
             taker_hashlock_pubkey: hashlock_pubkey,
+            features: conn2.pins.clone(),
         }))?;
         let accept2 = match conn2.read_ln()? {
             LightningMakerMessage::SwapOutAccept(accept) => accept,
@@ -942,6 +948,7 @@ impl Taker {
             locktime: in_locktime,
             min_confirmations: params.min_confirmations,
             taker_timelock_pubkey: timelock_pubkey,
+            features: conn1.pins.clone(),
         }))?;
         let accept1 = match conn1.read_ln()? {
             LightningMakerMessage::SwapInAccept(accept) => accept,

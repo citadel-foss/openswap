@@ -15,7 +15,6 @@ mod legacy_verification;
 #[cfg(feature = "lightning")]
 pub mod lightning_swap;
 mod payment;
-pub mod swap_tracker;
 mod taproot_swap;
 mod taproot_verification;
 

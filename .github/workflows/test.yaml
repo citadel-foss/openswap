@@ -67,6 +67,12 @@ jobs:
       - name: Install electrs
         uses: ./.github/actions/electrs
 
+      - name: Check release compatibility fixtures
+        if: matrix.partition == 1
+        run: |
+          cargo test --lib --features lightning compat
+          cargo test --test compat_kdf
+
       - name: Run cargo-llvm-cov
         # Surface electrs stderr in a failing test's output, or a hung electrum
         # test leaves no evidence of what the server was doing. No

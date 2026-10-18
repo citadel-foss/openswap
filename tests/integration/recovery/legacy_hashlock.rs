@@ -28,7 +28,6 @@ use std::time::Duration;
 )]
 fn maker_drops_after_sweep(world: &mut World) {
     let before = world.balances();
-    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
 
     let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
         .with_tx_count(3)
@@ -46,7 +45,6 @@ fn maker_drops_after_sweep(world: &mut World) {
         "Swap should fail due to Maker2 closing after sweep"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    world.taker().log_tracker_state();
 
     // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
@@ -87,8 +85,5 @@ fn maker_drops_after_sweep(world: &mut World) {
         },
     });
 
-    world.taker().log_tracker_state();
     info!("Legacy hashlock recovery test completed successfully!");
-
-    tracker_logger.stop();
 }

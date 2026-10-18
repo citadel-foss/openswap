@@ -24,7 +24,6 @@ use bitcoind::{
 use electrsd::ElectrsD;
 use openswap::{
     maker::{MakerBehavior, MakerServer, MakerServerConfig},
-    protocol::common_messages::ProtocolVersion,
     taker::{Taker, TakerBehavior, TakerInitConfig},
     wallet::{BackendConfig, CoreRpcConfig, ElectrumConfig},
 };
@@ -239,10 +238,6 @@ impl TestFramework {
                         time_relative_fee_pct: 0.0001,
                         required_confirms: 1,
                         check_blocklist,
-                        supported_protocols: vec![
-                            ProtocolVersion::Legacy,
-                            ProtocolVersion::Taproot,
-                        ],
                         fidelity_amount: 5_000_000, // 0.05 BTC
                         fidelity_timelock: 950,     // ~950 blocks for test
                         network: bitcoin::Network::Regtest,
@@ -413,8 +408,8 @@ impl TestFramework {
         self.remove_temp_dir();
     }
 
-    /// Deletes the temp dir, unless the test is failing: then its logs,
-    /// wallets and trackers stay behind for inspection (CI uploads them).
+    /// Deletes the temp dir, unless the test is failing: then its logs
+    /// and wallets stay behind for inspection (CI uploads them).
     fn remove_temp_dir(&self) {
         if thread::panicking() {
             log::warn!(

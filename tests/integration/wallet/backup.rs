@@ -5,6 +5,8 @@ use bitcoind::{
     bitcoincore_rpc::{self, RpcApi},
     BitcoinD,
 };
+use serde::Deserialize;
+use serde_cbor::{value::from_value, Value as CborValue};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
@@ -15,7 +17,10 @@ use openswap::wallet::{
 };
 
 use openswap::{
-    security::{load_sensitive_struct, KeyMaterial, SecurityError, SerdeCbor, SerdeJson},
+    security::{
+        decrypt_struct_with_aad, load_sensitive_struct, EncryptedData, KeyMaterial, SecurityError,
+        SerdeJson,
+    },
     utill::MIN_RELAY_FEE_RATE,
 };
 
@@ -431,28 +436,49 @@ fn assert_restores_sparse_bonds(
     assert_eq!(*from_full.get_external_index(), 31);
 }
 
-/// Asserts the wallet file on disk is genuinely encrypted with the given
-/// passphrase: it must be an encrypted container, reject a wrong password,
-/// and open with the correct one. (The missing-password `PasswordRequired`
-/// path is covered by wallet storage unit tests, which have the concrete
-/// `WalletStore` type available.)
+#[derive(Deserialize)]
+struct WalletEnvelope {
+    requires: Vec<String>,
+    encrypted: CborValue,
+}
+
+#[derive(Deserialize)]
+struct EncryptionParameters {
+    nonce: [u8; 12],
+    pbkdf2_salt: [u8; 16],
+}
+
+/// Decrypts the envelope's ciphertext with `password`, using its stored salt.
+/// The generic sensitive-file reader only handles the bare backup container.
+fn decrypt_wallet_file(path: &Path, password: &str) -> Result<CborValue, SecurityError> {
+    let mut envelope: WalletEnvelope = serde_cbor::from_slice(&fs::read(path).unwrap()).unwrap();
+    envelope.requires.sort_unstable();
+    envelope.requires.dedup();
+    let aad = envelope.requires.join("\n").into_bytes();
+    let parameters: EncryptionParameters = from_value(envelope.encrypted.clone()).unwrap();
+    let encrypted: EncryptedData = from_value(envelope.encrypted).unwrap();
+    let material = KeyMaterial::existing(
+        password.to_string(),
+        parameters.nonce,
+        parameters.pbkdf2_salt,
+    );
+    decrypt_struct_with_aad::<CborValue>(encrypted, &material, &aad)
+}
+
+/// Check the envelope's ciphertext with both passwords.
 fn assert_wallet_file_encrypted(path: &Path, password: &str) {
     assert!(
         Wallet::is_wallet_encrypted(path).unwrap(),
         "restored wallet file must be encrypted"
     );
-
-    let err = load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(
-        path,
-        Some("definitely-wrong-password".to_string()),
-    )
-    .expect_err("encrypted wallet file must reject a wrong password");
-    assert!(matches!(err, SecurityError::Decryption));
-
-    let (_, material) =
-        load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(path, Some(password.to_string()))
-            .expect("the restore password must open the restored wallet file");
-    assert!(material.is_some());
+    assert!(matches!(
+        decrypt_wallet_file(path, "definitely-wrong-password"),
+        Err(SecurityError::Decryption)
+    ));
+    assert!(matches!(
+        decrypt_wallet_file(path, password).unwrap(),
+        CborValue::Map(_)
+    ));
 }
 
 #[world_test(backend = BitcoindBackend, keypool = 1)]
@@ -530,17 +556,12 @@ fn encwallet_encbackup_encrestore(node: &mut Node) {
 
     // Loading a file with no saved tip resumes a restore, rerunning its probe.
     for path in [&original_wallet, &restored_wallet_file] {
-        let (saved, _) = load_sensitive_struct::<serde_cbor::Value, SerdeCbor>(
-            path,
-            Some("integration-test".to_string()),
-        )
-        .unwrap();
-        let serde_cbor::Value::Map(saved) = saved else {
+        let CborValue::Map(saved) = decrypt_wallet_file(path, "integration-test").unwrap() else {
             panic!("wallet file is not a map")
         };
-        let field = |name: &str| saved[&serde_cbor::Value::Text(name.to_string())].clone();
-        assert!(matches!(field("last_synced_height"), serde_cbor::Value::Integer(h) if h > 0));
-        assert_eq!(field("pending_restore"), serde_cbor::Value::Null);
+        let field = |name: &str| saved[&CborValue::Text(name.to_string())].clone();
+        assert!(matches!(field("last_synced_height"), CborValue::Integer(h) if h > 0));
+        assert_eq!(field("pending_restore"), CborValue::Null);
     }
 
     // A nameless restore path resolves to the backup's original filename

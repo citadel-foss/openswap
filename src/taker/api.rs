@@ -11,13 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) use super::swap_tracker::SwapPhase;
-use super::swap_tracker::{
-    funding_shared, incoming_claimed, now_secs, ContractOutcome, ContractResolution,
-    ExchangeProgress, FinalizationProgress, LegacyExchangeProgress, MakerProgress, RecoveryState,
-    SerializableSecretKey, SwapRecord, SwapTracker, TaprootExchangeProgress,
-};
-
 use bitcoin::{
     hashes::{hash160::Hash as Hash160, Hash},
     secp256k1::{
@@ -30,19 +23,21 @@ use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 use zeroize::Zeroizing;
 
 use crate::{
+    atomic_file::FileLock,
     blocklist::{AddOutcome, AddressBlocklist, BlocklistEntry},
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
     protocol::{
         common_messages::{
-            GetOffer, MakerToTakerMessage, Offer, PrivateKeyHandover, ProtocolVersion, SwapDetails,
-            SwapPrivkey, TakerHello, TakerToMakerMessage,
+            GetOffer, Hello, MakerToTakerMessage, Offer, PrivateKeyHandover, ProtocolVersion,
+            SwapDetails, SwapPrivkey, TakerToMakerMessage,
         },
         contract::calculate_pubkey_from_nonce,
+        features::{choose_pins, supported, unmet_for_flow, KNOWN},
     },
     utill::{
         funding_fee_policy_sats, generate_maker_keys, get_taker_dir, read_message, send_message,
-        sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
+        set_config_key, sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
         blockchain::BackendConnector,
@@ -468,8 +463,6 @@ pub(crate) struct OngoingSwapState {
     pub(crate) hashlock_nonces: Vec<SecretKey>,
     /// Spare maker addresses available to substitute if a selected maker rejects during negotiation.
     pub(crate) spare_makers: Vec<MakerAddress>,
-    /// Current phase of the swap lifecycle.
-    pub(crate) phase: SwapPhase,
     /// Reference block height captured during negotiation for consistent Taproot CLTV timelocks.
     /// Taproot uses absolute heights, so all timelock calculations must use the same base height.
     pub(crate) reference_height: Option<u32>,
@@ -506,6 +499,9 @@ pub(crate) struct MakerConnection {
     pub(crate) address: MakerAddress,
     /// Protocol version negotiated with this maker.
     pub(crate) protocol: ProtocolVersion,
+    /// Exact feature names this hop's swap uses. Every reconnect checks the
+    /// maker still lists them. Empty until negotiated.
+    pub(crate) pins: Vec<String>,
     /// Tweakable point for this swap.
     pub(crate) tweakable_point: Option<PublicKey>,
     /// Maker's offer (fee schedule), if known from offerbook discovery.
@@ -521,10 +517,6 @@ pub(crate) struct MakerConnection {
     /// The maker's frozen plan shape from its ack: one entry per planned
     /// funding tx, valued by input count. Empty until the ack arrives.
     pub(crate) funding_splits: Vec<u32>,
-    /// Protocol-specific exchange progress milestones.
-    pub(crate) exchange: ExchangeProgress,
-    /// Shared finalization milestones (preimage, privkey exchange).
-    pub(crate) finalization: FinalizationProgress,
 }
 
 impl MakerConnection {
@@ -538,45 +530,23 @@ impl MakerConnection {
         Self {
             address,
             protocol,
+            pins: Vec::new(),
             tweakable_point: None,
             offer,
             negotiated_timelock: 0,
             amount: Amount::ZERO,
             incoming_count: 0,
             funding_splits: Vec::new(),
-            exchange: match protocol {
-                ProtocolVersion::Legacy => {
-                    ExchangeProgress::Legacy(LegacyExchangeProgress::default())
-                }
-                ProtocolVersion::Taproot => {
-                    ExchangeProgress::Taproot(TaprootExchangeProgress::default())
-                }
-            },
-            finalization: FinalizationProgress::default(),
         }
     }
 
-    /// Get mutable reference to Legacy exchange progress.
-    pub(crate) fn legacy_exchange_mut(
-        &mut self,
-    ) -> Result<&mut LegacyExchangeProgress, TakerError> {
-        match &mut self.exchange {
-            ExchangeProgress::Legacy(ref mut l) => Ok(l),
-            _ => Err(TakerError::General(
-                "Expected Legacy exchange progress".to_string(),
-            )),
-        }
-    }
-
-    /// Get mutable reference to Taproot exchange progress.
-    pub(crate) fn taproot_exchange_mut(
-        &mut self,
-    ) -> Result<&mut TaprootExchangeProgress, TakerError> {
-        match &mut self.exchange {
-            ExchangeProgress::Taproot(ref mut t) => Ok(t),
-            _ => Err(TakerError::General(
-                "Expected Taproot exchange progress".to_string(),
-            )),
+    /// Names this maker's Hello must list on every reconnect: the pins, or
+    /// just the protocol before they are negotiated.
+    pub(crate) fn needed(&self) -> Vec<String> {
+        if self.pins.is_empty() {
+            vec![self.protocol.feature_name().to_string()]
+        } else {
+            self.pins.clone()
         }
     }
 }
@@ -611,6 +581,8 @@ impl Taker {
 pub struct Taker {
     /// Configuration.
     pub(crate) config: TakerInitConfig,
+    /// Feature names a swap must pin where they apply, from `require_features` in config.toml.
+    pub(crate) require_features: Vec<String>,
     /// Wallet for managing funds.
     pub(crate) wallet: Arc<RwLock<Wallet>>,
     /// Opens backend connections without taking the wallet lock.
@@ -625,8 +597,8 @@ pub struct Taker {
     offer_sync_handle: OfferSyncHandle,
     /// Ongoing swap state (`None` when no swap is active).
     pub(crate) ongoing_swap: Option<OngoingSwapState>,
-    /// Persistent swap tracker for crash-resilient recovery.
-    pub(crate) swap_tracker: Arc<Mutex<SwapTracker>>,
+    /// Excludes the active swap from wallet recovery.
+    pub(crate) live_swap: Arc<Mutex<Option<String>>>,
     /// Background recovery loop (active when incomplete swap recovery is in progress).
     recovery_loop: Option<RecoveryLoop>,
     /// Breach detector for legacy swaps (monitors funding outpoints for adversarial contract broadcasts).
@@ -637,6 +609,9 @@ pub struct Taker {
     /// Test behavior.
     #[cfg(feature = "integration-test")]
     pub behavior: TakerBehavior,
+    /// Keeps a second process off this wallet while this one runs. Last, so
+    /// it is released only after every other field has stopped.
+    _wallet_lock: Option<FileLock>,
 }
 
 impl Drop for Taker {
@@ -644,18 +619,6 @@ impl Drop for Taker {
         log::info!("Shutting down taker.");
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        // Flush any pending swap state before shutdown
-        if let Some(swap) = &self.ongoing_swap {
-            if let Ok(record) = self.persist_build_record(swap) {
-                // Drop can't propagate; a poisoned tracker must not abort the
-                // process while we're already unwinding.
-                let mut tracker =
-                    lock_debug!(self.swap_tracker.lock()).unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = tracker.save_record(&record) {
-                    log::error!("Failed to flush swap tracker on shutdown: {:?}", e);
-                }
-            }
-        }
         // Shut down background recovery loop (if running)
         if let Some(recovery) = self.recovery_loop.take() {
             log::info!("Shutting down recovery loop");
@@ -768,6 +731,9 @@ impl Taker {
             .unwrap_or_else(get_taker_dir)?;
         std::fs::create_dir_all(&data_dir)?;
         let wallet_path = data_dir.join("wallets").join(&wallet_name);
+        // `Wallet::load` takes its own shared lock on `<wallet>.lock`; an
+        // exclusive one taken here on another handle would block it forever.
+        let wallet_lock = None;
         let shutdown = Arc::new(AtomicBool::new(false));
         let blockchain = AnyBlockchain::from_config_with_shutdown(&backend, shutdown.clone())?;
         // Misconfiguration (no txindex, dead ZMQ) must fail here, not mid-swap.
@@ -800,7 +766,7 @@ impl Taker {
             log::error!("could not rebuild watches on startup: {e}; recovery remains active");
         }
 
-        Self::init_taker_config(&config, &data_dir)?;
+        let require_features = Self::init_taker_config(&config, &data_dir)?;
 
         let connector = BackendConnector::new(backend, shutdown.clone());
 
@@ -814,13 +780,10 @@ impl Taker {
             initial_sync_complete,
             shutdown.clone(),
         )?;
-        let swap_tracker = Arc::new(Mutex::new(SwapTracker::load_or_create(&data_dir)?));
-        lock_debug!(swap_tracker.lock())
-            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?
-            .cleanup_incomplete();
 
         let mut taker = Taker {
             config,
+            require_features,
             wallet: Arc::new(RwLock::new(wallet)),
             backend: connector,
             shutdown,
@@ -828,7 +791,8 @@ impl Taker {
             watch_service,
             offer_sync_handle,
             ongoing_swap: None,
-            swap_tracker,
+            live_swap: Arc::new(Mutex::new(None)),
+            _wallet_lock: wallet_lock,
             recovery_loop: None,
             breach_detector: None,
             #[cfg(feature = "lightning")]
@@ -854,23 +818,17 @@ impl Taker {
         Ok(taker)
     }
 
-    /// After a restart nothing in memory owns a funding claim. A swap reaches
-    /// its broadcast loop only once its tracker record says `FundsBroadcast`,
-    /// so a claim without an incomplete record never sent a tx: release it.
+    /// After a restart nothing in memory owns a funding claim. A claim is saved
+    /// with its swap's coins, so one whose swap left no coins never sent a tx.
     /// Claims of swaps still in recovery stay until recovery cleans them up.
     fn release_orphan_reservations(&self) -> Result<(), TakerError> {
-        let tracked: HashSet<String> = lock_debug!(self.swap_tracker.lock())
-            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?
-            .incomplete_swaps()
-            .into_iter()
-            .map(|record| record.swap_id.clone())
-            .collect();
         let mut wallet = self.write_wallet()?;
+        let owned = wallet.swap_ids();
         let orphans: Vec<String> = wallet
             .store
             .swap_locks
             .keys()
-            .filter(|id| !tracked.contains(*id))
+            .filter(|id| !owned.contains(*id))
             .cloned()
             .collect();
         for id in &orphans {
@@ -891,19 +849,9 @@ impl Taker {
     fn init_recover_wallet(&mut self) {
         log::info!("Checking wallet for unresolved swap contracts...");
 
-        let scope = lock_debug!(self.swap_tracker.lock())
-            .ok()
-            .zip(self.read_wallet().ok())
-            .map(|(mut tracker, wallet)| tracker.recovery_scope_listing(&wallet));
-        // The loop retries the scope every pass, so a failure here skips only
-        // this startup pass, never the loop itself.
-        let scope = match scope {
-            Some(Ok(scope)) => Some(scope),
-            other => {
-                log::warn!("Startup recovery: could not read the recovery scope: {other:?}");
-                None
-            }
-        };
+        let scope = RecoveryLoop::scope(&self.live_swap, &self.wallet)
+            .inspect_err(|e| log::warn!("Startup recovery: scope: {e}"))
+            .ok();
         if scope
             .as_ref()
             .is_some_and(|(swap_ids, _)| swap_ids.is_empty())
@@ -929,8 +877,8 @@ impl Taker {
                 &crate::utill::NO_SHUTDOWN,
                 &incoming_contract_txids,
                 &swap_ids,
-                &|coin_swap| funding_shared(&self.swap_tracker, coin_swap),
-                &|swap_id| incoming_claimed(&self.swap_tracker, &self.wallet, swap_id),
+                &|_| true,
+                &|_| false,
             ) {
                 Ok((swept, recovered)) if !swept.is_empty() || !recovered.is_empty() => {
                     log::info!(
@@ -938,42 +886,18 @@ impl Taker {
                         swept.resolved.len(),
                         recovered.len()
                     );
-                    // Reports need these outcomes, and later passes read the claims back.
-                    if let Ok(mut tracker) = lock_debug!(self.swap_tracker.lock()) {
-                        RecoveryLoop::update_tracker_outcomes(
-                            &mut tracker,
-                            &swap_ids,
-                            &swept,
-                            &recovered,
-                        );
-                    }
                 }
                 Ok(_) => {}
                 Err(e) => log::warn!("Startup recovery failed: {:?}", e),
             }
         }
 
-        // Always start the loop: with nothing left, its first pass still marks
-        // the swaps cleaned up and writes their reports, so restarts stop retrying.
-        let data_dir = match self
-            .config
-            .data_dir
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(get_taker_dir)
-        {
-            Ok(dir) => dir,
-            Err(e) => {
-                log::warn!("Startup recovery: {e}; skipping recovery loop");
-                return;
-            }
-        };
+        // The loop handles contracts that did not mature during startup.
         match RecoveryLoop::start(
             self.wallet.clone(),
             self.backend.clone(),
-            self.swap_tracker.clone(),
+            self.live_swap.clone(),
             self.watch_service.clone(),
-            data_dir,
         ) {
             Ok(rl) => self.recovery_loop = Some(rl),
             // Without the loop, remaining contracts are never swept.
@@ -1020,12 +944,14 @@ impl Taker {
         Ok((watch_service, registry_clone, initial_sync_complete))
     }
 
-    /// Load/merge taker config and check Tor status.
+    /// Load/merge taker config and check Tor status. Returns `require_features`.
     fn init_taker_config(
         config: &TakerInitConfig,
         data_dir: &std::path::Path,
-    ) -> Result<(), TakerError> {
-        let mut taker_config = TakerConfig::new(Some(&data_dir.join("config.toml")))?;
+    ) -> Result<Vec<String>, TakerError> {
+        let config_path = data_dir.join("config.toml");
+        let loaded = TakerConfig::new(Some(&config_path))?;
+        let mut taker_config = loaded.clone();
 
         if let Some(control_port) = config.control_port {
             taker_config.control_port = control_port;
@@ -1041,7 +967,7 @@ impl Taker {
             taker_config.check_blocklist = check_blocklist;
         }
 
-        // Carried across the rewrite like every other setting above: the CLI
+        // Saved like every other setting above: the CLI
         // rebuilds `TakerInitConfig` from this file on the next launch, so
         // dropping these would silently disable the Lightning backend — and
         // with it the automatic recovery of any swap still in flight.
@@ -1065,8 +991,33 @@ impl Taker {
             )?;
         }
 
-        taker_config.write_to_file(&data_dir.join("config.toml"))?;
-        Ok(())
+        // Write only what changed: a full rewrite drops keys this build doesn't know.
+        let fields = |c: &TakerConfig| {
+            [
+                ("control_port", c.control_port.to_string()),
+                ("socks_port", c.socks_port.to_string()),
+                ("tor_auth_password", c.tor_auth_password.clone()),
+                ("check_blocklist", c.check_blocklist.to_string()),
+                (
+                    "ldk_server_url",
+                    c.ldk_server_url.clone().unwrap_or_default(),
+                ),
+                (
+                    "ldk_api_key_path",
+                    c.ldk_api_key_path.clone().unwrap_or_default(),
+                ),
+                (
+                    "ldk_tls_cert_path",
+                    c.ldk_tls_cert_path.clone().unwrap_or_default(),
+                ),
+            ]
+        };
+        for ((key, old), (_, new)) in fields(&loaded).iter().zip(&fields(&taker_config)) {
+            if old != new {
+                set_config_key(&config_path, key, new)?;
+            }
+        }
+        Ok(loaded.require_features)
     }
 
     /// Start the background offer sync service.
@@ -1100,14 +1051,11 @@ impl Taker {
         &self.config
     }
 
-    /// Log the current swap tracker state at INFO level.
+    /// Log unresolved swaps retained in the wallet.
     pub fn log_tracker_state(&self) {
-        // Info-only path; a poisoned tracker should not kill the caller.
-        let Ok(tracker) = lock_debug!(self.swap_tracker.lock()) else {
-            log::error!("swap tracker lock poisoned; skipping tracker state log");
-            return;
-        };
-        tracker.log_state();
+        if let Ok(wallet) = self.read_wallet() {
+            log::info!("Unresolved wallet swaps: {:?}", wallet.swap_ids());
+        }
     }
 
     /// Check whether the background recovery loop has completed.
@@ -1148,6 +1096,22 @@ impl Taker {
     /// or locked before `start_swap`, `start_swap` fails before anything is
     /// broadcast; prepare again to plan from the coins left.
     pub fn prepare_swap(&mut self, params: SwapParams) -> Result<SwapSummary, TakerError> {
+        // A prepared swap that was never started has nothing committed, so a
+        // new prepare replaces it, as it did before the live slot existed.
+        if self.ongoing_swap.is_some() {
+            if !self.no_outgoing_funding_on_chain() {
+                return Err(TakerError::General("A swap is already active".into()));
+            }
+            self.abort_unfunded_swap()?;
+        }
+        let result = self.prepare_swap_inner(params);
+        if result.is_err() && self.ongoing_swap.is_some() {
+            self.abort_unfunded_swap()?;
+        }
+        result
+    }
+
+    fn prepare_swap_inner(&mut self, params: SwapParams) -> Result<SwapSummary, TakerError> {
         log::info!(
             "Preparing openswap: amount={}, makers={}, protocol={:?}",
             params.send_amount,
@@ -1216,6 +1180,14 @@ impl Taker {
         let maker_count = params.maker_count;
         let should_sync_offerbook = params.preferred_makers.is_none();
 
+        {
+            let mut live = lock_debug!(self.live_swap.lock())
+                .map_err(|_| TakerError::General("live swap lock poisoned".into()))?;
+            if live.is_some() {
+                return Err(TakerError::General("A swap still owns the wallet".into()));
+            }
+            *live = Some(swap_id.clone());
+        }
         self.ongoing_swap = Some(OngoingSwapState {
             id: swap_id.clone(),
             preimage,
@@ -1227,7 +1199,6 @@ impl Taker {
             multisig_nonces: Vec::new(),
             hashlock_nonces: Vec::new(),
             spare_makers: Vec::new(),
-            phase: SwapPhase::MakersDiscovered,
             reference_height: None,
             hop0_plan: Hop0Plan::default(),
             payment: None,
@@ -1240,7 +1211,6 @@ impl Taker {
             self.sync_offerbook_and_wait()?;
         }
         self.discover_makers()?;
-        self.persist_swap(SwapPhase::MakersDiscovered)?;
 
         // PaySwap: solve the gross route amount before any amount is quoted.
         if let Some(address) = payment_address {
@@ -1273,7 +1243,6 @@ impl Taker {
         }
 
         self.negotiate_swap_details()?;
-        self.persist_swap(SwapPhase::Negotiated)?;
 
         // Build the summary from negotiated state. Re-read the amount: a
         // payment route solve rewrites it to the gross.
@@ -1396,6 +1365,14 @@ impl Taker {
     /// Commits funds on-chain: creates funding transactions, exchanges
     /// contracts with makers, finalizes, and sweeps.
     pub fn start_swap(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
+        // A wrong id must leave the prepared swap alone, not abort it.
+        let current_id = self.swap_state()?.id.clone();
+        if current_id != swap_id {
+            return Err(TakerError::General(format!(
+                "No prepared swap with id '{}' (current: '{}')",
+                swap_id, current_id
+            )));
+        }
         let result = self.start_swap_inner(swap_id);
         if let Err(error) = &result {
             if let Err(reconcile_error) = self.reconcile_start_failure(error) {
@@ -1413,44 +1390,19 @@ impl Taker {
     /// reached the network. This boundary covers failures from sweep, wallet
     /// sync, cleanup, and other `?` exits as well as protocol errors.
     fn reconcile_start_failure(&mut self, error: &TakerError) -> Result<(), TakerError> {
-        let failed_at = match self.ongoing_swap.as_ref() {
-            Some(swap)
-                if matches!(
-                    swap.phase,
-                    SwapPhase::FundsBroadcast
-                        | SwapPhase::ContractsExchanged
-                        | SwapPhase::Finalizing
-                        | SwapPhase::PrivkeysForwarded
-                ) =>
-            {
-                swap.phase
-            }
-            // Short of the broadcast loop nothing can land, so the funding
-            // claim goes with the failed start.
-            Some(swap) if swap.phase < SwapPhase::FundsBroadcast => {
-                let swap_id = swap.id.clone();
-                return self.release_funding_claim(&swap_id);
-            }
-            _ => return Ok(()),
-        };
-
-        // Recovery must not depend on this save: the tracker is updated in memory
-        let persisted = self.persist_failure(failed_at, error);
-        let recovered = self.recover_active_swap();
-        persisted.and(recovered)
+        if self.ongoing_swap.is_none() {
+            return Ok(());
+        }
+        log::warn!("Swap failed: {error:?}");
+        if self.no_outgoing_funding_on_chain() {
+            self.abort_unfunded_swap()
+        } else {
+            self.recover_active_swap()
+        }
     }
 
     fn start_swap_inner(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
         let swap_start_time = Instant::now();
-
-        // Verify the swap_id matches the prepared swap.
-        let current_id = self.swap_state()?.id.clone();
-        if current_id != swap_id {
-            return Err(TakerError::General(format!(
-                "No prepared swap with id '{}' (current: '{}')",
-                swap_id, current_id
-            )));
-        }
         #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::StopWatcherBeforeSwap {
             self.watch_service.stop_watcher_for_test();
@@ -1479,15 +1431,12 @@ impl Taker {
 
         self.funding_initialize()?;
 
-        // SP3: Persist after funding initialization (outgoing txids created).
-        self.persist_swap(SwapPhase::FundingCreated)?;
-
         #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::PayFromPlannedCoinsBeforeBroadcast {
             self.pay_from_planned_coins()?;
         }
 
-        // Protocol-specific execution with phase-aware recovery triggers.
+        // Protocol-specific exchange and funding.
         let protocol = self.swap_state()?.params.protocol;
         // Taproot knows its final route here, so one heartbeat can span both
         // exchange and finalization. Legacy owns an exchange-local heartbeat
@@ -1528,7 +1477,6 @@ impl Taker {
                                 log::error!("Failed to reinitialize funding: {:?}", fund_err);
                                 break;
                             }
-                            self.persist_swap(SwapPhase::FundingCreated)?;
                             exchange_result = self.exchange_legacy();
                             continue;
                         }
@@ -1547,18 +1495,7 @@ impl Taker {
                             log::warn!("Funding txs were broadcast, triggering recovery");
                         } else {
                             log::info!("No funds on-chain — safe to abort");
-                            // A failed save leaves the claim on disk for the startup sweep.
-                            if let Err(err) = self.release_funding_claim(swap_id) {
-                                log::error!("Failed to release the funding claim: {:?}", err);
-                            }
-                            let _ = lock_debug!(self.swap_tracker.lock())
-                                .map_err(|_| {
-                                    TakerError::General("swap tracker lock poisoned".into())
-                                })?
-                                .remove_record(
-                                    &self.swap_state().map(|s| s.id.clone()).unwrap_or_default(),
-                                );
-                            self.ongoing_swap = None;
+                            self.abort_unfunded_swap()?;
                         }
                         return Err(e);
                     }
@@ -1576,16 +1513,7 @@ impl Taker {
                         log::warn!("Funds were broadcast, triggering recovery");
                     } else {
                         log::info!("No funds on-chain — safe to abort");
-                        // A failed save leaves the claim on disk for the startup sweep.
-                        if let Err(err) = self.release_funding_claim(swap_id) {
-                            log::error!("Failed to release the funding claim: {:?}", err);
-                        }
-                        let _ = lock_debug!(self.swap_tracker.lock())
-                            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?
-                            .remove_record(
-                                &self.swap_state().map(|s| s.id.clone()).unwrap_or_default(),
-                            );
-                        self.ongoing_swap = None;
+                        self.abort_unfunded_swap()?;
                     }
                     return Err(e);
                 }
@@ -1609,12 +1537,7 @@ impl Taker {
                 let _ = wallet.send_tx(&outgoing.contract_tx);
             }
             drop(wallet);
-            let phase = self
-                .swap_state()
-                .map(|s| s.phase)
-                .unwrap_or(SwapPhase::FundsBroadcast);
             let err = TakerError::General("Test: broadcast contract after full setup".to_string());
-            self.persist_failure(phase, &err)?;
             return Err(err);
         }
 
@@ -1640,12 +1563,8 @@ impl Taker {
         if self.behavior == TakerBehavior::CrashAfterContractExchange {
             log::warn!("Test behavior: crashing after contract exchange");
             let err = TakerError::General("Test: crashed after contract exchange".to_string());
-            self.persist_failure(SwapPhase::ContractsExchanged, &err)?;
             return Err(err);
         }
-
-        // SP7: Finalization starts.
-        self.persist_swap(SwapPhase::Finalizing)?;
 
         // Crash with every contract funded and persisted but nothing settled, so
         // no counterparty has been handed a key either.
@@ -1653,7 +1572,6 @@ impl Taker {
         if self.behavior == TakerBehavior::CrashBeforeRecovery {
             log::warn!("Test behavior: crashing before finalization");
             let err = TakerError::General("Test: crashed before finalization".to_string());
-            self.persist_failure(SwapPhase::Finalizing, &err)?;
             return Err(err);
         }
 
@@ -1678,7 +1596,6 @@ impl Taker {
         }
 
         // Success path: sweep + report (shared by both protocols)
-        let swap_id_owned = swap_id.to_string();
         let incoming_contract_txids: HashSet<_> = self
             .swap_state()?
             .incoming_swapcoins
@@ -1706,23 +1623,6 @@ impl Taker {
             return Err(err);
         }
 
-        self.populate_success_outcomes(&swap_id_owned, &swept)?;
-
-        {
-            let swap_id_for_cleanup = self.swap_state()?.id.clone();
-            let mut wallet = self.write_wallet()?;
-            let outgoing_keys = wallet.outgoing_keys_for_swap(&swap_id_for_cleanup);
-            for key in &outgoing_keys {
-                wallet.remove_outgoing_swapcoin(key);
-            }
-            wallet.remove_watchonly_swapcoins(&swap_id_for_cleanup);
-            // Every broadcast was accepted by now; the swap is over either way.
-            wallet.release_swap_locks(&swap_id_for_cleanup, None);
-            wallet.save_to_disk()?;
-        }
-
-        self.persist_swap(SwapPhase::Completed)?;
-
         // Generate, save, and return the SwapReport
         let report = self.generate_swap_report(
             &initial_utxos,
@@ -1732,6 +1632,15 @@ impl Taker {
             Some(&swept),
         )?;
 
+        {
+            let swap_id = self.swap_state()?.id.clone();
+            let mut live = lock_debug!(self.live_swap.lock())
+                .map_err(|_| TakerError::General("live swap lock poisoned".into()))?;
+            let mut wallet = self.write_wallet()?;
+            wallet.remove_swap_coins_and_save(&swap_id, false, true)?;
+            *live = None;
+        }
+        self.ongoing_swap = None;
         log::info!("OpenSwap completed successfully: {:?}", report);
         Ok(report)
     }
@@ -2115,10 +2024,19 @@ impl Taker {
         let maker_address = self.swap_state()?.makers[maker_idx].address.to_string();
         log::info!("Connecting to maker {} at {}", maker_idx, maker_address);
 
-        let mut stream = self.net_connect(&maker_address)?;
-
-        let negotiated_protocol = self.net_handshake(&mut stream)?;
-        log::info!("Handshake complete, protocol: {:?}", negotiated_protocol);
+        let negotiated_protocol = self.swap_state()?.params.protocol;
+        let flow = negotiated_protocol.feature_name();
+        let (mut stream, features) = self.net_connect_with(&maker_address, &[flow.to_string()])?;
+        let pins = choose_pins(flow, &features);
+        // Checked before anything is funded: a maker that can't meet our
+        // requirements for this flow is skipped like any refusing maker.
+        unmet_for_flow(&self.require_features, &pins, flow).map_err(|missing| {
+            TakerError::General(format!(
+                "Maker {} cannot meet required features {:?}",
+                maker_idx, missing
+            ))
+        })?;
+        log::info!("Handshake complete, pins: {:?}", pins);
 
         // Fetch the maker's offer before proposing swap details.
         // This gives us the fee schedule for amount verification later.
@@ -2193,7 +2111,7 @@ impl Taker {
 
         let swap_details = SwapDetails {
             id: swap_id.to_string(),
-            protocol_version: negotiated_protocol,
+            features: pins.clone(),
             amount,
             tx_count,
             incoming_count,
@@ -2230,6 +2148,7 @@ impl Taker {
                     let swap = self.swap_state_mut()?;
                     swap.makers[maker_idx].tweakable_point = Some(tweakable_point);
                     swap.makers[maker_idx].protocol = negotiated_protocol;
+                    swap.makers[maker_idx].pins = pins;
                     swap.makers[maker_idx].negotiated_timelock = timelock;
                     swap.makers[maker_idx].amount = amount;
                     swap.makers[maker_idx].incoming_count = incoming_count;
@@ -2358,23 +2277,9 @@ impl Taker {
         maker_address: &str,
         details: &SwapDetails,
     ) -> Result<MakerToTakerMessage, TakerError> {
-        let mut stream = self.net_connect(maker_address)?;
-        // net_handshake reads the live swap state, but a replay can target a
-        // swap that already aborted and cleared it; take the protocol from the
-        // details being replayed instead.
-        send_message(&mut stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(&mut stream)?)?;
-        match msg {
-            MakerToTakerMessage::MakerHello(hello)
-                if hello
-                    .supported_protocols
-                    .contains(&details.protocol_version) => {}
-            _ => {
-                return Err(TakerError::General(
-                    "Expected MakerHello supporting the replayed protocol".to_string(),
-                ))
-            }
-        }
+        // A replay can target a swap that already aborted and cleared the live
+        // state, so the maker must list what the replayed details use.
+        let (mut stream, _) = self.net_connect_with(maker_address, &details.features)?;
         send_message(&mut stream, &TakerToMakerMessage::GetOffer(GetOffer))?;
         read_message(&mut stream)?;
         send_message(
@@ -2392,7 +2297,7 @@ impl Taker {
             + REFUND_LOCKTIME_STEP * (swap.makers.len() - maker_idx - 1) as u16;
         let details = SwapDetails {
             id: swap.id.clone(),
-            protocol_version: swap.params.protocol,
+            features: swap.makers[maker_idx].needed(),
             amount: swap.makers[maker_idx].amount,
             tx_count: swap.params.hop_tx_counts()[maker_idx + 1],
             incoming_count: swap.makers[maker_idx].incoming_count,
@@ -2470,8 +2375,8 @@ impl Taker {
         self.resend_swap_details(&address, &details)
     }
 
-    /// Send bare `WaitingFundingConfirmation` keepalives for `swap_ids`, in
-    /// order and `gap` apart, on one fresh connection, the way the route
+    /// Exchange feature Hellos, then send `WaitingFundingConfirmation` keepalives
+    /// for `swap_ids`, in order and `gap` apart, on one connection, the way the route
     /// heartbeat does. Test hook for the keepalive tests; the maker answers
     /// with silence either way, so acceptance vs refusal is observable in its
     /// log only.
@@ -2482,14 +2387,7 @@ impl Taker {
         swap_ids: &[&str],
         gap: std::time::Duration,
     ) -> Result<(), TakerError> {
-        let mut stream = self.net_connect(maker_address)?;
-        send_message(&mut stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
-        let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(&mut stream)?)?;
-        if !matches!(msg, MakerToTakerMessage::MakerHello(_)) {
-            return Err(TakerError::General(
-                "Expected MakerHello before a keepalive".to_string(),
-            ));
-        }
+        let (mut stream, _) = self.net_connect_with(maker_address, &[])?;
         for (i, swap_id) in swap_ids.iter().enumerate() {
             if i > 0 {
                 std::thread::sleep(gap);
@@ -2721,23 +2619,10 @@ impl Taker {
         Ok(self.read_wallet()?.reserved_inputs())
     }
 
-    /// Drop the hop-0 funding claim of a swap that never entered its
-    /// broadcast loop. Never call it past that point: a sent tx may still land.
-    fn release_funding_claim(&self, swap_id: &str) -> Result<(), TakerError> {
-        let mut wallet = self.write_wallet()?;
-        if wallet.release_swap_locks(swap_id, None) {
-            wallet.save_to_disk()?;
-        }
-        Ok(())
-    }
-
-    /// True only while the funding broadcast loop was never entered. The phase
-    /// flips to FundsBroadcast before the first send, so past that point a
-    /// partial batch is possible, substitution is off the table, and a failure
-    /// goes to recovery.
+    /// Only uncommitted recovery keys may be replaced by a spare route.
     fn no_outgoing_funding_on_chain(&self) -> bool {
         match self.swap_state() {
-            Ok(swap) => swap.phase < SwapPhase::FundsBroadcast,
+            Ok(swap) => swap.outgoing_swapcoins.iter().all(|coin| !coin.committed),
             Err(_) => false,
         }
     }
@@ -2931,51 +2816,79 @@ impl Taker {
         Ok(())
     }
 
-    /// Perform handshake with a maker and verify protocol support.
-    pub(crate) fn net_handshake(
-        &self,
-        stream: &mut TcpStream,
-    ) -> Result<ProtocolVersion, TakerError> {
-        handshake_with_maker(stream, self.swap_state()?.params.protocol)
+    /// Connect to a maker on the live swap and exchange Hellos. The maker must
+    /// still list this hop's pins.
+    pub(crate) fn net_connect(&self, address: &str) -> Result<TcpStream, TakerError> {
+        let swap = self.swap_state()?;
+        let needed = match swap
+            .makers
+            .iter()
+            .find(|m| m.address.to_string() == address)
+        {
+            Some(maker) => maker.needed(),
+            None => vec![swap.params.protocol.feature_name().to_string()],
+        };
+        Ok(self.net_connect_with(address, &needed)?.0)
     }
 
-    /// Connect to a maker using either direct connection or Tor proxy.
-    pub(crate) fn net_connect(&self, address: &str) -> Result<TcpStream, TakerError> {
-        connect_to_maker(
+    /// Connect to a maker directly or through Tor and exchange Hellos. The
+    /// maker must list every name in `needed`; returns the names it listed.
+    pub(crate) fn net_connect_with(
+        &self,
+        address: &str,
+        needed: &[String],
+    ) -> Result<(TcpStream, Vec<String>), TakerError> {
+        let mut stream = connect_to_maker(
             address,
             self.config.connection_type,
             self.config.socks_port,
             Duration::from_secs(MAKER_RESPONSE_TIMEOUT_SECS),
-        )
+        )?;
+        let features = handshake_with_maker(&mut stream, needed)?;
+        Ok((stream, features))
     }
 }
 
-/// Handshake over an already-connected stream, asserting the maker supports
-/// `desired`. Free of `Taker` so background threads can reconnect on their own.
+/// Exchange Hellos over a connected stream. The maker must list every name in
+/// `needed`. Returns the names it listed that this build recognizes; the rest
+/// mean nothing here. Free of `Taker` so background threads can reconnect.
 pub(crate) fn handshake_with_maker(
     stream: &mut TcpStream,
-    desired: ProtocolVersion,
-) -> Result<ProtocolVersion, TakerError> {
-    send_message(stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
+    needed: &[String],
+) -> Result<Vec<String>, TakerError> {
+    let hello = Hello {
+        features: supported().into_iter().map(String::from).collect(),
+    };
+    send_message(stream, &TakerToMakerMessage::Hello(hello))?;
 
-    let msg_bytes = read_message(stream)?;
-    let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
-
-    match msg {
-        MakerToTakerMessage::MakerHello(maker_hello) => {
-            if maker_hello.supported_protocols.contains(&desired) {
-                Ok(desired)
-            } else {
-                Err(TakerError::General(format!(
-                    "Maker does not support {:?}. Supported: {:?}",
-                    desired, maker_hello.supported_protocols
-                )))
-            }
+    let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(stream)?)?;
+    let features = match msg {
+        MakerToTakerMessage::Hello(hello) => hello.features,
+        MakerToTakerMessage::Unsupported(refusal) => {
+            return Err(TakerError::General(format!(
+                "Maker refused our Hello: {}",
+                refusal.reason
+            )))
         }
-        _ => Err(TakerError::General(
-            "Expected MakerHello response".to_string(),
-        )),
+        other => {
+            return Err(TakerError::General(format!(
+                "Expected Hello, got {other:?}"
+            )))
+        }
+    };
+    // Registry order, each name once: repeats can't grow what we keep.
+    let features: Vec<String> = KNOWN
+        .iter()
+        .filter(|f| features.iter().any(|name| name == f.name))
+        .map(|f| f.name.to_string())
+        .collect();
+    let missing: Vec<&String> = needed.iter().filter(|n| !features.contains(n)).collect();
+    if !missing.is_empty() {
+        return Err(TakerError::General(format!(
+            "Maker does not list {missing:?}"
+        )));
     }
+    Ok(features)
 }
 
 /// Connect to a maker directly or through Tor. Free of `Taker` so background
@@ -3031,17 +2944,16 @@ impl Taker {
         swap_id: &str,
     ) -> Option<super::background_services::RouteHeartbeat> {
         let state = self.swap_state().ok()?;
-        let addresses: Vec<String> = state
+        let peers: Vec<(String, Vec<String>)> = state
             .makers
             .iter()
-            .map(|maker| maker.address.to_string())
+            .map(|maker| (maker.address.to_string(), maker.needed()))
             .collect();
         let dial = super::background_services::PeerDial {
             connection_type: self.config.connection_type,
             socks_port: self.config.socks_port,
-            protocol: state.params.protocol,
         };
-        match super::background_services::RouteHeartbeat::start(swap_id, addresses, dial) {
+        match super::background_services::RouteHeartbeat::start(swap_id, peers, dial) {
             Ok(heartbeat) => Some(heartbeat),
             Err(e) => {
                 log::warn!("route heartbeat failed to start: {e:?}");
@@ -3055,8 +2967,6 @@ impl Taker {
         log::info!("Finalizing swap...");
 
         self.finalize_exchange_privkeys()?;
-
-        self.persist_swap(SwapPhase::PrivkeysForwarded)?;
 
         self.persist_incoming_swapcoins()?;
 
@@ -3101,8 +3011,6 @@ impl Taker {
                     let result = (|| -> Result<Vec<SecretKey>, TakerError> {
                         let maker_address = self.swap_state()?.makers[i].address.to_string();
                         let mut stream = self.net_connect(&maker_address)?;
-
-                        self.net_handshake(&mut stream)?;
 
                         log::info!("Sending privkey to maker {} and awaiting response", i);
 
@@ -3164,13 +3072,6 @@ impl Taker {
                     }
                 }
             };
-
-            self.swap_state_mut()?.makers[i]
-                .finalization
-                .privkey_received = true;
-            self.swap_state_mut()?.makers[i]
-                .finalization
-                .privkey_forwarded = true;
             #[cfg(debug_assertions)]
             log::debug!(
                 "[FINALIZATION] SwapID: {} | MakerIndex: {} | MakersTotal: {} | PrivkeyReceived: true | PrivkeyForwarded: true",
@@ -3237,7 +3138,6 @@ impl Taker {
             }
 
             current_privkeys = received_privkeys;
-            self.persist_progress()?;
         }
 
         Ok(())
@@ -3261,7 +3161,6 @@ impl Taker {
             wallet.get_incoming_swapcoins_count()
         );
         drop(wallet);
-        self.persist_progress()?;
         Ok(())
     }
 
@@ -3287,137 +3186,34 @@ impl Taker {
         }
     }
 
-    /// Build a `SwapRecord` from the current `OngoingSwapState`.
-    fn persist_build_record(&self, swap: &OngoingSwapState) -> Result<SwapRecord, TakerError> {
-        let now = now_secs();
-        Ok(SwapRecord {
-            swap_id: swap.id.clone(),
-            preimage: swap.preimage,
-            protocol: swap.params.protocol,
-            send_amount_sat: swap.params.send_amount.to_sat(),
-            maker_count: swap.params.maker_count,
-            phase: swap.phase,
-            failed_at_phase: None,
-            failure_reason: None,
-            makers: swap
-                .makers
-                .iter()
-                .map(|m| MakerProgress {
-                    address: m.address.to_string(),
-                    negotiated: m.tweakable_point.is_some(),
-                    exchange: m.exchange.clone(),
-                    finalization: m.finalization.clone(),
-                })
-                .collect(),
-            outgoing_contract_txids: swap
-                .outgoing_swapcoins
-                .iter()
-                .map(|sc| sc.contract_tx.compute_txid())
-                .collect(),
-            incoming_contract_txids: swap
-                .incoming_swapcoins
-                .iter()
-                .map(|sc| sc.contract_tx.compute_txid())
-                .collect(),
-            watchonly_contract_txids: swap
-                .watchonly_swapcoins
-                .iter()
-                .map(|sc| sc.contract_tx.compute_txid())
-                .collect(),
-            recovery: RecoveryState::default(),
-            multisig_nonces: swap
-                .multisig_nonces
-                .iter()
-                .map(|k| SerializableSecretKey::from(*k))
-                .collect(),
-            hashlock_nonces: swap
-                .hashlock_nonces
-                .iter()
-                .map(|k| SerializableSecretKey::from(*k))
-                .collect(),
-            payment_address: swap.payment.as_ref().map(|p| p.address.to_string()),
-            payment_amount_sat: swap.payment.as_ref().map(|p| p.amount.to_sat()),
-            created_at: now,
-            updated_at: now,
-        })
-    }
-
-    /// Flush the current swap state to the tracker on disk.
-    ///
-    /// Sets the swap phase and rebuilds the full record from `OngoingSwapState`
-    /// so that maker progress, txids, and nonces stay up-to-date. Preserves
-    /// `created_at` and `recovery` from any existing record.
-    pub(crate) fn persist_swap(&mut self, phase: SwapPhase) -> Result<(), TakerError> {
-        let swap = self.swap_state_mut()?;
-        swap.phase = phase;
-
-        // Snapshot preserved fields from any existing record.
+    fn abort_unfunded_swap(&mut self) -> Result<(), TakerError> {
         let swap_id = self.swap_state()?.id.clone();
-        let tracker_guard = lock_debug!(self.swap_tracker.lock())
-            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?;
-        let existing = tracker_guard.get_record(&swap_id);
-        let created_at = existing.map(|r| r.created_at);
-        let recovery = existing.map(|r| r.recovery.clone());
-        let failed_at = existing.and_then(|r| r.failed_at_phase);
-        let failure_reason = existing.and_then(|r| r.failure_reason.clone());
-        drop(tracker_guard);
-
-        // Build full record from current live state.
-        let swap_ref = self.swap_state()?;
-        let mut record = self.persist_build_record(swap_ref)?;
-
-        // Restore preserved fields so we don't lose recovery progress or timestamps.
-        if let Some(ts) = created_at {
-            record.created_at = ts;
+        let mut live = lock_debug!(self.live_swap.lock())
+            .map_err(|_| TakerError::General("live swap lock poisoned".into()))?;
+        {
+            let mut wallet = self.write_wallet()?;
+            wallet.remove_swap_coins_and_save(&swap_id, true, true)?;
         }
-        if let Some(rec) = recovery {
-            record.recovery = rec;
-        }
-        if let Some(fat) = failed_at {
-            record.failed_at_phase = Some(fat);
-        }
-        if let Some(reason) = failure_reason {
-            record.failure_reason = Some(reason);
-        }
-
-        lock_debug!(self.swap_tracker.lock())
-            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?
-            .save_record(&record)
-    }
-
-    /// Flush the current swap state to disk without changing the phase.
-    pub(crate) fn persist_progress(&mut self) -> Result<(), TakerError> {
-        let phase = self.swap_state()?.phase;
-        self.persist_swap(phase)
-    }
-
-    /// Persist a swap failure (SP-ERR) with the phase at which failure occurred.
-    fn persist_failure(
-        &mut self,
-        failed_at: SwapPhase,
-        error: &TakerError,
-    ) -> Result<(), TakerError> {
-        let swap = self.swap_state()?;
-        let swap_id = swap.id.clone();
-        let mut record = self.persist_build_record(swap)?;
-        record.phase = SwapPhase::Failed;
-        record.failed_at_phase = Some(failed_at);
-        record.failure_reason = Some(format!("{:?}", error));
-        record.updated_at = now_secs();
-
-        let mut tracker = lock_debug!(self.swap_tracker.lock())
-            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?;
-        if let Some(existing) = tracker.get_record(&swap_id) {
-            record.recovery = existing.recovery.clone();
-            record.created_at = existing.created_at;
-        }
-        tracker.save_record(&record)?;
-        drop(tracker);
-        self.swap_state_mut()?.phase = SwapPhase::Failed;
+        *live = None;
+        drop(live);
+        self.ongoing_swap = None;
         Ok(())
     }
 
-    /// Print the swap report and save it beside the wallet file: UTXO diffs,
+    /// Keep all outgoing recovery keys before either funding broadcast loop.
+    pub(crate) fn commit_outgoing_swapcoins(&mut self) -> Result<(), TakerError> {
+        for coin in &mut self.swap_state_mut()?.outgoing_swapcoins {
+            coin.committed = true;
+        }
+        let mut wallet = self.write_wallet()?;
+        for coin in &self.swap_state()?.outgoing_swapcoins {
+            wallet.add_outgoing_swapcoin(coin);
+        }
+        wallet.save_to_disk()?;
+        Ok(())
+    }
+
+    /// Print the swap report and save it inside the wallet: UTXO diffs,
     /// per-maker fees, contract and funding txids. `swept` is `None` on failure
     /// paths where no sweep ran.
     fn generate_swap_report(
@@ -3485,7 +3281,6 @@ impl Taker {
             .collect();
 
         let network = wallet.store.network;
-        let wallet_file_name = wallet.get_name().to_string();
         let incoming_contract_txids: HashSet<_> = swap
             .incoming_swapcoins
             .iter()
@@ -3513,6 +3308,8 @@ impl Taker {
                 (utxo.amount.to_sat(), address)
             })
             .collect();
+        // Released here: the report is saved through the write lock below.
+        drop(wallet);
 
         let output_swap_amounts: Vec<u64> = output_swap_utxos
             .iter()
@@ -3751,13 +3548,7 @@ impl Taker {
         );
 
         report.print();
-        let data_dir = self
-            .config
-            .data_dir
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(get_taker_dir)?;
-        if let Err(e) = report.save_for_wallet(&data_dir, Some(&wallet_file_name)) {
+        if let Err(e) = report.save_to_wallet(&mut *self.write_wallet()?) {
             log::warn!("Failed to save taker swap report: {:?}", e);
         }
 
@@ -3785,24 +3576,35 @@ impl Taker {
     /// Recover from a failed swap by persisting swapcoins to wallet and
     /// spawning a background `RecoveryLoop` for sweep/timelock recovery.
     ///
-    /// All recovery attempts, per-contract outcome tracking, phase transitions,
-    /// and wallet cleanup are handled by the `RecoveryLoop`.
+    /// The background loop retries unresolved contracts until they confirm.
     pub fn recover_active_swap(&mut self) -> Result<(), TakerError> {
         // A crashed process never reaches its recovery. Gate here rather than at
         // each failure site, so every path into recovery is covered. The legacy
         // replay behavior dies the same way: its recovery would spend the
-        // funding the replayed proof presents.
+        // funding the replayed proof presents. A malicious taker just walks away.
         #[cfg(feature = "integration-test")]
         if matches!(
             self.behavior,
-            TakerBehavior::CrashBeforeRecovery | TakerBehavior::ReplayLegacyProofOfFunding
+            TakerBehavior::CrashBeforeRecovery
+                | TakerBehavior::CrashAfterContractExchange
+                | TakerBehavior::BroadcastContractAfterFullSetup
+                | TakerBehavior::ReplayLegacyProofOfFunding
         ) {
             log::warn!("Test behavior: crashing instead of recovering");
+            // A real crash loses the in-memory swap; the replay test then
+            // prepares swap 2 on this same taker.
+            if self.behavior == TakerBehavior::ReplayLegacyProofOfFunding {
+                self.ongoing_swap = None;
+                *lock_debug!(self.live_swap.lock())
+                    .map_err(|_| TakerError::General("live swap lock poisoned".into()))? = None;
+            }
             return Ok(());
         }
 
         log::warn!("Starting swap recovery...");
 
+        let mut live = lock_debug!(self.live_swap.lock())
+            .map_err(|_| TakerError::General("live swap lock poisoned".into()))?;
         let swap_id = if let Some(ref swap) = self.ongoing_swap {
             let id = swap.id.clone();
             let mut wallet = self.write_wallet()?;
@@ -3812,25 +3614,19 @@ impl Taker {
             for incoming in &swap.incoming_swapcoins {
                 wallet.add_incoming_swapcoin(incoming);
             }
-            wallet.save_to_disk()?;
+            RecoveryLoop::finish_handover(&wallet, &mut live)?;
             id
         } else {
             // Cross-session recovery: get swap_id from persisted swapcoins
             let wallet = self.read_wallet()?;
-            let (incoming, outgoing) = wallet.find_unfinished_swapcoins();
-            drop(wallet);
-            outgoing
-                .first()
-                .and_then(|sc| sc.swap_id.clone())
-                .or_else(|| incoming.first().and_then(|sc| sc.swap_id.clone()))
+            wallet
+                .onchain_swap_ids()
+                .into_iter()
+                .next()
                 .ok_or(TakerError::NothingToRecover)?
         };
 
-        lock_debug!(self.swap_tracker.lock())
-            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?
-            .update_and_save(&swap_id, |record| {
-                record.phase = SwapPhase::Failed;
-            })?;
+        drop(live);
 
         #[cfg(debug_assertions)]
         log::debug!(
@@ -3843,72 +3639,12 @@ impl Taker {
             drop(recovery);
         }
         log::info!("Spawning recovery loop for swap {}", swap_id);
-        let data_dir = self
-            .config
-            .data_dir
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(get_taker_dir)?;
         self.recovery_loop = Some(RecoveryLoop::start(
             self.wallet.clone(),
             self.backend.clone(),
-            self.swap_tracker.clone(),
+            self.live_swap.clone(),
             self.watch_service.clone(),
-            data_dir,
         )?);
-
-        Ok(())
-    }
-
-    /// Populate per-contract outcomes for a successful swap.
-    ///
-    /// On success, all contracts resolve cooperatively:
-    /// - Incoming: `KeyPath` (swept via key-path using maker's privkey)
-    /// - Outgoing: `KeyPath` (maker claimed via key-path using our privkey)
-    /// - Watchonly: `KeyPath` (makers exchanged privkeys and spent cooperatively)
-    fn populate_success_outcomes(
-        &mut self,
-        swap_id: &str,
-        swept: &RecoveryOutcome,
-    ) -> Result<(), TakerError> {
-        let mut incoming_outcomes = Vec::new();
-        let mut outgoing_outcomes = Vec::new();
-        let mut watchonly_outcomes = Vec::new();
-
-        // Incoming contracts were swept cooperatively (key-path spend)
-        for (contract_txid, spending_txid) in &swept.resolved {
-            incoming_outcomes.push(ContractOutcome {
-                contract_txid: *contract_txid,
-                resolution: ContractResolution::KeyPath,
-                spending_txid: Some(*spending_txid),
-            });
-        }
-
-        // Outgoing + watchonly contracts resolved via key-path
-        if let Ok(swap) = self.swap_state() {
-            for sc in &swap.outgoing_swapcoins {
-                outgoing_outcomes.push(ContractOutcome {
-                    contract_txid: sc.contract_tx.compute_txid(),
-                    resolution: ContractResolution::KeyPath,
-                    spending_txid: None, // Maker's spending tx not tracked by us
-                });
-            }
-            for sc in &swap.watchonly_swapcoins {
-                watchonly_outcomes.push(ContractOutcome {
-                    contract_txid: sc.contract_tx.compute_txid(),
-                    resolution: ContractResolution::KeyPath,
-                    spending_txid: None,
-                });
-            }
-        }
-
-        lock_debug!(self.swap_tracker.lock())
-            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?
-            .update_and_save(swap_id, |r| {
-                r.recovery.incoming = incoming_outcomes;
-                r.recovery.outgoing = outgoing_outcomes;
-                r.recovery.watchonly = watchonly_outcomes;
-            })?;
 
         Ok(())
     }
@@ -4279,6 +4015,245 @@ pub enum TakerBehavior {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_cbor::{value::to_value, Value};
+    use std::{collections::BTreeMap, net::TcpListener, thread};
+
+    fn compat_hello_reply(reply: Value, needed: &[String]) -> Result<Vec<String>, TakerError> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let peer = thread::spawn(move || {
+            let (mut server, _) = listener.accept().unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let message: TakerToMakerMessage =
+                serde_cbor::from_slice(&read_message(&mut server).unwrap()).unwrap();
+            let TakerToMakerMessage::Hello(hello) = message else {
+                panic!("first message must be Hello");
+            };
+            assert_eq!(hello.features, supported());
+            send_message(&mut server, &reply).unwrap();
+        });
+        let result = handshake_with_maker(&mut client, needed);
+        peer.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn compat_hello_accepts_many_future_names_and_fields() {
+        let mut names: Vec<_> = (0..100).map(|i| format!("future-{i}-v1")).collect();
+        names.extend(KNOWN.iter().map(|f| f.name.to_string()));
+        let mut reply = to_value(MakerToTakerMessage::Hello(Hello { features: names })).unwrap();
+        let Value::Map(outer) = &mut reply else {
+            panic!()
+        };
+        let Value::Map(body) = outer.get_mut(&Value::Text("Hello".into())).unwrap() else {
+            panic!()
+        };
+        body.insert(
+            Value::Text("future_field".into()),
+            Value::Array(vec![Value::Integer(1)]),
+        );
+        let features = compat_hello_reply(reply, &["taproot".into()]).unwrap();
+        assert_eq!(features, KNOWN.iter().map(|f| f.name).collect::<Vec<_>>());
+        assert_eq!(choose_pins("taproot", &features), ["taproot"]);
+        assert!(unmet_for_flow(&["future-0-v1".into()], &["taproot".into()], "taproot").is_err());
+    }
+
+    #[test]
+    fn compat_hello_keeps_recognized_names_bounded_by_registry() {
+        let reply = to_value(MakerToTakerMessage::Hello(Hello {
+            features: vec!["taproot".into(); 100],
+        }))
+        .unwrap();
+        assert_eq!(
+            compat_hello_reply(reply, &["taproot".into()]).unwrap(),
+            ["taproot"]
+        );
+        let repeated = (0..100)
+            .flat_map(|_| KNOWN.iter().rev().map(|f| f.name.to_string()))
+            .chain(["future-v1".into()])
+            .collect();
+        let reply = to_value(MakerToTakerMessage::Hello(Hello { features: repeated })).unwrap();
+        assert_eq!(
+            compat_hello_reply(reply, &[]).unwrap(),
+            KNOWN.iter().map(|f| f.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compat_v023_maker_hello_cannot_repin_a_new_taker() {
+        let old_hello = Value::Map(BTreeMap::from([(
+            Value::Text("MakerHello".into()),
+            Value::Map(BTreeMap::from([(
+                Value::Text("supported_protocols".into()),
+                Value::Array(vec![
+                    Value::Text("Legacy".into()),
+                    Value::Text("Taproot".into()),
+                ]),
+            )])),
+        )]));
+        for needed in [vec![], vec!["taproot".into()]] {
+            assert!(matches!(
+                compat_hello_reply(old_hello.clone(), &needed),
+                Err(TakerError::Deserialize(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn compat_hello_requires_exact_reconnect_pins_and_readable_reply() {
+        for (features, needed, accepted) in [
+            (vec!["taproot"], vec!["taproot"], true),
+            (vec!["legacy"], vec!["taproot"], false),
+            (vec!["taproot", "future-v2"], vec!["future-v1"], false),
+            (vec!["taproot"], vec![], true),
+        ] {
+            let reply = to_value(MakerToTakerMessage::Hello(Hello {
+                features: features.into_iter().map(String::from).collect(),
+            }))
+            .unwrap();
+            let needed = needed.into_iter().map(String::from).collect::<Vec<_>>();
+            assert_eq!(compat_hello_reply(reply, &needed).is_ok(), accepted);
+        }
+        for reply in [
+            Value::Text("FutureReply".into()),
+            Value::Map(BTreeMap::from([(
+                Value::Text("Hello".into()),
+                Value::Integer(7),
+            )])),
+            Value::Map(BTreeMap::from([(
+                Value::Text("Unsupported".into()),
+                Value::Map(BTreeMap::from([
+                    (Value::Text("what".into()), Value::Text("Hello".into())),
+                    (
+                        Value::Text("reason".into()),
+                        Value::Text("required feature missing".into()),
+                    ),
+                ])),
+            )])),
+        ] {
+            assert!(compat_hello_reply(reply, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn compat_taker_requirements_survive_cli_merge_and_bind_pins() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "require_features = [\"future-v1\"]\n").unwrap();
+        let requirements = Taker::init_taker_config(
+            &TakerInitConfig {
+                connection_type: ConnectionType::Clearnet,
+                ..TakerInitConfig::default()
+            },
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(requirements, ["future-v1"]);
+        for flow in ["legacy", "taproot", "ln-swap-in", "ln-swap-out"] {
+            let pins = choose_pins(
+                flow,
+                &supported()
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                unmet_for_flow(&requirements, &pins, flow),
+                Err(requirements.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn compat_maker_connection_carries_pins_into_reconnects() {
+        let address = if cfg!(feature = "integration-test") {
+            "127.0.0.1:6102"
+        } else {
+            "aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaea37ead.onion"
+        };
+        let mut maker = MakerConnection::new(
+            MakerAddress::try_from(address.to_string()).unwrap(),
+            ProtocolVersion::Taproot,
+            None,
+        );
+        assert_eq!(maker.needed(), ["taproot"]);
+        maker.pins = vec!["taproot".into(), "future-v2".into()];
+        assert_eq!(maker.clone().needed(), ["taproot", "future-v2"]);
+    }
+
+    #[test]
+    fn compat_taker_cli_merge_keeps_unknown_keys_and_requirements() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# keep\r\nfuture_key = [\"future\"]\r\n\
+            require_features = [\"future-v2\", \"taproot\"]\r\n\
+            socks_port = 9050\r\ncontrol_port = 9051\r\n\
+            tor_auth_password = \"secret\"\r\ncheck_blocklist = false\r\n\
+            ldk_server_url = localhost:3537\r\nldk_api_key_path = /tmp/key\r\n\
+            ldk_tls_cert_path = /tmp/cert";
+        std::fs::write(&path, original).unwrap();
+        let config = TakerInitConfig {
+            connection_type: ConnectionType::Clearnet,
+            socks_port: 19050,
+            control_port: Some(19051),
+            check_blocklist: Some(true),
+            ..TakerInitConfig::default()
+        };
+        Taker::init_taker_config(&config, dir.path()).unwrap();
+        let expected = original
+            .replace("socks_port = 9050", "socks_port = 19050")
+            .replace("control_port = 9051", "control_port = 19051")
+            .replace("check_blocklist = false", "check_blocklist = true");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        let loaded = TakerConfig::new(Some(&path)).unwrap();
+        assert_eq!(loaded.require_features, ["future-v2", "taproot"]);
+        assert_eq!(loaded.tor_auth_password, "secret");
+        assert_eq!(loaded.ldk_server_url.as_deref(), Some("localhost:3537"));
+        assert_eq!(loaded.ldk_api_key_path.as_deref(), Some("/tmp/key"));
+        assert_eq!(loaded.ldk_tls_cert_path.as_deref(), Some("/tmp/cert"));
+    }
+
+    #[test]
+    fn compat_taker_cli_merge_skips_unchanged_values() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "# keep\n  socks_port  =  9050\n\
+            tor_auth_password = \"secret\"\nrequire_features = [\"taproot\"]\nfuture = keep";
+        std::fs::write(&path, original).unwrap();
+        let written_at = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let config = TakerInitConfig {
+            connection_type: ConnectionType::Clearnet,
+            tor_auth_password: Some("secret".to_string()),
+            ..TakerInitConfig::default()
+        };
+        Taker::init_taker_config(&config, dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written_at
+        );
+        assert!(!path.with_extension("partial").exists());
+    }
+
+    #[test]
+    fn compat_taker_cli_merge_refuses_bad_requirements_before_changes() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "require_features = [\"taproot\",]\nsocks_port = 9050\n";
+        std::fs::write(&path, original).unwrap();
+        let config = TakerInitConfig {
+            connection_type: ConnectionType::Clearnet,
+            socks_port: 19050,
+            ..TakerInitConfig::default()
+        };
+        assert!(Taker::init_taker_config(&config, dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
 
     #[test]
     fn taker_config_debug_hides_wallet_password() {

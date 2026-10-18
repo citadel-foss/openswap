@@ -90,8 +90,6 @@ fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
     world.verify_maker_pre_swap_balances();
     let before = world.balances();
 
-    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
-
     let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
         .with_tx_count(3)
         .with_required_confirms(1);
@@ -110,7 +108,6 @@ fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
         world.taker().inner().behavior
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    world.taker().log_tracker_state();
 
     // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
@@ -148,10 +145,7 @@ fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
         },
     });
 
-    world.taker().log_tracker_state();
-
     world.shutdown_makers();
-    tracker_logger.stop();
 }
 
 /// Legacy on Core RPC: the taker drops right after broadcasting its funding.
@@ -172,9 +166,6 @@ fn legacy_drop_after_funding(world: &mut World, params: SwapParams) {
     let before = world.balances();
     world.mine(1);
 
-    // Start periodic swap tracker logging
-    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
-
     // Prepare should succeed; execution should fail with DropAfterFundsBroadcast
     let summary = world
         .taker_mut()
@@ -186,7 +177,6 @@ fn legacy_drop_after_funding(world: &mut World, params: SwapParams) {
         "Swap should fail due to DropAfterFundsBroadcast behavior"
     );
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
-    world.taker().log_tracker_state();
 
     // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
@@ -218,11 +208,9 @@ fn legacy_drop_after_funding(world: &mut World, params: SwapParams) {
         },
     });
 
-    world.taker().log_tracker_state();
     info!("Abort1 test completed successfully!");
 
     world.shutdown_makers();
-    tracker_logger.stop();
 }
 
 /// A taker that never goes quiet must still not outlive the swap's locktime. Here the
@@ -304,7 +292,6 @@ fn taproot_drop_at_ack_response(world: &mut World) {
         "Prepare failed as expected: {:?}",
         prepare_result.err().unwrap()
     );
-    world.taker().inner().log_tracker_state();
 
     // The accepted-but-unfunded swap must be dropped without requiring a restart.
     wait_logged!(
@@ -352,7 +339,6 @@ fn taproot_drop_at_ack_response(world: &mut World) {
     // transactions were broadcast.
     assert_balances!(world, since before; { taker: { contract: 0, loss: 0 } });
 
-    world.taker().inner().log_tracker_state();
     info!("Taproot drop-at-ack-response test completed successfully!");
 }
 
@@ -401,6 +387,15 @@ fn new_plan_skips_inputs_of_a_dropped_swap(world: &mut World, protocol: Protocol
             outpoint
         );
     }
+
+    // Recovery took over the dropped swap, so it must not block a new one.
+    let params = SwapParams::new(protocol, amount, 2)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    world
+        .taker_mut()
+        .prepare(params)
+        .expect("prepare after recovery");
 }
 
 /// Another swap claims the planned coins after `prepare_swap`. `start_swap`

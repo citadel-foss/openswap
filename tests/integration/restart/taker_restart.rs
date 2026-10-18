@@ -13,17 +13,13 @@
 //!    timelocks to mature, so there is a wide window to die in.
 //! 3. A fresh `Taker` is built from the same data dir, with nothing in memory.
 //! 4. `recover_active_swap` must find the swap on disk and finish the job.
-//! 5. A crash before the tracker records the cleanup leaves nothing to recover;
-//!    the next startup must still finish the swap instead of retrying it forever.
+//! 5. A second restart reads the settled wallet with no tracker to reconcile.
 
 use bitcoin::Amount;
 use openswap::{
     maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
-    taker::{
-        swap_tracker::{RecoveryPhase, SwapTracker},
-        SwapParams, Taker,
-    },
+    taker::{SwapParams, Taker},
 };
 
 use crate::test_framework::*;
@@ -101,9 +97,11 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
     let wallet_path = taker_dir.join("wallets").join("taker1");
     let tracker_path = taker_dir.join("swap_tracker.cbor");
     let wallet_snapshot = taker_dir.join("wallet.snapshot");
-    let tracker_snapshot = taker_dir.join("tracker.snapshot");
     std::fs::copy(&wallet_path, &wallet_snapshot).unwrap();
-    std::fs::copy(&tracker_path, &tracker_snapshot).unwrap();
+    assert!(
+        !tracker_path.exists(),
+        "a new taker must never write a tracker"
+    );
 
     world.framework().set_block_gen_paused(false);
     wait_until!(
@@ -121,7 +119,6 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
     info!("Restoring the pre-sweep state to simulate a crash before cleanup");
     drop(taker);
     std::fs::copy(wallet_snapshot, wallet_path).unwrap();
-    std::fs::copy(&tracker_snapshot, &tracker_path).unwrap();
     thread::sleep(Duration::from_secs(5));
 
     world.adopt_taker(
@@ -195,10 +192,8 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
         lacks "No persisted swapcoins found for recovery",
     });
 
-    // Crash again before the tracker saw the cleanup: the chain and wallet are
-    // settled, so startup has nothing to recover but must still finish the swap.
+    // The settled wallet is sufficient on every subsequent restart.
     world.drop_takers();
-    std::fs::copy(&tracker_snapshot, &tracker_path).unwrap();
     world.adopt_taker(
         Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0))
             .expect("settled taker should open the same wallet"),
@@ -209,12 +204,14 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
         "the settled swap to be finished",
         world.taker().inner().is_recovery_complete()
     );
-    let tracker = SwapTracker::load_or_create(&taker_dir).unwrap();
-    assert_eq!(
-        tracker.get_record(&summary.swap_id).unwrap().recovery.phase,
-        RecoveryPhase::CleanedUp,
-        "startup left a settled swap for every restart to retry"
+    assert!(
+        !tracker_path.exists(),
+        "recovery must never recreate a tracker"
     );
+    let wallet = world.taker().inner().get_wallet().read().unwrap();
+    assert_eq!(wallet.get_incoming_swapcoins_count(), 0);
+    assert_eq!(wallet.get_outgoing_swapcoins_count(), 0);
+    drop(wallet);
 
     info!("Taker restart recovery test completed successfully!");
 }

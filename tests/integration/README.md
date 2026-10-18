@@ -53,7 +53,7 @@ The onion services are created with `Flags=Detach` and outlive the test
 process; CI's tor is ephemeral and drops them on restart.
 
 Each test keeps its data in `$TMPDIR/openswap-<random>/`: logs in
-`taker/debug.log` (every taker and maker writes there), wallets, swap trackers.
+`taker/debug.log` (every taker and maker writes there) and wallets.
 It is deleted when the test passes and kept when it fails; the log's first
 lines name the test. CI uploads the kept directories of a failed job.
 
@@ -79,7 +79,7 @@ tests/
     node.rs           Node: a bare regtest bitcoind (+ electrs) for chain-only tests
     expect.rs         assert_balances! rows: which balance fields a test asserts
     macros.rs         world_test, assert_balances!, assert_log!, wait_until!, wait_for!
-    actors.rs, chain.rs, logs.rs, reports.rs, tracker.rs, timing.rs
+    actors.rs, chain.rs, logs.rs, reports.rs, timing.rs
   macros/             the #[world_test] proc-macro crate (attribute macros need their own crate)
   TESTS.golden        every test name; check_test_names.sh diffs against it
 ```
@@ -230,7 +230,7 @@ The pieces:
   Nothing is defaulted: no takers or makers unless named. `.fee_overrides(..)`
   and `.check_blocklist()` select the other init variants.
 - **Steps** (`fund_taker_default`, `start_makers`, `mine`, `sync_makers`,
-  `spawn_tracker_logger`, ...) each call the
+  ...) each call the
   framework helper of the same name, so a step does exactly what the helper does.
   `world.framework()` reaches anything the world does not wrap.
 - **Handles**: `world.taker()` / `world.makers()[i]` wrap one taker or maker

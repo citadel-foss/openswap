@@ -129,9 +129,6 @@ fn run_taker_drops_after_funding<B: TestBackend>(
 
     world.mine(1);
 
-    // Start periodic swap tracker logging
-    let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
-
     // Over Tor the offers can still be under verification here.
     world
         .taker()
@@ -154,7 +151,6 @@ fn run_taker_drops_after_funding<B: TestBackend>(
         swap_error
     );
     info!("Swap failed as expected: {swap_error:?}");
-    world.taker().log_tracker_state();
 
     // Wait for makers to detect the drop and the outer timelock to mature;
     // slower-cadence backends (Tor) wait proportionally longer.
@@ -193,11 +189,9 @@ fn run_taker_drops_after_funding<B: TestBackend>(
         },
     });
 
-    world.taker().log_tracker_state();
     info!("Electrum taker-drop test ({protocol:?}) completed successfully!");
 
     world.shutdown_makers();
-    tracker_logger.stop();
 }
 
 /// A breached taker recovers all its incoming coins once the contracts
