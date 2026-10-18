@@ -261,6 +261,8 @@ openswap wallet::api::mempool_deferral_tests::pending_tx_is_not_replaced_without
 openswap wallet::api::mempool_deferral_tests::stuck_recovery_is_replaced_when_fees_rise
 openswap wallet::api::mempool_deferral_tests::stuck_recovery_stays_when_a_replacement_is_not_due
 openswap wallet::api::mempool_deferral_tests::stuck_refund_of_a_claimed_swap_is_replaced
+openswap wallet::api::mempool_deferral_tests::uncommitted_legacy_is_dropped_unless_its_funding_is_seen
+openswap wallet::api::mempool_deferral_tests::uncommitted_split_is_kept_until_its_funding_is_dead
 openswap wallet::api::prevout_contract_tests::cached_contract_is_idempotent_immutable_and_persistent
 openswap wallet::api::prevout_contract_tests::cached_contract_matches_only_the_approved_script
 openswap wallet::api::prevout_contract_tests::proof_of_funding_rejects_missing_cached_contract
