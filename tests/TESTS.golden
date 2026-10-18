@@ -412,6 +412,7 @@ openswap wallet::seed::tests::mismatched_stored_phrase_is_refused_on_read
 openswap wallet::seed::tests::offline_legacy_read_does_not_write_while_an_owner_runs
 openswap wallet::seed::tests::offline_open_needs_an_existing_wallet_file
 openswap wallet::seed::tests::offline_open_reads_the_seed_without_writing
+openswap wallet::seed::tests::offline_open_upgrades_an_old_wallet_when_no_process_runs
 openswap wallet::seed::tests::seal_checks_the_key_for_every_phrase_length
 openswap wallet::seed::tests::words_are_sized_once
 openswap wallet::seed_cli::tests::answers_match_the_exact_word_only

@@ -14,6 +14,7 @@ use super::{
     backup::parse_mnemonic,
     blockchain::{AnyBlockchain, BackendConfig, CoreRpcConfig},
     error::WalletError,
+    seed_cli::{WalletInUse, IN_USE_MESSAGE},
     storage::{SecretEntropy, SecretXpriv, WalletStore},
 };
 
@@ -96,8 +97,9 @@ pub(super) fn seal_entropy(
 
 impl Wallet {
     /// Opens an existing wallet file with no backend, for the offline seed
-    /// commands. It never syncs and never writes; the backend it holds is
-    /// inert and must not be used.
+    /// commands. It never syncs, and writes only the one-time upgrade of an
+    /// older file, under the exclusive lock; the backend it holds is inert
+    /// and must not be used.
     pub fn open_offline(path: &Path, password: Zeroizing<String>) -> Result<Self, WalletError> {
         if !path.exists() {
             return Err(WalletError::General(format!(
@@ -107,11 +109,24 @@ impl Wallet {
         if password.is_empty() {
             return Err(WalletError::WrongPassword);
         }
-        let (mut store, store_enc_material) =
-            WalletStore::read_from_disk(path, Some(password.to_string())).map_err(|e| match e {
-                WalletError::Security(SecurityError::Decryption) => WalletError::WrongPassword,
-                e => e,
-            })?;
+        let wrong_password = |e| match e {
+            WalletError::Security(SecurityError::Decryption) => WalletError::WrongPassword,
+            e => e,
+        };
+        let loaded = match WalletStore::read_without_upgrade(path, Some(password.to_string()))
+            .map_err(wrong_password)?
+        {
+            Some(loaded) => loaded,
+            // The upgrade rewrites the file, so no running process may hold it.
+            None => {
+                let Some(_owner) = WalletInUse::exclusive_if_idle(path)? else {
+                    return Err(WalletError::General(IN_USE_MESSAGE.to_string()));
+                };
+                WalletStore::read_from_disk(path, Some(password.to_string()))
+                    .map_err(wrong_password)?
+            }
+        };
+        let (mut store, store_enc_material) = loaded;
         store.master_key.seal(&store_enc_material)?;
         // Building the client opens no connection, and nothing here calls it.
         let blockchain =
@@ -485,5 +500,34 @@ mod tests {
             "an offline seed read rewrote the live owner's wallet"
         );
         assert!(!path.with_file_name("wallet.v023").exists());
+    }
+
+    #[test]
+    fn offline_open_upgrades_an_old_wallet_when_no_process_runs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let original = legacy_wallet(&path, PHRASE);
+        let v1 =
+            crate::security::encrypt_struct(&original.store, &original.store_enc_material).unwrap();
+        let source = serde_cbor::to_vec(&v1).unwrap();
+        std::fs::write(&path, &source).unwrap();
+        drop(original);
+
+        let wallet = Wallet::open_offline(&path, password("test-password")).unwrap();
+        assert!(matches!(
+            wallet.get_wallet_mnemonic(password("test-password")),
+            Err(WalletError::MnemonicUnavailable)
+        ));
+        assert_eq!(
+            std::fs::read(path.with_file_name("wallet.v023")).unwrap(),
+            source
+        );
+        assert_ne!(std::fs::read(&path).unwrap(), source);
+        // The lock taken for the upgrade is released again.
+        assert!(
+            super::super::seed_cli::WalletInUse::exclusive_if_idle(&path)
+                .unwrap()
+                .is_some()
+        );
     }
 }

@@ -734,21 +734,52 @@ impl WalletStore {
         path: &Path,
         password: Option<String>,
     ) -> Result<(Self, KeyMaterial), WalletError> {
-        let content = std::fs::read(path)?;
+        Self::read_file(path, password, true)?.ok_or_else(|| {
+            WalletError::General(format!("{} needs a one-time upgrade", path.display()))
+        })
+    }
+
+    /// Like [`Self::read_from_disk`], but never writes: `None` for a legacy
+    /// file, whose one-time upgrade rewrites it.
+    pub(crate) fn read_without_upgrade(
+        path: &Path,
+        password: Option<String>,
+    ) -> Result<Option<(Self, KeyMaterial)>, WalletError> {
+        Self::read_file(path, password, false)
+    }
+
+    fn read_file(
+        path: &Path,
+        password: Option<String>,
+        upgrade: bool,
+    ) -> Result<Option<(Self, KeyMaterial)>, WalletError> {
+        // Wiped on every return: a legacy file may be plaintext.
+        let mut password = password.map(Zeroizing::new);
+        let content = Zeroizing::new(std::fs::read(path)?);
         if is_versioned_container(&content) {
+            let password = password.as_mut().map(|p| std::mem::take(&mut **p));
             let (store, material) = load_sensitive_struct::<Self, SerdeCbor>(path, password)?;
-            return Ok((store, material.ok_or(SecurityError::PasswordRequired)?));
+            return Ok(Some((
+                store,
+                material.ok_or(SecurityError::PasswordRequired)?,
+            )));
         }
+        let mut take_password = || -> Result<String, WalletError> {
+            match password.as_mut() {
+                Some(p) if !p.is_empty() => Ok(std::mem::take(&mut **p)),
+                _ => Err(SecurityError::PasswordRequired.into()),
+            }
+        };
         if let Ok(file) = deserialize_from_cbor::<WalletFile>(&content) {
             check_requires(&file.requires, &supported()).map_err(WalletError::NeedsUpgrade)?;
-            let password = password
-                .filter(|p| !p.is_empty())
-                .ok_or(SecurityError::PasswordRequired)?;
-            return Ok(decrypt_with_password(
+            return Ok(Some(decrypt_with_password(
                 file.encrypted,
-                password,
+                take_password()?,
                 &requires_aad(&file.requires),
-            )?);
+            )?));
+        }
+        if !upgrade {
+            return Ok(None);
         }
         let encrypted = deserialize_from_cbor::<EncryptedData>(&content);
         let plaintext = if encrypted.is_err() {
@@ -756,17 +787,14 @@ impl WalletStore {
         } else {
             None
         };
-        let password = password
-            .filter(|p| !p.is_empty())
-            .ok_or(SecurityError::PasswordRequired)?;
         let (mut store, material) = if let Some(store) = plaintext {
             (
                 store,
-                KeyMaterial::new_from_password(Some(password))
+                KeyMaterial::new_from_password(Some(take_password()?))
                     .ok_or(SecurityError::PasswordRequired)?,
             )
         } else {
-            decrypt_with_password(encrypted?, password, &[])?
+            decrypt_with_password(encrypted?, take_password()?, &[])?
         };
         let refuse = |reason: String| {
             WalletError::General(format!(
@@ -856,7 +884,7 @@ impl WalletStore {
             }
         }
         log::warn!("Upgraded {}. After every wallet in this data directory is upgraded, manually delete maker_swap_tracker.cbor and swap_tracker.cbor. Keep the private .v023 archives for rollback.", path.display());
-        Ok((store, material))
+        Ok(Some((store, material)))
     }
 }
 

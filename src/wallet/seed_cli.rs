@@ -74,7 +74,7 @@ impl WalletInUse {
     }
 }
 
-const IN_USE_MESSAGE: &str = "this wallet is in use by a running process, which would \
+pub(super) const IN_USE_MESSAGE: &str = "this wallet is in use by a running process, which would \
      overwrite the change; stop it and run the command again";
 
 /// Writes `text` straight to `out`. `println!` would leave seed words in
