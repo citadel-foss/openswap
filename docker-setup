@@ -751,10 +751,10 @@ run_seed_command() {
     [[ "$COMPOSE_PROFILES" != *"internal-tor"* ]] || service="makerd-internal"
 
     # Start the maker again even if the operator interrupts us.
-    seed_restart_service=""
-    trap 'seed_interrupted $? 130' INT
-    trap 'seed_interrupted $? 143' TERM
-    trap 'seed_interrupted $? 129' HUP
+    seed_restart_service="" seed_pid="" seed_container="openswap-seed-$$"
+    trap 'seed_interrupted 130' INT
+    trap 'seed_interrupted 143' TERM
+    trap 'seed_interrupted 129' HUP
     trap 'restart_after_seed || true' EXIT
     if [ -n "$(docker compose ps -q --status running "$service")" ]; then
         seed_restart_service="$service"
@@ -762,20 +762,32 @@ run_seed_command() {
         docker compose stop "$service"
     fi
 
+    # Run in the background so a signal reaches the traps at once, not after
+    # the seed prompt ends. 0<&0 keeps the terminal; a background job gets /dev/null.
     local status=0
     docker compose -f docker-compose.yml -f docker/compose-seed.yml run --rm --no-deps \
-        --entrypoint makerd "$service" -w "$BITCOIN_WALLET_NAME" "$cmd" || status=$?
+        --name "$seed_container" --entrypoint makerd "$service" \
+        -w "$BITCOIN_WALLET_NAME" "$cmd" 0<&0 &
+    seed_pid=$!
+    wait "$seed_pid" || status=$?
+    seed_pid=""
 
     restart_after_seed || exit 1
     trap - EXIT INT TERM HUP
     return "$status"
 }
 
-# Restart the maker and exit with the interrupted command's status, or the
-# signal's status if that command succeeded.
+# Stop the seed run, restart the maker and exit with the seed run's status,
+# or the signal's status if that run succeeded.
 seed_interrupted() {
-    local status="$1"
-    [ "$status" -ne 0 ] || status="$2"
+    local status=0
+    trap '' INT TERM HUP
+    if [ -n "$seed_pid" ]; then
+        docker stop "$seed_container" >/dev/null 2>&1 || true
+        wait "$seed_pid" || status=$?
+        docker rm -f "$seed_container" >/dev/null 2>&1 || true
+    fi
+    [ "$status" -ne 0 ] || status="$1"
     restart_after_seed || true
     exit "$status"
 }
