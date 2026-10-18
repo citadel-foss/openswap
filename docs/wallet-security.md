@@ -147,11 +147,10 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   should skip `*.lock` files. Don't delete one while a process uses the wallet.
 - **Docker.** The container prints no seed. Use `exec` to see the words:
   `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`. To
-  record the confirmation or run `attach-seed`, stop the maker and use
-  `docker compose -f docker-compose.yml -f docker/compose-seed.yml run --rm
-  --no-deps --entrypoint makerd makerd -w openswap-maker show-seed`. The
-  extra file turns off Docker's logging for that run; a plain `docker compose
-  run` would copy every word into Docker's logs.
+  record the confirmation or attach a phrase, run `./docker-setup show-seed`
+  or `./docker-setup attach-seed`. The script stops the maker, runs the
+  command with Docker's logging off, and starts the maker again. A plain
+  `docker compose run` would copy every word into Docker's logs.
 - **Per-call password (library).** `Wallet::get_wallet_mnemonic` takes the
   current wallet password on every call. A wrong or empty one fails. The
   phrase is opened just in time and nothing is cached. `take_new_mnemonic` is

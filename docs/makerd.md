@@ -307,7 +307,7 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   $ makerd -w maker show-seed
   ```
 
-  The command works offline, asks for the passphrase at a hidden prompt, and refuses unless stdout is a terminal. It shows the words and never writes while the maker runs. To record the confirmation, stop the maker first: it holds the wallet and would overwrite the change. In Docker, `docker exec -it openswap-makerd makerd -w openswap-maker show-seed` shows the words. To confirm, run `docker compose stop makerd`, then `docker compose -f docker-compose.yml -f docker/compose-seed.yml run --rm --no-deps --entrypoint makerd makerd -w openswap-maker show-seed` (the extra file keeps the words out of Docker's logs), then start the maker again. With internal Tor the service is `makerd-internal`.
+  The command works offline, asks for the passphrase at a hidden prompt, and refuses unless stdout is a terminal. It shows the words and never writes while the maker runs. To record the confirmation, stop the maker first: it holds the wallet and would overwrite the change. In Docker, run `./docker-setup show-seed`: it stops the maker, shows the words, records the confirmation and starts the maker again. `docker exec -it openswap-makerd makerd -w openswap-maker show-seed` only shows the words while the maker runs. See [Docker](./docker.md).
 
 - **Configuration File**: If no `config` file exists, `makerd` will create a default `config.toml` file at `$HOME/.openswap/maker/config.toml`:
 
