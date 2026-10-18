@@ -8,6 +8,7 @@
 //! locking is handled wallet-side, not here.
 
 use std::{
+    borrow::Borrow,
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -32,8 +33,8 @@ use bitcoind::bitcoincore_rpc::json::{
     ListTransactionResult, ListUnspentResultEntry, WalletTxInfo,
 };
 use electrum_client::{
-    Batch, Client as ElectrumClient, Config as ClientConfig, ConfigBuilder, ElectrumApi,
-    GetHistoryRes, Param, Socks5Config, ToElectrumScriptHash,
+    Batch, ClientType, Config as ClientConfig, ConfigBuilder, ElectrumApi, GetHistoryRes,
+    HeaderNotification, Param, ScriptStatus, ServerFeaturesRes, Socks5Config, ToElectrumScriptHash,
 };
 use serde_json::{json, Value};
 
@@ -155,20 +156,135 @@ fn derive_timeout_secs(cfg: &ElectrumConfig) -> u8 {
 }
 
 /// Build the `electrum_client` config from ours.
-///
-/// `retry(0)` is deliberate. The client's own retry rebuilds the connection and
-/// then returns `Ok`, hiding the fact that every server-side script
-/// subscription was dropped — which leaves the watchtower deaf. Reconnection is
-/// handled by [`Electrum::call`] instead, which knows what to re-arm.
 fn client_config(cfg: &ElectrumConfig) -> ClientConfig {
     let is_onion = url_host(&cfg.url).ends_with(".onion");
     ConfigBuilder::new()
         .socks5(cfg.socks5.as_deref().map(Socks5Config::new))
         .timeout(Some(derive_timeout_secs(cfg)))
-        .retry(0)
         // A hidden-service name has no certificate to validate against.
         .validate_domain(!is_onion)
         .build()
+}
+
+/// One Electrum connection, used without `electrum_client::Client`'s retry
+/// wrapper.
+///
+/// That wrapper's retry rebuilds the connection and then returns `Ok`, hiding
+/// that every server-side script subscription was dropped. With `retry(0)` it
+/// instead replaces every error except `Protocol` and `AlreadySubscribed` with
+/// an empty `AllAttemptsErrored`, so the root cause is lost. Reconnection is
+/// handled by [`Electrum::call`], which knows what to re-arm.
+struct ElectrumClient(ClientType);
+
+macro_rules! raw {
+    ($client:expr, $method:ident($($arg:expr),*)) => {
+        match &$client.0 {
+            ClientType::TCP(c) => c.$method($($arg),*),
+            ClientType::SSL(c) => c.$method($($arg),*),
+            ClientType::Socks5(c) => c.$method($($arg),*),
+        }
+    };
+}
+
+impl ElectrumClient {
+    fn from_config(url: &str, config: ClientConfig) -> Result<Self, electrum_client::Error> {
+        ClientType::from_config(url, &config).map(Self)
+    }
+
+    fn raw_call(
+        &self,
+        method: &str,
+        params: impl IntoIterator<Item = Param>,
+    ) -> Result<Value, electrum_client::Error> {
+        raw!(self, raw_call(method, params))
+    }
+
+    fn batch_call(&self, batch: &Batch) -> Result<Vec<Value>, electrum_client::Error> {
+        raw!(self, batch_call(batch))
+    }
+
+    fn server_features(&self) -> Result<ServerFeaturesRes, electrum_client::Error> {
+        raw!(self, server_features())
+    }
+
+    fn ping(&self) -> Result<(), electrum_client::Error> {
+        raw!(self, ping())
+    }
+
+    fn block_header(&self, height: usize) -> Result<Header, electrum_client::Error> {
+        raw!(self, block_header(height))
+    }
+
+    fn block_headers_subscribe(&self) -> Result<HeaderNotification, electrum_client::Error> {
+        raw!(self, block_headers_subscribe())
+    }
+
+    fn block_headers_pop(&self) -> Result<Option<HeaderNotification>, electrum_client::Error> {
+        raw!(self, block_headers_pop())
+    }
+
+    fn estimate_fee(&self, blocks: usize) -> Result<f64, electrum_client::Error> {
+        raw!(self, estimate_fee(blocks))
+    }
+
+    fn script_subscribe(
+        &self,
+        script: &Script,
+    ) -> Result<Option<ScriptStatus>, electrum_client::Error> {
+        raw!(self, script_subscribe(script))
+    }
+
+    fn batch_script_subscribe<'s, I>(
+        &self,
+        scripts: I,
+    ) -> Result<Vec<Option<ScriptStatus>>, electrum_client::Error>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'s Script>,
+    {
+        raw!(self, batch_script_subscribe(scripts))
+    }
+
+    fn script_pop(&self, script: &Script) -> Result<Option<ScriptStatus>, electrum_client::Error> {
+        raw!(self, script_pop(script))
+    }
+
+    fn script_get_history(
+        &self,
+        script: &Script,
+    ) -> Result<Vec<GetHistoryRes>, electrum_client::Error> {
+        raw!(self, script_get_history(script))
+    }
+
+    fn batch_script_get_history<'s, I>(
+        &self,
+        scripts: I,
+    ) -> Result<Vec<Vec<GetHistoryRes>>, electrum_client::Error>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'s Script>,
+    {
+        raw!(self, batch_script_get_history(scripts))
+    }
+
+    fn transaction_get(&self, txid: &Txid) -> Result<Transaction, electrum_client::Error> {
+        raw!(self, transaction_get(txid))
+    }
+
+    fn batch_transaction_get<'t, I>(
+        &self,
+        txids: I,
+    ) -> Result<Vec<Transaction>, electrum_client::Error>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'t Txid>,
+    {
+        raw!(self, batch_transaction_get(txids))
+    }
+
+    fn transaction_broadcast(&self, tx: &Transaction) -> Result<Txid, electrum_client::Error> {
+        raw!(self, transaction_broadcast(tx))
+    }
 }
 
 /// How long to wait before retry `attempt` (1-based): 1s, 2s, 4s, then capped.
@@ -190,14 +306,21 @@ fn refusal_backoff(refusals: u8) -> Duration {
 /// True for errors that mean the request was answered, not that the transport
 /// failed. Reconnecting cannot help these. `NotSubscribed` is included because
 /// it is local client state, and after a rebuild it means "re-arm", not "retry".
+/// An answer that does not decode is terminal too, except a JSON error at EOF,
+/// which is how the client reports a connection the server closed.
 fn is_terminal(e: &electrum_client::Error) -> bool {
+    use electrum_client::Error as E;
     !is_rate_limited(e)
-        && matches!(
-            e,
-            electrum_client::Error::Protocol(_)
-                | electrum_client::Error::AlreadySubscribed(_)
-                | electrum_client::Error::NotSubscribed(_)
-        )
+        && match e {
+            E::Protocol(_)
+            | E::AlreadySubscribed(_)
+            | E::NotSubscribed(_)
+            | E::InvalidResponse(_)
+            | E::Hex(_)
+            | E::Bitcoin(_) => true,
+            E::JSON(json) => !json.is_eof() && !json.is_io(),
+            _ => false,
+        }
 }
 
 /// True for a protocol error saying we sent too much. ElectrumX-family servers
@@ -951,7 +1074,7 @@ impl Electrum {
 
     /// Run a backend call, reconnecting and retrying on transport failure.
     ///
-    /// The client is configured with `retry(0)`, so a dropped connection
+    /// [`ElectrumClient`] has no retry of its own, so a dropped connection
     /// surfaces here instead of being papered over. A rebuilt Tor circuit or a
     /// restarted server must not abort a swap, so we reconnect and retry up to
     /// `max_retries` times with a widening backoff before failing loudly.
@@ -3869,6 +3992,11 @@ pub(crate) mod tests {
         assert!(is_terminal(&Error::NotSubscribed([0u8; 32].into())));
         // A transport-shaped error must stay retryable.
         assert!(!is_terminal(&Error::Message("socket closed".into())));
+        // An answer that does not decode is terminal; EOF is a closed socket.
+        let bad_shape = serde_json::from_value::<u64>(json!("x")).unwrap_err();
+        assert!(is_terminal(&Error::JSON(bad_shape)));
+        let eof = serde_json::from_str::<Value>("").unwrap_err();
+        assert!(!is_terminal(&Error::JSON(eof)));
     }
 
     #[test]
@@ -4158,5 +4286,90 @@ pub(crate) mod tests {
         assert!(msg.contains("unreachable"), "got: {}", msg);
         assert!(msg.contains('4'), "got: {}", msg);
         assert!(msg.contains("no route"), "got: {}", msg);
+    }
+
+    /// Mock server that runs the opening handshake on its first connection and
+    /// closes every connection after the next request. Returns its address and
+    /// the number of connections it accepted.
+    fn hang_up_after_handshake() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock electrum");
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = connections.clone();
+        let header_hex =
+            serialize_hex(&bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let first = accepted.fetch_add(1, Ordering::SeqCst) == 0;
+                let header_hex = header_hex.clone();
+                thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    if first {
+                        let features = read_request(&mut reader);
+                        serde_json::to_writer(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": features["id"],
+                                "error": { "code": -32601, "message": "method not found" }
+                            }),
+                        )
+                        .unwrap();
+                        writer.write_all(b"\n").unwrap();
+                        let genesis = read_request(&mut reader);
+                        write_result(&mut writer, &genesis, json!(header_hex));
+                        let subscribe = read_request(&mut reader);
+                        write_result(
+                            &mut writer,
+                            &subscribe,
+                            json!({ "height": 0, "hex": header_hex }),
+                        );
+                    }
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                });
+            }
+        });
+        (addr, connections)
+    }
+
+    #[test]
+    fn unreachable_keeps_root_cause() {
+        let (addr, connections) = hang_up_after_handshake();
+        let mut config = cfg(&format!("tcp://{addr}"), None);
+        config.max_retries = 1;
+        let backend = Electrum::new(&config).expect("connect to mock electrum");
+
+        match backend.get_block_count() {
+            Err(WalletError::ElectrumUnreachable { attempts, last }) => {
+                assert_eq!(attempts, 2);
+                assert!(
+                    matches!(&last, Error::JSON(e) if e.is_eof()),
+                    "expected the closed connection's EOF, got {:?}",
+                    last
+                );
+            }
+            other => panic!("expected ElectrumUnreachable, got {:?}", other),
+        }
+        assert_eq!(backend.reconnect_count(), 1);
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn not_subscribed_is_terminal() {
+        let (addr, connections) = hang_up_after_handshake();
+        let mut config = cfg(&format!("tcp://{addr}"), None);
+        config.max_retries = 1;
+        let backend = Electrum::new(&config).expect("connect to mock electrum");
+
+        let spk = ScriptBuf::new();
+        match backend.call(LOCAL, |c| c.script_pop(&spk)) {
+            Err(WalletError::Electrum(Error::NotSubscribed(_))) => {}
+            other => panic!("expected NotSubscribed, got {:?}", other),
+        }
+        assert_eq!(backend.reconnect_count(), 0);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 }
