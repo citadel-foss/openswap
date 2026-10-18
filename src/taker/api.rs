@@ -3192,8 +3192,12 @@ impl Taker {
     }
 
     /// Keep all outgoing recovery keys before either funding broadcast loop.
+    /// Only the first send's coin is committed ahead of it, which sends the
+    /// swap to recovery from here; each other coin is committed by its loop
+    /// once its own send is accepted. Recovery drops a coin whose send failed
+    /// unless the backend has seen its funding.
     pub(crate) fn commit_outgoing_swapcoins(&mut self) -> Result<(), TakerError> {
-        for coin in &mut self.swap_state_mut()?.outgoing_swapcoins {
+        if let Some(coin) = self.swap_state_mut()?.outgoing_swapcoins.first_mut() {
             coin.committed = true;
         }
         let mut wallet = self.write_wallet()?;
@@ -3792,6 +3796,20 @@ static REPLAY_CONTRACT_CACHE: std::sync::Mutex<Vec<(String, (u32, TaprootContrac
 static REPLAY_POF_CACHE: std::sync::Mutex<
     Vec<(String, crate::protocol::legacy_messages::ProofOfFunding)>,
 > = std::sync::Mutex::new(Vec::new());
+
+/// Commit an outgoing coin once its funding send is accepted, and save it
+/// before the next send can fail. A crash in between leaves it to recovery,
+/// which keeps a coin whose funding the backend has seen.
+pub(crate) fn commit_sent_swapcoin(
+    wallet: &mut Wallet,
+    swapcoin: &OutgoingSwapCoin,
+) -> Result<(), TakerError> {
+    let mut sent = swapcoin.clone();
+    sent.committed = true;
+    wallet.add_outgoing_swapcoin(&sent);
+    wallet.save_to_disk()?;
+    Ok(())
+}
 
 /// The outpoints `tx` spends.
 pub(crate) fn spent_inputs(tx: &bitcoin::Transaction) -> Vec<OutPoint> {

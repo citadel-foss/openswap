@@ -515,8 +515,11 @@ fn process_taproot_contract<M: Maker>(
 
     // Persist swapcoins before broadcasting contract txs. A later broadcast
     // failure can leave earlier Taproot contract txs on-chain, and the wallet
-    // needs these records for timelock recovery after a restart. Committed
-    // from here: recovery must never discard a coin whose send may be out.
+    // needs these records for timelock recovery after a restart. The first
+    // coin is committed before its send: from here the swap goes to recovery,
+    // never to discard. Each other coin is committed once its own send is
+    // accepted; recovery drops one whose send failed unless the backend has
+    // seen it.
     for incoming in &incoming_swapcoins {
         maker.save_incoming_swapcoin(incoming)?;
     }
@@ -525,16 +528,13 @@ fn process_taproot_contract<M: Maker>(
     let commit = maker.behavior() != MakerBehavior::WithholdFundingSilently;
     #[cfg(not(feature = "integration-test"))]
     let commit = true;
-    for outgoing in outgoing_swapcoins.iter_mut() {
-        outgoing.committed = commit;
+    for (index, outgoing) in outgoing_swapcoins.iter_mut().enumerate() {
+        outgoing.committed = commit && index == 0;
         maker.save_outgoing_swapcoin(outgoing)?;
     }
     state.outgoing_swapcoins = outgoing_swapcoins.clone();
 
     for (index, outgoing) in outgoing_swapcoins.iter().enumerate() {
-        // The index only feeds the test hook below; touch it so production
-        // builds have no unused binding.
-        let _ = index;
         // QA: a mid-batch failure must leave the earlier sends recorded, or
         // recovery discards contract txs already on the wire. Inert for
         // single-tx batches.
@@ -599,6 +599,10 @@ fn process_taproot_contract<M: Maker>(
         }
         // Record each send before the next one, so a mid-batch failure never
         // reads back as "never broadcast".
+        if let Some(sent) = state.outgoing_swapcoins.get_mut(index) {
+            sent.committed = true;
+            maker.save_outgoing_swapcoin(sent)?;
+        }
         maker.record_funding_broadcast(&data.id, &txid)?;
         if !state.funding_broadcast_txids.contains(&txid) {
             state.funding_broadcast_txids.push(txid);

@@ -30,7 +30,7 @@ use crate::{
 };
 
 use super::{
-    api::{fund_all_or_nothing, spent_inputs, Hop0Plan, Taker},
+    api::{commit_sent_swapcoin, fund_all_or_nothing, spent_inputs, Hop0Plan, Taker},
     error::{breach_or_wallet_error, TakerError},
     legacy_verification::fetch_tx_with_retry,
 };
@@ -322,11 +322,13 @@ impl Taker {
                         let funding_tx = swapcoin.funding_tx.as_ref().ok_or_else(|| {
                             TakerError::General("Outgoing swapcoin missing funding_tx".to_string())
                         })?;
-                        // A failed send keeps the claim: the tx may still land.
-                        // Recovery resends it and refunds it.
+                        // A failed send keeps the claim until recovery settles
+                        // the swap. Recovery refunds the tx if it landed anyway,
+                        // and otherwise drops the coin without sending it.
                         wallet.send_tx(funding_tx).map_err(|e| {
                             TakerError::General(format!("Failed to broadcast funding tx: {:?}", e))
                         })?;
+                        commit_sent_swapcoin(&mut wallet, swapcoin)?;
                         // Its inputs are spent now, but the coin cache only learns
                         // that at the next sync; until then a new swap must not
                         // plan them. The lock is in memory only: once synced the

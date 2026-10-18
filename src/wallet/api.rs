@@ -941,6 +941,17 @@ impl Wallet {
         self.store.outgoing_swapcoins.len()
     }
 
+    /// Outgoing swap coins of `swap_id` recorded as funded: one per accepted
+    /// funding send, plus the batch's first coin, committed before its send.
+    #[cfg(feature = "integration-test")]
+    pub fn committed_outgoing_swapcoins_count(&self, swap_id: &str) -> usize {
+        self.store
+            .outgoing_swapcoins
+            .values()
+            .filter(|coin| coin.swap_id.as_deref() == Some(swap_id) && coin.committed)
+            .count()
+    }
+
     /// Returns persisted outgoing contract outpoints, optionally restricted to
     /// the supplied swaps.
     pub(crate) fn outgoing_contract_outpoints(
@@ -1185,8 +1196,11 @@ impl Wallet {
         swap_id: &str,
         swapcoin: &super::swapcoin::OutgoingSwapCoin,
     ) -> Result<ContractChainState, WalletError> {
-        if !swapcoin.committed {
-            return Ok(ContractChainState::Discarded);
+        // An uncommitted coin's funding never went out, or its send failed.
+        // Recovery never sends it, but a failed send can still propagate:
+        // funding the backend has seen is treated as sent.
+        if !swapcoin.committed && !Self::funding_seen(chain, swapcoin)? {
+            return Self::unsent_funding_state(chain, swap_id, swapcoin);
         }
         let contract_txid = swapcoin.contract_tx.compute_txid();
         let contract_vout = swapcoin.get_contract_output_vout();
@@ -1279,8 +1293,9 @@ impl Wallet {
                 return Ok(ContractChainState::NotYet);
             }
         };
-        // A send that failed or never ran leaves a committed legacy funding
-        // unknown, and its contract can't go out without it. Only sent once
+        // Eviction, or a crash before the batch's first send, leaves committed
+        // legacy funding unknown, and its contract can't go out without it.
+        // An uncommitted coin's funding is known by now. Only sent once
         // the contract is signed, so the funds can always come back.
         if let Some(funding) = funding.filter(|_| swapcoin.protocol == ProtocolVersion::Legacy) {
             if chain.is_tx_unknown(&funding.compute_txid())? {
@@ -1304,6 +1319,68 @@ impl Wallet {
             return Ok(ContractChainState::NotYet);
         }
         Ok(ContractChainState::OnChain)
+    }
+
+    /// Whether the backend knows this coin's funding (mempool or chain): the
+    /// contract tx itself, or for Legacy the funding tx its contract spends.
+    fn funding_seen(
+        chain: &AnyBlockchain,
+        swapcoin: &super::swapcoin::OutgoingSwapCoin,
+    ) -> Result<bool, WalletError> {
+        if !chain.is_tx_unknown(&swapcoin.contract_tx.compute_txid())? {
+            return Ok(true);
+        }
+        if swapcoin.protocol == ProtocolVersion::Legacy {
+            if let Some(input) = swapcoin.contract_tx.input.first() {
+                return Ok(!chain.is_tx_unknown(&input.previous_output.txid)?);
+            }
+        }
+        Ok(false)
+    }
+
+    /// An uncommitted coin whose funding the backend has not seen. No peer
+    /// holds that funding signed: Legacy hands it out without witnesses, and
+    /// Taproot sends its contract data after the batch. So, as for master's
+    /// unshared funding, the coin is dropped once its funding is dead, or
+    /// while every input it spends is unspent: then only we could send it,
+    /// and we never will. An input spent by a tx the backend cannot name
+    /// keeps the coin, unsent, until that resolves.
+    fn unsent_funding_state(
+        chain: &AnyBlockchain,
+        swap_id: &str,
+        swapcoin: &super::swapcoin::OutgoingSwapCoin,
+    ) -> Result<ContractChainState, WalletError> {
+        let funding = match swapcoin.protocol {
+            ProtocolVersion::Taproot => Some(&swapcoin.contract_tx),
+            ProtocolVersion::Legacy => swapcoin.funding_tx.as_ref(),
+        };
+        if let Some(funding) = funding {
+            if Self::inputs_spent_elsewhere(chain, funding)? {
+                log::info!(
+                    "Unsent funding for {} was confirmed spent elsewhere, discarding swapcoin",
+                    swap_id
+                );
+                return Ok(ContractChainState::Discarded);
+            }
+            for input in &funding.input {
+                let prev = input.previous_output;
+                if chain
+                    .get_tx_out(&prev.txid, prev.vout, Some(true))?
+                    .is_none()
+                {
+                    log::info!(
+                        "Unsent funding for {} has an input spent by an unknown tx, keeping swapcoin",
+                        swap_id
+                    );
+                    return Ok(ContractChainState::NotYet);
+                }
+            }
+        }
+        log::info!(
+            "Funding for {} was never broadcast and its inputs are unspent, discarding swapcoin",
+            swap_id
+        );
+        Ok(ContractChainState::Discarded)
     }
 
     /// Our own timelock recovery spending the contract output from the mempool.
@@ -1468,12 +1545,45 @@ impl Wallet {
         let mut refunds = Vec::new();
         let mut fee_rates = None;
 
-        for (swap_id, swapcoin, timelock) in to_recover {
+        for (swap_id, mut swapcoin, timelock) in to_recover {
             // One failing coin must not hold back the other coins' refunds.
             if let Err(e) = (|| -> Result<(), WalletError> {
+                // Funding the backend has seen was sent. Commit the coin for
+                // good, so a later eviction cannot make it look unsent.
+                let commit_seen = |swapcoin: &mut super::swapcoin::OutgoingSwapCoin| {
+                    let mut w = lock_debug!(wallet.write())
+                        .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
+                    if let Some(stored) = w.store.outgoing_swapcoins.get_mut(&swap_id) {
+                        stored.committed = true;
+                    }
+                    w.save_to_disk()?;
+                    swapcoin.committed = true;
+                    Ok::<_, WalletError>(())
+                };
+                // One classification per pass: an uncommitted coin whose funding
+                // the backend has not seen goes straight to the unsent-funding
+                // rules (never sent, kept while an input is spent by an unknown
+                // tx). Seen funding is recorded as sent before any further work,
+                // so the probe inside ensure_contract_on_chain is never reached
+                // for an uncommitted coin.
+                let state = if swapcoin.committed {
+                    Self::ensure_contract_on_chain(chain, &swap_id, &swapcoin)?
+                } else if Self::funding_seen(chain, &swapcoin)? {
+                    commit_seen(&mut swapcoin)?;
+                    Self::ensure_contract_on_chain(chain, &swap_id, &swapcoin)?
+                } else {
+                    Self::unsent_funding_state(chain, &swap_id, &swapcoin)?
+                };
                 let contract_txid = swapcoin.contract_tx.compute_txid();
                 let contract_vout = swapcoin.get_contract_output_vout();
-                match Self::ensure_contract_on_chain(chain, &swap_id, &swapcoin)? {
+                match state {
+                    // An uncommitted coin skipped the CLTV gate above.
+                    ContractChainState::OnChain
+                        if swapcoin.protocol == ProtocolVersion::Taproot
+                            && current_height < timelock =>
+                    {
+                        return Ok(());
+                    }
                     ContractChainState::OnChain => {}
                     ContractChainState::Discarded => {
                         discarded.push(swap_id.clone());
@@ -7290,11 +7400,18 @@ mod mempool_deferral_tests {
             Amount::from_sat(50_000),
             1,
         );
-        coin.committed = true;
+        coin.committed = false;
         let chain = StubChain::with(&[(&parent, 50)]);
-        chain.lock().unwrap().reject_broadcast = true;
         let url = start_electrum_stub(chain.clone());
         let backend = electrum(&url);
+        // A split whose send failed is dropped, never sent by recovery.
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::Discarded
+        );
+        assert!(chain.lock().unwrap().broadcast.is_empty());
+        coin.committed = true;
+        chain.lock().unwrap().reject_broadcast = true;
         assert_eq!(
             Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
             ContractChainState::NotYet
@@ -7311,11 +7428,20 @@ mod mempool_deferral_tests {
             assert_eq!(chain.broadcast, vec![txid]);
             assert_eq!(chain.txs[&txid].0, contract);
         }
+        // A failed send that reached the network anyway is still reclaimed:
+        // funding the backend knows outweighs the missing flag.
         coin.committed = false;
         assert_eq!(
             Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
-            ContractChainState::Discarded
+            ContractChainState::OnChain
         );
+        let txid = contract.compute_txid();
+        assert!(chain
+            .lock()
+            .unwrap()
+            .broadcast
+            .iter()
+            .all(|sent| *sent == txid));
     }
 
     #[test]
@@ -7350,6 +7476,91 @@ mod mempool_deferral_tests {
             chain.lock().unwrap().broadcast,
             vec![funding.compute_txid(), coin.contract_tx.compute_txid()]
         );
+    }
+
+    #[test]
+    fn uncommitted_legacy_is_dropped_unless_its_funding_is_seen() {
+        let parent = tx(OutPoint::null(), 100_000, ScriptBuf::new());
+        let funding = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            50_000,
+            ScriptBuf::new(),
+        );
+        let mut coin = outgoing_coin();
+        coin.committed = false;
+        coin.contract_tx.input[0].previous_output = OutPoint::new(funding.compute_txid(), 0);
+        coin.funding_tx = Some(funding.clone());
+        let digest = secp256k1::Message::from_digest([1; 32]);
+        coin.others_contract_sig = Some(bitcoin::ecdsa::Signature::sighash_all(
+            crate::utill::global_secp().sign_ecdsa(&digest, &key(3)),
+        ));
+        let chain = StubChain::with(&[(&parent, 50)]);
+        let url = start_electrum_stub(chain.clone());
+        let backend = electrum(&url);
+        // A split whose send failed: recovery sends neither its funding nor
+        // its contract, and drops it.
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::Discarded
+        );
+        assert!(chain.lock().unwrap().broadcast.is_empty());
+
+        // The failed send reached the mempool anyway: the split is kept and
+        // its contract goes out so the timelock can reclaim it.
+        chain
+            .lock()
+            .unwrap()
+            .txs
+            .insert(funding.compute_txid(), (funding.clone(), 0));
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::OnChain
+        );
+        assert_eq!(
+            chain.lock().unwrap().broadcast,
+            vec![coin.contract_tx.compute_txid()]
+        );
+    }
+
+    #[test]
+    fn uncommitted_split_is_kept_until_its_funding_is_dead() {
+        let parent = tx(OutPoint::null(), 100_000, ScriptBuf::new());
+        let funding = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            50_000,
+            ScriptBuf::new(),
+        );
+        let conflict = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            40_000,
+            ScriptBuf::new(),
+        );
+        let mut coin = outgoing_coin();
+        coin.committed = false;
+        coin.contract_tx.input[0].previous_output = OutPoint::new(funding.compute_txid(), 0);
+        coin.funding_tx = Some(funding);
+        let chain = StubChain::with(&[(&parent, 50), (&conflict, 0)]);
+        let url = start_electrum_stub(chain.clone());
+        let backend = electrum(&url);
+        // An unconfirmed spend of its input may still be evicted, and the
+        // funding could then confirm: keep the coin, and send nothing.
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&backend, SWAP, &coin).unwrap(),
+            ContractChainState::NotYet
+        );
+        assert!(chain.lock().unwrap().broadcast.is_empty());
+
+        // Once that spend confirms, the funding can never confirm.
+        chain
+            .lock()
+            .unwrap()
+            .txs
+            .insert(conflict.compute_txid(), (conflict.clone(), 50));
+        assert_eq!(
+            Wallet::ensure_contract_on_chain(&electrum(&url), SWAP, &coin).unwrap(),
+            ContractChainState::Discarded
+        );
+        assert!(chain.lock().unwrap().broadcast.is_empty());
     }
 
     #[test]

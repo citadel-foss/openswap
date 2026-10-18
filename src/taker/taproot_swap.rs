@@ -24,7 +24,7 @@ use crate::{
 };
 
 use super::{
-    api::{fund_all_or_nothing, spent_inputs, Hop0Plan, Taker},
+    api::{commit_sent_swapcoin, fund_all_or_nothing, spent_inputs, Hop0Plan, Taker},
     error::{breach_or_wallet_error, TakerError},
 };
 
@@ -776,11 +776,13 @@ impl Taker {
                 log::warn!("Test behavior: withholding the contract tx broadcast");
                 continue;
             }
-            // A failed send keeps the claim: the tx may still land.
-            // Recovery resends it and refunds it.
+            // A failed send keeps the claim until recovery settles the swap.
+            // Recovery refunds the tx if it landed anyway, and otherwise drops
+            // the coin without sending it.
             let txid = wallet.send_tx(&swapcoin.contract_tx).map_err(|e| {
                 TakerError::General(format!("Failed to broadcast contract tx: {:?}", e))
             })?;
+            commit_sent_swapcoin(&mut wallet, swapcoin)?;
 
             log::info!("Broadcast contract tx: {}", txid);
             // Its inputs are spent now, but the coin cache only learns that

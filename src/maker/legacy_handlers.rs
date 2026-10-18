@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use bitcoin::{secp256k1::SecretKey, Amount, PublicKey, ScriptBuf};
+use bitcoin::{secp256k1::SecretKey, Amount, PublicKey, ScriptBuf, Txid};
 
 use super::{
     error::MakerError,
@@ -24,7 +24,10 @@ use crate::{
         legacy_messages::{FundingTxInfo, LegacyTakerMessage},
     },
     utill::{redeemscript_to_scriptpubkey, sweep_fee_policy_sats},
-    wallet::{min_contract_value_sats, swapcoin::IncomingSwapCoin},
+    wallet::{
+        min_contract_value_sats,
+        swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+    },
 };
 
 /// Handle a Legacy protocol message.
@@ -721,11 +724,28 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
     refuse_if_breached(maker.as_ref(), &resp.id)?;
     refuse_if_funding_spent(maker.as_ref(), state, &resp.id)?;
 
-    // Committed before the first send: from here recovery must never discard
-    // these coins for looking unsent. A refusal above leaves them discardable.
-    for outgoing in state.outgoing_swapcoins.iter_mut() {
-        outgoing.committed = true;
-        maker.save_outgoing_swapcoin(outgoing)?;
+    // The first send's coin is committed before it goes out: from here the
+    // swap goes to recovery, never to discard. Each other coin is committed
+    // once its own send is accepted; recovery drops one whose send failed
+    // unless the backend has seen its funding. A refusal above leaves them
+    // all discardable.
+    let commit_funded_by = |coins: &mut [OutgoingSwapCoin], txid: Txid| {
+        for outgoing in coins.iter_mut() {
+            let input = outgoing.contract_tx.input.first();
+            if input.is_some_and(|input| input.previous_output.txid == txid) {
+                outgoing.committed = true;
+                maker.save_outgoing_swapcoin(outgoing)?;
+            }
+        }
+        Ok::<_, MakerError>(())
+    };
+    // A withholding maker never sends, so its recovery must not send either.
+    #[cfg(feature = "integration-test")]
+    let commit = maker.behavior() != super::handlers::MakerBehavior::WithholdFundingSilently;
+    #[cfg(not(feature = "integration-test"))]
+    let commit = true;
+    if let Some(first) = state.pending_funding_txes.first().filter(|_| commit) {
+        commit_funded_by(&mut state.outgoing_swapcoins, first.compute_txid())?;
     }
 
     log::info!(
@@ -799,6 +819,7 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
 
         // Record each send before the next one can fail, so a mid-batch
         // failure never reads back as "never broadcast".
+        commit_funded_by(&mut state.outgoing_swapcoins, txid)?;
         if !state.funding_broadcast_txids.contains(&txid) {
             state.funding_broadcast_txids.push(txid);
         }
