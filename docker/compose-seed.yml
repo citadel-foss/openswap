@@ -1,6 +1,6 @@
 # `show-seed` and `attach-seed` print or read the seed phrase; keep their
-# terminal output out of Docker's logs. Use with `docker compose run`:
-#   docker compose -f docker-compose.yml -f docker/compose-seed.yml run ...
+# terminal output out of Docker's logs. `./docker-setup show-seed` and
+# `./docker-setup attach-seed` add this file to their `docker compose run`.
 services:
   makerd:
     logging:

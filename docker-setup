@@ -696,10 +696,10 @@ start_makerd() {
         print_info "Creating maker wallet..."
         docker compose run --rm --no-deps \
             -e MAKER_INIT_ONLY=1 "$service" || { print_error "Wallet creation failed"; exit 1; }
-        print_warning "Seed not backed up yet. Once makerd is running, run:"
+        print_warning "Seed not backed up yet. To show it and confirm your backup, run:"
+        print_warning "  ./docker-setup show-seed"
+        print_warning "It stops makerd for a moment. To only view the words while makerd runs:"
         print_warning "  docker exec -it openswap-makerd makerd -w ${BITCOIN_WALLET_NAME:-openswap-maker} show-seed"
-        print_warning "It shows the words only. To record the confirmation, stop makerd first and run:"
-        print_warning "  docker compose -f docker-compose.yml -f docker/compose-seed.yml run --rm --no-deps --entrypoint makerd $service -w ${BITCOIN_WALLET_NAME:-openswap-maker} show-seed"
     fi
     
     if docker compose up -d; then
@@ -733,6 +733,40 @@ start_makerd() {
         stop_stack
         exit 1
     fi
+}
+
+# Run show-seed or attach-seed on the maker wallet. The running maker holds the
+# wallet, so stop it first and start it again after; Docker keeps no log of the run.
+run_seed_command() {
+    local cmd="$1"
+    cd "$SCRIPT_DIR"
+    setup_env
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        print_error "$cmd needs an interactive terminal."
+        exit 1
+    fi
+    # Compose needs the secret to restart the maker; the seed command asks for the passphrase itself.
+    prompt_wallet_passphrase
+    local service="makerd"
+    [[ "$COMPOSE_PROFILES" != *"internal-tor"* ]] || service="makerd-internal"
+
+    local was_running="false"
+    if [ -n "$(docker compose ps -q --status running "$service")" ]; then
+        was_running="true"
+        print_info "Stopping makerd so $cmd can save the wallet..."
+        docker compose stop "$service"
+    fi
+
+    local status=0
+    docker compose -f docker-compose.yml -f docker/compose-seed.yml run --rm --no-deps \
+        --entrypoint makerd "$service" -w "$BITCOIN_WALLET_NAME" "$cmd" || status=$?
+
+    if [[ "$was_running" == "true" ]]; then
+        print_info "Starting makerd again..."
+        docker compose up -d "$service" || { print_error "Failed to start makerd; run ./docker-setup start"; exit 1; }
+        print_info "Follow its log with: ./docker-setup logs $service"
+    fi
+    return "$status"
 }
 
 run_command() {
@@ -776,6 +810,9 @@ show_help() {
     echo "                   Services: bitcoind, tor, makerd-internal (bundled Tor), makerd (your own Tor)"
     echo "  status           Show status of running services"
     echo "  shell            Open shell in a new container"
+    echo "  show-seed        Show the maker seed phrase and confirm your backup"
+    echo "                   (stops makerd while it runs, then starts it again)"
+    echo "  attach-seed      Add the original seed phrase to a maker wallet that has none"
     echo ""
     echo "Individual application commands:"
     echo "  makerd [args]   Run makerd with arguments"
@@ -826,6 +863,10 @@ case "${1:-}" in
     "shell")
         setup_env
         docker run --rm -it --network host "openswap/${IMAGE_NAME}:latest" /bin/sh
+    ;;
+    "show-seed"|"attach-seed")
+        check_docker
+        run_seed_command "$1"
     ;;
     "makerd"|"maker-cli"|"taker"|"bitcoin-cli")
         run_command "$@"
