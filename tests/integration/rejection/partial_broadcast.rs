@@ -75,7 +75,6 @@ fn wait_for_maker_timelock_recovery(
 )]
 fn run_maker_partial_broadcast<B: TestBackend>(
     world: &mut World,
-    protocol: ProtocolVersion,
     expected_spendable: u64,
     params: SwapParams,
 ) {
@@ -97,35 +96,38 @@ fn run_maker_partial_broadcast<B: TestBackend>(
     // Recovery sends the unsent split too. Legacy contracts both go out when
     // recovery starts, but a block between the two broadcasts can give them
     // different maturity, so their refunds may land in separate passes. A
-    // Taproot split went out with the swap, so the resent one comes back later.
-    let splits_left = match protocol {
-        ProtocolVersion::Legacy => 0,
-        ProtocolVersion::Taproot => 1,
-    };
+    // Taproot split went out with the swap, so the resent one comes back a
+    // pass later. Wait for both: a stop between the passes would strand it.
     let recovered = wait_for_maker_timelock_recovery(
         world.makers()[0].inner(),
         &swap_id,
-        2 - splits_left,
-        splits_left,
+        2,
+        0,
         timelock_recovery_wait::<B>() + Duration::from_secs(120),
     );
 
     assert_eq!(
         recovered.len(),
-        2 - splits_left,
+        2,
         "every sent split must be timelock-recovered"
     );
 
     // A partial batch must never be discarded as never broadcast.
     assert_log!(world; { lacks "nothing to recover. Discarding swapcoins" });
 
+    // Finished recovery stops the maker, and its exit rearms the wallet backend.
+    // Join without sending another stop, which would cancel our sync again.
+    world.join_makers();
     let maker = world.makers()[0].inner();
     assert_eq!(
         maker.wallet.read().unwrap().get_outgoing_swapcoins_count(),
-        splits_left
+        0
     );
-    assert_eq!(maker.reserved_inputs().unwrap() > 0, splits_left > 0);
-    world.shutdown_makers();
+    assert_eq!(
+        maker.reserved_inputs().unwrap(),
+        0,
+        "recovery must release the unsent split's inputs"
+    );
 
     world.mine(1);
     world.framework().wait_for_electrs_tip();
