@@ -149,7 +149,7 @@ If you build the taker with `--features lightning`, it also has the `ln-swap-in`
   $ ./taker -r 127.0.0.1:38332 -a myuser:mypass --password-file ./wallet.pass <SUBCOMMAND>
 ```
 
-> **Note:** Every `taker` command opens the encrypted wallet, so each invocation needs `--password-file` or `-p` (except `show-seed` and `attach-seed`, which prompt). The tutorial's bare `taker <SUBCOMMAND>` examples assume one is supplied.
+> **Note:** Every `taker` command opens the encrypted wallet, so each invocation needs `--password-file` or `-p` (except `restore`, which prompts for the new wallet's passphrase, and `show-seed` and `attach-seed`, which prompt for the current one). The tutorial's bare `taker <SUBCOMMAND>` examples assume one is supplied.
 
 ## For this tutorial, we'll assume a custom configuration with port 38332. Output examples will reflect this setup.
 
