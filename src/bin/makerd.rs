@@ -120,7 +120,8 @@ enum Commands {
     /// Works offline on an existing wallet file: no backend is needed and the
     /// maker does not start. The passphrase is asked at a hidden prompt, never
     /// taken from `-p`. Runs only with stdout on a terminal. In Docker:
-    /// `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`.
+    /// `docker exec -it openswap-makerd makerd -w <wallet> show-seed`, where
+    /// `<wallet>` is your `BITCOIN_WALLET_NAME` (default `openswap-maker`).
     ShowSeed,
     /// Store the original seed phrase in a wallet that has none, then exit.
     ///
