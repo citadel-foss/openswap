@@ -752,7 +752,9 @@ run_seed_command() {
 
     # Start the maker again even if the operator interrupts us.
     seed_restart_service=""
-    trap 'restart_after_seed || true; exit 1' INT TERM HUP
+    trap 'seed_interrupted $? 130' INT
+    trap 'seed_interrupted $? 143' TERM
+    trap 'seed_interrupted $? 129' HUP
     trap 'restart_after_seed || true' EXIT
     if [ -n "$(docker compose ps -q --status running "$service")" ]; then
         seed_restart_service="$service"
@@ -764,16 +766,27 @@ run_seed_command() {
     docker compose -f docker-compose.yml -f docker/compose-seed.yml run --rm --no-deps \
         --entrypoint makerd "$service" -w "$BITCOIN_WALLET_NAME" "$cmd" || status=$?
 
-    trap - EXIT INT TERM HUP
     restart_after_seed || exit 1
+    trap - EXIT INT TERM HUP
     return "$status"
 }
 
-# Start the maker stopped by run_seed_command, at most once.
+# Restart the maker and exit with the interrupted command's status, or the
+# signal's status if that command succeeded.
+seed_interrupted() {
+    local status="$1"
+    [ "$status" -ne 0 ] || status="$2"
+    restart_after_seed || true
+    exit "$status"
+}
+
+# Start the maker stopped by run_seed_command, at most once. Signals are
+# ignored from here so a second Ctrl-C can't cut the restart short.
 restart_after_seed() {
     [ -n "$seed_restart_service" ] || return 0
     local service="$seed_restart_service"
     seed_restart_service=""
+    trap '' INT TERM HUP
     print_info "Starting makerd again..."
     if ! docker compose up -d "$service"; then
         print_error "Failed to start makerd; run ./docker-setup start"
