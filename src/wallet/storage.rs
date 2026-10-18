@@ -2559,6 +2559,79 @@ mod tests {
     }
 
     #[test]
+    fn pre_port_v2_marker_controls_migration_and_report_import_once() {
+        let dir = tempdir().unwrap();
+        let (path, mut store, material) = stored_wallet(dir.path());
+        let _owner = crate::wallet::seed_cli::WalletInUse::owner(&path).unwrap();
+        let existing = Value::Map(BTreeMap::from([(
+            Value::Text("future-proof".into()),
+            Value::Bytes(vec![1, 2, 3]),
+        )]));
+        store
+            .reports
+            .insert("deniability_proofs".into(), vec![existing.clone()]);
+        // Migration depends on the marker's absence, not on an empty header.
+        let source = serde_cbor::to_vec(
+            &encrypt_struct_v2(&store, &material, vec!["legacy".into()]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&path, &source).unwrap();
+        let report = dir.path().join("wallet_swap_report.json");
+        std::fs::write(&report, V023_REPORT).unwrap();
+        assert!(
+            WalletStore::read_without_upgrade(&path, Some(PASSWORD.into()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        let (mut migrated, key) =
+            WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+        let expected: SwapReportFile = serde_json::from_slice(V023_REPORT).unwrap();
+        assert_eq!(
+            migrated.reports["deniability_proofs"],
+            vec![existing, to_value(&expected.deniability_proofs[0]).unwrap(),]
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("wallet.cbor.v2pre")).unwrap(),
+            source
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("wallet_swap_report.json.v2pre")).unwrap(),
+            V023_REPORT
+        );
+        assert!(!dir.path().join("wallet.cbor.v023").exists());
+        assert!(!report.exists());
+        let header: EncryptedDataV2 =
+            serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(header.requires, [WALLET_STORE_FORMAT]);
+
+        // Model a report left behind after commit and subsequently damaged.
+        // A current wallet may have new open swaps and obsolete trackers;
+        // reopening must neither rerun migration nor import/delete the report.
+        std::fs::write(&report, b"stale report").unwrap();
+        let tracker = dir.path().join("maker_swap_tracker.cbor");
+        std::fs::write(&tracker, V023_MAKER_OPEN).unwrap();
+        migrated
+            .swap_locks
+            .insert("new-swap".into(), SwapReservation::default());
+        migrated.write_to_disk(&path, &key).unwrap();
+        let committed = std::fs::read(&path).unwrap();
+        let (again, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+        assert_eq!(again, migrated);
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        assert_eq!(std::fs::read(&report).unwrap(), b"stale report");
+        assert_eq!(std::fs::read(&tracker).unwrap(), V023_MAKER_OPEN);
+        assert_eq!(
+            std::fs::read(dir.path().join("wallet.cbor.v2pre")).unwrap(),
+            source
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("wallet_swap_report.json.v2pre")).unwrap(),
+            V023_REPORT
+        );
+    }
+
+    #[test]
     fn pre_port_v2_refuses_open_swaps_trackers_and_reports_untouched() {
         for failure in [
             "incoming",

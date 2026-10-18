@@ -5713,6 +5713,67 @@ mod restore_history_probe_tests {
             reader.join().unwrap();
             assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
 
+            // An unmarked, seed-bearing V2 file must also migrate while
+            // consuming the daemon's one owner guard, without a second flock.
+            let blockchain =
+                AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+            let mut original = Wallet::load_or_init_with_lock(
+                &path,
+                blockchain,
+                Some(password()),
+                WalletInUse::owner(&path).unwrap(),
+            )
+            .unwrap();
+            original.store.seed_backed_up = true;
+            let seed_bytes = serde_cbor::to_vec(&original.store.sealed_mnemonic).unwrap();
+            let master_bytes = serde_cbor::to_vec(&original.store.master_key).unwrap();
+            let unmarked = crate::security::encrypt_struct_v2(
+                &original.store,
+                &original.store_enc_material,
+                Vec::new(),
+            )
+            .unwrap();
+            let source = serde_cbor::to_vec(&unmarked).unwrap();
+            std::fs::write(&path, &source).unwrap();
+            let error = Wallet::open_offline(&path, password()).unwrap_err();
+            assert!(matches!(error, WalletError::General(ref message)
+                if message == crate::wallet::seed_cli::IN_USE_MESSAGE));
+            assert_eq!(std::fs::read(&path).unwrap(), source);
+            assert!(!path.with_file_name("wallet.v2pre").exists());
+            drop(original);
+            let blockchain =
+                AnyBlockchain::Electrum(Electrum::new(&electrum_config(url.clone())).unwrap());
+            let migrated = Wallet::load_or_init_with_lock(
+                &path,
+                blockchain,
+                Some(password()),
+                WalletInUse::owner(&path).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(path.with_file_name("wallet.v2pre")).unwrap(),
+                source
+            );
+            assert_eq!(
+                serde_cbor::to_vec(&migrated.store.sealed_mnemonic).unwrap(),
+                seed_bytes
+            );
+            assert_eq!(
+                serde_cbor::to_vec(&migrated.store.master_key).unwrap(),
+                master_bytes
+            );
+            assert!(migrated.seed_backed_up());
+            assert_eq!(
+                migrated.get_wallet_mnemonic(password()).unwrap().words(),
+                first_words.unwrap()
+            );
+            let header: crate::security::EncryptedDataV2 =
+                serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(header.requires, [crate::security::WALLET_STORE_FORMAT]);
+            assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_none());
+            drop(migrated);
+            assert!(WalletInUse::exclusive_if_idle(&path).unwrap().is_some());
+
             // The legacy migration branch must consume the same owner guard,
             // rather than acquiring another handle while rewriting the file.
             for (name, original, closed) in [
