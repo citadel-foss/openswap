@@ -16,15 +16,18 @@ list() {
         --message-format oneline --color never | LC_ALL=C sort
 }
 
+current=$(mktemp tests/.TESTS.golden.XXXXXX)
+trap 'rm -f "$current"' EXIT
+list > "$current"
+
 if [ "${1:-}" = "--update" ]; then
-    list > tests/TESTS.golden
+    # Compile and list successfully before replacing the reviewed manifest.
+    # A tempfile beside the destination keeps the replacement atomic.
+    mv "$current" tests/TESTS.golden
     echo "tests/TESTS.golden updated: $(wc -l < tests/TESTS.golden) tests"
     exit 0
 fi
 
-current=$(mktemp)
-trap 'rm -f "$current"' EXIT
-list > "$current"
 if ! diff -u tests/TESTS.golden "$current"; then
     echo "Test names differ from tests/TESTS.golden (- golden, + current)." >&2
     echo "If the change is intended, run tests/check_test_names.sh --update." >&2

@@ -2301,12 +2301,51 @@ mod tests {
         let seed_bytes = serde_cbor::to_vec(&store.sealed_mnemonic).unwrap();
         let master_bytes = serde_cbor::to_vec(&store.master_key).unwrap();
         let old = crate::security::encrypt_struct_v2(&store, &material).unwrap();
-        std::fs::write(&path, serde_cbor::to_vec(&old).unwrap()).unwrap();
+        let source = serde_cbor::to_vec(&old).unwrap();
+        std::fs::write(&path, &source).unwrap();
         assert!(Wallet::is_wallet_encrypted(&path).unwrap());
+
+        // Both entry points must password-gate the old V2 format without
+        // rewriting it or accidentally routing it through V1 migration.
+        for nonmutating in [false, true] {
+            for password in [None, Some(""), Some("wrong password")] {
+                let supplied = password.map(String::from);
+                let err = if nonmutating {
+                    WalletStore::read_without_upgrade(&path, supplied).unwrap_err()
+                } else {
+                    WalletStore::read_from_disk(&path, supplied).unwrap_err()
+                };
+                match password {
+                    None | Some("") => assert!(matches!(
+                        err,
+                        WalletError::Security(SecurityError::PasswordRequired)
+                    )),
+                    _ => assert!(matches!(
+                        err,
+                        WalletError::Security(SecurityError::Decryption)
+                    )),
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), source);
+                assert!(!path.with_file_name("wallet.v023").exists());
+            }
+        }
+        let (offline, _) = WalletStore::read_without_upgrade(&path, Some(PASSWORD.into()))
+            .unwrap()
+            .expect("pre-port V2 reads without upgrading");
+        assert_eq!(offline, store);
+        assert_eq!(std::fs::read(&path).unwrap(), source);
 
         let (read, key) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
         assert_eq!(read, store);
+        assert_eq!(std::fs::read(&path).unwrap(), source);
         read.write_to_disk(&path, &key).unwrap();
+        // P1 still writes the forward-compatible envelope. The #1165 V2
+        // reader must refuse it before it could drop reports or extra fields.
+        let saved = std::fs::read(&path).unwrap();
+        assert!(
+            load_sensitive_struct::<WalletStore, SerdeCbor>(&path, Some(PASSWORD.into())).is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
         let (rewritten, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
         assert_eq!(rewritten, store);
         assert_eq!(
