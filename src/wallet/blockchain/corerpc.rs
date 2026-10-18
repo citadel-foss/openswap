@@ -43,6 +43,10 @@ pub struct CoreRpcConfig {
 
 const RPC_HOSTPORT: &str = "localhost:18443";
 
+/// Core answers `importdescriptors` and `rescanblockchain` only once the rescan
+/// ends, which takes hours on mainnet.
+const RESCAN_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Bitcoin Core's conventional ZMQ notification port.
 const ZMQ_DEFAULT_PORT: u16 = 28332;
 
@@ -216,6 +220,8 @@ impl ZmqSubscriber {
 /// it, so it never opens a socket.
 pub struct CoreRPC {
     rpc: Client,
+    /// Same endpoint as `rpc`, with [`RESCAN_TIMEOUT`] for the calls that rescan.
+    rescan_rpc: Client,
     config: CoreRpcConfig,
     /// `rawtx`/`rawblock` subscriber, established lazily by the watchtower.
     zmq: ZmqSubscriber,
@@ -239,12 +245,19 @@ impl CoreRPC {
     /// Connect an RPC client for the configured wallet endpoint. Cheap — the
     /// client connects lazily on first use. Used by `AnyBlockchain::from_config`.
     pub fn new(config: &CoreRpcConfig) -> Result<Self, WalletError> {
-        let rpc = Client::new(
-            &format!("http://{}/wallet/{}", config.url, config.wallet_name),
-            config.auth.clone(),
-        )?;
+        let url = format!("http://{}/wallet/{}", config.url, config.wallet_name);
+        let rpc = Client::new(&url, config.auth.clone())?;
+        let mut builder = jsonrpc::simple_http::Builder::new()
+            .timeout(RESCAN_TIMEOUT)
+            .url(&url)
+            .map_err(|e| CoreRpcError::JsonRpc(e.into()))?;
+        if let (Some(user), pass) = config.auth.clone().get_user_pass()? {
+            builder = builder.auth(user, pass);
+        }
+        let rescan_rpc = Client::from_jsonrpc(jsonrpc::Client::with_transport(builder.build()));
         Ok(Self {
             rpc,
+            rescan_rpc,
             config: config.clone(),
             zmq: ZmqSubscriber::new(config.zmq_addr.clone()),
         })
@@ -658,7 +671,7 @@ impl Blockchain for CoreRPC {
 
     fn import_descriptors(&self, requests: &[Value]) -> Result<(), WalletError> {
         let results: Vec<Value> = self
-            .rpc
+            .rescan_rpc
             .call("importdescriptors", &[Value::Array(requests.to_vec())])?;
         // Core rejects a descriptor in its own result, not as an RPC error.
         let failures: Vec<String> = requests
@@ -678,7 +691,7 @@ impl Blockchain for CoreRPC {
     }
 
     fn rescan_wallet_from(&self, height: u64) -> Result<(), WalletError> {
-        let _: Value = self.rpc.call("rescanblockchain", &[json!(height)])?;
+        let _: Value = self.rescan_rpc.call("rescanblockchain", &[json!(height)])?;
         Ok(())
     }
 
@@ -749,6 +762,10 @@ pub(crate) mod tests {
         collections::HashSet,
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         thread,
         time::Instant,
     };
@@ -759,6 +776,39 @@ pub(crate) mod tests {
         wallet::{api::test_support::test_wallet, AnyBlockchain, BackendConfig, Wallet},
     };
     use zeroize::Zeroizing;
+
+    /// Reads one HTTP JSON-RPC request; `None` once the client hangs up.
+    fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Value> {
+        let mut line = String::new();
+        let mut body_len = 0;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return None;
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some(n) = line.to_lowercase().strip_prefix("content-length:") {
+                body_len = n.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; body_len];
+        reader.read_exact(&mut body).ok()?;
+        Some(serde_json::from_slice(&body).unwrap())
+    }
+
+    fn write_result(writer: &mut TcpStream, request: &Value, result: Value) {
+        let reply =
+            json!({ "jsonrpc": "2.0", "id": request["id"], "result": result, "error": null })
+                .to_string();
+        let _ = write!(
+            writer,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+            reply.len()
+        )
+        .and_then(|()| writer.flush());
+    }
 
     /// Serves one canned reply per JSON-RPC method, failing on any other.
     fn mock_core(
@@ -773,20 +823,10 @@ pub(crate) mod tests {
                 let (stream, _) = listener.accept().expect("accept core client");
                 let mut writer = stream.try_clone().unwrap();
                 let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-                while seen.len() < expected && reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    let mut body_len = 0;
-                    while line.trim() != "" {
-                        if let Some(n) = line.to_lowercase().strip_prefix("content-length:") {
-                            body_len = n.trim().parse().unwrap();
-                        }
-                        line.clear();
-                        reader.read_line(&mut line).unwrap();
-                    }
-                    line.clear();
-                    let mut body = vec![0; body_len];
-                    reader.read_exact(&mut body).unwrap();
-                    let request: Value = serde_json::from_slice(&body).unwrap();
+                while seen.len() < expected {
+                    let Some(request) = read_request(&mut reader) else {
+                        break;
+                    };
                     let method = request["method"].as_str().unwrap().to_string();
                     let result = replies
                         .iter()
@@ -795,15 +835,7 @@ pub(crate) mod tests {
                         .1
                         .clone();
                     seen.push(method);
-                    let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result, "error": null })
-                        .to_string();
-                    write!(
-                        writer,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
-                        reply.len()
-                    )
-                    .unwrap();
-                    writer.flush().unwrap();
+                    write_result(&mut writer, &request, result);
                 }
             }
             seen
@@ -868,6 +900,43 @@ pub(crate) mod tests {
             Err(WalletError::CoreTooOld)
         ));
         assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
+    }
+
+    /// Core answers `rescanblockchain` only when the scan ends, long after
+    /// simple_http's default 15 s timeout.
+    #[test]
+    fn rescan_survives_long_scan_without_resend() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock core");
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.expect("accept core client");
+                let counter = Arc::clone(&counter);
+                thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    while let Some(request) = read_request(&mut reader) {
+                        assert_eq!(request["method"], "rescanblockchain");
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_secs(20));
+                        write_result(
+                            &mut writer,
+                            &request,
+                            json!({ "start_height": 0, "stop_height": 0 }),
+                        );
+                    }
+                });
+            }
+        });
+        let core = CoreRPC::new(&CoreRpcConfig {
+            url: addr.to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        core.rescan_wallet_from(0).unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     fn blockchain_info(chain: &str) -> Value {

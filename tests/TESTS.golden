@@ -357,6 +357,7 @@ openswap wallet::blockchain::corerpc::tests::init_interactive_refuses_core_befor
 openswap wallet::blockchain::corerpc::tests::load_or_init_refuses_core_before_v22_for_an_existing_wallet
 openswap wallet::blockchain::corerpc::tests::load_or_init_refuses_core_before_v22_without_a_wallet_file
 openswap wallet::blockchain::corerpc::tests::prepare_backend_wallet_refuses_core_before_v22
+openswap wallet::blockchain::corerpc::tests::rescan_survives_long_scan_without_resend
 openswap wallet::blockchain::corerpc::tests::resolve_zmq_addr_adds_tcp_to_a_bare_address
 openswap wallet::blockchain::corerpc::tests::restore_refuses_core_before_v22_without_a_wallet_file
 openswap wallet::blockchain::corerpc::tests::zmq_malformed_message_is_reported_as_missed
