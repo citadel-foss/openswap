@@ -268,6 +268,8 @@ openswap wallet::ffi::tests::unusable_fee_rates_are_refused
 openswap wallet::fidelity::test::a_forged_proof_is_named_as_forgery
 openswap wallet::fidelity::test::a_stale_advertised_confirmation_height_still_verifies
 openswap wallet::fidelity::test::restore_finds_bonds_past_missing_indexes_and_by_hint
+openswap wallet::fidelity::test::test_bond_maturity_time_for_a_height_locktime
+openswap wallet::fidelity::test::test_bond_maturity_time_refuses_a_seconds_locktime
 openswap wallet::fidelity::test::test_fidelity_bond_value_function_behavior
 openswap wallet::fidelity::test::test_fidelity_bond_values
 openswap wallet::fidelity::test_fidleity_redeemscripts
