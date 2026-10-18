@@ -555,10 +555,6 @@ fn main() -> Result<(), TakerError> {
         return Ok(());
     }
 
-    // Held until exit, so `show-seed` and `attach-seed` don't write under us.
-    let _wallet_in_use =
-        seed_cli::WalletInUse::shared(&data_dir.join("wallets").join(&wallet_name))
-            .map_err(|e| TakerError::General(format!("could not lock the wallet file: {e}")))?;
     Wallet::init_interactive(
         &data_dir.join("wallets").join(&wallet_name),
         &backend,
