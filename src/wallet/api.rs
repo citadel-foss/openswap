@@ -549,12 +549,9 @@ impl Wallet {
         blockchain: AnyBlockchain,
         password: Option<String>,
     ) -> Result<Self, WalletError> {
-        Self::load_with_lock(
-            path,
-            blockchain,
-            password.clone().map(Zeroizing::new),
-            Self::shared_after_migration(path, password.as_deref())?,
-        )
+        let password = password.map(Zeroizing::new);
+        let in_use = Self::shared_after_migration(path, password.as_ref())?;
+        Self::load_with_lock(path, blockchain, password, in_use)
     }
 
     /// Takes the shared lock for a library load. An older file rewrites on
@@ -562,19 +559,20 @@ impl Wallet {
     /// first under the exclusive lock, as `open_offline` does.
     fn shared_after_migration(
         path: &Path,
-        password: Option<&str>,
+        password: Option<&Zeroizing<String>>,
     ) -> Result<WalletInUse, WalletError> {
-        let password = password.filter(|p| !p.is_empty()).map(str::to_owned);
+        // Each reader takes its own copy and wipes it.
+        let password = || password.filter(|p| !p.is_empty()).map(|p| p.to_string());
         if path.exists()
             && matches!(
-                WalletStore::read_without_upgrade(path, password.clone()),
+                WalletStore::read_without_upgrade(path, password()),
                 Ok(None)
             )
         {
             let Some(_owner) = WalletInUse::exclusive_if_idle(path)? else {
                 return Err(WalletError::General(IN_USE_MESSAGE.to_string()));
             };
-            match WalletStore::read_from_disk(path, password) {
+            match WalletStore::read_from_disk(path, password()) {
                 // No passphrase: nothing was written, and the load reports it.
                 Err(WalletError::Security(SecurityError::PasswordRequired)) => {}
                 other => {
@@ -675,12 +673,9 @@ impl Wallet {
         blockchain: AnyBlockchain,
         password: Option<String>,
     ) -> Result<Wallet, WalletError> {
-        Self::load_or_init_with_lock(
-            path,
-            blockchain,
-            password.clone().map(Zeroizing::new),
-            Self::shared_after_migration(path, password.as_deref())?,
-        )
+        let password = password.map(Zeroizing::new);
+        let in_use = Self::shared_after_migration(path, password.as_ref())?;
+        Self::load_or_init_with_lock(path, blockchain, password, in_use)
     }
 
     /// Consumes an already-held guard, so daemon startup reads, migrates and
