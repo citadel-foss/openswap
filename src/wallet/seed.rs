@@ -429,6 +429,85 @@ mod tests {
     }
 
     #[test]
+    fn pre_port_v2_seed_remains_password_gated_after_rewrite() {
+        for backed_up in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("wallet");
+            let mut original = legacy_wallet(&path, PHRASE);
+            original
+                .attach_wallet_mnemonic(password("test-password"), password(PHRASE))
+                .unwrap();
+            original.store.seed_backed_up = backed_up;
+            let seed_bytes = serde_cbor::to_vec(&original.store.sealed_mnemonic).unwrap();
+            let master_bytes = serde_cbor::to_vec(&original.store.master_key).unwrap();
+            // Use #1165's writer, so this exercises the old V2 read path
+            // followed by a save in the port's format.
+            let old =
+                crate::security::encrypt_struct_v2(&original.store, &original.store_enc_material)
+                    .unwrap();
+            std::fs::write(&path, serde_cbor::to_vec(&old).unwrap()).unwrap();
+            drop(original);
+
+            let mut offline = Wallet::open_offline(&path, password("test-password")).unwrap();
+            assert_eq!(offline.seed_backed_up(), backed_up);
+            assert_eq!(
+                offline
+                    .get_wallet_mnemonic(password("test-password"))
+                    .unwrap()
+                    .words()
+                    .as_str(),
+                PHRASE
+            );
+            let before_confirmation = std::fs::read(&path).unwrap();
+            for wrong in ["", "wrong-password"] {
+                assert!(matches!(
+                    offline.get_wallet_mnemonic(password(wrong)),
+                    Err(WalletError::WrongPassword)
+                ));
+                assert!(matches!(
+                    offline.confirm_seed_backup(password(wrong)),
+                    Err(WalletError::WrongPassword)
+                ));
+                assert_eq!(std::fs::read(&path).unwrap(), before_confirmation);
+                assert_eq!(offline.seed_backed_up(), backed_up);
+            }
+            // Match the seed CLI's write path: a fresh read under its guard.
+            drop(offline);
+            let _owner = WalletInUse::exclusive_if_idle(&path).unwrap().unwrap();
+            let mut offline = Wallet::open_offline(&path, password("test-password")).unwrap();
+            offline
+                .confirm_seed_backup(password("test-password"))
+                .unwrap();
+            drop(offline);
+
+            let reopened = Wallet::open_offline(&path, password("test-password")).unwrap();
+            assert!(reopened.seed_backed_up());
+            assert_eq!(
+                serde_cbor::to_vec(&reopened.store.sealed_mnemonic).unwrap(),
+                seed_bytes
+            );
+            assert_eq!(
+                serde_cbor::to_vec(&reopened.store.master_key).unwrap(),
+                master_bytes
+            );
+            assert_eq!(
+                reopened
+                    .get_wallet_mnemonic(password("test-password"))
+                    .unwrap()
+                    .words()
+                    .as_str(),
+                PHRASE
+            );
+            for wrong in ["", "wrong-password"] {
+                assert!(matches!(
+                    reopened.get_wallet_mnemonic(password(wrong)),
+                    Err(WalletError::WrongPassword)
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn migrated_v1_wallet_can_attach_and_reopen_its_seed() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wallet");

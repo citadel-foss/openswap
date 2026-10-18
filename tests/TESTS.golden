@@ -414,6 +414,7 @@ openswap wallet::seed::tests::offline_open_needs_an_existing_wallet_file
 openswap wallet::seed::tests::offline_open_reads_the_seed_without_writing
 openswap wallet::seed::tests::offline_open_upgrades_an_old_wallet_when_no_process_runs
 openswap wallet::seed::tests::offline_upgrade_refusals_release_lock_and_preserve_inputs
+openswap wallet::seed::tests::pre_port_v2_seed_remains_password_gated_after_rewrite
 openswap wallet::seed::tests::seal_checks_the_key_for_every_phrase_length
 openswap wallet::seed::tests::words_are_sized_once
 openswap wallet::seed_cli::tests::answers_match_the_exact_word_only
