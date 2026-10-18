@@ -146,7 +146,8 @@ On top of whole-file encryption, the BIP32 master key (`MasterKey` in
   command overwrite a running wallet. Tools that list the wallets directory
   should skip `*.lock` files. Don't delete one while a process uses the wallet.
 - **Docker.** The container prints no seed. Use `exec` to see the words:
-  `docker exec -it openswap-makerd makerd -w openswap-maker show-seed`. To
+  `docker exec -it openswap-makerd makerd -w <wallet> show-seed`, where
+  `<wallet>` is your `BITCOIN_WALLET_NAME` (default `openswap-maker`). To
   record the confirmation or attach a phrase, run `./docker-setup show-seed`
   or `./docker-setup attach-seed`. The script stops the maker, runs the
   command with Docker's logging off, and starts the maker again. A plain
