@@ -13,12 +13,15 @@ use std::{
     time::Duration,
 };
 
-use bitcoin::{Amount, Network, TxOut};
+use bitcoin::{hashes::sha256, Amount, Network, TxOut};
 use bitcoind::bitcoincore_rpc::{json::ScanTxOutRequest, RpcApi};
 use openswap::{
     blocklist::BlocklistError,
-    lightning::{LightningBackend, MockLightningBackend},
-    maker::lightning_handlers::LnMakerPhase,
+    lightning::{LightningBackend, MockLightningBackend, PaymentOutcome},
+    maker::{
+        lightning_handlers::{ln_watchdog_tick_now, LnMakerPhase},
+        MakerServer,
+    },
     taker::{error::TakerError, lightning_swap::LnSwapParams},
     wallet::AddressType,
 };
@@ -40,24 +43,26 @@ fn maker_and_taker_nodes() -> (Arc<MockLightningBackend>, Arc<MockLightningBacke
 }
 
 /// One maker, one taker; a swap-in followed by a swap-out over the same
-/// maker, asserting both layers settle and no recovery records remain.
+/// maker, asserting both layers settle and no recovery records remain on
+/// either side.
 #[world_test(
     backend = BitcoindBackend,
     bind = [(maker_ln, taker_ln) = maker_and_taker_nodes()],
     maker_behaviors = [Normal],
     takers = [Normal],
     maker_lightning = [maker_ln],
-    taker_lightning = [taker_ln],
+    taker_lightning = [taker_ln.clone()],
     setup = [
         fund_taker(3, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
         fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
         start_makers(120),
     ],
 )]
-fn lightning_submarine_swaps_e2e(world: &mut World) {
+fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningBackend>) {
     // A handle of its own, so the node stays reachable while the taker is borrowed.
     let framework = world.framework().clone();
     let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
     let maker_address = world.makers()[0].address();
     let taker = world.taker_mut().inner_mut();
 
@@ -126,6 +131,49 @@ fn lightning_submarine_swaps_e2e(world: &mut World) {
         "no pending lightning swaps should remain, got: {:?}",
         outcomes
     );
+
+    // The maker read the preimage from the taker's claim and settled the held
+    // payment: the taker's node reports it settled with the swap's preimage.
+    let out_hash: sha256::Hash = swap_out.swap_id.parse().unwrap();
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(1),
+        "the maker to settle the swap-out's held payment",
+        matches!(
+            taker_ln.payment_outcome(out_hash).unwrap(),
+            PaymentOutcome::Settled(preimage) if preimage.payment_hash() == out_hash
+        )
+    );
+
+    // Nor do maker-side ones: the live map empties once each swap resolves.
+    // The swap-in stays held until a watchdog pass sees its sweep confirm,
+    // and the server's watchdog skips swaps idle under five minutes, so
+    // force the passes here.
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(1),
+        "the maker to forget both resolved swaps",
+        {
+            ln_watchdog_tick_now(&maker);
+            maker.ln_swaps.lock().unwrap().is_empty()
+        }
+    );
+    // So does the wallet store, which a restart restores the live map
+    // from.
+    world.shutdown_makers();
+    let mut config = maker.config.clone();
+    // `init` consumes the passphrase, so a restart has to supply it again.
+    config.password = Some("integration-test".to_string());
+    drop(maker);
+    world.drop_makers();
+    let restarted = Arc::new(MakerServer::init(config).expect("maker restarts"));
+    let restored = restarted.ln_swaps.lock().unwrap().clone();
+    assert!(
+        restored.is_empty(),
+        "resolved swaps left durable maker records: {:?}",
+        restored.keys().collect::<Vec<_>>()
+    );
+    world.adopt_makers([restarted]);
 }
 
 /// With screening on, a maker must refuse a swap-in whose on-chain funding

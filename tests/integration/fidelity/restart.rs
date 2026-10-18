@@ -15,10 +15,11 @@ use openswap::{
 use crate::test_framework::*;
 
 use std::{
+    fs,
     path::PathBuf,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::{assert_single_adopted_bond, maker_restart_config};
@@ -189,6 +190,12 @@ fn live_bond_is_advertised_while_another_is_pending(world: &mut World) {
     wait_for_makers_setup(std::slice::from_ref(maker), 120);
     maker.shutdown.store(true, Relaxed);
     let _ = maker_thread.join();
+    let live_outpoint = {
+        let wallet = maker.wallet.read().unwrap();
+        let bonds = wallet.get_fidelity_bonds();
+        assert_eq!(bonds.len(), 1, "run 1 must create exactly one bond");
+        bonds[0].outpoint()
+    };
 
     // ----- A second bond is broadcast and kept unconfirmed -----
     world.framework().set_block_gen_paused(true);
@@ -207,6 +214,9 @@ fn live_bond_is_advertised_while_another_is_pending(world: &mut World) {
         .unwrap();
 
     // ----- Run 2: setup completes while the second bond is still pending -----
+    // Run 1 already published the live bond; only run 2's publication counts.
+    let log_path = world.taker_log_path();
+    let mark = log_mark(&log_path);
     let restarted = Arc::new(MakerServer::init(maker_restart_config(maker)).unwrap());
     let restarted_clone = restarted.clone();
     let restarted_thread = thread::spawn(move || {
@@ -217,6 +227,38 @@ fn live_bond_is_advertised_while_another_is_pending(world: &mut World) {
     // Read before stopping, assert after: a failed assert must not leave the
     // restarted maker running.
     let still_pending = bitcoind.client.get_mempool_entry(&pending_txid).is_ok();
+    // The restart must actually publish the live bond, not just log the intent:
+    // a relay has to accept the event built right after an intent line. Every
+    // attempt counts, since a failed first one is retried by the periodic
+    // rebroadcast (every 30s) with a fresh event ID.
+    let published = format!("Publishing fidelity bond to Nostr | outpoint={live_outpoint} ");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let published_in_run_2 = loop {
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        let accepted = log.get(mark as usize..).is_some_and(|new| {
+            new.match_indices(&published).any(|(intent, _)| {
+                let after = &new[intent..];
+                let Some(event_id) = after
+                    .split("Nostr event built | event_id=")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                else {
+                    return false;
+                };
+                after.lines().any(|l| {
+                    l.contains("Nostr relay accepted event")
+                        && l.contains(&format!("event_id={event_id}"))
+                })
+            })
+        });
+        if accepted {
+            break true;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+        thread::sleep(POLL);
+    };
     restarted.shutdown.store(true, Relaxed);
     let _ = restarted_thread.join();
     world.framework().set_block_gen_paused(false);
@@ -225,11 +267,18 @@ fn live_bond_is_advertised_while_another_is_pending(world: &mut World) {
         still_pending,
         "the second bond must still be unconfirmed when setup completes"
     );
-    // The restart advertised the live bond instead of waiting.
-    assert_log!(world; {
+    assert!(
+        published_in_run_2,
+        "the restarted maker must publish its live bond {} to Nostr",
+        live_outpoint
+    );
+    // The restart advertised the live bond instead of waiting, and never the
+    // pending one.
+    assert_log!(log_path, since mark; {
         has format!(
             "Fidelity bond {pending_txid} still unconfirmed; advertising the live bond meanwhile"
         ),
+        lacks format!("Publishing fidelity bond to Nostr | outpoint={pending_txid}:"),
     });
 }
 

@@ -8,13 +8,15 @@
 //! A normal swap runs first so `SwapUtxo` and `VerifyDeniability` have
 //! something real to report.
 
-use bitcoin::{Address, Amount};
+use bitcoin::{Address, Amount, Txid};
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::{AuthenticatedRpcRequest, RpcMsgReq as Req, RpcMsgResp as Resp},
     protocol::common_messages::ProtocolVersion,
     taker::SwapParams,
-    utill::{read_message, send_message},
+    utill::{read_message, send_message, UTXO},
 };
+use serde_json::{json, Value};
 
 use crate::test_framework::*;
 
@@ -52,6 +54,37 @@ impl Rpc {
         let bytes = read_message(&mut stream).expect("failed to read RPC response");
         serde_cbor::from_slice(&bytes).expect("failed to decode RPC response")
     }
+}
+
+/// Each UTXO as JSON without its confirmation count, which the background
+/// miner moves between reading the wallet and asking the RPC, sorted.
+fn utxo_rows(utxos: &[UTXO]) -> Vec<String> {
+    let mut rows: Vec<String> = utxos
+        .iter()
+        .map(|utxo| {
+            let mut row = serde_json::to_value(utxo).unwrap();
+            row.as_object_mut().unwrap().remove("confirmations");
+            row.to_string()
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The bonds of a `ListFidelity` reply without their tip-dependent valuation,
+/// which every live bond must carry.
+fn bond_rows(list: &str) -> Vec<Value> {
+    let mut bonds: Vec<Value> = serde_json::from_str(list).expect("ListFidelity must be JSON");
+    for bond in &mut bonds {
+        let bond = bond.as_object_mut().unwrap();
+        let value = bond.remove("bond_value");
+        assert_eq!(
+            value.is_some(),
+            bond["status"] == "Live",
+            "only a live bond is valued: {bond:?}"
+        );
+    }
+    bonds
 }
 
 /// `assert_rpc!(rpc, { request => reply pattern [if guard], .. })`: sends every
@@ -145,24 +178,59 @@ fn rpc_server(world: &mut World) {
     };
     // What the RPC reports must match what the wallet reports directly.
     let wallet = world.makers()[0].balances();
+    let (wallet_utxos, wallet_fidelity_utxos, wallet_bonds) = {
+        let wallet = target.wallet.read().unwrap();
+        let rows = |coins: Vec<_>| {
+            utxo_rows(
+                &coins
+                    .into_iter()
+                    .map(UTXO::from_utxo_data)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let bonds = wallet
+            .get_fidelity_bonds()
+            .iter()
+            .map(|bond| {
+                json!({
+                    "index": bond.bond_index,
+                    "outpoint": bond.outpoint().to_string(),
+                    "amount": bond.amount.to_sat(),
+                    "status": if bond.is_spent() { "Redeemed" } else { "Live" },
+                })
+            })
+            .collect::<Vec<_>>();
+        (
+            rows(wallet.list_all_utxo_spend_info()),
+            rows(wallet.list_fidelity_spend_info()),
+            bonds,
+        )
+    };
+    assert!(!wallet_utxos.is_empty(), "the maker wallet must hold UTXOs");
+    assert_eq!(
+        wallet_bonds.len(),
+        1,
+        "the maker must hold exactly its bond"
+    );
 
     // ---- Queries ----
     assert_rpc!(rpc, {
         Req::Ping => Resp::Pong,
-        Req::Utxo => Resp::UtxoResp { utxos } if !utxos.is_empty(),
+        Req::Utxo => Resp::UtxoResp { utxos } if utxo_rows(&utxos) == wallet_utxos,
         // Unswept incoming swapcoins only: the completed swap swept them, and
         // the proceeds show up under `Balances.swap`.
         Req::SwapUtxo => Resp::SwapUtxoResp { utxos } if utxos.is_empty(),
         // A swap that completed leaves no live contracts.
         Req::ContractUtxo => Resp::ContractUtxoResp { utxos } if utxos.is_empty(),
-        Req::FidelityUtxo => Resp::FidelityUtxoResp { utxos } if utxos.len() == 1,
+        Req::FidelityUtxo => Resp::FidelityUtxoResp { utxos }
+            if utxos.len() == 1 && utxo_rows(&utxos) == wallet_fidelity_utxos,
         Req::Balances => Resp::TotalBalanceResp(b)
             if (b.regular, b.swap, b.contract, b.fidelity)
                 == (wallet.regular, wallet.swap, wallet.contract, wallet.fidelity),
         Req::GetDataDir => Resp::GetDataDirResp(dir) if dir == data_dir,
         Req::GetTorAddress => Resp::GetTorAddressResp(addr)
             if addr == "Maker is not running on TOR",
-        Req::ListFidelity => Resp::ListBonds(list) if !list.is_empty(),
+        Req::ListFidelity => Resp::ListBonds(list) if bond_rows(&list) == wallet_bonds,
         Req::SyncWallet => Resp::Pong,
         Req::VerifyDeniability { swap_id: swap_id.clone() } => Resp::VerifyDeniabilityResp(true),
         // An unknown swap id is an error, not `false`.
@@ -176,13 +244,29 @@ fn rpc_server(world: &mut World) {
             .expect("NewAddress must return a parseable address")
             .assume_checked()
     );
-    assert_rpc!(rpc, {
-        Req::SendToAddress {
+    let txid = expect_resp!(
+        rpc.call(Req::SendToAddress {
             address: new_address.to_string(),
             amount: 100_000,
             feerate: 2.0,
-        } => Resp::SendToAddressResp(txid) if !txid.is_empty(),
-    });
+        }),
+        Resp::SendToAddressResp(txid) => Txid::from_str(&txid)
+            .expect("SendToAddress must return a parseable txid")
+    );
+    // The reply names a real transaction that pays the requested output.
+    let tx = world
+        .bitcoind()
+        .client
+        .get_raw_transaction(&txid, None)
+        .expect("SendToAddress txid must be known to bitcoind");
+    assert!(
+        tx.output
+            .iter()
+            .any(|out| out.script_pubkey == new_address.script_pubkey()
+                && out.value == Amount::from_sat(100_000)),
+        "SendToAddress tx {txid} must pay 100,000 sats to {new_address}: {:?}",
+        tx.output
+    );
 
     // ---- The cookie is actually checked ----
     let intruder = Rpc {

@@ -142,6 +142,41 @@ fn keepalive_naming_unseen_funding_is_refused(world: &mut World) {
     world.framework().set_block_gen_paused(false);
 }
 
+/// One connection keeps alive only the first swap it names: a later keepalive
+/// for another admitted swap closes the connection before it refreshes that
+/// swap, so N persistent sockets cannot hold more than N admissions open.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+)]
+fn keepalive_socket_cannot_switch_swap_id(world: &mut World) {
+    let (first, log_path) = keepalive_admission(world, false);
+    let (second, _) = keepalive_admission(world, false);
+    assert_ne!(first, second);
+    let maker_addr = world.makers()[0].address();
+
+    // Past the integration-test throttle window, so only the id switch can
+    // refuse the second keepalive.
+    world
+        .taker()
+        .inner()
+        .test_send_keepalives(&maker_addr, &[&first, &second], Duration::from_secs(2))
+        .expect("the keepalives must be sent");
+
+    wait_for_log(
+        &log_path,
+        &format!("Refusing keepalive for swap {second}"),
+        Duration::from_secs(30),
+    );
+    let refreshed = |id: &str| format!("(swap {id}). Resetting timer");
+    assert_log!(log_path; {
+        has &refreshed(&first),
+        lacks &refreshed(&second),
+    });
+}
+
 /// A taker that returns after the maker drained its idle admission is
 /// admitted again by the re-check before funding, and the swap completes.
 #[world_test(

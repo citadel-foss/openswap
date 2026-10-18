@@ -67,5 +67,26 @@ pub(crate) fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> io:
         temporary_file.sync_all()?;
     }
 
-    std::fs::rename(&temporary_path, path)
+    std::fs::rename(&temporary_path, path)?;
+
+    // Without a directory sync, a power loss can undo the rename after `Ok` returned.
+    // A sync failure only leaves durability unconfirmed; the rename already happened.
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let directory = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Err(error) = File::open(directory).and_then(|dir| dir.sync_all()) {
+            log::warn!(
+                "Could not sync {} after writing {}: {error}",
+                directory.display(),
+                path.display()
+            );
+        }
+    }
+
+    Ok(())
 }

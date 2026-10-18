@@ -129,9 +129,10 @@ fn run_taker_restart_recovery(world: &mut World, protocol: ProtocolVersion) {
             .expect("restarted taker should open the same wallet"),
     );
 
-    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-    // 135s at 5 blocks/3s; 300s bounds the wait.
+    // 135s at 5 blocks/3s. Even back to back that is 165s, so 420s leaves about
+    // 255s of margin.
     // The makers stay up meanwhile, as they did through the old fixed wait.
     info!("Waiting for the restarted taker's recovery loop to finish...");
     wait_until!(

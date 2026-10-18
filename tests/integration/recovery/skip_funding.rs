@@ -33,6 +33,78 @@ fn assert_grace_then_discard(log_path: &str, swap_id: &str) {
     });
 }
 
+/// The balances a timelock-only recovery settles at. Losses are measured from
+/// the taker's funded balance and the makers' post-fidelity, pre-swap ones.
+struct TimelockOnlyExpect {
+    taker_regular: u64,
+    taker_swap: u64,
+    taker_loss: u64,
+    maker_regular: [u64; 2],
+    maker_swap: [u64; 2],
+    /// Maker2 never broadcast its funding, so it must end exactly where it began.
+    maker_loss: [u64; 2],
+}
+
+/// Also what `restart::watchtower_liveness` settles at with Maker1's watcher stopped.
+const LEGACY_TIMELOCK_ONLY: TimelockOnlyExpect = TimelockOnlyExpect {
+    taker_regular: 14998629,
+    taker_swap: 0,
+    taker_loss: 1371,
+    maker_regular: [14998419, 14999757],
+    maker_swap: [0, 0],
+    maker_loss: [1338, 0],
+};
+
+const TAPROOT_TIMELOCK_ONLY: TimelockOnlyExpect = TimelockOnlyExpect {
+    taker_regular: 14999085,
+    taker_swap: 0,
+    taker_loss: 915,
+    maker_regular: [14998875, 14999757],
+    maker_swap: [0, 0],
+    maker_loss: [882, 0],
+};
+
+const TAPROOT_TIMELOCK_ONLY_ELECTRUM: TimelockOnlyExpect = TimelockOnlyExpect {
+    taker_regular: 14999085,
+    taker_swap: 0,
+    taker_loss: 915,
+    maker_regular: [14998875, 14999757],
+    maker_swap: [0, 0],
+    maker_loss: [882, 0],
+};
+
+/// Syncs the makers and asserts every wallet against `expected`. The taker
+/// must already be synced past its confirmed recovery txs.
+fn assert_timelock_only_balances(
+    world: &World,
+    taker_original_balance: Amount,
+    maker_spendable_balance: &[Amount],
+    expected: &TimelockOnlyExpect,
+) {
+    world.sync_makers();
+    let maker_spendable: Vec<Amount> = maker_spendable_balance
+        .iter()
+        .zip(expected.maker_loss)
+        .map(|(before, loss)| *before - Amount::from_sat(loss))
+        .collect();
+    assert_balances!(world; {
+        taker: {
+            regular: expected.taker_regular,
+            swap: expected.taker_swap,
+            contract: 0,
+            fidelity: 0,
+            spendable: taker_original_balance - Amount::from_sat(expected.taker_loss),
+        },
+        makers: {
+            regular: expected.maker_regular,
+            swap: expected.maker_swap,
+            contract: 0,
+            fidelity: BOND,
+            spendable: maker_spendable,
+        },
+    });
+}
+
 /// Test: Timelock-only recovery when last maker skips funding broadcast.
 ///
 /// Route: Taker → Maker1 → Maker2 → Taker
@@ -108,9 +180,11 @@ pub(crate) fn run_legacy_timelock_only_recovery(
         assert!(!world.makers()[0].inner().watch_service.is_alive());
     }
 
-    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // Recovery waits out the 30s maker idle timeout (test builds), the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-    // 135s at 5 blocks/3s; 300s bounds the wait.
+    // 135s at 5 blocks/3s, and the 120s unbroadcast grace (UNBROADCAST_DISCARD_GRACE)
+    // before Maker2's never-broadcast funding is discarded. The grace counts from
+    // the swap's creation, alongside the timelock, so 300s bounds the wait.
     info!("Waiting for the grace discard and the makers' timelock recovery...");
     wait_logged!(
         world,
@@ -155,54 +229,12 @@ pub(crate) fn run_legacy_timelock_only_recovery(
     world.framework().wait_for_electrs_tip();
     world.taker().sync();
 
-    // Contract balance should be 0
-    assert_balances!(world; { taker: { contract: 0 } });
-    let taker_balances = world.taker().balances();
-
-    // Balance diff should be small (timelock recovery fees only)
-    let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
-        .unwrap_or(Amount::ZERO);
-
-    info!(
-        "Taker balance diff: {} sats (original: {}, current: {})",
-        balance_diff.to_sat(),
+    assert_timelock_only_balances(
+        world,
         taker_original_balance,
-        taker_balances.spendable,
+        &maker_spendable_balance,
+        &LEGACY_TIMELOCK_ONLY,
     );
-
-    assert!(
-        balance_diff.to_sat() < 10000,
-        "Taker should have recovered most funds. Lost {} sats (expected < 10000)",
-        balance_diff.to_sat(),
-    );
-
-    // Verify maker balances are close to pre-swap (post-fidelity) balances
-    for (i, maker) in world.makers().iter().enumerate() {
-        maker.sync();
-        let maker_balances = maker.balances();
-        let original = maker_spendable_balance[i];
-
-        let maker_diff = original
-            .checked_sub(maker_balances.spendable)
-            .unwrap_or(Amount::ZERO);
-
-        info!(
-            "Maker {} balance diff: {} sats (pre-swap: {}, current: {})",
-            i,
-            maker_diff.to_sat(),
-            original,
-            maker_balances.spendable,
-        );
-
-        // Makers should recover most of their funds (small loss from tx fees)
-        assert!(
-            maker_diff.to_sat() < 10000,
-            "Maker {} should have recovered most funds. Lost {} sats (expected < 10000)",
-            i,
-            maker_diff.to_sat(),
-        );
-    }
 
     world.taker().inner().log_tracker_state();
     info!("Legacy timelock-only recovery test completed successfully!");
@@ -266,10 +298,16 @@ fn legacy_timelock_only_recovery(
     ],
     swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
     cases = [
-        taproot_timelock_only_recovery(backend = BitcoindBackend),
+        taproot_timelock_only_recovery(
+            backend = BitcoindBackend,
+            expected = &TAPROOT_TIMELOCK_ONLY,
+        ),
         /// Same timelock-only recovery on Electrum: the grace and discard decisions
         /// read the indexer rather than the maker's own node.
-        taproot_timelock_only_recovery_electrum(backend = ElectrumBackend),
+        taproot_timelock_only_recovery_electrum(
+            backend = ElectrumBackend,
+            expected = &TAPROOT_TIMELOCK_ONLY_ELECTRUM,
+        ),
     ],
 )]
 fn run_taproot_timelock_only_recovery(
@@ -277,6 +315,7 @@ fn run_taproot_timelock_only_recovery(
     taker_original_balance: Amount,
     maker_spendable_balance: Vec<Amount>,
     params: SwapParams,
+    expected: &TimelockOnlyExpect,
 ) {
     // Start periodic swap tracker logging (every 10s)
     let tracker_logger = world.spawn_tracker_logger(Duration::from_secs(10));
@@ -316,9 +355,11 @@ fn run_taproot_timelock_only_recovery(
         "Maker2 must keep its swapcoins when the swap fails"
     );
 
-    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // Recovery waits out the 30s maker idle timeout (test builds), the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-    // 135s at 5 blocks/3s; 300s bounds the wait.
+    // 135s at 5 blocks/3s, and the 120s unbroadcast grace (UNBROADCAST_DISCARD_GRACE)
+    // before Maker2's never-broadcast funding is discarded. The grace counts from
+    // the swap's creation, alongside the timelock, so 300s bounds the wait.
     info!("Waiting for the grace discard and the makers' timelock recovery...");
     wait_logged!(
         world,
@@ -364,54 +405,12 @@ fn run_taproot_timelock_only_recovery(
     world.framework().wait_for_electrs_tip();
     world.taker().sync();
 
-    // Contract balance should be 0
-    assert_balances!(world; { taker: { contract: 0 } });
-    let taker_balances = world.taker().balances();
-
-    // Balance diff should be small (timelock recovery fees only)
-    let balance_diff = taker_original_balance
-        .checked_sub(taker_balances.spendable)
-        .unwrap_or(Amount::ZERO);
-
-    info!(
-        "Taker balance diff: {} sats (original: {}, current: {})",
-        balance_diff.to_sat(),
+    assert_timelock_only_balances(
+        world,
         taker_original_balance,
-        taker_balances.spendable,
+        &maker_spendable_balance,
+        expected,
     );
-
-    assert!(
-        balance_diff.to_sat() < 10000,
-        "Taker should have recovered most funds. Lost {} sats (expected < 10000)",
-        balance_diff.to_sat(),
-    );
-
-    // Verify maker balances are close to pre-swap (post-fidelity) balances
-    for (i, maker) in world.makers().iter().enumerate() {
-        maker.sync();
-        let maker_balances = maker.balances();
-        let original = maker_spendable_balance[i];
-
-        let maker_diff = original
-            .checked_sub(maker_balances.spendable)
-            .unwrap_or(Amount::ZERO);
-
-        info!(
-            "Maker {} balance diff: {} sats (pre-swap: {}, current: {})",
-            i,
-            maker_diff.to_sat(),
-            original,
-            maker_balances.spendable,
-        );
-
-        // Makers should recover most of their funds (small loss from tx fees)
-        assert!(
-            maker_diff.to_sat() < 10000,
-            "Maker {} should have recovered most funds. Lost {} sats (expected < 10000)",
-            i,
-            maker_diff.to_sat(),
-        );
-    }
 
     world.taker().inner().log_tracker_state();
     info!("Taproot timelock-only recovery test completed successfully!");

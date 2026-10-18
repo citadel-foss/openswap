@@ -14,6 +14,7 @@ use std::{
 };
 
 use bitcoin::{
+    hashes::sha256,
     secp256k1::{Secp256k1, SecretKey},
     Amount, Network, OutPoint, PublicKey, Txid,
 };
@@ -74,27 +75,16 @@ fn maker_node_pair() -> (Arc<MockLightningBackend>, Arc<MockLightningBackend>) {
     (ln, payee)
 }
 
-#[world_test(
-    backend = BitcoindBackend,
-    bind = [ln = maker_node()],
-    maker_behaviors = [Normal],
-    takers = [Normal],
-    maker_lightning = [ln.clone()],
-    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
-)]
-fn lightning_maker_restart_recovers_funded_swap(world: &mut World, ln: Arc<MockLightningBackend>) {
-    // A handle of its own: the makers are dropped mid-test, the node is not.
-    let framework = world.framework().clone();
-    let bitcoind = &framework.bitcoind;
-    let maker = world.makers()[0].inner().clone();
-    // Must clear the maker's floor: enough window must remain after the
-    // confirmations it waits for.
-    let locktime: u16 = 30;
-    let amount = Amount::from_sat(40_000);
-
-    // The taker's secret and claim key; the maker never learns the preimage.
-    let preimage = Preimage([0x77; 32]);
-    let payment_hash = preimage.payment_hash();
+/// Drives `maker` through a swap-out for `payment_hash` until it has funded
+/// the on-chain HTLC: request, the taker's held payment, then `SwapOutPaid`.
+/// The taker never claims, so only the maker's timelock branch remains.
+fn fund_swap_out(
+    maker: &Arc<MakerServer>,
+    ln: &MockLightningBackend,
+    payment_hash: sha256::Hash,
+    amount: Amount,
+    locktime: u16,
+) -> LnHtlcFunded {
     let swap_id = payment_hash.to_string();
     let taker_hashlock_pubkey = PublicKey::new(
         SecretKey::from_slice(&[0x31; 32])
@@ -102,10 +92,9 @@ fn lightning_maker_restart_recovers_funded_swap(world: &mut World, ln: Arc<MockL
             .public_key(&Secp256k1::new()),
     );
 
-    // ---- Drive the maker to a funded swap-out ----
     let mut state = ConnectionState::default();
     handle_message(
-        &maker,
+        maker,
         &mut state,
         TakerToMakerMessage::TakerHello(TakerHello),
     )
@@ -113,7 +102,7 @@ fn lightning_maker_restart_recovers_funded_swap(world: &mut World, ln: Arc<MockL
 
     let accept = match expect_ln(
         handle_message(
-            &maker,
+            maker,
             &mut state,
             ln_message(LightningTakerMessage::SwapOutRequest(LnSwapOutRequest {
                 swap_id: swap_id.clone(),
@@ -138,9 +127,9 @@ fn lightning_maker_restart_recovers_funded_swap(world: &mut World, ln: Arc<MockL
         "the held payment must reach the swap's mailbox"
     );
 
-    let funded = match expect_ln(
+    match expect_ln(
         handle_message(
-            &maker,
+            maker,
             &mut state,
             ln_message(LightningTakerMessage::SwapOutPaid(LnSwapOutPaid {
                 swap_id: swap_id.clone(),
@@ -150,7 +139,33 @@ fn lightning_maker_restart_recovers_funded_swap(world: &mut World, ln: Arc<MockL
     ) {
         LightningMakerMessage::SwapOutFunded(funded) => funded,
         other => panic!("expected SwapOutFunded, got {}", other),
-    };
+    }
+}
+
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_restart_recovers_funded_swap(world: &mut World, ln: Arc<MockLightningBackend>) {
+    // A handle of its own: the makers are dropped mid-test, the node is not.
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    // Must clear the maker's floor: enough window must remain after the
+    // confirmations it waits for.
+    let locktime: u16 = 30;
+    let amount = Amount::from_sat(40_000);
+
+    // The taker's secret; the maker never learns the preimage.
+    let preimage = Preimage([0x77; 32]);
+    let payment_hash = preimage.payment_hash();
+    let swap_id = payment_hash.to_string();
+
+    let funded = fund_swap_out(&maker, &ln, payment_hash, amount, locktime);
     log::info!("maker funded the HTLC at {}", funded.outpoint);
 
     // ---- Restart: everything in memory is lost ----
@@ -217,6 +232,147 @@ fn lightning_maker_restart_recovers_funded_swap(world: &mut World, ln: Arc<MockL
 
     restarted.shutdown.store(true, Relaxed);
     restarted.watch_service.shutdown();
+}
+
+/// The server's watchdog skips swaps touched within its five-minute idle
+/// window (`WATCHDOG_MIN_IDLE`). Backdates `swap_id`'s last phase change past
+/// it, so the next 30-second tick acts on the swap instead of a test waiting
+/// out the window.
+fn backdate_past_watchdog_idle(maker: &MakerServer, swap_id: &str) {
+    let mut swaps = maker.ln_swaps.lock().unwrap();
+    let swap = swaps.get_mut(swap_id).expect("the swap is still held");
+    swap.updated_at = Instant::now()
+        .checked_sub(Duration::from_secs(300))
+        .expect("the monotonic clock reaches five minutes back");
+}
+
+/// After a restart, the maker's own server must refund a funded swap-out the
+/// taker never claimed: once the CSV window passes, the watchdog broadcasts
+/// the timelock spend, the coins come back to the maker's wallet, and the
+/// swap closes with its held payment failed back.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+// The watcher answers a query for a watched, unspent outpoint with
+// `UtxoSpent { spending_tx: None }`, which `watchdog_resolve_swap_out` reads
+// as "spent, tx not known yet" and retries forever, so the refund branch is
+// never reached. Un-ignore once that is fixed.
+#[ignore = "the watchdog never reaches its swap-out refund branch (issue #1127)"]
+fn lightning_maker_restart_refunds_unclaimed_swap_out(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    // A handle of its own: the makers are dropped mid-test, the node is not.
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    let locktime: u16 = 30;
+    let amount = Amount::from_sat(40_000);
+
+    // The taker pays but never claims, so the preimage stays private.
+    let preimage = Preimage([0x78; 32]);
+    let payment_hash = preimage.payment_hash();
+    let swap_id = payment_hash.to_string();
+    let funded = fund_swap_out(&maker, &ln, payment_hash, amount, locktime);
+    log::info!("maker funded the HTLC at {}", funded.outpoint);
+
+    // ---- Restart from the wallet store, then start the server ----
+    let mut config = maker.config.clone();
+    // `init` consumes the passphrase, so a restart has to supply it again.
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(maker);
+    world.drop_makers();
+
+    let mut restarted = MakerServer::init(config).expect("maker restarts");
+    restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
+    assert!(
+        restarted.ln_swaps.lock().unwrap().contains_key(&swap_id),
+        "the in-flight swap must be restored from the wallet"
+    );
+    backdate_past_watchdog_idle(&restarted, &swap_id);
+    let log_path = world.taker_log_path();
+    world.adopt_makers([Arc::new(restarted)]);
+    world.start_makers(120);
+    let maker = world.makers()[0].inner().clone();
+
+    // CSV counts from the funding's confirmation.
+    generate_blocks(bitcoind, locktime as u64 + 2);
+
+    // ---- The watchdog refunds on its own ----
+    wait_for_log(
+        &log_path,
+        &format!("Swap-out {swap_id} refund broadcast"),
+        Duration::from_secs(180),
+    );
+    // The record keeps the swap, and its key, until the refund confirms.
+    let mut refund_txid = None;
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_secs(1),
+        "the maker to record its refund txid",
+        {
+            refund_txid = maker
+                .ln_swaps
+                .lock()
+                .unwrap()
+                .get(&swap_id)
+                .and_then(|swap| swap.refund_txid);
+            refund_txid.is_some()
+        }
+    );
+    let refund_txid = refund_txid.unwrap();
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(1),
+        "the maker's refund to confirm",
+        confirmations(bitcoind, &refund_txid) >= 1
+    );
+    let refund = raw_tx_with_retry(bitcoind, &refund_txid);
+    assert_eq!(
+        refund
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect::<Vec<_>>(),
+        vec![funded.outpoint],
+        "the refund must spend exactly the swap's HTLC"
+    );
+
+    // The refunded coins are back in the maker's wallet.
+    world.makers()[0].sync();
+    assert!(
+        maker
+            .wallet
+            .read()
+            .unwrap()
+            .list_all_utxo()
+            .iter()
+            .any(|utxo| utxo.txid == refund_txid),
+        "the maker's wallet must hold the refund output"
+    );
+
+    // ---- A later tick closes the swap ----
+    // Broadcasting touched the record, so backdate it again for the tick
+    // that sees the confirmed refund.
+    backdate_past_watchdog_idle(&maker, &swap_id);
+    wait_until!(
+        Duration::from_secs(120),
+        every Duration::from_secs(1),
+        "the maker to close the refunded swap",
+        !maker.ln_swaps.lock().unwrap().contains_key(&swap_id)
+    );
+    // Closing failed the held payment back, so it can no longer be claimed.
+    assert!(
+        ln.claim_held_payment(&preimage).is_err(),
+        "the refunded swap's held payment must be failed back"
+    );
 }
 
 /// An unfunded swap-in as the maker stores it on acceptance.

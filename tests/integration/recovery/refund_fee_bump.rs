@@ -39,7 +39,7 @@ impl Drop for FeerateOverride {
 }
 
 /// The mempool tx spending `outpoint`, straight from bitcoind.
-fn mempool_spender(bitcoind: &BitcoinD, outpoint: &OutPoint) -> Option<Txid> {
+pub(super) fn mempool_spender(bitcoind: &BitcoinD, outpoint: &OutPoint) -> Option<Txid> {
     let spends: serde_json::Value = bitcoind
         .client
         .call(

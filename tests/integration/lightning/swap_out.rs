@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
-use bitcoin::{Amount, OutPoint, ScriptBuf};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Witness};
 use bitcoind::bitcoincore_rpc::RpcApi;
 
 use openswap::lightning::{
-    HtlcFunded, LightningBackend, LnEvent, MockLightningBackend, SwapOutMaker, SwapOutParams,
-    SwapOutTaker,
+    HtlcFunded, LightningBackend, LnEvent, MockLightningBackend, PaymentOutcome, SwapError,
+    SwapOutMaker, SwapOutParams, SwapOutTaker,
 };
 
 use crate::test_framework::*;
@@ -118,7 +118,7 @@ fn swap_out_refund_path(node: &mut Node) {
 
     let params = test_params();
     let mut taker = SwapOutTaker::new(ln.clone(), params);
-    let mut maker = SwapOutMaker::new(ln);
+    let mut maker = SwapOutMaker::new(ln.clone());
 
     let accept = maker.accept(taker.make_request()).unwrap();
     let spk = taker.on_accept(&accept).unwrap().script_pubkey().unwrap();
@@ -150,13 +150,31 @@ fn swap_out_refund_path(node: &mut Node) {
         "maker's timelock refund must confirm"
     );
 
-    // The refund reveals nothing the maker could settle with.
-    assert!(maker.settle_from_spend(&refund_tx).is_err());
+    // The refund reveals nothing the maker could settle with, and is
+    // rejected for exactly that reason.
+    let err = maker
+        .settle_from_spend(&refund_tx)
+        .expect_err("a refund spend must not settle");
+    assert!(
+        matches!(&err, SwapError::Validation(msg)
+            if msg == "transaction does not reveal the HTLC preimage"),
+        "expected the no-preimage rejection, got: {:?}",
+        err
+    );
+
+    // The rejection left the held payment untouched: still pending, neither
+    // settled nor failed back.
+    let outcome = ln.payment_outcome(taker.payment_hash()).unwrap();
+    assert!(
+        matches!(outcome, PaymentOutcome::Pending),
+        "the held payment must stay pending after the refund, got: {:?}",
+        outcome
+    );
 }
 
 /// The maker only accepts a preimage that actually matches the payment hash:
-/// a witness carrying 32 bytes that hash to something else is rejected
-/// before touching the Lightning backend.
+/// a claim of this swap's HTLC whose witness carries 32 bytes that hash to
+/// something else is rejected before touching the Lightning backend.
 #[test]
 fn swap_out_settle_rejects_foreign_spend() {
     let ln: Arc<dyn LightningBackend> = Arc::new(MockLightningBackend::new());
@@ -169,26 +187,41 @@ fn swap_out_settle_rejects_foreign_spend() {
     taker.pay_invoice().unwrap();
     assert!(maker.try_await_payment().unwrap());
 
-    // A spend of a *different* swap's HTLC (different preimage, hence a
-    // different redeemscript) must not extract anything.
-    let other_taker = SwapOutTaker::new(
-        Arc::new(MockLightningBackend::new()) as Arc<dyn LightningBackend>,
-        params,
-    );
-    let mut other_maker =
-        SwapOutMaker::new(Arc::new(MockLightningBackend::new()) as Arc<dyn LightningBackend>);
-    let other_accept = other_maker.accept(other_taker.make_request()).unwrap();
-    let mut other_taker = other_taker;
-    other_taker.on_accept(&other_accept).unwrap();
-    let foreign_claim = other_taker
+    // The real claim, with its preimage swapped for a different 32 bytes:
+    // the redeemscript still matches this swap, so only the payment-hash
+    // guard can reject it.
+    let claim = taker
         .claim_tx(
             OutPoint::default(),
             Amount::from_sat(50_000),
             ScriptBuf::new(),
         )
         .unwrap();
-    assert!(
-        maker.settle_from_spend(&foreign_claim).is_err(),
-        "a foreign HTLC spend must not settle this swap"
+    let mut forged_claim = claim.clone();
+    let mut witness: Vec<Vec<u8>> = forged_claim.input[0]
+        .witness
+        .iter()
+        .map(<[u8]>::to_vec)
+        .collect();
+    assert_eq!(
+        witness.len(),
+        3,
+        "hashlock witness is [sig, preimage, script]"
     );
+    assert_eq!(witness[1], taker.preimage().0.to_vec());
+    witness[1] = [0xAB; 32].to_vec();
+    forged_claim.input[0].witness = Witness::from_slice(&witness);
+
+    let err = maker
+        .settle_from_spend(&forged_claim)
+        .expect_err("a preimage for another hash must not settle this swap");
+    assert!(
+        matches!(&err, SwapError::Validation(msg)
+            if msg == "revealed preimage does not match the payment hash"),
+        "expected the payment-hash mismatch rejection, got: {:?}",
+        err
+    );
+
+    // The held payment is still claimable with the genuine preimage.
+    assert_eq!(maker.settle_from_spend(&claim).unwrap(), taker.preimage());
 }

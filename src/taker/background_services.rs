@@ -132,10 +132,10 @@ impl RecoveryLoop {
                             height
                         }
                     };
-                    if tip.is_none_or(|tip| last_tip.replace(tip) == Some(tip)) {
+                    let Some(tip) = tip.filter(|&tip| last_tip.replace(tip) != Some(tip)) else {
                         thread::park_timeout(RECOVERY_LOOP_INTERVAL);
                         continue;
-                    }
+                    };
 
                     // One connection shared by both steps below and by later passes:
                     // on Tor Electrum each fresh connection costs a circuit handshake.
@@ -233,7 +233,7 @@ impl RecoveryLoop {
 
                     if !all_resolved {
                         log::info!(
-                            "Recovery loop: contracts still unresolved, retrying on the next block"
+                            "Recovery loop: contracts still unresolved at height {tip}, retrying on the next block"
                         );
                     } else {
                         log::info!("Recovery loop: all contracts resolved");

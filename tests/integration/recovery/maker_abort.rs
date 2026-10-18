@@ -178,9 +178,10 @@ impl<'w> MakerAbort<'w> {
         let world = &*self.world;
         world.taker().log_tracker_state();
 
-        // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+        // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
         // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-        // 135s at 5 blocks/3s; 300s bounds the wait.
+        // 135s at 5 blocks/3s. Even back to back that is 165s, so 300s leaves about
+        // 135s of margin.
         info!("Waiting for makers to recover their contracts...");
         if world.makers()[1].inner().behavior == MakerBehavior::CloseAfterSweep {
             // This maker's recovery never concludes: its own hashlock sweep spent
@@ -238,7 +239,9 @@ impl<'w> MakerAbort<'w> {
     }
 }
 
-/// Test: Maker drops at private key handover phase (Taproot). Recovery via timelock.
+/// Test: Maker drops at private key handover phase (Taproot). The preimage is
+/// already out, so every party sweeps its incoming contract instead of
+/// refunding its outgoing by timelock.
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal, CloseAtPrivateKeyHandover],

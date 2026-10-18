@@ -6,16 +6,18 @@
 //! recovery. Exercise the complete protocol, restart both makers from the same
 //! wallets, and prove that neither protocol leaves recovery material behind.
 
-use bitcoin::{Amount, Network};
+use bitcoin::{Amount, Network, OutPoint, Txid};
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::{MakerBehavior, MakerServer},
     protocol::common_messages::ProtocolVersion,
     taker::SwapParams,
+    wallet::Wallet,
 };
 
 use crate::test_framework::*;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 /// The `network` line `init` records in the maker's `config.toml`.
 fn recorded_network(maker: &MakerServer) -> Option<String> {
@@ -117,6 +119,29 @@ fn run_successful_swap_restart(world: &mut World, protocol: ProtocolVersion) {
     }
 }
 
+/// What each maker pays in all to sweep its handed-over incoming swapcoins on
+/// restart.
+const SWEEP_FEE: u64 = 224;
+
+/// The wallet's swept incoming swapcoin UTXOs.
+fn swept_outpoints(wallet: &Wallet) -> HashSet<OutPoint> {
+    wallet
+        .list_swept_incoming_swap_utxos()
+        .into_iter()
+        .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+        .collect()
+}
+
+/// The contract txid of every incoming swapcoin any wallet stored, per the log.
+fn incoming_contract_txids(log_path: &str) -> HashSet<Txid> {
+    std::fs::read_to_string(log_path)
+        .unwrap()
+        .split("Added incoming swapcoin to wallet store: ")
+        .skip(1)
+        .map(|rest| rest.split_whitespace().next().unwrap().parse().unwrap())
+        .collect()
+}
+
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [behavior, behavior],
@@ -159,6 +184,25 @@ fn run_interrupted_restart(world: &mut World, incoming_remains: bool, params: Sw
         })
     );
 
+    // Record what each maker holds before the restart, so the restart must
+    // sweep its incoming swapcoins into the wallet, not merely forget them.
+    world.sync_makers();
+    let before = world
+        .makers()
+        .iter()
+        .map(|maker| {
+            let wallet = maker.inner().wallet.read().unwrap();
+            (
+                wallet.get_incoming_swapcoins_count(),
+                swept_outpoints(&wallet),
+                wallet.get_balances().unwrap().spendable,
+            )
+        })
+        .collect::<Vec<_>>();
+    // A Taproot incoming swapcoin is not a wallet UTXO, so its contract txid
+    // comes from the log. The taker's own incoming coins land here too.
+    let contract_txids = incoming_contract_txids(&world.taker_log_path());
+
     let configs = world
         .makers()
         .iter()
@@ -187,4 +231,77 @@ fn run_interrupted_restart(world: &mut World, incoming_remains: bool, params: Sw
             wallet.get_incoming_swapcoins_count() == 0 && wallet.get_outgoing_swapcoins_count() == 0
         })
     );
+
+    world.mine(1);
+    world.sync_makers();
+    let client = &world.bitcoind().client;
+    for (i, (maker, (incoming, swept_before, spendable))) in
+        world.makers().iter().zip(before).enumerate()
+    {
+        assert_eq!(
+            incoming != 0,
+            incoming_remains,
+            "maker {i}: held {incoming} incoming swapcoins before the restart"
+        );
+        // The new swept coins are the outputs of the restart's sweeps.
+        let wallet = maker.inner().wallet.read().unwrap();
+        let swept = wallet
+            .list_swept_incoming_swap_utxos()
+            .into_iter()
+            .filter(|(utxo, _)| !swept_before.contains(&OutPoint::new(utxo.txid, utxo.vout)))
+            .collect::<Vec<_>>();
+        let gain = wallet
+            .get_balances()
+            .unwrap()
+            .spendable
+            .checked_sub(spendable)
+            .expect("the restart must not lose spendable funds");
+        drop(wallet);
+        let sweep_txids = swept
+            .iter()
+            .map(|(utxo, _)| utxo.txid)
+            .collect::<HashSet<_>>();
+        let mut spent = HashSet::new();
+        let mut spent_value = Amount::ZERO;
+        for txid in &sweep_txids {
+            let info = client.get_raw_transaction_info(txid, None).unwrap();
+            assert!(
+                info.confirmations.is_some_and(|c| c > 0),
+                "maker {}: sweep {} must be confirmed",
+                i,
+                txid
+            );
+            for input in &info.transaction().unwrap().input {
+                let prev = input.previous_output;
+                assert!(
+                    contract_txids.contains(&prev.txid),
+                    "maker {}: sweep {} spends {}, not an incoming contract",
+                    i,
+                    txid,
+                    prev
+                );
+                spent_value += client.get_raw_transaction(&prev.txid, None).unwrap().output
+                    [prev.vout as usize]
+                    .value;
+                spent.insert(prev);
+            }
+        }
+        // One confirmed spend per incoming swapcoin, and the sweeps pay the
+        // maker everything but their own fee.
+        assert_eq!(
+            spent.len(),
+            incoming,
+            "maker {i}: the sweeps spend {spent:?}, expected {incoming} incoming contracts"
+        );
+        assert_eq!(
+            gain,
+            swept.iter().map(|(utxo, _)| utxo.amount).sum::<Amount>(),
+            "maker {i}: the spendable gain must be exactly the swept coins"
+        );
+        assert_eq!(
+            spent_value - gain,
+            Amount::from_sat(SWEEP_FEE * incoming_remains as u64),
+            "maker {i}: spendable gained {gain} from {spent_value} of incoming swapcoins"
+        );
+    }
 }

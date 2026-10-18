@@ -19,6 +19,7 @@ use bitcoind::bitcoincore_rpc::RpcApi;
 use crate::test_framework::*;
 
 use log::info;
+use std::time::Duration;
 
 /// Taproot PaySwap with multiple final swapcoins (`tx_count = 3`), so the
 /// settlement splits the receiver amount across several exact outputs.
@@ -88,16 +89,16 @@ fn taproot_exact_payment(world: &mut World) {
     );
     assert_eq!(quote.amount, payment_amount);
     assert_eq!(quote.address, receiver_address);
-    assert!(quote.settlement_budget > Amount::ZERO);
+    // Three final swapcoins, each budgeted at the 155 vB taproot script-path
+    // spend at 1 sat/vB.
     assert_eq!(
-        quote.settlement_budget.to_sat() % 3,
-        0,
+        quote.settlement_budget,
+        Amount::from_sat(3 * 155),
         "settlement budget must divide exactly across all final swapcoins"
     );
-    assert!(
-        summary.send_amount > payment_amount + quote.settlement_budget,
-        "gross route amount must cover the receiver amount, settlement budget, and maker fees"
-    );
+    // Receiver amount, settlement budget, both makers' fees and the priced
+    // funding costs.
+    assert_eq!(summary.send_amount, Amount::from_sat(503_749));
 
     let report = world
         .taker_mut()
@@ -132,26 +133,36 @@ fn taproot_exact_payment(world: &mut World) {
         !report.outgoing_utxos.is_empty(),
         "PaySwap must still report the taker funding inputs"
     );
-    assert!(
-        report.fee_paid < payment_amount.to_sat(),
-        "receiver payment principal must not be reported as a fee"
-    );
+    // The receiver payment is not a fee: fee_paid is the maker fees plus the
+    // mining fee, each pinned on its own.
     assert_eq!(
-        report.mining_fee,
-        report.fee_paid.saturating_sub(report.total_maker_fees),
-        "mining fee must be derived after excluding the receiver payment"
+        report
+            .maker_fee_info
+            .iter()
+            .map(|fee| fee.total_fee)
+            .collect::<Vec<_>>(),
+        [627.0, 589.0],
+        "per-maker fees in route order"
     );
+    assert_eq!(report.total_maker_fees, 1_216);
+    assert_eq!(report.mining_fee, 2_995);
+    assert_eq!(report.fee_paid, 4_211);
     assert_eq!(
         payment_result.settlement_txids.len(),
         3,
         "one settlement tx per final swapcoin"
     );
 
-    // The taker must own no output of the settlement.
+    // The taker must own no output of the settlement. The makers may sweep
+    // their incoming coins after the taker returns.
     world.taker().sync();
+    world.wait_makers_settled(Duration::from_secs(120));
+    world.sync_makers();
     assert_balances!(world, since before; {
-        // The wallet cost is the delivered payment plus the reported fees.
-        taker: { swap: 0, contract: 0, loss: payment_result.delivered_amount + report.fee_paid },
+        // The delivered payment plus fee_paid.
+        taker: { swap: 0, contract: 0, loss: 504_211 },
+        // Each maker's fee plus the route's funding allowance, less its mining.
+        makers: { contract: 0, gain: [659, 621] },
     });
 
     let spendable_decrease = before.takers[0]
@@ -218,11 +229,11 @@ fn legacy_exact_payment(world: &mut World) {
     );
     assert_eq!(quote.amount, payment_amount);
     assert_eq!(quote.address, receiver_address);
-    assert!(quote.settlement_budget > Amount::ZERO);
-    assert!(
-        summary.send_amount > payment_amount + quote.settlement_budget,
-        "gross route amount must cover the receiver amount, settlement budget, and maker fees"
-    );
+    // One final swapcoin: contract publication plus the contract spend.
+    assert_eq!(quote.settlement_budget, Amount::from_sat(300));
+    // Receiver amount, settlement budget, both makers' fees and the priced
+    // funding costs.
+    assert_eq!(summary.send_amount, Amount::from_sat(502_280));
 
     let report = world
         .taker_mut()
@@ -262,20 +273,30 @@ fn legacy_exact_payment(world: &mut World) {
         1,
         "one settlement tx per final swapcoin"
     );
-    assert!(
-        report.fee_paid < payment_amount.to_sat(),
-        "receiver payment principal must not be reported as a fee"
-    );
+    // The receiver payment is not a fee: fee_paid is the maker fees plus the
+    // mining fee, each pinned on its own.
     assert_eq!(
-        report.mining_fee,
-        report.fee_paid.saturating_sub(report.total_maker_fees),
-        "mining fee must be derived after excluding the receiver payment"
+        report
+            .maker_fee_info
+            .iter()
+            .map(|fee| fee.total_fee)
+            .collect::<Vec<_>>(),
+        [627.0, 589.0],
+        "per-maker fees in route order"
     );
+    assert_eq!(report.total_maker_fees, 1_216);
+    assert_eq!(report.mining_fee, 1_218);
+    assert_eq!(report.fee_paid, 2_434);
 
+    // The makers may sweep their incoming coins after the taker returns.
     world.taker().sync();
+    world.wait_makers_settled(Duration::from_secs(120));
+    world.sync_makers();
     assert_balances!(world, since before; {
-        // The wallet cost is the delivered payment plus the reported fees.
-        taker: { swap: 0, contract: 0, loss: payment_result.delivered_amount + report.fee_paid },
+        // The delivered payment plus fee_paid.
+        taker: { swap: 0, contract: 0, loss: 502_434 },
+        // Each maker's fee plus the route's funding allowance, less its mining.
+        makers: { contract: 0, gain: [637, 599] },
     });
 
     let spendable_decrease = before.takers[0]
@@ -451,6 +472,8 @@ fn negotiation_guards_abort_before_funding(world: &mut World) {
     let failing_maker = world.makers()[0].address();
     let spare_maker = world.makers()[1].address();
     let payment_amount = Amount::from_sat(100_000);
+    world.sync_all();
+    let before = world.balances();
     let mempool_before = world.bitcoind().client.get_raw_mempool().unwrap();
 
     let receiver = world
@@ -480,17 +503,15 @@ fn negotiation_guards_abort_before_funding(world: &mut World) {
 
     // The quoted maker closed a connection. Refusing to substitute it is a
     // routing decision, not a verdict, so neither maker may be blamed.
-    let standings = world.takers()[0]
-        .inner()
-        .fetch_offers()
-        .unwrap()
-        .all_makers();
-    for standing in &standings {
+    // `maker_standing` reads the first taker's offerbook and panics if a maker
+    // is missing, so the check cannot be skipped.
+    for index in 0..world.makers().len() {
+        let standing = world.maker_standing(index);
         assert!(
-            !matches!(standing.state, MakerState::Banned(_)),
-            "aborting a payment swap must blame nobody, but {} is {:?}",
-            standing.address,
-            standing.state
+            !matches!(standing, MakerState::Banned(_)),
+            "aborting a payment swap must blame nobody, but maker {} is {:?}",
+            index,
+            standing
         );
     }
 
@@ -519,4 +540,10 @@ fn negotiation_guards_abort_before_funding(world: &mut World) {
         mempool_before,
         "negotiation guards must abort before any funding transaction is broadcast"
     );
+    // The mempool check alone misses a funding tx the background miner has
+    // already confirmed; the wallets cannot: neither taker spent or locked a sat.
+    world.sync_all();
+    assert_balances!(world, since before; {
+        takers: { contract: 0, loss: 0 },
+    });
 }

@@ -272,6 +272,29 @@ fn read_pubkey_from_fidelity_script(redeemscript: &ScriptBuf) -> Result<PublicKe
     }
 }
 
+/// When a bond matures, as a timestamp.
+///
+/// A fidelity locktime is height-based everywhere else it is handled, so a
+/// seconds-based one is refused rather than read as a maturity time.
+fn bond_maturity_time(
+    lock_time: LockTime,
+    tip_height: u64,
+    tip_time: u64,
+) -> Result<u64, FidelityError> {
+    match lock_time {
+        LockTime::Blocks(blocks) => {
+            // Estimated locktime from block height = [current-time + (maturity-height - block-count) * 10 * 60] sec
+            let height_diff = blocks
+                .to_consensus_u32()
+                .checked_sub(tip_height as u32)
+                .ok_or(FidelityError::BondLocktimeExpired)? as u64;
+
+            Ok(tip_time + (height_diff * 10 * 60))
+        }
+        LockTime::Seconds(_) => Err(FidelityError::InvalidBondLocktime),
+    }
+}
+
 /// Calculates the theoretical fidelity bond value. Refer [The OG Fidelity Bond Paper by Chris Belcher.]<https://gist.github.com/chris-belcher/87ebbcbb639686057a389acb9ab3e25b#financial-mathematics-of-joinmarket-fidelity-bonds>
 fn calculate_fidelity_value(
     value: Amount,          // Bond amount in sats
@@ -590,23 +613,12 @@ impl Wallet {
             .expect("This can't error")
             .as_secs();
 
+        // Needs no chain data, and rejects a bond we would otherwise pay a round
+        // trip to value.
+        let locktime = bond_maturity_time(bond.lock_time, tip_height, tip_time)?;
+
         let conf_height = bond.conf_height.ok_or(FidelityError::BondDoesNotExist)? as u64;
         let confirmation_time = self.blockchain.header_at_height(conf_height)?.time as u64;
-
-        let locktime = match bond.lock_time {
-            LockTime::Blocks(blocks) => {
-                // Estimated locktime from block height = [current-time + (maturity-height - block-count) * 10 * 60] sec
-                let height_diff =
-                    if let Some(x) = blocks.to_consensus_u32().checked_sub(tip_height as u32) {
-                        x as u64
-                    } else {
-                        return Err(FidelityError::BondLocktimeExpired.into());
-                    };
-
-                tip_time + (height_diff * 10 * 60)
-            }
-            LockTime::Seconds(sec) => sec.to_consensus_u32() as u64,
-        };
 
         let bond_value =
             calculate_fidelity_value(bond.amount, locktime, confirmation_time, current_time);
@@ -1144,6 +1156,42 @@ mod test {
         for v in &value_diff {
             assert!(v.abs() < EPSILON);
         }
+    }
+
+    /// A fidelity locktime is height-based everywhere else: the wallet refuses to
+    /// build a bond from a timestamp and verification rejects one. Valuing it has
+    /// to agree, or it would read a Unix timestamp as a maturity time.
+    #[test]
+    fn test_bond_maturity_time_refuses_a_seconds_locktime() {
+        let seconds = LockTime::from_consensus(1_700_000_000);
+        assert!(matches!(seconds, LockTime::Seconds(_)));
+
+        assert!(matches!(
+            bond_maturity_time(seconds, 800_000, 1_700_000_000),
+            Err(FidelityError::InvalidBondLocktime)
+        ));
+    }
+
+    #[test]
+    fn test_bond_maturity_time_for_a_height_locktime() {
+        let tip_height = 800_000;
+        let tip_time = 1_700_000_000;
+        let matures_in = 144;
+
+        let height = LockTime::from_consensus(tip_height as u32 + matures_in);
+        assert!(matches!(height, LockTime::Blocks(_)));
+        assert_eq!(
+            bond_maturity_time(height, tip_height, tip_time).unwrap(),
+            tip_time + u64::from(matures_in) * 10 * 60
+        );
+
+        // A height the chain has already passed is an expired bond, not a maturity
+        // time in the past.
+        let passed = LockTime::from_consensus(tip_height as u32 - 1);
+        assert!(matches!(
+            bond_maturity_time(passed, tip_height, tip_time),
+            Err(FidelityError::BondLocktimeExpired)
+        ));
     }
 
     #[test]

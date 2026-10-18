@@ -2470,15 +2470,17 @@ impl Taker {
         self.resend_swap_details(&address, &details)
     }
 
-    /// Send a bare `WaitingFundingConfirmation` keepalive for `swap_id` on a
-    /// fresh connection, the way the route heartbeat does. Test hook for the
-    /// keepalive tests; the maker answers with silence either way, so
-    /// acceptance vs refusal is observable in its log only.
+    /// Send bare `WaitingFundingConfirmation` keepalives for `swap_ids`, in
+    /// order and `gap` apart, on one fresh connection, the way the route
+    /// heartbeat does. Test hook for the keepalive tests; the maker answers
+    /// with silence either way, so acceptance vs refusal is observable in its
+    /// log only.
     #[cfg(feature = "integration-test")]
-    pub fn test_send_keepalive(
+    pub fn test_send_keepalives(
         &self,
         maker_address: &str,
-        swap_id: &str,
+        swap_ids: &[&str],
+        gap: std::time::Duration,
     ) -> Result<(), TakerError> {
         let mut stream = self.net_connect(maker_address)?;
         send_message(&mut stream, &TakerToMakerMessage::TakerHello(TakerHello))?;
@@ -2488,10 +2490,15 @@ impl Taker {
                 "Expected MakerHello before a keepalive".to_string(),
             ));
         }
-        send_message(
-            &mut stream,
-            &TakerToMakerMessage::WaitingFundingConfirmation(swap_id.to_string()),
-        )?;
+        for (i, swap_id) in swap_ids.iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(gap);
+            }
+            send_message(
+                &mut stream,
+                &TakerToMakerMessage::WaitingFundingConfirmation(swap_id.to_string()),
+            )?;
+        }
         Ok(())
     }
 

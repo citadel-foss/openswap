@@ -112,9 +112,10 @@ fn run_taproot_taker_abort(world: &mut World, expected: &TakerAbortExpect) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     world.taker().log_tracker_state();
 
-    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-    // 135s at 5 blocks/3s; 300s bounds the wait.
+    // 135s at 5 blocks/3s. Even back to back that is 165s, so 300s leaves about
+    // 135s of margin.
     info!("Waiting for makers to recover their outgoing funds via timelock...");
     world.wait_makers_settled(Duration::from_secs(300));
     world.sync_makers();
@@ -187,9 +188,10 @@ fn legacy_drop_after_funding(world: &mut World, params: SwapParams) {
     info!("Swap failed as expected: {:?}", swap_result.err().unwrap());
     world.taker().log_tracker_state();
 
-    // Recovery takes the 60s maker idle timeout (test builds) plus the 225-block
+    // Recovery waits out the 30s maker idle timeout (test builds) and the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-    // 135s at 5 blocks/3s; 300s bounds the wait.
+    // 135s at 5 blocks/3s. Even back to back that is 165s, so 300s leaves about
+    // 135s of margin.
     info!("Waiting for makers to recover their contracts...");
     world.wait_makers_settled(Duration::from_secs(300));
     world.sync_makers();
@@ -240,6 +242,7 @@ fn legacy_drop_after_funding(world: &mut World, params: SwapParams) {
     swap(protocol = Legacy, sats = 500_000, makers = 1, tx_count = 1),
 )]
 fn maker_recovers_swap_past_refund_deadline(world: &mut World, params: SwapParams) {
+    let before = world.balances();
     world
         .taker_mut()
         .swap_fails(params, "The swap must fail once the maker gives up on it");
@@ -249,7 +252,15 @@ fn maker_recovers_swap_past_refund_deadline(world: &mut World, params: SwapParam
         // The deadline, not a dropped connection, is what ended this swap. Keepalives
         // were still arriving every 5s, so the idle timeout could not have drained it.
         has "reached its refund deadline; recovering now",
-        has "Recovering from swap",
+    });
+
+    // "Recovering from swap" is logged before recovery runs, so only the
+    // settled wallet proves the maker recovered. The stall came before the
+    // maker broadcast its own funding, so recovery must leave it whole.
+    world.wait_makers_settled(timelock_recovery_wait::<BitcoindBackend>());
+    world.sync_makers();
+    assert_balances!(world, since before; {
+        maker: { regular: 14_999_757, swap: 0, contract: 0, fidelity: BOND, loss: 0 },
     });
 }
 
