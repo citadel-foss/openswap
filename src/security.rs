@@ -756,6 +756,46 @@ mod tests {
         assert!(matches!(load(&stripped), Err(SecurityError::Decryption)));
     }
 
+    #[test]
+    fn v2_version_precedes_requirements_password_and_payload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        for version in [0, 1, 3, u32::MAX] {
+            // A newer layout need not retain any other V2 fields.
+            let bytes = serde_cbor::to_vec(&serde_json::json!({
+                "version": version,
+                "requires": ["wallet-store-3"],
+                "ciphertext": [0],
+            }))
+            .unwrap();
+            fs::write(&path, &bytes).unwrap();
+            for password in [None, Some(String::new()), Some("wrong".into())] {
+                let error =
+                    load_sensitive_struct::<String, SerdeCbor>(&path, password).unwrap_err();
+                assert!(
+                    matches!(error, SecurityError::Format(message) if message.contains(&format!("version {version}")))
+                );
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+        }
+        let bytes = serde_cbor::to_vec(&EncryptedDataV2 {
+            version: 2,
+            requires: vec![WALLET_STORE_FORMAT.into(), "wallet-store-3".into()],
+            nonce: [0; 12],
+            pbkdf2_salt: [0; 16],
+            ciphertext: vec![0],
+        })
+        .unwrap();
+        fs::write(&path, &bytes).unwrap();
+        for password in [None, Some(String::new()), Some("wrong".into())] {
+            let error = load_sensitive_struct::<String, SerdeCbor>(&path, password).unwrap_err();
+            assert!(
+                matches!(error, SecurityError::NeedsUpgrade(names) if names == ["wallet-store-3"])
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
     #[derive(Serialize)]
     struct ContainerVersionOnly {
         version: u32,

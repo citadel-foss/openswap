@@ -1424,6 +1424,73 @@ mod tests {
     }
 
     #[test]
+    fn compat_v023_migration_is_refused_by_pre_port_v2_reader() {
+        use aes_gcm::{
+            aead::{Aead, Payload},
+            Aes256Gcm, KeyInit,
+        };
+
+        // Model #1165's header gate and decryptor independently of the new
+        // requirement registry and V2 loader. Confirm the model can decrypt
+        // an unmarked V2 control before testing its downgrade refusal.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PrePortV2 {
+            version: u32,
+            requires: Vec<String>,
+            nonce: [u8; 12],
+            pbkdf2_salt: [u8; 16],
+            ciphertext: Vec<u8>,
+        }
+        let old_read = |bytes: &[u8]| -> Result<Value, &'static str> {
+            let file: PrePortV2 = serde_cbor::from_slice(bytes).map_err(|_| "invalid container")?;
+            if file.version != 2 || !file.requires.is_empty() {
+                return Err("unsupported header");
+            }
+            let key = KeyMaterial::existing(V023_PASSWORD.into(), file.nonce, file.pbkdf2_salt);
+            let aad = serde_cbor::to_vec(&(file.version, file.requires)).unwrap();
+            let plain = Zeroizing::new(
+                Aes256Gcm::new_from_slice(&key.key)
+                    .unwrap()
+                    .decrypt(
+                        &file.nonce.into(),
+                        Payload {
+                            msg: &file.ciphertext,
+                            aad: &aad,
+                        },
+                    )
+                    .map_err(|_| "decryption failed")?,
+            );
+            serde_cbor::from_slice(&plain).map_err(|_| "invalid payload")
+        };
+
+        let dir = tempdir().unwrap();
+        let path = install_v023_wallet(dir.path());
+        let (store, key) = WalletStore::read_from_disk(&path, Some(V023_PASSWORD.into())).unwrap();
+        let unmarked = encrypt_struct_v2(&store, &key, Vec::new()).unwrap();
+        let control = old_read(&serde_cbor::to_vec(&unmarked).unwrap()).unwrap();
+        assert_eq!(control, to_value(&store).unwrap());
+        assert!(!store.reports.is_empty());
+        assert!(store.sealed_mnemonic.is_none());
+        assert!(!store.seed_backed_up);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let header: PrePortV2 = serde_cbor::from_slice(&bytes).unwrap();
+        assert_eq!(header.version, 2);
+        assert_eq!(header.requires, [WALLET_STORE_FORMAT]);
+        assert_eq!(old_read(&bytes), Err("unsupported header"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(path.with_file_name("closed.wallet.v023")).unwrap(),
+            V023_CLOSED
+        );
+        assert_eq!(
+            std::fs::read(path.with_file_name("closed_swap_report.json.v023")).unwrap(),
+            V023_REPORT
+        );
+    }
+
+    #[test]
     fn compat_v023_upgrade_preserves_verified_proofs_and_manual_tracker_files() {
         let dir = tempdir().unwrap();
         let path = install_v023_wallet(dir.path());

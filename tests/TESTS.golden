@@ -118,6 +118,7 @@ openswap security::tests::encryption_rotates_nonce_for_same_key_material
 openswap security::tests::sealed_secret_needs_the_password_on_every_open
 openswap security::tests::v2_container_is_refused_by_old_readers
 openswap security::tests::v2_container_refuses_unknown_versions_and_edited_headers
+openswap security::tests::v2_version_precedes_requirements_password_and_payload
 openswap taker::api::tests::compat_hello_accepts_many_future_names_and_fields
 openswap taker::api::tests::compat_hello_keeps_recognized_names_bounded_by_registry
 openswap taker::api::tests::compat_hello_requires_exact_reconnect_pins_and_readable_reply
@@ -436,6 +437,7 @@ openswap wallet::storage::tests::compat_cache_future_spend_info_drops_only_its_e
 openswap wallet::storage::tests::compat_lightning_records_derive_requirements_in_every_build
 openswap wallet::storage::tests::compat_v023_archive_failure_retries_with_an_identical_private_archive
 openswap wallet::storage::tests::compat_v023_malformed_tracker_predicates_refuse_untouched
+openswap wallet::storage::tests::compat_v023_migration_is_refused_by_pre_port_v2_reader
 openswap wallet::storage::tests::compat_v023_open_coins_trackers_and_bad_reports_refuse_untouched
 openswap wallet::storage::tests::compat_v023_password_refusals_preserve_every_input
 openswap wallet::storage::tests::compat_v023_retry_archives_a_changed_live_wallet
