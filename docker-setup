@@ -750,9 +750,12 @@ run_seed_command() {
     local service="makerd"
     [[ "$COMPOSE_PROFILES" != *"internal-tor"* ]] || service="makerd-internal"
 
-    local was_running="false"
+    # Start the maker again even if the operator interrupts us.
+    seed_restart_service=""
+    trap 'restart_after_seed || true; exit 1' INT TERM HUP
+    trap 'restart_after_seed || true' EXIT
     if [ -n "$(docker compose ps -q --status running "$service")" ]; then
-        was_running="true"
+        seed_restart_service="$service"
         print_info "Stopping makerd so $cmd can save the wallet..."
         docker compose stop "$service"
     fi
@@ -761,12 +764,22 @@ run_seed_command() {
     docker compose -f docker-compose.yml -f docker/compose-seed.yml run --rm --no-deps \
         --entrypoint makerd "$service" -w "$BITCOIN_WALLET_NAME" "$cmd" || status=$?
 
-    if [[ "$was_running" == "true" ]]; then
-        print_info "Starting makerd again..."
-        docker compose up -d "$service" || { print_error "Failed to start makerd; run ./docker-setup start"; exit 1; }
-        print_info "Follow its log with: ./docker-setup logs $service"
-    fi
+    trap - EXIT INT TERM HUP
+    restart_after_seed || exit 1
     return "$status"
+}
+
+# Start the maker stopped by run_seed_command, at most once.
+restart_after_seed() {
+    [ -n "$seed_restart_service" ] || return 0
+    local service="$seed_restart_service"
+    seed_restart_service=""
+    print_info "Starting makerd again..."
+    if ! docker compose up -d "$service"; then
+        print_error "Failed to start makerd; run ./docker-setup start"
+        return 1
+    fi
+    print_info "Follow its log with: ./docker-setup logs $service"
 }
 
 run_command() {
