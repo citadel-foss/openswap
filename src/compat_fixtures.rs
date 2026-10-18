@@ -4,7 +4,7 @@ mod offerbook;
 mod storage;
 mod wire;
 
-use crate::security::requires_aad;
+use crate::security::{encrypt_struct_v2, header_aad, EncryptedDataV2, KeyMaterial};
 use pbkdf2::pbkdf2_hmac_array;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_cbor::{value::to_value, Value};
@@ -107,17 +107,20 @@ fn compat_fixtures_flatten_rejects_integers_below_i64() {
     assert!(serde_cbor::from_slice::<Container>(&bytes).is_err());
 }
 
+#[derive(Serialize, Deserialize)]
+struct ProductionVector {
+    password: String,
+    iterations: u32,
+    salt: [u8; 16],
+    key: Vec<u8>,
+    aad: Vec<u8>,
+    plaintext: String,
+    encrypted: EncryptedDataV2,
+}
+
 #[test]
 fn compat_fixtures_production_kdf_and_aad_vectors_are_frozen() {
-    #[derive(Deserialize)]
-    struct Vector {
-        password: String,
-        iterations: u32,
-        salt: [u8; 16],
-        key: Vec<u8>,
-        aad: Vec<u8>,
-    }
-    let vector: Vector = serde_cbor::from_slice(include_bytes!(
+    let vector: ProductionVector = serde_cbor::from_slice(include_bytes!(
         "../tests/fixtures/compat/v0.3.0/production-kdf.cbor"
     ))
     .unwrap();
@@ -131,8 +134,62 @@ fn compat_fixtures_production_kdf_and_aad_vectors_are_frozen() {
         .as_slice(),
         vector.key
     );
-    assert_eq!(requires_aad(&["taproot", "legacy", "taproot"]), vector.aad);
-    assert_eq!(requires_aad::<&str>(&[]), b"");
+    assert_eq!(
+        header_aad(2, &vector.encrypted.requires).unwrap(),
+        vector.aad
+    );
+    assert_eq!(
+        vector.aad,
+        b"\x82\x02\x83\x66legacy\x67taproot\x6ewallet-store-2"
+    );
+    assert_eq!(header_aad(2, &[]).unwrap(), b"\x82\x02\x80");
+}
+
+fn generate_production_vector(release: &Path) {
+    // Retain the production KDF inputs when changing the container/AAD vector.
+    #[derive(Deserialize)]
+    struct Inputs {
+        password: String,
+        iterations: u32,
+        salt: [u8; 16],
+        plaintext: String,
+    }
+    let input: Inputs =
+        serde_cbor::from_slice(&fs::read(release.join("production-kdf.cbor")).unwrap()).unwrap();
+    let key =
+        pbkdf2_hmac_array::<Sha256, 32>(input.password.as_bytes(), &input.salt, input.iterations);
+    let material = KeyMaterial {
+        key,
+        nonce: [0; 12],
+        pbkdf2_salt: input.salt,
+    };
+    let requires = vec!["legacy".into(), "taproot".into(), "wallet-store-2".into()];
+    let aad = header_aad(2, &requires).unwrap();
+    let encrypted = encrypt_struct_v2(&input.plaintext, &material, requires).unwrap();
+    write(
+        release,
+        "production-kdf",
+        &ProductionVector {
+            password: input.password,
+            iterations: input.iterations,
+            salt: input.salt,
+            key: key.to_vec(),
+            aad,
+            plaintext: input.plaintext,
+            encrypted,
+        },
+    );
+}
+
+#[test]
+#[ignore = "writes the next release's storage fixtures; run explicitly with lightning"]
+fn generate_storage_compat_fixtures() {
+    if !cfg!(feature = "lightning") {
+        panic!("generate every Lightning sample too");
+    }
+    let release = fixture_root().join("v0.3.0");
+    storage::generate(&release);
+    generate_production_vector(&release);
 }
 
 #[test]
@@ -144,5 +201,6 @@ fn generate_compat_fixtures() {
     let release = fixture_root().join("v0.3.0");
     wire::generate(&release);
     storage::generate(&release);
+    generate_production_vector(&release);
     offerbook::generate(&release);
 }

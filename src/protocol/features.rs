@@ -21,7 +21,8 @@ pub struct Feature {
     pub lightning: bool,
 }
 
-/// Every name this build recognizes.
+/// Protocol features this build recognizes. Disk format names are listed in
+/// `crate::security::FORMAT_NAMES` and included by [`supported`].
 pub const KNOWN: &[Feature] = &[
     Feature {
         name: "legacy",
@@ -51,6 +52,7 @@ pub fn supported() -> Vec<&'static str> {
         .iter()
         .filter(|f| cfg!(feature = "lightning") || !f.lightning)
         .map(|f| f.name)
+        .chain(crate::security::FORMAT_NAMES.iter().copied())
         .collect()
 }
 

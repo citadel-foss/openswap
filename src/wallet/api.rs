@@ -5702,6 +5702,61 @@ mod restore_history_probe_tests {
             .is_file());
     }
 
+    #[test]
+    fn v023_and_pre_port_backups_restore_to_marked_v2() {
+        use crate::security::{EncryptedData, EncryptedDataV2, WALLET_STORE_FORMAT};
+
+        let dir = tempdir().unwrap();
+        let backend = BackendConfig::Electrum(electrum_config(start_stub(StdHashSet::new())));
+        let v023: WalletBackup = serde_cbor::from_slice(include_bytes!(
+            "../../tests/fixtures/compat/v0.2.3/backup-wallet.cbor"
+        ))
+        .unwrap();
+        let source = Wallet::init(
+            &dir.path().join("source"),
+            AnyBlockchain::from_config(&backend).unwrap(),
+            Zeroizing::new("source-password".into()),
+        )
+        .unwrap();
+        let words = source
+            .get_wallet_mnemonic(Zeroizing::new("source-password".into()))
+            .unwrap()
+            .words();
+        let pre_port =
+            WalletBackup::new(&source, Zeroizing::new("source-password".into())).unwrap();
+        // #1165's backup predates `requires`; preserve its seed payload.
+        let serde_cbor::Value::Map(mut payload) = serde_cbor::value::to_value(&pre_port).unwrap()
+        else {
+            panic!("backup is a map")
+        };
+        payload.remove(&serde_cbor::Value::Text("requires".into()));
+        let pre_port: WalletBackup =
+            serde_cbor::value::from_value(serde_cbor::Value::Map(payload)).unwrap();
+
+        for (name, backup, has_seed) in [("v023", v023, false), ("pre-port", pre_port, true)] {
+            assert!(backup.requires.is_empty());
+            let path = dir.path().join(name);
+            let restored = Wallet::restore_with(
+                &backup,
+                &path,
+                &backend,
+                Zeroizing::new("restored-password".into()),
+                RestoreOptions::default(),
+            )
+            .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let container: EncryptedDataV2 = serde_cbor::from_slice(&bytes).unwrap();
+            assert_eq!(container.requires, [WALLET_STORE_FORMAT]);
+            assert!(serde_cbor::from_slice::<EncryptedData>(&bytes).is_err());
+            let seed = restored.get_wallet_mnemonic(Zeroizing::new("restored-password".into()));
+            if has_seed {
+                assert_eq!(seed.unwrap().words(), words);
+            } else {
+                assert!(matches!(seed, Err(WalletError::MnemonicUnavailable)));
+            }
+        }
+    }
+
     /// A backup takes the phrase only past the current wallet password, and a
     /// restore seals it again under the new wallet's own password. A backup
     /// without one restores with none; one whose phrase doesn't derive its

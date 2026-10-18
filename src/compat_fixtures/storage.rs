@@ -1,6 +1,6 @@
 use super::{check, write};
 use crate::wallet::{
-    check_envelope, compat_assert_empty_extra, compat_backup, compat_reports, generate_storage,
+    check_container, compat_assert_empty_extra, compat_backup, compat_reports, generate_storage,
     swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
     DeniabilityProof, FidelityBond, LnMakerSwapRecord, LnPendingSwap, MakerFeeInfo, MakerReport,
     PaymentResult, RecoveryReport, ReportUtxo, SwapReportFile, SwapReservation, TakerReport,
@@ -67,7 +67,7 @@ pub(super) fn check_release(release: &Path) {
     if release.file_name().unwrap() != "v0.2.3" {
         assert!(
             release.join("wallet-file.cbor").is_file(),
-            "missing wallet envelope in {}",
+            "missing wallet container in {}",
             release.display()
         );
     }
@@ -78,7 +78,7 @@ pub(super) fn check_release(release: &Path) {
         }
         let name = path.file_stem().unwrap().to_str().unwrap();
         if name == "wallet-file" {
-            check_envelope(release);
+            check_container(release);
         } else if name.starts_with("wallet-") {
             let store: WalletStore = check(release, name);
             compat_assert_empty_extra(&store);

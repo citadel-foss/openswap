@@ -442,9 +442,12 @@ mod tests {
             let master_bytes = serde_cbor::to_vec(&original.store.master_key).unwrap();
             // Use #1165's writer, so this exercises the old V2 read path
             // followed by a save in the port's format.
-            let old =
-                crate::security::encrypt_struct_v2(&original.store, &original.store_enc_material)
-                    .unwrap();
+            let old = crate::security::encrypt_struct_v2(
+                &original.store,
+                &original.store_enc_material,
+                Vec::new(),
+            )
+            .unwrap();
             std::fs::write(&path, serde_cbor::to_vec(&old).unwrap()).unwrap();
             drop(original);
 

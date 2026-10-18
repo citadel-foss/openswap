@@ -15,6 +15,7 @@ openswap compat_fixtures::compat_fixtures_flatten_rejects_integers_below_i64
 openswap compat_fixtures::compat_fixtures_production_kdf_and_aad_vectors_are_frozen
 openswap compat_fixtures::compat_fixtures_subset_guard_rejects_renamed_fields
 openswap compat_fixtures::generate_compat_fixtures
+openswap compat_fixtures::generate_storage_compat_fixtures
 openswap compat_fixtures::offerbook::compat_fixtures_offerbook_keeps_future_bond_fields_on_downgrade
 openswap compat_fixtures::wire::compat_fixtures_wire_frame_and_hello_prefix_are_frozen
 openswap maker::api::admission_cap_tests::claimed_txids_stay_unfunded_and_completed_swaps_are_not_counted
@@ -277,6 +278,7 @@ openswap wallet::api::restore_history_probe_tests::restore_probe_reports_a_windo
 openswap wallet::api::restore_history_probe_tests::resumed_restore_checks_the_window_before_syncing
 openswap wallet::api::restore_history_probe_tests::seed_is_readable_after_taker_init_fails
 openswap wallet::api::restore_history_probe_tests::sync_does_not_enter_the_backend_after_shutdown
+openswap wallet::api::restore_history_probe_tests::v023_and_pre_port_backups_restore_to_marked_v2
 openswap wallet::api::restore_history_probe_tests::window_cap_and_old_core_are_not_retried
 openswap wallet::api::swap_reservation_tests::a_reservation_survives_a_wallet_reload
 openswap wallet::api::swap_reservation_tests::only_a_spendable_coin_no_swap_holds_can_be_claimed
@@ -450,7 +452,6 @@ openswap wallet::storage::tests::maker_swap_debug_redacts_the_preimage
 openswap wallet::storage::tests::old_new_old_sequence_never_loses_the_sealed_phrase
 openswap wallet::storage::tests::pre_port_v2_preserves_opaque_seed_and_forward_fields_on_save
 openswap wallet::storage::tests::reads_encrypted_wallet_when_password_is_supplied
-openswap wallet::storage::tests::requires_aad_is_sorted_unique_names_joined_by_newline
 openswap wallet::storage::tests::sealed_master_key_roundtrips
 openswap wallet::storage::tests::sealed_master_key_survives_encrypted_store_roundtrip
 openswap wallet::storage::tests::sealed_mnemonic_survives_save_and_load_unopened
@@ -459,6 +460,7 @@ openswap wallet::storage::tests::test_write_and_read_wallet_to_disk
 openswap wallet::storage::tests::unknown_fields_survive_and_unreadable_cache_entries_drop
 openswap wallet::storage::tests::unserved_names_refuse_untouched_and_stripped_names_fail_decryption
 openswap wallet::storage::tests::version_1_file_migrates_on_load
+openswap wallet::storage::tests::wallet_saves_v2_with_format_marker_and_refuses_pre_port_readers
 openswap wallet::swapcoin::timelock_spend_tests::legacy_hashlock_claim_is_not_ours
 openswap wallet::swapcoin::timelock_spend_tests::legacy_timelock_recovery_is_ours
 openswap wallet::swapcoin::timelock_spend_tests::taproot_hashlock_claim_is_not_ours

@@ -1053,6 +1053,9 @@ mod tests {
             requires: vec!["legacy".into()],
             ..new
         };
+        let gated_file = encrypt_struct(&gated, &material).unwrap();
+        let gated_read: WalletBackup = decrypt_struct(gated_file, &material).unwrap();
+        assert_eq!(gated_read.requires, ["legacy"]);
         let old_again: CompatV023Backup =
             serde_cbor::from_slice(&serde_cbor::to_vec(&gated).unwrap()).unwrap();
         assert_eq!(old_again.master_key, old.master_key);
@@ -1092,15 +1095,17 @@ mod tests {
             requires: vec!["future-v1".to_string()],
             ..dummy_backup("restored.cbor")
         };
-        let err = Wallet::restore(
-            &backup,
-            &target,
-            &BackendConfig::CoreRpc(CoreRpcConfig::default()),
-            test_password(),
-        )
-        .expect_err("an unserved name must refuse the restore");
-        assert!(matches!(err, WalletError::NeedsUpgrade(names) if names == ["future-v1"]));
-        assert!(!target.exists());
+        for password in [Zeroizing::default(), test_password()] {
+            let err = Wallet::restore(
+                &backup,
+                &target,
+                &BackendConfig::CoreRpc(CoreRpcConfig::default()),
+                password,
+            )
+            .expect_err("an unserved name must refuse the restore before password validation");
+            assert!(matches!(err, WalletError::NeedsUpgrade(names) if names == ["future-v1"]));
+            assert!(!target.exists());
+        }
     }
 
     /// A backup whose `file_name` traverses or is absolute must be rejected

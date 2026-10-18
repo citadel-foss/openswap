@@ -50,7 +50,7 @@ pub(crate) use backup::compat_backup;
 pub(crate) use report::{compat_reports, SwapReportFile};
 #[cfg(test)]
 pub(crate) use storage::compat_support::{
-    check_envelope, compat_assert_empty_extra, generate_storage,
+    check_container, compat_assert_empty_extra, generate_storage,
 };
 #[cfg(test)]
 pub(crate) use storage::{SwapReservation, WalletStore};

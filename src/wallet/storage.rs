@@ -1,18 +1,16 @@
 //! The Wallet Storage Interface.
 //!
 //! Wallet data is written to disk as AES-256-GCM-encrypted CBOR inside the
-//! [`WalletFile`] envelope; there is no cleartext-on-disk wallet format by
-//! design. Version 2 container files still load. Bare version 1 and legacy
-//! cleartext files are migrated once on load. The master key and the seed
+//! version 2 container. Bare version 1 and legacy cleartext files are read
+//! only for one-time migration. The master key and the seed
 //! phrase are each sealed again, see [`MasterKey`] and
 //! [`WalletStore::sealed_mnemonic`].
 
 use crate::{
-    protocol::features::{check_requires, supported},
     security::{
-        decrypt_struct, decrypt_with_password, encrypt_struct, encrypt_struct_with_aad,
-        is_versioned_container, load_sensitive_struct, requires_aad, EncryptedData, KeyMaterial,
-        SealedSecret, SecurityError, SerdeCbor, FORMAT_NAMES,
+        decrypt_struct, decrypt_with_password, encrypt_struct, encrypt_struct_v2,
+        is_versioned_container, load_sensitive_struct, EncryptedData, KeyMaterial, SealedSecret,
+        SecurityError, SerdeCbor, FORMAT_NAMES,
     },
     utill::deserialize_from_cbor,
     wallet::UTXOSpendInfo,
@@ -238,16 +236,6 @@ impl<'de> Deserialize<'de> for MasterKey {
     }
 }
 
-/// Cleartext envelope around the encrypted store. `requires` is read before
-/// anything is decrypted and is bound to the ciphertext as AES-GCM associated
-/// data, so stripping a name makes decryption fail. No other fields: any future
-/// cleartext field must be gated by a name in `requires`.
-#[derive(Serialize, Deserialize)]
-pub(super) struct WalletFile {
-    requires: Vec<String>,
-    encrypted: EncryptedData,
-}
-
 /// Feature names a stored record needs its reader to understand. Each impl
 /// destructures every field and matches every variant, so a new one forces a
 /// decision: a build that can't serve a name refuses the whole wallet.
@@ -380,6 +368,7 @@ impl Requires for WalletStore {
             swap_locks,
             ln_pending_swaps,
             ln_maker_swaps,
+            // The V2 container guards these; no separate seed feature name.
             sealed_mnemonic: _,
             seed_backed_up: _,
             // Only informational; an older build that drops one loses no funds.
@@ -712,12 +701,8 @@ impl WalletStore {
         let mut names: BTreeSet<&'static str> = FORMAT_NAMES.iter().copied().collect();
         self.requires(&mut names);
         let requires: Vec<String> = names.into_iter().map(String::from).collect();
-        let encrypted = encrypt_struct_with_aad(self, store_enc_material, &requires_aad(&requires))
+        let file = encrypt_struct_v2(self, store_enc_material, requires)
             .map_err(|e| WalletError::General(format!("wallet store encryption failed: {e:?}")))?;
-        let file = WalletFile {
-            requires,
-            encrypted,
-        };
         write_atomic(path, no_clobber, |writer| {
             serde_cbor::to_writer(writer, &file)?;
             Ok(())
@@ -770,14 +755,6 @@ impl WalletStore {
                 _ => Err(SecurityError::PasswordRequired.into()),
             }
         };
-        if let Ok(file) = deserialize_from_cbor::<WalletFile>(&content) {
-            check_requires(&file.requires, &supported()).map_err(WalletError::NeedsUpgrade)?;
-            return Ok(Some(decrypt_with_password(
-                file.encrypted,
-                take_password()?,
-                &requires_aad(&file.requires),
-            )?));
-        }
         if !upgrade {
             return Ok(None);
         }
@@ -1269,7 +1246,7 @@ pub(crate) mod compat_support {
             &store.swap_locks["fixture-swap"],
         );
         write(release, "bond-fidelity", &store.fidelity_bond[0]);
-        generate_envelope(release, &store);
+        generate_container(release, &store);
     }
 
     #[test]
@@ -1317,35 +1294,42 @@ pub(crate) mod compat_support {
         .is_err());
     }
 
-    pub(crate) fn generate_envelope(release: &Path, store: &WalletStore) {
+    pub(crate) fn generate_container(release: &Path, store: &WalletStore) {
         let MasterKey::Sealed(sealed) = &store.master_key else {
             panic!()
         };
         let (mut master, key) =
             decrypt_with_password::<Xpriv>(sealed.clone(), "fixture-password".into(), &[]).unwrap();
         master.private_key.non_secure_erase();
-        let mut names = BTreeSet::new();
+        let mut names: BTreeSet<_> = FORMAT_NAMES.iter().copied().collect();
         store.requires(&mut names);
         let requires: Vec<_> = names.into_iter().map(String::from).collect();
-        let encrypted = encrypt_struct_with_aad(store, &key, &requires_aad(&requires)).unwrap();
-        write(
-            release,
-            "wallet-file",
-            &WalletFile {
-                requires,
-                encrypted,
-            },
-        );
+        let file = encrypt_struct_v2(store, &key, requires).unwrap();
+        write(release, "wallet-file", &file);
     }
 
-    pub(crate) fn check_envelope(release: &Path) {
-        let file: WalletFile = check(release, "wallet-file");
-        let (store, key) = decrypt_with_password::<WalletStore>(
-            file.encrypted,
-            "fixture-password".into(),
-            &requires_aad(&file.requires),
-        )
-        .unwrap();
+    pub(crate) fn check_container(release: &Path) {
+        let file: crate::security::EncryptedDataV2 = check(release, "wallet-file");
+        assert_eq!(
+            file.requires,
+            [
+                "ln-swap-in",
+                "ln-swap-out",
+                crate::security::WALLET_STORE_FORMAT
+            ]
+        );
+        let loaded = load_sensitive_struct::<WalletStore, SerdeCbor>(
+            &release.join("wallet-file.cbor"),
+            Some("fixture-password".into()),
+        );
+        if !cfg!(feature = "lightning") {
+            assert!(
+                matches!(loaded, Err(SecurityError::NeedsUpgrade(names)) if names == ["ln-swap-in", "ln-swap-out"])
+            );
+            return;
+        }
+        let (store, key) = loaded.unwrap();
+        let key = key.unwrap();
         compat_assert_empty_extra(&store);
         assert_eq!(
             store.master_key.with_unlocked(&key, |k| Ok(*k)).ok(),
@@ -1391,7 +1375,7 @@ fn write_atomic(
 mod tests {
     use super::*;
     use crate::{
-        security::SecurityError,
+        security::{EncryptedDataV2, SecurityError, WALLET_STORE_FORMAT},
         wallet::{
             deniability::{verify_proof_for_test, DeniabilityProof},
             report::{RecoveryReport, SwapRole},
@@ -1719,15 +1703,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let (path, _, material) = stored_wallet(dir.path());
         for name in ["future-v1", "legacy-v1", "ln-swap-in"] {
-            let file = WalletFile {
-                requires: vec![name.into()],
-                encrypted: serde_json::from_value(serde_json::json!({
-                    "nonce": material.nonce,
-                    "pbkdf2_salt": material.pbkdf2_salt,
-                    "encrypted_payload": [0],
-                }))
-                .unwrap(),
-            };
+            let file: EncryptedDataV2 = serde_json::from_value(serde_json::json!({
+                "version": 2,
+                "requires": [name],
+                "nonce": material.nonce,
+                "pbkdf2_salt": material.pbkdf2_salt,
+                "ciphertext": [0],
+            }))
+            .unwrap();
             let bytes = serde_cbor::to_vec(&file).unwrap();
             std::fs::write(&path, &bytes).unwrap();
             assert!(Wallet::is_wallet_encrypted(&path).unwrap());
@@ -1754,11 +1737,12 @@ mod tests {
     fn compat_wallet_headers_authenticate_and_bare_files_upgrade() {
         let dir = tempdir().unwrap();
         let (path, store, material) = stored_wallet(dir.path());
-        let encrypted = encrypt_struct_with_aad(&store, &material, b"legacy\ntaproot").unwrap();
-        let file = WalletFile {
-            requires: vec!["taproot".into(), "legacy".into(), "taproot".into()],
-            encrypted: encrypted.clone(),
-        };
+        let file = encrypt_struct_v2(
+            &store,
+            &material,
+            vec!["taproot".into(), "legacy".into(), "taproot".into()],
+        )
+        .unwrap();
         std::fs::write(&path, serde_cbor::to_vec(&file).unwrap()).unwrap();
         assert_eq!(
             WalletStore::read_from_disk(&path, Some(PASSWORD.into()))
@@ -1766,11 +1750,16 @@ mod tests {
                 .0,
             store
         );
-        for requires in [vec![], vec!["legacy".into()], vec!["taproot".into()]] {
-            let file = WalletFile {
-                requires,
-                encrypted: encrypted.clone(),
-            };
+        // V2 authenticates the exact sequence, including order and duplicates.
+        for requires in [
+            vec![],
+            vec!["legacy".into()],
+            vec!["taproot".into()],
+            vec!["legacy".into(), "taproot".into()],
+            vec!["legacy".into(), "taproot".into(), "taproot".into()],
+        ] {
+            let mut file = file.clone();
+            file.requires = requires;
             let bytes = serde_cbor::to_vec(&file).unwrap();
             std::fs::write(&path, &bytes).unwrap();
             assert!(matches!(
@@ -1935,8 +1924,8 @@ mod tests {
                 store.ln_pending_swaps.insert("taker".into(), pending);
                 store.write_to_disk(&path, &material).unwrap();
                 let bytes = std::fs::read(&path).unwrap();
-                let file: WalletFile = serde_cbor::from_slice(&bytes).unwrap();
-                assert_eq!(file.requires, [name]);
+                let file: EncryptedDataV2 = serde_cbor::from_slice(&bytes).unwrap();
+                assert_eq!(file.requires, [name, WALLET_STORE_FORMAT]);
                 let read = WalletStore::read_from_disk(&path, Some(PASSWORD.into()));
                 if cfg!(feature = "lightning") {
                     assert_eq!(read.unwrap().0, store);
@@ -1950,20 +1939,53 @@ mod tests {
         }
         store.ln_pending_swaps.get_mut("taker").unwrap().is_swap_in = true;
         store.write_to_disk(&path, &material).unwrap();
-        let union: WalletFile = serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(union.requires, ["ln-swap-in", "ln-swap-out"]);
+        let union: EncryptedDataV2 =
+            serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            union.requires,
+            ["ln-swap-in", "ln-swap-out", WALLET_STORE_FORMAT]
+        );
         store.ln_pending_swaps.clear();
         store.ln_maker_swaps.clear();
         store.write_to_disk(&path, &material).unwrap();
-        let file: WalletFile = serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(file.requires.is_empty());
+        let file: EncryptedDataV2 = serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file.requires, [WALLET_STORE_FORMAT]);
     }
 
     #[test]
-    fn requires_aad_is_sorted_unique_names_joined_by_newline() {
-        assert_eq!(requires_aad::<&str>(&[]), b"");
-        assert_eq!(requires_aad(&["taproot"]), b"taproot");
-        assert_eq!(requires_aad(&["b", "a-v2", "b"]), b"a-v2\nb");
+    fn wallet_saves_v2_with_format_marker_and_refuses_pre_port_readers() {
+        let dir = tempdir().unwrap();
+        let (path, store, material) = stored_wallet(dir.path());
+        let first = std::fs::read(&path).unwrap();
+        let file: EncryptedDataV2 = serde_cbor::from_slice(&first).unwrap();
+        assert_eq!(file.requires, [WALLET_STORE_FORMAT]);
+        assert!(crate::protocol::features::supported().contains(&WALLET_STORE_FORMAT));
+        assert!(serde_cbor::from_slice::<EncryptedData>(&first).is_err());
+        // #1165's reader rejects every nonempty requires list.
+        assert!(!file.requires.is_empty());
+        let (loaded, _) =
+            load_sensitive_struct::<WalletStore, SerdeCbor>(&path, Some(PASSWORD.into())).unwrap();
+        assert_eq!(loaded, store);
+        store.write_to_disk(&path, &material).unwrap();
+        let second: EncryptedDataV2 =
+            serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(second.requires, file.requires);
+        assert_ne!(second, file, "each save must rotate the nonce");
+        // Removing the downgrade guard cannot make a saved wallet readable.
+        let mut stripped = second;
+        stripped.requires.clear();
+        let bytes = serde_cbor::to_vec(&stripped).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        for result in [
+            WalletStore::read_from_disk(&path, Some(PASSWORD.into())).map(|_| ()),
+            WalletStore::read_without_upgrade(&path, Some(PASSWORD.into())).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(WalletError::Security(SecurityError::Decryption))
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -2003,10 +2025,13 @@ mod tests {
         let (path, store, material) = stored_wallet(dir.path());
 
         let write = |requires: &[&str], aad: &[&str]| {
-            let file = WalletFile {
-                requires: requires.iter().map(|n| n.to_string()).collect(),
-                encrypted: encrypt_struct_with_aad(&store, &material, &requires_aad(aad)).unwrap(),
-            };
+            let mut file = encrypt_struct_v2(
+                &store,
+                &material,
+                aad.iter().map(|n| n.to_string()).collect(),
+            )
+            .unwrap();
+            file.requires = requires.iter().map(|n| n.to_string()).collect();
             let bytes = serde_cbor::to_vec(&file).unwrap();
             std::fs::write(&path, &bytes).unwrap();
             bytes
@@ -2097,8 +2122,8 @@ mod tests {
                 );
             }
             let migrated = std::fs::read(&path).unwrap();
-            assert!(serde_cbor::from_slice::<WalletFile>(&migrated).is_ok());
-            // A report created beside a restored envelope is never imported or deleted.
+            assert!(serde_cbor::from_slice::<EncryptedDataV2>(&migrated).is_ok());
+            // A report created beside a restored container is never imported or deleted.
             std::fs::write(&report_path, &report_bytes).unwrap();
             let (second, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
             assert_eq!(second, read);
@@ -2300,7 +2325,7 @@ mod tests {
             .insert("future_report".into(), vec![Value::Bool(true)]);
         let seed_bytes = serde_cbor::to_vec(&store.sealed_mnemonic).unwrap();
         let master_bytes = serde_cbor::to_vec(&store.master_key).unwrap();
-        let old = crate::security::encrypt_struct_v2(&store, &material).unwrap();
+        let old = crate::security::encrypt_struct_v2(&store, &material, Vec::new()).unwrap();
         let source = serde_cbor::to_vec(&old).unwrap();
         std::fs::write(&path, &source).unwrap();
         assert!(Wallet::is_wallet_encrypted(&path).unwrap());
@@ -2339,12 +2364,14 @@ mod tests {
         assert_eq!(read, store);
         assert_eq!(std::fs::read(&path).unwrap(), source);
         read.write_to_disk(&path, &key).unwrap();
-        // P1 still writes the forward-compatible envelope. The #1165 V2
-        // reader must refuse it before it could drop reports or extra fields.
+        // P2 writes V2 with the format marker: the current reader accepts it,
+        // while #1165's blanket nonempty-requires refusal guards downgrades.
         let saved = std::fs::read(&path).unwrap();
-        assert!(
-            load_sensitive_struct::<WalletStore, SerdeCbor>(&path, Some(PASSWORD.into())).is_err()
-        );
+        let saved_container: EncryptedDataV2 = serde_cbor::from_slice(&saved).unwrap();
+        assert_eq!(saved_container.requires, [WALLET_STORE_FORMAT]);
+        let (saved_store, _) =
+            load_sensitive_struct::<WalletStore, SerdeCbor>(&path, Some(PASSWORD.into())).unwrap();
+        assert_eq!(saved_store, store);
         assert_eq!(std::fs::read(&path).unwrap(), saved);
         let (rewritten, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
         assert_eq!(rewritten, store);
@@ -2422,7 +2449,7 @@ mod tests {
         read.write_to_disk(&path, &read_material).unwrap();
         let v2_bytes = std::fs::read(&path).unwrap();
         assert!(serde_cbor::from_slice::<EncryptedData>(&v2_bytes).is_err());
-        assert!(serde_cbor::from_slice::<WalletFile>(&v2_bytes).is_ok());
+        assert!(serde_cbor::from_slice::<EncryptedDataV2>(&v2_bytes).is_ok());
         let (upgraded, _) = WalletStore::read_from_disk(&path, Some(password.to_string())).unwrap();
         assert_eq!(upgraded, store);
     }

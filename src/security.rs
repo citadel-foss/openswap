@@ -16,8 +16,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::utill;
-use std::{collections::BTreeSet, fs, io, path::Path};
+use crate::{
+    protocol::features::{check_requires, supported},
+    utill,
+};
+use std::{fs, io, path::Path};
 
 /// Errors returned while loading or decrypting sensitive data.
 #[derive(Debug)]
@@ -34,6 +37,8 @@ pub enum SecurityError {
     /// responsible for obtaining a password (e.g. by prompting the user)
     /// and retrying with `Some(password)`.
     PasswordRequired,
+    /// The container requires features this build cannot read.
+    NeedsUpgrade(Vec<String>),
 }
 
 impl std::fmt::Display for SecurityError {
@@ -44,6 +49,9 @@ impl std::fmt::Display for SecurityError {
             Self::Decryption => write!(f, "decryption failed; wrong password or corrupted data"),
             Self::Cbor(err) => write!(f, "CBOR error: {err}"),
             Self::PasswordRequired => write!(f, "file is encrypted but no password was supplied"),
+            Self::NeedsUpgrade(names) => {
+                write!(f, "file needs features this build lacks: {names:?}")
+            }
         }
     }
 }
@@ -312,7 +320,7 @@ const ENCRYPTED_DATA_VERSION: u32 = 2;
 pub struct EncryptedDataV2 {
     version: u32,
     /// Features a reader must support before it may open the file.
-    requires: Vec<String>,
+    pub(crate) requires: Vec<String>,
     nonce: EncryptionNonce,
     pbkdf2_salt: PBKDF2Salt,
     ciphertext: Vec<u8>,
@@ -325,7 +333,7 @@ struct ContainerVersion {
 }
 
 /// The cleartext header as authenticated data: editing it fails decryption.
-fn header_aad(version: u32, requires: &[String]) -> Result<Vec<u8>, serde_cbor::Error> {
+pub(crate) fn header_aad(version: u32, requires: &[String]) -> Result<Vec<u8>, serde_cbor::Error> {
     serde_cbor::to_vec(&(version, requires))
 }
 
@@ -434,8 +442,7 @@ pub fn encrypt_struct<T: Serialize>(
 }
 
 /// [`encrypt_struct`] with associated data. `aad` is authenticated but not
-/// encrypted: decryption fails unless the same bytes are supplied. Used only
-/// by the wallet envelope.
+/// encrypted: decryption fails unless the same bytes are supplied.
 pub fn encrypt_struct_with_aad<T: Serialize>(
     plain_struct: T,
     enc_material: &KeyMaterial,
@@ -449,12 +456,13 @@ pub fn encrypt_struct_with_aad<T: Serialize>(
     })
 }
 
-/// Like [`encrypt_struct`], but writes the version 2 container.
+/// Like [`encrypt_struct`], but writes the version 2 container with authenticated
+/// requirements. Wallet writers supply the sorted union of format and record names.
 pub fn encrypt_struct_v2<T: Serialize>(
     plain_struct: &T,
     enc_material: &KeyMaterial,
+    requires: Vec<String>,
 ) -> Result<EncryptedDataV2, EncryptError> {
-    let requires = Vec::new();
     let aad = header_aad(ENCRYPTED_DATA_VERSION, &requires)?;
     let (nonce, ciphertext) = seal_cbor(plain_struct, &enc_material.key, &aad)?;
     Ok(EncryptedDataV2 {
@@ -553,22 +561,12 @@ pub(crate) fn decrypt_with_password<T: DeserializeOwned>(
     Ok((decrypted, material))
 }
 
-/// Names an incompatible change to the wallet encryption or its KDF adds to
-/// the wallet's `requires`. A build that adds one keeps the old parameters and
-/// reader. None this release: the iteration count is a global constant.
-pub(crate) const FORMAT_NAMES: &[&str] = &[];
+/// Marks stores that preserve reports and unknown fields. Pre-port V2 readers
+/// refuse any nonempty `requires`, preventing a downgrade from dropping them.
+pub(crate) const WALLET_STORE_FORMAT: &str = "wallet-store-2";
 
-/// The associated data that binds a file's cleartext `requires` names to its
-/// ciphertext: the sorted unique names joined by `"\n"`, as UTF-8. Frozen; an
-/// empty set is empty bytes, matching v0.2.3 files and master-key sealing.
-pub(crate) fn requires_aad<S: AsRef<str>>(names: &[S]) -> Vec<u8> {
-    let names: BTreeSet<&str> = names.iter().map(AsRef::as_ref).collect();
-    names
-        .into_iter()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .into_bytes()
-}
+/// Requirements written on every wallet save, alongside record requirements.
+pub(crate) const FORMAT_NAMES: &[&str] = &[WALLET_STORE_FORMAT];
 
 /// Loads a sensitive struct from a file, supporting both encrypted and plaintext formats.
 ///
@@ -664,12 +662,7 @@ fn decrypt_v2<T: DeserializeOwned, F: SerdeFormat>(
     }
     let data = F::from_slice::<EncryptedDataV2>(content)
         .map_err(|err| SecurityError::Format(format!("invalid encrypted file {file:?}: {err}")))?;
-    if !data.requires.is_empty() {
-        return Err(SecurityError::Format(format!(
-            "{file:?} needs features this build lacks: {:?}",
-            data.requires
-        )));
-    }
+    check_requires(&data.requires, &supported()).map_err(SecurityError::NeedsUpgrade)?;
     let Some(mut password) = password.filter(|p| !p.is_empty()) else {
         return Err(SecurityError::PasswordRequired);
     };
@@ -689,7 +682,8 @@ mod tests {
     fn v2_container_is_refused_by_old_readers() {
         let material = KeyMaterial::new_from_password(Some("test password".to_string())).unwrap();
         let v2 =
-            serde_cbor::to_vec(&encrypt_struct_v2(&"wallet state", &material).unwrap()).unwrap();
+            serde_cbor::to_vec(&encrypt_struct_v2(&"wallet state", &material, Vec::new()).unwrap())
+                .unwrap();
         let v1 = serde_cbor::to_vec(&encrypt_struct("wallet state", &material).unwrap()).unwrap();
 
         // Older builds parse wallet files only as `EncryptedData`.
@@ -721,7 +715,7 @@ mod tests {
     #[test]
     fn v2_container_refuses_unknown_versions_and_edited_headers() {
         let material = KeyMaterial::new_from_password(Some("test password".to_string())).unwrap();
-        let data = encrypt_struct_v2(&"wallet state", &material).unwrap();
+        let data = encrypt_struct_v2(&"wallet state", &material, Vec::new()).unwrap();
         let dir = tempdir().unwrap();
         let path = dir.path().join("wallet");
         let load = |data: &EncryptedDataV2| {
@@ -748,7 +742,7 @@ mod tests {
             ..data.clone()
         };
         assert!(
-            matches!(load(&needs_more), Err(SecurityError::Format(e)) if e.contains("future-feature"))
+            matches!(load(&needs_more), Err(SecurityError::NeedsUpgrade(names)) if names == ["future-feature"])
         );
 
         // The header is authenticated: a requirement stripped by hand fails decryption.
@@ -808,17 +802,15 @@ mod tests {
 
     #[test]
     fn compat_aad_vectors_and_legacy_ciphertext_are_frozen() {
-        assert_eq!(requires_aad::<&str>(&[]), b"");
-        assert_eq!(
-            requires_aad(&["taproot", "legacy", "taproot"]),
-            b"legacy\ntaproot"
-        );
-        assert_eq!(
-            requires_aad(&["x-v2", "x-v10", "x-v1"]),
-            b"x-v1\nx-v10\nx-v2"
-        );
+        assert_eq!(header_aad(2, &[]).unwrap(), b"\x82\x02\x80");
+        let names = vec![
+            "legacy".into(),
+            "taproot".into(),
+            WALLET_STORE_FORMAT.into(),
+        ];
+        let aad = header_aad(2, &names).unwrap();
+        assert_eq!(aad, b"\x82\x02\x83\x66legacy\x67taproot\x6ewallet-store-2");
         let material = KeyMaterial::new_from_password(Some("compat-password".into())).unwrap();
-        let aad = requires_aad(&["taproot", "legacy"]);
         let encrypted = encrypt_struct_with_aad("known payload", &material, &aad).unwrap();
         assert_eq!(
             decrypt_struct_with_aad::<String>(encrypted.clone(), &material, &aad).unwrap(),
@@ -830,8 +822,8 @@ mod tests {
         ));
         for wrong in [
             Vec::new(),
-            b"taproot".to_vec(),
-            b"legacy\ntaproot\n".to_vec(),
+            header_aad(2, &["taproot".into()]).unwrap(),
+            header_aad(3, &names).unwrap(),
         ] {
             assert!(matches!(
                 decrypt_struct_with_aad::<String>(encrypted.clone(), &material, &wrong),

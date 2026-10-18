@@ -242,7 +242,10 @@ impl From<serde_json::Error> for WalletError {
 
 impl From<SecurityError> for WalletError {
     fn from(value: SecurityError) -> Self {
-        Self::Security(value)
+        match value {
+            SecurityError::NeedsUpgrade(names) => Self::NeedsUpgrade(names),
+            other => Self::Security(other),
+        }
     }
 }
 

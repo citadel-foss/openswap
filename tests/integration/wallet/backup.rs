@@ -6,7 +6,7 @@ use bitcoind::{
     BitcoinD,
 };
 use serde::Deserialize;
-use serde_cbor::{value::from_value, Value as CborValue};
+use serde_cbor::Value as CborValue;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
@@ -18,8 +18,7 @@ use openswap::wallet::{
 
 use openswap::{
     security::{
-        decrypt_struct_with_aad, load_sensitive_struct, EncryptedData, KeyMaterial, SecurityError,
-        SerdeJson,
+        load_sensitive_struct, EncryptedData, KeyMaterial, SecurityError, SerdeCbor, SerdeJson,
     },
     utill::MIN_RELAY_FEE_RATE,
 };
@@ -437,36 +436,24 @@ fn assert_restores_sparse_bonds(
 }
 
 #[derive(Deserialize)]
-struct WalletEnvelope {
+struct WalletHeader {
+    version: u32,
     requires: Vec<String>,
-    encrypted: CborValue,
 }
 
-#[derive(Deserialize)]
-struct EncryptionParameters {
-    nonce: [u8; 12],
-    pbkdf2_salt: [u8; 16],
-}
-
-/// Decrypts the envelope's ciphertext with `password`, using its stored salt.
-/// The generic sensitive-file reader only handles the bare backup container.
+/// Decrypts the V2 wallet with its authenticated header and stored salt.
 fn decrypt_wallet_file(path: &Path, password: &str) -> Result<CborValue, SecurityError> {
-    let mut envelope: WalletEnvelope = serde_cbor::from_slice(&fs::read(path).unwrap()).unwrap();
-    envelope.requires.sort_unstable();
-    envelope.requires.dedup();
-    let aad = envelope.requires.join("\n").into_bytes();
-    let parameters: EncryptionParameters = from_value(envelope.encrypted.clone()).unwrap();
-    let encrypted: EncryptedData = from_value(envelope.encrypted).unwrap();
-    let material = KeyMaterial::existing(
-        password.to_string(),
-        parameters.nonce,
-        parameters.pbkdf2_salt,
-    );
-    decrypt_struct_with_aad::<CborValue>(encrypted, &material, &aad)
+    load_sensitive_struct::<CborValue, SerdeCbor>(path, Some(password.to_string()))
+        .map(|(store, _)| store)
 }
 
-/// Check the envelope's ciphertext with both passwords.
+/// Check the V2 header and ciphertext with both passwords.
 fn assert_wallet_file_encrypted(path: &Path, password: &str) {
+    let bytes = fs::read(path).unwrap();
+    let header: WalletHeader = serde_cbor::from_slice(&bytes).unwrap();
+    assert_eq!(header.version, 2);
+    assert!(header.requires.iter().any(|name| name == "wallet-store-2"));
+    assert!(serde_cbor::from_slice::<EncryptedData>(&bytes).is_err());
     assert!(
         Wallet::is_wallet_encrypted(path).unwrap(),
         "restored wallet file must be encrypted"
