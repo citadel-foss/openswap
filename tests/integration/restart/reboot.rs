@@ -26,7 +26,7 @@ use std::{
     net::TcpStream,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Test: maker reboot recovery preserves funded Taproot swapcoins. Maker2 funds
@@ -775,6 +775,54 @@ fn run_reservations_survive_restart(world: &mut World, params: SwapParams) {
     assert!(wallet.get_outgoing_swapcoins_count() > 0);
     drop(wallet);
     assert_eq!(restarted.reserved_inputs().unwrap(), before);
+}
+
+/// A maker restarted inside the grace after its first Legacy funding send
+/// failed still holds the inputs, then frees them when the grace ends,
+/// counted from its funding claim, not the restart. The keys stay.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [FailFirstBroadcast],
+    takers = [CrashBeforeRecovery],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+    swap(protocol = Legacy, sats = 500_000, makers = 1, tx_count = 1),
+)]
+fn unsent_funding_grace_survives_a_maker_restart(world: &mut World, params: SwapParams) {
+    let summary = world.taker_mut().prepare(params).expect("prepare swap");
+    let swap_id = summary.swap_id.clone();
+    assert!(
+        world.taker_mut().start(&swap_id).is_err(),
+        "the swap must fail at the maker's first funding send"
+    );
+    let held = world.makers()[0].inner().reserved_inputs().unwrap();
+    assert!(held > 0, "the failed send must keep its inputs reserved");
+
+    // Restart well inside the grace.
+    thread::sleep(Duration::from_secs(30));
+    let log_path = world.taker_log_path();
+    let mark = log_mark(&log_path);
+    world.restart_maker(0, 120);
+    let restarted_at = Instant::now();
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_millis(500),
+        "restart recovery to start on the unsent swap",
+        fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .get(mark as usize..)
+            .is_some_and(|tail| tail.contains("recover_from_swap started"))
+    );
+    let maker = world.makers()[0].inner().clone();
+    assert_eq!(maker.reserved_inputs().unwrap(), held);
+
+    wait_for_release(&log_path, &swap_id);
+    assert!(
+        restarted_at.elapsed() < openswap::utill::UNBROADCAST_DISCARD_GRACE,
+        "the grace must count from the funding claim, not the restart"
+    );
+    assert_eq!(maker.reserved_inputs().unwrap(), 0);
+    assert!(maker.has_unfinished_outgoing_swapcoin(&swap_id).unwrap());
+    assert!(maker.wallet.read().unwrap().get_incoming_swapcoins_count() > 0);
 }
 
 /// A maker that dies after claiming its funding coins, before it saves any

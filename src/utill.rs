@@ -88,6 +88,22 @@ pub const TX_BROADCAST_TIMEOUT: Duration = Duration::from_secs(300);
 /// spends the timelock reaction margin.
 pub const TX_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(7200);
 
+/// How long a maker holds the inputs of a funding tx it has no proof it sent.
+/// Outlasts a full relay window plus backend lag, such as an Electrum reconnect.
+/// Releasing early is recoverable: the swap's keys are kept and watched.
+#[cfg(not(feature = "integration-test"))]
+pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(15 * 60);
+/// Short so a test can watch it expire. Test recovery starts once the taker's
+/// funding wait and the idle timeout pass, so the grace must outlast both.
+#[cfg(feature = "integration-test")]
+pub const UNBROADCAST_DISCARD_GRACE: Duration = Duration::from_secs(240);
+#[cfg(not(feature = "integration-test"))]
+const _: () = assert!(UNBROADCAST_DISCARD_GRACE.as_secs() >= 2 * TX_BROADCAST_TIMEOUT.as_secs());
+#[cfg(feature = "integration-test")]
+const _: () = assert!(
+    UNBROADCAST_DISCARD_GRACE.as_secs() >= 2 * crate::taker::api::MAKER_FUNDING_TIMEOUT.as_secs()
+);
+
 /// Default fee rate in sats/vb for all transactions, and the absolute floor:
 /// Bitcoin Core's default `minrelaytxfee`. Lower rates stop relaying.
 pub const MIN_RELAY_FEE_RATE: f64 = 1.0;

@@ -61,7 +61,7 @@ use super::{
     report::{RecoveryReport, SwapRole},
     seed::{seal_mnemonic, SEED_NOT_BACKED_UP},
     seed_cli::{WalletInUse, IN_USE_MESSAGE},
-    storage::{AddressType, SecretXpriv, WalletStore},
+    storage::{AddressType, SecretXpriv, SwapReservation, WalletStore},
     swapcoin::{contract_timelock, WatchOnlySwapCoin},
 };
 
@@ -364,6 +364,17 @@ pub struct RecoveryOutcome {
 
 /// A spend sent by a recovery pass: (swapcoin key, contract txid, spending txid).
 type SentSpend = (String, Txid, Txid);
+
+/// What one [`Wallet::settle_unsent_funding`] pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnsentPass {
+    /// Unsent funding still holds reserved inputs, waiting out the grace.
+    pub(crate) waiting: bool,
+    /// This pass gave reserved inputs back to the wallet.
+    pub(crate) released: bool,
+    /// Every outgoing coin was dead, so the swap was dropped.
+    pub(crate) finished: bool,
+}
 
 /// Chain state of one swapcoin's contract output on a recovery pass.
 #[derive(Debug, PartialEq, Eq)]
@@ -825,6 +836,59 @@ impl Wallet {
         );
     }
 
+    /// Restarts the swap's unbroadcast grace and saves it, just before a
+    /// funding send: a send that may still be in flight after a crash must get
+    /// the whole grace, however long the sends before it took.
+    pub(crate) fn restart_funding_grace(&mut self, swap_id: &str) -> Result<(), WalletError> {
+        if let Some(locks) = self.store.swap_locks.get_mut(swap_id) {
+            locks.reserved_at = now_secs();
+            self.save_to_disk()?;
+        }
+        Ok(())
+    }
+
+    /// Saves a funding batch's swapcoins in one write: a crash must not leave
+    /// half a batch. A failed save leaves none of it.
+    pub(crate) fn save_funding_batch(
+        &mut self,
+        incoming: &[super::swapcoin::IncomingSwapCoin],
+        outgoing: &[super::swapcoin::OutgoingSwapCoin],
+    ) -> Result<(), WalletError> {
+        let key = |tx: &Transaction| tx.compute_txid().to_string();
+        let previous_incoming: Vec<_> = incoming
+            .iter()
+            .map(|coin| key(&coin.contract_tx))
+            .map(|k| (k.clone(), self.store.incoming_swapcoins.get(&k).cloned()))
+            .collect();
+        let previous_outgoing: Vec<_> = outgoing
+            .iter()
+            .map(|coin| key(&coin.contract_tx))
+            .map(|k| (k.clone(), self.store.outgoing_swapcoins.get(&k).cloned()))
+            .collect();
+        incoming
+            .iter()
+            .for_each(|coin| self.add_incoming_swapcoin(coin));
+        outgoing
+            .iter()
+            .for_each(|coin| self.add_outgoing_swapcoin(coin));
+        let saved = self.save_to_disk();
+        if saved.is_err() {
+            for (k, coin) in previous_incoming {
+                match coin {
+                    Some(coin) => self.store.incoming_swapcoins.insert(k, coin),
+                    None => self.store.incoming_swapcoins.remove(&k),
+                };
+            }
+            for (k, coin) in previous_outgoing {
+                match coin {
+                    Some(coin) => self.store.outgoing_swapcoins.insert(k, coin),
+                    None => self.store.outgoing_swapcoins.remove(&k),
+                };
+            }
+        }
+        saved
+    }
+
     /// Finds a incoming swap coin by swap_id.
     #[allow(dead_code)]
     pub(crate) fn find_incoming_swapcoin(
@@ -952,7 +1016,7 @@ impl Wallet {
     }
 
     /// Outgoing swap coins of `swap_id` recorded as funded: one per accepted
-    /// funding send, plus the batch's first coin, committed before its send.
+    /// or seen funding send, plus Taproot's first coin, committed before its send.
     #[cfg(feature = "integration-test")]
     pub fn committed_outgoing_swapcoins_count(&self, swap_id: &str) -> usize {
         self.store
@@ -1061,11 +1125,12 @@ impl Wallet {
             .collect()
     }
 
-    pub(crate) fn swap_funding_committed(&self, swap_id: &str) -> bool {
+    /// Whether `swap_id` has an outgoing coin whose funding is not known sent.
+    pub(crate) fn has_unsent_funding(&self, swap_id: &str) -> bool {
         self.store
             .outgoing_swapcoins
             .values()
-            .any(|coin| coin.swap_id.as_deref() == Some(swap_id) && coin.committed)
+            .any(|coin| coin.swap_id.as_deref() == Some(swap_id) && !coin.committed)
     }
 
     /// Keep retry state in memory when cleanup cannot be saved.
@@ -1360,11 +1425,7 @@ impl Wallet {
         swap_id: &str,
         swapcoin: &super::swapcoin::OutgoingSwapCoin,
     ) -> Result<ContractChainState, WalletError> {
-        let funding = match swapcoin.protocol {
-            ProtocolVersion::Taproot => Some(&swapcoin.contract_tx),
-            ProtocolVersion::Legacy => swapcoin.funding_tx.as_ref(),
-        };
-        if let Some(funding) = funding {
+        if let Some(funding) = Self::own_funding(swapcoin) {
             if Self::inputs_spent_elsewhere(chain, funding)? {
                 log::info!(
                     "Unsent funding for {} was confirmed spent elsewhere, discarding swapcoin",
@@ -1391,6 +1452,133 @@ impl Wallet {
             swap_id
         );
         Ok(ContractChainState::Discarded)
+    }
+
+    /// The tx our own wallet sends for this coin: Legacy's funding tx, or
+    /// Taproot's contract tx, which is its funding.
+    fn own_funding(swapcoin: &super::swapcoin::OutgoingSwapCoin) -> Option<&Transaction> {
+        match swapcoin.protocol {
+            ProtocolVersion::Taproot => Some(&swapcoin.contract_tx),
+            ProtocolVersion::Legacy => swapcoin.funding_tx.as_ref(),
+        }
+    }
+
+    /// One maker pass over the uncommitted outgoing coins of `swap_id`: their
+    /// funding was never sent, or its send failed. Seen funding is recorded as
+    /// sent. Funding whose input a named tx spent in a block can never confirm,
+    /// so its coin is dropped, and the whole swap once no outgoing coin is
+    /// left. Any other coin is kept and watched; past the grace its inputs go
+    /// back to the wallet. Nothing is ever broadcast here.
+    pub(crate) fn settle_unsent_funding(
+        wallet: &std::sync::RwLock<Wallet>,
+        chain: &AnyBlockchain,
+        swap_id: &str,
+        grace_over: bool,
+    ) -> Result<UnsentPass, WalletError> {
+        let unsent: Vec<(String, super::swapcoin::OutgoingSwapCoin)> = lock_debug!(wallet.read())
+            .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?
+            .store
+            .outgoing_swapcoins
+            .iter()
+            .filter(|(_, coin)| coin.swap_id.as_deref() == Some(swap_id) && !coin.committed)
+            .map(|(key, coin)| (key.clone(), coin.clone()))
+            .collect();
+        // A failed query is no proof of absence: it frees nothing this pass,
+        // but what the other queries proved is still saved, so a seen funding
+        // evicted later is never taken for unsent.
+        let mut seen = Vec::new();
+        let mut dead = Vec::new();
+        let mut unknown = Vec::new();
+        let mut failure = None;
+        for (key, coin) in unsent {
+            let funding = Self::own_funding(&coin);
+            let inputs: Vec<OutPoint> = funding
+                .map(|tx| tx.input.iter().map(|input| input.previous_output).collect())
+                .unwrap_or_default();
+            let dead_funding =
+                || funding.map_or(Ok(false), |tx| Self::inputs_spent_elsewhere(chain, tx));
+            match Self::funding_seen(chain, &coin) {
+                Ok(true) => seen.push(key),
+                Ok(false) => match dead_funding() {
+                    Ok(true) => dead.push((key, inputs)),
+                    Ok(false) => unknown.extend(inputs),
+                    Err(e) => failure = Some(e),
+                },
+                Err(e) => failure = Some(e),
+            }
+        }
+
+        let mut w = lock_debug!(wallet.write())
+            .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
+        let mut pass = UnsentPass::default();
+        if !dead.is_empty() && w.outgoing_keys_for_swap(swap_id).len() == dead.len() {
+            log::info!(
+                "Funding for {} was confirmed spent elsewhere, dropping the kept swap",
+                swap_id
+            );
+            w.remove_swap_coins_and_save(swap_id, true, true)?;
+            pass.finished = true;
+            return Ok(pass);
+        }
+        let previous_outgoing = w.store.outgoing_swapcoins.clone();
+        let previous_locks = w
+            .store
+            .swap_locks
+            .get(swap_id)
+            .map(|locks| (locks.outpoints.clone(), locks.reserved_at));
+        for key in &seen {
+            if let Some(coin) = w.store.outgoing_swapcoins.get_mut(key) {
+                log::info!(
+                    "Funding of {} for {} was seen; recording it as sent",
+                    key,
+                    swap_id
+                );
+                coin.committed = true;
+            }
+        }
+        for (key, inputs) in &dead {
+            log::info!(
+                "Funding of {} for {} was confirmed spent elsewhere, dropping its swapcoin",
+                key,
+                swap_id
+            );
+            w.store.outgoing_swapcoins.remove(key);
+            w.release_swap_locks(swap_id, Some(inputs));
+        }
+        let holding = w
+            .store
+            .swap_locks
+            .get(swap_id)
+            .is_some_and(|locks| unknown.iter().any(|input| locks.outpoints.contains(input)));
+        if holding && grace_over && failure.is_none() {
+            pass.released = w.release_swap_locks(swap_id, Some(&unknown));
+        } else {
+            pass.waiting = holding;
+        }
+        if !seen.is_empty() || !dead.is_empty() || pass.released {
+            if let Err(e) = w.save_to_disk() {
+                w.store.outgoing_swapcoins = previous_outgoing;
+                match previous_locks {
+                    Some((outpoints, reserved_at)) => {
+                        w.store.swap_locks.insert(
+                            swap_id.to_owned(),
+                            SwapReservation {
+                                outpoints,
+                                reserved_at,
+                            },
+                        );
+                    }
+                    None => {
+                        w.store.swap_locks.remove(swap_id);
+                    }
+                }
+                return Err(e);
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(pass),
+        }
     }
 
     /// Our own timelock recovery spending the contract output from the mempool.
@@ -1435,6 +1623,7 @@ impl Wallet {
             &|_| false,
             &|_| false,
             &mut false,
+            true,
         )?;
         Ok(Self::finish_recoveries(
             wallet,
@@ -1462,6 +1651,9 @@ impl Wallet {
     ///
     /// `synced` skips the wallet sync when the pass already ran one, and is set
     /// once this call syncs.
+    ///
+    /// `keep_unsent` leaves an unsent coin to [`Self::settle_unsent_funding`]:
+    /// the maker keeps its keys in case that funding still confirms.
     #[allow(clippy::too_many_arguments)]
     fn broadcast_timelock_recoveries(
         wallet: &std::sync::RwLock<Wallet>,
@@ -1471,6 +1663,7 @@ impl Wallet {
         claimed_by_hashlock: &dyn Fn(&str) -> bool,
         claim_proven: &dyn Fn(&str) -> bool,
         synced: &mut bool,
+        keep_unsent: bool,
     ) -> Result<(Vec<SentSpend>, Vec<String>), WalletError> {
         // Snapshot everything the recovery needs, then drop the guard before any backend call.
         let candidates = {
@@ -1581,6 +1774,8 @@ impl Wallet {
                 } else if Self::funding_seen(chain, &swapcoin)? {
                     commit_seen(&mut swapcoin)?;
                     Self::ensure_contract_on_chain(chain, &swap_id, &swapcoin)?
+                } else if keep_unsent {
+                    ContractChainState::NotYet
                 } else {
                     Self::unsent_funding_state(chain, &swap_id, &swapcoin)?
                 };
@@ -2011,6 +2206,7 @@ impl Wallet {
             // A failed sweep step holds every refund, but proves no claim.
             &|swap_id| claiming.contains(swap_id) || claimed.contains(swap_id),
             &mut synced,
+            false,
         )?;
         Self::finish_recoveries(
             wallet,
@@ -6405,7 +6601,7 @@ mod timelock_reconcile_tests {
     const CONTRACT_HEIGHT: i64 = 5;
     const RECOVERY_HEIGHT: i64 = 6;
     const TIP: i64 = 10;
-    const PASSWORD: &str = "test-password";
+    pub(super) const PASSWORD: &str = "test-password";
 
     pub(super) fn key(byte: u8) -> SecretKey {
         SecretKey::from_slice(&[byte; 32]).unwrap()
@@ -6776,10 +6972,9 @@ mod timelock_reconcile_tests {
         assert!(wallet
             .remove_swap_coins_and_save("swap", true, true)
             .is_err());
-        assert!(wallet.swap_funding_committed("swap"));
         let (_, outgoing) = wallet.find_unfinished_swapcoins();
         assert_eq!(outgoing.len(), 1);
-        assert!(outgoing[0].incoming_claimed);
+        assert!(outgoing[0].committed && outgoing[0].incoming_claimed);
     }
 
     #[test]
@@ -7130,7 +7325,7 @@ mod mempool_deferral_tests {
     use super::{
         timelock_reconcile_tests::{
             electrum, key, pubkey, scripthash, shutdown_after, stub_wallet,
-            taproot_coin_and_recovery, tx,
+            taproot_coin_and_recovery, tx, PASSWORD,
         },
         *,
     };
@@ -7164,6 +7359,8 @@ mod mempool_deferral_tests {
         txs: HashMap<Txid, (Transaction, i64)>,
         broadcast: Vec<Txid>,
         reject_broadcast: bool,
+        /// Lookups of these txs fail as a down backend would, never as "unknown".
+        fail_lookups: HashSet<Txid>,
         /// Every fee estimate, in sat/vB.
         feerate: f64,
     }
@@ -7177,6 +7374,7 @@ mod mempool_deferral_tests {
                     .collect(),
                 broadcast: Vec::new(),
                 reject_broadcast: false,
+                fail_lookups: HashSet::new(),
                 feerate: 1.0,
             }))
         }
@@ -7264,6 +7462,15 @@ mod mempool_deferral_tests {
                             "blockchain.estimatefee" => json!(chain.feerate / 100_000.0),
                             "blockchain.scripthash.get_history" => chain.history(param),
                             "blockchain.scripthash.listunspent" => chain.unspent(param),
+                            "blockchain.transaction.get"
+                                if param
+                                    .parse::<Txid>()
+                                    .is_ok_and(|txid| chain.fail_lookups.contains(&txid)) =>
+                            {
+                                return json!({"jsonrpc": "2.0", "id": req["id"], "error": {
+                                    "code": -32603, "message": "backend unavailable",
+                                }});
+                            }
                             "blockchain.transaction.get" => {
                                 match param.parse::<Txid>().ok().and_then(|t| chain.txs.get(&t)) {
                                     Some((tx, _)) => json!(serialize_hex(tx)),
@@ -7639,6 +7846,297 @@ mod mempool_deferral_tests {
         assert!(chain.lock().unwrap().broadcast.is_empty());
     }
 
+    /// A mined parent, our unsent Legacy funding spending it, and the coin
+    /// whose contract spends that funding. `seed` keeps each coin distinct.
+    fn unsent_coin(seed: u8) -> (Transaction, Transaction, OutgoingSwapCoin) {
+        let parent = tx(
+            OutPoint::new(Txid::from_byte_array([seed; 32]), 0),
+            100_000,
+            ScriptBuf::new(),
+        );
+        let funding = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            50_000,
+            ScriptBuf::new(),
+        );
+        let mut coin = outgoing_coin();
+        coin.committed = false;
+        coin.contract_tx.input[0].previous_output = OutPoint::new(funding.compute_txid(), 0);
+        coin.funding_tx = Some(funding.clone());
+        (parent, funding, coin)
+    }
+
+    /// The swap's incoming coin and `outgoing`, each unsent coin's funding
+    /// inputs reserved for the swap.
+    fn unsent_wallet(path: &Path, url: &str, outgoing: &[&OutgoingSwapCoin]) -> RwLock<Wallet> {
+        let mut wallet = stub_wallet(path, electrum(url));
+        wallet.add_incoming_swapcoin(&incoming_coin());
+        for coin in outgoing {
+            wallet.add_outgoing_swapcoin(coin);
+            if let Some(funding) = coin.funding_tx.as_ref().filter(|_| !coin.committed) {
+                let inputs: Vec<_> = funding.input.iter().map(|i| i.previous_output).collect();
+                wallet.reserve_swap_locks(SWAP, &inputs);
+            }
+        }
+        wallet.save_to_disk().unwrap();
+        RwLock::new(wallet)
+    }
+
+    /// Fresh connection per pass: passes run a block apart, past any cache.
+    fn settle(wallet: &RwLock<Wallet>, url: &str, grace_over: bool) -> UnsentPass {
+        Wallet::settle_unsent_funding(wallet, &electrum(url), SWAP, grace_over).unwrap()
+    }
+
+    fn coin_counts(wallet: &RwLock<Wallet>) -> (usize, usize, usize) {
+        let w = wallet.read().unwrap();
+        (
+            w.get_incoming_swapcoins_count(),
+            w.get_outgoing_swapcoins_count(),
+            w.store.swap_locks.values().map(|l| l.outpoints.len()).sum(),
+        )
+    }
+
+    #[test]
+    fn unsent_funding_waits_out_the_grace_then_frees_only_its_inputs() {
+        let (parent, _, coin) = unsent_coin(1);
+        let chain = StubChain::with(&[(&parent, 50)]);
+        let url = start_electrum_stub(chain.clone());
+        let temp_dir = tempdir().unwrap();
+        let wallet = unsent_wallet(&temp_dir.path().join("wallet.cbor"), &url, &[&coin]);
+
+        let waiting = UnsentPass {
+            waiting: true,
+            ..UnsentPass::default()
+        };
+        assert_eq!(settle(&wallet, &url, false), waiting);
+        assert_eq!(coin_counts(&wallet), (1, 1, 1));
+
+        let released = UnsentPass {
+            released: true,
+            ..UnsentPass::default()
+        };
+        assert_eq!(settle(&wallet, &url, true), released);
+        // Keys and contract data stay: the funding could still confirm.
+        assert_eq!(coin_counts(&wallet), (1, 1, 0));
+        assert_eq!(settle(&wallet, &url, true), UnsentPass::default());
+        assert_eq!(coin_counts(&wallet), (1, 1, 0));
+
+        // The maker's refund pass neither sends nor drops the kept coin.
+        Wallet::recover_timelocked_swapcoins(
+            &wallet,
+            &electrum(&url),
+            &shutdown_after(60),
+            None,
+            &|_| false,
+        )
+        .unwrap();
+        assert_eq!(coin_counts(&wallet), (1, 1, 0));
+        assert!(chain.lock().unwrap().broadcast.is_empty());
+    }
+
+    #[test]
+    fn unsent_funding_seen_after_release_is_recorded_as_sent() {
+        let (parent, funding, coin) = unsent_coin(2);
+        let chain = StubChain::with(&[(&parent, 50)]);
+        let url = start_electrum_stub(chain.clone());
+        let temp_dir = tempdir().unwrap();
+        let wallet = unsent_wallet(&temp_dir.path().join("wallet.cbor"), &url, &[&coin]);
+        assert!(settle(&wallet, &url, true).released);
+
+        chain
+            .lock()
+            .unwrap()
+            .txs
+            .insert(funding.compute_txid(), (funding.clone(), 0));
+        assert_eq!(settle(&wallet, &url, true), UnsentPass::default());
+        let key = coin.contract_tx.compute_txid().to_string();
+        assert!(wallet.read().unwrap().store.outgoing_swapcoins[&key].committed);
+        assert!(!wallet.read().unwrap().has_unsent_funding(SWAP));
+        // Recording it sends nothing: the refund pass takes it from here.
+        assert!(chain.lock().unwrap().broadcast.is_empty());
+    }
+
+    #[test]
+    fn unsent_funding_is_dropped_only_once_its_input_spend_confirms() {
+        let (parent, _, coin) = unsent_coin(3);
+        let conflict = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            40_000,
+            ScriptBuf::new(),
+        );
+        let chain = StubChain::with(&[(&parent, 50), (&conflict, 0)]);
+        let url = start_electrum_stub(chain.clone());
+        let temp_dir = tempdir().unwrap();
+        let wallet = unsent_wallet(&temp_dir.path().join("wallet.cbor"), &url, &[&coin]);
+
+        // A mempool spend may still be evicted: keep everything.
+        assert!(!settle(&wallet, &url, true).finished);
+        assert_eq!(coin_counts(&wallet), (1, 1, 0));
+
+        chain
+            .lock()
+            .unwrap()
+            .txs
+            .insert(conflict.compute_txid(), (conflict.clone(), 50));
+        let finished = UnsentPass {
+            finished: true,
+            ..UnsentPass::default()
+        };
+        assert_eq!(settle(&wallet, &url, true), finished);
+        assert_eq!(coin_counts(&wallet), (0, 0, 0));
+        assert!(chain.lock().unwrap().broadcast.is_empty());
+    }
+
+    #[test]
+    fn dead_unsent_split_leaves_the_rest_of_the_swap() {
+        let (parent, _, unsent) = unsent_coin(4);
+        let conflict = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            40_000,
+            ScriptBuf::new(),
+        );
+        let (_, _, mut sent) = unsent_coin(5);
+        sent.committed = true;
+        let chain = StubChain::with(&[(&parent, 50), (&conflict, 50)]);
+        let url = start_electrum_stub(chain.clone());
+        let temp_dir = tempdir().unwrap();
+        let wallet = unsent_wallet(
+            &temp_dir.path().join("wallet.cbor"),
+            &url,
+            &[&unsent, &sent],
+        );
+
+        assert_eq!(settle(&wallet, &url, false), UnsentPass::default());
+        assert_eq!(coin_counts(&wallet), (1, 1, 0));
+        let key = sent.contract_tx.compute_txid().to_string();
+        assert!(wallet
+            .read()
+            .unwrap()
+            .store
+            .outgoing_swapcoins
+            .contains_key(&key));
+    }
+
+    #[test]
+    fn failed_lookup_keeps_unsent_funding_reserved() {
+        let (parent, _, coin) = unsent_coin(6);
+        let chain = StubChain::with(&[(&parent, 50)]);
+        let url = start_electrum_stub(chain.clone());
+        let temp_dir = tempdir().unwrap();
+        let wallet = unsent_wallet(&temp_dir.path().join("wallet.cbor"), &url, &[&coin]);
+
+        chain
+            .lock()
+            .unwrap()
+            .fail_lookups
+            .insert(coin.contract_tx.compute_txid());
+        assert!(Wallet::settle_unsent_funding(&wallet, &electrum(&url), SWAP, true).is_err());
+        assert_eq!(coin_counts(&wallet), (1, 1, 1));
+    }
+
+    /// One coin's failed lookup must not cost another coin's proof that its
+    /// funding was seen: once that funding is evicted it would read as unsent.
+    #[test]
+    fn seen_funding_is_saved_even_when_another_lookup_fails() {
+        let (parent_a, funding_a, seen) = unsent_coin(7);
+        let (parent_b, _, failing) = unsent_coin(8);
+        let chain = StubChain::with(&[(&parent_a, 50), (&parent_b, 50), (&funding_a, 0)]);
+        chain
+            .lock()
+            .unwrap()
+            .fail_lookups
+            .insert(failing.contract_tx.compute_txid());
+        let url = start_electrum_stub(chain.clone());
+        let temp_dir = tempdir().unwrap();
+        let wallet = unsent_wallet(
+            &temp_dir.path().join("wallet.cbor"),
+            &url,
+            &[&seen, &failing],
+        );
+
+        assert!(Wallet::settle_unsent_funding(&wallet, &electrum(&url), SWAP, true).is_err());
+        let key = seen.contract_tx.compute_txid().to_string();
+        assert!(wallet.read().unwrap().store.outgoing_swapcoins[&key].committed);
+        // Nothing is freed while a lookup fails.
+        assert_eq!(coin_counts(&wallet), (1, 2, 2));
+
+        // The seen funding is evicted and the backend recovers: the failing
+        // coin's inputs are freed, the committed one's stay reserved.
+        {
+            let mut chain = chain.lock().unwrap();
+            chain.txs.remove(&funding_a.compute_txid());
+            chain.fail_lookups.clear();
+        }
+        assert!(settle(&wallet, &url, true).released);
+        assert_eq!(coin_counts(&wallet), (1, 2, 1));
+        let held = OutPoint::new(parent_a.compute_txid(), 0);
+        assert!(wallet.read().unwrap().store.swap_locks[SWAP]
+            .outpoints
+            .contains(&held));
+    }
+
+    /// The batch is saved whole before its sends: a failed save leaves none
+    /// of it, so a later save cannot persist half a batch.
+    #[test]
+    fn funding_batch_saves_whole_or_not_at_all() {
+        let (parent, _, coin) = unsent_coin(9);
+        let url = start_electrum_stub(StubChain::with(&[(&parent, 50)]));
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet.cbor");
+        let mut wallet = stub_wallet(&path, electrum(&url));
+        wallet.save_to_disk().unwrap();
+        let incoming = incoming_coin();
+
+        // A directory at the destination forces the atomic replacement to fail.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(wallet
+            .save_funding_batch(std::slice::from_ref(&incoming), std::slice::from_ref(&coin))
+            .is_err());
+        assert_eq!(wallet.get_incoming_swapcoins_count(), 0);
+        assert_eq!(wallet.get_outgoing_swapcoins_count(), 0);
+
+        std::fs::remove_dir(&path).unwrap();
+        wallet
+            .save_funding_batch(std::slice::from_ref(&incoming), &[coin])
+            .unwrap();
+        let (store, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+        assert_eq!(store.incoming_swapcoins.len(), 1);
+        assert_eq!(store.outgoing_swapcoins.len(), 1);
+    }
+
+    /// Each funding send restarts the grace on disk: slow earlier sends, or
+    /// a claim made long before, must not let a restart free the inputs of a
+    /// send that may still be in flight.
+    #[test]
+    fn each_send_attempt_persists_a_fresh_grace_origin() {
+        let (parent, _, _) = unsent_coin(10);
+        let url = start_electrum_stub(StubChain::with(&[(&parent, 50)]));
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet.cbor");
+        let mut wallet = stub_wallet(&path, electrum(&url));
+        wallet.reserve_swap_locks(SWAP, &[OutPoint::new(parent.compute_txid(), 0)]);
+        wallet.store.swap_locks.get_mut(SWAP).unwrap().reserved_at = 1;
+        wallet.save_to_disk().unwrap();
+        let saved_at = || {
+            let (store, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.into())).unwrap();
+            store.swap_locks[SWAP].reserved_at
+        };
+
+        let before = now_secs();
+        wallet.restart_funding_grace(SWAP).unwrap();
+        let first = saved_at();
+        assert!(first >= before, "the first send restarts the grace on disk");
+
+        // Origins are whole seconds; wait for the next one.
+        thread::sleep(Duration::from_millis(1_100));
+        wallet.restart_funding_grace(SWAP).unwrap();
+        assert!(
+            saved_at() > first,
+            "each later send moves the origin forward"
+        );
+    }
+
     #[test]
     fn compat_incoming_claim_report_and_removal_save_together() {
         for role in [SwapRole::Maker, SwapRole::Taker] {
@@ -7882,6 +8380,7 @@ mod mempool_deferral_tests {
                 &|swap_id| claimed && swap_id == SWAP,
                 &|_| false,
                 &mut false,
+                false,
             )
             .unwrap();
             assert!(discarded.is_empty());

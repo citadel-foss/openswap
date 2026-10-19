@@ -22,7 +22,10 @@ use crate::{
     protocol::common_messages::{
         message_name, MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage, UnsupportedMessage,
     },
-    utill::{HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE},
+    utill::{
+        now_secs, HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE,
+        UNBROADCAST_DISCARD_GRACE,
+    },
     wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, SwapRole, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
@@ -1482,6 +1485,15 @@ fn recover_from_swap(
         }
         Ok(true)
     };
+    // The grace runs from the funding claim, so a restart does not reset it.
+    // With no claim left there is nothing to release, only coins to watch.
+    let grace_from = lock_debug!(maker.wallet.read())
+        .map_err(|_| MakerError::General("Failed to lock wallet"))?
+        .store
+        .swap_locks
+        .get(&swap_id)
+        .map_or_else(now_secs, |locks| locks.reserved_at);
+    let mut grace_logged = false;
     let mut watchtower_down_logged = false;
     let mut last_block = None;
     let mut last_preimages_known = None;
@@ -1611,32 +1623,66 @@ fn recover_from_swap(
             return Ok(());
         }
 
-        // A committed batch can still confirm after its mempool view disappears.
-        // Only coins saved before the write-ahead commitment are never funded.
-        {
-            let mut wallet = lock_debug!(maker.wallet.write())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-            let keys = wallet.outgoing_keys_for_swap(&swap_id);
-            let uncommitted = !keys.is_empty() && !wallet.swap_funding_committed(&swap_id);
-            if uncommitted {
-                log::info!(
-                    "[{}] Funding was never committed for swap {} — nothing to recover. Discarding swapcoins.",
-                    maker.config.network_port,
-                    swap_id
-                );
-                let saved = wallet.remove_swap_coins_and_save(&swap_id, true, true);
-                drop(wallet);
-                if let Err(error) = saved {
-                    log::warn!("Cannot save cleanup for swap {swap_id}: {error:?}; retrying");
-                    last_block = None;
-                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
-                        break;
+        // Uncommitted coins: funding never sent, or its send failed. Their keys
+        // stay, since that funding may still confirm; past the grace only their
+        // inputs go back to the wallet. Once per block, and nothing is sent.
+        let has_unsent = lock_debug!(maker.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .has_unsent_funding(&swap_id);
+        if new_block && has_unsent {
+            let age = now_secs().saturating_sub(grace_from);
+            let grace_over = age >= UNBROADCAST_DISCARD_GRACE.as_secs();
+            let pass = held
+                .take()
+                .map_or_else(|| maker.backend.connect(), Ok)
+                .and_then(|chain| {
+                    let pass = if tip_refreshed {
+                        Ok(())
+                    } else {
+                        chain.get_block_count().map(|_| tip_refreshed = true)
                     }
-                    continue;
+                    .and_then(|()| {
+                        Wallet::settle_unsent_funding(&maker.wallet, &chain, &swap_id, grace_over)
+                    });
+                    held = Some(chain);
+                    pass
+                });
+            match pass {
+                Ok(pass) if pass.finished => {
+                    log::info!(
+                        "[{}] Swap {} is settled: its unsent funding can never confirm",
+                        maker.config.network_port,
+                        swap_id
+                    );
+                    #[cfg(feature = "integration-test")]
+                    maker.shutdown.store(true, Relaxed);
+                    return Ok(());
                 }
-                #[cfg(feature = "integration-test")]
-                maker.shutdown.store(true, Relaxed);
-                return Ok(());
+                Ok(pass) => {
+                    if pass.waiting && !grace_logged {
+                        grace_logged = true;
+                        log::info!(
+                            "[{}] Swap {} shows no funding broadcast after {}s; keeping it until {}s",
+                            maker.config.network_port,
+                            swap_id,
+                            age,
+                            UNBROADCAST_DISCARD_GRACE.as_secs()
+                        );
+                    }
+                    if pass.released {
+                        log::info!(
+                            "[{}] Funding was never broadcast for swap {} — released its inputs, keeping swap data until they are spent elsewhere",
+                            maker.config.network_port,
+                            swap_id
+                        );
+                    }
+                }
+                Err(e) => log::warn!(
+                    "[{}] Could not check unsent funding for swap {}: {:?}; keeping it",
+                    maker.config.network_port,
+                    swap_id,
+                    e
+                ),
             }
         }
 

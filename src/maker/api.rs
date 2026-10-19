@@ -1834,6 +1834,20 @@ impl MakerServer {
             .collect())
     }
 
+    /// The stored Legacy funding txs of `swap_id`, so a test can publish one
+    /// the maker never sent.
+    #[cfg(feature = "integration-test")]
+    pub fn outgoing_funding_txs(&self, swap_id: &str) -> Result<Vec<Transaction>, MakerError> {
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        let (_, outgoing) = wallet.find_unfinished_swapcoins();
+        Ok(outgoing
+            .into_iter()
+            .filter(|coin| coin.swap_id.as_deref() == Some(swap_id))
+            .filter_map(|coin| coin.funding_tx)
+            .collect())
+    }
+
     /// Verify the deniability proof for a specific swap.
     pub fn verify_deniability(&self, swap_id: &str) -> Result<bool, std::io::Error> {
         lock_debug!(self.wallet.read())
@@ -2690,6 +2704,24 @@ impl MakerTrait for MakerServer {
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
         wallet.add_outgoing_swapcoin(swapcoin);
         wallet.save_to_disk().map_err(MakerError::Wallet)
+    }
+
+    fn save_funding_batch(
+        &self,
+        incoming: &[crate::wallet::swapcoin::IncomingSwapCoin],
+        outgoing: &[crate::wallet::swapcoin::OutgoingSwapCoin],
+    ) -> Result<(), MakerError> {
+        lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .save_funding_batch(incoming, outgoing)
+            .map_err(MakerError::Wallet)
+    }
+
+    fn restart_funding_grace(&self, swap_id: &str) -> Result<(), MakerError> {
+        lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .restart_funding_grace(swap_id)
+            .map_err(MakerError::Wallet)
     }
 
     fn register_watch_outpoint(

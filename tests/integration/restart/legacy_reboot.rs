@@ -9,7 +9,7 @@
 //! 3. Maker2 closes at hash preimage / private key handover.
 //! 4. Maker2 is restarted before idle recovery runs.
 //! 5. Startup recovery must not discard the persisted swapcoins: they were
-//!    saved as committed before the funding broadcast.
+//!    committed once the funding send was accepted.
 
 use bitcoin::Amount;
 use openswap::{maker::MakerServer, protocol::common_messages::ProtocolVersion, taker::SwapParams};

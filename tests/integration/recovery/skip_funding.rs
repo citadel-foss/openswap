@@ -19,12 +19,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// An uncommitted swap can be discarded without an absence-based grace period.
-fn assert_uncommitted_discard(log_path: &str, swap_id: &str) {
-    assert_log!(log_path; {
-        has format!("Funding was never committed for swap {swap_id}"),
-        lacks format!("Swap {swap_id} shows no funding broadcast after"),
-    });
+/// Maker2 never sent its funding. Past the grace its inputs are the wallet's
+/// again, while it keeps the swap's keys in case that funding still lands.
+/// It watches them for good, so it is stopped here.
+fn assert_unsent_released(world: &mut World, swap_id: &str) {
+    wait_for_release(&world.taker_log_path(), swap_id);
+    world.shutdown_maker(1);
+    let victim = world.makers()[1].inner();
+    assert_eq!(
+        victim.reserved_inputs().unwrap(),
+        0,
+        "Maker2 must free the inputs of its unsent funding"
+    );
+    assert!(
+        victim.has_unfinished_outgoing_swapcoin(swap_id).unwrap(),
+        "Maker2 must keep its unsent swap's keys"
+    );
 }
 
 /// The balances a timelock-only recovery settles at. Losses are measured from
@@ -152,28 +162,11 @@ pub(crate) fn run_legacy_timelock_only_recovery(
 
     // Recovery waits out the 30s maker idle timeout (test builds), the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-    // 135s at 5 blocks/3s; 300s bounds the wait.
-    info!("Waiting for the uncommitted discard and the makers' timelock recovery...");
-    wait_logged!(
-        world,
-        &format!("Funding was never committed for swap {}", summary.swap_id),
-        Duration::from_secs(300)
-    );
-
-    // The deliberately uncommitted funding is discarded immediately.
-    assert_uncommitted_discard(&world.taker_log_path(), &summary.swap_id);
-    // Maker2 stops itself once it has discarded the swap; let every maker
-    // finish before syncing one, or the sync races that shutdown.
+    // 135s at 5 blocks/3s, and the unbroadcast grace before Maker2 frees its inputs.
+    info!("Waiting for the grace release and the makers' timelock recovery...");
+    assert_unsent_released(world, &summary.swap_id);
+    // Maker1 stops itself once recovered; let it finish before syncing.
     world.wait_makers_settled(Duration::from_secs(300));
-    world.makers()[1].sync();
-    let victim_after = {
-        let wallet = world.makers()[1].inner().wallet.read().unwrap();
-        wallet.get_outgoing_swapcoins_count() + wallet.get_incoming_swapcoins_count()
-    };
-    assert_eq!(
-        victim_after, 0,
-        "Maker2 must release its uncommitted swapcoins"
-    );
 
     // Every maker recovered its contracts
     world.sync_makers();
@@ -298,28 +291,11 @@ fn run_taproot_timelock_only_recovery(
 
     // Recovery waits out the 30s maker idle timeout (test builds), the 225-block
     // outer-hop timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers), about
-    // 135s at 5 blocks/3s; 300s bounds the wait.
-    info!("Waiting for the uncommitted discard and the makers' timelock recovery...");
-    wait_logged!(
-        world,
-        &format!("Funding was never committed for swap {}", summary.swap_id),
-        Duration::from_secs(300)
-    );
-
-    // The skipped batch is uncommitted and can be discarded immediately.
-    assert_uncommitted_discard(&world.taker_log_path(), &summary.swap_id);
-    // Maker2 stops itself once it has discarded the swap; let every maker
-    // finish before syncing one, or the sync races that shutdown.
+    // 135s at 5 blocks/3s, and the unbroadcast grace before Maker2 frees its inputs.
+    info!("Waiting for the grace release and the makers' timelock recovery...");
+    assert_unsent_released(world, &summary.swap_id);
+    // Maker1 stops itself once recovered; let it finish before syncing.
     world.wait_makers_settled(Duration::from_secs(300));
-    world.makers()[1].sync();
-    let victim_after = {
-        let wallet = world.makers()[1].inner().wallet.read().unwrap();
-        wallet.get_outgoing_swapcoins_count() + wallet.get_incoming_swapcoins_count()
-    };
-    assert_eq!(
-        victim_after, 0,
-        "Maker2 must release its uncommitted swapcoins"
-    );
 
     // Every maker recovered its contracts
     world.sync_makers();
@@ -407,6 +383,7 @@ fn run_withheld_funding_bans_its_maker(world: &mut World, params: SwapParams) {
 /// A refund settles the swap one way. The last maker publishes the taker's
 /// incoming contract only after the taker refunded its outgoing: sweeping it
 /// now would reveal the preimage and take both sides, so no sweep may follow.
+/// That maker kept its keys and would refund them, so it is stopped first.
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal, WithholdFundingSilently],
@@ -423,7 +400,7 @@ fn late_incoming_after_refund_is_never_swept(world: &mut World, params: SwapPara
         .expect("Prepare should succeed");
 
     // The last maker's withheld contracts are the taker's incoming side. Grab
-    // them mid-swap: its recovery drops them once the swap fails.
+    // them mid-swap, as the taker sees them.
     let withheld = {
         let (maker, swap_id) = (world.makers()[1].inner().clone(), summary.swap_id.clone());
         let deadline = Instant::now() + Duration::from_secs(300);
@@ -459,6 +436,11 @@ fn late_incoming_after_refund_is_never_swept(world: &mut World, params: SwapPara
             .get_outgoing_swapcoins_count()
             == 0
     );
+
+    // The last maker kept its keys and would refund the published contracts
+    // itself, spending them before the taker's passes could prove anything.
+    // Stop it, so only the taker can touch them.
+    world.shutdown_maker(1);
 
     info!("Taker refunded; publishing the withheld incoming contracts");
     for tx in &withheld {

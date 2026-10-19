@@ -478,7 +478,7 @@ fn process_taproot_contract<M: Maker>(
                 maker.network_port()
             );
             // The unrecorded variant leaves the coins uncommitted, so recovery
-            // sees the swap as never funded and discards it.
+            // frees their inputs after the grace and keeps watching them.
             if maker.behavior() == MakerBehavior::SkipFundingBroadcast {
                 state.funding_broadcast_txids = outgoing_swapcoins
                     .iter()
@@ -518,11 +518,8 @@ fn process_taproot_contract<M: Maker>(
     // needs these records for timelock recovery after a restart. The first
     // coin is committed before its send: from here the swap goes to recovery,
     // never to discard. Each other coin is committed once its own send is
-    // accepted; recovery drops one whose send failed unless the backend has
-    // seen it.
-    for incoming in &incoming_swapcoins {
-        maker.save_incoming_swapcoin(incoming)?;
-    }
+    // accepted; recovery frees the inputs of one whose send failed after a
+    // grace, unless the backend has seen it.
     // A withholding maker never sends, so its recovery must not send either.
     #[cfg(feature = "integration-test")]
     let commit = maker.behavior() != MakerBehavior::WithholdFundingSilently;
@@ -530,11 +527,13 @@ fn process_taproot_contract<M: Maker>(
     let commit = true;
     for (index, outgoing) in outgoing_swapcoins.iter_mut().enumerate() {
         outgoing.committed = commit && index == 0;
-        maker.save_outgoing_swapcoin(outgoing)?;
     }
+    maker.save_funding_batch(&incoming_swapcoins, &outgoing_swapcoins)?;
     state.outgoing_swapcoins = outgoing_swapcoins.clone();
 
     for (index, outgoing) in outgoing_swapcoins.iter().enumerate() {
+        // A crash during this send must not free its inputs at once.
+        maker.restart_funding_grace(&data.id)?;
         // QA: a mid-batch failure must leave the earlier sends recorded, or
         // recovery discards contract txs already on the wire. Inert for
         // single-tx batches.

@@ -138,6 +138,11 @@ pub enum MakerBehavior {
     /// Fail the batch's second funding broadcast so the first tx is on-chain
     /// while the handler errors; exercises partial-batch recovery.
     FailSecondBroadcast,
+    /// Fail the batch's first Legacy funding send with nothing sent.
+    FailFirstBroadcast,
+    /// Send the first Legacy funding tx, then report the send as failed, as a
+    /// lost backend reply would.
+    BroadcastThenFailFirst,
     /// Build funding splits at the relay floor while the taker reimburses the
     /// negotiated rate (funding-fee underpayment rejection tests).
     UnderpayFundingFee,
@@ -521,6 +526,17 @@ pub trait Maker: Send + Sync {
 
     /// Save outgoing swapcoin to wallet.
     fn save_outgoing_swapcoin(&self, swapcoin: &OutgoingSwapCoin) -> Result<(), MakerError>;
+
+    /// Save a funding batch's swapcoins in one write, before its sends.
+    fn save_funding_batch(
+        &self,
+        incoming: &[IncomingSwapCoin],
+        outgoing: &[OutgoingSwapCoin],
+    ) -> Result<(), MakerError>;
+
+    /// Persist a fresh unbroadcast grace for `swap_id` just before one of its
+    /// funding sends, so the grace counts from the last send attempt.
+    fn restart_funding_grace(&self, swap_id: &str) -> Result<(), MakerError>;
 
     /// Register outpoint for watching. Errs if the watcher is gone; a swap
     /// without breach detection must not proceed, so callers abort on failure.

@@ -257,7 +257,8 @@ fn decodable_cache_entries<'de, D: Deserializer<'de>>(
         .collect())
 }
 
-/// Inputs one swap holds out of coin selection, and when it took them.
+/// Inputs one swap holds out of coin selection, and when it took them or
+/// last tried to send its funding: the unbroadcast grace counts from there.
 /// Persisted so a restart inside the grace still honours the reservation:
 /// a funding broadcast can still arrive for a swap the process forgot.
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]

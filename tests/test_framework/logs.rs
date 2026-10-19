@@ -116,6 +116,30 @@ pub(crate) fn wait_for_log(log_path: &str, expected: &str, timeout: Duration) {
     }
 }
 
+/// The line a maker logs once the grace frees a never-sent swap's inputs.
+pub(crate) fn release_line(swap_id: &str) -> String {
+    format!("Funding was never broadcast for swap {swap_id} — released its inputs")
+}
+
+/// Waits out the unbroadcast grace for `swap_id`, then checks the grace was
+/// logged before the release.
+#[track_caller]
+pub(crate) fn wait_for_release(log_path: &str, swap_id: &str) {
+    wait_for_log(
+        log_path,
+        &release_line(swap_id),
+        openswap::utill::UNBROADCAST_DISCARD_GRACE + Duration::from_secs(60),
+    );
+    assert_log(
+        &log_path,
+        None,
+        &[LogCheck::Order(vec![
+            format!("Swap {swap_id} shows no funding broadcast after"),
+            release_line(swap_id),
+        ])],
+    );
+}
+
 /// Like [`wait_for_log`], but only matches content appended after this call.
 /// Use when the needle can already sit in the file from an earlier phase
 /// (fidelity-setup sightings look identical to swap-funding sightings).
