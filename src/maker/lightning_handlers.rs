@@ -1574,6 +1574,15 @@ fn watchdog_resolve_swap_out(
         log::warn!("swap-out {swap_id}: watch request failed: {e:?}");
         MakerError::General("watch request failed")
     })?;
+    #[cfg(feature = "integration-test")]
+    let answer = if HIDE_HTLC_SPENDS.load(std::sync::atomic::Ordering::SeqCst) {
+        crate::watch_tower::watcher::WatcherEvent::UtxoSpent {
+            outpoint,
+            spending_tx: None,
+        }
+    } else {
+        answer
+    };
     match HtlcWatch::from_answer(answer)? {
         HtlcWatch::Spent(spending_tx) => {
             let spk = swap.htlc.script_pubkey().map_err(|e| {
@@ -1654,8 +1663,21 @@ fn watchdog_resolve_swap_out(
                 .funding_height
                 .map(|h| current >= h.saturating_add(swap.locktime as u32))
                 .unwrap_or(false);
-            if !refundable {
-                return Ok(());
+            let unspent_on_chain = || {
+                maker
+                    .htlc_unspent_and_age(&outpoint)
+                    .map(|(unspent, _)| unspent)
+            };
+            match UnspentHtlc::decide(refundable, unspent_on_chain)? {
+                UnspentHtlc::Wait => return Ok(()),
+                UnspentHtlc::SpentUnseen => {
+                    log::warn!(
+                        "Swap-out {swap_id}: HTLC is spent on chain but the watcher has no \
+                         spend on record; waiting for it instead of refunding"
+                    );
+                    return Ok(());
+                }
+                UnspentHtlc::Refund => {}
             }
             let mut swap = swap.clone();
             let destination = payout_script(maker, swap_id, &mut swap)?;
@@ -1705,6 +1727,13 @@ fn watchdog_resolve_swap_out(
 pub static INTERRUPT_REFUND: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Makes the watchdog read every swap-out HTLC as watched with no spend on
+/// record, as the watcher answers while a Core re-check after lost
+/// notifications is still pending. Set by tests.
+#[cfg(feature = "integration-test")]
+pub static HIDE_HTLC_SPENDS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether `spend` is the refund this swap built. Lacking the preimage
 /// does not make a spend ours; only the persisted refund txid does.
 fn is_our_refund(swap: &LnMakerSwap, spend: &bitcoin::Transaction) -> bool {
@@ -1722,9 +1751,42 @@ enum HtlcWatch {
     Unwatched,
 }
 
+/// What the watchdog may do with a swap-out HTLC the watcher reports unspent.
+#[derive(Debug, PartialEq)]
+enum UnspentHtlc {
+    /// The CSV window has not passed yet.
+    Wait,
+    /// The chain has a spend the watcher has not recorded yet.
+    SpentUnseen,
+    /// Unspent on chain, mempool included, past the CSV window.
+    Refund,
+}
+
+impl UnspentHtlc {
+    /// The watcher's "no spend" is not authoritative: it also answers that
+    /// while a Core re-check after lost notifications is still pending
+    /// (#1176). The refund cannot be undone, so it waits for the chain to say
+    /// the output is still unspent. The chain is read only once the CSV
+    /// window has passed, and a failed read is an error, never "unspent".
+    fn decide(
+        refundable: bool,
+        unspent_on_chain: impl FnOnce() -> Result<bool, MakerError>,
+    ) -> Result<Self, MakerError> {
+        if !refundable {
+            return Ok(Self::Wait);
+        }
+        Ok(if unspent_on_chain()? {
+            Self::Refund
+        } else {
+            Self::SpentUnseen
+        })
+    }
+}
+
 impl HtlcWatch {
     /// `UtxoSpent` names the spend whenever one is on record, so one without
-    /// it is unspent. An answer the watcher could not give is an error.
+    /// it is unspent as far as the watcher knows; the refund still asks the
+    /// chain (`UnspentHtlc`). An answer the watcher could not give is an error.
     fn from_answer(answer: crate::watch_tower::watcher::WatcherEvent) -> Result<Self, MakerError> {
         use crate::watch_tower::watcher::WatcherEvent;
         match answer {
@@ -1793,6 +1855,47 @@ mod tests {
         // Refunding on an answer the watcher could not give would race a
         // claim it never saw.
         assert!(HtlcWatch::from_answer(WatcherEvent::Error("not subscribed".into())).is_err());
+    }
+
+    /// Past the CSV window, a refund goes out only if the chain still has the
+    /// HTLC unspent. The watcher's "no spend" can be an unfinished re-check,
+    /// and a chain that cannot answer is no answer either.
+    #[test]
+    fn refund_waits_for_the_chain_to_say_unspent() {
+        let unread = || -> Result<bool, MakerError> { panic!("chain read before the CSV passed") };
+        assert_eq!(
+            UnspentHtlc::decide(false, unread).unwrap(),
+            UnspentHtlc::Wait
+        );
+        assert_eq!(
+            UnspentHtlc::decide(true, || Ok(true)).unwrap(),
+            UnspentHtlc::Refund
+        );
+        assert_eq!(
+            UnspentHtlc::decide(true, || Ok(false)).unwrap(),
+            UnspentHtlc::SpentUnseen
+        );
+        assert!(UnspentHtlc::decide(true, || Err(MakerError::General("rpc down"))).is_err());
+    }
+
+    /// A spend on record is served as spent; the chain check never sees it.
+    #[test]
+    fn recorded_spend_stays_spent() {
+        use crate::watch_tower::watcher::WatcherEvent;
+        let spend = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        assert_eq!(
+            HtlcWatch::from_answer(WatcherEvent::UtxoSpent {
+                outpoint: bitcoin::OutPoint::null(),
+                spending_tx: Some(spend.clone()),
+            })
+            .unwrap(),
+            HtlcWatch::Spent(spend)
+        );
     }
 
     /// Only the refund whose txid the swap recorded is ours to send again.
