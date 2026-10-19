@@ -721,9 +721,19 @@ impl Wallet {
     ) -> Result<(), WalletError> {
         let mut password = password.map(Zeroizing::new);
         if path.exists() {
-            // Check a given passphrase now, not on the next start.
-            if let Some(p) = password.as_mut().filter(|p| !p.is_empty()) {
-                Self::read_store(path, Some(std::mem::take(&mut **p))).map_err(|e| {
+            // Check a given passphrase now, not on the next start. An older
+            // file upgrades on that read, so only under the exclusive lock.
+            if let Some(p) = password.as_ref().filter(|p| !p.is_empty()) {
+                let check = || -> Result<(), WalletError> {
+                    if WalletStore::read_without_upgrade(path, Some(p.to_string()))?.is_none() {
+                        let Some(_owner) = WalletInUse::exclusive_if_idle(path)? else {
+                            return Err(WalletError::General(IN_USE_MESSAGE.to_string()));
+                        };
+                        WalletStore::read_from_disk(path, Some(p.to_string()))?;
+                    }
+                    Ok(())
+                };
+                check().map_err(|e| {
                     WalletError::General(format!(
                         "wallet {path:?} already exists and could not be opened \
                          with the given passphrase: {e}"
@@ -5614,6 +5624,72 @@ mod restore_history_probe_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("already exists"), "{}", err);
+    }
+
+    /// The passphrase check of `init-wallet` upgrades an older file only
+    /// when no process holds the wallet, and never on a wrong passphrase.
+    #[test]
+    fn init_interactive_upgrades_an_older_wallet_only_when_idle() {
+        let temp_dir = tempdir().unwrap();
+        let backend = BackendConfig::Electrum(electrum_config("tcp://127.0.0.1:1".to_string()));
+
+        let v023 = temp_dir.path().join("closed.wallet");
+        let v023_source = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed.wallet");
+        std::fs::write(&v023, v023_source).unwrap();
+
+        let unmarked = temp_dir.path().join("unmarked");
+        let material = KeyMaterial::new_from_password(Some("right".to_string())).unwrap();
+        let master = Xpriv::new_master(bitcoin::Network::Regtest, &MASTER_SEED).unwrap();
+        WalletStore::init(
+            "unmarked".to_string(),
+            &unmarked,
+            bitcoin::Network::Regtest,
+            master,
+            None,
+            None,
+            &material,
+        )
+        .unwrap();
+        let (store, material) =
+            WalletStore::read_from_disk(&unmarked, Some("right".to_string())).unwrap();
+        let unmarked_source = serde_cbor::to_vec(
+            &crate::security::encrypt_struct_v2(&store, &material, Vec::new()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&unmarked, &unmarked_source).unwrap();
+
+        for (path, source, password, suffix) in [
+            (&v023, &v023_source[..], "compat-v023", ".v023"),
+            (&unmarked, &unmarked_source[..], "right", ".v2pre"),
+        ] {
+            let mut archive = path.as_os_str().to_os_string();
+            archive.push(suffix);
+            let archive = std::path::PathBuf::from(archive);
+
+            let holder = WalletInUse::shared(path).unwrap();
+            let err = Wallet::init_interactive(path, &backend, Some(password.to_string()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(IN_USE_MESSAGE), "{}", err);
+            assert_eq!(std::fs::read(path).unwrap(), source);
+            assert!(!archive.exists());
+            drop(holder);
+
+            let err = Wallet::init_interactive(path, &backend, Some("wrong".to_string()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("already exists"), "{}", err);
+            assert_eq!(std::fs::read(path).unwrap(), source);
+            assert!(!archive.exists());
+
+            Wallet::init_interactive(path, &backend, Some(password.to_string())).unwrap();
+            assert_eq!(std::fs::read(&archive).unwrap(), source);
+            assert!(
+                WalletStore::read_without_upgrade(path, Some(password.to_string()))
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     /// The phrase alone must give the key and, with a wide enough gap, the
