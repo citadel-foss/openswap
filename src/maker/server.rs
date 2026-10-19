@@ -1128,7 +1128,8 @@ const MIN_WITNESS_ITEM_FOR_HASHLOCK: usize = 2;
 const PREIMAGE_LEN: usize = 32;
 
 /// The spend the watcher holds for `outpoint`. An answer the watcher could
-/// not give is an error, never "unspent".
+/// not give is an error, never "unspent", and so is a watch it does not
+/// have: every contract output is watched until its swap is finished.
 fn watched_spend(
     watch_service: &crate::watch_tower::service::WatchService,
     outpoint: OutPoint,
@@ -1138,7 +1139,12 @@ fn watched_spend(
         MakerError::General("watchtower query failed")
     })? {
         crate::watch_tower::watcher::WatcherEvent::UtxoSpent { spending_tx, .. } => Ok(spending_tx),
-        _ => Ok(None),
+        other => {
+            log::warn!("watch request for {outpoint} has no answer: {other:?}");
+            Err(MakerError::General(
+                "watchtower has no watch for the contract",
+            ))
+        }
     }
 }
 
@@ -1161,38 +1167,39 @@ fn check_for_preimage(
 
     // Query the watch tower for spends on each outgoing contract output.
     for outgoing in outgoing_swapcoins {
+        // Only the contract output is watched; a Taproot contract can also
+        // carry change, which no preimage spend touches.
         let contract_txid = outgoing.contract_tx.compute_txid();
-        for (vout, _) in outgoing.contract_tx.output.iter().enumerate() {
-            let outpoint = bitcoin::OutPoint {
-                txid: contract_txid,
-                vout: vout as u32,
-            };
-            // Blocking on purpose: we need this pass's fresh answer before
-            // choosing timelock over hashlock — a stale miss refunds while a
-            // preimage spend already exists. A failed query aborts this pass;
-            // the recovery loop retries instead of refunding blind.
-            let spending_tx = match direct_chain.as_ref() {
-                Some(chain) => chain
-                    .spending_transaction(
-                        &outpoint,
-                        outgoing.contract_tx.output[vout].script_pubkey.as_script(),
-                        None,
-                    )
-                    .map_err(MakerError::Wallet)?,
-                None => watched_spend(&maker.watch_service, outpoint)?,
-            };
+        let vout = outgoing.get_contract_output_vout() as usize;
+        let outpoint = bitcoin::OutPoint {
+            txid: contract_txid,
+            vout: vout as u32,
+        };
+        // Blocking on purpose: we need this pass's fresh answer before
+        // choosing timelock over hashlock — a stale miss refunds while a
+        // preimage spend already exists. A failed query aborts this pass;
+        // the recovery loop retries instead of refunding blind.
+        let spending_tx = match direct_chain.as_ref() {
+            Some(chain) => chain
+                .spending_transaction(
+                    &outpoint,
+                    outgoing.contract_tx.output[vout].script_pubkey.as_script(),
+                    None,
+                )
+                .map_err(MakerError::Wallet)?,
+            None => watched_spend(&maker.watch_service, outpoint)?,
+        };
 
-            if let Some(spending_tx) = spending_tx {
-                // Extract preimages from the spending transaction's witnesses.
-                for input in &spending_tx.input {
-                    let op = (input.previous_output.txid, input.previous_output.vout);
-                    if seen_outpoints.insert(op)
-                        && input.witness.len() >= MIN_WITNESS_ITEM_FOR_HASHLOCK
-                        && input.witness[1].len() == PREIMAGE_LEN
-                    {
-                        if let Ok(preimage) = <[u8; 32]>::try_from(&input.witness[1][..]) {
-                            preimages.push(preimage);
-                        }
+        if let Some(spending_tx) = spending_tx {
+            // Extract preimages from the spending transaction's witnesses.
+            for input in &spending_tx.input {
+                let op = (input.previous_output.txid, input.previous_output.vout);
+                if seen_outpoints.insert(op)
+                    && input.witness.len() >= MIN_WITNESS_ITEM_FOR_HASHLOCK
+                    && input.witness[1].len() == PREIMAGE_LEN
+                {
+                    if let Ok(preimage) = <[u8; 32]>::try_from(&input.witness[1][..]) {
+                        preimages.push(preimage);
                     }
                 }
             }
@@ -2281,9 +2288,15 @@ mod tests {
     #[test]
     fn preimage_check_stops_on_an_unknown_answer() {
         let outpoint = OutPoint::new(Txid::all_zeros(), 0);
-        let service = answering(WatcherEvent::Error("not subscribed".to_string()));
-        assert!(watched_spend(&service, outpoint).is_err());
-        service.shutdown();
+        // A watch the watcher does not have is no answer either.
+        for answer in [
+            WatcherEvent::Error("not subscribed".to_string()),
+            WatcherEvent::NoOutpoint,
+        ] {
+            let service = answering(answer.clone());
+            assert!(watched_spend(&service, outpoint).is_err(), "{:?}", answer);
+            service.shutdown();
+        }
 
         let claim = bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
