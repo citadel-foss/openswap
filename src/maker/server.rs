@@ -1659,6 +1659,12 @@ fn recover_from_swap(
                     return Ok(());
                 }
                 Ok(pass) => {
+                    log::info!(
+                        "[{}] Swap {} checked its unsent funding at height {}",
+                        maker.config.network_port,
+                        swap_id,
+                        current_height
+                    );
                     if pass.waiting && !grace_logged {
                         grace_logged = true;
                         log::info!(

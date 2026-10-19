@@ -1016,7 +1016,7 @@ impl Wallet {
     }
 
     /// Outgoing swap coins of `swap_id` recorded as funded: one per accepted
-    /// or seen funding send, plus Taproot's first coin, committed before its send.
+    /// or seen funding send, plus the taker's first coin, committed before its send.
     #[cfg(feature = "integration-test")]
     pub fn committed_outgoing_swapcoins_count(&self, swap_id: &str) -> usize {
         self.store

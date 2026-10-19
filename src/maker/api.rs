@@ -1834,8 +1834,8 @@ impl MakerServer {
             .collect())
     }
 
-    /// The stored Legacy funding txs of `swap_id`, so a test can publish one
-    /// the maker never sent.
+    /// The stored funding txs of `swap_id`, so a test can publish one the
+    /// maker never sent. A Taproot contract tx is its own funding.
     #[cfg(feature = "integration-test")]
     pub fn outgoing_funding_txs(&self, swap_id: &str) -> Result<Vec<Transaction>, MakerError> {
         let wallet = lock_debug!(self.wallet.read())
@@ -1844,7 +1844,10 @@ impl MakerServer {
         Ok(outgoing
             .into_iter()
             .filter(|coin| coin.swap_id.as_deref() == Some(swap_id))
-            .filter_map(|coin| coin.funding_tx)
+            .filter_map(|coin| match coin.protocol {
+                ProtocolVersion::Taproot => Some(coin.contract_tx),
+                ProtocolVersion::Legacy => coin.funding_tx,
+            })
             .collect())
     }
 

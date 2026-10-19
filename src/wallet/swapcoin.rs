@@ -905,11 +905,10 @@ pub struct OutgoingSwapCoin {
     /// Negotiated swap feerate (sats/vB) at creation.
     #[serde(default = "default_negotiated_feerate")]
     pub negotiated_feerate: u64,
-    /// Saved `true` for the batch's first coin before its funding send, and
-    /// for each other coin once its own send is accepted; never set back. A
-    /// committed coin's funding may be on the network, so it is never
-    /// discarded for looking unsent. An uncommitted one is kept only while
-    /// the backend knows its funding. Missing reads as `true`, the safe answer.
+    /// Saved `true` once the coin's funding send is accepted or seen (the
+    /// taker also sets it on its first coin before sending); never set back.
+    /// A committed coin's funding may be on the network, so it is never
+    /// discarded for looking unsent. Missing reads as `true`, the safe answer.
     #[serde(default = "yes")]
     pub committed: bool,
     /// Saved `true` with the sweep of this swap's incoming coin, and never set

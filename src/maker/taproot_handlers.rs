@@ -515,21 +515,11 @@ fn process_taproot_contract<M: Maker>(
 
     // Persist swapcoins before broadcasting contract txs. A later broadcast
     // failure can leave earlier Taproot contract txs on-chain, and the wallet
-    // needs these records for timelock recovery after a restart. The first
-    // coin is committed before its send: from here the swap goes to recovery,
-    // never to discard. Each other coin is committed once its own send is
-    // accepted; recovery frees the inputs of one whose send failed after a
-    // grace, unless the backend has seen it.
-    // A withholding maker never sends, so its recovery must not send either.
-    #[cfg(feature = "integration-test")]
-    let commit = maker.behavior() != MakerBehavior::WithholdFundingSilently;
-    #[cfg(not(feature = "integration-test"))]
-    let commit = true;
-    for (index, outgoing) in outgoing_swapcoins.iter_mut().enumerate() {
-        outgoing.committed = commit && index == 0;
-    }
+    // needs these records for timelock recovery after a restart. Each coin is
+    // committed only once its own send is accepted. Recovery never sends an
+    // uncommitted coin: it keeps it, and frees its inputs after a grace unless
+    // the backend has seen it.
     maker.save_funding_batch(&incoming_swapcoins, &outgoing_swapcoins)?;
-    state.outgoing_swapcoins = outgoing_swapcoins.clone();
 
     for (index, outgoing) in outgoing_swapcoins.iter().enumerate() {
         // A crash during this send must not free its inputs at once.
@@ -549,6 +539,24 @@ fn process_taproot_contract<M: Maker>(
                     message: "Test: second funding broadcast rejected".to_string(),
                     data: None,
                 })),
+            )));
+        }
+        #[cfg(feature = "integration-test")]
+        if index == 0
+            && matches!(
+                maker.behavior(),
+                MakerBehavior::FailFirstBroadcast | MakerBehavior::BroadcastThenFailFirst
+            )
+        {
+            if maker.behavior() == MakerBehavior::BroadcastThenFailFirst {
+                maker.broadcast_transaction(&outgoing.contract_tx)?;
+            }
+            log::warn!(
+                "[{}] Test behavior: failing the first Taproot funding broadcast",
+                maker.network_port()
+            );
+            return Err(MakerError::Wallet(WalletError::General(
+                "Test: failing the first funding broadcast".to_string(),
             )));
         }
         let txid = outgoing.contract_tx.compute_txid();

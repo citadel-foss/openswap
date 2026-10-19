@@ -450,8 +450,8 @@ fn maker_refuses_unfinished_swap_id_after_restart(world: &mut World) {
     restarted_thread.join().unwrap();
 }
 
-/// Runs a Legacy swap whose single maker fails its first funding send, and
-/// returns the swap id with the funding txs the maker stored.
+/// Runs a swap whose single maker fails its first funding send, and returns
+/// the swap id with the funding txs the maker stored.
 fn fail_first_send(world: &mut World, params: SwapParams) -> (String, Vec<Transaction>) {
     let summary = world
         .taker_mut()
@@ -462,7 +462,7 @@ fn fail_first_send(world: &mut World, params: SwapParams) -> (String, Vec<Transa
         world.taker_mut().start(&swap_id).is_err(),
         "the swap must fail at the maker's first funding send"
     );
-    assert_log!(world; { has "Test behavior: failing the first funding broadcast" });
+    assert_log!(world; { has "Test behavior: failing the first" });
     let funding = world.makers()[0]
         .inner()
         .outgoing_funding_txs(&swap_id)
@@ -471,17 +471,22 @@ fn fail_first_send(world: &mut World, params: SwapParams) -> (String, Vec<Transa
     (swap_id, funding)
 }
 
-/// The maker's first Legacy funding send fails with nothing sent. Recovery
-/// never sends it: after the grace it frees the inputs for reuse and keeps
-/// the keys. Only a block spending a freed input elsewhere ends the swap.
+/// The maker's first funding send fails with nothing sent. Recovery never
+/// sends it: after the grace it frees the inputs for reuse and keeps the
+/// keys. Only a block spending a freed input elsewhere ends the swap.
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [FailFirstBroadcast],
     takers = [CrashBeforeRecovery],
     setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
-    swap(protocol = Legacy, sats = 500_000, makers = 1, tx_count = 1),
+    swap(protocol = protocol, sats = 500_000, makers = 1, tx_count = 1),
+    cases = [
+        failed_first_send_frees_inputs_and_keeps_keys(protocol = ProtocolVersion::Legacy),
+        failed_first_send_frees_inputs_and_keeps_keys_taproot(protocol = ProtocolVersion::Taproot),
+    ],
 )]
-fn failed_first_send_frees_inputs_and_keeps_keys(world: &mut World, params: SwapParams) {
+fn run_failed_first_send_frees_inputs(world: &mut World, params: SwapParams) {
+    let protocol = params.protocol;
     let (swap_id, funding) = fail_first_send(world, params);
     let maker = world.makers()[0].inner().clone();
     let contracts = maker.outgoing_contract_txs(&swap_id).unwrap();
@@ -535,14 +540,22 @@ fn failed_first_send_frees_inputs_and_keeps_keys(world: &mut World, params: Swap
         .send_raw_transaction(&spend)
         .unwrap();
 
-    // A mempool spend may still be evicted: passes over blocks without it
-    // keep the swap.
+    // A mempool spend may still be evicted: a pass on each block without it
+    // keeps the swap.
     let mark = log_mark(&world.taker_log_path());
     for _ in 0..2 {
         mine_empty_block(world);
-        thread::sleep(Duration::from_secs(10));
+        let height = world.bitcoind().client.get_block_count().unwrap();
+        wait_for_log(
+            &world.taker_log_path(),
+            &format!("Swap {swap_id} checked its unsent funding at height {height}"),
+            Duration::from_secs(60),
+        );
     }
-    assert_log!(world, since mark; { has "recover_timelocked" });
+    // Legacy's refund pass also runs every block, after the settle pass.
+    if protocol == ProtocolVersion::Legacy {
+        assert_log!(world, since mark; { has "recover_timelocked" });
+    }
     assert!(maker.has_unfinished_outgoing_swapcoin(&swap_id).unwrap());
 
     world.mine(1);
@@ -580,9 +593,23 @@ fn wait_for_single_refund(world: &World, swap_id: &str) {
     maker_behaviors = [FailFirstBroadcast],
     takers = [CrashBeforeRecovery],
     setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
-    swap(protocol = Legacy, sats = 500_000, makers = 1, tx_count = 1),
+    swap(protocol = protocol, sats = 500_000, makers = 1, tx_count = 1),
+    cases = [
+        released_funding_that_confirms_is_refunded(
+            protocol = ProtocolVersion::Legacy,
+            expected_spendable = 14_999_311,
+        ),
+        released_funding_that_confirms_is_refunded_taproot(
+            protocol = ProtocolVersion::Taproot,
+            expected_spendable = 14_999_463,
+        ),
+    ],
 )]
-fn released_funding_that_confirms_is_refunded(world: &mut World, params: SwapParams) {
+fn run_released_funding_that_confirms(
+    world: &mut World,
+    expected_spendable: u64,
+    params: SwapParams,
+) {
     let (swap_id, funding) = fail_first_send(world, params);
     wait_for_release(&world.taker_log_path(), &swap_id);
 
@@ -596,10 +623,10 @@ fn released_funding_that_confirms_is_refunded(world: &mut World, params: SwapPar
     world.join_makers();
     world.mine(1);
     world.makers()[0].sync();
-    // 14_999_757 before the swap, less the funding (154), contract and refund
-    // fees: the same three txs as the partial-broadcast split, so the same sum.
+    // 14_999_757 before the swap, less the funding (154) and the refund; Legacy
+    // also pays a contract tx. Same txs as the partial-broadcast split.
     assert_balances!(world; {
-        maker: { swap: 0, contract: 0, fidelity: BOND, spendable: 14_999_311 },
+        maker: { swap: 0, contract: 0, fidelity: BOND, spendable: expected_spendable },
     });
 }
 
@@ -610,9 +637,23 @@ fn released_funding_that_confirms_is_refunded(world: &mut World, params: SwapPar
     maker_behaviors = [BroadcastThenFailFirst],
     takers = [CrashBeforeRecovery],
     setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
-    swap(protocol = Legacy, sats = 500_000, makers = 1, tx_count = 1),
+    swap(protocol = protocol, sats = 500_000, makers = 1, tx_count = 1),
+    cases = [
+        seen_failed_send_is_refunded_never_released(
+            protocol = ProtocolVersion::Legacy,
+            expected_spendable = 14_999_311,
+        ),
+        seen_failed_send_is_refunded_never_released_taproot(
+            protocol = ProtocolVersion::Taproot,
+            expected_spendable = 14_999_463,
+        ),
+    ],
 )]
-fn seen_failed_send_is_refunded_never_released(world: &mut World, params: SwapParams) {
+fn run_seen_failed_send_is_refunded(
+    world: &mut World,
+    expected_spendable: u64,
+    params: SwapParams,
+) {
     let (swap_id, _) = fail_first_send(world, params);
     wait_for_single_refund(world, &swap_id);
     assert_log!(world; {
@@ -623,9 +664,9 @@ fn seen_failed_send_is_refunded_never_released(world: &mut World, params: SwapPa
     world.join_makers();
     world.mine(1);
     world.makers()[0].sync();
-    // 14_999_757 before the swap, less one funding (154), contract and refund
-    // fee: the swap's coin comes back once, less only what its txs paid.
+    // 14_999_757 before the swap, less the funding (154) and the refund; Legacy
+    // also pays a contract tx. The coin comes back once, less only those fees.
     assert_balances!(world; {
-        maker: { swap: 0, contract: 0, fidelity: BOND, spendable: 14_999_311 },
+        maker: { swap: 0, contract: 0, fidelity: BOND, spendable: expected_spendable },
     });
 }
