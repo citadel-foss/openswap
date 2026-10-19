@@ -1127,6 +1127,21 @@ const MIN_WITNESS_ITEM_FOR_HASHLOCK: usize = 2;
 /// Preimage length in bytes.
 const PREIMAGE_LEN: usize = 32;
 
+/// The spend the watcher holds for `outpoint`. An answer the watcher could
+/// not give is an error, never "unspent".
+fn watched_spend(
+    watch_service: &crate::watch_tower::service::WatchService,
+    outpoint: OutPoint,
+) -> Result<Option<bitcoin::Transaction>, MakerError> {
+    match watch_service.watch_request(outpoint).map_err(|e| {
+        log::warn!("watch request for {outpoint} failed: {e}");
+        MakerError::General("watchtower query failed")
+    })? {
+        crate::watch_tower::watcher::WatcherEvent::UtxoSpent { spending_tx, .. } => Ok(spending_tx),
+        _ => Ok(None),
+    }
+}
+
 /// Read spends through the watcher, or directly through the wallet backend
 /// after the watcher exits, then persist any revealed hashlock preimages.
 fn check_for_preimage(
@@ -1164,15 +1179,7 @@ fn check_for_preimage(
                         None,
                     )
                     .map_err(MakerError::Wallet)?,
-                None => match maker.watch_service.watch_request(outpoint).map_err(|e| {
-                    log::warn!("watch request for {outpoint} failed: {e}");
-                    MakerError::General("watchtower query failed")
-                })? {
-                    crate::watch_tower::watcher::WatcherEvent::UtxoSpent {
-                        spending_tx, ..
-                    } => spending_tx,
-                    _ => None,
-                },
+                None => watched_spend(&maker.watch_service, outpoint)?,
             };
 
             if let Some(spending_tx) = spending_tx {
@@ -2264,7 +2271,33 @@ pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watch_tower::{service::answering, watcher::WatcherEvent};
+    use bitcoin::hashes::Hash;
     use std::io::Write;
+
+    /// The preimage check reads a spend's witness before it lets recovery
+    /// refund. A watcher that cannot answer must stop the pass, or the
+    /// timelock refund could race a preimage spend it never saw.
+    #[test]
+    fn preimage_check_stops_on_an_unknown_answer() {
+        let outpoint = OutPoint::new(Txid::all_zeros(), 0);
+        let service = answering(WatcherEvent::Error("not subscribed".to_string()));
+        assert!(watched_spend(&service, outpoint).is_err());
+        service.shutdown();
+
+        let claim = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let service = answering(WatcherEvent::UtxoSpent {
+            outpoint,
+            spending_tx: Some(claim.clone()),
+        });
+        assert_eq!(watched_spend(&service, outpoint).unwrap(), Some(claim));
+        service.shutdown();
+    }
 
     /// A fresh maker must get the default port when it is free.
     #[test]

@@ -20,7 +20,7 @@ use crossbeam_channel::Sender as CbSender;
 
 use crate::{
     utill::HEART_BEAT_INTERVAL,
-    wallet::{blockchain::WatchEvent, AnyBlockchain, Blockchain, CoreRPC},
+    wallet::{blockchain::WatchEvent, AnyBlockchain, Blockchain, CoreRPC, Electrum},
     watch_tower::{
         nostr,
         registry_storage::{FileRegistry, WatchRequest},
@@ -48,8 +48,9 @@ pub struct Watcher<R: Role> {
     /// Core block hashes whose height lookup failed. Retried on every loop pass
     /// without retaining full blocks in memory.
     pending_block_discovery: Vec<BlockHash>,
-    /// Watches to re-check against the backend after notifications were lost.
-    /// Retried on every loop pass until each lookup completes.
+    /// Watches to re-check against the backend after notifications were lost,
+    /// or, on Electrum, missed: a failed subscribe or tx fetch. Retried on
+    /// every loop pass until each lookup completes.
     pending_reconcile: Vec<OutPoint>,
     /// Set by `WatchService::shutdown`; long scans check it per iteration so a
     /// deep rescan cannot stall the join.
@@ -295,6 +296,8 @@ impl<R: Role> Watcher<R> {
                     Err(e) => {
                         log::error!("electrum script-subscribe failed for {outpoint}: {e}");
                         self.pending_subscribes.push((outpoint, script_pubkey));
+                        // Unarmed, it hears nothing: look for a spend it already has.
+                        self.queue_reconcile(outpoint);
                     }
                 }
             }
@@ -315,6 +318,7 @@ impl<R: Role> Watcher<R> {
                         Err(e) => {
                             log::error!("electrum script-subscribe failed for {outpoint}: {e}");
                             self.pending_subscribes.push((*outpoint, spk.clone()));
+                            self.queue_reconcile(*outpoint);
                         }
                     }
                 }
@@ -371,10 +375,32 @@ impl<R: Role> Watcher<R> {
                         }
                         continue;
                     }
+                    // What is on record proves nothing for a watch that may have
+                    // missed a spend or its replacement, so ask the server. If
+                    // it cannot tell, neither can we, though a spend on record
+                    // still stands.
+                    let spending_tx = if self.is_blind(&watch) {
+                        match self.check_blind_watch(&watch) {
+                            Ok(spend) => spend,
+                            Err(e) if watch.spent_tx.is_some() => {
+                                log::warn!("could not re-check the spend of {outpoint}: {e:?}");
+                                watch.spent_tx
+                            }
+                            Err(e) => {
+                                log::error!("could not check {outpoint} against the server: {e:?}");
+                                _ = reply.send(WatcherEvent::Error(format!(
+                                    "spend of {outpoint} unknown: the watch may have missed it and the server did not answer: {e:?}"
+                                )));
+                                return true;
+                            }
+                        }
+                    } else {
+                        watch.spent_tx
+                    };
                     spent = true;
                     _ = reply.send(WatcherEvent::UtxoSpent {
                         outpoint: watch.outpoint,
-                        spending_tx: watch.spent_tx,
+                        spending_tx,
                     });
                 }
                 if !spent {
@@ -416,6 +442,50 @@ impl<R: Role> Watcher<R> {
                 self.tip.store(height, Ordering::Release);
             }
         }
+    }
+
+    fn queue_reconcile(&mut self, outpoint: OutPoint) {
+        if !self.pending_reconcile.contains(&outpoint) {
+            self.pending_reconcile.push(outpoint);
+        }
+    }
+
+    /// Whether a watch may have missed a spend: Electrum has not armed or
+    /// replayed its subscription, or could not fetch a transaction in its
+    /// history. On Core, a pending re-check leaves the answers as they were.
+    fn is_blind(&self, watch: &WatchRequest) -> bool {
+        match &self.blockchain {
+            AnyBlockchain::Electrum(electrum) => {
+                self.pending_reconcile.contains(&watch.outpoint)
+                    || electrum.may_have_missed(&watch.script_pubkey)
+            }
+            AnyBlockchain::CoreRPC(_) => false,
+        }
+    }
+
+    /// Ask the server for the spend of a blind watch, recording any found, and
+    /// answer with the spend on record after it. A completed check settles a
+    /// queued re-check of the watch too.
+    fn check_blind_watch(
+        &mut self,
+        watch: &WatchRequest,
+    ) -> Result<Option<Transaction>, WatcherError> {
+        let Self {
+            blockchain,
+            registry,
+            pending_reconcile,
+            ..
+        } = self;
+        let AnyBlockchain::Electrum(electrum) = blockchain else {
+            return Ok(watch.spent_tx.clone());
+        };
+        recheck_electrum_watch(electrum, registry, watch)?;
+        pending_reconcile.retain(|outpoint| *outpoint != watch.outpoint);
+        Ok(registry
+            .list_watches()?
+            .into_iter()
+            .find(|recorded| recorded.outpoint == watch.outpoint)
+            .and_then(|recorded| recorded.spent_tx))
     }
 
     /// Whether a recorded confirmed spend is still on chain. A failed query
@@ -485,7 +555,13 @@ impl<R: Role> Watcher<R> {
             let Some(event) = self.blockchain.poll_event() else {
                 break;
             };
+            // The server is not answering. Polling on would only repeat the
+            // failed call, while queued commands wait for their answers.
+            let unreachable = matches!(event, WatchEvent::Unreachable);
             self.handle_event(event);
+            if unreachable {
+                break;
+            }
         }
     }
 
@@ -506,8 +582,11 @@ impl<R: Role> Watcher<R> {
             ..
         } = self;
 
+        // As with re-checks: a failure ends the pass, so a down server costs
+        // one subscribe, with its retries, per pass rather than one per watch.
+        let mut stopped = false;
         pending_subscribes.retain(|(outpoint, spk)| {
-            if shutdown.load(Ordering::Relaxed) {
+            if stopped || shutdown.load(Ordering::Relaxed) {
                 return true;
             }
             match blockchain.subscribe_script(spk, *outpoint) {
@@ -518,10 +597,15 @@ impl<R: Role> Watcher<R> {
                 Err(e) => {
                     // The outpoint remains unwatched while this fails.
                     log::error!("re-subscribe still failing for {outpoint}: {e}");
+                    stopped = true;
                     true
                 }
             }
         });
+        // The failed one is first, so moving it last lets the others through.
+        if stopped {
+            pending_subscribes.rotate_left(1);
+        }
 
         if !R::RUN_DISCOVERY {
             return;
@@ -563,10 +647,11 @@ impl<R: Role> Watcher<R> {
         });
     }
 
-    /// Re-check queued watches against Core after lost notifications,
-    /// recording any spend found. A lookup that fails, or that Core cannot
-    /// answer yet, ends the pass with the rest still queued, so a node that
-    /// cannot answer costs one lookup per pass instead of one per watch.
+    /// Re-check queued watches against the backend after lost or missed
+    /// notifications, recording any spend found. A lookup that fails, or that
+    /// Core cannot answer yet, ends the pass with the rest still queued, so a
+    /// server that cannot answer costs one lookup per pass instead of one per
+    /// watch.
     fn reconcile_watches(&mut self) {
         if self.pending_reconcile.is_empty() {
             return;
@@ -578,11 +663,6 @@ impl<R: Role> Watcher<R> {
             shutdown,
             ..
         } = self;
-        // Only Core reports lost notifications.
-        let AnyBlockchain::CoreRPC(core) = blockchain else {
-            pending_reconcile.clear();
-            return;
-        };
         let watches = match registry.list_watches() {
             Ok(watches) => watches,
             Err(e) => {
@@ -599,7 +679,14 @@ impl<R: Role> Watcher<R> {
             let Some(watch) = watches.iter().find(|watch| watch.outpoint == *outpoint) else {
                 return false;
             };
-            match reconcile_watch(core, registry, watch) {
+            let outcome = match &*blockchain {
+                AnyBlockchain::CoreRPC(core) => reconcile_watch(core, registry, watch),
+                // Electrum has no txindex to wait for: a completed check settles it.
+                AnyBlockchain::Electrum(electrum) => {
+                    recheck_electrum_watch(electrum, registry, watch).map(|_| true)
+                }
+            };
+            match outcome {
                 Ok(true) => false,
                 Ok(false) => {
                     log::info!("Core cannot fully answer for {outpoint} yet, will re-check");
@@ -658,9 +745,17 @@ impl<R: Role> Watcher<R> {
             WatchEvent::Missed => match self.registry.list_watches() {
                 Ok(watches) => {
                     for watch in watches {
-                        if !self.pending_reconcile.contains(&watch.outpoint) {
-                            self.pending_reconcile.push(watch.outpoint);
-                        }
+                        self.queue_reconcile(watch.outpoint);
+                    }
+                }
+                Err(e) => log::error!("registry lock poisoned, cannot re-check watches: {e:?}"),
+            },
+            // The transaction Electrum could not fetch may be a watched spend,
+            // so each watch on the script is checked against the server.
+            WatchEvent::Unfetched(spk) => match self.registry.list_watches() {
+                Ok(watches) => {
+                    for watch in watches.iter().filter(|watch| watch.script_pubkey == spk) {
+                        self.queue_reconcile(watch.outpoint);
                     }
                 }
                 Err(e) => log::error!("registry lock poisoned, cannot re-check watches: {e:?}"),
@@ -796,6 +891,28 @@ fn reconcile_watch(
     Ok(settled)
 }
 
+/// Ask Electrum for the spend of a watch that may have missed it, recording
+/// any spend found. Recorded as unconfirmed, like every Electrum spend, so it
+/// never displaces a spend on record as confirmed.
+fn recheck_electrum_watch(
+    electrum: &Electrum,
+    registry: &mut FileRegistry,
+    watch: &WatchRequest,
+) -> Result<Option<Transaction>, WatcherError> {
+    let spend = electrum.live_spending_transaction(&watch.outpoint, &watch.script_pubkey)?;
+    if let Some(tx) = &spend {
+        if watch.spent_tx.as_ref() != Some(tx) {
+            log::warn!(
+                "recovered missed spend of {}: {}",
+                watch.outpoint,
+                tx.compute_txid()
+            );
+        }
+        process_transaction(tx, registry, false)?;
+    }
+    Ok(spend)
+}
+
 /// What Core can say about the spend of a watched outpoint.
 enum Spend {
     /// The spending transaction, and whether it is mined. Mined matters: a
@@ -865,6 +982,7 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::{
+        collections::HashSet,
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
         sync::Mutex,
@@ -873,8 +991,8 @@ mod tests {
 
     use crate::{
         wallet::{
-            blockchain::{BlockRef, ZmqPublisher},
-            CoreRPC, CoreRpcConfig,
+            blockchain::{mock_electrum, scripthash, BlockRef, MockElectrum, ZmqPublisher},
+            CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
         },
         watch_tower::service::MakerRole,
     };
@@ -2210,5 +2328,675 @@ mod tests {
 
         assert!(watcher.pending_reconcile.is_empty());
         assert_eq!(recorded_spend(&watcher, outpoint), None);
+    }
+
+    /// The parts of an Electrum server the watcher reads. Every transaction
+    /// in `history` is in the mempool.
+    #[derive(Default)]
+    struct ElectrumNode {
+        history: Vec<(ScriptBuf, Transaction)>,
+        /// `scripthash.subscribe` fails while set.
+        refuse_subscribe: bool,
+        /// Scripts whose `scripthash.get_history` fails.
+        history_fails: HashSet<ScriptBuf>,
+        /// Transactions `transaction.get` fails for.
+        unfetchable: HashSet<Txid>,
+    }
+
+    impl ElectrumNode {
+        fn answer(&self, method: &str, params: &Value) -> Result<Value, Value> {
+            let failure = || Err(json!({ "code": 1, "message": "daemon error" }));
+            let hash = params[0].as_str().unwrap_or_default();
+            match method {
+                "blockchain.scripthash.subscribe" if self.refuse_subscribe => failure(),
+                "blockchain.scripthash.subscribe" => Ok(Value::Null),
+                "blockchain.scripthash.get_history" => {
+                    if self.history_fails.iter().any(|s| scripthash(s) == hash) {
+                        return failure();
+                    }
+                    Ok(self
+                        .history
+                        .iter()
+                        .filter(|(script, _)| scripthash(script) == hash)
+                        .map(|(_, tx)| json!({ "tx_hash": tx.compute_txid(), "height": 0 }))
+                        .collect())
+                }
+                "blockchain.transaction.get" => {
+                    let txid: Txid = hash.parse().unwrap();
+                    if self.unfetchable.contains(&txid) {
+                        return failure();
+                    }
+                    self.history
+                        .iter()
+                        .find(|(_, tx)| tx.compute_txid() == txid)
+                        .map(|(_, tx)| json!(serialize_hex(tx)))
+                        .ok_or_else(|| {
+                            json!({ "code": 2, "message": "No such mempool or blockchain transaction" })
+                        })
+                }
+                method => {
+                    Err(json!({ "code": -32601, "message": format!("unexpected {}", method) }))
+                }
+            }
+        }
+    }
+
+    fn electrum_watcher(node: &Arc<Mutex<ElectrumNode>>) -> (Watcher<MakerRole>, MockElectrum) {
+        // A failed fetch is given up on at once, and every poll pings.
+        electrum_watcher_with(node, 0, 0)
+    }
+
+    /// `max_retries` above zero lets a dropped connection be rebuilt.
+    fn electrum_watcher_with(
+        node: &Arc<Mutex<ElectrumNode>>,
+        max_retries: u8,
+        poll_interval_secs: u64,
+    ) -> (Watcher<MakerRole>, MockElectrum) {
+        let node = node.clone();
+        let server =
+            mock_electrum(move |method, params| node.lock().unwrap().answer(method, params));
+        let config = ElectrumConfig {
+            url: server.url.clone(),
+            max_retries,
+            poll_interval_secs: Some(poll_interval_secs),
+            ..ElectrumConfig::default()
+        };
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let watcher = Watcher::new(
+            AnyBlockchain::Electrum(Electrum::new(&config).unwrap()),
+            FileRegistry::new(),
+            rx,
+            Vec::new(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        (watcher, server)
+    }
+
+    fn contract_script(n: u8) -> ScriptBuf {
+        ScriptBuf::from_bytes(vec![0x51, n])
+    }
+
+    fn register<R: Role>(watcher: &mut Watcher<R>, outpoint: OutPoint, script_pubkey: ScriptBuf) {
+        watcher.handle_command(WatcherCommand::RegisterWatchRequest {
+            outpoint,
+            script_pubkey,
+        });
+    }
+
+    fn ask<R: Role>(watcher: &mut Watcher<R>, outpoint: OutPoint) -> WatcherEvent {
+        let (reply, answer) = crossbeam_channel::unbounded();
+        watcher.handle_command(WatcherCommand::WatchRequest { outpoint, reply });
+        answer.try_recv().expect("every watch request is answered")
+    }
+
+    /// [`ask`] on a thread of its own, failing the test if no answer comes
+    /// within `limit`. A watcher stuck polling a dead server would otherwise
+    /// hang the run.
+    fn ask_within(
+        watcher: Watcher<MakerRole>,
+        outpoint: OutPoint,
+        limit: Duration,
+    ) -> (Watcher<MakerRole>, WatcherEvent) {
+        let stop = watcher.shutdown.clone();
+        let (done, answered) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut watcher = watcher;
+            let answer = ask(&mut watcher, outpoint);
+            _ = done.send((watcher, answer));
+        });
+        answered.recv_timeout(limit).unwrap_or_else(|_| {
+            stop.store(true, Ordering::SeqCst);
+            panic!(
+                "watch request for {} unanswered after {:?}",
+                outpoint, limit
+            )
+        })
+    }
+
+    /// [`Watcher::drain_events`] under the same limit as [`ask_within`].
+    fn drain_within(watcher: Watcher<MakerRole>, limit: Duration) -> Watcher<MakerRole> {
+        let stop = watcher.shutdown.clone();
+        let (done, drained) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut watcher = watcher;
+            watcher.drain_events();
+            _ = done.send(watcher);
+        });
+        drained.recv_timeout(limit).unwrap_or_else(|_| {
+            stop.store(true, Ordering::SeqCst);
+            panic!("events still draining after {:?}", limit)
+        })
+    }
+
+    fn assert_unknown(answer: WatcherEvent) {
+        match answer {
+            WatcherEvent::Error(_) => {}
+            other => panic!("expected an unknown answer, got {:?}", other),
+        }
+    }
+
+    fn may_have_missed<R: Role>(watcher: &Watcher<R>, script: &ScriptBuf) -> bool {
+        match &watcher.blockchain {
+            AnyBlockchain::Electrum(electrum) => electrum.may_have_missed(script),
+            AnyBlockchain::CoreRPC(_) => unreachable!("an Electrum watcher"),
+        }
+    }
+
+    /// The spend in a `UtxoSpent` answer; any other answer fails the test.
+    fn answered_spend(answer: WatcherEvent) -> Option<Transaction> {
+        match answer {
+            WatcherEvent::UtxoSpent { spending_tx, .. } => spending_tx,
+            other => panic!("expected the watched outpoint, got {:?}", other),
+        }
+    }
+
+    fn history_reads(calls: &Mutex<Vec<String>>) -> usize {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == "blockchain.scripthash.get_history")
+            .count()
+    }
+
+    /// A watch whose subscription failed hears nothing, so having no spend on
+    /// record proves nothing. Until it is armed, a query asks the server.
+    #[test]
+    fn unsubscribed_watch_is_answered_from_the_server() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let claim = spend(outpoint);
+        let node = Arc::new(Mutex::new(ElectrumNode {
+            refuse_subscribe: true,
+            ..ElectrumNode::default()
+        }));
+        let (mut watcher, server) = electrum_watcher(&node);
+        register(&mut watcher, outpoint, contract_script(1));
+        assert_eq!(answered_spend(ask(&mut watcher, outpoint)), None);
+
+        node.lock()
+            .unwrap()
+            .history
+            .push((contract_script(1), claim.clone()));
+        assert_eq!(
+            answered_spend(ask(&mut watcher, outpoint)),
+            Some(claim.clone()),
+            "a spend made while the watch was not subscribed went unreported"
+        );
+
+        // Armed at last: the replay keeps the spend, and answers come from the
+        // registry again.
+        node.lock().unwrap().refuse_subscribe = false;
+        watcher.retry_pending_work();
+        watcher.drain_events();
+        assert!(watcher.pending_subscribes.is_empty());
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(claim.clone()));
+        let reads = history_reads(&server.calls);
+        assert_eq!(answered_spend(ask(&mut watcher, outpoint)), Some(claim));
+        assert_eq!(history_reads(&server.calls), reads);
+    }
+
+    /// When the server cannot say whether an unsubscribed watch was spent,
+    /// the answer is unknown, never unspent, and the check is retried.
+    #[test]
+    fn failed_check_of_an_unsubscribed_watch_is_unknown_and_retried() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let claim = spend(outpoint);
+        let node = Arc::new(Mutex::new(ElectrumNode {
+            history: vec![(contract_script(1), claim.clone())],
+            refuse_subscribe: true,
+            history_fails: HashSet::from([contract_script(1)]),
+            ..ElectrumNode::default()
+        }));
+        let (mut watcher, _calls) = electrum_watcher(&node);
+        register(&mut watcher, outpoint, contract_script(1));
+
+        match ask(&mut watcher, outpoint) {
+            WatcherEvent::Error(_) => {}
+            other => panic!("expected an unknown answer, got {:?}", other),
+        }
+        watcher.retry_pending_work();
+        assert_eq!(recorded_spend(&watcher, outpoint), None);
+        assert_eq!(watcher.pending_reconcile, [outpoint]);
+
+        node.lock().unwrap().history_fails.clear();
+        watcher.retry_pending_work();
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(claim));
+        assert!(watcher.pending_reconcile.is_empty());
+    }
+
+    /// A hashlock claim with a 32-byte preimage in its witness.
+    fn claim_with_preimage(outpoint: OutPoint, preimage: [u8; 32]) -> Transaction {
+        let mut claim = spend(outpoint);
+        claim.input[0].witness = Witness::from_slice(&[vec![1; 72], preimage.to_vec(), vec![0x51]]);
+        claim
+    }
+
+    /// A spend in the history whose fetch keeps failing must not read as
+    /// unspent once the retries are spent, and must be recorded, preimage
+    /// and all, once the server serves it.
+    #[test]
+    fn spend_the_fetch_gave_up_on_is_unknown_until_recovered() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let preimage = [7; 32];
+        let claim = claim_with_preimage(outpoint, preimage);
+        let node = Arc::new(Mutex::new(ElectrumNode {
+            history: vec![(contract_script(1), claim.clone())],
+            unfetchable: HashSet::from([claim.compute_txid()]),
+            ..ElectrumNode::default()
+        }));
+        let (mut watcher, _calls) = electrum_watcher(&node);
+        register(&mut watcher, outpoint, contract_script(1));
+        for _ in 0..3 {
+            watcher.drain_events();
+        }
+
+        match ask(&mut watcher, outpoint) {
+            WatcherEvent::Error(_) => {}
+            other => panic!("expected an unknown answer, got {:?}", other),
+        }
+
+        node.lock().unwrap().unfetchable.clear();
+        watcher.retry_pending_work();
+        assert!(watcher.pending_reconcile.is_empty());
+        let recovered = answered_spend(ask(&mut watcher, outpoint)).expect("the spend is recorded");
+        assert_eq!(recovered, claim);
+        assert_eq!(recovered.input[0].witness[1], preimage);
+    }
+
+    /// A watch the server keeps failing on must not hold back the others.
+    #[test]
+    fn failing_electrum_watch_does_not_starve_the_queue() {
+        let failing = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let spent = OutPoint::new(Txid::from_byte_array([2; 32]), 0);
+        let claim = spend(spent);
+        let node = Arc::new(Mutex::new(ElectrumNode {
+            history: vec![(contract_script(2), claim.clone())],
+            refuse_subscribe: true,
+            history_fails: HashSet::from([contract_script(1)]),
+            ..ElectrumNode::default()
+        }));
+        let (mut watcher, _calls) = electrum_watcher(&node);
+        register(&mut watcher, failing, contract_script(1));
+        register(&mut watcher, spent, contract_script(2));
+
+        watcher.retry_pending_work();
+        watcher.retry_pending_work();
+
+        assert_eq!(recorded_spend(&watcher, spent), Some(claim));
+        assert_eq!(watcher.pending_reconcile, [failing]);
+    }
+
+    /// After a restart the watches are rebuilt; one that cannot subscribe
+    /// must still have its spend recovered.
+    #[test]
+    fn rebuilt_watch_that_cannot_subscribe_is_recovered() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let claim = spend(outpoint);
+        let node = Arc::new(Mutex::new(ElectrumNode {
+            history: vec![(contract_script(1), claim.clone())],
+            refuse_subscribe: true,
+            ..ElectrumNode::default()
+        }));
+        let (mut watcher, _calls) = electrum_watcher(&node);
+        let (reply, rebuilt) = crossbeam_channel::unbounded();
+        watcher.handle_command(WatcherCommand::RebuildWatches {
+            watches: vec![(outpoint, contract_script(1))],
+            reply,
+        });
+        assert!(matches!(rebuilt.try_recv(), Ok(Ok(()))));
+
+        watcher.retry_pending_work();
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(claim));
+    }
+
+    /// A spend recorded while the watch is blind may since have been
+    /// replaced, so the answer still comes from the server. One the server
+    /// cannot refute stays on record.
+    #[test]
+    fn blind_watch_rechecks_a_recorded_spend() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let claim = spend(outpoint);
+        let mut replacement = spend(outpoint);
+        replacement.lock_time = bitcoin::absolute::LockTime::from_consensus(1);
+        let node = Arc::new(Mutex::new(ElectrumNode {
+            history: vec![(contract_script(1), claim.clone())],
+            refuse_subscribe: true,
+            ..ElectrumNode::default()
+        }));
+        let (mut watcher, _server) = electrum_watcher(&node);
+        register(&mut watcher, outpoint, contract_script(1));
+        assert_eq!(answered_spend(ask(&mut watcher, outpoint)), Some(claim));
+
+        node.lock().unwrap().history = vec![(contract_script(1), replacement.clone())];
+        assert_eq!(
+            answered_spend(ask(&mut watcher, outpoint)),
+            Some(replacement.clone()),
+            "a replacement made while the watch was not subscribed went unreported"
+        );
+        assert_eq!(
+            recorded_spend(&watcher, outpoint),
+            Some(replacement.clone())
+        );
+
+        node.lock()
+            .unwrap()
+            .history_fails
+            .insert(contract_script(1));
+        assert_eq!(
+            answered_spend(ask(&mut watcher, outpoint)),
+            Some(replacement)
+        );
+    }
+
+    /// A spend whose notification died with a dropped connection shows only
+    /// once the reconnect replays the history. Until that replay succeeds the
+    /// watch has to ask the server.
+    #[test]
+    fn watch_asks_the_server_until_a_reconnect_is_replayed() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let claim = spend(outpoint);
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        let (mut watcher, server) = electrum_watcher_with(&node, 1, 0);
+        register(&mut watcher, outpoint, contract_script(1));
+        assert_eq!(answered_spend(ask(&mut watcher, outpoint)), None);
+
+        {
+            let mut node = node.lock().unwrap();
+            node.history.push((contract_script(1), claim.clone()));
+            node.history_fails.insert(contract_script(1));
+        }
+        server.hang_up();
+        // The first answer follows the reconnect, the second the failed replay.
+        for _ in 0..2 {
+            match ask(&mut watcher, outpoint) {
+                WatcherEvent::Error(_) => {}
+                other => panic!("expected an unknown answer, got {:?}", other),
+            }
+        }
+
+        node.lock().unwrap().history_fails.clear();
+        assert_eq!(answered_spend(ask(&mut watcher, outpoint)), Some(claim));
+    }
+
+    /// A spend on record that the server no longer lists, evicted say, is
+    /// still the evidence there is. A blind watch must keep answering it.
+    #[test]
+    fn blind_watch_keeps_an_evicted_recorded_spend() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let claim = spend(outpoint);
+        let node = Arc::new(Mutex::new(ElectrumNode {
+            history: vec![(contract_script(1), claim.clone())],
+            refuse_subscribe: true,
+            ..ElectrumNode::default()
+        }));
+        let (mut watcher, _server) = electrum_watcher(&node);
+        register(&mut watcher, outpoint, contract_script(1));
+        assert_eq!(
+            answered_spend(ask(&mut watcher, outpoint)),
+            Some(claim.clone())
+        );
+
+        node.lock().unwrap().history.clear();
+        assert_eq!(
+            answered_spend(ask(&mut watcher, outpoint)),
+            Some(claim),
+            "a recorded spend the server stopped listing was dropped"
+        );
+    }
+
+    /// When the connection dies and the server cannot be reached again, the
+    /// watch hears nothing: its answer is unknown, never unspent. Once the
+    /// server is back the watch is re-armed and replayed, and trusted again.
+    #[test]
+    fn dead_connection_answers_unknown_until_recovered() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let claim = spend(outpoint);
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        // Pings two seconds apart, so a failed one ends before the next is due.
+        let (mut watcher, server) = electrum_watcher_with(&node, 1, 2);
+        register(&mut watcher, outpoint, contract_script(1));
+        assert_eq!(answered_spend(ask(&mut watcher, outpoint)), None);
+
+        node.lock()
+            .unwrap()
+            .history
+            .push((contract_script(1), claim.clone()));
+        server.set_down(true);
+        thread::sleep(Duration::from_millis(2100));
+        let (mut watcher, answer) = ask_within(watcher, outpoint, Duration::from_secs(20));
+        assert_unknown(answer);
+
+        server.set_down(false);
+        assert_eq!(
+            answered_spend(ask(&mut watcher, outpoint)),
+            Some(claim.clone())
+        );
+        // The next ping tick replays the history; then the registry answers.
+        thread::sleep(Duration::from_millis(2100));
+        watcher.drain_events();
+        assert!(!may_have_missed(&watcher, &contract_script(1)));
+        let reads = history_reads(&server.calls);
+        assert_eq!(answered_spend(ask(&mut watcher, outpoint)), Some(claim));
+        assert_eq!(history_reads(&server.calls), reads);
+    }
+
+    /// A ping that fails after its retries outlasts the ping interval. That
+    /// must not keep the loop polling the dead server: every request is
+    /// answered, as unknown, within the time of a failed call or two.
+    #[test]
+    fn outage_answers_every_request_within_a_bound() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        // Two retries back off for 3s, against a 1s ping interval.
+        let (mut watcher, server) = electrum_watcher_with(&node, 2, 1);
+        register(&mut watcher, outpoint, contract_script(1));
+        assert_eq!(answered_spend(ask(&mut watcher, outpoint)), None);
+
+        server.set_down(true);
+        thread::sleep(Duration::from_millis(1100));
+        for _ in 0..2 {
+            let answer;
+            (watcher, answer) = ask_within(watcher, outpoint, Duration::from_secs(20));
+            assert_unknown(answer);
+        }
+    }
+
+    /// Calls of `method` the mock server has seen.
+    fn requests_for(server: &MockElectrum, method: &str) -> usize {
+        server
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == method)
+            .count()
+    }
+
+    /// Re-arming on a fresh connection that fails costs one subscribe and
+    /// its retry, not one per watch, and every watch stays blind until all
+    /// are armed and replayed.
+    #[test]
+    fn re_arm_on_a_failing_connection_stops_at_the_first_failure() {
+        let outpoints: Vec<OutPoint> = (1..=4)
+            .map(|n| OutPoint::new(Txid::from_byte_array([n; 32]), 0))
+            .collect();
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        let (mut watcher, server) = electrum_watcher_with(&node, 1, 0);
+        for (n, outpoint) in (1..=4).zip(&outpoints) {
+            register(&mut watcher, *outpoint, contract_script(n));
+        }
+        let limit = Duration::from_secs(20);
+        const SUBSCRIBE: &str = "blockchain.scripthash.subscribe";
+
+        // Reconnects work, but every subscribe on them drops the connection.
+        server.drop_requests_for(Some(SUBSCRIBE));
+        server.hang_up();
+        // The first poll reconnects and finds the scripts unknown to the new
+        // client; the next re-arms. Each stops at its first failure.
+        for _ in 0..2 {
+            let before = requests_for(&server, SUBSCRIBE);
+            watcher = drain_within(watcher, limit);
+            assert_eq!(requests_for(&server, SUBSCRIBE) - before, 2);
+            for n in 1..=4 {
+                assert!(may_have_missed(&watcher, &contract_script(n)));
+            }
+        }
+
+        server.drop_requests_for(None);
+        for _ in 0..3 {
+            watcher = drain_within(watcher, limit);
+        }
+        for n in 1..=4 {
+            assert!(!may_have_missed(&watcher, &contract_script(n)));
+        }
+    }
+
+    /// A server that refuses the re-arm keeps every watch blind, and the
+    /// poll must still end: the drain cannot spin on re-arming.
+    #[test]
+    fn refused_re_arm_keeps_watches_blind_without_spinning() {
+        let outpoints: Vec<OutPoint> = (1..=4)
+            .map(|n| OutPoint::new(Txid::from_byte_array([n; 32]), 0))
+            .collect();
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        let (mut watcher, server) = electrum_watcher_with(&node, 1, 0);
+        for (n, outpoint) in (1..=4).zip(&outpoints) {
+            register(&mut watcher, *outpoint, contract_script(n));
+        }
+        let limit = Duration::from_secs(20);
+
+        node.lock().unwrap().refuse_subscribe = true;
+        server.hang_up();
+        for _ in 0..3 {
+            watcher = drain_within(watcher, limit);
+            for n in 1..=4 {
+                assert!(may_have_missed(&watcher, &contract_script(n)));
+            }
+        }
+
+        node.lock().unwrap().refuse_subscribe = false;
+        for _ in 0..3 {
+            watcher = drain_within(watcher, limit);
+        }
+        for n in 1..=4 {
+            assert!(!may_have_missed(&watcher, &contract_script(n)));
+        }
+    }
+
+    /// Watches armed before an outage, and one registered during it, all get
+    /// their spends once the server is back.
+    #[test]
+    fn watches_recover_after_an_outage() {
+        let outpoints: Vec<OutPoint> = (1..=3)
+            .map(|n| OutPoint::new(Txid::from_byte_array([n; 32]), 0))
+            .collect();
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        let (mut watcher, server) = electrum_watcher_with(&node, 1, 0);
+        register(&mut watcher, outpoints[0], contract_script(1));
+        register(&mut watcher, outpoints[1], contract_script(2));
+
+        server.set_down(true);
+        register(&mut watcher, outpoints[2], contract_script(3));
+        assert_eq!(watcher.pending_subscribes.len(), 1);
+        for (n, outpoint) in (1..=3).zip(&outpoints) {
+            node.lock()
+                .unwrap()
+                .history
+                .push((contract_script(n), spend(*outpoint)));
+        }
+        let (mut watcher, answer) = ask_within(watcher, outpoints[0], Duration::from_secs(20));
+        assert_unknown(answer);
+
+        server.set_down(false);
+        for _ in 0..3 {
+            watcher.drain_events();
+            watcher.retry_pending_work();
+        }
+        assert!(watcher.pending_subscribes.is_empty());
+        for (n, outpoint) in (1..=3).zip(&outpoints) {
+            assert!(!may_have_missed(&watcher, &contract_script(n)));
+            assert_eq!(recorded_spend(&watcher, *outpoint), Some(spend(*outpoint)));
+        }
+    }
+
+    /// While subscribes keep failing, a retry pass makes one attempt rather
+    /// than one per watch, and the watch that failed goes to the back so it
+    /// cannot hold back the others.
+    #[test]
+    fn failing_subscription_costs_one_attempt_and_starves_none() {
+        let (failing, other) = (
+            OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+            OutPoint::new(Txid::from_byte_array([2; 32]), 0),
+        );
+        let node = Arc::new(Mutex::new(ElectrumNode {
+            // The first watch's subscribe fails at its history read, for good.
+            history_fails: HashSet::from([contract_script(1)]),
+            ..ElectrumNode::default()
+        }));
+        let (mut watcher, server) = electrum_watcher(&node);
+        register(&mut watcher, failing, contract_script(1));
+        node.lock().unwrap().refuse_subscribe = true;
+        register(&mut watcher, other, contract_script(2));
+        register(
+            &mut watcher,
+            OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+            contract_script(3),
+        );
+        assert_eq!(watcher.pending_subscribes.len(), 3);
+
+        let subscribes =
+            |server: &MockElectrum| requests_for(server, "blockchain.scripthash.subscribe");
+        // A pass of the loop: events, then retries.
+        let pass = |watcher: &mut Watcher<MakerRole>| {
+            watcher.drain_events();
+            watcher.retry_pending_work();
+        };
+        let before = subscribes(&server);
+        pass(&mut watcher);
+        assert_eq!(subscribes(&server) - before, 1);
+
+        node.lock().unwrap().refuse_subscribe = false;
+        pass(&mut watcher);
+        pass(&mut watcher);
+        assert_eq!(
+            watcher
+                .pending_subscribes
+                .iter()
+                .map(|(outpoint, _)| *outpoint)
+                .collect::<Vec<_>>(),
+            [failing]
+        );
+    }
+
+    /// Recovery reads the mempool, which must not displace a spend on
+    /// record as confirmed.
+    #[test]
+    fn electrum_recovery_keeps_a_confirmed_spend() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let confirmed = spend(outpoint);
+        let mut rival = spend(outpoint);
+        rival.lock_time = bitcoin::absolute::LockTime::from_consensus(1);
+        let node = Arc::new(Mutex::new(ElectrumNode {
+            history: vec![(contract_script(1), rival)],
+            refuse_subscribe: true,
+            ..ElectrumNode::default()
+        }));
+        let (mut watcher, _calls) = electrum_watcher(&node);
+        watcher
+            .registry
+            .upsert_watch(&WatchRequest {
+                outpoint,
+                script_pubkey: contract_script(1),
+                in_block: true,
+                spent_tx: Some(confirmed.clone()),
+            })
+            .unwrap();
+        register(&mut watcher, outpoint, contract_script(1));
+
+        watcher.retry_pending_work();
+
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(confirmed));
+        assert!(is_recorded_confirmed(&watcher, outpoint));
     }
 }

@@ -1057,6 +1057,7 @@ pub(crate) mod tests {
             WatchEvent::BlockConnected(_) => "block",
             WatchEvent::Missed => "missed",
             WatchEvent::Unreachable => "unreachable",
+            WatchEvent::Unfetched(_) => "unfetched",
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut kinds = Vec::new();

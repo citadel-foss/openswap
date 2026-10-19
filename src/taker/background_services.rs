@@ -962,4 +962,99 @@ mod tests {
         assert_eq!(peer.retry_in, 0, "reconnect must not wait out a backoff");
         assert_eq!(peer.backoff, RECONNECT_BACKOFF_MIN_TICKS);
     }
+
+    /// A live watcher that cannot tell whether a sentinel was spent must not
+    /// read as "unspent": the swap has to abort.
+    #[test]
+    fn unknown_watcher_answer_requires_abort() {
+        use crate::{
+            wallet::{CoreRPC, CoreRpcConfig},
+            watch_tower::service::answering,
+        };
+        use bitcoin::hashes::Hash;
+        use std::time::Instant;
+
+        let service = answering(WatcherEvent::Error("not subscribed".to_string()));
+        // Only asked once the watcher is gone, which it never is here.
+        let backend = AnyBlockchain::CoreRPC(
+            CoreRPC::new(&CoreRpcConfig {
+                url: "127.0.0.1:0".to_string(),
+                ..CoreRpcConfig::default()
+            })
+            .unwrap(),
+        );
+        let detector = BreachDetector::start(service.clone(), backend).unwrap();
+        let outpoint = OutPoint::new(Txid::all_zeros(), 0);
+        detector
+            .add_sentinels(&service, &[(outpoint, Txid::all_zeros(), ScriptBuf::new())])
+            .unwrap();
+
+        let deadline = Instant::now() + HEART_BEAT_INTERVAL * 4;
+        while !detector.requires_abort() {
+            assert!(
+                Instant::now() < deadline,
+                "an unknown answer did not abort the swap"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!detector.is_breached());
+        detector.stop();
+        service.shutdown();
+    }
+
+    /// Unknown is no verdict, so it must not stick: once the watcher can
+    /// answer again, a pass that finds no breach clears the abort.
+    #[test]
+    fn abort_flag_clears_once_the_watcher_answers() {
+        use crate::{
+            wallet::{CoreRPC, CoreRpcConfig},
+            watch_tower::service::answering_with,
+        };
+        use bitcoin::hashes::Hash;
+        use std::time::Instant;
+
+        let outpoint = OutPoint::new(Txid::all_zeros(), 0);
+        let server_down = Arc::new(AtomicBool::new(true));
+        let down = server_down.clone();
+        let service = answering_with(move || {
+            if down.load(Relaxed) {
+                WatcherEvent::Error("server down".to_string())
+            } else {
+                WatcherEvent::UtxoSpent {
+                    outpoint,
+                    spending_tx: None,
+                }
+            }
+        });
+        // Only asked once the watcher is gone, which it never is here.
+        let backend = AnyBlockchain::CoreRPC(
+            CoreRPC::new(&CoreRpcConfig {
+                url: "127.0.0.1:0".to_string(),
+                ..CoreRpcConfig::default()
+            })
+            .unwrap(),
+        );
+        let detector = BreachDetector::start(service.clone(), backend).unwrap();
+        detector
+            .add_sentinels(&service, &[(outpoint, Txid::all_zeros(), ScriptBuf::new())])
+            .unwrap();
+        let wait_for = |abort: bool| {
+            let deadline = Instant::now() + HEART_BEAT_INTERVAL * 4;
+            while detector.requires_abort() != abort {
+                assert!(
+                    Instant::now() < deadline,
+                    "requires_abort never became {}",
+                    abort
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+
+        wait_for(true);
+        server_down.store(false, Relaxed);
+        wait_for(false);
+        assert!(!detector.is_breached());
+        detector.stop();
+        service.shutdown();
+    }
 }

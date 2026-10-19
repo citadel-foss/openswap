@@ -24,6 +24,8 @@ mod electrum;
 pub(crate) use corerpc::tests::ZmqPublisher;
 pub use corerpc::{CoreRPC, CoreRpcConfig};
 #[cfg(test)]
+pub(crate) use electrum::tests::{mock_electrum, scripthash, MockElectrum};
+#[cfg(test)]
 pub(crate) use electrum::SCRIPT_CACHE_TTL;
 pub use electrum::{Electrum, ElectrumConfig, WATCHER_READ_TIMEOUT_DIRECT_SECS};
 
@@ -34,7 +36,7 @@ use std::{
 
 use bitcoin::{
     address::NetworkUnchecked, block::Header, Address, Block, BlockHash, Network, OutPoint, Script,
-    Transaction, Txid,
+    ScriptBuf, Transaction, Txid,
 };
 use bitcoind::bitcoincore_rpc::json::{
     GetBlockchainInfoResult, GetRawTransactionResult, GetTxOutResult, ListTransactionResult,
@@ -113,6 +115,9 @@ pub enum WatchEvent {
     /// message, or a dropped socket), so watched outpoints must be re-checked
     /// against the backend. Bitcoin Core only.
     Missed,
+    /// A transaction in this script's history could not be fetched, so a
+    /// spend of an outpoint watched on it may be unrecorded. Electrum only.
+    Unfetched(ScriptBuf),
 }
 
 /// Resolved backend selector. Built from the user's init config (the single

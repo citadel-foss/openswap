@@ -296,7 +296,8 @@ struct NotifierState {
     /// has been replayed, which is what lets `retry_subscribes` spot the gap.
     subscriptions: HashMap<ScriptBuf, Subscription>,
     /// Failed `transaction.get` tries per txid. Past `max_retries` we stop
-    /// re-reading that txid's script, which would otherwise cycle forever.
+    /// re-reading that txid's script on every tick, which would otherwise
+    /// cycle forever. The txid stays unseen, so the next read still fetches it.
     fetch_attempts: HashMap<Txid, u8>,
     /// Scripts whose history still needs re-reading after a failed tx fetch. The
     /// server only notifies on status changes, so nothing else would revisit them.
@@ -306,6 +307,11 @@ struct NotifierState {
     pending: VecDeque<WatchEvent>,
     /// Last time the socket was pumped with a real RPC (see `poll_event`).
     last_ping: Option<std::time::Instant>,
+    /// Scripts whose subscribe failed on this connection. electrum-client
+    /// records a script before asking the server and keeps the record when
+    /// that fails, so its `AlreadySubscribed` for one of these is no
+    /// subscription. Cleared when the connection is recycled.
+    failed_arms: HashSet<ScriptBuf>,
     /// Wallet scripts subscribed on this connection, with their last `listunspent`
     /// answer, or `None` once an alert says their coins changed.
     wallet_scripts: HashMap<ScriptBuf, Option<Vec<UnspentRes>>>,
@@ -382,8 +388,9 @@ pub struct Electrum {
     config: ElectrumConfig,
     /// Ping cadence for `poll_event`, resolved from the config at construction.
     ping_interval: Duration,
-    /// Set when `call` rebuilds the client. The fresh socket carries no
-    /// server-side script subscriptions, so `poll_event` must re-arm them.
+    /// Set when a call's connection fails or `call` rebuilds the client.
+    /// Neither a dead nor a fresh socket carries the server-side script
+    /// subscriptions, so `poll_event` must re-arm them.
     needs_rearm: AtomicBool,
     /// Set after the final watcher for a script is removed. Recycling the
     /// connection clears electrum-client's unsafe-to-unsubscribe local state.
@@ -571,13 +578,108 @@ impl Electrum {
                 .any(|input| input.previous_output == *outpoint)
                 .then_some(tx));
         }
-        for entry in self.history(script)? {
-            let tx = self.transaction_get_validating(&entry.tx_hash)?;
-            if tx.input.iter().any(|i| i.previous_output == *outpoint) {
-                return Ok(Some(tx));
+        self.spender_in(self.history(script)?, outpoint)
+    }
+
+    /// [`Self::spending_transaction`] from the server's current history, not
+    /// the cache. The watcher asks this in place of a subscription that is not
+    /// armed, so a spend made since the last read must show.
+    pub(crate) fn live_spending_transaction(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+    ) -> Result<Option<Transaction>, WalletError> {
+        let history = self.call(GET_HISTORY, |c| c.script_get_history(script))?;
+        self.spender_in(history, outpoint)
+    }
+
+    /// The transaction in `history` that spends `outpoint`. A transaction the
+    /// server cannot serve leaves the answer unknown only if it could be the
+    /// spend: the funding itself, and anything mined before it, cannot.
+    fn spender_in(
+        &self,
+        history: Vec<GetHistoryRes>,
+        outpoint: &OutPoint,
+    ) -> Result<Option<Transaction>, WalletError> {
+        let funded_at = history
+            .iter()
+            .find(|entry| entry.tx_hash == outpoint.txid)
+            .map(|entry| entry.height)
+            .filter(|height| *height > 0);
+        let mut unfetched = None;
+        for entry in history {
+            let mined_before_funding =
+                entry.height > 0 && funded_at.is_some_and(|funded| entry.height < funded);
+            if entry.tx_hash == outpoint.txid || mined_before_funding {
+                continue;
+            }
+            match self.transaction_get_validating(&entry.tx_hash) {
+                Ok(tx) if tx.input.iter().any(|i| i.previous_output == *outpoint) => {
+                    return Ok(Some(tx))
+                }
+                Ok(_) => {}
+                // The server answered, just not with this transaction.
+                Err(e @ WalletError::Electrum(_)) => unfetched = Some(e),
+                // Unreachable or shutting down: the rest would fail the same way.
+                Err(e) => return Err(e),
             }
         }
-        Ok(None)
+        unfetched.map_or(Ok(None), Err)
+    }
+
+    /// Queue a `TxSeen` for each transaction in `spk`'s `history` not surfaced
+    /// yet. A failed fetch leaves the txid unseen, so any later read fetches it
+    /// again, and reports the script as `Unfetched`, since the transaction may
+    /// be a watched spend. The script is re-read on the ping tick until the
+    /// txid's retries are spent; then it waits for the next notification or
+    /// reconnect, while the watcher asks the server about its watches.
+    fn surface_history(
+        &self,
+        state: &mut NotifierState,
+        spk: &Script,
+        history: Vec<GetHistoryRes>,
+    ) {
+        let NotifierState {
+            subscriptions,
+            fetch_attempts,
+            dirty,
+            pending,
+            ..
+        } = state;
+        // Unsubscribed under us. Panicking would kill the watch loop; losing
+        // one tick does not.
+        let Some(sub) = subscriptions.get_mut(spk) else {
+            return;
+        };
+        let mut unfetched = false;
+        for h in history {
+            if !sub.seen.insert(h.tx_hash) {
+                continue;
+            }
+            match self.transaction_get_validating(&h.tx_hash) {
+                Ok(tx) => {
+                    fetch_attempts.remove(&h.tx_hash);
+                    pending.push_back(WatchEvent::TxSeen {
+                        raw_tx: serialize(&tx),
+                    });
+                }
+                Err(e) => {
+                    sub.seen.remove(&h.tx_hash);
+                    unfetched = true;
+                    if retry_fetch(fetch_attempts, h.tx_hash, self.config.max_retries) {
+                        dirty.insert(spk.to_owned());
+                    } else {
+                        log::warn!(
+                            "fetching tx {} keeps failing, re-reading its history only when notified: {e:?}",
+                            h.tx_hash
+                        );
+                    }
+                }
+            }
+        }
+        if unfetched {
+            pending.push_back(WatchEvent::Unfetched(spk.to_owned()));
+        }
     }
 
     /// The mined transaction spending `outpoint`, skipping mempool entries.
@@ -772,6 +874,20 @@ impl Electrum {
             .map_or(0, |s| s.watchers.len())
     }
 
+    /// Whether a spend paying from `spk` may have gone unheard: the script is
+    /// not subscribed, a reconnect has not re-armed it yet, or its history
+    /// still needs the re-read that replays what was missed.
+    pub(crate) fn may_have_missed(&self, spk: &Script) -> bool {
+        if self.needs_rearm.load(Ordering::SeqCst) {
+            return true;
+        }
+        let state = lock_debug!(self.notifier.lock()).unwrap_or_else(|e| {
+            log::warn!("electrum notifier lock poisoned; recovering");
+            e.into_inner()
+        });
+        !state.subscriptions.contains_key(spk) || state.dirty.contains(spk)
+    }
+
     /// Flag that aborts in-flight retry backoffs when set.
     /// Shared with the owner (e.g. `WatchService`) so shutdown can cancel them.
     pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
@@ -802,6 +918,12 @@ impl Electrum {
             Err(e) if is_terminal(&e) => return Err(e.into()),
             Err(e) => e,
         };
+        // The connection failed and took its server-side subscriptions with
+        // it, whether or not a reconnect below succeeds. A rate limit is the
+        // server answering, so the subscriptions still stand.
+        if !is_rate_limited(&last) {
+            self.needs_rearm.store(true, Ordering::SeqCst);
+        }
 
         for attempt in 1..=self.config.max_retries {
             let backoff = backoff_after(attempt, &last);
@@ -885,12 +1007,28 @@ impl Electrum {
     }
 
     /// Arm the server-side scripthash subscription, treating an existing one as
-    /// success. Shared by the initial subscribe and the post-reconnect re-arm.
-    fn arm_subscription(&self, spk: &Script) -> Result<(), WalletError> {
+    /// success unless it is left from a subscribe that failed (`failed_arms`).
+    /// Shared by the initial subscribe and the post-reconnect re-arm.
+    fn arm_subscription(
+        &self,
+        failed_arms: &mut HashSet<ScriptBuf>,
+        spk: &Script,
+    ) -> Result<(), WalletError> {
         match self.call(SUBSCRIBE, |c| c.script_subscribe(spk).map(|_| ())) {
             Ok(()) => Ok(()),
-            Err(WalletError::Electrum(electrum_client::Error::AlreadySubscribed(_))) => Ok(()),
-            Err(e) => Err(e),
+            Err(WalletError::Electrum(electrum_client::Error::AlreadySubscribed(_)))
+                if !failed_arms.contains(spk) =>
+            {
+                Ok(())
+            }
+            Err(e) => {
+                // Only a fresh connection forgets the failed subscribe, so
+                // recycle it for the retry to reach the server.
+                failed_arms.insert(spk.to_owned());
+                self.subscription_reset_pending
+                    .store(true, Ordering::SeqCst);
+                Err(e)
+            }
         }
     }
 
@@ -1052,7 +1190,7 @@ fn checked_confirmations(tip: u64, height: u64) -> Result<u32, WalletError> {
 }
 
 /// Count a failed `transaction.get` for `txid`. `true` means retry later, `false`
-/// means the cap is spent, so the caller must stop re-reading the script.
+/// means the cap is spent, so the caller stops re-reading the script on its own.
 fn retry_fetch(attempts: &mut HashMap<Txid, u8>, txid: Txid, cap: u8) -> bool {
     let tries = attempts.entry(txid).or_default();
     *tries += 1;
@@ -1707,7 +1845,7 @@ impl Blockchain for Electrum {
         let state = &mut *guard;
         // Arm the server side first, even when a local entry already exists: a
         // reconnect leaves the entry behind with no subscription under it.
-        self.arm_subscription(spk)?;
+        self.arm_subscription(&mut state.failed_arms, spk)?;
         if let Some(sub) = state.subscriptions.get_mut(spk) {
             sub.watchers.insert(watch);
             return Ok(());
@@ -1717,35 +1855,13 @@ impl Blockchain for Electrum {
         let hist = self.call(GET_HISTORY, |c| c.script_get_history(spk))?;
 
         // Backend subscription works. Now record it as seen.
-        let sub = state.subscriptions.entry(spk.to_owned()).or_default();
-        sub.watchers.insert(watch);
-        for h in hist {
-            if !sub.seen.insert(h.tx_hash) {
-                continue;
-            }
-            match self.transaction_get_validating(&h.tx_hash) {
-                Ok(tx) => {
-                    state.fetch_attempts.remove(&h.tx_hash);
-                    state.pending.push_back(WatchEvent::TxSeen {
-                        raw_tx: serialize(&tx),
-                    });
-                }
-                // Couldn't fetch now. Forget it and flag the script, so a later poll
-                // re-reads this history instead of waiting for a notification.
-                Err(e) => {
-                    if retry_fetch(
-                        &mut state.fetch_attempts,
-                        h.tx_hash,
-                        self.config.max_retries,
-                    ) {
-                        sub.seen.remove(&h.tx_hash);
-                        state.dirty.insert(spk.to_owned());
-                    } else {
-                        log::warn!("giving up fetching tx {}: {e:?}", h.tx_hash);
-                    }
-                }
-            }
-        }
+        state
+            .subscriptions
+            .entry(spk.to_owned())
+            .or_default()
+            .watchers
+            .insert(watch);
+        self.surface_history(state, spk, hist);
         Ok(())
     }
 
@@ -1796,6 +1912,7 @@ impl Blockchain for Electrum {
                     .store(true, Ordering::SeqCst);
                 return None;
             }
+            state.failed_arms.clear();
         }
 
         // A reconnect hands us a socket with no server-side subscriptions.
@@ -1803,12 +1920,32 @@ impl Blockchain for Electrum {
         // while we were deaf still surfaces.
         if self.needs_rearm.swap(false, Ordering::SeqCst) {
             let armed: Vec<ScriptBuf> = state.subscriptions.keys().cloned().collect();
+            let mut refused = false;
             for spk in armed {
-                if let Err(e) = self.arm_subscription(&spk) {
-                    log::warn!("re-arm after reconnect failed: {e:?}");
-                    self.needs_rearm.store(true, Ordering::SeqCst);
+                match self.arm_subscription(&mut state.failed_arms, &spk) {
+                    Ok(()) => {
+                        state.dirty.insert(spk);
+                    }
+                    // Refused for this script alone, so the others still go.
+                    Err(e @ WalletError::Electrum(_)) => {
+                        log::warn!("re-arm after reconnect refused: {e:?}");
+                        refused = true;
+                    }
+                    // Unreachable: the rest would fail the same way, each
+                    // after its own retries.
+                    Err(e) => {
+                        log::warn!("re-arm after reconnect failed: {e:?}");
+                        self.needs_rearm.store(true, Ordering::SeqCst);
+                        return Some(WatchEvent::Unreachable);
+                    }
                 }
-                state.dirty.insert(spk);
+            }
+            // Still flagged, every watch stays blind until all are armed. The
+            // poll ends here: re-subscribing the headers would hand back a
+            // block event each time, and the drain would never finish.
+            if refused {
+                self.needs_rearm.store(true, Ordering::SeqCst);
+                return None;
             }
             // The rebuilt socket lost the header subscription too; without it
             // `block_headers_pop` stays empty and tip updates silently stop. The
@@ -1837,8 +1974,11 @@ impl Blockchain for Electrum {
                 .last_ping
                 .is_none_or(|at| at.elapsed() >= self.ping_interval);
         if ping_due {
+            let pinged = self.call(PING, |c| c.ping());
+            // Timed from the end: a ping that failed after its retries must
+            // not leave the next poll due to fail the same way at once.
             state.last_ping = Some(std::time::Instant::now());
-            if let Err(e) = self.call(PING, |c| c.ping()) {
+            if let Err(e) = pinged {
                 // Without the ping the socket is never read and the watcher
                 // goes deaf while looking alive — loud, not a warning.
                 log::error!("electrum notification ping failed: {e:?}");
@@ -1862,47 +2002,40 @@ impl Blockchain for Electrum {
                     // rebuilt under us. Re-arm and re-read on the next tick
                     // rather than skipping this script forever.
                     Err(_) => {
-                        if let Err(e) = self.arm_subscription(&spk) {
-                            log::warn!("re-arm after script_pop failure: {e:?}");
-                        }
                         state.dirty.insert(spk.clone());
+                        // Still flagged, a script that fails here is re-armed
+                        // on the next poll.
+                        match self.arm_subscription(&mut state.failed_arms, &spk) {
+                            Ok(()) => {}
+                            Err(e @ WalletError::Electrum(_)) => {
+                                log::warn!("re-arm after script_pop failure refused: {e:?}");
+                                self.needs_rearm.store(true, Ordering::SeqCst);
+                            }
+                            // Unreachable: the rest would wait out the same retries.
+                            Err(e) => {
+                                log::warn!("re-arm after script_pop failure: {e:?}");
+                                self.needs_rearm.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                        }
                         continue;
                     }
                 }
             }
-            let Ok(hist) = self.call(GET_HISTORY, |c| c.script_get_history(&spk)) else {
-                state.dirty.insert(spk.clone());
-                continue;
-            };
-            // Unsubscribed under us between the key clone and here. Panicking
-            // would kill the watch loop; losing one tick does not.
-            let Some(seen) = state.subscriptions.get_mut(&spk).map(|s| &mut s.seen) else {
-                continue;
-            };
-            for h in hist {
-                if seen.insert(h.tx_hash) {
-                    match self.transaction_get_validating(&h.tx_hash) {
-                        Ok(tx) => {
-                            state.fetch_attempts.remove(&h.tx_hash);
-                            state.pending.push_back(WatchEvent::TxSeen {
-                                raw_tx: serialize(&tx),
-                            });
-                        }
-                        Err(e) => {
-                            if retry_fetch(
-                                &mut state.fetch_attempts,
-                                h.tx_hash,
-                                self.config.max_retries,
-                            ) {
-                                seen.remove(&h.tx_hash);
-                                state.dirty.insert(spk.clone());
-                            } else {
-                                log::warn!("giving up fetching tx {}: {e:?}", h.tx_hash);
-                            }
-                        }
-                    }
+            let hist = match self.call(GET_HISTORY, |c| c.script_get_history(&spk)) {
+                Ok(hist) => hist,
+                // The server answered, for this script alone.
+                Err(WalletError::Electrum(_)) => {
+                    state.dirty.insert(spk.clone());
+                    continue;
                 }
-            }
+                // Unreachable: the other scripts would wait out the same retries.
+                Err(_) => {
+                    state.dirty.insert(spk.clone());
+                    break;
+                }
+            };
+            self.surface_history(state, &spk, hist);
         }
         if let Some(ev) = state.pending.pop_front() {
             return Some(ev);
@@ -1931,7 +2064,7 @@ impl Blockchain for Electrum {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
         net::TcpListener,
@@ -1967,6 +2100,466 @@ mod tests {
         .expect("write electrum response");
         stream.write_all(b"\n").expect("terminate response");
         stream.flush().expect("flush electrum response");
+    }
+
+    /// A running [`mock_electrum`] server.
+    pub(crate) struct MockElectrum {
+        pub(crate) url: String,
+        /// Every method called, in order.
+        pub(crate) calls: Arc<Mutex<Vec<String>>>,
+        hang_up: Arc<AtomicBool>,
+        down: Arc<AtomicBool>,
+        dropped: Arc<Mutex<Option<String>>>,
+    }
+
+    impl MockElectrum {
+        /// Drop the connection at its next request, unanswered, as a
+        /// restarting server would. Later connections are served as before.
+        pub(crate) fn hang_up(&self) {
+            self.hang_up.store(true, Ordering::SeqCst);
+        }
+
+        /// While set the server is down: connections are refused, and open
+        /// ones are dropped at their next request.
+        pub(crate) fn set_down(&self, down: bool) {
+            self.down.store(down, Ordering::SeqCst);
+        }
+
+        /// Drop the connection, unanswered, at each request for `method`,
+        /// after recording it. `None` serves every method again.
+        pub(crate) fn drop_requests_for(&self, method: Option<&str>) {
+            *self.dropped.lock().unwrap() = method.map(str::to_string);
+        }
+    }
+
+    /// Serves the Electrum protocol from `answer` on every connection and
+    /// records each method called. The handshake and pings are answered here;
+    /// an `Err` is sent as the JSON-RPC error object. Runs until the test
+    /// process exits.
+    pub(crate) fn mock_electrum(
+        answer: impl Fn(&str, &Value) -> Result<Value, Value> + Send + Sync + 'static,
+    ) -> MockElectrum {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock electrum");
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let header_hex =
+            serialize_hex(&bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let hang_up = Arc::new(AtomicBool::new(false));
+        let down = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(Mutex::new(None::<String>));
+        let answer = Arc::new(answer);
+        let (server_calls, server_hang_up, server_down) =
+            (calls.clone(), hang_up.clone(), down.clone());
+        let server_dropped = dropped.clone();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            // Polled rather than blocking in accept, so going down can close
+            // the listener and refuse connections, and coming back can rebind.
+            let mut listener = Some(listener);
+            loop {
+                if server_down.load(Ordering::SeqCst) {
+                    listener = None;
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let Some(open) = &listener else {
+                    listener = TcpListener::bind(addr).ok();
+                    if listener.is_none() {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    continue;
+                };
+                open.set_nonblocking(true).expect("poll mock electrum");
+                let stream = match open.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("block mock connection");
+                let (answer, calls) = (answer.clone(), server_calls.clone());
+                let (header_hex, hang_up) = (header_hex.clone(), server_hang_up.clone());
+                let (down, dropped) = (server_down.clone(), server_dropped.clone());
+                thread::spawn(move || {
+                    let mut writer = stream.try_clone().expect("clone electrum stream");
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        if hang_up.swap(false, Ordering::SeqCst) || down.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        line.clear();
+                        let method = request["method"].as_str().unwrap_or_default();
+                        calls.lock().unwrap().push(method.to_string());
+                        if dropped.lock().unwrap().as_deref() == Some(method) {
+                            return;
+                        }
+                        let reply = match method {
+                            // Fall back to the genesis header for the network.
+                            "server.features" => {
+                                Err(json!({ "code": -32601, "message": "method not found" }))
+                            }
+                            "blockchain.block.header" => Ok(json!(header_hex)),
+                            "blockchain.headers.subscribe" => {
+                                Ok(json!({ "height": 1, "hex": header_hex }))
+                            }
+                            "server.ping" => Ok(Value::Null),
+                            method => answer(method, &request["params"]),
+                        };
+                        let mut response = json!({ "jsonrpc": "2.0", "id": request["id"] });
+                        match reply {
+                            Ok(result) => response["result"] = result,
+                            Err(error) => response["error"] = error,
+                        }
+                        if serde_json::to_writer(&mut writer, &response).is_err()
+                            || writer.write_all(b"\n").is_err()
+                            || writer.flush().is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        MockElectrum {
+            url,
+            calls,
+            hang_up,
+            down,
+            dropped,
+        }
+    }
+
+    /// The Electrum scripthash of `script`, as the protocol sends it.
+    pub(crate) fn scripthash(script: &Script) -> String {
+        script.to_electrum_scripthash().to_lower_hex_string()
+    }
+
+    /// A transaction spending `outpoint`, with one output so it has a script
+    /// whose history lists it.
+    fn spend_of(outpoint: OutPoint) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: outpoint,
+                ..Default::default()
+            }],
+            output: vec![bitcoin::TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    /// One script whose history holds `tx`, which `transaction.get` serves only
+    /// while `fetchable` is set. Returns the backend, already watching it.
+    fn backend_with_unfetchable(tx: &Transaction, fetchable: &Arc<AtomicBool>) -> Electrum {
+        let (txid, hex) = (tx.compute_txid(), serialize_hex(tx));
+        let fetchable = fetchable.clone();
+        let server = mock_electrum(move |method, _params| match method {
+            "blockchain.scripthash.subscribe" => Ok(Value::Null),
+            "blockchain.scripthash.get_history" => Ok(json!([{ "tx_hash": txid, "height": 0 }])),
+            "blockchain.transaction.get" if fetchable.load(Ordering::SeqCst) => Ok(json!(hex)),
+            "blockchain.transaction.get" => Err(json!({ "code": 1, "message": "daemon error" })),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        Electrum::new(&ElectrumConfig {
+            url: server.url,
+            max_retries: 1,
+            // Every poll is a ping tick, so a flagged script is re-read on each.
+            poll_interval_secs: Some(0),
+            ..Default::default()
+        })
+        .expect("connect to mock electrum")
+    }
+
+    /// Whether a few polls surface a transaction.
+    fn polls_see_a_tx(backend: &Electrum) -> bool {
+        (0..5)
+            .filter_map(|_| backend.poll_event())
+            .any(|event| matches!(event, WatchEvent::TxSeen { .. }))
+    }
+
+    /// Once the retries for a failing fetch are spent, the transaction must
+    /// still be fetched by a later read of the script's history, here the one
+    /// after a reconnect.
+    #[test]
+    fn a_fetch_given_up_on_is_retried_by_a_later_history_read() {
+        let claim = spend_of(OutPoint::new(Txid::from_byte_array([1; 32]), 0));
+        let fetchable = Arc::new(AtomicBool::new(false));
+        let backend = backend_with_unfetchable(&claim, &fetchable);
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+
+        backend
+            .subscribe_script(&script, OutPoint::null())
+            .expect("subscribe");
+        assert!(!polls_see_a_tx(&backend), "the fetch still fails");
+
+        fetchable.store(true, Ordering::SeqCst);
+        backend.needs_rearm.store(true, Ordering::SeqCst);
+        assert!(
+            polls_see_a_tx(&backend),
+            "the transaction the retries gave up on was never fetched again"
+        );
+    }
+
+    /// Retries spent on a script's earlier subscription must not leave its
+    /// next one giving up at the first failed fetch.
+    #[test]
+    fn a_resubscribed_script_retries_a_failed_fetch() {
+        let claim = spend_of(OutPoint::new(Txid::from_byte_array([1; 32]), 0));
+        let fetchable = Arc::new(AtomicBool::new(false));
+        let backend = backend_with_unfetchable(&claim, &fetchable);
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+
+        backend
+            .subscribe_script(&script, OutPoint::null())
+            .expect("subscribe");
+        assert!(!polls_see_a_tx(&backend), "the fetch still fails");
+        backend
+            .unsubscribe_script(&script, OutPoint::null())
+            .expect("unsubscribe");
+        backend
+            .subscribe_script(&script, OutPoint::null())
+            .expect("subscribe again");
+
+        fetchable.store(true, Ordering::SeqCst);
+        assert!(
+            polls_see_a_tx(&backend),
+            "the second subscription gave up on the failed fetch at once"
+        );
+    }
+
+    /// A backend whose one script lists `history` as (tx, height), and whose
+    /// `transaction.get` fails for each tx in `unfetchable`.
+    fn backend_over(history: &[(Transaction, i32)], unfetchable: &[&Transaction]) -> Electrum {
+        let entries: Vec<Value> = history
+            .iter()
+            .map(|(tx, height)| json!({ "tx_hash": tx.compute_txid(), "height": height }))
+            .collect();
+        let served: HashMap<String, String> = history
+            .iter()
+            .filter(|(tx, _)| !unfetchable.contains(&tx))
+            .map(|(tx, _)| (tx.compute_txid().to_string(), serialize_hex(tx)))
+            .collect();
+        let server = mock_electrum(move |method, params| match method {
+            "blockchain.scripthash.get_history" => Ok(json!(entries)),
+            "blockchain.transaction.get" => served
+                .get(params[0].as_str().unwrap_or_default())
+                .map(|hex| json!(hex))
+                .ok_or_else(|| json!({ "code": 1, "message": "daemon error" })),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        Electrum::new(&ElectrumConfig {
+            url: server.url,
+            max_retries: 0,
+            ..Default::default()
+        })
+        .expect("connect to mock electrum")
+    }
+
+    /// A transaction paying the test script, made distinct by `n`.
+    fn deposit(n: u8) -> Transaction {
+        spend_of(OutPoint::new(Txid::from_byte_array([n; 32]), 0))
+    }
+
+    /// A transaction the server cannot serve leaves the spend unknown only if
+    /// it could be the spend. The funding itself, and anything mined before
+    /// it, cannot.
+    #[test]
+    fn spend_check_ignores_unfetchable_txs_that_cannot_spend() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let (funding, earlier) = (deposit(1), deposit(2));
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let history = [(earlier.clone(), 100), (funding.clone(), 101)];
+        let backend = backend_over(&history, &[&earlier, &funding]);
+        assert_eq!(
+            backend
+                .live_spending_transaction(&outpoint, &script)
+                .unwrap(),
+            None,
+            "a tx that cannot spend the outpoint left its spend unknown"
+        );
+
+        // A mempool tx could be the spend, so the spend stays unknown.
+        let pending = deposit(3);
+        let history = [(funding.clone(), 101), (pending.clone(), 0)];
+        let backend = backend_over(&history, &[&pending]);
+        assert!(backend
+            .live_spending_transaction(&outpoint, &script)
+            .is_err());
+    }
+
+    /// A backend watching `script`, on a server whose `get_history` answers
+    /// `error` for `failing` and is empty for everything else.
+    fn watching_backend(
+        script: &Script,
+        failing: &Script,
+        error: Value,
+        max_retries: u8,
+    ) -> (Electrum, MockElectrum) {
+        let failing = scripthash(failing);
+        let server = mock_electrum(move |method, params| match method {
+            "blockchain.scripthash.subscribe" => Ok(Value::Null),
+            "blockchain.scripthash.get_history" if params[0].as_str() == Some(&failing) => {
+                Err(error.clone())
+            }
+            "blockchain.scripthash.get_history" => Ok(json!([])),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries,
+            poll_interval_secs: Some(0),
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        backend
+            .subscribe_script(script, OutPoint::null())
+            .expect("subscribe");
+        (backend, server)
+    }
+
+    /// electrum-client records a script before asking the server and keeps
+    /// the record when the server refuses. A retry on that connection must
+    /// still reach the server, or the script counts as armed while unheard.
+    #[test]
+    fn a_refused_subscribe_is_sent_again_on_retry() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let refuse = Arc::new(AtomicBool::new(true));
+        let refusing = refuse.clone();
+        let server = mock_electrum(move |method, _params| match method {
+            "blockchain.scripthash.subscribe" if refusing.load(Ordering::SeqCst) => {
+                Err(json!({ "code": 1, "message": "too many subscriptions" }))
+            }
+            "blockchain.scripthash.subscribe" => Ok(Value::Null),
+            "blockchain.scripthash.get_history" => Ok(json!([])),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 1,
+            poll_interval_secs: Some(0),
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        assert!(backend.subscribe_script(&script, OutPoint::null()).is_err());
+
+        refuse.store(false, Ordering::SeqCst);
+        // Before the connection is recycled, the record left by the refusal
+        // must not pass for a subscription.
+        assert!(backend.subscribe_script(&script, OutPoint::null()).is_err());
+        // What the watcher's loop does between retries.
+        backend.poll_event();
+        backend
+            .subscribe_script(&script, OutPoint::null())
+            .expect("subscribe on retry");
+        let subscribes = server
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call == "blockchain.scripthash.subscribe")
+            .count();
+        assert_eq!(subscribes, 2, "the retry never asked the server");
+    }
+
+    /// A dropped connection takes its subscriptions with it, whether or not a
+    /// reconnect follows. Until they are re-armed and replayed, nothing heard
+    /// on them can be trusted.
+    #[test]
+    fn a_transport_failure_leaves_every_script_unheard() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let daemon_error = json!({ "code": 1, "message": "daemon error" });
+        let (backend, server) = watching_backend(&script, &ScriptBuf::new(), daemon_error, 1);
+        assert!(!backend.may_have_missed(&script));
+
+        server.set_down(true);
+        assert!(backend.get_block_count().is_err());
+        assert!(
+            backend.may_have_missed(&script),
+            "subscriptions on a dead connection still counted as heard"
+        );
+
+        server.set_down(false);
+        for _ in 0..5 {
+            backend.poll_event();
+        }
+        assert!(!backend.may_have_missed(&script));
+    }
+
+    /// An error the server answers with, a rate limit included, says nothing
+    /// about the connection, so it must not cast doubt on the subscriptions.
+    #[test]
+    fn a_server_error_leaves_the_subscriptions_trusted() {
+        let (script, failing) = (
+            ScriptBuf::from_bytes(vec![0x51]),
+            ScriptBuf::from_bytes(vec![0x52]),
+        );
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        for (error, max_retries) in [
+            (json!({ "code": 1, "message": "daemon error" }), 1),
+            // No retries: a rate limit backs off for 30s before each one.
+            (
+                json!({ "code": -32600, "message": "excessive resource usage" }),
+                0,
+            ),
+        ] {
+            let (backend, _server) =
+                watching_backend(&script, &failing, error.clone(), max_retries);
+            assert!(backend
+                .live_spending_transaction(&outpoint, &failing)
+                .is_err());
+            assert!(!backend.may_have_missed(&script), "{}", error);
+        }
+    }
+
+    /// A spend mined in the same block as its funding is still a spend.
+    #[test]
+    fn spend_check_finds_a_spend_mined_with_its_funding() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let funding = deposit(1);
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let claim = spend_of(outpoint);
+        let history = [(funding.clone(), 101), (claim.clone(), 101)];
+        let backend = backend_over(&history, &[]);
+        assert_eq!(
+            backend
+                .live_spending_transaction(&outpoint, &script)
+                .unwrap(),
+            Some(claim)
+        );
+
+        // And one the server cannot serve leaves the spend unknown.
+        let pending = deposit(3);
+        let history = [(funding, 101), (pending.clone(), 101)];
+        let backend = backend_over(&history, &[&pending]);
+        assert!(backend
+            .live_spending_transaction(&outpoint, &script)
+            .is_err());
+    }
+
+    /// One transaction the server cannot serve must not hide a spend it can.
+    #[test]
+    fn spend_check_finds_the_spend_past_an_unfetchable_tx() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let funding = deposit(1);
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let (other, claim) = (deposit(2), spend_of(outpoint));
+        let history = [(funding, 101), (other.clone(), 0), (claim.clone(), 0)];
+        let backend = backend_over(&history, &[&other]);
+        assert_eq!(
+            backend
+                .live_spending_transaction(&outpoint, &script)
+                .unwrap(),
+            Some(claim)
+        );
     }
 
     /// A concurrent call can enter `RawClient::recv` after the elected reader

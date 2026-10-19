@@ -3050,8 +3050,6 @@ impl MakerTrait for MakerServer {
     }
 
     fn incoming_contract_breached(&self, swap_id: &str) -> Result<Option<Txid>, MakerError> {
-        use crate::watch_tower::{watcher::WatcherEvent, watcher_error::WatcherError};
-
         let funding_outpoints: Vec<OutPoint> = {
             let swaps =
                 lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
@@ -3070,22 +3068,10 @@ impl MakerTrait for MakerServer {
         };
 
         for funding_outpoint in funding_outpoints {
-            let spender = match self.watch_service.watch_request(funding_outpoint) {
-                // A watched outpoint with no recorded spend replies `spending_tx: None`.
-                Ok(WatcherEvent::UtxoSpent { spending_tx, .. }) => {
-                    spending_tx.map(|tx| tx.compute_txid())
-                }
-                // `NoOutpoint` means the watch armed at ProofOfFunding is gone; the
-                // service already turns a watcher `Error` reply into `Err`.
-                other => {
-                    return Err(MakerError::Watcher(WatcherError::General(format!(
-                        "breach query for funding {funding_outpoint} of swap {swap_id} failed: {other:?}"
-                    ))));
-                }
-            };
             // Before the handover only the previous hop's pre-signed contract can
             // spend the 2-of-2, so any spend ends the swap.
-            if let Some(spender) = spender {
+            if let Some(spender) = funding_spender(&self.watch_service, funding_outpoint, swap_id)?
+            {
                 log::warn!(
                     "[{}] Incoming funding {} of swap {} spent by {}: incoming contract broadcast",
                     self.config.network_port,
@@ -3931,6 +3917,28 @@ impl MakerRpc for MakerServer {
     }
 }
 
+/// The txid that spent a swap's incoming funding, as the watcher has it. Any
+/// answer but a watched outpoint is an error, never "not breached".
+fn funding_spender(
+    watch_service: &WatchService,
+    funding_outpoint: OutPoint,
+    swap_id: &str,
+) -> Result<Option<Txid>, MakerError> {
+    use crate::watch_tower::{watcher::WatcherEvent, watcher_error::WatcherError};
+
+    match watch_service.watch_request(funding_outpoint) {
+        // A watched outpoint with no recorded spend replies `spending_tx: None`.
+        Ok(WatcherEvent::UtxoSpent { spending_tx, .. }) => {
+            Ok(spending_tx.map(|tx| tx.compute_txid()))
+        }
+        // `NoOutpoint` means the watch armed at ProofOfFunding is gone; the
+        // service already turns a watcher `Error` reply into `Err`.
+        other => Err(MakerError::Watcher(WatcherError::General(format!(
+            "breach query for funding {funding_outpoint} of swap {swap_id} failed: {other:?}"
+        )))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3947,6 +3955,39 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    /// A breach query the watcher cannot answer, or for a watch it no longer
+    /// has, must not read as "not breached": the swap would carry on while
+    /// the previous hop's contract is on chain.
+    #[test]
+    fn breach_query_without_an_answer_is_an_error() {
+        use crate::watch_tower::{service::answering, watcher::WatcherEvent};
+        use bitcoin::hashes::Hash;
+
+        let funding = bitcoin::OutPoint::new(bitcoin::Txid::all_zeros(), 0);
+        for answer in [
+            WatcherEvent::Error("not subscribed".to_string()),
+            WatcherEvent::NoOutpoint,
+        ] {
+            let service = answering(answer.clone());
+            assert!(
+                super::funding_spender(&service, funding, "swap").is_err(),
+                "{:?}",
+                answer
+            );
+            service.shutdown();
+        }
+
+        let service = answering(WatcherEvent::UtxoSpent {
+            outpoint: funding,
+            spending_tx: None,
+        });
+        assert_eq!(
+            super::funding_spender(&service, funding, "swap").unwrap(),
+            None
+        );
+        service.shutdown();
+    }
 
     #[test]
     fn maker_config_debug_hides_wallet_password() {

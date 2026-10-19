@@ -300,6 +300,35 @@ pub fn start_maker_watch_service(
     .map_err(WatcherError::from)
 }
 
+/// A watch service whose watcher answers every query with `answer`, for
+/// testing how callers read each answer.
+#[cfg(test)]
+pub(crate) fn answering(answer: WatcherEvent) -> WatchService {
+    answering_with(move || answer.clone())
+}
+
+/// [`answering`] with each answer read from `answer` as the query arrives.
+#[cfg(test)]
+pub(crate) fn answering_with(answer: impl Fn() -> WatcherEvent + Send + 'static) -> WatchService {
+    let (tx, rx) = mpsc::channel();
+    WatchService::spawn(
+        tx,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+        move || {
+            for command in rx {
+                match command {
+                    WatcherCommand::WatchRequest { reply, .. } => _ = reply.send(answer()),
+                    WatcherCommand::Shutdown => break,
+                    _ => {}
+                }
+            }
+            Ok(())
+        },
+    )
+    .expect("spawn test watcher")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
