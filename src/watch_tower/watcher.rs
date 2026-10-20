@@ -2853,7 +2853,9 @@ mod tests {
     }
 
     /// A server that refuses the re-arm keeps every watch blind, and the
-    /// poll must still end: the drain cannot spin on re-arming.
+    /// poll must still end: the drain cannot spin on re-arming. Recovery reads
+    /// the block height from the watcher, so the tip must keep following the
+    /// server meanwhile, and requests must still be answered.
     #[test]
     fn refused_re_arm_keeps_watches_blind_without_spinning() {
         let outpoints: Vec<OutPoint> = (1..=4)
@@ -2864,15 +2866,25 @@ mod tests {
         for (n, outpoint) in (1..=4).zip(&outpoints) {
             register(&mut watcher, *outpoint, contract_script(n));
         }
+        assert_eq!(watcher.tip.load(Ordering::Acquire), 1);
         let limit = Duration::from_secs(20);
 
         node.lock().unwrap().refuse_subscribe = true;
         server.hang_up();
-        for _ in 0..3 {
+        watcher = drain_within(watcher, limit);
+        for height in 2..=4 {
+            // A block mined while the re-arm is refused.
+            let header = bitcoin::block::Header {
+                nonce: height as u32,
+                ..bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header
+            };
+            server.set_tip(height, &header);
             watcher = drain_within(watcher, limit);
             for n in 1..=4 {
                 assert!(may_have_missed(&watcher, &contract_script(n)));
             }
+            assert_eq!(watcher.tip.load(Ordering::Acquire), height);
+            (watcher, _) = ask_within(watcher, outpoints[0], limit);
         }
 
         node.lock().unwrap().refuse_subscribe = false;

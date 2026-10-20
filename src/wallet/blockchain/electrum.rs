@@ -1193,7 +1193,8 @@ fn checked_confirmations(tip: u64, height: u64) -> Result<u32, WalletError> {
 /// means the cap is spent, so the caller stops re-reading the script on its own.
 fn retry_fetch(attempts: &mut HashMap<Txid, u8>, txid: Txid, cap: u8) -> bool {
     let tries = attempts.entry(txid).or_default();
-    *tries += 1;
+    // Counted again on every later read of the script, so it must not wrap.
+    *tries = tries.saturating_add(1);
     *tries <= cap
 }
 
@@ -1940,28 +1941,41 @@ impl Blockchain for Electrum {
                     }
                 }
             }
-            // Still flagged, every watch stays blind until all are armed. The
-            // poll ends here: re-subscribing the headers would hand back a
-            // block event each time, and the drain would never finish.
+            // Still flagged, every watch stays blind until all are armed.
             if refused {
                 self.needs_rearm.store(true, Ordering::SeqCst);
-                return None;
             }
             // The rebuilt socket lost the header subscription too; without it
             // `block_headers_pop` stays empty and tip updates silently stop. The
             // reply is the tip, which covers blocks mined while we were deaf.
+            // Recovery reads its height from that, so a refusal must not stop it.
             match self.call(HEADERS_SUBSCRIBE, |c| c.block_headers_subscribe()) {
-                Ok(tip) => state
-                    .pending
-                    .push_back(WatchEvent::BlockConnected(BlockRef {
-                        height: tip.height as u64,
-                        hash: serialize(&tip.header.block_hash()),
-                    })),
+                Ok(tip) => {
+                    let (height, hash) = (tip.height as i64, tip.header.block_hash());
+                    // A refused pass runs again on the next poll, so only a new
+                    // tip is news there; repeating the same one would keep the
+                    // drain from ever finishing.
+                    let moved = height != state.last_height || state.last_hash != Some(hash);
+                    if moved || !refused {
+                        state.last_height = height;
+                        state.last_hash = Some(hash);
+                        state
+                            .pending
+                            .push_back(WatchEvent::BlockConnected(BlockRef {
+                                height: height as u64,
+                                hash: serialize(&hash),
+                            }));
+                    }
+                }
                 Err(e) => {
                     log::warn!("re-arm header subscription after reconnect failed: {e:?}");
                     self.needs_rearm.store(true, Ordering::SeqCst);
                     state.pending.push_back(WatchEvent::Unreachable);
                 }
+            }
+            // The poll ends here: the scripts wait for the re-arm.
+            if refused {
+                return state.pending.pop_front();
             }
         }
 
@@ -2110,9 +2124,15 @@ pub(crate) mod tests {
         hang_up: Arc<AtomicBool>,
         down: Arc<AtomicBool>,
         dropped: Arc<Mutex<Option<String>>>,
+        tip: Arc<Mutex<(u64, String)>>,
     }
 
     impl MockElectrum {
+        /// The tip `blockchain.headers.subscribe` reports from now on.
+        pub(crate) fn set_tip(&self, height: u64, header: &bitcoin::block::Header) {
+            *self.tip.lock().unwrap() = (height, serialize_hex(header));
+        }
+
         /// Drop the connection at its next request, unanswered, as a
         /// restarting server would. Later connections are served as before.
         pub(crate) fn hang_up(&self) {
@@ -2147,10 +2167,11 @@ pub(crate) mod tests {
         let hang_up = Arc::new(AtomicBool::new(false));
         let down = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(Mutex::new(None::<String>));
+        let tip = Arc::new(Mutex::new((1, header_hex.clone())));
         let answer = Arc::new(answer);
         let (server_calls, server_hang_up, server_down) =
             (calls.clone(), hang_up.clone(), down.clone());
-        let server_dropped = dropped.clone();
+        let (server_dropped, server_tip) = (dropped.clone(), tip.clone());
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
             // Polled rather than blocking in accept, so going down can close
@@ -2184,6 +2205,7 @@ pub(crate) mod tests {
                 let (answer, calls) = (answer.clone(), server_calls.clone());
                 let (header_hex, hang_up) = (header_hex.clone(), server_hang_up.clone());
                 let (down, dropped) = (server_down.clone(), server_dropped.clone());
+                let tip = server_tip.clone();
                 thread::spawn(move || {
                     let mut writer = stream.try_clone().expect("clone electrum stream");
                     let mut reader = BufReader::new(stream);
@@ -2206,7 +2228,8 @@ pub(crate) mod tests {
                             }
                             "blockchain.block.header" => Ok(json!(header_hex)),
                             "blockchain.headers.subscribe" => {
-                                Ok(json!({ "height": 1, "hex": header_hex }))
+                                let (height, hex) = tip.lock().unwrap().clone();
+                                Ok(json!({ "height": height, "hex": hex }))
                             }
                             "server.ping" => Ok(Value::Null),
                             method => answer(method, &request["params"]),
@@ -2232,6 +2255,15 @@ pub(crate) mod tests {
             hang_up,
             down,
             dropped,
+            tip,
+        }
+    }
+
+    /// A block header distinct for each `nonce`, standing in for a mined block.
+    fn block_header(nonce: u32) -> bitcoin::block::Header {
+        bitcoin::block::Header {
+            nonce,
+            ..bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header
         }
     }
 
@@ -2307,6 +2339,103 @@ pub(crate) mod tests {
             polls_see_a_tx(&backend),
             "the transaction the retries gave up on was never fetched again"
         );
+    }
+
+    /// A transaction that never fetches is counted again on every later read
+    /// of its script, so the count must stop at its ceiling, not overflow, and
+    /// spent retries must stay spent.
+    #[test]
+    fn a_fetch_failing_for_good_stops_counting_at_the_ceiling() {
+        let txid = Txid::from_byte_array([1; 32]);
+        let mut attempts = HashMap::from([(txid, u8::MAX - 1)]);
+        for _ in 0..3 {
+            assert!(!retry_fetch(&mut attempts, txid, 1));
+            assert_eq!(attempts[&txid], u8::MAX);
+        }
+    }
+
+    /// A count at its ceiling must not keep the transaction from being fetched
+    /// by a later history read once the server can serve it.
+    #[test]
+    fn a_fetch_counted_to_the_ceiling_is_still_recovered() {
+        let claim = spend_of(OutPoint::new(Txid::from_byte_array([1; 32]), 0));
+        let fetchable = Arc::new(AtomicBool::new(false));
+        let backend = backend_with_unfetchable(&claim, &fetchable);
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+
+        backend
+            .subscribe_script(&script, OutPoint::null())
+            .expect("subscribe");
+        backend
+            .notifier
+            .lock()
+            .unwrap()
+            .fetch_attempts
+            .insert(claim.compute_txid(), u8::MAX);
+        assert!(!polls_see_a_tx(&backend), "the fetch still fails");
+
+        fetchable.store(true, Ordering::SeqCst);
+        backend.needs_rearm.store(true, Ordering::SeqCst);
+        assert!(
+            polls_see_a_tx(&backend),
+            "the transaction at the count ceiling was never fetched again"
+        );
+        assert!(!backend
+            .notifier
+            .lock()
+            .unwrap()
+            .fetch_attempts
+            .contains_key(&claim.compute_txid()));
+    }
+
+    /// While the server keeps refusing a re-arm, each new tip must still come
+    /// through once, a block replaced at the same height included, and an
+    /// unchanged tip not at all, so the poll keeps ending.
+    #[test]
+    fn a_refused_re_arm_reports_each_new_tip_once() {
+        let refuse = Arc::new(AtomicBool::new(false));
+        let server = {
+            let refuse = refuse.clone();
+            mock_electrum(move |method, _params| match method {
+                "blockchain.scripthash.subscribe" if refuse.load(Ordering::SeqCst) => {
+                    Err(json!({ "code": 1, "message": "too many subscriptions" }))
+                }
+                "blockchain.scripthash.subscribe" => Ok(Value::Null),
+                "blockchain.scripthash.get_history" => Ok(json!([])),
+                method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+            })
+        };
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 1,
+            poll_interval_secs: Some(0),
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        backend
+            .subscribe_script(&script, OutPoint::null())
+            .expect("subscribe");
+        refuse.store(true, Ordering::SeqCst);
+        server.hang_up();
+        let tips = || -> Vec<(u64, Vec<u8>)> {
+            (0..5)
+                .filter_map(|_| backend.poll_event())
+                .filter_map(|event| match event {
+                    WatchEvent::BlockConnected(b) => Some((b.height, b.hash)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(tips().is_empty(), "the tip has not moved");
+
+        let mined = block_header(2);
+        server.set_tip(2, &mined);
+        assert_eq!(tips(), [(2, serialize(&mined.block_hash()))]);
+        let replacement = block_header(3);
+        server.set_tip(2, &replacement);
+        assert_eq!(tips(), [(2, serialize(&replacement.block_hash()))]);
+        assert!(backend.may_have_missed(&script));
     }
 
     /// Retries spent on a script's earlier subscription must not leave its

@@ -258,8 +258,11 @@ openswap wallet::blockchain::corerpc::tests::zmq_sequence_wraparound_is_not_a_ga
 openswap wallet::blockchain::corerpc::tests::zmq_topics_are_sequenced_independently
 openswap wallet::blockchain::electrum::tests::a_cached_tip_below_the_mined_height_is_read_again
 openswap wallet::blockchain::electrum::tests::a_changed_tip_drops_script_answers_and_headers
+openswap wallet::blockchain::electrum::tests::a_fetch_counted_to_the_ceiling_is_still_recovered
+openswap wallet::blockchain::electrum::tests::a_fetch_failing_for_good_stops_counting_at_the_ceiling
 openswap wallet::blockchain::electrum::tests::a_fetch_given_up_on_is_retried_by_a_later_history_read
 openswap wallet::blockchain::electrum::tests::a_full_tx_cache_starts_over
+openswap wallet::blockchain::electrum::tests::a_refused_re_arm_reports_each_new_tip_once
 openswap wallet::blockchain::electrum::tests::a_refused_subscribe_is_sent_again_on_retry
 openswap wallet::blockchain::electrum::tests::a_resubscribed_script_retries_a_failed_fetch
 openswap wallet::blockchain::electrum::tests::a_server_error_leaves_the_subscriptions_trusted
