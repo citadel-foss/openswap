@@ -268,6 +268,7 @@ openswap wallet::blockchain::electrum::tests::a_resubscribed_script_retries_a_fa
 openswap wallet::blockchain::electrum::tests::a_server_error_leaves_the_subscriptions_trusted
 openswap wallet::blockchain::electrum::tests::a_transport_failure_leaves_every_script_unheard
 openswap wallet::blockchain::electrum::tests::accumulated_total_above_max_money_errors
+openswap wallet::blockchain::electrum::tests::an_unreachable_history_read_stops_the_script_walk
 openswap wallet::blockchain::electrum::tests::cached_transaction_does_not_hide_server_eviction
 openswap wallet::blockchain::electrum::tests::calls_on_one_electrum_socket_are_serialized
 openswap wallet::blockchain::electrum::tests::clearnet_default_has_no_proxy

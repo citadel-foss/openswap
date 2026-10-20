@@ -2259,11 +2259,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// A block header distinct for each `nonce`, standing in for a mined block.
+    /// A block header distinct for each `nonce`, standing in for a block mined
+    /// on genesis. The parent keeps it apart from genesis, whose nonce is 2.
     fn block_header(nonce: u32) -> bitcoin::block::Header {
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
         bitcoin::block::Header {
             nonce,
-            ..bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header
+            prev_blockhash: genesis.block_hash(),
+            ..genesis
         }
     }
 
@@ -2289,8 +2292,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// One script whose history holds `tx`, which `transaction.get` serves only
-    /// while `fetchable` is set. Returns the backend, already watching it.
+    /// A backend whose server lists `tx` in every script's history and serves
+    /// it from `transaction.get` only while `fetchable` is set. Nothing is
+    /// subscribed yet.
     fn backend_with_unfetchable(tx: &Transaction, fetchable: &Arc<AtomicBool>) -> Electrum {
         let (txid, hex) = (tx.compute_txid(), serialize_hex(tx));
         let fetchable = fetchable.clone();
@@ -2621,6 +2625,37 @@ pub(crate) mod tests {
             backend.poll_event();
         }
         assert!(!backend.may_have_missed(&script));
+    }
+
+    /// A history read the server never answers would fail the same way for
+    /// every other script, so the walk stops there and leaves them all for
+    /// the next poll instead of waiting out each one's retries.
+    #[test]
+    fn an_unreachable_history_read_stops_the_script_walk() {
+        let scripts = [
+            ScriptBuf::from_bytes(vec![0x51]),
+            ScriptBuf::from_bytes(vec![0x52]),
+        ];
+        let daemon_error = json!({ "code": 1, "message": "daemon error" });
+        let (backend, server) = watching_backend(&scripts[0], &ScriptBuf::new(), daemon_error, 0);
+        backend
+            .subscribe_script(&scripts[1], OutPoint::null())
+            .expect("subscribe");
+        let history_reads = || backend.requests.lock().unwrap().get(GET_HISTORY).copied();
+        let before = history_reads().unwrap_or_default();
+
+        backend
+            .notifier
+            .lock()
+            .unwrap()
+            .dirty
+            .extend(scripts.clone());
+        server.drop_requests_for(Some(GET_HISTORY));
+        backend.poll_event();
+
+        assert_eq!(history_reads().unwrap_or_default() - before, 1);
+        let state = backend.notifier.lock().unwrap();
+        assert!(scripts.iter().all(|spk| state.dirty.contains(spk)));
     }
 
     /// An error the server answers with, a rate limit included, says nothing

@@ -41,7 +41,7 @@ use crate::{
         FidelityError, RecoveryOutcome, RestoreOptions, Wallet, WalletError, MAX_FIDELITY_TIMELOCK,
         MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
     },
-    watch_tower::service::WatchService,
+    watch_tower::{service::WatchService, watcher::WatcherEvent, watcher_error::WatcherError},
 };
 
 #[cfg(feature = "integration-test")]
@@ -3924,8 +3924,6 @@ fn funding_spender(
     funding_outpoint: OutPoint,
     swap_id: &str,
 ) -> Result<Option<Txid>, MakerError> {
-    use crate::watch_tower::{watcher::WatcherEvent, watcher_error::WatcherError};
-
     match watch_service.watch_request(funding_outpoint) {
         // A watched outpoint with no recorded spend replies `spending_tx: None`.
         Ok(WatcherEvent::UtxoSpent { spending_tx, .. }) => {
@@ -3949,7 +3947,9 @@ mod tests {
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
         utill::MIN_RELAY_FEE_RATE,
         wallet::{FidelityError, WalletError, MIN_FIDELITY_BOND_AMOUNT_SATS},
+        watch_tower::{service::answering, watcher::WatcherEvent},
     };
+    use bitcoin::hashes::Hash;
     use std::{
         sync::{atomic::Ordering, mpsc, Arc, TryLockError},
         thread,
@@ -3961,9 +3961,6 @@ mod tests {
     /// the previous hop's contract is on chain.
     #[test]
     fn breach_query_without_an_answer_is_an_error() {
-        use crate::watch_tower::{service::answering, watcher::WatcherEvent};
-        use bitcoin::hashes::Hash;
-
         let funding = bitcoin::OutPoint::new(bitcoin::Txid::all_zeros(), 0);
         for answer in [
             WatcherEvent::Error("not subscribed".to_string()),

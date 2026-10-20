@@ -24,6 +24,7 @@ use crate::{
         HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE, UNBROADCAST_DISCARD_GRACE,
     },
     wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, Wallet},
+    watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
 
 use super::{
@@ -1131,14 +1132,14 @@ const PREIMAGE_LEN: usize = 32;
 /// not give is an error, never "unspent", and so is a watch it does not
 /// have: every contract output is watched until its swap is finished.
 fn watched_spend(
-    watch_service: &crate::watch_tower::service::WatchService,
+    watch_service: &WatchService,
     outpoint: OutPoint,
 ) -> Result<Option<bitcoin::Transaction>, MakerError> {
     match watch_service.watch_request(outpoint).map_err(|e| {
         log::warn!("watch request for {outpoint} failed: {e}");
         MakerError::General("watchtower query failed")
     })? {
-        crate::watch_tower::watcher::WatcherEvent::UtxoSpent { spending_tx, .. } => Ok(spending_tx),
+        WatcherEvent::UtxoSpent { spending_tx, .. } => Ok(spending_tx),
         other => {
             log::warn!("watch request for {outpoint} has no answer: {other:?}");
             Err(MakerError::General(
@@ -2278,7 +2279,7 @@ pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::watch_tower::{service::answering, watcher::WatcherEvent};
+    use crate::watch_tower::service::answering;
     use bitcoin::hashes::Hash;
     use std::io::Write;
 
