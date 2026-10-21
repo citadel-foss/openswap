@@ -401,6 +401,9 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
     let bitcoind = &framework.bitcoind;
     let maker = world.makers()[0].inner().clone();
     let locktime: u16 = 30;
+    // The test mines every block itself. A background block could confirm
+    // the refund between the mempool checks below and close the swap early.
+    pause_block_generation(&framework);
 
     let preimage = Preimage([0x79; 32]);
     let swap_id = preimage.payment_hash().to_string();
@@ -490,6 +493,7 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
         ln.claim_held_payment(&preimage).is_err(),
         "the refunded swap's held payment must be failed back"
     );
+    framework.set_block_gen_paused(false);
 }
 
 /// Holds a watchdog test switch on until dropped, even if the test panics.
