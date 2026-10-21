@@ -1442,7 +1442,7 @@ fn watchdog_finish_swap_in(
     // this an `InPaid` swap whose payment failed would be polled forever.
     let funded_at = match swap.funding_height {
         Some(height) => height,
-        None => match recover_swap_in_funding_height(maker, swap_id, swap)? {
+        None => match recover_funding_height(maker, swap_id, swap, LnMakerPhase::InPaid)? {
             Some(height) => height,
             None => return Ok(()),
         },
@@ -1516,31 +1516,32 @@ fn swap_in_htlc_refunded(maker: &Arc<MakerServer>, swap: &LnMakerSwap) -> Result
     maker.is_htlc_spend_confirmed(&outpoint, &spk)
 }
 
-/// Recovers the funding height of an InPaid swap-in stored without one, as a
-/// handler whose height lookup failed used to store it. The watchdog cannot
-/// time the taker's refund window without it. Returns the height once it is
-/// stored; `None` leaves the swap for a later pass, because the funding has
-/// no confirmation height yet or the swap has changed since `swap` was read.
+/// Recovers the funding height of a swap stored in `phase` without one, as a
+/// handler whose height lookup failed stores it. The watchdog cannot time
+/// the refund window without it. Returns the height once it is stored;
+/// `None` leaves the swap for a later pass, because the funding has no
+/// confirmation height yet or the swap has changed since `swap` was read.
 /// A failed lookup is an error, and the swap is kept.
-fn recover_swap_in_funding_height(
+fn recover_funding_height(
     maker: &Arc<MakerServer>,
     swap_id: &str,
     swap: &LnMakerSwap,
+    phase: LnMakerPhase,
 ) -> Result<Option<u32>, MakerError> {
     let Some((outpoint, _)) = swap.funding else {
         return Ok(None);
     };
     let Some(height) = maker.tx_confirmation_height(&outpoint.txid)? else {
         log::warn!(
-            "Swap-in {swap_id}: funding {outpoint} has no confirmation height; keeping the swap \
+            "Swap {swap_id}: funding {outpoint} has no confirmation height; keeping the swap \
              until it does"
         );
         return Ok(None);
     };
-    if !maker.fill_ln_funding_height(swap_id, LnMakerPhase::InPaid, outpoint, height)? {
+    if !maker.fill_ln_funding_height(swap_id, phase, outpoint, height)? {
         return Ok(None);
     }
-    log::info!("Swap-in {swap_id}: recovered funding height {height} from the chain");
+    log::info!("Swap {swap_id}: recovered funding height {height} from the chain");
     Ok(Some(height))
 }
 
@@ -1658,12 +1659,19 @@ fn watchdog_resolve_swap_out(
         }
         HtlcWatch::Unspent => {
             // Unspent: refund once the CSV window has passed. An early
-            // attempt fails non-BIP68-final harmlessly and is retried.
+            // attempt fails non-BIP68-final harmlessly and is retried. A
+            // swap stored without its height gets the funding's.
+            let funded_at = match swap.funding_height {
+                Some(height) => height,
+                None => {
+                    match recover_funding_height(maker, swap_id, swap, LnMakerPhase::OutFunded)? {
+                        Some(height) => height,
+                        None => return Ok(()),
+                    }
+                }
+            };
             let current = maker.get_current_height()?;
-            let refundable = swap
-                .funding_height
-                .map(|h| current >= h.saturating_add(swap.locktime as u32))
-                .unwrap_or(false);
+            let refundable = current >= funded_at.saturating_add(swap.locktime as u32);
             let unspent_on_chain = || {
                 maker
                     .htlc_unspent_and_age(&outpoint)
@@ -1681,6 +1689,9 @@ fn watchdog_resolve_swap_out(
                 UnspentHtlc::Refund => {}
             }
             let mut swap = swap.clone();
+            // Stored below with the refund, so it must not carry the
+            // snapshot's missing height over the one just recovered.
+            swap.funding_height = Some(funded_at);
             let destination = payout_script(maker, swap_id, &mut swap)?;
             let refund_tx = swap
                 .htlc
@@ -1720,6 +1731,20 @@ fn watchdog_resolve_swap_out(
             Ok(())
         }
     }
+}
+
+/// Runs the watchdog's pass over an OutFunded swap-out on a snapshot the test
+/// supplies, whatever state the stored swap has reached since.
+#[cfg(feature = "integration-test")]
+pub fn watchdog_resolve_swap_out_snapshot(
+    maker: &Arc<MakerServer>,
+    swap_id: &str,
+    swap: &LnMakerSwap,
+) -> Result<(), MakerError> {
+    let (Some(ln), Some(router)) = (maker.lightning.clone(), maker.ln_router.clone()) else {
+        return Err(MakerError::General("lightning is not configured"));
+    };
+    watchdog_resolve_swap_out(maker, &LnContext { ln, router }, swap_id, swap)
 }
 
 /// Stops the watchdog's swap-out refund between its two steps, recording it
