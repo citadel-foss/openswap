@@ -312,6 +312,16 @@ struct NotifierState {
     /// Scripts whose history still needs re-reading after a failed tx fetch. The
     /// server only notifies on status changes, so nothing else would revisit them.
     dirty: HashSet<ScriptBuf>,
+    /// Scripts whose history failure has already been warned about.
+    history_failures: HashSet<ScriptBuf>,
+    /// Last recycle warning's reason, error category, and time. Only logs are throttled.
+    recycle_warning: Option<(
+        &'static str,
+        std::mem::Discriminant<electrum_client::Error>,
+        Instant,
+    )>,
+    /// Last reported (blind, total) outpoint counts for backend-known subscriptions.
+    blind_counts: Option<(usize, usize)>,
     /// Events buffered between `poll_event` calls (one notification can yield
     /// many new transactions; we hand them back one at a time).
     pending: VecDeque<WatchEvent>,
@@ -330,6 +340,30 @@ struct NotifierState {
     wallet_scripts: HashMap<ScriptBuf, Option<Vec<UnspentRes>>>,
     /// `reconnects` when `wallet_scripts` was armed. A rebuilt socket holds none of them.
     wallet_connection: u64,
+}
+
+impl NotifierState {
+    fn log_blind_watches(&mut self, needs_rearm: bool) {
+        let total: usize = self
+            .subscriptions
+            .values()
+            .map(|sub| sub.watchers.len())
+            .sum();
+        let blind: usize = self
+            .subscriptions
+            .iter()
+            .filter(|(spk, _)| needs_rearm || self.dirty.contains(*spk))
+            .map(|(_, sub)| sub.watchers.len())
+            .sum();
+        if self.blind_counts != Some((blind, total)) {
+            if blind > 0 {
+                log::warn!("{blind} of {total} watches blind (backend-known subscriptions)");
+            } else if self.blind_counts.is_some_and(|(previous, _)| previous > 0) {
+                log::info!("{blind} of {total} watches blind (backend-known subscriptions)");
+            }
+            self.blind_counts = (total > 0).then_some((blind, total));
+        }
+    }
 }
 
 /// Answers kept so the same question is not sent twice. Public servers
@@ -439,10 +473,7 @@ impl Drop for Electrum {
         let mut counts: Vec<_> = requests.iter().collect();
         counts.sort();
         let total: u64 = counts.iter().map(|(_, n)| **n).sum();
-        log::debug!(
-            "electrum connection to {} sent {total} request(s): {counts:?}",
-            self.config.url
-        );
+        log::debug!("electrum connection sent {total} request(s): {counts:?}");
     }
 }
 
@@ -735,10 +766,9 @@ impl Electrum {
         // Without a proxy an onion host has no route: it cannot be resolved, so
         // fail with the reason rather than an opaque DNS error.
         if cfg.socks5.is_none() && url_host(&cfg.url).ends_with(".onion") {
-            return Err(electrum_err(format!(
-                "electrum url {} is an onion address but no socks5 proxy is configured",
-                cfg.url
-            )));
+            return Err(electrum_err(
+                "electrum url is an onion address but no socks5 proxy is configured".to_string(),
+            ));
         }
         let (inner, genesis, last_height, last_hash) = Self::connect(cfg, &shutdown)?;
         let config = cfg.clone();
@@ -819,8 +849,7 @@ impl Electrum {
         for attempt in 1..=cfg.max_retries {
             let backoff = backoff_after(attempt, &last);
             log::warn!(
-                "electrum connect to {} failed ({last:?}); retrying in {}s (attempt {attempt}/{})",
-                cfg.url,
+                "electrum connect failed ({last:?}); retrying in {}s (attempt {attempt}/{})",
                 backoff.as_secs(),
                 cfg.max_retries
             );
@@ -844,8 +873,7 @@ impl Electrum {
 
         let attempts = cfg.max_retries.saturating_add(1);
         log::error!(
-            "electrum backend {} unreachable at connect after {attempts} attempt(s): {last:?}",
-            cfg.url
+            "electrum backend unreachable at connect after {attempts} attempt(s): {last:?}"
         );
         Err(WalletError::ElectrumUnreachable { attempts, last })
     }
@@ -944,8 +972,7 @@ impl Electrum {
             // An idle server dropping the session is routine, so only the first
             // attempt is a warning; the rest are noise until we actually fail.
             let msg = format!(
-                "electrum call to {} failed ({last:?}); reconnecting in {}s (attempt {attempt}/{})",
-                self.config.url,
+                "electrum call failed ({last:?}); reconnecting in {}s (attempt {attempt}/{})",
                 backoff.as_secs(),
                 self.config.max_retries
             );
@@ -981,10 +1008,7 @@ impl Electrum {
         }
 
         let attempts = self.config.max_retries.saturating_add(1);
-        log::error!(
-            "electrum backend {} unreachable after {attempts} attempt(s): {last:?}",
-            self.config.url
-        );
+        log::error!("electrum backend unreachable after {attempts} attempt(s): {last:?}");
         Err(WalletError::ElectrumUnreachable { attempts, last })
     }
 
@@ -1016,7 +1040,7 @@ impl Electrum {
         *guard = fresh;
         self.needs_rearm.store(true, Ordering::SeqCst);
         self.reconnects.fetch_add(1, Ordering::Relaxed);
-        log::info!("reconnected to electrum backend {}", self.config.url);
+        log::info!("reconnected to electrum backend");
         Ok(())
     }
 
@@ -1047,18 +1071,36 @@ impl Electrum {
                             let (refused, retry_at) =
                                 state.refusals.entry(spk.to_owned()).or_insert((0, now));
                             *refused = refused.saturating_add(1);
-                            *retry_at = now + refusal_backoff(*refused);
+                            let backoff = refusal_backoff(*refused);
+                            *retry_at = now + backoff;
+                            log::warn!(
+                                "electrum subscription refused for {}: refusal count {refused}, backoff {}s: {e:?}",
+                                spk.to_electrum_scripthash().to_lower_hex_string(),
+                                backoff.as_secs()
+                            );
                         }
                     }
                     // The connection failed: recycle on the next poll.
-                    _ => self
-                        .subscription_reset_pending
-                        .store(true, Ordering::SeqCst),
+                    _ => {
+                        if first_here {
+                            log::warn!(
+                                "electrum subscription failed for {}: {e:?}",
+                                spk.to_electrum_scripthash().to_lower_hex_string()
+                            );
+                        }
+                        self.subscription_reset_pending
+                            .store(true, Ordering::SeqCst);
+                    }
                 }
                 return Err(e);
             }
         }
-        state.refusals.remove(spk);
+        if let Some((refused, _)) = state.refusals.remove(spk) {
+            log::info!(
+                "electrum subscription successfully re-armed for {}: prior refusal count {refused}",
+                spk.to_electrum_scripthash().to_lower_hex_string()
+            );
+        }
         Ok(())
     }
 
@@ -1903,12 +1945,15 @@ impl Blockchain for Electrum {
             // Another watched outpoint still shares this script and needs the
             // notifications, so leave the server subscription armed.
             if !sub.watchers.is_empty() {
+                guard.log_blind_watches(self.needs_rearm.load(Ordering::SeqCst));
                 return Ok(());
             }
             guard.subscriptions.remove(spk);
         }
         guard.dirty.remove(spk);
         guard.refusals.remove(spk);
+        guard.history_failures.remove(spk);
+        guard.log_blind_watches(self.needs_rearm.load(Ordering::SeqCst));
         // Keep the electrum-client subscription alive until this connection is
         // dropped. Its `script_unsubscribe` holds the internal notification-map
         // mutex while waiting for the server response. If a queued script
@@ -1927,6 +1972,7 @@ impl Blockchain for Electrum {
             e.into_inner()
         });
         let state = &mut *guard;
+        state.log_blind_watches(self.needs_rearm.load(Ordering::SeqCst));
         if let Some(ev) = state.pending.pop_front() {
             return Some(ev);
         }
@@ -1946,14 +1992,36 @@ impl Blockchain for Electrum {
                 .is_some_and(|(_, retry_at)| *retry_at <= now)
         });
         if reset || refusal_due {
+            let reason = match (reset, refusal_due) {
+                (true, true) => "reset+refusal_due",
+                (true, false) => "reset",
+                _ => "refusal_due",
+            };
             if let Err(e) = self.reconnect_client() {
-                log::warn!("failed to recycle Electrum subscriptions: {e:?}");
+                let category = std::mem::discriminant(&e);
+                if state
+                    .recycle_warning
+                    .is_none_or(|(last_reason, last_category, at)| {
+                        reason != last_reason
+                            || category != last_category
+                            || at.elapsed() >= Duration::from_secs(30)
+                    })
+                {
+                    log::warn!("failed to recycle Electrum subscriptions (reason={reason}): {e:?}");
+                    state.recycle_warning = Some((reason, category, Instant::now()));
+                } else {
+                    log::debug!(
+                        "failed to recycle Electrum subscriptions (reason={reason}): {e:?}"
+                    );
+                }
                 if reset {
                     self.subscription_reset_pending
                         .store(true, Ordering::SeqCst);
                 }
                 return None;
             }
+            state.recycle_warning = None;
+            log::info!("recycled Electrum subscriptions (reason={reason})");
             state.failed_arms.clear();
         }
 
@@ -1970,13 +2038,19 @@ impl Blockchain for Electrum {
                     }
                     // Refused for this script alone, so the others still go.
                     Err(e @ WalletError::Electrum(_)) => {
-                        log::warn!("re-arm after reconnect refused: {e:?}");
+                        log::debug!(
+                            "re-arm after reconnect refused for {}: {e:?}",
+                            spk.to_electrum_scripthash().to_lower_hex_string()
+                        );
                         refused = true;
                     }
                     // Unreachable: the rest would fail the same way, each
                     // after its own retries.
                     Err(e) => {
-                        log::warn!("re-arm after reconnect failed: {e:?}");
+                        log::debug!(
+                            "re-arm after reconnect failed for {}: {e:?}",
+                            spk.to_electrum_scripthash().to_lower_hex_string()
+                        );
                         self.needs_rearm.store(true, Ordering::SeqCst);
                         return Some(WatchEvent::Unreachable);
                     }
@@ -2016,6 +2090,7 @@ impl Blockchain for Electrum {
             }
             // The poll ends here: the scripts wait for the re-arm.
             if refused {
+                state.log_blind_watches(self.needs_rearm.load(Ordering::SeqCst));
                 return state.pending.pop_front();
             }
         }
@@ -2037,6 +2112,7 @@ impl Blockchain for Electrum {
                 // Without the ping the socket is never read and the watcher
                 // goes deaf while looking alive — loud, not a warning.
                 log::error!("electrum notification ping failed: {e:?}");
+                state.log_blind_watches(self.needs_rearm.load(Ordering::SeqCst));
                 return Some(WatchEvent::Unreachable);
             }
         }
@@ -2063,12 +2139,18 @@ impl Blockchain for Electrum {
                         match self.arm_subscription(state, &spk) {
                             Ok(()) => {}
                             Err(e @ WalletError::Electrum(_)) => {
-                                log::warn!("re-arm after script_pop failure refused: {e:?}");
+                                log::debug!(
+                                    "re-arm after script_pop failure refused for {}: {e:?}",
+                                    spk.to_electrum_scripthash().to_lower_hex_string()
+                                );
                                 self.needs_rearm.store(true, Ordering::SeqCst);
                             }
                             // Unreachable: the rest would wait out the same retries.
                             Err(e) => {
-                                log::warn!("re-arm after script_pop failure: {e:?}");
+                                log::debug!(
+                                    "re-arm after script_pop failure for {}: {e:?}",
+                                    spk.to_electrum_scripthash().to_lower_hex_string()
+                                );
                                 self.needs_rearm.store(true, Ordering::SeqCst);
                                 break;
                             }
@@ -2078,20 +2160,29 @@ impl Blockchain for Electrum {
                 }
             }
             let hist = match self.call(GET_HISTORY, |c| c.script_get_history(&spk)) {
-                Ok(hist) => hist,
-                // The server answered, for this script alone.
-                Err(WalletError::Electrum(_)) => {
-                    state.dirty.insert(spk.clone());
-                    continue;
+                Ok(hist) => {
+                    state.history_failures.remove(&spk);
+                    hist
                 }
-                // Unreachable: the other scripts would wait out the same retries.
-                Err(_) => {
+                Err(e) => {
+                    if state.history_failures.insert(spk.clone()) {
+                        log::warn!(
+                            "electrum get_history failed for {}: {e:?}",
+                            spk.to_electrum_scripthash().to_lower_hex_string()
+                        );
+                    }
                     state.dirty.insert(spk.clone());
+                    // A server answer fails this script alone; an unreachable
+                    // transport would make the others wait out the same retries.
+                    if matches!(e, WalletError::Electrum(_)) {
+                        continue;
+                    }
                     break;
                 }
             };
             self.surface_history(state, &spk, hist);
         }
+        state.log_blind_watches(self.needs_rearm.load(Ordering::SeqCst));
         if let Some(ev) = state.pending.pop_front() {
             return Some(ev);
         }
@@ -2132,6 +2223,38 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::{utill::MIN_RELAY_FEE_RATE, wallet::AnyBlockchain};
+
+    // Unit tests do not use the integration fixture's file logger. Capture only
+    // this thread so parallel tests cannot contribute to these assertions.
+    thread_local! {
+        static LOGS: std::cell::RefCell<Vec<(log::Level, String)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    pub(crate) fn take_logs() -> Vec<(log::Level, String)> {
+        struct Logger;
+        impl log::Log for Logger {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if record.target().starts_with("openswap::") {
+                    LOGS.with(|logs| {
+                        logs.borrow_mut()
+                            .push((record.level(), record.args().to_string()))
+                    });
+                }
+            }
+            fn flush(&self) {}
+        }
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            log::set_logger(&Logger).expect("install unit test logger");
+            log::set_max_level(log::LevelFilter::Debug);
+        });
+        LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
+    }
 
     fn cfg(url: &str, socks5: Option<&str>) -> ElectrumConfig {
         ElectrumConfig {
@@ -2645,6 +2768,10 @@ pub(crate) mod tests {
     }
 
     impl Electrum {
+        pub(crate) fn take_test_logs() -> Vec<(log::Level, String)> {
+            take_logs()
+        }
+
         /// Lets every refused script be retried on the next poll, as once its
         /// backoff has passed.
         pub(crate) fn expire_refusal_backoff(&self) {
@@ -2744,6 +2871,306 @@ pub(crate) mod tests {
         assert_eq!(backend.reconnect_count() - reconnects, 1);
         assert_eq!(subscribes_sent(&server) - sent, 2);
         assert!(scripts.iter().all(|spk| backend.may_have_missed(spk)));
+    }
+
+    #[test]
+    fn refusal_logs_report_transitions_without_poll_spam() {
+        take_logs();
+        let refuse = Arc::new(AtomicBool::new(false));
+        let (backend, _server, scripts, _) = refusing_backend(&refuse, &[0]);
+        let hash = scripthash(&scripts[0]);
+        let logs = take_logs();
+        assert!(logs.iter().any(|(level, msg)| *level == log::Level::Warn
+            && msg.contains(&hash)
+            && msg.contains("refusal count 1")
+            && msg.contains("backoff 0s")
+            && msg.contains("too many subscriptions")));
+        let initial_blind_warnings = logs
+            .iter()
+            .filter(|(level, msg)| *level == log::Level::Warn && msg.contains("watches blind"))
+            .count();
+        for _ in 0..4 {
+            backend.poll_event();
+        }
+        let logs = take_logs();
+        assert_eq!(
+            logs.iter()
+                .filter(|(level, msg)| *level == log::Level::Warn && msg.contains("refusal count"))
+                .count(),
+            1
+        );
+        assert!(logs
+            .iter()
+            .any(|(_, msg)| msg.contains("refusal count 2") && msg.contains("backoff 1s")));
+        assert_eq!(
+            initial_blind_warnings
+                + logs
+                    .iter()
+                    .filter(
+                        |(level, msg)| *level == log::Level::Warn && msg.contains("watches blind")
+                    )
+                    .count(),
+            1
+        );
+        assert!(logs
+            .iter()
+            .any(|(_, msg)| msg.contains("reason=refusal_due")));
+        refuse.store(false, Ordering::SeqCst);
+        backend.expire_refusal_backoff();
+        for _ in 0..4 {
+            backend.poll_event();
+        }
+        let logs = take_logs();
+        assert_eq!(
+            logs.iter()
+                .filter(|(level, msg)| *level == log::Level::Info
+                    && msg.contains(&hash)
+                    && msg.contains("successfully re-armed")
+                    && msg.contains("refusal count 2"))
+                .count(),
+            1
+        );
+        assert!(logs
+            .iter()
+            .any(|(_, msg)| msg.contains("0 of 2 watches blind")));
+    }
+
+    #[test]
+    fn recycle_warning_suppression_preserves_attempts_and_reasons() {
+        take_logs();
+        let refuse = Arc::new(AtomicBool::new(false));
+        let (backend, server, _, _) = refusing_backend(&refuse, &[0]);
+        let wait_for_server = |up| {
+            let start = Instant::now();
+            while std::net::TcpStream::connect(server.url.trim_start_matches("tcp://")).is_ok()
+                != up
+            {
+                assert!(start.elapsed() < Duration::from_secs(2));
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        server.set_down(true);
+        wait_for_server(false);
+        take_logs();
+        for _ in 0..3 {
+            backend.poll_event();
+        }
+        let logs = take_logs();
+        let warnings: Vec<_> = logs
+            .iter()
+            .filter(|(level, msg)| *level == log::Level::Warn && msg.contains("failed to recycle"))
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].1.contains("reason=refusal_due"));
+        assert_eq!(
+            logs.iter()
+                .filter(
+                    |(level, msg)| *level == log::Level::Debug && msg.contains("failed to recycle")
+                )
+                .count(),
+            2
+        );
+        // Advance only the log-suppression clock, leaving retry deadlines alone.
+        backend
+            .notifier
+            .lock()
+            .unwrap()
+            .recycle_warning
+            .as_mut()
+            .unwrap()
+            .2 = Instant::now() - Duration::from_secs(30);
+        backend.poll_event();
+        assert_eq!(
+            take_logs()
+                .iter()
+                .filter(
+                    |(level, msg)| *level == log::Level::Warn && msg.contains("failed to recycle")
+                )
+                .count(),
+            1
+        );
+        backend
+            .subscription_reset_pending
+            .store(true, Ordering::SeqCst);
+        backend.poll_event();
+        let logs = take_logs();
+        assert!(logs
+            .iter()
+            .any(|(level, msg)| *level == log::Level::Warn
+                && msg.contains("reason=reset+refusal_due")));
+        server.set_down(false);
+        wait_for_server(true);
+        refuse.store(false, Ordering::SeqCst);
+        for _ in 0..3 {
+            backend.poll_event();
+        }
+        assert!(take_logs()
+            .iter()
+            .any(|(level, msg)| *level == log::Level::Info
+                && msg.contains("reason=reset+refusal_due")));
+        assert!(backend.notifier.lock().unwrap().recycle_warning.is_none());
+        backend
+            .subscription_reset_pending
+            .store(true, Ordering::SeqCst);
+        backend.poll_event();
+        assert!(take_logs()
+            .iter()
+            .any(|(_, msg)| msg.contains("reason=reset") && !msg.contains("refusal_due")));
+    }
+
+    #[test]
+    fn blind_watch_logs_count_shared_outpoints_and_global_rearm() {
+        take_logs();
+        let refuse = Arc::new(AtomicBool::new(false));
+        let (backend, _server, scripts, _) = refusing_backend(&refuse, &[0]);
+        let extra = OutPoint::new(Txid::from_byte_array([7; 32]), 0);
+        backend.subscribe_script(&scripts[1], extra).unwrap();
+        backend.poll_event();
+        backend.poll_event();
+        assert!(
+            take_logs()
+                .iter()
+                .any(|(level, msg)| *level == log::Level::Warn
+                    && msg.contains("3 of 3 watches blind"))
+        );
+        assert!(backend.may_have_missed(&scripts[1]));
+        backend.unsubscribe_script(&scripts[1], extra).unwrap();
+        backend.poll_event();
+        assert!(take_logs()
+            .iter()
+            .any(|(_, msg)| msg.contains("2 of 2 watches blind")));
+        refuse.store(false, Ordering::SeqCst);
+        backend.expire_refusal_backoff();
+        for _ in 0..4 {
+            backend.poll_event();
+        }
+        assert!(take_logs()
+            .iter()
+            .any(|(_, msg)| msg.contains("0 of 2 watches blind")));
+        for spk in &scripts {
+            backend.unsubscribe_script(spk, OutPoint::null()).unwrap();
+        }
+        backend.poll_event();
+        assert!(!take_logs()
+            .iter()
+            .any(|(level, msg)| *level == log::Level::Warn && msg.contains("watches blind")));
+    }
+
+    #[test]
+    fn history_warnings_reset_after_recovery_and_unsubscription() {
+        take_logs();
+        let fail = Arc::new(AtomicBool::new(false));
+        let failing = fail.clone();
+        let server = mock_electrum(move |method, _| match method {
+            SUBSCRIBE => Ok(Value::Null),
+            GET_HISTORY if failing.load(Ordering::SeqCst) => {
+                Err(json!({"code": 1, "message": "history unavailable"}))
+            }
+            GET_HISTORY => Ok(json!([])),
+            _ => Err(json!({"code": -32601, "message": "unexpected method"})),
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 0,
+            poll_interval_secs: Some(0),
+            ..Default::default()
+        })
+        .unwrap();
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        backend.subscribe_script(&script, OutPoint::null()).unwrap();
+        let poll = || {
+            backend
+                .notifier
+                .lock()
+                .unwrap()
+                .dirty
+                .insert(script.clone());
+            backend.poll_event();
+        };
+        fail.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            poll();
+        }
+        let logs = take_logs();
+        assert_eq!(
+            logs.iter()
+                .filter(|(level, msg)| *level == log::Level::Warn
+                    && msg.contains("get_history failed")
+                    && msg.contains(&scripthash(&script))
+                    && msg.contains("history unavailable"))
+                .count(),
+            1
+        );
+        fail.store(false, Ordering::SeqCst);
+        poll();
+        fail.store(true, Ordering::SeqCst);
+        poll();
+        assert_eq!(
+            take_logs()
+                .iter()
+                .filter(
+                    |(level, msg)| *level == log::Level::Warn && msg.contains("get_history failed")
+                )
+                .count(),
+            1
+        );
+        backend
+            .unsubscribe_script(&script, OutPoint::null())
+            .unwrap();
+        fail.store(false, Ordering::SeqCst);
+        backend.subscribe_script(&script, OutPoint::null()).unwrap();
+        fail.store(true, Ordering::SeqCst);
+        poll();
+        assert_eq!(
+            take_logs()
+                .iter()
+                .filter(
+                    |(level, msg)| *level == log::Level::Warn && msg.contains("get_history failed")
+                )
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn endpoint_credentials_are_omitted_from_connection_logs() {
+        take_logs();
+        let (mut backend, _server) = watching_backend(
+            &ScriptBuf::from_bytes(vec![0x51]),
+            &ScriptBuf::new(),
+            json!({"code": 1, "message": "unused"}),
+            1,
+        );
+        backend.reconnect_client().unwrap();
+        let endpoint = "tcp://user:SECRET@host:50001/private?token=SECRET";
+        backend.config.url = endpoint.to_owned();
+        let _ = backend.call::<()>(PING, |_| {
+            Err(Error::IOError(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            )))
+        });
+        drop(backend);
+        let _ = Electrum::new(&ElectrumConfig {
+            url: endpoint.to_owned(),
+            max_retries: 0,
+            ..Default::default()
+        });
+        let onion_error =
+            Electrum::new(&cfg("tcp://user:SECRET@private.onion:50001", None)).unwrap_err();
+        assert!(!onion_error.to_string().contains("SECRET"));
+        let logs = take_logs();
+        assert!(logs
+            .iter()
+            .any(|(_, msg)| msg.contains("reconnected to electrum backend")));
+        assert!(logs
+            .iter()
+            .any(|(_, msg)| msg.contains("unreachable after")));
+        assert!(
+            logs.iter()
+                .all(|(_, msg)| !msg.contains("SECRET") && !msg.contains("tcp://")),
+            "{:?}",
+            logs
+        );
     }
 
     /// The wait doubles with each refusal running, from an immediate first
@@ -2923,6 +3350,7 @@ pub(crate) mod tests {
     /// on them can be trusted.
     #[test]
     fn a_transport_failure_leaves_every_script_unheard() {
+        take_logs();
         let script = ScriptBuf::from_bytes(vec![0x51]);
         let daemon_error = json!({ "code": 1, "message": "daemon error" });
         let (backend, server) = watching_backend(&script, &ScriptBuf::new(), daemon_error, 1);
@@ -2940,6 +3368,12 @@ pub(crate) mod tests {
             backend.poll_event();
         }
         assert!(!backend.may_have_missed(&script));
+        let logs = take_logs();
+        assert!(logs
+            .iter()
+            .any(|(level, msg)| *level == log::Level::Info
+                && msg == "reconnected to electrum backend"));
+        assert!(!logs.iter().any(|(_, msg)| msg.contains("refusal_due")));
     }
 
     /// A history read the server never answers would fail the same way for

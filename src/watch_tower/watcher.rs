@@ -607,7 +607,8 @@ impl<R: Role> Watcher<R> {
                 }
                 Err(e) => {
                     // The outpoint remains unwatched while this fails.
-                    log::error!("re-subscribe still failing for {outpoint}: {e}");
+                    // Both enqueue paths already logged the initial failure.
+                    log::debug!("re-subscribe still failing for {outpoint}: {e}");
                     stopped = true;
                     true
                 }
@@ -3081,6 +3082,8 @@ mod tests {
     /// cannot hold back the others.
     #[test]
     fn failing_subscription_costs_one_attempt_and_starves_none() {
+        let take_logs = Electrum::take_test_logs;
+        take_logs();
         let (failing, other) = (
             OutPoint::new(Txid::from_byte_array([1; 32]), 0),
             OutPoint::new(Txid::from_byte_array([2; 32]), 0),
@@ -3100,6 +3103,14 @@ mod tests {
             contract_script(3),
         );
         assert_eq!(watcher.pending_subscribes.len(), 3);
+        assert_eq!(
+            take_logs()
+                .iter()
+                .filter(|(level, msg)| *level == log::Level::Error
+                    && msg.contains("script-subscribe failed"))
+                .count(),
+            3
+        );
 
         let subscribes =
             |server: &MockElectrum| requests_for(server, "blockchain.scripthash.subscribe");
@@ -3111,6 +3122,11 @@ mod tests {
         let before = subscribes(&server);
         pass(&mut watcher);
         assert_eq!(subscribes(&server) - before, 1);
+        let logs = take_logs();
+        assert!(logs.iter().any(|(level, msg)| *level == log::Level::Debug
+            && msg.contains("re-subscribe still failing")));
+        assert!(!logs.iter().any(|(level, msg)| *level == log::Level::Error
+            && msg.contains("re-subscribe still failing")));
 
         node.lock().unwrap().refuse_subscribe = false;
         pass(&mut watcher);

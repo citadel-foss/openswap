@@ -274,10 +274,13 @@ openswap wallet::blockchain::electrum::tests::accumulated_total_above_max_money_
 openswap wallet::blockchain::electrum::tests::an_unanswered_subscribe_recycles_at_once_during_a_refusal_backoff
 openswap wallet::blockchain::electrum::tests::an_unreachable_history_read_stops_the_script_walk
 openswap wallet::blockchain::electrum::tests::an_unsubscribe_recycles_the_connection_during_a_refusal_backoff
+openswap wallet::blockchain::electrum::tests::blind_watch_logs_count_shared_outpoints_and_global_rearm
 openswap wallet::blockchain::electrum::tests::cached_transaction_does_not_hide_server_eviction
 openswap wallet::blockchain::electrum::tests::calls_on_one_electrum_socket_are_serialized
 openswap wallet::blockchain::electrum::tests::clearnet_default_has_no_proxy
+openswap wallet::blockchain::electrum::tests::endpoint_credentials_are_omitted_from_connection_logs
 openswap wallet::blockchain::electrum::tests::estimate_feerate_converts_btc_per_kvb_and_rejects_no_estimate
+openswap wallet::blockchain::electrum::tests::history_warnings_reset_after_recovery_and_unsubscription
 openswap wallet::blockchain::electrum::tests::mined_height_above_the_tip_errors
 openswap wallet::blockchain::electrum::tests::onion_without_proxy_is_rejected_before_connecting
 openswap wallet::blockchain::electrum::tests::only_the_unknown_txid_protocol_error_reads_as_absent
@@ -288,7 +291,9 @@ openswap wallet::blockchain::electrum::tests::proxy_does_not_require_an_onion_ur
 openswap wallet::blockchain::electrum::tests::rate_limit_errors_are_retried_after_a_long_wait
 openswap wallet::blockchain::electrum::tests::read_timeout_is_generous_when_proxied
 openswap wallet::blockchain::electrum::tests::recovery_feerates_stop_at_a_dead_link
+openswap wallet::blockchain::electrum::tests::recycle_warning_suppression_preserves_attempts_and_reasons
 openswap wallet::blockchain::electrum::tests::refusal_backoff_grows_to_a_cap
+openswap wallet::blockchain::electrum::tests::refusal_logs_report_transitions_without_poll_spam
 openswap wallet::blockchain::electrum::tests::script_answers_expire
 openswap wallet::blockchain::electrum::tests::spend_check_finds_a_spend_mined_with_its_funding
 openswap wallet::blockchain::electrum::tests::spend_check_finds_the_spend_past_an_unfetchable_tx
