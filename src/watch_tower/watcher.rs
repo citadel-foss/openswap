@@ -2888,12 +2888,55 @@ mod tests {
         }
 
         node.lock().unwrap().refuse_subscribe = false;
+        // The refusals hold the retry back until their backoff is up.
+        match &watcher.blockchain {
+            AnyBlockchain::Electrum(electrum) => electrum.expire_refusal_backoff(),
+            AnyBlockchain::CoreRPC(_) => unreachable!("an Electrum watcher"),
+        }
         for _ in 0..3 {
             watcher = drain_within(watcher, limit);
         }
         for n in 1..=4 {
             assert!(!may_have_missed(&watcher, &contract_script(n)));
         }
+    }
+
+    /// Every watch request drains the events. While the server refuses the
+    /// re-arm, a drain that recycled the connection would re-arm every watch,
+    /// so request traffic would multiply the load on the refusing server.
+    /// Each request is still answered, from the server.
+    #[test]
+    fn watch_requests_do_not_recycle_a_refusing_connection() {
+        let outpoints: Vec<OutPoint> = (1..=2)
+            .map(|n| OutPoint::new(Txid::from_byte_array([n; 32]), 0))
+            .collect();
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        let (mut watcher, server) = electrum_watcher_with(&node, 1, 0);
+        for (n, outpoint) in (1..=2).zip(&outpoints) {
+            register(&mut watcher, *outpoint, contract_script(n));
+        }
+        let limit = Duration::from_secs(20);
+        let reconnects = |watcher: &Watcher<MakerRole>| match &watcher.blockchain {
+            AnyBlockchain::Electrum(electrum) => electrum.reconnect_count(),
+            AnyBlockchain::CoreRPC(_) => unreachable!("an Electrum watcher"),
+        };
+        const SUBSCRIBE: &str = "blockchain.scripthash.subscribe";
+
+        node.lock().unwrap().refuse_subscribe = true;
+        server.hang_up();
+        watcher = drain_within(watcher, limit);
+        let (before, sent) = (reconnects(&watcher), requests_for(&server, SUBSCRIBE));
+        for _ in 0..10 {
+            let answer;
+            (watcher, answer) = ask_within(watcher, outpoints[0], limit);
+            assert_eq!(answered_spend(answer), None);
+            for n in 1..=2 {
+                assert!(may_have_missed(&watcher, &contract_script(n)));
+            }
+        }
+        // The one immediate retry, re-arming both watches.
+        assert_eq!(reconnects(&watcher) - before, 1);
+        assert_eq!(requests_for(&server, SUBSCRIBE) - sent, 2);
     }
 
     /// Watches armed before an outage, and one registered during it, all get
