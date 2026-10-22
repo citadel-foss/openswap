@@ -415,11 +415,22 @@ impl<R: Role> Watcher<R> {
                 if let Err(e) = self.registry.remove_watch(outpoint) {
                     log::error!("registry lock poisoned, watch not removed: {e:?}");
                 }
+                let was_pending = self.pending_subscribes.iter().any(|(o, _)| *o == outpoint);
                 self.pending_subscribes.retain(|(o, _)| *o != outpoint);
+                // A watch still waiting to subscribe holds nothing on the server.
+                // While another waits on the same script, releasing it would
+                // only recycle the connection and restart the script's backoff.
+                let still_wanted = was_pending
+                    && self
+                        .pending_subscribes
+                        .iter()
+                        .any(|(_, spk)| *spk == script_pubkey);
                 // Release this outpoint's hold. A script another watched outpoint
                 // still shares stays subscribed by design.
-                if let Err(e) = self.blockchain.unsubscribe_script(&script_pubkey, outpoint) {
-                    log::warn!("electrum script-unsubscribe failed for {outpoint}: {e}");
+                if !still_wanted {
+                    if let Err(e) = self.blockchain.unsubscribe_script(&script_pubkey, outpoint) {
+                        log::warn!("electrum script-unsubscribe failed for {outpoint}: {e}");
+                    }
                 }
                 // With nothing watched the backend stops reading new blocks, so the
                 // height would go stale while still looking current.
@@ -596,7 +607,8 @@ impl<R: Role> Watcher<R> {
                 }
                 Err(e) => {
                     // The outpoint remains unwatched while this fails.
-                    log::error!("re-subscribe still failing for {outpoint}: {e}");
+                    // Both enqueue paths already logged the initial failure.
+                    log::debug!("re-subscribe still failing for {outpoint}: {e}");
                     stopped = true;
                     true
                 }
@@ -2888,12 +2900,145 @@ mod tests {
         }
 
         node.lock().unwrap().refuse_subscribe = false;
+        // The refusals hold the retry back until their backoff is up.
+        match &watcher.blockchain {
+            AnyBlockchain::Electrum(electrum) => electrum.expire_refusal_backoff(),
+            AnyBlockchain::CoreRPC(_) => unreachable!("an Electrum watcher"),
+        }
         for _ in 0..3 {
             watcher = drain_within(watcher, limit);
         }
         for n in 1..=4 {
             assert!(!may_have_missed(&watcher, &contract_script(n)));
         }
+    }
+
+    /// Every watch request drains the events. While the server refuses the
+    /// re-arm, a drain that recycled the connection would re-arm every watch,
+    /// so request traffic would multiply the load on the refusing server.
+    /// Each request is still answered, from the server.
+    #[test]
+    fn watch_requests_do_not_recycle_a_refusing_connection() {
+        let outpoints: Vec<OutPoint> = (1..=2)
+            .map(|n| OutPoint::new(Txid::from_byte_array([n; 32]), 0))
+            .collect();
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        let (mut watcher, server) = electrum_watcher_with(&node, 1, 0);
+        for (n, outpoint) in (1..=2).zip(&outpoints) {
+            register(&mut watcher, *outpoint, contract_script(n));
+        }
+        let limit = Duration::from_secs(20);
+        let reconnects = |watcher: &Watcher<MakerRole>| match &watcher.blockchain {
+            AnyBlockchain::Electrum(electrum) => electrum.reconnect_count(),
+            AnyBlockchain::CoreRPC(_) => unreachable!("an Electrum watcher"),
+        };
+        const SUBSCRIBE: &str = "blockchain.scripthash.subscribe";
+
+        node.lock().unwrap().refuse_subscribe = true;
+        server.hang_up();
+        watcher = drain_within(watcher, limit);
+        let (before, sent) = (reconnects(&watcher), requests_for(&server, SUBSCRIBE));
+        for _ in 0..10 {
+            let answer;
+            (watcher, answer) = ask_within(watcher, outpoints[0], limit);
+            assert_eq!(answered_spend(answer), None);
+            for n in 1..=2 {
+                assert!(may_have_missed(&watcher, &contract_script(n)));
+            }
+        }
+        // The one immediate retry, re-arming both watches.
+        assert_eq!(reconnects(&watcher) - before, 1);
+        assert_eq!(requests_for(&server, SUBSCRIBE) - sent, 2);
+    }
+
+    /// Two watches on one script the server refuses wait out one backoff.
+    /// Dropping one, while the other still waits to subscribe, must neither
+    /// recycle the connection nor restart the backoff.
+    #[test]
+    fn unwatching_one_of_two_refused_watches_keeps_the_backoff() {
+        let (first, second) = (
+            OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+            OutPoint::new(Txid::from_byte_array([2; 32]), 0),
+        );
+        let node = Arc::new(Mutex::new(ElectrumNode {
+            refuse_subscribe: true,
+            ..ElectrumNode::default()
+        }));
+        let (mut watcher, _server) = electrum_watcher(&node);
+        register(&mut watcher, first, contract_script(1));
+        register(&mut watcher, second, contract_script(1));
+        let reconnects = |watcher: &Watcher<MakerRole>| match &watcher.blockchain {
+            AnyBlockchain::Electrum(electrum) => electrum.reconnect_count(),
+            AnyBlockchain::CoreRPC(_) => unreachable!("an Electrum watcher"),
+        };
+        let pass = |watcher: &mut Watcher<MakerRole>| {
+            watcher.drain_events();
+            watcher.retry_pending_work();
+        };
+        // The immediate retry is refused too, so the backoff runs.
+        pass(&mut watcher);
+        let before = reconnects(&watcher);
+
+        watcher.handle_command(WatcherCommand::Unwatch {
+            outpoint: first,
+            script_pubkey: contract_script(1),
+        });
+        pass(&mut watcher);
+        pass(&mut watcher);
+        assert_eq!(reconnects(&watcher), before);
+        assert_eq!(
+            watcher
+                .pending_subscribes
+                .iter()
+                .map(|(outpoint, _)| *outpoint)
+                .collect::<Vec<_>>(),
+            [second]
+        );
+        assert!(may_have_missed(&watcher, &contract_script(1)));
+    }
+
+    /// An armed watch dropped while another on its script still waits to
+    /// subscribe is released as before: it stops holding the subscription.
+    #[test]
+    fn unwatching_an_armed_watch_releases_it_while_another_waits() {
+        let (armed, waiting) = (
+            OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+            OutPoint::new(Txid::from_byte_array([2; 32]), 0),
+        );
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        let (mut watcher, server) = electrum_watcher_with(&node, 1, 0);
+        let holders = |watcher: &Watcher<MakerRole>| match &watcher.blockchain {
+            AnyBlockchain::Electrum(electrum) => {
+                electrum.subscription_watchers(&contract_script(1))
+            }
+            AnyBlockchain::CoreRPC(_) => unreachable!("an Electrum watcher"),
+        };
+        register(&mut watcher, armed, contract_script(1));
+        // The rebuilt connection refuses the script, so a second watch on it
+        // cannot subscribe and waits.
+        node.lock().unwrap().refuse_subscribe = true;
+        server.hang_up();
+        watcher.drain_events();
+        register(&mut watcher, waiting, contract_script(1));
+        assert_eq!(watcher.pending_subscribes.len(), 1);
+        assert_eq!(holders(&watcher), 1);
+
+        watcher.handle_command(WatcherCommand::Unwatch {
+            outpoint: armed,
+            script_pubkey: contract_script(1),
+        });
+        assert_eq!(
+            holders(&watcher),
+            0,
+            "the dropped watch still holds the script"
+        );
+        node.lock().unwrap().refuse_subscribe = false;
+        for _ in 0..3 {
+            watcher.drain_events();
+            watcher.retry_pending_work();
+        }
+        assert!(watcher.pending_subscribes.is_empty());
+        assert_eq!(holders(&watcher), 1);
     }
 
     /// Watches armed before an outage, and one registered during it, all get
@@ -2937,6 +3082,8 @@ mod tests {
     /// cannot hold back the others.
     #[test]
     fn failing_subscription_costs_one_attempt_and_starves_none() {
+        let take_logs = Electrum::take_test_logs;
+        take_logs();
         let (failing, other) = (
             OutPoint::new(Txid::from_byte_array([1; 32]), 0),
             OutPoint::new(Txid::from_byte_array([2; 32]), 0),
@@ -2956,6 +3103,14 @@ mod tests {
             contract_script(3),
         );
         assert_eq!(watcher.pending_subscribes.len(), 3);
+        assert_eq!(
+            take_logs()
+                .iter()
+                .filter(|(level, msg)| *level == log::Level::Error
+                    && msg.contains("script-subscribe failed"))
+                .count(),
+            3
+        );
 
         let subscribes =
             |server: &MockElectrum| requests_for(server, "blockchain.scripthash.subscribe");
@@ -2967,6 +3122,11 @@ mod tests {
         let before = subscribes(&server);
         pass(&mut watcher);
         assert_eq!(subscribes(&server) - before, 1);
+        let logs = take_logs();
+        assert!(logs.iter().any(|(level, msg)| *level == log::Level::Debug
+            && msg.contains("re-subscribe still failing")));
+        assert!(!logs.iter().any(|(level, msg)| *level == log::Level::Error
+            && msg.contains("re-subscribe still failing")));
 
         node.lock().unwrap().refuse_subscribe = false;
         pass(&mut watcher);
