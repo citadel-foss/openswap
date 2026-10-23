@@ -42,6 +42,7 @@ use crate::{
     },
     utill::generate_keypair,
     wallet::LnMakerSwapRecord,
+    watch_tower::watcher::WatcherEvent,
 };
 
 use super::{
@@ -1576,7 +1577,7 @@ fn watchdog_resolve_swap_out(
     })?;
     #[cfg(feature = "integration-test")]
     let answer = if HIDE_HTLC_SPENDS.load(std::sync::atomic::Ordering::SeqCst) {
-        crate::watch_tower::watcher::WatcherEvent::UtxoSpent {
+        WatcherEvent::UtxoSpent {
             outpoint,
             spending_tx: None,
         }
@@ -1787,8 +1788,7 @@ impl HtlcWatch {
     /// `UtxoSpent` names the spend whenever one is on record, so one without
     /// it is unspent as far as the watcher knows; the refund still asks the
     /// chain (`UnspentHtlc`). An answer the watcher could not give is an error.
-    fn from_answer(answer: crate::watch_tower::watcher::WatcherEvent) -> Result<Self, MakerError> {
-        use crate::watch_tower::watcher::WatcherEvent;
+    fn from_answer(answer: WatcherEvent) -> Result<Self, MakerError> {
         match answer {
             WatcherEvent::UtxoSpent {
                 spending_tx: Some(tx),
@@ -1838,7 +1838,6 @@ mod tests {
     /// tx not known yet", it kept the watchdog from ever refunding.
     #[test]
     fn watched_htlc_without_a_spend_is_unspent() {
-        use crate::watch_tower::watcher::WatcherEvent;
         let outpoint = bitcoin::OutPoint::null();
         assert_eq!(
             HtlcWatch::from_answer(WatcherEvent::UtxoSpent {
@@ -1881,7 +1880,6 @@ mod tests {
     /// A spend on record is served as spent; the chain check never sees it.
     #[test]
     fn recorded_spend_stays_spent() {
-        use crate::watch_tower::watcher::WatcherEvent;
         let spend = bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,

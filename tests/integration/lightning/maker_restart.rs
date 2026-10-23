@@ -44,7 +44,10 @@ use openswap::{
 
 use crate::test_framework::*;
 
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{
+    AtomicBool,
+    Ordering::{Relaxed, SeqCst},
+};
 
 fn ln_message(msg: LightningTakerMessage) -> TakerToMakerMessage {
     TakerToMakerMessage::Lightning(Box::new(msg))
@@ -488,6 +491,22 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
     );
 }
 
+/// Holds a watchdog test switch on until dropped, even if the test panics.
+struct Switch(&'static AtomicBool);
+
+impl Switch {
+    fn on(switch: &'static AtomicBool) -> Self {
+        switch.store(true, SeqCst);
+        Self(switch)
+    }
+}
+
+impl Drop for Switch {
+    fn drop(&mut self) {
+        self.0.store(false, SeqCst);
+    }
+}
+
 /// A crash in the middle of the watchdog's refund, between recording it and
 /// broadcasting it, must leave a restarted maker able to finish it: send the
 /// refund, recognise it as its own, and close the swap once it confirms.
@@ -507,7 +526,6 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
     ln: Arc<MockLightningBackend>,
 ) {
     use openswap::maker::lightning_handlers::INTERRUPT_REFUND;
-    use std::sync::atomic::Ordering::SeqCst;
 
     let framework = world.framework().clone();
     let bitcoind = &framework.bitcoind;
@@ -530,9 +548,9 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
     mine_to(bitcoind, funded_at + locktime as u64 + 1);
 
     // ---- The refund is interrupted, and the maker goes down ----
-    INTERRUPT_REFUND.store(true, SeqCst);
+    let interrupted = Switch::on(&INTERRUPT_REFUND);
     ln_watchdog_tick_now(&maker);
-    INTERRUPT_REFUND.store(false, SeqCst);
+    drop(interrupted);
     let recorded = maker
         .get_ln_swap(&swap_id)
         .unwrap()
@@ -604,7 +622,6 @@ fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
     ln: Arc<MockLightningBackend>,
 ) {
     use openswap::maker::lightning_handlers::HIDE_HTLC_SPENDS;
-    use std::sync::atomic::Ordering::SeqCst;
 
     let framework = world.framework().clone();
     let bitcoind = &framework.bitcoind;
@@ -628,7 +645,7 @@ fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
     mine_to(bitcoind, funded_at + locktime as u64 + 1);
 
     // ---- The taker claims, and the watcher does not say so ----
-    HIDE_HTLC_SPENDS.store(true, SeqCst);
+    let hidden = Switch::on(&HIDE_HTLC_SPENDS);
     let swap = maker
         .get_ln_swap(&swap_id)
         .unwrap()
@@ -684,7 +701,7 @@ fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
     no_refund(&maker);
 
     // ---- Once the watcher has the claim, the preimage settles the swap ----
-    HIDE_HTLC_SPENDS.store(false, SeqCst);
+    drop(hidden);
     wait_until!(
         Duration::from_secs(30),
         every Duration::from_millis(200),
