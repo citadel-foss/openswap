@@ -136,7 +136,8 @@ pub struct LnMakerSwap {
     pub funding: Option<(OutPoint, Amount)>,
     /// Refund timing. Swap-in: the block that confirmed the funding, where the
     /// taker's CSV refund window starts. Swap-out: the chain tip when the
-    /// maker broadcast its funding.
+    /// maker broadcast its funding, or, if that read failed, the block that
+    /// confirmed it.
     pub funding_height: Option<u32>,
     /// Last phase-change time; the watchdog only touches idle states.
     pub updated_at: Instant,
@@ -1708,7 +1709,10 @@ fn watchdog_resolve_swap_out(
             let refund_txid = refund_tx.compute_txid();
             if swap.refund_txid != Some(refund_txid) {
                 swap.refund_txid = Some(refund_txid);
-                maker.store_ln_swap(swap_id, swap.clone())?;
+                // A claim may have closed the swap since the snapshot.
+                if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::OutFunded, swap.clone())? {
+                    return Ok(());
+                }
             }
             #[cfg(feature = "integration-test")]
             if INTERRUPT_REFUND.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1724,7 +1728,7 @@ fn watchdog_resolve_swap_out(
                         "Swap-out {swap_id} refund broadcast: {txid} (held until confirmed)"
                     );
                     swap.touch();
-                    maker.store_ln_swap(swap_id, swap)?;
+                    maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::OutFunded, swap)?;
                 }
                 Err(e) => log::debug!("swap-out {swap_id} refund not yet broadcastable: {e:?}"),
             }
