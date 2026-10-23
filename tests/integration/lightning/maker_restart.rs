@@ -962,8 +962,9 @@ fn lightning_maker_keeps_a_swap_out_while_its_funding_height_is_unknown(
 }
 
 /// The watchdog acts on a snapshot of each swap-out. Recovering a missing
-/// funding height must not bring back a swap removed since, nor overwrite a
-/// height another writer stored, nor refund on the snapshot's account.
+/// funding height or recording a refund must not bring back a swap removed
+/// since, nor overwrite a height another writer stored, nor refund on the
+/// snapshot's account.
 #[world_test(
     backend = BitcoindBackend,
     bind = [ln = maker_node()],
@@ -982,7 +983,11 @@ fn lightning_maker_stale_snapshot_keeps_newer_swap_out_state(
     let locktime: u16 = 30;
     pause_block_generation(&framework);
 
-    let preimages = [Preimage([0x7e; 32]), Preimage([0x7f; 32])];
+    let preimages = [
+        Preimage([0x7e; 32]),
+        Preimage([0x7f; 32]),
+        Preimage([0x80; 32]),
+    ];
     let ids: Vec<String> = preimages
         .iter()
         .map(|preimage| preimage.payment_hash().to_string())
@@ -1005,7 +1010,7 @@ fn lightning_maker_stale_snapshot_keeps_newer_swap_out_state(
         confirmation_height(bitcoind, &fundings[1].outpoint.txid),
         confirmed_at
     );
-    let snapshots: Vec<LnMakerSwap> = ids
+    let mut snapshots: Vec<LnMakerSwap> = ids
         .iter()
         .map(|id| {
             drop_funding_height(&maker, id);
@@ -1019,6 +1024,10 @@ fn lightning_maker_stale_snapshot_keeps_newer_swap_out_state(
     let mut filled = snapshots[1].clone();
     filled.funding_height = Some(confirmed_at as u32 + 3);
     maker.store_ln_swap(&ids[1], filled).unwrap();
+    // 2: removed since a snapshot that had its height, so the pass goes
+    // straight to the refund.
+    snapshots[2].funding_height = Some(confirmed_at as u32);
+    maker.remove_ln_swap(&ids[2]).unwrap();
 
     // Past the CSV counted from the real confirmation, not from swap 1's
     // stored height: a pass that went on the snapshots would refund both.
@@ -1028,11 +1037,13 @@ fn lightning_maker_stale_snapshot_keeps_newer_swap_out_state(
     }
 
     let check = |swaps: &dyn Fn(&str) -> Option<LnMakerSwap>, when: &str| {
-        assert!(
-            swaps(&ids[0]).is_none(),
-            "{}: a removed swap was brought back",
-            when
-        );
+        for id in [&ids[0], &ids[2]] {
+            assert!(
+                swaps(id).is_none(),
+                "{}: a removed swap was brought back",
+                when
+            );
+        }
         let filled = swaps(&ids[1]).unwrap_or_else(|| panic!("{}: swap 1 was deleted", when));
         assert_eq!(filled.phase, LnMakerPhase::OutFunded, "{when}");
         assert_eq!(
