@@ -6,7 +6,7 @@ use std::{
     time::Instant,
 };
 
-use bitcoin::{bip32::ChainCode, Amount, OutPoint, PublicKey, Transaction, Txid};
+use bitcoin::{bip32::ChainCode, Amount, OutPoint, PublicKey, Transaction, Txid, XOnlyPublicKey};
 
 use bitcoind::bitcoincore_rpc::{jsonrpc::error::Error as JsonRpcError, Error as BitcoinRpcError};
 
@@ -18,6 +18,7 @@ use crate::{
             ProtocolVersion, SwapDetails, TakerToMakerMessage, UnsupportedMessage,
         },
         features::{check_bounds, check_pins, supported, unmet_at_hello},
+        funding_bump::within_bump_shortfall,
         legacy_messages::LegacyTakerMessage,
         taproot_messages::TaprootTakerMessage,
     },
@@ -163,6 +164,12 @@ pub enum MakerBehavior {
     /// Answer every lookup of a Lightning HTLC funding's confirmation height
     /// with no height, as after a reorg takes the funding's block away.
     NoFundingHeight,
+    /// Keep our outgoing funding out of blocks once broadcast, as a fee spike
+    /// would, so only a fee bump can get the hop confirmed.
+    StallFunding,
+    /// Never latch our funding as mined, the way a node that never saw an
+    /// orphaned block would not, so a bump after a reorg goes through.
+    SkipFundingLatch,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).
@@ -195,10 +202,27 @@ pub(crate) fn offset_meets_reaction_time(refund_locktime_offset: u16) -> bool {
     refund_locktime_offset >= MIN_CONTRACT_REACTION_TIME
 }
 
-/// The declared amount is exact: the taker priced this hop on it, so less
-/// short-changes the maker and more was never reserved.
-pub(crate) fn incoming_matches_swap_amount(total_incoming: Amount, swap_amount: Amount) -> bool {
-    total_incoming == swap_amount
+/// Whether a swap's pins include funding bumps.
+pub(crate) fn pins_funding_bump(features: &[String]) -> bool {
+    features
+        .iter()
+        .any(|feature| feature == crate::protocol::funding_bump::FUNDING_BUMP_FEATURE)
+}
+
+/// The declared amount caps the incoming: more was never reserved. On a swap
+/// that pinned funding bumps, less is what upstream bumps took, and only
+/// within their bound: our fee stays the one admitted, so a smaller amount
+/// short-changes nobody. Without them the hop arrives whole.
+pub(crate) fn incoming_fits_swap_amount(
+    total_incoming: Amount,
+    swap_amount: Amount,
+    bumps: bool,
+) -> bool {
+    if bumps {
+        within_bump_shortfall(total_incoming, swap_amount)
+    } else {
+        total_incoming == swap_amount
+    }
 }
 
 /// We can only sweep our incoming contract until `timelock + REFUND_LOCKTIME_STEP`.
@@ -265,10 +289,82 @@ pub struct ConnectionState {
     /// The funding plan frozen at admission; its input counts are what the Ack
     /// declared. Empty until admission succeeds.
     pub funding_plan: Vec<SplitPlan>,
+    /// Key the taker signs funding bumps with, declared at admission.
+    pub taker_auth_pubkey: Option<XOnlyPublicKey>,
+    /// Fee bumps of our outgoing funding.
+    pub funding_bump: FundingBumpState,
     /// Last activity timestamp.
     pub last_activity: Instant,
     /// Swap start time for duration tracking in reports.
     pub swap_start_time: Instant,
+}
+
+/// A Legacy bump built and held until the next hop signs its contracts:
+/// without that signature a broadcast replacement could not be refunded.
+#[derive(Debug, Clone)]
+pub struct PendingFundingBump {
+    /// The taker's sequence number for this bump.
+    pub seq: u32,
+    /// Feerate the replacements pay.
+    pub feerate: u64,
+    /// Split index and replacement version of each bumped outgoing swapcoin,
+    /// its funding tx signed and its contract tx not yet countersigned.
+    pub replacements: Vec<(usize, OutgoingSwapCoin)>,
+}
+
+/// Fee bumps of our outgoing hop's funding.
+#[derive(Debug, Clone, Default)]
+pub struct FundingBumpState {
+    /// Highest sequence number the taker has used; a request must exceed it.
+    pub seq: u32,
+    /// Feerate the latest replacements pay; zero before the first bump.
+    pub feerate: u64,
+    /// Bumps broadcast so far.
+    pub bumps: u32,
+    /// Replacement versions of our outgoing swapcoins. Each spends the coins
+    /// of one original, so one version per split confirms; all are kept,
+    /// here and in the wallet, until it is known which.
+    pub replacements: Vec<OutgoingSwapCoin>,
+    /// Legacy: a bump awaiting the next hop's contract signatures.
+    pub pending: Option<PendingFundingBump>,
+    /// The next hop has built on whichever version confirmed. A later bump
+    /// could only conflict with funding it already accepted, after a reorg,
+    /// so none is taken.
+    pub settled: bool,
+}
+
+impl FundingBumpState {
+    /// Fold `newer`, one connection's view, into this stored one. Several
+    /// connections of a swap each hold a snapshot, and one that predates
+    /// another's bump must not undo it: every field only moves forward and
+    /// replacements are only ever added. A version that became one of
+    /// `outgoing`, the swap's settled coins, is no replacement any more.
+    pub(crate) fn merge_from(&mut self, newer: &FundingBumpState, outgoing: &[OutgoingSwapCoin]) {
+        // A pending proposal is the latest request's: a commit clears it.
+        if newer.seq >= self.seq {
+            self.pending = newer.pending.clone();
+        }
+        self.seq = self.seq.max(newer.seq);
+        self.feerate = self.feerate.max(newer.feerate);
+        self.bumps = self.bumps.max(newer.bumps);
+        self.settled |= newer.settled;
+        for version in &newer.replacements {
+            let txid = version.contract_tx.compute_txid();
+            if !self
+                .replacements
+                .iter()
+                .any(|kept| kept.contract_tx.compute_txid() == txid)
+            {
+                self.replacements.push(version.clone());
+            }
+        }
+        let settled: Vec<Txid> = outgoing
+            .iter()
+            .map(|coin| coin.contract_tx.compute_txid())
+            .collect();
+        self.replacements
+            .retain(|version| !settled.contains(&version.contract_tx.compute_txid()));
+    }
 }
 
 /// Phases of a swap.
@@ -309,6 +405,8 @@ impl Default for ConnectionState {
             service_fee_sats: 0,
             funding_broadcast_txids: Vec::new(),
             funding_plan: Vec::new(),
+            taker_auth_pubkey: None,
+            funding_bump: FundingBumpState::default(),
             last_activity: Instant::now(),
             swap_start_time: Instant::now(),
         }
@@ -470,8 +568,10 @@ pub trait Maker: Send + Sync {
     fn calculate_swap_fee(&self, amount: Amount, timelock: u32) -> Amount;
 
     /// Execute the funding plan frozen at admission, one transaction per
-    /// split. `amount` must match the plan's pre-netting total exactly; a
-    /// missing or mismatched plan is a protocol error. A planned coin another
+    /// split. `amount` is the plan's pre-netting total, or short of it only
+    /// by what upstream funding bumps took off the incoming hop, which then
+    /// comes out of the splits; a missing plan, or an amount above its total,
+    /// is a protocol error. A planned coin another
     /// swap took is replaced by a re-plan of the same shape.
     /// The `Vec<u32>` is `payment_output_positions`: each split's payment
     /// output index in its funding tx.
@@ -564,11 +664,14 @@ pub trait Maker: Send + Sync {
     /// Persist the terminal maker state after every incoming contract has been
     /// swept. This must complete before a success report is emitted: otherwise
     /// a restart can mistake the already-delivered outgoing coins for an
-    /// abandoned swap and launch recovery for them.
+    /// abandoned swap and launch recovery for them. The outgoing coins in
+    /// `keep`, funding versions a bump left behind, stay persisted until they
+    /// are retired.
     fn finalize_successful_swap(
         &self,
         swap_id: &str,
         expected_outgoing: usize,
+        keep: &[Txid],
     ) -> Result<(), MakerError>;
 
     /// Store connection state for persistence across connections.
@@ -637,8 +740,10 @@ pub trait Maker: Send + Sync {
     ) -> Result<crate::protocol::Hash160, MakerError>;
 
     /// Initialize outgoing swap by executing the funding plan frozen at
-    /// admission. `send_amount` must match the plan's pre-netting total
-    /// exactly; a missing or mismatched plan is a protocol error.
+    /// admission. `send_amount` is the plan's pre-netting total, or short of
+    /// it only by what upstream funding bumps took off the incoming hop, which
+    /// then comes out of the splits; a missing plan, or an amount above its
+    /// total, is a protocol error.
     #[allow(clippy::too_many_arguments)]
     fn initialize_swap(
         &self,
@@ -656,6 +761,47 @@ pub trait Maker: Send + Sync {
         &self,
         multisig_redeemscript: &bitcoin::ScriptBuf,
     ) -> Option<OutgoingSwapCoin>;
+
+    /// Whether this transaction is mined. A failed query is an error, never
+    /// `false`: an unconfirmed funding is the only one we may replace.
+    fn is_funding_confirmed(&self, txid: &Txid) -> Result<bool, MakerError>;
+
+    /// Point our Taproot incoming coins of `swap_id` whose funding a bump
+    /// replaced at the version that was mined, in the wallet and in
+    /// `incoming`. A bump after a reorg could otherwise leave us claiming a
+    /// contract that never exists.
+    fn follow_replaced_incoming(
+        &self,
+        swap_id: &str,
+        incoming: &mut [IncomingSwapCoin],
+    ) -> Result<(), MakerError>;
+
+    /// Whether `txid`, one of `swap_id`'s funding txs, is mined now or ever
+    /// was: a mined one is latched, so a reorg cannot unconfirm it for us.
+    fn funding_ever_confirmed(&self, swap_id: &str, txid: &Txid) -> Result<bool, MakerError>;
+
+    /// Sign a replacement of funding split `split` of `swap_id`. It spends
+    /// exactly that split's inputs, which the wallet's coin cache stops
+    /// listing once the original is out, so the signing data is the build's.
+    fn sign_funding_replacement(
+        &self,
+        swap_id: &str,
+        split: usize,
+        tx: &mut Transaction,
+    ) -> Result<(), MakerError>;
+
+    /// Feerate in sat/vB a replacement must add over what it replaces.
+    fn replacement_increment_rate(&self) -> f64;
+
+    /// Flag the outgoing swapcoins of these contract txids as funding
+    /// versions a bump replaced: retired once beaten deep, recovered if a
+    /// reorg mines one.
+    fn mark_replaced_funding(&self, contract_txids: &[Txid]) -> Result<(), MakerError>;
+
+    /// Test hook: keep one of our funding txs out of blocks, the way a fee
+    /// spike would, so a test can bump it.
+    #[cfg(feature = "integration-test")]
+    fn stall_funding_for_test(&self, txid: &Txid);
 
     /// Get the test behavior override.
     #[cfg(feature = "integration-test")]
@@ -965,6 +1111,10 @@ pub struct MakerConfig {
     pub require_features: Vec<String>,
     /// Public name sent in the offer.
     pub name: String,
+    /// Highest feerate we replace our own funding at; zero refuses bumps.
+    pub max_funding_bump_feerate: u64,
+    /// Most extra fee one hop's funding may take across its bumps.
+    pub max_funding_bump_sats: u64,
 }
 
 /// Message handler
@@ -1057,6 +1207,15 @@ pub fn handle_message<M: Maker>(
             maker.touch_connection_state(id)?;
             state.touch();
             Ok(None)
+        }
+        TakerToMakerMessage::BumpFunding(request) => {
+            restore_state_if_needed(maker, state, &request.id)?;
+            super::funding_bump::handle_bump_funding(maker, state, request)
+        }
+        TakerToMakerMessage::BumpFundingCommit(commit) => {
+            restore_state_if_needed(maker, state, &commit.id)?;
+            ensure_negotiated_protocol(state, ProtocolVersion::Legacy)?;
+            super::funding_bump::handle_bump_funding_commit(maker, state, commit)
         }
         TakerToMakerMessage::Lightning(ln_msg) => {
             #[cfg(feature = "lightning")]
@@ -1159,6 +1318,8 @@ fn handle_get_offer<M: Maker>(
         // Fetched here rather than through `get_config`: this is one of the
         // two places that actually needs it.
         lightning: maker.lightning_offer(),
+        max_funding_bump_feerate: config.max_funding_bump_feerate,
+        max_funding_bump_sats: config.max_funding_bump_sats,
     };
 
     #[cfg(feature = "integration-test")]
@@ -1249,6 +1410,18 @@ fn handle_swap_details<M: Maker>(
         }
     };
 
+    // A swap that pinned funding bumps needs the key its bumps are signed with.
+    if pins_funding_bump(&details.features) && details.taker_auth_pubkey.is_none() {
+        log::warn!(
+            "[{}] Rejecting SwapDetails for {}: funding bumps pinned without the taker's key",
+            Maker::network_port(maker.as_ref()),
+            details.id,
+        );
+        return Ok(Some(MakerToTakerMessage::AckSwapDetails(
+            AckSwapDetails::reject(),
+        )));
+    }
+
     log::info!(
         "[{}] Received SwapDetails: amount={}, timelock={}, pins={:?}",
         Maker::network_port(maker.as_ref()),
@@ -1285,6 +1458,11 @@ fn handle_swap_details<M: Maker>(
     state.timelock = details.timelock;
     state.refund_locktime_offset = refund_locktime_offset;
     state.protocol = protocol;
+    // Funding bumps only on a swap that pinned them; a key sent without the
+    // pin authorizes nothing.
+    state.taker_auth_pubkey = details
+        .taker_auth_pubkey
+        .filter(|_| pins_funding_bump(&details.features));
     state.swap_start_time = Instant::now();
     let swap_fee = maker.calculate_swap_fee(details.amount, state.refund_locktime_offset as u32);
     state.service_fee_sats = swap_fee.to_sat();
@@ -1315,6 +1493,7 @@ fn handle_swap_details<M: Maker>(
         state.service_fee_sats = 0;
         state.swap_feerate = 0.0;
         state.funding_plan = Vec::new();
+        state.taker_auth_pubkey = None;
         return Ok(Some(MakerToTakerMessage::AckSwapDetails(
             AckSwapDetails::reject(),
         )));
@@ -1407,6 +1586,8 @@ fn restore_state_if_needed<M: Maker>(
             state.funding_plan = stored.funding_plan;
             state.swap_start_time = stored.swap_start_time;
             state.refund_locktime_offset = stored.refund_locktime_offset;
+            state.taker_auth_pubkey = stored.taker_auth_pubkey;
+            state.funding_bump = stored.funding_bump;
         }
     }
     Ok(())
@@ -1493,6 +1674,8 @@ mod tests {
             (vec!["taproot"], vec!["future-v1"]),
             (vec!["taproot"], vec!["taproot-v1"]),
             (vec!["ln-swap-in"], vec![]),
+            // Funding bumps pinned without the key that signs them.
+            (vec!["taproot", "funding-bump-v1"], vec![]),
         ]
         .iter()
         .enumerate()
@@ -1515,6 +1698,7 @@ mod tests {
                 feerate: 1,
                 timelock: 1_000,
                 refund_locktime_offset: 60,
+                taker_auth_pubkey: None,
             };
             let reply = handle_message(
                 &maker,
@@ -1530,6 +1714,130 @@ mod tests {
             assert!(maker.get_connection_state("compat-pins").unwrap().is_none());
             maker.watch_service.shutdown();
         }
+    }
+
+    /// A funding version told apart by `value`.
+    fn version(value: u64) -> OutgoingSwapCoin {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let key = bitcoin::secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
+        let pubkey = PublicKey {
+            compressed: true,
+            inner: bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &key),
+        };
+        let contract_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: OutPoint::new(bitcoin::hashes::Hash::from_byte_array([1; 32]), 0),
+                ..Default::default()
+            }],
+            output: vec![bitcoin::TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        OutgoingSwapCoin::new_legacy(
+            key,
+            pubkey,
+            contract_tx,
+            bitcoin::ScriptBuf::new(),
+            key,
+            Amount::from_sat(value),
+            1,
+        )
+    }
+
+    /// Connection A bumped and stored its replacement; connection B, holding
+    /// the snapshot from before, takes a later request and stores. B's store
+    /// must keep A's replacement and count: recovery and the success
+    /// cleanup both read every version from here.
+    #[test]
+    fn a_stale_connection_cannot_undo_another_connections_bump() {
+        let original = version(50_000);
+        let before = FundingBumpState::default();
+        let mut stored = before.clone();
+        let bumped_by_a = FundingBumpState {
+            seq: 1,
+            feerate: 4,
+            bumps: 1,
+            replacements: vec![version(49_000)],
+            ..FundingBumpState::default()
+        };
+        stored.merge_from(&bumped_by_a, std::slice::from_ref(&original));
+
+        let mut from_b = before;
+        from_b.seq = 2;
+        stored.merge_from(&from_b, std::slice::from_ref(&original));
+
+        assert_eq!(stored.seq, 2);
+        assert_eq!(stored.feerate, 4);
+        assert_eq!(stored.bumps, 1);
+        assert_eq!(stored.replacements.len(), 1);
+        assert_eq!(
+            stored.replacements[0].contract_tx.compute_txid(),
+            bumped_by_a.replacements[0].contract_tx.compute_txid()
+        );
+    }
+
+    /// Once the hop settles, the version that won is an outgoing coin and no
+    /// replacement; the ones that lost stay replacements. A settled hop
+    /// stays settled whoever stores next.
+    #[test]
+    fn a_settled_version_leaves_the_replacements() {
+        let (original, winner) = (version(50_000), version(49_000));
+        let mut stored = FundingBumpState {
+            seq: 1,
+            bumps: 1,
+            replacements: vec![winner.clone()],
+            ..FundingBumpState::default()
+        };
+        let resolved = FundingBumpState {
+            seq: 1,
+            bumps: 1,
+            settled: true,
+            replacements: vec![original.clone()],
+            ..FundingBumpState::default()
+        };
+        stored.merge_from(&resolved, std::slice::from_ref(&winner));
+        let txids: Vec<Txid> = stored
+            .replacements
+            .iter()
+            .map(|coin| coin.contract_tx.compute_txid())
+            .collect();
+        assert_eq!(txids, vec![original.contract_tx.compute_txid()]);
+        assert!(stored.settled);
+
+        stored.merge_from(&FundingBumpState::default(), std::slice::from_ref(&winner));
+        assert!(stored.settled);
+    }
+
+    /// A commit clears the pending proposal it consumed; a stale snapshot
+    /// from before the proposal must not clear it.
+    #[test]
+    fn only_the_latest_request_sets_the_pending_proposal() {
+        let pending = PendingFundingBump {
+            seq: 3,
+            feerate: 5,
+            replacements: vec![(0, version(49_000))],
+        };
+        let mut stored = FundingBumpState {
+            seq: 3,
+            pending: Some(pending),
+            ..FundingBumpState::default()
+        };
+        let stale = FundingBumpState {
+            seq: 2,
+            ..FundingBumpState::default()
+        };
+        stored.merge_from(&stale, &[]);
+        assert!(stored.pending.is_some());
+
+        let committed = FundingBumpState {
+            seq: 3,
+            ..FundingBumpState::default()
+        };
+        stored.merge_from(&committed, &[]);
+        assert!(stored.pending.is_none());
     }
 
     /// A second handler for a swap whose funding is running is refused; the
@@ -1593,19 +1901,35 @@ mod tests {
     }
 
     #[test]
-    fn incoming_must_match_the_declared_swap_amount() {
+    fn incoming_must_fit_the_declared_swap_amount() {
         let negotiated = Amount::from_sat(500_000);
 
-        assert!(incoming_matches_swap_amount(negotiated, negotiated));
-        assert!(!incoming_matches_swap_amount(
-            negotiated + Amount::from_sat(1),
-            negotiated
-        ));
-        // The declared amount is exact: under-delivery pays fees on the
-        // declared value while delivering less, so it is rejected too.
-        assert!(!incoming_matches_swap_amount(
+        for bumps in [true, false] {
+            assert!(incoming_fits_swap_amount(negotiated, negotiated, bumps));
+            assert!(!incoming_fits_swap_amount(
+                negotiated + Amount::from_sat(1),
+                negotiated,
+                bumps
+            ));
+            // Past the bump bound, a short hop is under-delivery, not a bump.
+            assert!(!incoming_fits_swap_amount(
+                negotiated - Amount::from_sat(50_001),
+                negotiated,
+                bumps
+            ));
+        }
+        // Upstream funding bumps may leave the hop short; the fee was fixed
+        // at admission, so the shortfall costs the maker nothing.
+        assert!(incoming_fits_swap_amount(
             negotiated - Amount::from_sat(4_000),
-            negotiated
+            negotiated,
+            true
+        ));
+        // A swap without funding bumps has nothing to explain a short hop.
+        assert!(!incoming_fits_swap_amount(
+            negotiated - Amount::from_sat(4_000),
+            negotiated,
+            false
         ));
     }
 

@@ -270,6 +270,39 @@ impl CoreRPC {
         Ok(indexes["txindex"]["synced"].as_bool().unwrap_or(false))
     }
 
+    /// Test hook: take `txid`'s fee out of the miner's view, so regtest mining
+    /// leaves it in the mempool the way a fee spike would. A replacement has
+    /// another txid and is mined as usual.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn deprioritise_for_test(&self, txid: &Txid) -> Result<(), WalletError> {
+        self.prioritise_for_test(txid, -100_000_000)
+    }
+
+    /// Test hook: shift `txid`'s fee in the miner's view by `delta` sats.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn prioritise_for_test(&self, txid: &Txid, delta: i64) -> Result<(), WalletError> {
+        let _: bool = self.rpc.call(
+            "prioritisetransaction",
+            &[json!(txid.to_string()), json!(0), json!(delta)],
+        )?;
+        Ok(())
+    }
+
+    /// Test hook: orphan the block that mined `txid`, and every block on top
+    /// of it, as a reorg would. Its txs go back to the mempool.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn orphan_block_of_for_test(&self, txid: &Txid) -> Result<(), WalletError> {
+        let hash = self
+            .rpc
+            .get_raw_transaction_info(txid, None)?
+            .blockhash
+            .ok_or_else(|| WalletError::General(format!("{txid} is not mined")))?;
+        let _: Value = self
+            .rpc
+            .call("invalidateblock", &[json!(hash.to_string())])?;
+        Ok(())
+    }
+
     /// The node's `incrementalrelayfee` in sat/vB: what a replacement must
     /// add over the tx it replaces. `None` when the node does not report one.
     pub(crate) fn incremental_relay_feerate(&self) -> Result<Option<f64>, WalletError> {
@@ -447,9 +480,13 @@ impl Blockchain for CoreRPC {
             }
             Err(e) => return Err(e.into()),
         };
+        // The txindex keeps naming the block of a tx a reorg took out of the
+        // active chain; only confirmations say it is mined now.
         match info.blockhash {
-            Some(hash) => Ok(Some(self.rpc.get_block_header_info(&hash)?.height as u64)),
-            None => Ok(None),
+            Some(hash) if info.confirmations.unwrap_or(0) > 0 => {
+                Ok(Some(self.rpc.get_block_header_info(&hash)?.height as u64))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -492,8 +529,10 @@ impl Blockchain for CoreRPC {
             }
             Err(e) => return Err(e.into()),
         };
-        if info.blockhash.is_some() {
-            // Confirmed in a block.
+        // Confirmed in a block of the active chain. The txindex keeps naming
+        // the block of a tx a reorg took out, as `tx_block_height` notes; such
+        // a tx is known only if it went back to the mempool.
+        if info.blockhash.is_some() && info.confirmations.unwrap_or(0) > 0 {
             return Ok(false);
         }
         // Unconfirmed. `getrawtransaction` also returns wallet-record

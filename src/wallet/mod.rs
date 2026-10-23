@@ -19,12 +19,16 @@ pub(crate) mod swapcoin;
 
 pub(crate) use api::{
     contract_and_timelock_vsize, infer_address_type, p2tr_min_non_dust_sats,
-    payment_settlement_budget_sats, wait_for_tx_confirmation, SpendKind,
+    payment_settlement_budget_sats, replaced_version_discard_depth, wait_for_slots_confirmation,
+    wait_for_tx_confirmation, SlotTrack, SlotWait, SlotWaitOutcome, SpendKind,
 };
 pub use api::{min_contract_value_sats, Balances, RecoveryOutcome, UTXOSpendInfo, Wallet};
 pub use backup::{
     BondHint, OpenSwapsSummary, RestoreOptions, WalletBackup, RESTORE_OPEN_SWAPS_WARNING,
 };
+#[cfg(feature = "integration-test")]
+#[doc(hidden)]
+pub use blockchain::register_test_electrum_node;
 pub use blockchain::{
     AnyBlockchain, BackendConfig, Blockchain, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
     FeePriority, HdOrigin,

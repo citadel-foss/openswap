@@ -191,6 +191,107 @@ known makers. One proof bans the maker for good. Only removing the maker
 with `taker remove-maker` lifts the ban. A timeout or a node failure never
 counts as proof. Only arithmetic does.
 
+## Funding bumps
+
+Fees can jump after a hop's funding is broadcast. The funding then sits in
+the mempool, unconfirmed. After two hours the swap gives up, and every
+party's coins were locked for nothing. A funding bump replaces that stuck
+funding with a copy that pays a higher feerate. It is off unless you turn it
+on with `--bump-max-feerate` (`SwapParams::with_funding_bump`).
+
+Bumps need every maker on the route to support them. Taker and makers agree
+on them per swap through the `funding-bump-v1` feature in the handshake. If
+any maker does not offer it, the swap runs without bumps, and that maker
+gets neither the bump messages nor the key that signs them.
+
+**You pay for every bump.** The copy spends the same coins and returns the
+same change as the original. Only the contract output shrinks, by the extra
+miner fee. So the party that funds the hop pays nothing, whether that is you
+or a maker. The next maker receives that much less and forwards that much
+less, and so does every maker after it. You receive that much less at the
+end. Each maker still earns the service fee it agreed to on the full amount.
+
+**Only one version can confirm.** The original and its copy spend the same
+coins, so the network confirms one of them. Every party keeps both until
+one does. If your node stops in between, recovery still settles whichever
+version confirmed.
+
+**How a bump is decided.** Your node waits a few blocks (`--bump-after-blocks`,
+default 2). If the hop is still unconfirmed, it reads the rate the market
+pays to confirm in the next blocks. It bumps only when that rate is at
+least one relay step above what the funding already pays. It never goes
+past your own cap or the cap of the maker that funds the hop. It bumps each
+hop at most `--bump-max-count` times (default 2). A Legacy hop must confirm
+within a few blocks of the previous one, so bumps on Legacy must come early.
+
+**Every version is priced on the original.** The copy at a given feerate
+always pays `(new feerate - swap feerate) x (size of the original + 1 vbyte)`
+more than the original. Both sides work it out from the feerate alone. So a
+maker can answer a repeated request with the copy it already sent, and you
+can check that copy to the sat.
+
+**What the maker checks.** A maker only replaces its funding when you sign
+the request. Your node signs it with a key it declared in the swap details.
+Every maker on the route knows the swap id, so the id alone moves nothing.
+The maker refuses a feerate above its own cap (`max_funding_bump_feerate`),
+or a bump that takes more than its cap (`max_funding_bump_sats`) out of its
+contracts. Both caps are in its offer, and both are 0, refusing every bump,
+unless the operator sets them. The cap matters because a bump is a cost the
+maker carries until the swap succeeds. If the swap then fails, the maker
+refunds a smaller contract than it funded.
+
+On Legacy the maker first shows you the copy without signatures. The next
+maker signs the copy's contract, and only then does the funding maker
+broadcast it. Without that signature the funding maker could not take its
+coins back if the swap failed.
+
+**What the next maker checks.** A hop may arrive short of its declared
+amount, but only by what bumps can explain: at most 10%. Anything below
+that is refused like any other under-delivery. The maker keeps the service
+fee it priced on the declared amount.
+
+**What you check.** A maker's copy must spend exactly the coins of the
+original. It must return the same change, and its contract output must be
+lower by exactly the extra fee. On Legacy the copy's contract must be the
+one the rules build from it. Anything else is a proven cheat.
+
+**Reorgs.** A funding that confirmed may be the one the next maker built
+on. If a reorg later takes its block away, a bump would replace funding the
+next maker already accepted. So a maker records every funding of its own it
+sees mined, on each new block, and never bumps one again. On Legacy it also
+stops bumping once it signs the next maker's contract. A maker whose node
+never saw the orphaned block could still be asked to bump. On Taproot the
+next maker then finds the version that was mined: it spends the same coins
+and pays the same contract, so the maker claims that one instead. It gets
+less than it accepted, by at most the funding maker's bump cap.
+
+A reorg can also swap which version of a funding is mined, after the hop
+settled on another. So every version keeps what is needed to refund it
+until the version that beat it is 6 blocks deep, even after the swap
+completes. Maker and taker drop them in the background once they are that
+deep; a taker stopped before then picks them up when it next starts. If a
+reorg mines one of them instead, the swap is recovered from it. A failed swap's recovery waits for
+the same depth.
+
+That covers the funder. Once the swap completed, a revived version's coins
+are the receiver's: it holds the keys and should claim them. A taker keeps
+its replaced incoming versions and claims one a reorg revives. A maker does
+not yet keep them (a Legacy last hop has none to keep), so after a reorg that
+deep the funder only holds on to its refund. A taker funder never takes back
+what a maker should claim; a maker funder refunds it once its timelock
+passes, as with any contract left unclaimed. A version you broadcast counts even if your node's answer
+was lost: it is tracked from the moment it is signed.
+
+**A lost answer.** If the maker's answer to a bump never reaches you, your
+node does not know the replacement it broadcast. It looks for a transaction
+spending the original's coins, in the mempool and in the blocks since the
+hop's wait began. It accepts one only if it is exactly a bump of the
+original at some feerate within the caps. Anything else is the maker
+spending its funding outside the swap, a proven cheat.
+
+**Privacy.** Anyone who saw both versions can tell which output shrank:
+that output is the swap's contract.
+
 ## Before you confirm
 
 The command line shows you the ceiling, not the best case. It adds up the

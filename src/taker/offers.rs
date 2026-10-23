@@ -2007,6 +2007,8 @@ impl MakerAddress {
             tweak_chain_code: router_offer.tweak_chain_code,
             name: router_offer.name,
             lightning: router_offer.lightning,
+            max_funding_bump_feerate: router_offer.max_funding_bump_feerate,
+            max_funding_bump_sats: router_offer.max_funding_bump_sats,
         };
 
         log::info!(
@@ -2483,6 +2485,8 @@ pub(crate) mod tests {
             tweak_chain_code: bitcoin::bip32::ChainCode::from([0u8; 32]),
             name: "maker".to_string(),
             lightning: None,
+            max_funding_bump_feerate: 0,
+            max_funding_bump_sats: 0,
         }
     }
 

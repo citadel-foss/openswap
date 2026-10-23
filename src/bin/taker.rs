@@ -6,8 +6,8 @@ use openswap::{
     lock_debug,
     protocol::ProtocolVersion,
     taker::{
-        error::TakerError, format_state, MakerOfferCandidate, MakerState, SwapParams, Taker,
-        TakerConfig, TakerInitConfig,
+        error::TakerError, format_state, FundingBumpPolicy, MakerOfferCandidate, MakerState,
+        SwapParams, Taker, TakerConfig, TakerInitConfig,
     },
     utill::{parse_proxy_auth, setup_taker_logger, MAX_TX_COUNT, UTXO},
     wallet::{seed_cli, AddressType, BondHint, CoreRpcConfig, RestoreOptions, Wallet},
@@ -221,6 +221,25 @@ enum Commands {
         /// amount then means the exact amount the receiver gets.
         #[clap(long = "payment-address")]
         payment_address: Option<String>,
+        /// Replace a hop's funding at a higher feerate, up to this many sats/vB,
+        /// while it sits unconfirmed. The extra fee comes out of the swap amount.
+        /// Off unless set.
+        #[clap(long = "bump-max-feerate")]
+        bump_max_feerate: Option<u64>,
+        /// Blocks a hop's funding waits unconfirmed before each bump.
+        #[clap(
+            long = "bump-after-blocks",
+            default_value = "2",
+            requires = "bump_max_feerate"
+        )]
+        bump_after_blocks: u32,
+        /// Most bumps per hop.
+        #[clap(
+            long = "bump-max-count",
+            default_value = "2",
+            requires = "bump_max_feerate"
+        )]
+        bump_max_count: u32,
         /// Skip the confirmation prompt and proceed immediately.
         #[clap(long, short = 'y')]
         yes: bool,
@@ -764,6 +783,9 @@ fn run() -> Result<(), TakerError> {
             maker_addresses,
             auto_select,
             payment_address,
+            bump_max_feerate,
+            bump_after_blocks,
+            bump_max_count,
             yes,
         } => {
             let protocol_version = parse_protocol(protocol)?;
@@ -806,6 +828,13 @@ fn run() -> Result<(), TakerError> {
                 swap_params.payment_address = Some(address.parse().map_err(|e| {
                     TakerError::General(format!("Invalid payment address '{address}': {e}"))
                 })?);
+            }
+            if let Some(max_feerate) = bump_max_feerate {
+                swap_params.funding_bump = Some(
+                    FundingBumpPolicy::new(*max_feerate)
+                        .with_after_blocks(*bump_after_blocks)
+                        .with_max_bumps(*bump_max_count),
+                );
             }
 
             // Phase 1: Prepare — discover makers, negotiate, get fee summary.

@@ -558,7 +558,8 @@ fn run_failed_first_send_frees_inputs(world: &mut World, params: SwapParams) {
     }
     assert!(maker.has_unfinished_outgoing_swapcoin(&swap_id).unwrap());
 
-    world.mine(1);
+    // Dropped once the spend is buried past reorg depth (6 blocks).
+    world.mine(6);
     wait_until!(
         Duration::from_secs(60),
         every Duration::from_secs(2),

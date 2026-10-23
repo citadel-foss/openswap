@@ -84,6 +84,47 @@ pub(crate) const RESTORE_ADDRESS_GAP: u32 = 100;
 /// higher indices must not keep the loop or the watch window growing forever.
 const MAX_SYNC_PASSES: u32 = 100;
 pub(crate) const MAX_WATCH_WINDOW: u32 = 100_000;
+/// [`Wallet::judge_unseen_incoming`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnseenIncoming {
+    /// A mined replacement pays the same contract: move the coin onto it.
+    Follow,
+    /// Its coins went elsewhere for good: nothing is ever swept from it.
+    Drop,
+    /// Not decided yet.
+    Wait,
+}
+
+/// What [`Wallet::retire_replaced_versions`] did with a swap's leftover versions.
+#[derive(Debug, Default)]
+pub(crate) struct Retirement {
+    /// Contract outputs of the outgoing versions dropped, to unwatch.
+    pub(crate) removed: Vec<(OutPoint, ScriptBuf)>,
+    /// Versions still kept: not yet beaten deep enough.
+    pub(crate) remaining: usize,
+    /// One kept version's own funding is mined: a reorg made it the hop, and
+    /// the swap needs recovering from it.
+    pub(crate) revived: bool,
+}
+
+/// A funding version that a fee bump replaced, or that replaced another, is
+/// dropped only once the spend that beat it is this many blocks deep: a reorg
+/// that undoes a shallower one can still confirm the dropped version.
+pub(crate) const REPLACED_VERSION_DISCARD_DEPTH: u64 = 6;
+
+/// [`REPLACED_VERSION_DISCARD_DEPTH`], which a test can raise through
+/// `OPENSWAP_REPLACED_VERSION_DISCARD_DEPTH` to keep a swap's replaced
+/// versions around long enough to reorg one back in.
+pub(crate) fn replaced_version_discard_depth() -> u64 {
+    #[cfg(feature = "integration-test")]
+    if let Some(depth) = std::env::var("OPENSWAP_REPLACED_VERSION_DISCARD_DEPTH")
+        .ok()
+        .and_then(|depth| depth.parse().ok())
+    {
+        return depth;
+    }
+    REPLACED_VERSION_DISCARD_DEPTH
+}
 /// script-path: sig+preimage+script+control_block (~154)
 const TAPROOT_SCRIPTPATH_VSIZE: u64 = 155;
 /// ≈141 + 1 (growing block-height)
@@ -1125,12 +1166,184 @@ impl Wallet {
             .collect()
     }
 
+    /// The mined replacement of a Taproot incoming contract whose funding a fee
+    /// bump replaced: a confirmed tx spending exactly the same coins and paying
+    /// the same contract script once. Its keys and scripts are the contract's,
+    /// so the coin is ours to claim there just as it was in the original.
+    fn confirmed_taproot_replacement(
+        chain: &AnyBlockchain,
+        coin: &super::swapcoin::IncomingSwapCoin,
+    ) -> Result<Option<Transaction>, WalletError> {
+        if coin.protocol != ProtocolVersion::Taproot {
+            return Ok(None);
+        }
+        let contract_txid = coin.contract_tx.compute_txid();
+        if chain.tx_block_height(&contract_txid)?.is_some() {
+            return Ok(None);
+        }
+        let Some(contract_output) = coin
+            .contract_tx
+            .output
+            .get(coin.get_contract_output_vout() as usize)
+        else {
+            return Ok(None);
+        };
+        let Some(outpoint) = coin.contract_tx.input.first().map(|i| i.previous_output) else {
+            return Ok(None);
+        };
+        let parent = match chain.get_raw_transaction(&outpoint.txid, None) {
+            Ok(parent) if parent.compute_txid() == outpoint.txid => parent,
+            Ok(_) => return Ok(None),
+            Err(_) if chain.is_tx_unknown(&outpoint.txid)? => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(prevout) = parent.output.get(outpoint.vout as usize) else {
+            return Ok(None);
+        };
+        let Some(spender) =
+            chain.confirmed_spending_transaction(&outpoint, &prevout.script_pubkey)?
+        else {
+            return Ok(None);
+        };
+        let same_coins = spender.input.len() == coin.contract_tx.input.len()
+            && coin.contract_tx.input.iter().all(|input| {
+                spender
+                    .input
+                    .iter()
+                    .any(|other| other.previous_output == input.previous_output)
+            });
+        let paying = spender
+            .output
+            .iter()
+            .filter(|output| output.script_pubkey == contract_output.script_pubkey)
+            .count();
+        if spender.compute_txid() == contract_txid || !same_coins || paying != 1 {
+            return Ok(None);
+        }
+        Ok(Some(spender))
+    }
+
+    /// What recovery does with an incoming coin whose contract output it cannot
+    /// find: follow a mined Taproot replacement paying the same contract, drop
+    /// one whose coins went elsewhere for good, else wait.
+    fn judge_unseen_incoming(
+        chain: &AnyBlockchain,
+        coin: &super::swapcoin::IncomingSwapCoin,
+    ) -> Result<UnseenIncoming, WalletError> {
+        if coin.protocol != ProtocolVersion::Taproot
+            || chain
+                .tx_block_height(&coin.contract_tx.compute_txid())?
+                .is_some()
+        {
+            return Ok(UnseenIncoming::Wait);
+        }
+        if !coin.replaced && Self::confirmed_taproot_replacement(chain, coin)?.is_some() {
+            return Ok(UnseenIncoming::Follow);
+        }
+        if Self::replaced_by_confirmed_spend(
+            chain,
+            &coin.contract_tx,
+            replaced_version_discard_depth(),
+        )? {
+            return Ok(UnseenIncoming::Drop);
+        }
+        Ok(UnseenIncoming::Wait)
+    }
+
+    /// Point each Taproot incoming swapcoin of `swap_id` at the mined version
+    /// when a funding fee bump replaced its own, after a reorg or behind our
+    /// back. Returns each moved coin's old contract txid and the coin now.
+    pub(crate) fn follow_replaced_incoming(
+        wallet: &std::sync::RwLock<Wallet>,
+        chain: &AnyBlockchain,
+        swap_id: &str,
+    ) -> Result<Vec<(Txid, super::swapcoin::IncomingSwapCoin)>, WalletError> {
+        let coins: Vec<_> = lock_debug!(wallet.read())
+            .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?
+            .store
+            .incoming_swapcoins
+            .values()
+            .filter(|coin| {
+                // A flagged copy stands for one version only; retirement
+                // drops it once another version is mined deep.
+                coin.protocol == ProtocolVersion::Taproot
+                    && coin.swap_id.as_deref() == Some(swap_id)
+                    && coin.spending_tx.is_none()
+                    && !coin.replaced
+            })
+            .cloned()
+            .collect();
+        let mut moved = Vec::new();
+        for coin in coins {
+            let Some(replacement) = Self::confirmed_taproot_replacement(chain, &coin)? else {
+                continue;
+            };
+            let script =
+                &coin.contract_tx.output[coin.get_contract_output_vout() as usize].script_pubkey;
+            let Some(amount) = replacement
+                .output
+                .iter()
+                .find(|output| output.script_pubkey == *script)
+                .map(|output| output.value)
+            else {
+                continue;
+            };
+            let old = coin.contract_tx.compute_txid();
+            let mut followed = coin;
+            followed.contract_txid = followed.contract_txid.map(|_| replacement.compute_txid());
+            followed.contract_tx = replacement;
+            followed.funding_amount = amount;
+            moved.push((old, followed));
+        }
+        if !moved.is_empty() {
+            let mut w = lock_debug!(wallet.write())
+                .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
+            for (old, followed) in &moved {
+                w.remove_incoming_swapcoin(&old.to_string());
+                w.add_incoming_swapcoin(followed);
+                log::warn!(
+                    "Incoming contract {} of swap {} was replaced by {} worth {}; following it",
+                    old,
+                    swap_id,
+                    followed.contract_tx.compute_txid(),
+                    followed.funding_amount
+                );
+            }
+            w.save_to_disk()?;
+        }
+        Ok(moved)
+    }
+
     /// Whether `swap_id` has an outgoing coin whose funding is not known sent.
     pub(crate) fn has_unsent_funding(&self, swap_id: &str) -> bool {
         self.store
             .outgoing_swapcoins
             .values()
             .any(|coin| coin.swap_id.as_deref() == Some(swap_id) && !coin.committed)
+    }
+
+    /// Flag the swapcoins whose contract tx is one of `contract_txids` as
+    /// funding versions a fee bump replaced, and save. Retirement acts only
+    /// on these, and only these can come back revived.
+    pub(crate) fn mark_replaced_versions(
+        &mut self,
+        contract_txids: &[Txid],
+    ) -> Result<(), WalletError> {
+        for txid in contract_txids {
+            let key = txid.to_string();
+            if let Some(coin) = self.store.outgoing_swapcoins.get_mut(&key) {
+                coin.replaced = true;
+            }
+            if let Some(coin) = self.store.incoming_swapcoins.get_mut(&key) {
+                coin.replaced = true;
+            }
+        }
+        self.save_to_disk()
+    }
+
+    /// Drop the watch-only coins of `swap_id`, not saving.
+    pub(crate) fn remove_watchonly_swapcoins(&mut self, swap_id: &str) {
+        self.store.watchonly_swapcoins.remove(swap_id);
     }
 
     /// Keep retry state in memory when cleanup cannot be saved.
@@ -1200,31 +1413,15 @@ impl Wallet {
     }
 
     /// Whether a confirmed transaction other than `tx` spends one of its
-    /// inputs, so `tx` can never confirm.
+    /// inputs, deep enough that `tx` can never confirm.
     fn inputs_spent_elsewhere(
         chain: &AnyBlockchain,
         tx: &Transaction,
     ) -> Result<bool, WalletError> {
-        for input in &tx.input {
-            let outpoint = input.previous_output;
-            let parent = match chain.get_raw_transaction(&outpoint.txid, None) {
-                Ok(tx) => tx,
-                Err(_) if chain.is_tx_unknown(&outpoint.txid)? => continue,
-                Err(e) => return Err(e),
-            };
-            if parent.compute_txid() != outpoint.txid {
-                continue;
-            }
-            if let Some(output) = parent.output.get(outpoint.vout as usize) {
-                if chain
-                    .confirmed_spending_transaction(&outpoint, &output.script_pubkey)?
-                    .is_some_and(|spender| spender.compute_txid() != tx.compute_txid())
-                {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        // Only a spend buried deep: a fee bump's other versions spend these
+        // very inputs, and a reorg that undoes a shallow one can still
+        // confirm `tx`.
+        Self::replaced_by_confirmed_spend(chain, tx, replaced_version_discard_depth())
     }
 
     /// On-chain swaps with stored recovery or watch-only coins.
@@ -1249,6 +1446,173 @@ impl Wallet {
         ids.extend(self.store.ln_pending_swaps.keys().cloned());
         ids.extend(self.store.ln_maker_swaps.keys().cloned());
         ids
+    }
+
+    /// The confirmed tx spending `outpoint` and how many blocks deep it is.
+    /// `None` when no confirmed spend is found, or the parent is unknown.
+    fn confirmed_spend_depth(
+        chain: &AnyBlockchain,
+        outpoint: &OutPoint,
+    ) -> Result<Option<(Txid, u64)>, WalletError> {
+        let parent = match chain.get_raw_transaction(&outpoint.txid, None) {
+            Ok(parent) if parent.compute_txid() == outpoint.txid => parent,
+            Ok(_) => return Ok(None),
+            // As in `check_funding_inputs_state`: only a genuinely absent
+            // parent has nothing to check.
+            Err(_) if chain.is_tx_unknown(&outpoint.txid)? => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(output) = parent.output.get(outpoint.vout as usize) else {
+            return Ok(None);
+        };
+        let Some(spender) =
+            chain.confirmed_spending_transaction(outpoint, &output.script_pubkey)?
+        else {
+            return Ok(None);
+        };
+        let spender_txid = spender.compute_txid();
+        let Some(height) = chain.tx_block_height(&spender_txid)? else {
+            return Ok(None);
+        };
+        let depth = chain.get_block_count()?.saturating_sub(height) + 1;
+        Ok(Some((spender_txid, depth)))
+    }
+
+    /// Whether another tx than `tx` spent one of its inputs and is at least
+    /// `min_depth` blocks deep: a replacement of it won for good, so `tx`
+    /// never lands. A confirmed spend by `tx` itself, say mined since the
+    /// caller last looked, is not one; nor is a shallower one, which a reorg
+    /// can still undo.
+    pub(crate) fn replaced_by_confirmed_spend(
+        chain: &AnyBlockchain,
+        tx: &Transaction,
+        min_depth: u64,
+    ) -> Result<bool, WalletError> {
+        let txid = tx.compute_txid();
+        for input in &tx.input {
+            if Self::confirmed_spend_depth(chain, &input.previous_output)?
+                .is_some_and(|(spender, depth)| spender != txid && depth >= min_depth)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// One pass over the funding versions a fee bump left behind for
+    /// `swap_id` once the swap settled on another, the coins flagged
+    /// `replaced`: each is dropped once the spend that beat it is
+    /// [`REPLACED_VERSION_DISCARD_DEPTH`] deep, and kept before that, since a
+    /// reorg can still confirm it and its refund needs the coin. Reads the
+    /// chain with no wallet lock held.
+    pub(crate) fn retire_replaced_versions(
+        wallet: &std::sync::RwLock<Wallet>,
+        chain: &AnyBlockchain,
+        swap_id: &str,
+    ) -> Result<Retirement, WalletError> {
+        let (outgoing, incoming) = {
+            let wallet = lock_debug!(wallet.read())
+                .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
+            let of_swap = |id: &Option<String>| id.as_deref() == Some(swap_id);
+            let outgoing: Vec<(String, Option<Transaction>, OutPoint, ScriptBuf)> = wallet
+                .store
+                .outgoing_swapcoins
+                .iter()
+                .filter(|(_, coin)| of_swap(&coin.swap_id) && coin.replaced)
+                .map(|(key, coin)| {
+                    let funding = match coin.protocol {
+                        ProtocolVersion::Taproot => Some(coin.contract_tx.clone()),
+                        ProtocolVersion::Legacy => coin.funding_tx.clone(),
+                    };
+                    let vout = coin.get_contract_output_vout();
+                    let script = coin
+                        .contract_tx
+                        .output
+                        .get(vout as usize)
+                        .map(|output| output.script_pubkey.clone())
+                        .unwrap_or_default();
+                    (
+                        key.clone(),
+                        funding,
+                        OutPoint::new(coin.contract_tx.compute_txid(), vout),
+                        script,
+                    )
+                })
+                .collect();
+            // A Taproot incoming coin's contract tx is the maker's funding; a
+            // Legacy copy carries the funding of the version it stands for.
+            let incoming: Vec<(String, Option<Transaction>)> = wallet
+                .store
+                .incoming_swapcoins
+                .iter()
+                .filter(|(_, coin)| of_swap(&coin.swap_id) && coin.replaced)
+                .map(|(key, coin)| {
+                    let funding = match coin.protocol {
+                        ProtocolVersion::Taproot => Some(coin.contract_tx.clone()),
+                        ProtocolVersion::Legacy => coin.replaced_funding_tx.clone(),
+                    };
+                    (key.clone(), funding)
+                })
+                .collect();
+            (outgoing, incoming)
+        };
+
+        // `Some(true)`: beaten deep, retire it. `Some(false)`: its own
+        // funding is mined. `None`: keep it for now.
+        let judge = |funding: Option<&Transaction>| -> Result<Option<bool>, WalletError> {
+            let Some(funding) = funding else {
+                return Ok(None);
+            };
+            if Self::replaced_by_confirmed_spend(chain, funding, replaced_version_discard_depth())?
+            {
+                return Ok(Some(true));
+            }
+            Ok(chain
+                .tx_block_height(&funding.compute_txid())?
+                .map(|_| false))
+        };
+        let mut retirement = Retirement::default();
+        let mut retire_outgoing = Vec::new();
+        let mut retire_incoming = Vec::new();
+        for (key, funding, outpoint, script) in &outgoing {
+            match judge(funding.as_ref())? {
+                Some(true) => {
+                    retire_outgoing.push(key.clone());
+                    retirement.removed.push((*outpoint, script.clone()));
+                }
+                verdict => {
+                    retirement.revived |= verdict == Some(false);
+                    retirement.remaining += 1;
+                }
+            }
+        }
+        for (key, funding) in &incoming {
+            match judge(funding.as_ref())? {
+                Some(true) => retire_incoming.push(key.clone()),
+                verdict => {
+                    retirement.revived |= verdict == Some(false);
+                    retirement.remaining += 1;
+                }
+            }
+        }
+        if retire_outgoing.is_empty() && retire_incoming.is_empty() {
+            return Ok(retirement);
+        }
+        let mut wallet = lock_debug!(wallet.write())
+            .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
+        for key in &retire_outgoing {
+            wallet.remove_outgoing_swapcoin(key);
+        }
+        for key in &retire_incoming {
+            wallet.remove_incoming_swapcoin(key);
+        }
+        wallet.save_to_disk()?;
+        log::info!(
+            "Retired {} funding version(s) of swap {} that another version beat for good",
+            retire_outgoing.len() + retire_incoming.len(),
+            swap_id
+        );
+        Ok(retirement)
     }
 
     /// Returns contract_txid keys of incoming swapcoins matching a swap_id.
@@ -1919,19 +2283,29 @@ impl Wallet {
                         )
                     };
                     let first_maker_lock = hops.first().and_then(timelock);
-                    let mut dangling = first_maker_lock.is_some();
+                    // A fee-bumped hop is kept in every version, and only one
+                    // of them ever exists: a contract is refunded once any of
+                    // its versions is. Versions share every script and key.
+                    let mut refunded: Vec<(&WatchOnlySwapCoin, bool)> = Vec::new();
                     for hop in hops.iter().filter(|hop| timelock(hop) == first_maker_lock) {
                         let outpoint = hop.contract_outpoint();
-                        dangling = match hop.contract_tx.output.get(outpoint.vout as usize) {
+                        let spent = match hop.contract_tx.output.get(outpoint.vout as usize) {
                             Some(output) => chain
                                 .confirmed_spending_transaction(&outpoint, &output.script_pubkey)?
                                 .is_some_and(|tx| hop.is_timelock_spend(&tx)),
                             None => false,
                         };
-                        if !dangling {
-                            break;
+                        match refunded
+                            .iter_mut()
+                            .find(|(seen, _)| seen.is_version_of(hop))
+                        {
+                            Some((_, any)) => *any |= spent,
+                            None => refunded.push((hop, spent)),
                         }
                     }
+                    let dangling = first_maker_lock.is_some()
+                        && !refunded.is_empty()
+                        && refunded.iter().all(|(_, spent)| *spent);
                     if !dangling {
                         log::debug!(
                             "Holding refund of {} for the first maker's hashlock claim",
@@ -2566,6 +2940,20 @@ impl Wallet {
             .swap_locks
             .values()
             .any(|locks| locks.outpoints.contains(outpoint))
+    }
+
+    /// Test-only: the funding tx of every outgoing swapcoin that has one:
+    /// a Taproot coin's contract tx, a Legacy coin's stored funding tx.
+    #[cfg(feature = "integration-test")]
+    pub fn outgoing_funding_txs_for_test(&self) -> Vec<Transaction> {
+        self.store
+            .outgoing_swapcoins
+            .values()
+            .filter_map(|coin| match coin.protocol {
+                ProtocolVersion::Taproot => Some(coin.contract_tx.clone()),
+                ProtocolVersion::Legacy => coin.funding_tx.clone(),
+            })
+            .collect()
     }
 
     /// Test-only: reserve `outpoints` for `swap_key` and persist it, as
@@ -4250,6 +4638,30 @@ impl Wallet {
                             return Ok(());
                         }
                     } else {
+                        // A fee bump replaced this contract. A replacement paying
+                        // the same contract is ours to claim: follow it, and
+                        // the next pass sweeps it. One beaten for good by any
+                        // other spend is never swept.
+                        let verdict = Self::judge_unseen_incoming(chain, &swapcoin)?;
+                        if verdict == UnseenIncoming::Follow {
+                            if let Some(id) = swapcoin.swap_id.as_deref() {
+                                Self::follow_replaced_incoming(wallet, chain, id)?;
+                            }
+                            return Ok(());
+                        }
+                        if verdict == UnseenIncoming::Drop {
+                            log::info!(
+                                "Incoming contract {} for {} was replaced and its inputs are confirmed spent — dropping it",
+                                utxo_txid,
+                                swap_id
+                            );
+                            let mut w = lock_debug!(wallet.write()).map_err(|_| {
+                                WalletError::General("wallet lock poisoned".to_string())
+                            })?;
+                            w.remove_incoming_swapcoin(&swap_id);
+                            w.save_to_disk()?;
+                            return Ok(());
+                        }
                         log::info!(
                             "Skipping sweep for {} - UTXO not available on chain",
                             swap_id
@@ -4462,14 +4874,105 @@ pub(crate) fn wait_for_tx_confirmation(
     shutdown: Option<&std::sync::atomic::AtomicBool>,
     abort_check: Option<&dyn Fn() -> bool>,
 ) -> Result<u32, WalletError> {
-    if required_confirms == 0 || txids.is_empty() {
-        return Ok(0);
+    let slots: Vec<Vec<Txid>> = txids.iter().map(|txid| vec![*txid]).collect();
+    match wait_for_slots_confirmation(
+        blockchain,
+        &slots,
+        &SlotWait {
+            required_confirms,
+            arrival_timeout,
+            started: Instant::now(),
+            interrupt_at_height: None,
+        },
+        &mut SlotTrack::new(slots.len()),
+        shutdown,
+        abort_check,
+    )? {
+        SlotWaitOutcome::Confirmed { height, .. } => Ok(height),
+        SlotWaitOutcome::HeightReached(_) => Err(WalletError::General(
+            "confirmation wait returned at a height it was never given".to_string(),
+        )),
+    }
+}
+
+/// The bounds of a [`wait_for_slots_confirmation`].
+pub(crate) struct SlotWait {
+    /// Confirmations each slot needs.
+    pub(crate) required_confirms: u32,
+    /// How long a slot may go unseen, or vanish, before the wait fails.
+    pub(crate) arrival_timeout: Duration,
+    /// When the wait began. A resumed wait passes its first start, so
+    /// [`TX_CONFIRMATION_TIMEOUT`] bounds all of it.
+    pub(crate) started: Instant,
+    /// Return [`SlotWaitOutcome::HeightReached`] once the tip reaches this
+    /// height and some slot is still unconfirmed.
+    pub(crate) interrupt_at_height: Option<u64>,
+}
+
+/// What a [`wait_for_slots_confirmation`] has seen of its slots, kept by the
+/// caller across the waits an interrupt height splits it into: which slots
+/// were never seen and since when, and when a seen slot vanished.
+pub(crate) struct SlotTrack {
+    arrival_started: Instant,
+    unseen: HashSet<usize>,
+    vanished_at: HashMap<usize, Instant>,
+}
+
+impl SlotTrack {
+    /// Nothing seen yet of `slots` slots; the arrival deadline runs from now.
+    pub(crate) fn new(slots: usize) -> Self {
+        Self {
+            arrival_started: Instant::now(),
+            unseen: (0..slots).collect(),
+            vanished_at: HashMap::new(),
+        }
+    }
+}
+
+/// How a [`wait_for_slots_confirmation`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SlotWaitOutcome {
+    /// Every slot confirmed. `winners[i]` is the member of slot `i` that did;
+    /// `height` is the highest block any of them was mined at.
+    Confirmed { height: u32, winners: Vec<Txid> },
+    /// The tip reached the interrupt height first.
+    HeightReached(u64),
+}
+
+/// Wait until one member of every slot reaches the required confirmations.
+///
+/// A slot is the set of transactions spending the same coins, such as a
+/// funding tx and its fee-bumped replacements: only one of them can confirm,
+/// and any one confirming settles the slot. The slot counts as seen while any
+/// member is, and as vanished only when every member is gone, since a replaced
+/// tx leaves the mempool as its replacement enters it. Otherwise bounded as
+/// [`wait_for_tx_confirmation`] is. `track` carries what the wait has seen,
+/// so a wait resumed after [`SlotWaitOutcome::HeightReached`] keeps the
+/// arrival deadline and eviction windows it started with.
+pub(crate) fn wait_for_slots_confirmation(
+    blockchain: &AnyBlockchain,
+    slots: &[Vec<Txid>],
+    wait: &SlotWait,
+    track: &mut SlotTrack,
+    shutdown: Option<&std::sync::atomic::AtomicBool>,
+    abort_check: Option<&dyn Fn() -> bool>,
+) -> Result<SlotWaitOutcome, WalletError> {
+    let required_confirms = wait.required_confirms;
+    let arrival_timeout = wait.arrival_timeout;
+    if required_confirms == 0 || slots.is_empty() {
+        return Ok(SlotWaitOutcome::Confirmed {
+            height: 0,
+            winners: slots
+                .iter()
+                .filter_map(|slot| slot.first().copied())
+                .collect(),
+        });
     }
 
     log::info!(
         "Waiting for {} confirmation(s) on {} transaction(s)...",
         required_confirms,
-        txids.len()
+        slots.len()
     );
 
     const SYNC_INTERVAL_SECS: u64 = 10;
@@ -4477,9 +4980,12 @@ pub(crate) fn wait_for_tx_confirmation(
     /// eviction from the mempool is still noticed.
     const MEMPOOL_RECHECK: Duration = Duration::from_secs(60);
 
-    let started = Instant::now();
-    let mut unseen: HashSet<Txid> = txids.iter().copied().collect();
-    let mut vanished_at: HashMap<Txid, Instant> = HashMap::new();
+    let SlotTrack {
+        arrival_started: started,
+        unseen,
+        vanished_at,
+    } = track;
+    let started = *started;
     let mut last_tip = None;
     let mut last_read: Option<Instant> = None;
 
@@ -4490,7 +4996,7 @@ pub(crate) fn wait_for_tx_confirmation(
         if abort_check.is_some_and(|f| f()) {
             return Err(WalletError::Interrupted("Abort requested"));
         }
-        if started.elapsed() > TX_CONFIRMATION_TIMEOUT {
+        if wait.started.elapsed() > TX_CONFIRMATION_TIMEOUT {
             log::error!(
                 "Tx(s) did not confirm within {}s",
                 TX_CONFIRMATION_TIMEOUT.as_secs()
@@ -4518,55 +5024,65 @@ pub(crate) fn wait_for_tx_confirmation(
 
         let mut all_confirmed = true;
         let mut max_confirm_height: u32 = 0;
+        let mut winners = Vec::with_capacity(slots.len());
 
-        for txid in txids {
-            match blockchain.get_raw_transaction_info(txid, None) {
-                Ok(tx_info) => {
-                    let confirms: u32 = tx_info.confirmations.unwrap_or(0);
-                    // First sighting gets a line: the eviction window anchors
-                    // to it, and tests time a replacement off it.
-                    if unseen.remove(txid) && confirms < required_confirms {
-                        log::info!(
-                            "Tx {txid} seen in mempool, waiting for {required_confirms} confirmation(s)"
-                        );
-                    }
-                    if confirms < required_confirms {
-                        log::debug!(
-                            "Tx {} has {} confirmations (need {})",
-                            txid,
-                            confirms,
-                            required_confirms
-                        );
-                        all_confirmed = false;
-                    } else {
-                        // QA: Ask the backend for the mined height directly;
-                        // tip-height arithmetic can race with a newly mined block.
-                        let confirm_height = blockchain.tx_block_height(txid)?.ok_or_else(|| {
-                            WalletError::General(format!(
-                                "Confirmed transaction {txid} has no block height"
-                            ))
-                        })? as u32;
-                        max_confirm_height = max_confirm_height.max(confirm_height);
-                    }
+        for (slot_index, slot) in slots.iter().enumerate() {
+            let mut seen = None;
+            let mut winner = None;
+            for txid in slot {
+                let Ok(tx_info) = blockchain.get_raw_transaction_info(txid, None) else {
+                    log::debug!("Tx {txid} is not visible to the backend");
+                    continue;
+                };
+                seen.get_or_insert(*txid);
+                let confirms: u32 = tx_info.confirmations.unwrap_or(0);
+                if confirms < required_confirms {
+                    log::debug!(
+                        "Tx {} has {} confirmations (need {})",
+                        txid,
+                        confirms,
+                        required_confirms
+                    );
+                    continue;
                 }
-                Err(e) => {
-                    log::debug!("Error getting tx info for {}: {:?}", txid, e);
-                    // A seen tx that vanishes (mempool eviction) gets one window to
-                    // reappear. Re-sighting never clears the window, so a tx
-                    // flapping in and out of the mempool still trips the bound.
-                    if !unseen.contains(txid)
-                        && vanished_at
-                            .entry(*txid)
-                            .or_insert_with(Instant::now)
-                            .elapsed()
-                            > arrival_timeout
-                    {
-                        return Err(WalletError::TxConfirmationTimeout(
-                            "Tx vanished from our mempool and did not reappear".to_string(),
-                        ));
-                    }
-                    all_confirmed = false;
+                // QA: Ask the backend for the mined height directly;
+                // tip-height arithmetic can race with a newly mined block.
+                let confirm_height = blockchain.tx_block_height(txid)?.ok_or_else(|| {
+                    WalletError::General(format!(
+                        "Confirmed transaction {txid} has no block height"
+                    ))
+                })? as u32;
+                max_confirm_height = max_confirm_height.max(confirm_height);
+                winner = Some(*txid);
+                break;
+            }
+            // First sighting gets a line: the eviction window anchors to it,
+            // and tests time a replacement off it.
+            if let Some(txid) = seen {
+                if unseen.remove(&slot_index) && winner.is_none() {
+                    log::info!(
+                        "Tx {txid} seen in mempool, waiting for {required_confirms} confirmation(s)"
+                    );
                 }
+            }
+            if seen.is_none()
+                && !unseen.contains(&slot_index)
+                // A seen slot that vanishes (mempool eviction) gets one window
+                // to reappear. Re-sighting never clears the window, so a slot
+                // flapping in and out of the mempool still trips the bound.
+                && vanished_at
+                    .entry(slot_index)
+                    .or_insert_with(Instant::now)
+                    .elapsed()
+                    > arrival_timeout
+            {
+                return Err(WalletError::TxConfirmationTimeout(
+                    "Tx vanished from our mempool and did not reappear".to_string(),
+                ));
+            }
+            match winner {
+                Some(txid) => winners.push(txid),
+                None => all_confirmed = false,
             }
         }
 
@@ -4580,7 +5096,10 @@ pub(crate) fn wait_for_tx_confirmation(
             // Never seeing a tx is not the same as the backend telling us it has
             // none. Only a definite answer for every missing tx names a withheld
             // broadcast; an error means we could not ask.
-            let mut missing: Vec<Txid> = unseen.iter().copied().collect();
+            let mut missing: Vec<Txid> = unseen
+                .iter()
+                .flat_map(|slot_index| slots[*slot_index].iter().copied())
+                .collect();
             missing.sort();
             let mut confirmed_absent = true;
             for txid in &missing {
@@ -4612,7 +5131,16 @@ pub(crate) fn wait_for_tx_confirmation(
                 "All transactions confirmed (latest at height {})",
                 max_confirm_height
             );
-            return Ok(max_confirm_height);
+            return Ok(SlotWaitOutcome::Confirmed {
+                height: max_confirm_height,
+                winners,
+            });
+        }
+
+        if let (Some(tip), Some(at)) = (tip, wait.interrupt_at_height) {
+            if tip >= at {
+                return Ok(SlotWaitOutcome::HeightReached(tip));
+            }
         }
 
         log::info!("Next sync in {} secs", SYNC_INTERVAL_SECS);
@@ -7091,6 +7619,24 @@ mod timelock_reconcile_tests {
         recovery: Transaction,
         recovery_mined: bool,
     ) -> String {
+        start_core_stub_full(contract, recovery, recovery_mined, RECOVERY_HEIGHT)
+    }
+
+    /// As [`start_core_stub`], with the recovery mined at `recovery_height`.
+    fn start_core_stub_at(
+        contract: Transaction,
+        recovery: Transaction,
+        recovery_height: i64,
+    ) -> String {
+        start_core_stub_full(contract, recovery, true, recovery_height)
+    }
+
+    fn start_core_stub_full(
+        contract: Transaction,
+        recovery: Transaction,
+        recovery_mined: bool,
+        recovery_height: i64,
+    ) -> String {
         use std::io::Read;
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
@@ -7100,7 +7646,7 @@ mod timelock_reconcile_tests {
         let mut mined =
             HashMap::from([(contract.compute_txid(), (contract.clone(), CONTRACT_HEIGHT))]);
         if recovery_mined {
-            mined.insert(recovery.compute_txid(), (recovery.clone(), RECOVERY_HEIGHT));
+            mined.insert(recovery.compute_txid(), (recovery.clone(), recovery_height));
         }
         let mined = Arc::new(mined);
 
@@ -7265,6 +7811,349 @@ mod timelock_reconcile_tests {
             })
             .unwrap(),
         )
+    }
+
+    /// A Taproot contract tx whose fee-bump replacement confirmed is kept
+    /// while that replacement is shallow: a reorg can still confirm it.
+    #[test]
+    fn core_keeps_a_replaced_taproot_contract_until_its_replacement_is_deep() {
+        let (mut coin, _) = taproot_coin_and_recovery();
+        let parent = tx(
+            OutPoint::new(Txid::from_byte_array([8; 32]), 0),
+            60_000,
+            ScriptBuf::new_p2wpkh(&pubkey(6).wpubkey_hash().unwrap()),
+        );
+        let contract_spk = coin.contract_tx.output[0].script_pubkey.clone();
+        let version = |value| {
+            tx(
+                OutPoint::new(parent.compute_txid(), 0),
+                value,
+                contract_spk.clone(),
+            )
+        };
+        coin.contract_tx = version(50_000);
+        let replacement = version(49_000);
+        let url = start_core_stub(parent, replacement);
+        let chain = core(url);
+        // The stub mines the replacement 5 blocks deep.
+        let depth = (TIP - RECOVERY_HEIGHT + 1) as u64;
+        assert!(depth < REPLACED_VERSION_DISCARD_DEPTH);
+        let state = Wallet::ensure_contract_on_chain(&chain, "swap", &coin).unwrap();
+        assert_ne!(state, ContractChainState::Discarded);
+        // At the depth the discard waits for, the same spend replaces it.
+        assert!(Wallet::replaced_by_confirmed_spend(&chain, &coin.contract_tx, depth).unwrap());
+        assert!(
+            !Wallet::replaced_by_confirmed_spend(&chain, &coin.contract_tx, depth + 1).unwrap()
+        );
+    }
+
+    /// A contract mined after the caller saw it unconfirmed spends its own
+    /// inputs: that confirmed spend is the contract landing, not a
+    /// replacement, so it must never read as one.
+    #[test]
+    fn a_contract_spending_its_own_inputs_is_not_replaced() {
+        let (mut coin, _) = taproot_coin_and_recovery();
+        let parent = tx(
+            OutPoint::new(Txid::from_byte_array([8; 32]), 0),
+            60_000,
+            ScriptBuf::new_p2wpkh(&pubkey(6).wpubkey_hash().unwrap()),
+        );
+        coin.contract_tx = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            50_000,
+            coin.contract_tx.output[0].script_pubkey.clone(),
+        );
+        let url = start_core_stub(parent, coin.contract_tx.clone());
+        assert!(!Wallet::replaced_by_confirmed_spend(&core(url), &coin.contract_tx, 1).unwrap());
+    }
+
+    /// A completed swap's leftover funding version, and a fresh wallet that
+    /// holds it, as a bump leaves behind once the swap settles on another.
+    fn leftover_version(dir: &Path) -> (RwLock<Wallet>, OutgoingSwapCoin, Transaction) {
+        let (mut coin, _) = taproot_coin_and_recovery();
+        let parent = tx(
+            OutPoint::new(Txid::from_byte_array([8; 32]), 0),
+            60_000,
+            ScriptBuf::new_p2wpkh(&pubkey(6).wpubkey_hash().unwrap()),
+        );
+        let contract_spk = coin.contract_tx.output[0].script_pubkey.clone();
+        coin.contract_tx = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            50_000,
+            contract_spk,
+        );
+        coin.swap_id = Some("swap".to_string());
+        coin.replaced = true;
+        let mut wallet = super::test_support::test_wallet(&dir.join("wallet"));
+        wallet.add_outgoing_swapcoin(&coin);
+        (RwLock::new(wallet), coin, parent)
+    }
+
+    /// The version that beat a leftover one is mined, but shallow: a reorg
+    /// can still confirm the leftover, so it is kept.
+    #[test]
+    fn a_leftover_version_is_kept_while_its_winner_is_shallow() {
+        let dir = tempdir().unwrap();
+        let (wallet, coin, parent) = leftover_version(dir.path());
+        let winner = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            49_000,
+            coin.contract_tx.output[0].script_pubkey.clone(),
+        );
+        let chain = core(start_core_stub(parent, winner));
+        let retirement = Wallet::retire_replaced_versions(&wallet, &chain, "swap").unwrap();
+        assert!(retirement.removed.is_empty());
+        assert_eq!(retirement.remaining, 1);
+        assert!(!retirement.revived);
+        assert_eq!(
+            wallet.read().unwrap().outgoing_keys_for_swap("swap").len(),
+            1
+        );
+    }
+
+    /// Once the version that beat a leftover one is buried deep enough, no
+    /// reorg can bring the leftover back: it is dropped, for good, and its
+    /// contract output handed back to unwatch.
+    #[test]
+    fn a_leftover_version_is_retired_once_its_winner_is_deep() {
+        let dir = tempdir().unwrap();
+        let (wallet, coin, parent) = leftover_version(dir.path());
+        let winner = tx(
+            OutPoint::new(parent.compute_txid(), 0),
+            49_000,
+            coin.contract_tx.output[0].script_pubkey.clone(),
+        );
+        let depth = REPLACED_VERSION_DISCARD_DEPTH as i64;
+        let chain = core(start_core_stub_at(parent, winner, TIP - depth + 1));
+        let retirement = Wallet::retire_replaced_versions(&wallet, &chain, "swap").unwrap();
+        assert_eq!(retirement.remaining, 0);
+        assert!(!retirement.revived);
+        assert_eq!(
+            retirement.removed,
+            vec![(
+                OutPoint::new(coin.contract_tx.compute_txid(), 0),
+                coin.contract_tx.output[0].script_pubkey.clone(),
+            )]
+        );
+        assert!(wallet
+            .read()
+            .unwrap()
+            .outgoing_keys_for_swap("swap")
+            .is_empty());
+        // The removal is on disk, not only in memory.
+        let wallet_path = wallet.read().unwrap().wallet_file_path.clone();
+        let (reloaded, _) =
+            WalletStore::read_from_disk(&wallet_path, Some(PASSWORD.to_string())).unwrap();
+        assert!(reloaded.outgoing_swapcoins.is_empty());
+    }
+
+    /// An incoming Taproot coin whose contract output recovery cannot find.
+    /// A mined replacement paying the same contract is followed, never
+    /// dropped: the coins are still ours to claim there. A flagged copy
+    /// stands for its own version only, so it is dropped once beaten deep;
+    /// so is any coin whose coins went elsewhere. A shallow spend waits.
+    #[test]
+    fn recovery_follows_a_replacement_paying_the_same_contract() {
+        let (outgoing, _) = taproot_coin_and_recovery();
+        let parent = tx(
+            OutPoint::new(Txid::from_byte_array([8; 32]), 0),
+            60_000,
+            ScriptBuf::new_p2wpkh(&pubkey(6).wpubkey_hash().unwrap()),
+        );
+        let contract_spk = outgoing.contract_tx.output[0].script_pubkey.clone();
+        let spending = |value, script: &ScriptBuf| {
+            tx(
+                OutPoint::new(parent.compute_txid(), 0),
+                value,
+                script.clone(),
+            )
+        };
+        let coin = |replaced| {
+            let mut coin = crate::wallet::swapcoin::IncomingSwapCoin::new_taproot(
+                key(3),
+                outgoing.hashlock_script.clone().unwrap(),
+                outgoing.timelock_script.clone().unwrap(),
+                spending(50_000, &contract_spk),
+                Amount::from_sat(50_000),
+                1,
+            );
+            coin.replaced = replaced;
+            coin
+        };
+        let elsewhere = ScriptBuf::new_p2wpkh(&pubkey(7).wpubkey_hash().unwrap());
+        let deep = TIP - REPLACED_VERSION_DISCARD_DEPTH as i64 + 1;
+        for (replaced, winner_script, height, expected) in [
+            (false, &contract_spk, deep, UnseenIncoming::Follow),
+            (true, &contract_spk, deep, UnseenIncoming::Drop),
+            (false, &elsewhere, deep, UnseenIncoming::Drop),
+            (false, &elsewhere, deep + 1, UnseenIncoming::Wait),
+        ] {
+            let chain = core(start_core_stub_at(
+                parent.clone(),
+                spending(49_000, winner_script),
+                height,
+            ));
+            assert_eq!(
+                Wallet::judge_unseen_incoming(&chain, &coin(replaced)).unwrap(),
+                expected,
+                "replaced={} height={}",
+                replaced,
+                height
+            );
+        }
+    }
+
+    /// Only a flagged version comes back revived: an ordinary swap's coin
+    /// whose funding is mined is no leftover, and retirement leaves it alone.
+    #[test]
+    fn an_unflagged_coin_is_never_retired_or_revived() {
+        let dir = tempdir().unwrap();
+        let (wallet, coin, _) = leftover_version(dir.path());
+        wallet
+            .write()
+            .unwrap()
+            .store
+            .outgoing_swapcoins
+            .values_mut()
+            .for_each(|coin| coin.replaced = false);
+        let unrelated = tx(
+            OutPoint::new(Txid::from_byte_array([4; 32]), 0),
+            1_000,
+            ScriptBuf::new(),
+        );
+        let chain = core(start_core_stub(coin.contract_tx.clone(), unrelated));
+        let retirement = Wallet::retire_replaced_versions(&wallet, &chain, "swap").unwrap();
+        assert!(!retirement.revived);
+        assert_eq!(retirement.remaining, 0);
+        assert!(retirement.removed.is_empty());
+        assert_eq!(
+            wallet.read().unwrap().outgoing_keys_for_swap("swap").len(),
+            1
+        );
+    }
+
+    /// A reorg mined the leftover version itself: the swap needs recovering
+    /// from it, and the coin stays for that.
+    #[test]
+    fn a_mined_leftover_version_is_reported_revived() {
+        let dir = tempdir().unwrap();
+        let (wallet, coin, _) = leftover_version(dir.path());
+        let unrelated = tx(
+            OutPoint::new(Txid::from_byte_array([4; 32]), 0),
+            1_000,
+            ScriptBuf::new(),
+        );
+        let chain = core(start_core_stub(coin.contract_tx.clone(), unrelated));
+        let retirement = Wallet::retire_replaced_versions(&wallet, &chain, "swap").unwrap();
+        assert!(retirement.revived);
+        assert_eq!(retirement.remaining, 1);
+        assert_eq!(
+            wallet.read().unwrap().outgoing_keys_for_swap("swap").len(),
+            1
+        );
+    }
+
+    /// A slot settles on whichever of its versions is mined, and the wait
+    /// reports each slot's winner.
+    #[test]
+    fn a_slot_confirms_on_whichever_version_is_mined() {
+        let (coin, recovery) = taproot_coin_and_recovery();
+        let url = start_core_stub(coin.contract_tx.clone(), recovery.clone());
+        let replaced = tx(
+            OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+            1_000,
+            ScriptBuf::new(),
+        );
+        let outcome = wait_for_slots_confirmation(
+            &core(url),
+            &[
+                vec![replaced.compute_txid(), recovery.compute_txid()],
+                vec![coin.contract_tx.compute_txid()],
+            ],
+            &SlotWait {
+                required_confirms: 1,
+                arrival_timeout: Duration::from_secs(30),
+                started: Instant::now(),
+                interrupt_at_height: None,
+            },
+            &mut SlotTrack::new(2),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SlotWaitOutcome::Confirmed {
+                height: RECOVERY_HEIGHT as u32,
+                winners: vec![recovery.compute_txid(), coin.contract_tx.compute_txid()],
+            }
+        );
+    }
+
+    /// While a slot is unconfirmed, the wait hands control back at the
+    /// height the caller set, so a bump can be decided there.
+    #[test]
+    fn an_unconfirmed_wait_returns_at_its_interrupt_height() {
+        let (coin, recovery) = taproot_coin_and_recovery();
+        let url = start_core_stub(coin.contract_tx.clone(), recovery);
+        let stuck = tx(
+            OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+            1_000,
+            ScriptBuf::new(),
+        );
+        let outcome = wait_for_slots_confirmation(
+            &core(url),
+            &[vec![stuck.compute_txid()]],
+            &SlotWait {
+                required_confirms: 1,
+                arrival_timeout: Duration::from_secs(30),
+                started: Instant::now(),
+                interrupt_at_height: Some(TIP as u64),
+            },
+            &mut SlotTrack::new(1),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome, SlotWaitOutcome::HeightReached(TIP as u64));
+    }
+
+    /// A wait split by height interrupts is one wait: a tx never seen across
+    /// all of them still runs out the arrival deadline set when it began.
+    #[test]
+    fn interrupted_waits_keep_the_first_arrival_deadline() {
+        let (coin, recovery) = taproot_coin_and_recovery();
+        let url = start_core_stub(coin.contract_tx.clone(), recovery);
+        let chain = core(url);
+        let never_sent = tx(
+            OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+            1_000,
+            ScriptBuf::new(),
+        );
+        let slots = [vec![never_sent.compute_txid()]];
+        let wait = SlotWait {
+            required_confirms: 1,
+            arrival_timeout: Duration::from_millis(500),
+            started: Instant::now(),
+            interrupt_at_height: Some(TIP as u64),
+        };
+        let mut track = SlotTrack::new(slots.len());
+        assert_eq!(
+            wait_for_slots_confirmation(&chain, &slots, &wait, &mut track, None, None).unwrap(),
+            SlotWaitOutcome::HeightReached(TIP as u64)
+        );
+        thread::sleep(Duration::from_millis(600));
+        // Each resumed wait alone is younger than the deadline; together
+        // they are not.
+        let resumed = wait_for_slots_confirmation(&chain, &slots, &wait, &mut track, None, None);
+        assert!(
+            matches!(
+                resumed,
+                Err(WalletError::TxNeverBroadcast(_) | WalletError::TxConfirmationTimeout(_))
+            ),
+            "a resumed wait must keep the first arrival deadline, got {:?}",
+            resumed
+        );
     }
 
     #[test]
@@ -8777,12 +9666,15 @@ mod legacy_recovery_tests {
                                     json!({"id": id, "result": [{"txid": requested["txid"], "vout": requested["vout"], "spendingtxid": spending}], "error": null}),
                                 )
                             }
+                            // The same tip the Electrum stub reports, so a
+                            // mined tx is equally deep on both backends.
                             "getblockcount" => {
                                 let height = txs
                                     .iter()
                                     .filter_map(|(_, height, _)| *height)
                                     .max()
-                                    .unwrap_or(0);
+                                    .unwrap_or(0)
+                                    .max(100);
                                 (200, json!({"id": id, "result": height, "error": null}))
                             }
                             "getblockhash" => (
@@ -9509,6 +10401,55 @@ mod legacy_recovery_tests {
                 Wallet::ensure_contract_on_chain(&blockchain, "swap-maker-signed", &sc).unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
+    }
+
+    /// A shared funding whose input a rival spends only in the mempool can
+    /// still confirm: the rival may be evicted, and the peer holds the signed
+    /// funding. Electrum's confirmed view hides that input all the same, so
+    /// only a proven deep confirmed spend may discard the coin.
+    #[test]
+    fn test_ensure_contract_signed_legacy_with_mempool_spent_funding_input_is_not_yet() {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+        let spend_parent = |value| Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_tx.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let funding_tx = spend_parent(50_000);
+        let rival = spend_parent(90_000);
+
+        let mut sc = make_legacy_outgoing_swapcoin(Some(funding_tx.clone()));
+        sc.contract_tx.input[0].previous_output = OutPoint::new(funding_tx.compute_txid(), 0);
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let msg = bitcoin::secp256k1::Message::from_digest([1u8; 32]);
+        sc.others_contract_sig = Some(bitcoin::ecdsa::Signature::sighash_all(
+            secp.sign_ecdsa(&msg, &SecretKey::from_slice(&[3u8; 32]).unwrap()),
+        ));
+        for_both_backends(
+            vec![(parent_tx, Some(10), true), (rival, None, true)],
+            |blockchain| {
+                let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-mempool-rival", &sc)
+                    .unwrap();
+                assert_eq!(res, ContractChainState::NotYet);
+            },
+        );
     }
 
     #[test]

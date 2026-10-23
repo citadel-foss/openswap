@@ -525,6 +525,22 @@ pub(crate) fn sign_contract_tx(
 }
 
 /// Verify a signature on a contract transaction.
+/// Refuse a peer's contract signature that will not sign the digest it was
+/// checked against. The signature goes into the witness with its own
+/// sighash flag, and only `SIGHASH_ALL` matches what
+/// [`verify_contract_tx_sig`] verified: any other flag leaves the contract
+/// unspendable.
+pub(crate) fn check_contract_sig_sighash(
+    sig: &bitcoin::ecdsa::Signature,
+) -> Result<(), ProtocolError> {
+    if sig.sighash_type != EcdsaSighashType::All {
+        return Err(ProtocolError::General(
+            "Contract signature is not SIGHASH_ALL",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn verify_contract_tx_sig(
     contract_tx: &Transaction,
     multisig_redeemscript: &Script,
@@ -585,6 +601,32 @@ mod test {
     use std::str::FromStr;
 
     const TEST_CURRENT_HEIGHT: u32 = 100;
+
+    /// A contract signature is stored only with `SIGHASH_ALL`: any other flag
+    /// would sign a digest the verification never checked.
+    #[test]
+    fn only_a_sighash_all_contract_signature_is_kept() {
+        let secp = Secp256k1::new();
+        let key = SecretKey::from_slice(&[7; 32]).unwrap();
+        let signature = secp.sign_ecdsa(&Message::from_digest([1; 32]), &key);
+        let with = |sighash_type| bitcoin::ecdsa::Signature {
+            signature,
+            sighash_type,
+        };
+        assert!(check_contract_sig_sighash(&with(EcdsaSighashType::All)).is_ok());
+        for other in [
+            EcdsaSighashType::None,
+            EcdsaSighashType::Single,
+            EcdsaSighashType::AllPlusAnyoneCanPay,
+            EcdsaSighashType::SinglePlusAnyoneCanPay,
+        ] {
+            assert!(
+                check_contract_sig_sighash(&with(other)).is_err(),
+                "{:?}",
+                other
+            );
+        }
+    }
 
     fn read_pubkeys_from_contract_reedimscript(
         contract_script: &Script,

@@ -16,7 +16,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin::{bip32::ChainCode, Amount, Network, OutPoint, PublicKey, Transaction, Txid};
+use bitcoin::{
+    bip32::ChainCode, Amount, Network, OutPoint, PublicKey, Transaction, Txid, XOnlyPublicKey,
+};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -37,13 +39,14 @@ use crate::{
     },
     wallet::{
         blockchain::BackendConnector,
-        funding::{fit_declared_shape, net_policy_fees, SplitPlan},
+        funding::{fit_declared_shape, net_policy_fees, shave_plan, SplitPlan},
         min_contract_value_sats,
         seed_cli::WalletInUse,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FeePriority,
-        FidelityError, MakerReport, RecoveryOutcome, RestoreOptions, SwapRole, Wallet, WalletError,
-        MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
+        FidelityError, MakerReport, RecoveryOutcome, RestoreOptions, SwapRole, UTXOSpendInfo,
+        Wallet, WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS,
+        MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::{service::WatchService, watcher::WatcherEvent, watcher_error::WatcherError},
 };
@@ -54,8 +57,9 @@ pub use super::handlers::MakerBehavior;
 use super::{
     error::MakerError,
     handlers::{
-        past_refund_deadline, ConnectionState, FundingGuard, Maker as MakerTrait, MakerConfig,
-        SwapPhase, MAX_CONCURRENT_SWAPS, MAX_UNFUNDED_ADMISSIONS, MIN_CONTRACT_REACTION_TIME,
+        past_refund_deadline, ConnectionState, FundingBumpState, FundingGuard, Maker as MakerTrait,
+        MakerConfig, SwapPhase, MAX_CONCURRENT_SWAPS, MAX_UNFUNDED_ADMISSIONS,
+        MIN_CONTRACT_REACTION_TIME,
     },
     rpc::server::MakerRpc,
 };
@@ -170,6 +174,9 @@ struct NegotiatedTerms {
     /// The wire feerate as an f64; the u64-to-f64 conversion is exact for
     /// every valid rate, so a plain `==` detects a changed rate.
     swap_feerate: f64,
+    /// Key the taker signs funding bumps with. A resend under another key
+    /// would let a new key move funding the first one agreed to.
+    taker_auth_pubkey: Option<XOnlyPublicKey>,
 }
 
 impl From<&ConnectionState> for NegotiatedTerms {
@@ -183,6 +190,7 @@ impl From<&ConnectionState> for NegotiatedTerms {
             protocol: state.protocol,
             refund_locktime_offset: state.refund_locktime_offset,
             swap_feerate: state.swap_feerate,
+            taker_auth_pubkey: state.taker_auth_pubkey,
         }
     }
 }
@@ -226,6 +234,15 @@ struct SwapState {
     /// from it, and it cannot be derived later once the swap has moved on.
     /// `None` until that confirmation is observed.
     funding_confirmation_height: Option<u32>,
+    /// Fee bumps of our outgoing funding.
+    funding_bump: FundingBumpState,
+    /// How to sign each funding split's inputs, kept from the build so a bump
+    /// can re-sign them after the coin cache has dropped them.
+    funding_input_infos: Vec<Vec<UTXOSpendInfo>>,
+    /// Our funding txids ever seen mined. Once one is, the next hop may have
+    /// built on it, so no bump may replace it, even after a reorg unconfirms
+    /// it. Only ever grows, and no handler's stored copy can shrink it.
+    funding_seen_confirmed: HashSet<Txid>,
 }
 
 impl Default for SwapState {
@@ -240,6 +257,7 @@ impl Default for SwapState {
                 protocol: ProtocolVersion::Legacy,
                 refund_locktime_offset: 0,
                 swap_feerate: 0.0,
+                taker_auth_pubkey: None,
             },
             phase: SwapPhase::AwaitingHello,
             incoming_swapcoins: Vec::new(),
@@ -253,6 +271,9 @@ impl Default for SwapState {
             last_activity: Instant::now(),
             swap_start_time: Instant::now(),
             funding_confirmation_height: None,
+            funding_bump: FundingBumpState::default(),
+            funding_input_infos: Vec::new(),
+            funding_seen_confirmed: HashSet::new(),
         }
     }
 }
@@ -329,6 +350,12 @@ pub struct MakerServerConfig {
     pub nostr_relays: Vec<String>,
     /// Public name sent to takers in the offer.
     pub name: String,
+    /// Highest feerate in sat/vB we replace our own funding at when a taker
+    /// asks. Zero, the default, refuses every funding bump.
+    pub max_funding_bump_feerate: u64,
+    /// Most extra fee in sats one hop's funding may take across its bumps.
+    /// The taker pays it on success; if the swap fails we lose it.
+    pub max_funding_bump_sats: u64,
     /// LDK Server gRPC address (`host:port`, no scheme) for the Lightning
     /// backend. Lightning swaps are offered only when this is set (and the
     /// binary is built with the `lightning` feature).
@@ -375,6 +402,8 @@ impl Default for MakerServerConfig {
             password: None,
             nostr_relays: NOSTR_RELAYS.iter().map(|s| s.to_string()).collect(),
             name: "default-maker".to_string(),
+            max_funding_bump_feerate: 0,
+            max_funding_bump_sats: 0,
             ldk_server_url: None,
             ldk_api_key_path: None,
             ldk_tls_cert_path: None,
@@ -502,6 +531,14 @@ impl MakerServerConfig {
                 default_config.tor_auth_password,
             ),
             name,
+            max_funding_bump_feerate: parse_field(
+                config_map.get("max_funding_bump_feerate"),
+                default_config.max_funding_bump_feerate,
+            ),
+            max_funding_bump_sats: parse_field(
+                config_map.get("max_funding_bump_sats"),
+                default_config.max_funding_bump_sats,
+            ),
             ldk_server_url: config_map.get("ldk_server_url").cloned(),
             ldk_api_key_path: config_map.get("ldk_api_key_path").cloned(),
             ldk_tls_cert_path: config_map.get("ldk_tls_cert_path").cloned(),
@@ -559,6 +596,10 @@ check_blocklist = {}
 require_features = [{}]
 # Public name shown to takers (required, at most {} characters, no control characters)
 name = \"{}\"
+# Highest feerate (sat/vB) we replace our own swap funding at when a taker asks; 0 refuses
+max_funding_bump_feerate = {}
+# Most extra fee (sats) one hop's funding may take across its bumps; lost if the swap fails
+max_funding_bump_sats = {}
 ",
             self.network_port,
             self.rpc_port,
@@ -584,6 +625,8 @@ name = \"{}\"
                 .join(", "),
             MAX_MAKER_NAME_LEN,
             self.name,
+            self.max_funding_bump_feerate,
+            self.max_funding_bump_sats,
         );
 
         let mut toml_data = toml_data;
@@ -1721,7 +1764,13 @@ impl MakerServer {
                     protocol: state.negotiated.protocol,
                     swap_amount_sat: state.negotiated.swap_amount.to_sat(),
                     incoming_swapcoins: state.incoming_swapcoins,
-                    outgoing_swapcoins: state.outgoing_swapcoins,
+                    // Every broadcast version of a bumped funding: recovery
+                    // refunds the one that confirms and discards the rest.
+                    outgoing_swapcoins: state
+                        .outgoing_swapcoins
+                        .into_iter()
+                        .chain(state.funding_bump.replacements)
+                        .collect(),
                     funding_broadcast_txids: state.funding_broadcast_txids,
                 });
             }
@@ -1858,6 +1907,63 @@ impl MakerServer {
             .verify_deniability(swap_id)
     }
 
+    /// Record every outgoing funding tx of a live swap that is now mined, so
+    /// no later bump replaces it. Run on each new block: a block that a reorg
+    /// orphans still lived long enough to be seen here.
+    pub(crate) fn latch_confirmed_funding(&self) -> Result<(), MakerError> {
+        let pending: Vec<(String, Txid)> = {
+            let swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            swaps
+                .iter()
+                .filter(|(_, state)| state.phase == SwapPhase::AwaitingPrivateKeyHandover)
+                .flat_map(|(id, state)| {
+                    state
+                        .outgoing_swapcoins
+                        .iter()
+                        .chain(&state.funding_bump.replacements)
+                        .filter_map(|coin| match coin.protocol {
+                            ProtocolVersion::Taproot => Some(coin.contract_tx.compute_txid()),
+                            ProtocolVersion::Legacy => {
+                                coin.funding_tx.as_ref().map(|tx| tx.compute_txid())
+                            }
+                        })
+                        .filter(|txid| !state.funding_seen_confirmed.contains(txid))
+                        .map(|txid| (id.clone(), txid))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut confirmed = Vec::new();
+        for (swap_id, txid) in pending {
+            #[cfg(feature = "integration-test")]
+            if self.behavior() == MakerBehavior::SkipFundingLatch {
+                continue;
+            }
+            if self.is_funding_confirmed(&txid)? {
+                confirmed.push((swap_id, txid));
+            }
+        }
+        let mut swaps =
+            lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        for (swap_id, txid) in confirmed {
+            if let Some(state) = swaps.get_mut(&swap_id) {
+                if state.funding_seen_confirmed.insert(txid) {
+                    log::info!(
+                        "[{}] Funding {} of swap {} is mined; it can no longer be bumped",
+                        self.config.network_port,
+                        txid,
+                        swap_id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Plan this hop's forwarding at admission, on the forwardable amount:
     /// the declared amount minus the service fee and the sweep price of every
     /// incoming contract. Failures map to a liquidity rejection so the taker
@@ -1940,15 +2046,17 @@ impl MakerServer {
         }
     }
 
-    /// The funding plan frozen at admission. `amount` must equal the plan's
-    /// pre-netting total: the frozen values plus each split's policy fee,
-    /// derived from the plan shape at the negotiated rate. A missing or
-    /// mismatched plan is a protocol error.
+    /// The funding plan frozen at admission and its pre-netting total: the
+    /// frozen values plus each split's policy fee, derived from the plan shape
+    /// at the negotiated rate. `amount` may fall short of that total only by
+    /// what upstream funding bumps took off our incoming hop; the caller takes
+    /// the difference out of the splits. A missing plan, or an amount above
+    /// its total, is a protocol error.
     fn frozen_funding_plan(
         &self,
         swap_id: &str,
         amount: Amount,
-    ) -> Result<Vec<SplitPlan>, MakerError> {
+    ) -> Result<(Vec<SplitPlan>, Amount), MakerError> {
         let swaps = lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
         let state = swaps
             .get(swap_id)
@@ -1967,22 +2075,25 @@ impl MakerServer {
                 .and_then(|total| total.checked_add(split.value.to_sat()))
                 .ok_or(MakerError::General("Funding plan total overflow"))?;
         }
-        if gross != amount.to_sat() {
+        if amount.to_sat() > gross {
             return Err(MakerError::General(
-                "Requested amount does not match the frozen funding plan",
+                "Requested amount exceeds the frozen funding plan",
             ));
         }
-        Ok(state.funding_plan.clone())
+        Ok((state.funding_plan.clone(), Amount::from_sat(gross)))
     }
 
     /// Claim the plan's coins, then build and sign one funding tx per split; a
     /// rebuild reuses the plan it claimed before. `gross` is the plan's
-    /// pre-netting total. A build failure releases the whole reservation.
+    /// pre-netting total; `forward` is what this hop actually forwards, short
+    /// of `gross` by any upstream bump, which comes out of the splits. A build
+    /// failure releases the whole reservation.
     fn execute_frozen_plan(
         &self,
         swap_id: &str,
         plan: &[SplitPlan],
         gross: Amount,
+        forward: Amount,
         addresses: &[bitcoin::Address],
         feerate: f64,
     ) -> Result<(Vec<Transaction>, Vec<u32>, u64), MakerError> {
@@ -2095,6 +2206,13 @@ impl MakerServer {
             }
         }
         drop(_claiming);
+        // The claim keeps the plan as admitted; only what is built forwards less.
+        let min_split = min_contract_value_sats(terms.protocol, terms.swap_feerate)
+            .ok_or(MakerError::General("Contract floor cannot be priced"))?;
+        let shortfall = gross.checked_sub(forward).ok_or(MakerError::General(
+            "Forward exceeds the frozen funding plan",
+        ))?;
+        let plan = shave_plan(&plan, shortfall.to_sat(), min_split).map_err(MakerError::Wallet)?;
         #[cfg(feature = "integration-test")]
         if self.behavior() == MakerBehavior::AbandonFundingClaim {
             log::warn!(
@@ -2106,6 +2224,7 @@ impl MakerServer {
 
         let mut funding_txes = Vec::with_capacity(plan.len());
         let mut payment_output_positions = Vec::with_capacity(plan.len());
+        let mut input_infos = Vec::with_capacity(plan.len());
         let mut total_miner_fee = 0u64;
         // One wallet lock per split, not per batch: holding it across one
         // RPC-and-sign per split stalls every other connection.
@@ -2124,6 +2243,7 @@ impl MakerServer {
                     total_miner_fee += result.total_miner_fee;
                     funding_txes.extend(result.funding_txes);
                     payment_output_positions.extend(result.payment_output_positions);
+                    input_infos.extend(result.input_infos);
                 }
                 Err(e) => {
                     if let Ok(mut wallet) = lock_debug!(self.wallet.write()) {
@@ -2143,6 +2263,12 @@ impl MakerServer {
                     return Err(MakerError::Wallet(e));
                 }
             }
+        }
+        if let Some(state) = lock_debug!(self.ongoing_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .get_mut(swap_id)
+        {
+            state.funding_input_infos = input_infos;
         }
         Ok((funding_txes, payment_output_positions, total_miner_fee))
     }
@@ -2345,6 +2471,8 @@ impl MakerTrait for MakerServer {
             required_confirms: self.config.required_confirms,
             require_features: self.config.require_features.clone(),
             name: self.config.name.clone(),
+            max_funding_bump_feerate: self.config.max_funding_bump_feerate,
+            max_funding_bump_sats: self.config.max_funding_bump_sats,
         }
     }
 
@@ -2478,7 +2606,7 @@ impl MakerTrait for MakerServer {
         addresses: &[bitcoin::Address],
         feerate: f64,
     ) -> Result<(Vec<Transaction>, Vec<u32>), MakerError> {
-        let plan = self.frozen_funding_plan(swap_id, amount)?;
+        let (plan, gross) = self.frozen_funding_plan(swap_id, amount)?;
 
         // Malice hooks: tamper with the frozen plan's values after
         // verification, so the taker's exact checks are what catch it.
@@ -2502,7 +2630,7 @@ impl MakerTrait for MakerServer {
         };
 
         let (funding_txes, payment_output_positions, _) =
-            self.execute_frozen_plan(swap_id, &plan, amount, addresses, feerate)?;
+            self.execute_frozen_plan(swap_id, &plan, gross, amount, addresses, feerate)?;
         Ok((funding_txes, payment_output_positions))
     }
 
@@ -2820,6 +2948,7 @@ impl MakerTrait for MakerServer {
         &self,
         swap_id: &str,
         expected_outgoing: usize,
+        keep: &[Txid],
     ) -> Result<(), MakerError> {
         let outgoing_keys = {
             let wallet = lock_debug!(self.wallet.read())
@@ -2830,15 +2959,30 @@ impl MakerTrait for MakerServer {
                     "persisted outgoing swapcoin count does not match completed swap",
                 ));
             }
+            let keep: Vec<String> = keep.iter().map(|txid| txid.to_string()).collect();
             outgoing_keys
+                .into_iter()
+                .filter(|key| !keep.contains(key))
+                .collect::<Vec<_>>()
         };
 
         {
             let mut wallet = lock_debug!(self.wallet.write())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-            wallet
-                .remove_swap_coins_and_save(swap_id, false, true)
-                .map_err(MakerError::Wallet)?;
+            if keep.is_empty() {
+                wallet
+                    .remove_swap_coins_and_save(swap_id, false, true)
+                    .map_err(MakerError::Wallet)?;
+            } else {
+                // The kept versions stay, so the swap's coins are removed one
+                // by one; its watch-only coins and claim go as they would.
+                for key in &outgoing_keys {
+                    wallet.remove_outgoing_swapcoin(key);
+                }
+                wallet.remove_watchonly_swapcoins(swap_id);
+                wallet.release_swap_locks(swap_id, None);
+                wallet.save_to_disk().map_err(MakerError::Wallet)?;
+            }
         }
 
         log::info!(
@@ -2987,6 +3131,12 @@ impl MakerTrait for MakerServer {
         swap_state.pending_funding_txes = state.pending_funding_txes.clone();
         swap_state.funding_broadcast_txids = state.funding_broadcast_txids.clone();
         swap_state.service_fee_sats = state.service_fee_sats;
+        // Merged, never replaced: another connection of this swap may have
+        // bumped since this one's snapshot.
+        let outgoing = swap_state.outgoing_swapcoins.clone();
+        swap_state
+            .funding_bump
+            .merge_from(&state.funding_bump, &outgoing);
         // The plan frozen at admission wins over the handler's empty one;
         // later stores carry the same plan back.
         if let Some(plan) = planned {
@@ -3030,6 +3180,8 @@ impl MakerTrait for MakerServer {
             state.funding_plan = s.funding_plan.clone();
             state.swap_start_time = s.swap_start_time;
             state.refund_locktime_offset = s.negotiated.refund_locktime_offset;
+            state.taker_auth_pubkey = s.negotiated.taker_auth_pubkey;
+            state.funding_bump = s.funding_bump.clone();
             state.last_activity = s.last_activity;
             state
         }))
@@ -3405,7 +3557,7 @@ impl MakerTrait for MakerServer {
             next_multisig_pubkeys.len()
         );
 
-        let plan = self.frozen_funding_plan(swap_id, send_amount)?;
+        let (plan, gross) = self.frozen_funding_plan(swap_id, send_amount)?;
         // The taker derived its key bundles from the shape reported in the
         // Ack: one bundle per frozen split, no more and no fewer.
         if next_multisig_pubkeys.len() != plan.len() {
@@ -3440,6 +3592,7 @@ impl MakerTrait for MakerServer {
         let (funding_txes, payment_output_positions, total_miner_fee) = self.execute_frozen_plan(
             swap_id,
             &plan,
+            gross,
             send_amount,
             &openswap_addresses,
             contract_feerate,
@@ -3547,6 +3700,112 @@ impl MakerTrait for MakerServer {
             self.config.network_port
         );
         None
+    }
+
+    fn is_funding_confirmed(&self, txid: &Txid) -> Result<bool, MakerError> {
+        Ok(lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .tx_block_height(txid)
+            .map_err(MakerError::Wallet)?
+            .is_some())
+    }
+
+    fn follow_replaced_incoming(
+        &self,
+        swap_id: &str,
+        incoming: &mut [IncomingSwapCoin],
+    ) -> Result<(), MakerError> {
+        let chain = self.backend.connect().map_err(MakerError::Wallet)?;
+        for (old, followed) in Wallet::follow_replaced_incoming(&self.wallet, &chain, swap_id)? {
+            if let Some(coin) = incoming
+                .iter_mut()
+                .find(|coin| coin.contract_tx.compute_txid() == old)
+            {
+                *coin = followed;
+            }
+        }
+        Ok(())
+    }
+
+    fn funding_ever_confirmed(&self, swap_id: &str, txid: &Txid) -> Result<bool, MakerError> {
+        let latched = lock_debug!(self.ongoing_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .get(swap_id)
+            .is_some_and(|state| state.funding_seen_confirmed.contains(txid));
+        if latched {
+            return Ok(true);
+        }
+        #[cfg(feature = "integration-test")]
+        if self.behavior() == MakerBehavior::SkipFundingLatch {
+            return self.is_funding_confirmed(txid);
+        }
+        if !self.is_funding_confirmed(txid)? {
+            return Ok(false);
+        }
+        if let Some(state) = lock_debug!(self.ongoing_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .get_mut(swap_id)
+        {
+            state.funding_seen_confirmed.insert(*txid);
+        }
+        Ok(true)
+    }
+
+    fn sign_funding_replacement(
+        &self,
+        swap_id: &str,
+        split: usize,
+        tx: &mut Transaction,
+    ) -> Result<(), MakerError> {
+        let infos = lock_debug!(self.ongoing_swaps.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .get(swap_id)
+            .and_then(|state| state.funding_input_infos.get(split).cloned())
+            .ok_or(MakerError::General(
+                "No signing data for this funding split; it cannot be replaced",
+            ))?;
+        lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .sign_transaction(tx, infos.into_iter())
+            .map_err(MakerError::Wallet)
+    }
+
+    fn replacement_increment_rate(&self) -> f64 {
+        match lock_debug!(self.wallet.read()) {
+            Ok(wallet) => wallet.blockchain.replacement_increment_rate(),
+            Err(_) => MIN_RELAY_FEE_RATE,
+        }
+    }
+
+    fn mark_replaced_funding(&self, contract_txids: &[Txid]) -> Result<(), MakerError> {
+        lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .mark_replaced_versions(contract_txids)
+            .map_err(MakerError::Wallet)
+    }
+
+    #[cfg(feature = "integration-test")]
+    fn stall_funding_for_test(&self, txid: &Txid) {
+        if self.behavior() != MakerBehavior::StallFunding {
+            return;
+        }
+        let stalled = lock_debug!(self.wallet.read())
+            .map_err(|_| WalletError::General("Failed to lock wallet".to_string()))
+            .and_then(|wallet| wallet.blockchain.deprioritise_for_test(txid));
+        match stalled {
+            Ok(()) => log::warn!(
+                "[{}] Test behavior: keeping funding tx {} out of blocks",
+                self.config.network_port,
+                txid
+            ),
+            Err(e) => log::error!(
+                "[{}] Test behavior: could not stall funding tx {}: {:?}",
+                self.config.network_port,
+                txid,
+                e
+            ),
+        }
     }
 
     #[cfg(feature = "integration-test")]

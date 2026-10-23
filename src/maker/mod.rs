@@ -11,6 +11,7 @@
 //! 6103: RPC Connection for operations.
 
 mod error;
+mod funding_bump;
 mod rpc;
 
 pub mod legacy_handlers;

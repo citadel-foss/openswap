@@ -6,6 +6,7 @@
 
 mod config;
 pub mod error;
+mod funding_bump;
 pub mod offers;
 
 pub mod api;
@@ -19,6 +20,7 @@ mod taproot_swap;
 mod taproot_verification;
 
 pub use config::TakerConfig;
+pub use funding_bump::FundingBumpPolicy;
 
 #[cfg(feature = "integration-test")]
 pub use api::TakerBehavior;

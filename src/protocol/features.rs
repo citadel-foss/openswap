@@ -44,6 +44,13 @@ pub const KNOWN: &[Feature] = &[
         flows: &["ln-swap-out"],
         lightning: true,
     },
+    // Fee-bumping a stuck funding tx: both sides take bump messages and the
+    // taker's auth key, and a hop may arrive short by what bumps took.
+    Feature {
+        name: "funding-bump-v1",
+        flows: &["legacy", "taproot"],
+        lightning: false,
+    },
 ];
 
 /// Names this build can serve.
@@ -228,6 +235,8 @@ mod tests {
             ("taproot", "taproot", false),
             ("ln-swap-in", "ln-swap-in", true),
             ("ln-swap-out", "ln-swap-out", true),
+            ("funding-bump-v1", "legacy", false),
+            ("funding-bump-v1", "taproot", false),
         ] {
             let entries: Vec<_> = KNOWN.iter().filter(|f| f.name == name).collect();
             assert_eq!(entries.len(), 1, "{name}");
@@ -384,7 +393,15 @@ mod tests {
         for flow in ["legacy", "taproot", "ln-swap-in", "ln-swap-out"] {
             let pins = choose_pins(flow, &theirs);
             let served = supported().contains(&flow);
-            assert_eq!(pins, if served { names(&[flow]) } else { vec![] });
+            // The on-chain flows take funding bumps along.
+            let expected = match flow {
+                "legacy" | "taproot" => names(&[flow, "funding-bump-v1"]),
+                _ => names(&[flow]),
+            };
+            assert_eq!(pins, if served { expected } else { vec![] });
+            if served {
+                assert!(check_pins(&pins, &[]).is_ok());
+            }
             assert_eq!(check_pins(&names(&[flow]), &[]).is_ok(), served);
             assert!(check_pins(&names(&[flow, flow]), &[]).is_err());
             assert!(check_pins(&names(&[flow]), &names(&["future-v1"])).is_err());

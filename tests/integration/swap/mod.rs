@@ -5,6 +5,7 @@
 mod concurrent_takers;
 mod electrum;
 mod finalization;
+mod funding_bump;
 mod mixed_protocol;
 mod multi_confirm;
 mod multi_maker;

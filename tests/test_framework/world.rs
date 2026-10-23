@@ -179,6 +179,8 @@ impl TestFramework {
                         ..Default::default()
                     },
                 );
+                // The stall and reorg hooks act on the node electrs indexes.
+                openswap::wallet::register_test_electrum_node(&url, rpc_config.clone());
                 electrsd = Some(e);
                 electrum_url = Some(url.clone());
                 url
@@ -245,6 +247,10 @@ impl TestFramework {
                         // Wallet files are always encrypted; tests use a fixed
                         // passphrase (PBKDF2 rounds are 1 under `integration-test`).
                         password: Some("integration-test".to_string()),
+                        // Funding bumps are off unless a taker asks for them, so
+                        // every maker accepts them within these bounds.
+                        max_funding_bump_feerate: 50,
+                        max_funding_bump_sats: 100_000,
                         ..MakerServerConfig::default()
                     }
                     .with_backend(backend);

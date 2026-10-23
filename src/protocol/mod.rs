@@ -1,6 +1,7 @@
 //! Defines the Contract Transaction and Protocol Messages.
 
 pub mod common_messages;
+pub mod funding_bump;
 pub mod legacy_messages;
 pub mod lightning_messages;
 pub mod taproot_messages;

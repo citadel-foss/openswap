@@ -324,12 +324,21 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                     .push(outgoing);
             }
 
+            // A completed swap leaves only the funding versions a bump left
+            // behind: retired once their winner is deep, recovered as revived
+            // if a reorg mined one. Any other swap is recovered as usual.
             for (swap_id, (inc, out)) in groups {
+                if inc.is_empty() && !out.is_empty() && out.iter().all(|coin| coin.replaced) {
+                    spawn_version_retirement(&maker, swap_id)?;
+                    continue;
+                }
                 let maker_clone = Arc::clone(&maker);
                 let handle = thread::Builder::new()
                     .name(format!("reboot-recovery-{}", maker.config.network_port))
                     .spawn(move || {
-                        if let Err(e) = recover_from_swap(maker_clone, swap_id.clone(), inc, out) {
+                        if let Err(e) =
+                            recover_from_swap(maker_clone, swap_id.clone(), inc, out, false)
+                        {
                             log::error!("Reboot recovery failed for {}: {:?}", swap_id, e);
                         }
                     })
@@ -894,8 +903,19 @@ fn handle_connection(
 
                 // Make the terminal state durable before reporting success. The
                 // in-memory state still owns everything needed by the report.
+                // Every funding version is still persisted. The losers of a
+                // bump stay so until the winner is buried deep: a reorg can
+                // still confirm one, and its refund needs the coin.
+                let persisted_outgoing =
+                    state.outgoing_swapcoins.len() + state.funding_bump.replacements.len();
+                let losers: Vec<bitcoin::Txid> = state
+                    .funding_bump
+                    .replacements
+                    .iter()
+                    .map(|coin| coin.contract_tx.compute_txid())
+                    .collect();
                 if let Err(error) =
-                    maker.finalize_successful_swap(swap_id, state.outgoing_swapcoins.len())
+                    maker.finalize_successful_swap(swap_id, persisted_outgoing, &losers)
                 {
                     maker.store_connection_state(swap_id, &state, false)?;
                     return Err(error);
@@ -923,6 +943,9 @@ fn handle_connection(
                     .filter_map(super::legacy_handlers::funding_watch)
                 {
                     maker.unwatch_outpoint(outpoint, spk);
+                }
+                if !losers.is_empty() {
+                    spawn_version_retirement(&maker, swap_id.to_string())?;
                 }
             } else if let Some(ref swap_id) = state.swap_id {
                 maker.store_connection_state(swap_id, &state, false)?;
@@ -956,9 +979,23 @@ fn swap_is_quiet(maker: &Arc<MakerServer>, state: &ConnectionState) -> bool {
 
 /// Background thread that checks for idle swap states and spawns recovery.
 fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
+    let mut latched_at = None;
     loop {
         if maker.is_shutdown() {
             break;
+        }
+
+        // Latch each block's newly mined funding before a reorg can orphan it.
+        let tip = maker.watch_service.tip();
+        if tip.is_none() || tip != latched_at {
+            match maker.latch_confirmed_funding() {
+                Ok(()) => latched_at = tip,
+                Err(e) => log::warn!(
+                    "[{}] Could not check outgoing funding confirmations: {:?}",
+                    maker.config.network_port,
+                    e
+                ),
+            }
         }
 
         let idle_swaps = maker.drain_idle_swaps(IDLE_CONNECTION_TIMEOUT)?;
@@ -991,6 +1028,7 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
                         idle.swap_id,
                         idle.incoming_swapcoins,
                         idle.outgoing_swapcoins,
+                        false,
                     ) {
                         log::error!("Failed to recover from swap {}: {:?}", swap_id, e);
                     }
@@ -1271,6 +1309,87 @@ fn check_for_preimage(
     Ok(())
 }
 
+/// Retire the funding versions a bump left behind once a swap completed:
+/// each block, drop the ones the winner beat deep enough
+/// ([`Wallet::retire_replaced_versions`]) along with their watches. If a reorg
+/// mines one of them instead, the swap is recovered from it like any other.
+///
+/// [`Wallet::retire_replaced_versions`]: crate::wallet::Wallet::retire_replaced_versions
+fn spawn_version_retirement(maker: &Arc<MakerServer>, swap_id: String) -> Result<(), MakerError> {
+    let maker_clone = Arc::clone(maker);
+    let handle = thread::Builder::new()
+        .name(format!("version-retirement-{swap_id}"))
+        .spawn(move || {
+            let maker = maker_clone;
+            // Kept across passes, as recovery keeps its own: a fresh Electrum
+            // connection costs a handshake, over Tor a slow one. A failed pass
+            // drops it and the next one reconnects.
+            let mut held: Option<crate::wallet::AnyBlockchain> = None;
+            loop {
+                let retired = held
+                    .take()
+                    .map_or_else(|| maker.backend.connect(), Ok)
+                    .and_then(|chain| {
+                        let retired = crate::wallet::Wallet::retire_replaced_versions(
+                            &maker.wallet,
+                            &chain,
+                            &swap_id,
+                        )?;
+                        held = Some(chain);
+                        Ok(retired)
+                    });
+                match retired {
+                    Ok(retirement) => {
+                        for (outpoint, spk) in retirement.removed {
+                            maker.unwatch_outpoint(outpoint, spk);
+                        }
+                        if retirement.revived {
+                            log::warn!(
+                                "[{}] A replaced funding version of swap {} is mined after a reorg; recovering",
+                                maker.config.network_port,
+                                swap_id
+                            );
+                            let outgoing = match lock_debug!(maker.wallet.read()) {
+                                Ok(wallet) => wallet
+                                    .find_unfinished_swapcoins()
+                                    .1
+                                    .into_iter()
+                                    .filter(|coin| coin.swap_id.as_deref() == Some(&swap_id))
+                                    .collect(),
+                                Err(_) => Vec::new(),
+                            };
+                            if let Err(e) = recover_from_swap(
+                                Arc::clone(&maker),
+                                swap_id.clone(),
+                                Vec::new(),
+                                outgoing,
+                                true,
+                            ) {
+                                log::error!("Failed to recover from swap {}: {:?}", swap_id, e);
+                            }
+                            return;
+                        }
+                        if retirement.remaining == 0 {
+                            return;
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        "[{}] Retiring the replaced funding of swap {}: {:?}",
+                        maker.config.network_port,
+                        swap_id,
+                        e
+                    ),
+                }
+                if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                    return;
+                }
+            }
+        })
+        .map_err(MakerError::IO)?;
+    maker.thread_pool.add_thread(handle)?;
+    Ok(())
+}
+
 /// Recover maker funds after taker drops.
 ///
 /// Two recovery paths are tried in a loop:
@@ -1279,11 +1398,16 @@ fn check_for_preimage(
 ///    We extract it via the watch tower and sweep our incoming swapcoins.
 /// 2. **Timelock** (outgoing swapcoins): After the timelock expires, we reclaim
 ///    our outgoing funds via the timelock spending path.
+///
+/// `revived` recovers a completed swap whose replaced funding version a reorg
+/// mined: its incoming was claimed long ago, yet the version's coins are
+/// left to the next hop only until the timelock, as any contract's are.
 fn recover_from_swap(
     maker: Arc<MakerServer>,
     swap_id: String,
-    incoming_swapcoins: Vec<crate::wallet::swapcoin::IncomingSwapCoin>,
+    mut incoming_swapcoins: Vec<crate::wallet::swapcoin::IncomingSwapCoin>,
     outgoing_swapcoins: Vec<crate::wallet::swapcoin::OutgoingSwapCoin>,
+    revived: bool,
 ) -> Result<(), MakerError> {
     // The watcher hears each new block, so asking the server every pass is waste.
     // The fallback uses its own connection, kept while the watcher is down and dropped on error:
@@ -1421,66 +1545,121 @@ fn recover_from_swap(
         }
         Ok(false)
     };
+    // A cooperative or hashlock spend of this outgoing coin's contract.
+    let outgoing_settled = |chain: &AnyBlockchain,
+                            outgoing: &crate::wallet::swapcoin::OutgoingSwapCoin|
+     -> Result<bool, MakerError> {
+        let (outpoint, output) = match outgoing.protocol {
+            ProtocolVersion::Legacy => {
+                let Some(input) = outgoing.contract_tx.input.first() else {
+                    return Ok(false);
+                };
+                let Some(output) = outgoing
+                    .funding_tx
+                    .as_ref()
+                    .filter(|tx| tx.compute_txid() == input.previous_output.txid)
+                    .and_then(|tx| tx.output.get(input.previous_output.vout as usize))
+                else {
+                    return Ok(false);
+                };
+                (input.previous_output, output)
+            }
+            ProtocolVersion::Taproot => {
+                let txid = outgoing.contract_tx.compute_txid();
+                let vout = outgoing.get_contract_output_vout();
+                let Some(output) = outgoing.contract_tx.output.get(vout as usize) else {
+                    return Ok(false);
+                };
+                (bitcoin::OutPoint::new(txid, vout), output)
+            }
+        };
+        if !chain
+            .is_confirmed_spend(&outpoint, &output.script_pubkey)
+            .map_err(MakerError::Wallet)?
+        {
+            return Ok(false);
+        }
+        let Some(spending_tx) = chain
+            .spending_transaction(&outpoint, output.script_pubkey.as_script(), None)
+            .map_err(MakerError::Wallet)?
+        else {
+            return Ok(false);
+        };
+        let settlement_spend = spending_tx.input.iter().any(|input| {
+            input.previous_output == outpoint
+                && match outgoing.protocol {
+                    ProtocolVersion::Legacy => {
+                        spending_tx.compute_txid() != outgoing.contract_tx.compute_txid()
+                    }
+                    ProtocolVersion::Taproot => {
+                        input.witness.len() == 1
+                            || input
+                                .witness
+                                .iter()
+                                .nth(1)
+                                .is_some_and(|item| item.len() == PREIMAGE_LEN)
+                    }
+                }
+        });
+        Ok(settlement_spend)
+    };
+    // Every split settled. A bumped split keeps all its versions, and only
+    // one of them can ever be spent: one settled version settles the split,
+    // but only once every other version is beaten deep enough that no reorg
+    // can bring it back, since settling drops them all.
     let all_outgoing_confirmed_settled = |chain: &AnyBlockchain| -> Result<bool, MakerError> {
         if outgoing_swapcoins.is_empty() {
             return Ok(false);
         }
-
-        for outgoing in &outgoing_swapcoins {
-            let (outpoint, output) = match outgoing.protocol {
-                ProtocolVersion::Legacy => {
-                    let Some(input) = outgoing.contract_tx.input.first() else {
-                        return Ok(false);
-                    };
-                    let Some(output) = outgoing
-                        .funding_tx
-                        .as_ref()
-                        .filter(|tx| tx.compute_txid() == input.previous_output.txid)
-                        .and_then(|tx| tx.output.get(input.previous_output.vout as usize))
-                    else {
-                        return Ok(false);
-                    };
-                    (input.previous_output, output)
-                }
-                ProtocolVersion::Taproot => {
-                    let txid = outgoing.contract_tx.compute_txid();
-                    let vout = outgoing.get_contract_output_vout();
-                    let Some(output) = outgoing.contract_tx.output.get(vout as usize) else {
-                        return Ok(false);
-                    };
-                    (bitcoin::OutPoint::new(txid, vout), output)
-                }
-            };
-            if !chain
-                .is_confirmed_spend(&outpoint, &output.script_pubkey)
-                .map_err(MakerError::Wallet)?
-            {
-                return Ok(false);
+        fn funding_of(
+            outgoing: &crate::wallet::swapcoin::OutgoingSwapCoin,
+        ) -> Option<&bitcoin::Transaction> {
+            match outgoing.protocol {
+                ProtocolVersion::Legacy => outgoing.funding_tx.as_ref(),
+                ProtocolVersion::Taproot => Some(&outgoing.contract_tx),
             }
-            let Some(spending_tx) = chain
-                .spending_transaction(&outpoint, output.script_pubkey.as_script(), None)
-                .map_err(MakerError::Wallet)?
-            else {
+        }
+        let mut splits = std::collections::HashMap::<
+            bitcoin::OutPoint,
+            Vec<&crate::wallet::swapcoin::OutgoingSwapCoin>,
+        >::new();
+        for outgoing in &outgoing_swapcoins {
+            let funding_input = funding_of(outgoing)
+                .and_then(|funding| funding.input.first())
+                .map(|input| input.previous_output)
+                .unwrap_or(bitcoin::OutPoint::new(
+                    outgoing.contract_tx.compute_txid(),
+                    0,
+                ));
+            splits.entry(funding_input).or_default().push(outgoing);
+        }
+        for versions in splits.values() {
+            let mut settled = None;
+            for (index, outgoing) in versions.iter().enumerate() {
+                if outgoing_settled(chain, outgoing)? {
+                    settled = Some(index);
+                    break;
+                }
+            }
+            let Some(settled) = settled else {
                 return Ok(false);
             };
-            let settlement_spend = spending_tx.input.iter().any(|input| {
-                input.previous_output == outpoint
-                    && match outgoing.protocol {
-                        ProtocolVersion::Legacy => {
-                            spending_tx.compute_txid() != outgoing.contract_tx.compute_txid()
-                        }
-                        ProtocolVersion::Taproot => {
-                            input.witness.len() == 1
-                                || input
-                                    .witness
-                                    .iter()
-                                    .nth(1)
-                                    .is_some_and(|item| item.len() == PREIMAGE_LEN)
-                        }
-                    }
-            });
-            if !settlement_spend {
-                return Ok(false);
+            for (index, outgoing) in versions.iter().enumerate() {
+                if index == settled {
+                    continue;
+                }
+                let beaten = match funding_of(outgoing) {
+                    Some(funding) => crate::wallet::Wallet::replaced_by_confirmed_spend(
+                        chain,
+                        funding,
+                        crate::wallet::replaced_version_discard_depth(),
+                    )
+                    .map_err(MakerError::Wallet)?,
+                    None => false,
+                };
+                if !beaten {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -1517,6 +1696,22 @@ fn recover_from_swap(
         // The chain only moves with a block, so server work waits for one. A failed
         // pass therefore retries on the next block, not every heartbeat.
         let new_block = last_block.replace(current_height) != Some(current_height);
+        // A bump of our incoming funding after a reorg moves the contract to
+        // the version that was mined; claim that one.
+        if new_block
+            && incoming_swapcoins
+                .iter()
+                .any(|coin| coin.protocol == ProtocolVersion::Taproot)
+        {
+            if let Err(e) = maker.follow_replaced_incoming(&swap_id, &mut incoming_swapcoins) {
+                log::warn!(
+                    "[{}] Could not check swap {} for replaced incoming funding: {:?}",
+                    maker.config.network_port,
+                    swap_id,
+                    e
+                );
+            }
+        }
         let handover_persisted = !incoming_swapcoins.is_empty()
             && incoming_swapcoins
                 .iter()
@@ -1947,10 +2142,12 @@ fn recover_from_swap(
                 maker.shutdown.store(true, Relaxed);
                 return Ok(());
             }
-        } else if current_height >= timelock_expiry && !incoming_swapcoins.is_empty() {
+        } else if current_height >= timelock_expiry && (!incoming_swapcoins.is_empty() || revived) {
             // Refund only while incoming coins are left. They are saved before
             // outgoing ones, so a funded swap with none left had its incoming
             // claimed before a restart, and a refund would take both sides.
+            // A revived version is the exception: the next hop had until the
+            // timelock to claim it, and past that its coins would only be stranded.
             // --- Timelock path: reclaim outgoing after timelock expires ---
             log::info!(
                 "[{}] Timelock expired at {} (expiry={}), recovering via timelock path",

@@ -68,6 +68,24 @@ fn unsupported(method: &str) -> WalletError {
     WalletError::General(format!("{method} is not supported by this backend"))
 }
 
+/// The Core node behind each test electrs, by its Electrum URL: regtest
+/// Electrum mines through that node, so the mining hooks act on it.
+#[cfg(feature = "integration-test")]
+static TEST_ELECTRUM_NODES: std::sync::Mutex<Vec<(String, CoreRpcConfig)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Test hook: name the Core node an electrs at `electrum_url` indexes, so
+/// the mining hooks work on an Electrum backend too.
+#[cfg(feature = "integration-test")]
+#[doc(hidden)]
+pub fn register_test_electrum_node(electrum_url: &str, node: CoreRpcConfig) {
+    let mut nodes = TEST_ELECTRUM_NODES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    nodes.retain(|(url, _)| url != electrum_url);
+    nodes.push((electrum_url.to_string(), node));
+}
+
 /// HD-origin metadata for a watched script.
 ///
 /// Returned by [`Blockchain::hd_origin_for_script`] so the wallet's UTXO
@@ -494,6 +512,53 @@ impl AnyBlockchain {
             },
             AnyBlockchain::Electrum(b) => b.confirmed_spending_transaction(outpoint, script),
         }
+    }
+
+    /// The Core node that mines this backend's chain, for the mining hooks:
+    /// the node itself, or the one registered behind a test electrs.
+    #[cfg(feature = "integration-test")]
+    fn with_test_miner<T>(
+        &self,
+        method: &str,
+        hook: impl FnOnce(&CoreRPC) -> Result<T, WalletError>,
+    ) -> Result<T, WalletError> {
+        match self {
+            AnyBlockchain::CoreRPC(b) => hook(b),
+            AnyBlockchain::Electrum(b) => {
+                let node = TEST_ELECTRUM_NODES
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .find(|(url, _)| url == b.url())
+                    .map(|(_, node)| node.clone())
+                    .ok_or_else(|| unsupported(method))?;
+                hook(&CoreRPC::new(&node)?)
+            }
+        }
+    }
+
+    /// Test hook: keep `txid` out of mined blocks.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn deprioritise_for_test(&self, txid: &Txid) -> Result<(), WalletError> {
+        self.with_test_miner("deprioritise_for_test", |node| {
+            node.deprioritise_for_test(txid)
+        })
+    }
+
+    /// Test hook: shift `txid`'s fee in the miner's view by `delta` sats.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn prioritise_for_test(&self, txid: &Txid, delta: i64) -> Result<(), WalletError> {
+        self.with_test_miner("prioritise_for_test", |node| {
+            node.prioritise_for_test(txid, delta)
+        })
+    }
+
+    /// Test hook: orphan the block that mined `txid`.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn orphan_block_of_for_test(&self, txid: &Txid) -> Result<(), WalletError> {
+        self.with_test_miner("orphan_block_of_for_test", |node| {
+            node.orphan_block_of_for_test(txid)
+        })
     }
 
     /// Feerate in sat/vB a replacement must add: Core's `incrementalrelayfee`,
