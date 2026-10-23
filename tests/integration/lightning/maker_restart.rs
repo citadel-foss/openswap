@@ -507,6 +507,17 @@ impl Drop for Switch {
     }
 }
 
+/// A test that panics while holding a [`Switch`] still leaves it off.
+#[test]
+fn switch_resets_on_panic() {
+    static FLAG: AtomicBool = AtomicBool::new(false);
+    let _ = std::panic::catch_unwind(|| {
+        let _on = Switch::on(&FLAG);
+        panic!("held");
+    });
+    assert!(!FLAG.load(SeqCst));
+}
+
 /// A crash in the middle of the watchdog's refund, between recording it and
 /// broadcasting it, must leave a restarted maker able to finish it: send the
 /// refund, recognise it as its own, and close the swap once it confirms.
