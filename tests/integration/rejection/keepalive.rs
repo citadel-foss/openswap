@@ -5,7 +5,14 @@
 //! sweep.
 
 use bitcoin::Amount;
-use openswap::{protocol::common_messages::ProtocolVersion, taker::SwapParams};
+use openswap::{
+    maker::handlers::Maker,
+    protocol::{
+        common_messages::{ProtocolVersion, SwapDetails, TakerToMakerMessage},
+        legacy_messages::ProofOfFunding,
+    },
+    taker::SwapParams,
+};
 
 use crate::test_framework::*;
 
@@ -227,4 +234,78 @@ fn completed_swap_state_is_restored_after_a_failed_sweep(world: &mut World, para
     );
     // Restoring a completed swap is not a late message.
     assert_log!(world; { lacks "Rejecting late message" });
+}
+
+/// A connection still holding a drained swap must not drive the swap's next
+/// admission. Connection A admits swap X; the idle drain drops X; connection
+/// B admits X again. A message on A is then refused before A adopts B's
+/// stored state, and B's admission stays as it was.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [fund_makers_default(), spawn_ready_makers_and_mine()],
+)]
+fn stale_connection_cannot_drive_a_readmitted_swap(world: &mut World) {
+    let log_path = world.taker_log_path();
+    let address = world.makers()[0].address();
+    let maker = world.makers()[0].inner().clone();
+
+    let swap_id = "11080000deadbeef".to_string();
+    let details = SwapDetails {
+        id: swap_id.clone(),
+        features: Vec::new(),
+        amount: Amount::from_sat(500_000),
+        tx_count: 1,
+        incoming_count: 1,
+        max_input_budget: 2,
+        feerate: 1,
+        timelock: 150,
+        refund_locktime_offset: 150,
+    };
+
+    // A is established, so the maker reads it with no deadline until the 60s
+    // test read timeout: it stays open across the 30s idle drain below.
+    let (mut stale, _) =
+        RawMakerConnection::admit(&address, ProtocolVersion::Legacy, details.clone());
+    wait_for_log(
+        &log_path,
+        &format!("Released idle unfunded swap {swap_id}"),
+        Duration::from_secs(50),
+    );
+    let (_fresh, _) = RawMakerConnection::admit(&address, ProtocolVersion::Legacy, details.clone());
+
+    let admission = || {
+        let state = maker
+            .get_connection_state(&swap_id)
+            .unwrap()
+            .expect("the re-admitted swap is stored");
+        (state.swap_start_time, state.funding_plan)
+    };
+    let readmitted = admission();
+
+    let offset = std::fs::metadata(&log_path).unwrap().len() as usize;
+    stale.send(&TakerToMakerMessage::ProofOfFunding(ProofOfFunding {
+        id: swap_id.clone(),
+        confirmed_funding_txes: vec![],
+        next_openswap_info: vec![],
+        refund_locktime: 150,
+    }));
+    stale.expect_closed();
+
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let after = &log[offset..];
+    // Without the guard, A would load B's state first, then fail later.
+    assert!(
+        !after.contains(&format!("Restored state for {swap_id}")),
+        "the stale connection must not adopt the new admission's state"
+    );
+    assert!(
+        after.contains("Swap plan expired; the taker must send new SwapDetails"),
+        "the maker must refuse the stale connection as expired"
+    );
+    assert!(
+        admission() == readmitted,
+        "the stale message must leave the new admission untouched"
+    );
 }

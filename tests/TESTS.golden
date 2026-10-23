@@ -698,6 +698,7 @@ openswap::integration rejection::keepalive::keepalive_naming_unseen_funding_is_r
 openswap::integration rejection::keepalive::keepalive_socket_cannot_switch_swap_id
 openswap::integration rejection::keepalive::keepalive_with_mempool_funding_still_refreshes
 openswap::integration rejection::keepalive::slow_taker_is_readmitted_before_funding
+openswap::integration rejection::keepalive::stale_connection_cannot_drive_a_readmitted_swap
 openswap::integration rejection::partial_broadcast::failed_first_send_frees_inputs_and_keeps_keys
 openswap::integration rejection::partial_broadcast::failed_first_send_frees_inputs_and_keeps_keys_taproot
 openswap::integration rejection::partial_broadcast::maker_recovers_partial_broadcast_electrum

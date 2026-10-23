@@ -30,6 +30,7 @@ mod logs;
 mod node;
 mod ports;
 mod procs;
+mod raw_maker;
 mod reports;
 mod timing;
 mod wait;
@@ -46,6 +47,7 @@ pub use self::{
     macros::world_test,
     node::*,
     procs::{electrs::*, tor::*},
+    raw_maker::*,
     reports::*,
     wait::*,
     world::*,
