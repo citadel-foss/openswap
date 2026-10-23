@@ -1693,7 +1693,16 @@ fn watchdog_resolve_swap_out(
             // Stored below with the refund, so it must not carry the
             // snapshot's missing height over the one just recovered.
             swap.funding_height = Some(funded_at);
-            let destination = payout_script(maker, swap_id, &mut swap)?;
+            // Not payout_script(), whose store is unconditional: a new script
+            // changes the refund txid, so the guarded store below writes both.
+            let destination = match &swap.payout_script {
+                Some(script) => script.clone(),
+                None => {
+                    let script = maker.get_receive_address()?.script_pubkey();
+                    swap.payout_script = Some(script.clone());
+                    script
+                }
+            };
             let refund_tx = swap
                 .htlc
                 .create_timelock_spend(outpoint, value, &swap.privkey, destination)
