@@ -49,10 +49,10 @@ try {
     }
     else {
         $focusedTests = @(
-            "standard_swap::test_standard_openswap",
-            "taproot_swap::test_taproot_openswap",
-            "electrum_swap::test_legacy_openswap_electrum",
-            "electrum_swap::test_taproot_openswap_electrum"
+            "swap::standard::legacy_two_maker_swap_completes",
+            "swap::taproot::taproot_two_maker_swap_completes",
+            "swap::electrum::legacy_swap_completes",
+            "swap::electrum::taproot_swap_completes"
         )
         $testExitCode = 0
         foreach ($testName in $focusedTests) {

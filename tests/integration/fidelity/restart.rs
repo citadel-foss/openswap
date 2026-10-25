@@ -468,8 +468,10 @@ fn evicted_bond_rebroadcast_on_restart_electrum(world: &mut World) {
     // mempool.dat. (No `-walletbroadcast=0` needed here: with the Electrum
     // backend no node-side wallet tracks the bond tx. No ZMQ args either:
     // electrs talks to the node over RPC/p2p only.)
-    let new_bitcoind =
-        spawn_replacement_bitcoind(world.temp_dir().join(".bitcoin"), &["-persistmempool=0"]);
+    let new_bitcoind = spawn_replacement_bitcoind(
+        world.bitcoind().workdir().to_path_buf(),
+        &["-persistmempool=0"],
+    );
 
     assert!(
         new_bitcoind.client.get_mempool_entry(&bond_txid).is_err(),
@@ -514,7 +516,7 @@ fn evicted_bond_rebroadcast_on_restart_electrum(world: &mut World) {
     // to index the block (the background miner stays paused: it talks to the
     // dead node).
     generate_blocks(&new_bitcoind, 1);
-    let _ = new_electrsd.trigger();
+    new_electrsd.trigger();
     wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
 
     assert_single_adopted_bond(&restarted, bond_txid);

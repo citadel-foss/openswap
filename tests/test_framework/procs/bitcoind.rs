@@ -68,6 +68,20 @@ fn read_tarball_from_file(path: &str) -> Vec<u8> {
     buffer
 }
 
+fn bitcoind_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "bitcoind.exe"
+    } else {
+        "bitcoind"
+    }
+}
+
+fn is_bitcoind_entry(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "bitcoind" || name == "bitcoind.exe")
+}
+
 fn unpack_tarball(tarball_bytes: &[u8], destination: &Path) {
     let decoder = GzDecoder::new(tarball_bytes);
     let mut archive = Archive::new(decoder);
@@ -79,7 +93,7 @@ fn unpack_tarball(tarball_bytes: &[u8], destination: &Path) {
         let mut entry =
             entry.unwrap_or_else(|e| panic!("cannot read bitcoind tarball entry: {:?}", e));
         if let Ok(file) = entry.path() {
-            if file.ends_with("bitcoind") {
+            if is_bitcoind_entry(file.as_ref()) {
                 // `false` means the entry's path escapes `destination` and was skipped.
                 unpacked |= entry
                     .unpack_in(destination)
@@ -93,6 +107,57 @@ fn unpack_tarball(tarball_bytes: &[u8], destination: &Path) {
     std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
         .unwrap_or_else(|e| panic!("bitcoind tarball failed its gzip integrity check: {:?}", e));
 }
+
+/// Windows releases are zip files. Extract only the bitcoind binary, keeping
+/// the `bitcoin-<V>/bin/` layout the installer expects.
+fn unpack_zip(zip_bytes: &[u8], destination: &Path) {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes))
+        .unwrap_or_else(|e| panic!("cannot read bitcoind zip: {:?}", e));
+    let mut unpacked = false;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .unwrap_or_else(|e| panic!("cannot read bitcoind zip entry: {:?}", e));
+        let Some(name) = entry.enclosed_name() else {
+            continue;
+        };
+        if !is_bitcoind_entry(&name) {
+            continue;
+        }
+        let out_path = destination.join(&name);
+        if let Some(parent) = out_path.parent() {
+            create_dir_all(parent).unwrap();
+        }
+        let mut output = File::create(&out_path)
+            .unwrap_or_else(|e| panic!("cannot unpack bitcoind from zip: {:?}", e));
+        std::io::copy(&mut entry, &mut output)
+            .unwrap_or_else(|e| panic!("cannot unpack bitcoind from zip: {:?}", e));
+        unpacked = true;
+    }
+    assert!(unpacked, "bitcoind zip has no bitcoind binary");
+}
+
+fn unpack_archive(bytes: &[u8], destination: &Path) {
+    if bytes.starts_with(b"PK") {
+        unpack_zip(bytes, destination);
+    } else {
+        unpack_tarball(bytes, destination);
+    }
+}
+
+#[cfg(unix)]
+fn ensure_bitcoind_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path)
+        .unwrap_or_else(|e| panic!("cannot stat {}: {e}", path.display()))
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o755);
+    fs::set_permissions(path, permissions)
+        .unwrap_or_else(|e| panic!("cannot mark {} executable: {e}", path.display()));
+}
+
+#[cfg(not(unix))]
+fn ensure_bitcoind_executable(_path: &Path) {}
 
 /// Release tarball for this platform, or `None` when there is no gzipped
 /// tarball to download for it.
@@ -108,6 +173,7 @@ fn get_bitcoind_filename(os: &str, arch: &str) -> Option<String> {
         ("linux", "aarch64") => Some(format!(
             "bitcoin-{BITCOIN_VERSION}-aarch64-linux-gnu.tar.gz"
         )),
+        ("windows", "x86_64") => Some(format!("bitcoin-{BITCOIN_VERSION}-win64.zip")),
         _ => None,
     }
 }
@@ -129,7 +195,9 @@ fn install_bitcoind(bitcoin_bin_dir: &Path, os: &str, arch: &str) {
         .unwrap_or_else(|e| panic!("cannot lock {}: {e}", lock_path.display()));
 
     let bitcoin_home = bitcoin_bin_dir.join(format!("bitcoin-{BITCOIN_VERSION}"));
-    if bitcoin_home.join("bin").join("bitcoind").exists() {
+    let installed = bitcoin_home.join("bin").join(bitcoind_binary_name());
+    if installed.exists() {
+        ensure_bitcoind_executable(&installed);
         return; // Installed by another process while this one waited.
     }
 
@@ -165,16 +233,18 @@ fn install_bitcoind(bitcoin_bin_dir: &Path, os: &str, arch: &str) {
     }
     let staging = bitcoin_bin_dir.join(format!(".bitcoind-staging-{}", std::process::id()));
     create_dir_all(&staging).unwrap();
-    unpack_tarball(&tarball_bytes, &staging);
+    unpack_archive(&tarball_bytes, &staging);
 
     let staged_home = staging.join(format!("bitcoin-{BITCOIN_VERSION}"));
-    let staged_binary = staged_home.join("bin").join("bitcoind");
+    let staged_binary = staged_home.join("bin").join(bitcoind_binary_name());
     assert!(
         staged_binary.exists(),
-        "bitcoind tarball has no bitcoin-{}/bin/bitcoind",
-        BITCOIN_VERSION
+        "bitcoind archive has no bitcoin-{}/bin/{}",
+        BITCOIN_VERSION,
+        bitcoind_binary_name()
     );
 
+    ensure_bitcoind_executable(&staged_binary);
     if os == "macos" {
         std::process::Command::new("codesign")
             .arg("--sign")
@@ -230,12 +300,17 @@ pub(crate) fn init_bitcoind(
         .join(format!("bitcoin-{BITCOIN_VERSION}"))
         .join("bin");
 
+    let bitcoind_path = bitcoin_exe_home.join(bitcoind_binary_name());
     // Unlocked fast path: the binary only ever appears complete, by rename.
-    if !bitcoin_exe_home.join("bitcoind").exists() {
+    if !bitcoind_path.exists() {
         install_bitcoind(&bitcoin_bin_dir, os, arch);
+    } else {
+        // A binary extracted by an older copy may already be on disk without
+        // the execute bit. Re-applying it is a no-op on Windows.
+        ensure_bitcoind_executable(&bitcoind_path);
     }
 
-    env::set_var("BITCOIND_EXE", bitcoin_exe_home.join("bitcoind"));
+    env::set_var("BITCOIND_EXE", &bitcoind_path);
 
     let exe_path = bitcoind::exe_path().unwrap();
 

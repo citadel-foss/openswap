@@ -4,7 +4,6 @@ use bip39::rand;
 use std::{
     env, fs,
     path::PathBuf,
-    process::Child,
     sync::{
         atomic::{
             AtomicBool,
@@ -21,7 +20,6 @@ use bitcoind::{
     BitcoinD,
 };
 
-use electrsd::ElectrsD;
 use openswap::{
     maker::{MakerBehavior, MakerServer, MakerServerConfig},
     taker::{Taker, TakerBehavior, TakerInitConfig},
@@ -34,8 +32,8 @@ use super::{
     ports::{free_ports, reserve_listeners},
     procs::{
         bitcoind::{init_bitcoind, try_generate_blocks, wait_for_bitcoind_exit},
-        electrs::{init_electrsd, wait_for_electrs_tip},
-        nostr::{spawn_nostr_relay, wait_for_relay_healthy},
+        electrs::{init_electrsd, wait_for_electrs_tip, TestElectrs},
+        nostr::{spawn_nostr_relay, wait_for_relay_healthy, TestNostrRelay},
     },
 };
 
@@ -48,7 +46,7 @@ pub struct TestFramework {
     /// Present only when the backend in [`TestFramework::init`] asks for an Electrum URL.
     /// Kept alive here so the electrs child process lives for the duration of the test.
     /// Behind a `Mutex` so teardown can drop it before bitcoind, from `&self`.
-    pub(crate) electrsd: Mutex<Option<ElectrsD>>,
+    pub(crate) electrsd: Mutex<Option<TestElectrs>>,
     pub(crate) temp_dir: PathBuf,
     pub(crate) nostr_relay_url: String,
     /// Kept so [`TestFramework::taker_init_config`] can rebuild the same backend
@@ -65,7 +63,7 @@ pub struct TestFramework {
     /// Set by the first teardown, so `stop()` followed by `Drop` tears down once.
     torn_down: AtomicBool,
     block_gen_paused: AtomicBool,
-    nostr_relay: Mutex<Option<Child>>,
+    nostr_relay: Mutex<Option<TestNostrRelay>>,
 }
 
 /// Per-maker offer override for [`TestFramework::init`].
@@ -130,10 +128,13 @@ impl TestFramework {
         log::info!("temporary directory : {}", temp_dir.display());
         // Names the test in its own log, so a kept data dir can be traced back.
         log::info!("test: {}", thread::current().name().unwrap_or("<unnamed>"));
+        // A failed start can leave a process holding the datadir. Each attempt
+        // gets its own directory so the next port retry is not locked out.
         let (bitcoind, zmq_addr) = (0..3)
-            .find_map(|_| {
+            .find_map(|attempt| {
                 let zmq_addr = format!("tcp://127.0.0.1:{}", free_ports(1)[0]);
-                init_bitcoind(&temp_dir, zmq_addr.clone())
+                let datadir = temp_dir.join(format!("bitcoind-{attempt}"));
+                init_bitcoind(&datadir, zmq_addr.clone())
                     .ok()
                     .map(|b| (b, zmq_addr))
             })
@@ -160,7 +161,7 @@ impl TestFramework {
         // process running; the guard kills it on that path instead.
         let mut nostr_relay = RelayGuard(Some(nostr_relay));
         let nostr_relay_url = format!("ws://127.0.0.1:{nostr_port}");
-        let mut electrsd: Option<ElectrsD> = None;
+        let mut electrsd: Option<TestElectrs> = None;
         let mut backend_config: Option<BackendConfig> = None;
         let (takers, makers) = {
             let mut electrum_url: Option<String> = None;
@@ -303,7 +304,7 @@ impl TestFramework {
                     }
                 }
                 if let Some(elec) = tf.electrsd.lock().unwrap().as_ref() {
-                    let _ = elec.trigger();
+                    elec.trigger();
                 }
             }
         });
@@ -433,7 +434,7 @@ impl TestFramework {
 
 /// Owns the nostr relay during `init`, killing it if `init` unwinds before the
 /// framework takes it over.
-struct RelayGuard(Option<Child>);
+struct RelayGuard(Option<TestNostrRelay>);
 
 impl Drop for RelayGuard {
     fn drop(&mut self) {

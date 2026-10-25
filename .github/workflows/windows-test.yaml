@@ -127,14 +127,14 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --features integration-test --test integration \
-            standard_swap::test_standard_openswap -- \
+            swap::standard::legacy_two_maker_swap_completes -- \
             --exact --nocapture --test-threads=1
           cargo test --features integration-test --test integration \
-            taproot_swap::test_taproot_openswap -- \
+            swap::taproot::taproot_two_maker_swap_completes -- \
             --exact --nocapture --test-threads=1
           cargo test --features integration-test --test integration \
-            electrum_swap::test_legacy_openswap_electrum -- \
+            swap::electrum::legacy_swap_completes -- \
             --exact --nocapture --test-threads=1
           cargo test --features integration-test --test integration \
-            electrum_swap::test_taproot_openswap_electrum -- \
+            swap::electrum::taproot_swap_completes -- \
             --exact --nocapture --test-threads=1

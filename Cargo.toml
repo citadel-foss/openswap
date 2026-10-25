@@ -54,6 +54,7 @@ signal-hook = "0.3"
 minreq = { version = "2.12.0", features = ["https"] }
 flate2 = {version = "1.0.35"}
 tar = {version = "0.4.43"}
+zip = "2"
 # No `electrs_*` feature: those enable electrsd's `download`, which needs the yanked
 # `zip` 0.6. The tests take the binary from ELECTRS_EXEC; see tests/install_electrs.sh.
 # The crate itself does not build on Windows. Windows tests spawn ELECTRS_EXEC.
