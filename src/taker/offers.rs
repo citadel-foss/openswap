@@ -2834,6 +2834,21 @@ pub(crate) mod tests {
         assert_eq!(OfferBook::read_from_disk(&path).unwrap().makers.len(), 1);
     }
 
+    #[cfg(unix)]
+    struct RestoreWrite<'a>(&'a std::path::Path);
+
+    #[cfg(unix)]
+    impl Drop for RestoreWrite<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(self.0) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(self.0, perms);
+            }
+        }
+    }
+
     #[test]
     fn failed_offerbook_write_preserves_existing_file() {
         let dir = tempdir().unwrap();
@@ -2849,16 +2864,6 @@ pub(crate) mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            struct RestoreWrite<'a>(&'a std::path::Path);
-            impl Drop for RestoreWrite<'_> {
-                fn drop(&mut self) {
-                    if let Ok(metadata) = std::fs::metadata(self.0) {
-                        let mut perms = metadata.permissions();
-                        perms.set_mode(0o755);
-                        let _ = std::fs::set_permissions(self.0, perms);
-                    }
-                }
-            }
             let _restore = RestoreWrite(dir.path());
             let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
             perms.set_mode(0o555);

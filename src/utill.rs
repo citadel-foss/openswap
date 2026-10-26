@@ -2411,13 +2411,32 @@ mod tests {
         }
     }
 
+    /// Puts directory write permission back so the temp dir can be removed.
+    struct RestoreDirectoryMode<'a>(&'a std::path::Path);
+
+    impl Drop for RestoreDirectoryMode<'_> {
+        fn drop(&mut self) {
+            if let Ok(metadata) = fs::metadata(self.0) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = fs::set_permissions(self.0, perms);
+            }
+        }
+    }
+
     #[test]
     fn compat_set_config_key_failed_write_keeps_original() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let original = "port = 1\nfuture_key = keep\n";
         fs::write(&path, original).unwrap();
-        fs::create_dir(path.with_extension("partial")).unwrap();
+        // Staging names are unique, so a leftover `*.partial` directory no
+        // longer blocks the write. A directory this process cannot create
+        // files in still does.
+        let _restore = RestoreDirectoryMode(dir.path());
+        let mut perms = fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(dir.path(), perms).unwrap();
         assert!(set_config_key(&path, "port", "2").is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
@@ -2446,8 +2465,10 @@ mod tests {
         let path = dir.path().join("config.toml");
         let partial = path.with_extension("partial");
         for stale in [false, true] {
-            if stale {
+            if path.exists() {
                 fs::remove_file(&path).unwrap();
+            }
+            if stale {
                 fs::write(&partial, "stale").unwrap();
                 fs::set_permissions(&partial, fs::Permissions::from_mode(0o666)).unwrap();
             }
@@ -2457,7 +2478,16 @@ mod tests {
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
-            assert!(!partial.exists());
+            if stale {
+                // A predictable staging name is no longer opened, replaced, or removed.
+                assert_eq!(fs::read(&partial).unwrap(), b"stale");
+                assert_eq!(
+                    fs::metadata(&partial).unwrap().permissions().mode() & 0o777,
+                    0o666
+                );
+            } else {
+                assert!(!partial.exists());
+            }
         }
     }
 
@@ -2483,6 +2513,9 @@ mod tests {
             assert_eq!(previous, if linked { "unrelated" } else { "stale" });
             if linked {
                 assert_eq!(fs::read_to_string(&other).unwrap(), "unrelated");
+                assert!(partial.symlink_metadata().unwrap().file_type().is_symlink());
+            } else {
+                assert_eq!(fs::read(&partial).unwrap(), b"stale");
             }
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
@@ -2492,7 +2525,6 @@ mod tests {
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
-            assert!(!partial.exists());
         }
     }
 

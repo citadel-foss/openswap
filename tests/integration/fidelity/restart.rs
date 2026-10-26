@@ -344,7 +344,7 @@ fn evicted_bond_rebroadcast_on_restart(world: &mut World) {
     let raw_tx = format!("-zmqpubrawtx={zmq_addr}");
     let block_hash = format!("-zmqpubrawblock={zmq_addr}");
     let new_bitcoind = spawn_replacement_bitcoind(
-        world.temp_dir().join(".bitcoin"),
+        world.bitcoind().workdir(),
         &[
             "-persistmempool=0",
             "-walletbroadcast=0",

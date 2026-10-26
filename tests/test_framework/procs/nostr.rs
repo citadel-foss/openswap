@@ -128,7 +128,8 @@ pub(in crate::test_framework) fn spawn_nostr_relay(temp_dir: &Path, port: u16) -
             .spawn()
             .unwrap_or_else(|e| {
                 panic!(
-                    "failed to spawn nostr relay binary '{bin}': {e}. Install it with `cargo install nostr-rs-relay` or set OPENSWAP_TEST_NOSTR_RELAY_BIN."
+                    "failed to spawn nostr relay binary '{}': {}. Install it with `cargo install nostr-rs-relay` or set OPENSWAP_TEST_NOSTR_RELAY_BIN.",
+                    bin, e
                 )
             });
         TestNostrRelay {
