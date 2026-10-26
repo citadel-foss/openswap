@@ -767,7 +767,14 @@ fn run() -> Result<(), TakerError> {
             // Block until the offerbook sync cycle completes (includes Nostr discovery wait).
             taker.sync_offerbook_and_wait()?;
 
-            println!("Offerbook synchronized in {:.2?}", sync_start.elapsed());
+            if taker.initial_market_sync_complete() {
+                println!("Offerbook synchronized in {:.2?}", sync_start.elapsed());
+            } else {
+                eprintln!(
+                    "Initial market sync is incomplete after {:.2?}; the offerbook may be missing makers because discovery or offer checks did not complete.",
+                    sync_start.elapsed()
+                );
+            }
 
             let offerbook = taker.fetch_offers()?;
             let makers = offerbook.all_makers();

@@ -297,7 +297,7 @@ Now we are ready to initiate a openswap. We are first going to sync the offer bo
 $ taker fetch-offers
 ```
 
-This blocks until the offerbook sync cycle completes (including Nostr-based maker discovery), then prints each discovered maker with its state, offer terms, and fidelity bond details, followed by a summary line:
+This blocks until the offerbook sync cycle completes (including Nostr-based maker discovery), then prints each discovered maker with its state, offer terms, and fidelity bond details, followed by a summary line. On each taker start, it refreshes offers from all makers found on the configured relays, including addresses already in the local offerbook. If a relay or blockchain backend does not respond, the command warns that the displayed offerbook may be incomplete.
 
 ```bash
 Waiting for offerbook synchronization to complete…

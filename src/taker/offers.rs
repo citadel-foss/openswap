@@ -640,8 +640,11 @@ pub struct OfferSyncService {
     socks_port: u16,
     /// Shared so per-maker offer-fetch workers can each hold a handle.
     blockchain: Arc<AnyBlockchain>,
-    /// Set to `true` by Nostr discovery after the first EOSE is received.
+    /// Set to `true` after every configured Nostr relay sends its initial EOSE.
     initial_sync_complete: Arc<AtomicBool>,
+    /// First completed discovery pass must ignore cached freshness and retry
+    /// deadlines, which may have been written by a previous taker process.
+    startup_refresh_complete: Arc<AtomicBool>,
     /// Shared with the handle and the fetch workers so shutdown stops new
     /// fetches; in-flight ones abort via the backend's own flag.
     shutdown: Arc<AtomicBool>,
@@ -653,6 +656,8 @@ pub struct OfferSyncHandle {
     join: Option<JoinHandle<()>>,
     cmd_tx: mpsc::Sender<SyncCommand>,
     offerbook: OfferBookHandle,
+    initial_sync_complete: Arc<AtomicBool>,
+    startup_refresh_complete: Arc<AtomicBool>,
 }
 
 /// Lightweight clone-able client for triggering offer sync operations from
@@ -689,6 +694,12 @@ impl OfferSyncClient {
 }
 
 impl OfferSyncHandle {
+    /// Whether every relay completed its snapshot and the first offer refresh ran.
+    pub fn initial_market_sync_complete(&self) -> bool {
+        self.initial_sync_complete.load(Ordering::SeqCst)
+            && self.startup_refresh_complete.load(Ordering::Relaxed)
+    }
+
     /// Shutdown handler
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -809,6 +820,7 @@ impl OfferSyncService {
             socks_port,
             blockchain,
             initial_sync_complete,
+            startup_refresh_complete: Arc::new(AtomicBool::new(false)),
             shutdown,
         }
     }
@@ -818,17 +830,19 @@ impl OfferSyncService {
         let _guard = SyncGuard {
             flag: &self.offerbook.is_syncing,
         };
+        let discovery_complete = self.initial_sync_complete.load(Ordering::SeqCst);
+        let startup_refresh = !self.startup_refresh_complete.load(Ordering::Relaxed);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
-        let height = match self.blockchain.get_block_count() {
-            Ok(h) => h as u32,
+        let (height, mut chain_checks_complete) = match self.blockchain.get_block_count() {
+            Ok(h) => (h as u32, true),
             Err(e) => {
                 log::warn!("get_block_count failed; skipping fidelity prune this cycle: {e:?}");
-                0
+                (0, false)
             }
         };
         let fidelities = self.registry.list_fidelity(height)?;
@@ -853,9 +867,12 @@ impl OfferSyncService {
                     live_outpoints.push((address, outpoint, Some(fidelity.expire_height)));
                 }
                 Ok(None) => spent_outpoints.push(outpoint),
-                Err(e) => log::warn!(
-                    "Failed to check fidelity output {outpoint}; leaving offerbook unchanged: {e:?}"
-                ),
+                Err(e) => {
+                    chain_checks_complete = false;
+                    log::warn!(
+                        "Failed to check fidelity output {outpoint}; leaving offerbook unchanged: {e:?}"
+                    );
+                }
             }
         }
         let live_candidates = group_live_fidelity_candidates(live_outpoints);
@@ -863,12 +880,11 @@ impl OfferSyncService {
         {
             let mut book = lock_debug!(self.offerbook.inner.write())
                 .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
-            let pruned = book.prune_stale_makers(now);
             let expired_suppressions = book.prune_expired_suppressions(height);
-            let mut changed = pruned > 0 || expired_suppressions > 0;
+            let mut changed = expired_suppressions > 0;
             // The registry is memory-only and starts empty. Until Nostr's initial
             // snapshot completes, absence from it does not invalidate a saved offer.
-            if self.initial_sync_complete.load(Ordering::SeqCst) {
+            if discovery_complete {
                 let before = book.makers.len();
                 // Only a manual delete lifts a ban, so an expired or spent bond
                 // must not take the ban with it.
@@ -883,10 +899,8 @@ impl OfferSyncService {
             for outpoint in spent_outpoints {
                 changed |= book.remove_fidelity_outpoint(outpoint);
             }
-            changed |= book.apply_live_candidates(&live_candidates, now);
-            if pruned > 0 {
-                log::info!("Pruned {pruned} makers not synced for at least two days");
-            }
+            changed |= book
+                .apply_live_candidates_with_override(&live_candidates, now, |_| startup_refresh);
             if changed {
                 book.write_to_disk(&self.offerbook.path)?;
             }
@@ -894,11 +908,28 @@ impl OfferSyncService {
 
         let to_poll = lock_debug!(self.offerbook.inner.read())
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?
-            .makers_to_poll(now, &live_candidates);
+            .makers_to_poll_with_override(now, &live_candidates, startup_refresh);
 
-        if !to_poll.is_empty() {
+        let workers_complete = if !to_poll.is_empty() {
             let handles = self.spawn_offer_workers(to_poll)?;
-            Self::join_offer_workers(handles);
+            Self::join_offer_workers(handles)
+        } else {
+            true
+        };
+
+        // A cached offer may be old only because the taker was stopped. Give
+        // discovered makers one refresh attempt before suppressing stale ones;
+        // otherwise a restart after two days hides even a healthy maker for
+        // another two days. Wait for the first Nostr snapshot so an empty
+        // per-boot registry cannot trigger this cleanup prematurely.
+        if discovery_complete {
+            let mut book = lock_debug!(self.offerbook.inner.write())
+                .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+            let pruned = book.prune_stale_makers(now);
+            if pruned > 0 {
+                log::info!("Pruned {pruned} makers not synced for at least two days");
+                book.write_to_disk(&self.offerbook.path)?;
+            }
         }
 
         let finished_at = SystemTime::now()
@@ -908,6 +939,9 @@ impl OfferSyncService {
         self.offerbook
             .last_sync_ts
             .store(finished_at, Ordering::Relaxed);
+        if discovery_complete && chain_checks_complete && workers_complete {
+            self.startup_refresh_complete.store(true, Ordering::Relaxed);
+        }
 
         Ok(())
     }
@@ -1043,7 +1077,7 @@ impl OfferSyncService {
     fn spawn_offer_workers(
         &self,
         makers: Vec<MakerAddress>,
-    ) -> Result<Vec<JoinHandle<()>>, TakerError> {
+    ) -> Result<Vec<JoinHandle<bool>>, TakerError> {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -1077,27 +1111,27 @@ impl OfferSyncService {
                             log::warn!(
                                 "offer-fetch-worker-{i}: backend connect failed: {e:?}; skipping this cycle"
                             );
-                            return;
+                            return false;
                         }
                     };
                     loop {
                         if shutdown.load(Ordering::Relaxed) {
-                            break;
+                            return false;
                         }
                         let addr = {
                             let Ok(mut guard) = lock_debug!(queue.lock()) else {
-                                break;
+                                return false;
                             };
                             guard.next()
                         };
-                        let Some(addr) = addr else { break };
+                        let Some(addr) = addr else { return true };
 
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or(Duration::ZERO)
                             .as_secs();
 
-                        let _ = Self::fetch_and_record_one(
+                        if Self::fetch_and_record_one(
                             addr,
                             socks_port,
                             &backend,
@@ -1105,7 +1139,11 @@ impl OfferSyncService {
                             &offerbook_path,
                             now,
                             &shutdown,
-                        );
+                        )
+                        .is_none()
+                        {
+                            return false;
+                        }
                     }
                 }) {
                 Ok(handle) => handle,
@@ -1125,17 +1163,26 @@ impl OfferSyncService {
     }
 
     /// Joins every fetch worker so partial startup and normal polling share cleanup.
-    fn join_offer_workers(handles: Vec<JoinHandle<()>>) {
+    fn join_offer_workers(handles: Vec<JoinHandle<bool>>) -> bool {
+        let mut complete = true;
         for handle in handles {
             let thread = handle.thread().clone();
             crate::utill::log_shutdown_join_start("offer_sync", &thread);
             let result = handle.join();
-            crate::utill::log_shutdown_join_done(
-                "offer_sync",
-                &thread,
-                if result.is_ok() { "ok" } else { "panic" },
-            );
+            let outcome = match result {
+                Ok(true) => "ok",
+                Ok(false) => {
+                    complete = false;
+                    "incomplete"
+                }
+                Err(_) => {
+                    complete = false;
+                    "panic"
+                }
+            };
+            crate::utill::log_shutdown_join_done("offer_sync", &thread, outcome);
         }
+        complete
     }
 
     /// Starts the offerbook service
@@ -1143,6 +1190,8 @@ impl OfferSyncService {
         let shutdown = self.shutdown.clone();
         let shutdown_flag = shutdown.clone();
         let offerbook = self.offerbook.clone();
+        let initial_sync_complete = self.initial_sync_complete.clone();
+        let startup_refresh_complete = self.startup_refresh_complete.clone();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SyncCommand>();
 
         let join = std::thread::Builder::new()
@@ -1202,6 +1251,8 @@ impl OfferSyncService {
             join: Some(join),
             cmd_tx,
             offerbook,
+            initial_sync_complete,
+            startup_refresh_complete,
         })
     }
 
@@ -1407,10 +1458,20 @@ impl OfferBook {
     /// maker's own: anyone can confirm a transaction naming any onion. So a
     /// disputed address is never removed on discovery alone. Its maker is
     /// polled, and the bond its own signed proof names becomes the cached one.
+    #[cfg(test)]
     fn apply_live_candidates(
         &mut self,
         live: &HashMap<MakerAddress, LiveBonds>,
         now_ts: u64,
+    ) -> bool {
+        self.apply_live_candidates_with_override(live, now_ts, |_| false)
+    }
+
+    fn apply_live_candidates_with_override(
+        &mut self,
+        live: &HashMap<MakerAddress, LiveBonds>,
+        now_ts: u64,
+        startup_refresh: impl Fn(&MakerAddress) -> bool,
     ) -> bool {
         self.contested.clear();
         let mut changed = false;
@@ -1429,7 +1490,13 @@ impl OfferBook {
                 _ => None,
             };
             if let Some((outpoint, expiry)) = undisputed {
-                changed |= self.upsert_discovered(address.clone(), Some(outpoint), expiry, now_ts);
+                changed |= self.upsert_discovered_with_override(
+                    address.clone(),
+                    Some(outpoint),
+                    expiry,
+                    now_ts,
+                    startup_refresh(address),
+                );
                 continue;
             }
 
@@ -1449,7 +1516,13 @@ impl OfferBook {
                 .or_else(|| bonds.keys().next().copied());
             if let Some(outpoint) = seed {
                 let expiry = bonds.get(&outpoint).copied().flatten();
-                changed |= self.upsert_discovered(address.clone(), Some(outpoint), expiry, now_ts);
+                changed |= self.upsert_discovered_with_override(
+                    address.clone(),
+                    Some(outpoint),
+                    expiry,
+                    now_ts,
+                    startup_refresh(address),
+                );
             }
         }
         changed
@@ -1509,12 +1582,30 @@ impl OfferBook {
     /// Adds a maker learned through discovery. An active candidate rejects a new
     /// bond until its old outpoint is removed. A suppressed maker is admitted
     /// immediately for a new bond, or retried after cooldown for the same bond.
+    #[cfg(test)]
     fn upsert_discovered(
         &mut self,
         address: MakerAddress,
         fidelity_outpoint: Option<OutPoint>,
         fidelity_expiry_height: Option<u32>,
         now_ts: u64,
+    ) -> bool {
+        self.upsert_discovered_with_override(
+            address,
+            fidelity_outpoint,
+            fidelity_expiry_height,
+            now_ts,
+            false,
+        )
+    }
+
+    fn upsert_discovered_with_override(
+        &mut self,
+        address: MakerAddress,
+        fidelity_outpoint: Option<OutPoint>,
+        fidelity_expiry_height: Option<u32>,
+        now_ts: u64,
+        startup_refresh: bool,
     ) -> bool {
         if let Some(existing) = self.makers.iter_mut().find(|m| m.address == address) {
             let mut changed = false;
@@ -1545,7 +1636,15 @@ impl OfferBook {
                     (suppressed.fidelity_outpoint, fidelity_outpoint),
                     (Some(previous), Some(current)) if previous != current
                 );
-                if !bond_changed && now_ts < suppressed.retry_after_ts {
+                // Older releases could suppress a previously good offer solely
+                // because the taker had been stopped for two days. Give it one
+                // immediate recovery probe without lifting a later cooldown.
+                let previously_good = matches!(&suppressed.state, Some(MakerState::Good));
+                if !bond_changed
+                    && !previously_good
+                    && !startup_refresh
+                    && now_ts < suppressed.retry_after_ts
+                {
                     return false;
                 }
                 !bond_changed
@@ -1799,10 +1898,20 @@ impl OfferBook {
         }
     }
 
+    #[cfg(test)]
     fn makers_to_poll(
         &self,
         now_ts: u64,
         live_candidates: &HashMap<MakerAddress, LiveBonds>,
+    ) -> Vec<MakerAddress> {
+        self.makers_to_poll_with_override(now_ts, live_candidates, false)
+    }
+
+    fn makers_to_poll_with_override(
+        &self,
+        now_ts: u64,
+        live_candidates: &HashMap<MakerAddress, LiveBonds>,
+        startup_refresh: bool,
     ) -> Vec<MakerAddress> {
         self.makers
             .iter()
@@ -1816,15 +1925,21 @@ impl OfferBook {
                             .is_some_and(|bonds| bonds.contains_key(&outpoint))
                 }
             })
-            .filter(|m| match m.next_offer_check_ts {
-                Some(next_ts) => now_ts >= next_ts,
-                None => true,
+            .filter(|m| {
+                startup_refresh
+                    || match m.next_offer_check_ts {
+                        Some(next_ts) => now_ts >= next_ts,
+                        None => true,
+                    }
             })
-            .filter(|m| match m.last_offer_update_ts {
-                Some(last_ts) => {
-                    now_ts.saturating_sub(last_ts) >= OFFER_MAX_AGE_BEFORE_REFRESH.as_secs()
-                }
-                None => true,
+            .filter(|m| {
+                startup_refresh
+                    || match m.last_offer_update_ts {
+                        Some(last_ts) => {
+                            now_ts.saturating_sub(last_ts) >= OFFER_MAX_AGE_BEFORE_REFRESH.as_secs()
+                        }
+                        None => true,
+                    }
             })
             .map(|m| m.address.clone())
             .collect()
@@ -3072,6 +3187,59 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn startup_refresh_ignores_saved_freshness_and_backoff() {
+        let now_ts = 170000;
+        let address = addr("startup-refresh");
+        let outpoint = OutPoint::new(Txid::from_slice(&[19; 32]).unwrap(), 0);
+        let mut maker = candidate(address.clone());
+        maker.fidelity_outpoint = Some(outpoint);
+        maker.last_offer_update_ts = Some(now_ts - 1);
+        maker.next_offer_check_ts = Some(now_ts + 3600);
+        let book = OfferBook {
+            makers: vec![maker],
+            ..Default::default()
+        };
+        let live = HashMap::from([(address.clone(), BTreeMap::from([(outpoint, None)]))]);
+
+        assert!(book.makers_to_poll(now_ts, &live).is_empty());
+        assert_eq!(
+            book.makers_to_poll_with_override(now_ts, &live, true),
+            vec![address]
+        );
+        assert!(book
+            .makers_to_poll_with_override(now_ts, &HashMap::new(), true)
+            .is_empty());
+    }
+
+    #[test]
+    fn startup_refresh_retries_saved_cooldown_once() {
+        let now_ts = STALE_MAKER_AGE.as_secs() * 2;
+        let address = addr("startup-cooldown");
+        let bond = OutPoint::new(Txid::from_slice(&[20; 32]).unwrap(), 0);
+        let outpoint = Some(bond);
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), outpoint, Some(500), 0, None);
+        book.mark_failure(&address, UnavailableReason::NoOfferResponse, now_ts);
+        assert_eq!(book.prune_stale_makers(now_ts), 1);
+        let saved = serde_json::to_vec(&book).unwrap();
+        let mut book: OfferBook = serde_json::from_slice(&saved).unwrap();
+
+        assert!(!book.upsert_discovered(address.clone(), outpoint, Some(500), now_ts + 1));
+        assert!(book.upsert_discovered_with_override(
+            address.clone(),
+            outpoint,
+            Some(500),
+            now_ts + 1,
+            true,
+        ));
+        let live = HashMap::from([(address.clone(), BTreeMap::from([(bond, None)]))]);
+        assert_eq!(
+            book.makers_to_poll_with_override(now_ts + 1, &live, true),
+            vec![address]
+        );
+    }
+
+    #[test]
     fn backend_outage_does_not_consume_recovery_probe() {
         let ttl = STALE_MAKER_AGE.as_secs();
         let prune_ts = ttl * 2;
@@ -3163,6 +3331,9 @@ pub(crate) mod tests {
         assert!(book.active_makers(&MakerProtocol::Taproot).is_empty());
         let live_candidates = HashMap::from([(address, BTreeMap::from([(bond, None)]))]);
         assert!(book.makers_to_poll(now_ts, &live_candidates).is_empty());
+        assert!(book
+            .makers_to_poll_with_override(now_ts, &live_candidates, true)
+            .is_empty());
     }
 
     #[test]
@@ -3516,6 +3687,31 @@ pub(crate) mod tests {
         assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), retry_ts));
         book.mark_failure(&address, UnavailableReason::BondUnverified, retry_ts);
         assert_eq!(book.prune_stale_makers(retry_ts), 1);
+    }
+
+    #[test]
+    fn old_good_suppression_gets_one_immediate_recovery_probe() {
+        let ttl = STALE_MAKER_AGE.as_secs();
+        let now_ts = ttl * 3;
+        let address = addr("idle-good");
+        let offer = dummy_offer(&address.to_string());
+        let outpoint = Some(offer.fidelity.bond.outpoint);
+        let mut book = OfferBook::default();
+        book.insert_candidate(address.clone(), outpoint, Some(500), ttl, None);
+        book.mark_success(&address, offer, MakerProtocol::Taproot, Vec::new(), ttl);
+
+        // This is the suppression an older taker wrote before trying the
+        // maker when restarted after a long idle period.
+        assert_eq!(book.prune_stale_makers(now_ts), 1);
+        let saved = serde_json::to_vec(&book).unwrap();
+        let mut book: OfferBook = serde_json::from_slice(&saved).unwrap();
+        assert!(book.upsert_discovered(address.clone(), outpoint, Some(500), now_ts + 1));
+        assert_eq!(book.makers[0].first_seen_ts, Some(now_ts + 1 - ttl));
+
+        // If the recovery probe fails, normal cooldown applies again.
+        book.mark_failure(&address, UnavailableReason::NoOfferResponse, now_ts + 1);
+        assert_eq!(book.prune_stale_makers(now_ts + 1), 1);
+        assert!(!book.upsert_discovered(address, outpoint, Some(500), now_ts + 2));
     }
 
     #[test]
@@ -3911,6 +4107,8 @@ pub(crate) mod tests {
                 join: None,
                 cmd_tx,
                 offerbook: offerbook.clone(),
+                initial_sync_complete: Arc::new(AtomicBool::new(false)),
+                startup_refresh_complete: Arc::new(AtomicBool::new(false)),
             };
 
             assert!(handle.remove_maker(address).unwrap());
@@ -3952,6 +4150,8 @@ pub(crate) mod tests {
             join: None,
             cmd_tx,
             offerbook: offerbook.clone(),
+            initial_sync_complete: Arc::new(AtomicBool::new(false)),
+            startup_refresh_complete: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(handle.remove_maker(address).unwrap());

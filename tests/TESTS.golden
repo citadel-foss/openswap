@@ -245,6 +245,7 @@ openswap taker::offers::tests::mark_failure_keeps_one_unbroken_run
 openswap taker::offers::tests::mark_success_clears_an_unavailable_state
 openswap taker::offers::tests::offerbook_load_removes_invalid_persisted_addresses
 openswap taker::offers::tests::offered_fidelity_outpoint_must_match_discovery
+openswap taker::offers::tests::old_good_suppression_gets_one_immediate_recovery_probe
 openswap taker::offers::tests::only_a_manual_delete_lifts_a_ban
 openswap taker::offers::tests::removal_clears_the_suppression_record_too
 openswap taker::offers::tests::removal_falls_back_when_sync_is_busy_or_stopped
@@ -252,6 +253,8 @@ openswap taker::offers::tests::removal_reports_an_entry_removed_during_the_reque
 openswap taker::offers::tests::same_bond_discovery_cannot_bypass_cooldown
 openswap taker::offers::tests::spent_fidelity_removal_persists_and_can_be_restored_after_reorg
 openswap taker::offers::tests::stale_pruning_is_inclusive_and_uses_the_right_age_anchor
+openswap taker::offers::tests::startup_refresh_ignores_saved_freshness_and_backoff
+openswap taker::offers::tests::startup_refresh_retries_saved_cooldown_once
 openswap taker::offers::tests::suppression_carries_the_failure_run_back
 openswap taker::offers::tests::suppression_state_round_trips_and_missing_map_defaults
 openswap taker::offers::tests::sync_removes_cached_fidelity_without_exact_registry_match
@@ -757,6 +760,7 @@ openswap::integration lightning::swap_in::swap_in_wrong_preimage_fails_both_laye
 openswap::integration lightning::swap_out::swap_out_happy_path
 openswap::integration lightning::swap_out::swap_out_refund_path
 openswap::integration lightning::swap_out::swap_out_settle_rejects_foreign_spend
+openswap::integration offerbook::restart::long_idle_restart_refreshes_cached_and_missing_offers
 openswap::integration offerbook::restart::removal_survives_restart
 openswap::integration offerbook::sync_race::repeated_manual_sync_is_bounded
 openswap::integration recovery::contract_breach::breach_detected_after_watcher_exit

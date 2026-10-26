@@ -6,6 +6,7 @@
 
 use std::{
     borrow::Cow,
+    collections::HashSet,
     net::{Shutdown, TcpStream},
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
@@ -70,6 +71,10 @@ pub fn run_discovery(
     let worker_shutdown = shutdown.clone();
     let worker_registry = Arc::clone(&registry);
     let worker_initial_sync = initial_sync_complete.clone();
+    let expected_relays: HashSet<Arc<str>> = relays
+        .iter()
+        .map(|relay| Arc::from(relay.as_str()))
+        .collect();
     let worker_handle = match std::thread::Builder::new()
         .name("nostr-discovery-processor".to_string())
         .spawn(move || {
@@ -80,6 +85,7 @@ pub fn run_discovery(
                 kind,
                 worker_shutdown,
                 worker_initial_sync,
+                expected_relays,
             );
         }) {
         Ok(handle) => handle,
@@ -185,6 +191,7 @@ fn run_discovery_event_processor(
     kind: Kind,
     shutdown: Arc<AtomicBool>,
     initial_sync_complete: Arc<AtomicBool>,
+    mut pending_relays: HashSet<Arc<str>>,
 ) {
     let mut seen_txid = SeenTxids::new();
 
@@ -228,9 +235,15 @@ fn run_discovery_event_processor(
             }
         };
 
-        if is_eose && !initial_sync_complete.load(Ordering::SeqCst) {
-            initial_sync_complete.store(true, Ordering::SeqCst);
-            log::info!("Initial Nostr discovery sync complete (triggered by {relay_url})");
+        if is_eose && pending_relays.remove(&relay_url) {
+            log::info!(
+                "Initial Nostr snapshot received from {relay_url}; {} relay(s) pending",
+                pending_relays.len()
+            );
+            if pending_relays.is_empty() {
+                initial_sync_complete.store(true, Ordering::SeqCst);
+                log::info!("Initial Nostr discovery sync complete across all relays");
+            }
         }
     }
 }
@@ -856,6 +869,9 @@ mod tests {
         let worker_shutdown = shutdown.clone();
         let worker_registry = registry.clone();
         let worker_initial_sync = initial_sync_complete.clone();
+        let first_relay: Arc<str> = Arc::from("wss://relay.example");
+        let second_relay: Arc<str> = Arc::from("wss://relay-two.example");
+        let expected_relays = HashSet::from([first_relay.clone(), second_relay.clone()]);
 
         let handle = std::thread::spawn(move || {
             run_discovery_event_processor(
@@ -865,26 +881,35 @@ mod tests {
                 kind,
                 worker_shutdown,
                 worker_initial_sync,
+                expected_relays,
             );
         });
 
         assert!(!initial_sync_complete.load(Ordering::SeqCst));
 
         // Send an unrelated EOSE message through the channel — flag should NOT flip
-        let relay_url: Arc<str> = Arc::from("wss://relay.example");
         let unrelated_eose =
             RelayMessage::EndOfStoredEvents(Cow::Owned(SubscriptionId::new("sub1")));
-        event_tx.send((relay_url.clone(), unrelated_eose)).unwrap();
+        event_tx
+            .send((first_relay.clone(), unrelated_eose))
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!initial_sync_complete.load(Ordering::SeqCst));
 
-        // Send matching discovery EOSE message through the channel
-        let expected_sub = format!("market-discovery-{}", relay_url);
+        // One relay's matching EOSE is only a partial snapshot.
+        let expected_sub = format!("market-discovery-{}", first_relay);
         let eose_msg =
             RelayMessage::EndOfStoredEvents(Cow::Owned(SubscriptionId::new(expected_sub)));
-        event_tx.send((relay_url, eose_msg)).unwrap();
+        event_tx.send((first_relay, eose_msg)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!initial_sync_complete.load(Ordering::SeqCst));
 
-        // Wait for worker to process EOSE and flip the flag
+        let expected_sub = format!("market-discovery-{}", second_relay);
+        let eose_msg =
+            RelayMessage::EndOfStoredEvents(Cow::Owned(SubscriptionId::new(expected_sub)));
+        event_tx.send((second_relay, eose_msg)).unwrap();
+
+        // The full snapshot completes after the second relay's EOSE.
         let mut flipped = false;
         for _ in 0..40 {
             if initial_sync_complete.load(Ordering::SeqCst) {

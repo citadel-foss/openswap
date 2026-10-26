@@ -3673,6 +3673,11 @@ impl Taker {
         self.offer_sync_handle.sync_and_wait()
     }
 
+    /// Whether discovery and the first offer refresh both completed.
+    pub fn initial_market_sync_complete(&self) -> bool {
+        self.offer_sync_handle.initial_market_sync_complete()
+    }
+
     /// Returns a clone-able client for triggering offer sync operations from
     /// other threads (e.g. background workers) without requiring access to the
     /// `Taker` itself. Useful for callers that want to run a manual sync off
