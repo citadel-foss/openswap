@@ -2498,6 +2498,9 @@ mod tests {
         let partial = path.with_extension("partial");
         let other = dir.path().join("other.toml");
         for linked in [false, true] {
+            // The writer no longer consumes `*.partial`, so the previous case
+            // would still be sitting there when this one creates a symlink.
+            let _ = fs::remove_file(&partial);
             fs::write(&path, "port = 1\nfuture_key = keep\n").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
             if linked {
