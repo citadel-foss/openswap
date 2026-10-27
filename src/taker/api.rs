@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     convert::TryFrom,
     fs,
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     path::PathBuf,
     sync::{atomic::AtomicBool, mpsc, Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
     thread,
@@ -2913,15 +2913,15 @@ pub(crate) fn connect_to_maker(
 ) -> Result<TcpStream, TakerError> {
     {
         log::debug!("Connecting to maker at {}", address);
-        let timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
+        let timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS).min(read_timeout);
 
         #[cfg(feature = "integration-test")]
-        let socket = TcpStream::connect(address)
+        let socket = connect_clearnet_maker(address, timeout)
             .map_err(|e| TakerError::General(format!("Failed to connect to {}: {}", address, e)))?;
 
         #[cfg(not(feature = "integration-test"))]
         let socket = match connection_type {
-            ConnectionType::Clearnet => TcpStream::connect(address).map_err(|e| {
+            ConnectionType::Clearnet => connect_clearnet_maker(address, timeout).map_err(|e| {
                 TakerError::General(format!("Failed to connect to {}: {}", address, e))
             })?,
             ConnectionType::Tor => {
@@ -2942,6 +2942,30 @@ pub(crate) fn connect_to_maker(
 
         Ok(socket)
     }
+}
+
+/// Use timed TCP connects and share the remaining dial budget across resolved
+/// addresses so an unreachable peer cannot leave a heartbeat dial waiting on TCP.
+fn connect_clearnet_maker(address: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    let started = Instant::now();
+    let mut last_error = std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "no maker address resolved",
+    );
+    for address in address.to_socket_addrs()? {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "maker dial deadline elapsed",
+            ));
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 impl Taker {
@@ -4053,6 +4077,38 @@ mod tests {
     use super::*;
     use serde_cbor::{value::to_value, Value};
     use std::{collections::BTreeMap, net::TcpListener, thread};
+
+    #[test]
+    fn expired_dial_deadline_does_not_open_a_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(connect_to_maker(
+            &listener.local_addr().unwrap().to_string(),
+            ConnectionType::Clearnet,
+            0,
+            Duration::ZERO,
+        )
+        .is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn heartbeat_dial_applies_the_callers_write_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let deadline = Duration::from_millis(300);
+        let stream = connect_to_maker(
+            &listener.local_addr().unwrap().to_string(),
+            ConnectionType::Clearnet,
+            0,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), Some(deadline));
+        assert_eq!(stream.write_timeout().unwrap(), Some(deadline));
+    }
 
     fn compat_hello_reply(reply: Value, needed: &[String]) -> Result<Vec<String>, TakerError> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

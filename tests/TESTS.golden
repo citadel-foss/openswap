@@ -186,6 +186,8 @@ openswap taker::api::tests::compat_taker_cli_merge_refuses_bad_requirements_befo
 openswap taker::api::tests::compat_taker_cli_merge_skips_unchanged_values
 openswap taker::api::tests::compat_taker_requirements_survive_cli_merge_and_bind_pins
 openswap taker::api::tests::compat_v023_maker_hello_cannot_repin_a_new_taker
+openswap taker::api::tests::expired_dial_deadline_does_not_open_a_connection
+openswap taker::api::tests::heartbeat_dial_applies_the_callers_write_deadline
 openswap taker::api::tests::init_taker_config_persists_lightning_settings
 openswap taker::api::tests::taker_config_debug_hides_wallet_password
 openswap taker::background_services::tests::abort_flag_clears_once_the_watcher_answers
