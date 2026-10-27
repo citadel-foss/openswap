@@ -15,7 +15,7 @@ use std::{
         mpsc, Arc, Mutex, RwLock,
     },
     thread::{sleep, Builder, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(feature = "integration-test")]
@@ -96,6 +96,10 @@ const DISCOVERY_WAIT_MAX: Duration = Duration::from_secs(150);
 const DISCOVERY_WAIT_MAX: Duration = Duration::from_secs(10);
 
 const OFFER_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Allow partial relay snapshots to bypass saved retry deadlines during startup,
+/// but restore normal backoff if a relay remains unavailable beyond this window.
+const STARTUP_REFRESH_GRACE: Duration = DISCOVERY_WAIT_MAX.saturating_add(OFFER_SYNC_INTERVAL);
 
 /// Makers without a successful offer download for this long are removed from
 /// the visible offerbook. Their compact suppression record prevents an
@@ -645,6 +649,7 @@ pub struct OfferSyncService {
     /// First completed discovery pass must ignore cached freshness and retry
     /// deadlines, which may have been written by a previous taker process.
     startup_refresh_complete: Arc<AtomicBool>,
+    startup_refresh_started: Instant,
     /// Shared with the handle and the fetch workers so shutdown stops new
     /// fetches; in-flight ones abort via the backend's own flag.
     shutdown: Arc<AtomicBool>,
@@ -821,17 +826,28 @@ impl OfferSyncService {
             blockchain,
             initial_sync_complete,
             startup_refresh_complete: Arc::new(AtomicBool::new(false)),
+            startup_refresh_started: Instant::now(),
             shutdown,
         }
     }
 
+    /// A late complete snapshot still gets its first full refresh. An incomplete
+    /// snapshot only gets the override during the bounded startup grace period.
+    fn startup_refresh_active(&self, discovery_complete: bool) -> bool {
+        !self.startup_refresh_complete.load(Ordering::Relaxed)
+            && (discovery_complete
+                || self.startup_refresh_started.elapsed() < STARTUP_REFRESH_GRACE)
+    }
+
+    /// Discover live fidelity bonds, refresh eligible offers, then prune only
+    /// after every backend check and scheduled worker has completed.
     fn run_once(&self) -> Result<(), TakerError> {
         self.offerbook.is_syncing.store(true, Ordering::Relaxed);
         let _guard = SyncGuard {
             flag: &self.offerbook.is_syncing,
         };
         let discovery_complete = self.initial_sync_complete.load(Ordering::SeqCst);
-        let startup_refresh = !self.startup_refresh_complete.load(Ordering::Relaxed);
+        let startup_refresh = self.startup_refresh_active(discovery_complete);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -921,8 +937,9 @@ impl OfferSyncService {
         // discovered makers one refresh attempt before suppressing stale ones;
         // otherwise a restart after two days hides even a healthy maker for
         // another two days. Wait for the first Nostr snapshot so an empty
-        // per-boot registry cannot trigger this cleanup prematurely.
-        if discovery_complete {
+        // per-boot registry cannot trigger this cleanup prematurely. A failed
+        // backend check or worker must not consume a maker's refresh attempt.
+        if discovery_complete && chain_checks_complete && workers_complete {
             let mut book = lock_debug!(self.offerbook.inner.write())
                 .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
             let pruned = book.prune_stale_makers(now);
@@ -3043,6 +3060,95 @@ pub(crate) mod tests {
             assert_eq!(book.makers[0].address, banned);
             assert!(matches!(book.makers[0].state, MakerState::Banned(_)));
         }
+    }
+
+    #[test]
+    fn startup_backend_failure_does_not_suppress_an_unpolled_maker() {
+        let dir = tempdir().unwrap();
+        let handle = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let address = addr("6115");
+        let offer = dummy_offer(&address.to_string());
+        let outpoint = offer.fidelity.bond.outpoint;
+        let stale_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - STALE_MAKER_AGE.as_secs() * 2;
+        {
+            let mut book = handle.inner.write().unwrap();
+            book.insert_candidate(address.clone(), Some(outpoint), Some(1_000), stale_ts, None);
+            book.mark_success(
+                &address,
+                offer,
+                MakerProtocol::Taproot,
+                Vec::new(),
+                stale_ts,
+            );
+            book.write_to_disk(&handle.path).unwrap();
+        }
+        let registry = FileRegistry::new();
+        registry
+            .insert_fidelity(
+                outpoint.txid,
+                FidelityAnnouncement {
+                    onion: address.to_string(),
+                    expires_at_height: 1_000,
+                },
+            )
+            .unwrap();
+        let config = CoreRpcConfig {
+            url: "127.0.0.1:0".into(),
+            ..CoreRpcConfig::default()
+        };
+        let service = OfferSyncService::new(
+            handle.clone(),
+            registry,
+            0,
+            Arc::new(AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap())),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        service.run_once().unwrap();
+
+        for book in [
+            handle.snapshot().unwrap(),
+            OfferBook::read_from_disk(&handle.path).unwrap(),
+        ] {
+            assert_eq!(book.makers.len(), 1);
+            assert_eq!(book.makers[0].address, address);
+            assert_eq!(book.makers[0].last_offer_update_ts, Some(stale_ts));
+            assert!(book.suppressed_makers.is_empty());
+        }
+        assert!(!service.startup_refresh_complete.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn incomplete_discovery_stops_overriding_backoff_after_startup_grace() {
+        let dir = tempdir().unwrap();
+        let handle = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let config = CoreRpcConfig {
+            url: "127.0.0.1:0".into(),
+            ..CoreRpcConfig::default()
+        };
+        let mut service = OfferSyncService::new(
+            handle,
+            FileRegistry::new(),
+            0,
+            Arc::new(AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(service.startup_refresh_active(false));
+        service.startup_refresh_started = Instant::now() - STARTUP_REFRESH_GRACE;
+        assert!(!service.startup_refresh_active(false));
+        // If the missing relay recovers later, its complete snapshot still gets
+        // one full refresh, including saved addresses with future retry times.
+        assert!(service.startup_refresh_active(true));
+        service
+            .startup_refresh_complete
+            .store(true, Ordering::Relaxed);
+        assert!(!service.startup_refresh_active(true));
     }
 
     #[test]

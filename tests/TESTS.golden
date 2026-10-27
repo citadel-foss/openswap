@@ -122,6 +122,7 @@ openswap maker::server::tests::heartbeat_socket_cannot_switch_swap_id
 openswap maker::server::tests::pending_connections_are_bounded
 openswap maker::server::tests::pending_deadline_stops_slow_reads
 openswap maker::server::tests::preimage_check_stops_on_an_unknown_answer
+openswap maker::server::tests::proxied_backend_idle_budget_outlasts_electrum_read_retries
 openswap maker::server::tests::token_bucket_limits_connection_burst
 openswap maker::taproot_verification::tests::rejects_amount_that_does_not_match_contract_output
 openswap maker::taproot_verification::tests::rejects_duplicate_contract_outpoints
@@ -233,6 +234,7 @@ openswap taker::offers::tests::expired_bond_removes_its_suppression_record
 openswap taker::offers::tests::failed_offerbook_write_preserves_existing_file
 openswap taker::offers::tests::fidelity_candidate_transitions_enforce_one_live_bond
 openswap taker::offers::tests::groups_every_live_bond_claiming_an_address
+openswap taker::offers::tests::incomplete_discovery_stops_overriding_backoff_after_startup_grace
 openswap taker::offers::tests::legacy_candidate_fields_deserialize_and_backfill
 openswap taker::offers::tests::legacy_states_migrate_without_inventing_evidence
 openswap taker::offers::tests::maker_address_try_from_uses_strict_validation
@@ -253,6 +255,7 @@ openswap taker::offers::tests::removal_reports_an_entry_removed_during_the_reque
 openswap taker::offers::tests::same_bond_discovery_cannot_bypass_cooldown
 openswap taker::offers::tests::spent_fidelity_removal_persists_and_can_be_restored_after_reorg
 openswap taker::offers::tests::stale_pruning_is_inclusive_and_uses_the_right_age_anchor
+openswap taker::offers::tests::startup_backend_failure_does_not_suppress_an_unpolled_maker
 openswap taker::offers::tests::startup_refresh_ignores_saved_freshness_and_backoff
 openswap taker::offers::tests::startup_refresh_retries_saved_cooldown_once
 openswap taker::offers::tests::suppression_carries_the_failure_run_back
@@ -698,6 +701,7 @@ openswap::bin/makerd tests::restore_and_backup_read_their_options
 openswap::bin/makerd tests::restore_needs_exactly_one_source
 openswap::bin/makerd tests::seed_commands_take_the_wallet_flag_the_docs_print
 openswap::bin/taker tests::bond_hint_rejects_malformed_values
+openswap::bin/taker tests::fetch_offers_warns_only_when_initial_sync_is_incomplete
 openswap::bin/taker tests::only_market_commands_need_tor
 openswap::bin/taker tests::password_file_excludes_the_argv_password
 openswap::bin/taker tests::restore_needs_exactly_one_source
@@ -873,8 +877,10 @@ openswap::integration rejection::keepalive::completed_swap_state_is_restored_aft
 openswap::integration rejection::keepalive::keepalive_naming_unseen_funding_is_refused
 openswap::integration rejection::keepalive::keepalive_socket_cannot_switch_swap_id
 openswap::integration rejection::keepalive::keepalive_with_mempool_funding_still_refreshes
+openswap::integration rejection::keepalive::legacy_funding_setup_keeps_admission_alive
 openswap::integration rejection::keepalive::slow_taker_is_readmitted_before_funding
 openswap::integration rejection::keepalive::stale_connection_cannot_drive_a_readmitted_swap
+openswap::integration rejection::keepalive::taproot_funding_setup_keeps_admission_alive
 openswap::integration rejection::partial_broadcast::failed_first_send_frees_inputs_and_keeps_keys
 openswap::integration rejection::partial_broadcast::failed_first_send_frees_inputs_and_keeps_keys_taproot
 openswap::integration rejection::partial_broadcast::maker_recovers_partial_broadcast_electrum

@@ -14,6 +14,7 @@ use openswap::{
 };
 use serde_json::{json, to_string_pretty};
 use std::{
+    io::{self, Write},
     path::PathBuf,
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -521,6 +522,23 @@ fn main() -> Result<(), TakerError> {
     }
 }
 
+/// Report incomplete startup checks on stderr without claiming a full sync.
+fn report_offer_sync_status(
+    complete: bool,
+    elapsed: Duration,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> io::Result<()> {
+    if complete {
+        writeln!(stdout, "Offerbook synchronized in {elapsed:.2?}")
+    } else {
+        writeln!(
+            stderr,
+            "Initial market sync is incomplete after {elapsed:.2?}; the offerbook may be missing makers because discovery or offer checks did not complete."
+        )
+    }
+}
+
 /// Parses the arguments and runs one command. Commands that only read the
 /// wallet file run before the backend and Tor are set up.
 fn run() -> Result<(), TakerError> {
@@ -767,14 +785,12 @@ fn run() -> Result<(), TakerError> {
             // Block until the offerbook sync cycle completes (includes Nostr discovery wait).
             taker.sync_offerbook_and_wait()?;
 
-            if taker.initial_market_sync_complete() {
-                println!("Offerbook synchronized in {:.2?}", sync_start.elapsed());
-            } else {
-                eprintln!(
-                    "Initial market sync is incomplete after {:.2?}; the offerbook may be missing makers because discovery or offer checks did not complete.",
-                    sync_start.elapsed()
-                );
-            }
+            report_offer_sync_status(
+                taker.initial_market_sync_complete(),
+                sync_start.elapsed(),
+                &mut io::stdout(),
+                &mut io::stderr(),
+            )?;
 
             let offerbook = taker.fetch_offers()?;
             let makers = offerbook.all_makers();
@@ -1096,6 +1112,26 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(["taker"].iter().chain(args))
+    }
+
+    #[test]
+    fn fetch_offers_warns_only_when_initial_sync_is_incomplete() {
+        for complete in [false, true] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            report_offer_sync_status(complete, Duration::from_secs(1), &mut stdout, &mut stderr)
+                .unwrap();
+            let stdout = String::from_utf8(stdout).unwrap();
+            let stderr = String::from_utf8(stderr).unwrap();
+            if complete {
+                assert!(stdout.contains("Offerbook synchronized"));
+                assert!(stderr.is_empty());
+            } else {
+                assert!(stdout.is_empty());
+                assert!(stderr.contains("Initial market sync is incomplete"));
+                assert!(stderr.contains("may be missing makers"));
+            }
+        }
     }
 
     /// Released builds hash backup passwords 600,000 times, test builds once.

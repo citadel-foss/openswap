@@ -1411,6 +1411,9 @@ impl Taker {
         if !self.watch_service.is_alive() {
             return Err(TakerError::General("watchtower is down".into()));
         }
+        // Revalidating later hops and building funding can block on the backend.
+        // Keep earlier admissions alive throughout that work as well as exchange.
+        let mut route_heartbeat = self.start_route_heartbeat(swap_id);
         // A maker drops a swap left idle since admission; learn that before
         // funding, while failing still costs nothing.
         self.revalidate_admissions()?;
@@ -1433,6 +1436,13 @@ impl Taker {
         self.funding_initialize()?;
 
         #[cfg(feature = "integration-test")]
+        if self.behavior == TakerBehavior::StallAfterFundingInitialization {
+            std::thread::sleep(
+                crate::maker::server::IDLE_CONNECTION_TIMEOUT + Duration::from_secs(10),
+            );
+        }
+
+        #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::PayFromPlannedCoinsBeforeBroadcast {
             self.pay_from_planned_coins()?;
         }
@@ -1443,12 +1453,11 @@ impl Taker {
         // exchange and finalization. Legacy owns an exchange-local heartbeat
         // because spare substitution may change its route; after exchange we
         // reconnect a heartbeat to the settled route for finalization.
-        let mut route_heartbeat = if protocol == ProtocolVersion::Taproot {
-            let swap_id = self.swap_state()?.id.clone();
-            self.start_route_heartbeat(&swap_id)
-        } else {
-            None
-        };
+        if protocol == ProtocolVersion::Legacy {
+            // Legacy starts its exchange heartbeat with the current route so
+            // spare substitution can replace it when needed.
+            drop(route_heartbeat.take());
+        }
 
         match protocol {
             ProtocolVersion::Legacy => {
@@ -3917,6 +3926,9 @@ pub enum TakerBehavior {
     /// Normal behavior.
     #[default]
     Normal,
+    /// Hold funding initialization open past the maker's idle deadline, before
+    /// exchange starts, to model a slow wallet/backend operation.
+    StallAfterFundingInitialization,
     /// Try to broadcast the funding txs a Legacy maker hands out with its
     /// contract-sig request, then stop: the handout must not be broadcastable.
     BroadcastHandedOutFunding,

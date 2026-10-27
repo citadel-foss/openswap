@@ -67,6 +67,10 @@ fn long_idle_restart_refreshes_cached_and_missing_offers(world: &mut World) {
     let restarted = Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0))
         .expect("restart after a long idle period");
     restarted.sync_offerbook_and_wait().unwrap();
+    assert!(
+        restarted.initial_market_sync_complete(),
+        "discovery and the initial offer refresh must complete after restart"
+    );
     let refreshed_book = restarted.fetch_offers().unwrap();
     let refreshed_makers = refreshed_book.all_makers();
     let refreshed = refreshed_makers
@@ -143,6 +147,11 @@ fn removal_survives_restart(world: &mut World) {
     // Give the startup sync time to fail against the dead relay, so a pass
     // here cannot be credited to a sync that merely had not run yet.
     thread::sleep(Duration::from_secs(5));
+    restarted.sync_offerbook_and_wait().unwrap();
+    assert!(
+        !restarted.initial_market_sync_complete(),
+        "an unavailable relay must leave initial market sync incomplete"
+    );
 
     // ---- 4a. The removal holds across the restart ----
     let listed = listed_addresses(&restarted);
