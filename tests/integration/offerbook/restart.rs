@@ -16,6 +16,7 @@
 //!    the relay. A corrupted offerbook.json must stop the taker untouched.
 
 use bitcoin::Amount;
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     taker::{MakerState, Taker},
     wallet::AddressType,
@@ -100,6 +101,53 @@ fn listed_addresses(taker: &Taker) -> Vec<String> {
         .iter()
         .map(|m| m.address.to_string())
         .collect()
+}
+
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
+        start_makers_without_sync(120),
+    ],
+)]
+fn partial_relay_discovery_removes_expired_cached_makers(world: &mut World) {
+    let taker = world.take_taker();
+    taker.inner().sync_offerbook_and_wait().unwrap();
+    let address = world.makers()[0].address();
+    let book = taker.inner().fetch_offers().unwrap();
+    let makers = book.all_makers();
+    let maker = makers
+        .iter()
+        .find(|maker| maker.address.to_string() == address)
+        .expect("maker must be cached before restart");
+    assert_eq!(maker.state, MakerState::Good);
+    let expiry = maker.fidelity_expiry_height.unwrap() as u64;
+    drop(taker);
+
+    // Stop renewal, then expire the actual bond backing the cached Good offer.
+    world.shutdown_makers();
+    let tip = world.bitcoind().client.get_block_count().unwrap();
+    world.mine(expiry.saturating_sub(tip) + 1);
+
+    // The real relay completes its snapshot; the second relay never connects.
+    let config = world
+        .framework()
+        .taker_init_config::<BitcoindBackend>(0)
+        .with_nostr_relays(vec![
+            world.framework().nostr_relay_url.clone(),
+            "ws://127.0.0.1:0".to_string(),
+        ]);
+    let restarted = Taker::init(config).expect("restart with partial relay availability");
+    restarted.sync_offerbook_and_wait().unwrap();
+    assert!(!restarted.initial_market_sync_complete());
+    assert!(
+        !listed_addresses(&restarted).contains(&address),
+        "an expired cached Good maker must be removed despite incomplete discovery"
+    );
+    assert_log!(world; { has "1 relay(s) pending" });
+    drop(restarted);
 }
 
 #[world_test(

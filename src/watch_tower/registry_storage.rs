@@ -48,6 +48,7 @@ struct RegistryData {
     watches: HashMap<OutPoint, WatchRequest>,
     fidelity: HashSet<Fidelity>,
     nostr_cursors: HashMap<String, u64>,
+    discovery_snapshot_received: bool,
 }
 
 /// Registry used by the watcher. Memory-only: watch state is rebuilt from the
@@ -126,6 +127,16 @@ impl FileRegistry {
             });
             data.fidelity.clone()
         })
+    }
+
+    /// Records a matching discovery EOSE from a relay in this process.
+    pub(crate) fn record_discovery_snapshot(&self) -> Result<(), WatcherError> {
+        self.with_data(|data| data.discovery_snapshot_received = true)
+    }
+
+    /// Whether at least one relay supplied its initial discovery snapshot.
+    pub(crate) fn has_discovery_snapshot(&self) -> Result<bool, WatcherError> {
+        self.with_data(|data| data.discovery_snapshot_received)
     }
 
     /// Inserts a new fidelity record.

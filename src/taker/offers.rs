@@ -97,8 +97,8 @@ const DISCOVERY_WAIT_MAX: Duration = Duration::from_secs(10);
 
 const OFFER_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// Allow partial relay snapshots to bypass saved retry deadlines during startup,
-/// but restore normal backoff if a relay remains unavailable beyond this window.
+/// Wait for slower relays before cleaning up makers absent from the snapshots
+/// supplied by the available relays.
 const STARTUP_REFRESH_GRACE: Duration = DISCOVERY_WAIT_MAX.saturating_add(OFFER_SYNC_INTERVAL);
 
 /// Makers without a successful offer download for this long are removed from
@@ -646,10 +646,11 @@ pub struct OfferSyncService {
     blockchain: Arc<AnyBlockchain>,
     /// Set to `true` after every configured Nostr relay sends its initial EOSE.
     initial_sync_complete: Arc<AtomicBool>,
-    /// First completed discovery pass must ignore cached freshness and retry
-    /// deadlines, which may have been written by a previous taker process.
+    /// Reports whether full discovery and the initial offer checks completed.
     startup_refresh_complete: Arc<AtomicBool>,
     startup_refresh_started: Instant,
+    /// Each maker gets one startup poll independent of other makers' failures.
+    startup_polled: HashSet<MakerAddress>,
     /// Shared with the handle and the fetch workers so shutdown stops new
     /// fetches; in-flight ones abort via the backend's own flag.
     shutdown: Arc<AtomicBool>,
@@ -827,40 +828,43 @@ impl OfferSyncService {
             initial_sync_complete,
             startup_refresh_complete: Arc::new(AtomicBool::new(false)),
             startup_refresh_started: Instant::now(),
+            startup_polled: HashSet::new(),
             shutdown,
         }
     }
 
-    /// A late complete snapshot still gets its first full refresh. An incomplete
-    /// snapshot only gets the override during the bounded startup grace period.
-    fn startup_refresh_active(&self, discovery_complete: bool) -> bool {
-        !self.startup_refresh_complete.load(Ordering::Relaxed)
-            && (discovery_complete
-                || self.startup_refresh_started.elapsed() < STARTUP_REFRESH_GRACE)
+    /// An available relay can support cleanup after slower relays have had their
+    /// grace period. A wholly unavailable discovery service cannot erase a cache.
+    fn discovery_allows_cleanup(&self, discovery_complete: bool) -> Result<bool, TakerError> {
+        Ok(discovery_complete
+            || (self.startup_refresh_started.elapsed() >= STARTUP_REFRESH_GRACE
+                && self.registry.has_discovery_snapshot()?))
     }
 
-    /// Discover live fidelity bonds, refresh eligible offers, then prune only
-    /// after every backend check and scheduled worker has completed.
-    fn run_once(&self) -> Result<(), TakerError> {
+    /// Refresh discovered makers and clean up stale entries, preserving any
+    /// maker whose backend check or scheduled offer poll could not complete.
+    fn run_once(&mut self) -> Result<(), TakerError> {
         self.offerbook.is_syncing.store(true, Ordering::Relaxed);
         let _guard = SyncGuard {
             flag: &self.offerbook.is_syncing,
         };
         let discovery_complete = self.initial_sync_complete.load(Ordering::SeqCst);
-        let startup_refresh = self.startup_refresh_active(discovery_complete);
+        let cleanup_ready = self.discovery_allows_cleanup(discovery_complete)?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
 
-        let (height, mut chain_checks_complete) = match self.blockchain.get_block_count() {
+        let (height, height_known) = match self.blockchain.get_block_count() {
             Ok(h) => (h as u32, true),
             Err(e) => {
                 log::warn!("get_block_count failed; skipping fidelity prune this cycle: {e:?}");
                 (0, false)
             }
         };
+        let mut chain_checks_complete = height_known;
+        let mut deferred_makers = HashSet::new();
         let fidelities = self.registry.list_fidelity(height)?;
         let mut registry_candidates = HashSet::new();
         let mut spent_outpoints = Vec::new();
@@ -885,6 +889,7 @@ impl OfferSyncService {
                 Ok(None) => spent_outpoints.push(outpoint),
                 Err(e) => {
                     chain_checks_complete = false;
+                    deferred_makers.insert(address);
                     log::warn!(
                         "Failed to check fidelity output {outpoint}; leaving offerbook unchanged: {e:?}"
                     );
@@ -896,11 +901,14 @@ impl OfferSyncService {
         {
             let mut book = lock_debug!(self.offerbook.inner.write())
                 .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
-            let expired_suppressions = book.prune_expired_suppressions(height);
-            let mut changed = expired_suppressions > 0;
-            // The registry is memory-only and starts empty. Until Nostr's initial
-            // snapshot completes, absence from it does not invalidate a saved offer.
-            if discovery_complete {
+            let mut changed = false;
+            if height_known {
+                changed |= book.prune_expired_makers(height) > 0;
+                changed |= book.prune_expired_suppressions(height) > 0;
+            }
+            // A partial snapshot becomes usable for absence cleanup after the
+            // grace period; no snapshot leaves the saved offerbook intact.
+            if cleanup_ready {
                 let before = book.makers.len();
                 // Only a manual delete lifts a ban, so an expired or spent bond
                 // must not take the ban with it.
@@ -915,8 +923,9 @@ impl OfferSyncService {
             for outpoint in spent_outpoints {
                 changed |= book.remove_fidelity_outpoint(outpoint);
             }
-            changed |= book
-                .apply_live_candidates_with_override(&live_candidates, now, |_| startup_refresh);
+            changed |= book.apply_live_candidates_with_override(&live_candidates, now, |address| {
+                !self.startup_polled.contains(address)
+            });
             if changed {
                 book.write_to_disk(&self.offerbook.path)?;
             }
@@ -924,25 +933,28 @@ impl OfferSyncService {
 
         let to_poll = lock_debug!(self.offerbook.inner.read())
             .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?
-            .makers_to_poll_with_override(now, &live_candidates, startup_refresh);
+            .makers_to_poll_with_override(now, &live_candidates, |address| {
+                !self.startup_polled.contains(address)
+            });
 
+        let scheduled: HashSet<_> = to_poll.iter().cloned().collect();
         let workers_complete = if !to_poll.is_empty() {
             let handles = self.spawn_offer_workers(to_poll)?;
-            Self::join_offer_workers(handles)
+            let polled = Self::join_offer_workers(handles);
+            deferred_makers.extend(scheduled.difference(&polled).cloned());
+            let complete = scheduled.is_subset(&polled);
+            self.startup_polled.extend(polled);
+            complete
         } else {
             true
         };
 
-        // A cached offer may be old only because the taker was stopped. Give
-        // discovered makers one refresh attempt before suppressing stale ones;
-        // otherwise a restart after two days hides even a healthy maker for
-        // another two days. Wait for the first Nostr snapshot so an empty
-        // per-boot registry cannot trigger this cleanup prematurely. A failed
-        // backend check or worker must not consume a maker's refresh attempt.
-        if discovery_complete && chain_checks_complete && workers_complete {
+        // Backend and worker failures protect only the affected makers. Other
+        // stale records must still age out when one bond cannot be checked.
+        if cleanup_ready && height_known {
             let mut book = lock_debug!(self.offerbook.inner.write())
                 .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
-            let pruned = book.prune_stale_makers(now);
+            let pruned = book.prune_stale_makers_except(now, &deferred_makers);
             if pruned > 0 {
                 log::info!("Pruned {pruned} makers not synced for at least two days");
                 book.write_to_disk(&self.offerbook.path)?;
@@ -956,7 +968,12 @@ impl OfferSyncService {
         self.offerbook
             .last_sync_ts
             .store(finished_at, Ordering::Relaxed);
-        if discovery_complete && chain_checks_complete && workers_complete {
+        let offers_verified = !lock_debug!(self.offerbook.inner.read())
+            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?
+            .makers
+            .iter()
+            .any(|maker| maker.backend_retry_pending);
+        if discovery_complete && chain_checks_complete && workers_complete && offers_verified {
             self.startup_refresh_complete.store(true, Ordering::Relaxed);
         }
 
@@ -1094,7 +1111,7 @@ impl OfferSyncService {
     fn spawn_offer_workers(
         &self,
         makers: Vec<MakerAddress>,
-    ) -> Result<Vec<JoinHandle<bool>>, TakerError> {
+    ) -> Result<Vec<JoinHandle<HashSet<MakerAddress>>>, TakerError> {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -1119,6 +1136,7 @@ impl OfferSyncService {
             let handle = match Builder::new()
                 .name(format!("offer-fetch-worker-{i}"))
                 .spawn(move || {
+                    let mut polled = HashSet::new();
                     // Electrum's client is fully synchronous: two workers calling
                     // it at once can wedge it and hang taker shutdown forever.
                     // Each worker gets its own connection.
@@ -1128,20 +1146,20 @@ impl OfferSyncService {
                             log::warn!(
                                 "offer-fetch-worker-{i}: backend connect failed: {e:?}; skipping this cycle"
                             );
-                            return false;
+                            return polled;
                         }
                     };
                     loop {
                         if shutdown.load(Ordering::Relaxed) {
-                            return false;
+                            return polled;
                         }
                         let addr = {
                             let Ok(mut guard) = lock_debug!(queue.lock()) else {
-                                return false;
+                                return polled;
                             };
                             guard.next()
                         };
-                        let Some(addr) = addr else { return true };
+                        let Some(addr) = addr else { return polled };
 
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -1149,7 +1167,7 @@ impl OfferSyncService {
                             .as_secs();
 
                         if Self::fetch_and_record_one(
-                            addr,
+                            addr.clone(),
                             socks_port,
                             &backend,
                             &offerbook,
@@ -1159,8 +1177,9 @@ impl OfferSyncService {
                         )
                         .is_none()
                         {
-                            return false;
+                            return polled;
                         }
+                        polled.insert(addr);
                     }
                 }) {
                 Ok(handle) => handle,
@@ -1180,30 +1199,28 @@ impl OfferSyncService {
     }
 
     /// Joins every fetch worker so partial startup and normal polling share cleanup.
-    fn join_offer_workers(handles: Vec<JoinHandle<bool>>) -> bool {
-        let mut complete = true;
+    fn join_offer_workers(
+        handles: Vec<JoinHandle<HashSet<MakerAddress>>>,
+    ) -> HashSet<MakerAddress> {
+        let mut polled = HashSet::new();
         for handle in handles {
             let thread = handle.thread().clone();
             crate::utill::log_shutdown_join_start("offer_sync", &thread);
             let result = handle.join();
             let outcome = match result {
-                Ok(true) => "ok",
-                Ok(false) => {
-                    complete = false;
-                    "incomplete"
+                Ok(completed) => {
+                    polled.extend(completed);
+                    "ok"
                 }
-                Err(_) => {
-                    complete = false;
-                    "panic"
-                }
+                Err(_) => "panic",
             };
             crate::utill::log_shutdown_join_done("offer_sync", &thread, outcome);
         }
-        complete
+        polled
     }
 
     /// Starts the offerbook service
-    pub fn start(self) -> Result<OfferSyncHandle, TakerError> {
+    pub fn start(mut self) -> Result<OfferSyncHandle, TakerError> {
         let shutdown = self.shutdown.clone();
         let shutdown_flag = shutdown.clone();
         let offerbook = self.offerbook.clone();
@@ -1749,14 +1766,24 @@ impl OfferBook {
 
     /// Removes makers whose last successful offer is at least two days old.
     /// Never-successful makers use their first-seen timestamp as the age anchor.
+    #[cfg(test)]
     fn prune_stale_makers(&mut self, now_ts: u64) -> usize {
+        self.prune_stale_makers_except(now_ts, &HashSet::new())
+    }
+
+    /// Prunes stale records except those deferred by a backend or worker failure.
+    fn prune_stale_makers_except(
+        &mut self,
+        now_ts: u64,
+        deferred: &HashSet<MakerAddress>,
+    ) -> usize {
         let before = self.makers.len();
         let suppressed_makers = &mut self.suppressed_makers;
 
         self.makers.retain(|maker| {
             // Hiding a ban would drop the one record that keeps a proven cheat
             // out of every route.
-            if matches!(maker.state, MakerState::Banned(_)) {
+            if matches!(maker.state, MakerState::Banned(_)) || deferred.contains(&maker.address) {
                 return true;
             }
 
@@ -1782,6 +1809,23 @@ impl OfferBook {
             !stale
         });
 
+        before - self.makers.len()
+    }
+
+    /// Known bond expiry is independent of Nostr snapshot availability. Preserve
+    /// bans even when their bond expires so rediscovery cannot lift the ban.
+    fn prune_expired_makers(&mut self, current_height: u32) -> usize {
+        let before = self.makers.len();
+        self.makers.retain(|maker| {
+            let expiry = maker.fidelity_expiry_height.or_else(|| {
+                maker
+                    .offer
+                    .as_ref()
+                    .map(|offer| offer.fidelity.bond.lock_time.to_consensus_u32())
+            });
+            matches!(maker.state, MakerState::Banned(_))
+                || expiry.is_none_or(|expiry| expiry > current_height)
+        });
         before - self.makers.len()
     }
 
@@ -1921,14 +1965,14 @@ impl OfferBook {
         now_ts: u64,
         live_candidates: &HashMap<MakerAddress, LiveBonds>,
     ) -> Vec<MakerAddress> {
-        self.makers_to_poll_with_override(now_ts, live_candidates, false)
+        self.makers_to_poll_with_override(now_ts, live_candidates, |_| false)
     }
 
     fn makers_to_poll_with_override(
         &self,
         now_ts: u64,
         live_candidates: &HashMap<MakerAddress, LiveBonds>,
-        startup_refresh: bool,
+        startup_refresh: impl Fn(&MakerAddress) -> bool,
     ) -> Vec<MakerAddress> {
         self.makers
             .iter()
@@ -1943,14 +1987,15 @@ impl OfferBook {
                 }
             })
             .filter(|m| {
-                startup_refresh
+                startup_refresh(&m.address)
                     || match m.next_offer_check_ts {
                         Some(next_ts) => now_ts >= next_ts,
                         None => true,
                     }
             })
             .filter(|m| {
-                startup_refresh
+                startup_refresh(&m.address)
+                    || m.backend_retry_pending
                     || match m.last_offer_update_ts {
                         Some(last_ts) => {
                             now_ts.saturating_sub(last_ts) >= OFFER_MAX_AGE_BEFORE_REFRESH.as_secs()
@@ -2281,7 +2326,9 @@ impl fmt::Display for BanReason {
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        wallet::{CoreRPC, CoreRpcConfig},
+        wallet::{
+            blockchain::mock_electrum, BackendConfig, CoreRPC, CoreRpcConfig, ElectrumConfig,
+        },
         watch_tower::utils::FidelityAnnouncement,
     };
     use bitcoin::{
@@ -2586,6 +2633,20 @@ pub(crate) mod tests {
             backend_retry_pending: false,
             next_offer_check_ts: None,
         }
+    }
+
+    fn chain_at_height(height: u64) -> AnyBlockchain {
+        let server = mock_electrum(|method, _| panic!("unexpected call: {}", method));
+        server.set_tip(
+            height,
+            &bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
+        );
+        AnyBlockchain::from_config(&BackendConfig::Electrum(ElectrumConfig {
+            url: server.url,
+            max_retries: 0,
+            ..Default::default()
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -3020,7 +3081,7 @@ pub(crate) mod tests {
         };
         let registry = FileRegistry::new();
         let initial_sync_complete = Arc::new(AtomicBool::new(false));
-        let service = OfferSyncService::new(
+        let mut service = OfferSyncService::new(
             handle.clone(),
             registry.clone(),
             0,
@@ -3100,7 +3161,7 @@ pub(crate) mod tests {
             url: "127.0.0.1:0".into(),
             ..CoreRpcConfig::default()
         };
-        let service = OfferSyncService::new(
+        let mut service = OfferSyncService::new(
             handle.clone(),
             registry,
             0,
@@ -3124,6 +3185,234 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn partial_discovery_cleanup_preserves_bans_and_waits_for_absence_grace() {
+        let dir = tempdir().unwrap();
+        let handle = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let registry = FileRegistry::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expired = addr("6123");
+        let absent = addr("6124");
+        let stale = addr("6125");
+        let banned = addr("6126");
+        {
+            let mut book = handle.inner.write().unwrap();
+            for (address, expiry) in [(&expired, 1), (&absent, 1_000), (&banned, 1)] {
+                let offer = dummy_offer(&address.to_string());
+                book.insert_candidate(
+                    address.clone(),
+                    Some(offer.fidelity.bond.outpoint),
+                    Some(expiry),
+                    now,
+                    None,
+                );
+                book.mark_success(address, offer, MakerProtocol::Taproot, Vec::new(), now);
+            }
+            book.ban(&banned, BanReason::ProvenViolation, now);
+            book.insert_candidate(
+                stale.clone(),
+                None,
+                None,
+                now - STALE_MAKER_AGE.as_secs() * 2,
+                None,
+            );
+            book.makers
+                .iter_mut()
+                .find(|maker| maker.address == stale)
+                .unwrap()
+                .next_offer_check_ts = Some(now + 3600);
+        }
+        let mut service = OfferSyncService::new(
+            handle.clone(),
+            registry.clone(),
+            0,
+            Arc::new(chain_at_height(1)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        service.startup_polled.insert(stale.clone());
+
+        // A known expired bond is removed even before any relay answers.
+        service.run_once().unwrap();
+        let book = handle.snapshot().unwrap();
+        assert!(!book.makers.iter().any(|maker| maker.address == expired));
+        assert_eq!(book.makers.len(), 3);
+
+        // One relay's snapshot is not enough to discard other cached makers
+        // while a second relay is still within its startup grace period.
+        registry.record_discovery_snapshot().unwrap();
+        service.run_once().unwrap();
+        assert_eq!(handle.snapshot().unwrap().makers.len(), 3);
+        service.startup_refresh_started = Instant::now() - STARTUP_REFRESH_GRACE;
+        service.run_once().unwrap();
+        for book in [
+            handle.snapshot().unwrap(),
+            OfferBook::read_from_disk(&handle.path).unwrap(),
+        ] {
+            assert_eq!(book.makers.len(), 1);
+            assert_eq!(book.makers[0].address, banned);
+            assert!(book.suppressed_makers.contains_key(&stale));
+            assert!(book.active_makers(&MakerProtocol::Taproot).is_empty());
+        }
+        assert!(!service.startup_refresh_complete.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn failed_bond_checks_do_not_override_other_makers_retry_delays() {
+        use bitcoin::consensus::encode::serialize_hex;
+        use serde_json::json;
+
+        let healthy_tx =
+            bitcoin::constants::genesis_block(bitcoin::Network::Regtest).txdata[0].clone();
+        let mut failed_tx = healthy_tx.clone();
+        failed_tx.lock_time = LockTime::from_height(2).unwrap();
+        let healthy_outpoint = OutPoint::new(healthy_tx.compute_txid(), 0);
+        let failed_outpoint = OutPoint::new(failed_tx.compute_txid(), 0);
+        let failing = Arc::new(AtomicBool::new(true));
+        let failures = Arc::new(AtomicU64::new(0));
+        let server_failing = failing.clone();
+        let server_failures = failures.clone();
+        let server = mock_electrum(move |method, params| match method {
+            "blockchain.transaction.get" if params[0] == failed_outpoint.txid.to_string() => {
+                if server_failing.load(Ordering::Relaxed) {
+                    server_failures.fetch_add(1, Ordering::Relaxed);
+                    Err(json!({"code": -32603, "message": "temporary fidelity lookup failure"}))
+                } else {
+                    Ok(json!(serialize_hex(&failed_tx)))
+                }
+            }
+            "blockchain.transaction.get" => Ok(json!(serialize_hex(&healthy_tx))),
+            "blockchain.scripthash.listunspent" => Ok(json!([
+                {"tx_hash": healthy_outpoint.txid, "tx_pos": 0, "height": 1, "value": 5_000_000_000u64},
+                {"tx_hash": failed_outpoint.txid, "tx_pos": 0, "height": 1, "value": 5_000_000_000u64}
+            ])),
+            _ => panic!("unexpected call: {}", method),
+        });
+        let chain = AnyBlockchain::from_config(&BackendConfig::Electrum(ElectrumConfig {
+            url: server.url,
+            max_retries: 0,
+            ..Default::default()
+        }))
+        .unwrap();
+        let dir = tempdir().unwrap();
+        let handle = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let registry = FileRegistry::new();
+        let healthy = addr("6120");
+        let deferred = addr("6121");
+        let stale = addr("6122");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        {
+            let mut book = handle.inner.write().unwrap();
+            for (address, outpoint, updated) in [
+                (&healthy, healthy_outpoint, now),
+                (
+                    &deferred,
+                    failed_outpoint,
+                    now - STALE_MAKER_AGE.as_secs() * 2,
+                ),
+            ] {
+                let mut offer = dummy_offer(&address.to_string());
+                offer.fidelity.bond.outpoint = outpoint;
+                book.insert_candidate(address.clone(), Some(outpoint), Some(1_000), updated, None);
+                book.mark_success(address, offer, MakerProtocol::Taproot, Vec::new(), updated);
+                book.makers
+                    .iter_mut()
+                    .find(|maker| &maker.address == address)
+                    .unwrap()
+                    .next_offer_check_ts = Some(now + 3600);
+                registry
+                    .insert_fidelity(
+                        outpoint.txid,
+                        FidelityAnnouncement {
+                            onion: address.to_string(),
+                            expires_at_height: 1_000,
+                        },
+                    )
+                    .unwrap();
+            }
+            book.insert_candidate(
+                stale.clone(),
+                None,
+                None,
+                now - STALE_MAKER_AGE.as_secs() * 2,
+                None,
+            );
+            book.makers
+                .iter_mut()
+                .find(|maker| maker.address == stale)
+                .unwrap()
+                .next_offer_check_ts = Some(now + 3600);
+        }
+        let mut service = OfferSyncService::new(
+            handle.clone(),
+            registry,
+            0,
+            Arc::new(chain),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        service.startup_refresh_started = Instant::now() - STARTUP_REFRESH_GRACE;
+        service
+            .startup_polled
+            .extend([healthy.clone(), stale.clone()]);
+        for _ in 0..2 {
+            service.run_once().unwrap();
+            let book = handle.snapshot().unwrap();
+            let maker = book
+                .makers
+                .iter()
+                .find(|maker| maker.address == healthy)
+                .unwrap();
+            assert_eq!(maker.state, MakerState::Good);
+            assert_eq!(maker.next_offer_check_ts, Some(now + 3600));
+            assert_eq!(maker.last_offer_update_ts, Some(now));
+            assert!(book.makers.iter().any(|maker| maker.address == deferred));
+            assert!(book.suppressed_makers.contains_key(&stale));
+            assert!(!service.startup_polled.contains(&deferred));
+            assert!(!service.startup_refresh_complete.load(Ordering::Relaxed));
+        }
+        assert_eq!(failures.load(Ordering::Relaxed), 2);
+
+        // Only the deferred maker gets its pending first poll when its bond
+        // becomes checkable, even though its saved retry time is in the future.
+        failing.store(false, Ordering::Relaxed);
+        service.run_once().unwrap();
+        assert!(service.startup_polled.contains(&deferred));
+        service.run_once().unwrap();
+        let book = handle.snapshot().unwrap();
+        assert!(book.suppressed_makers.contains_key(&deferred));
+        assert_eq!(
+            book.makers
+                .iter()
+                .find(|maker| maker.address == healthy)
+                .unwrap()
+                .next_offer_check_ts,
+            Some(now + 3600)
+        );
+    }
+
+    #[test]
+    fn backend_retry_respects_its_deadline_with_a_recent_cached_offer() {
+        let now = 170_000;
+        let address = addr("6127");
+        let mut maker = candidate(address.clone());
+        maker.last_offer_update_ts = Some(now);
+        maker.backend_retry_pending = true;
+        maker.next_offer_check_ts = Some(now + 1);
+        let book = OfferBook {
+            makers: vec![maker],
+            ..Default::default()
+        };
+        assert!(book.makers_to_poll(now, &HashMap::new()).is_empty());
+        assert_eq!(book.makers_to_poll(now + 1, &HashMap::new()), vec![address]);
+    }
+
+    #[test]
     fn incomplete_discovery_stops_overriding_backoff_after_startup_grace() {
         let dir = tempdir().unwrap();
         let handle = OfferBookHandle::load_or_create(dir.path()).unwrap();
@@ -3139,16 +3428,40 @@ pub(crate) mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
-        assert!(service.startup_refresh_active(false));
+        let now = 170_000;
+        let address = addr("6116");
+        let mut maker = candidate(address.clone());
+        maker.last_offer_update_ts = Some(now);
+        maker.next_offer_check_ts = Some(now + 3600);
+        let mut book = OfferBook {
+            makers: vec![maker],
+            ..Default::default()
+        };
+        assert_eq!(
+            book.makers_to_poll_with_override(now, &HashMap::new(), |address| {
+                !service.startup_polled.contains(address)
+            }),
+            vec![address.clone()]
+        );
+        service.startup_polled.insert(address);
         service.startup_refresh_started = Instant::now() - STARTUP_REFRESH_GRACE;
-        assert!(!service.startup_refresh_active(false));
-        // If the missing relay recovers later, its complete snapshot still gets
-        // one full refresh, including saved addresses with future retry times.
-        assert!(service.startup_refresh_active(true));
-        service
-            .startup_refresh_complete
-            .store(true, Ordering::Relaxed);
-        assert!(!service.startup_refresh_active(true));
+        assert!(book
+            .makers_to_poll_with_override(now, &HashMap::new(), |address| {
+                !service.startup_polled.contains(address)
+            })
+            .is_empty());
+        // A maker learned later still gets its own initial poll without
+        // overriding the retry deadline of the already-polled maker.
+        let late_address = addr("6117");
+        let mut late = candidate(late_address.clone());
+        late.next_offer_check_ts = Some(now + 3600);
+        book.makers.push(late);
+        assert_eq!(
+            book.makers_to_poll_with_override(now, &HashMap::new(), |address| {
+                !service.startup_polled.contains(address)
+            }),
+            vec![late_address]
+        );
     }
 
     #[test]
@@ -3309,11 +3622,11 @@ pub(crate) mod tests {
 
         assert!(book.makers_to_poll(now_ts, &live).is_empty());
         assert_eq!(
-            book.makers_to_poll_with_override(now_ts, &live, true),
+            book.makers_to_poll_with_override(now_ts, &live, |_| true),
             vec![address]
         );
         assert!(book
-            .makers_to_poll_with_override(now_ts, &HashMap::new(), true)
+            .makers_to_poll_with_override(now_ts, &HashMap::new(), |_| true)
             .is_empty());
     }
 
@@ -3340,7 +3653,7 @@ pub(crate) mod tests {
         ));
         let live = HashMap::from([(address.clone(), BTreeMap::from([(bond, None)]))]);
         assert_eq!(
-            book.makers_to_poll_with_override(now_ts + 1, &live, true),
+            book.makers_to_poll_with_override(now_ts + 1, &live, |_| true),
             vec![address]
         );
     }
@@ -3438,7 +3751,7 @@ pub(crate) mod tests {
         let live_candidates = HashMap::from([(address, BTreeMap::from([(bond, None)]))]);
         assert!(book.makers_to_poll(now_ts, &live_candidates).is_empty());
         assert!(book
-            .makers_to_poll_with_override(now_ts, &live_candidates, true)
+            .makers_to_poll_with_override(now_ts, &live_candidates, |_| true)
             .is_empty());
     }
 

@@ -226,6 +226,7 @@ openswap taker::offers::tests::a_violation_clears_the_suppression_record
 openswap taker::offers::tests::an_unpriceable_offer_does_not_ban_its_maker
 openswap taker::offers::tests::backend_down_leaves_maker_state_unchanged
 openswap taker::offers::tests::backend_outage_does_not_consume_recovery_probe
+openswap taker::offers::tests::backend_retry_respects_its_deadline_with_a_recent_cached_offer
 openswap taker::offers::tests::bond_failures_split_into_recoverable_and_proven
 openswap taker::offers::tests::changed_bond_or_manual_poll_bypasses_suppression
 openswap taker::offers::tests::compat_offerbook_ignores_future_fields_but_refuses_unknown_states
@@ -233,6 +234,7 @@ openswap taker::offers::tests::compat_offerbook_round_trips_all_states_through_v
 openswap taker::offers::tests::discovery_replaces_spent_bond_metadata
 openswap taker::offers::tests::draining_sync_requests_preserves_polls_and_removals
 openswap taker::offers::tests::expired_bond_removes_its_suppression_record
+openswap taker::offers::tests::failed_bond_checks_do_not_override_other_makers_retry_delays
 openswap taker::offers::tests::failed_offerbook_write_preserves_existing_file
 openswap taker::offers::tests::fidelity_candidate_transitions_enforce_one_live_bond
 openswap taker::offers::tests::groups_every_live_bond_claiming_an_address
@@ -251,6 +253,7 @@ openswap taker::offers::tests::offerbook_load_removes_invalid_persisted_addresse
 openswap taker::offers::tests::offered_fidelity_outpoint_must_match_discovery
 openswap taker::offers::tests::old_good_suppression_gets_one_immediate_recovery_probe
 openswap taker::offers::tests::only_a_manual_delete_lifts_a_ban
+openswap taker::offers::tests::partial_discovery_cleanup_preserves_bans_and_waits_for_absence_grace
 openswap taker::offers::tests::removal_clears_the_suppression_record_too
 openswap taker::offers::tests::removal_falls_back_when_sync_is_busy_or_stopped
 openswap taker::offers::tests::removal_reports_an_entry_removed_during_the_request
@@ -767,6 +770,7 @@ openswap::integration lightning::swap_out::swap_out_happy_path
 openswap::integration lightning::swap_out::swap_out_refund_path
 openswap::integration lightning::swap_out::swap_out_settle_rejects_foreign_spend
 openswap::integration offerbook::restart::long_idle_restart_refreshes_cached_and_missing_offers
+openswap::integration offerbook::restart::partial_relay_discovery_removes_expired_cached_makers
 openswap::integration offerbook::restart::removal_survives_restart
 openswap::integration offerbook::sync_race::repeated_manual_sync_is_bounded
 openswap::integration recovery::contract_breach::breach_detected_after_watcher_exit

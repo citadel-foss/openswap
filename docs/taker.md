@@ -299,7 +299,7 @@ $ taker fetch-offers
 
 This blocks until the offerbook sync cycle completes (including Nostr-based maker discovery), then prints each discovered maker with its state, offer terms, and fidelity bond details, followed by a summary line. On each taker start, it refreshes offers from all makers found on the configured relays, including addresses already in the local offerbook. If a relay or blockchain backend does not respond, the command warns that the displayed offerbook may be incomplete.
 
-An unavailable relay does not keep automatic polls bypassing retry delays indefinitely: normal delays resume after a startup grace period. If the relay later completes discovery, the full maker snapshot still receives its initial refresh.
+Each discovered maker receives one initial poll before its normal freshness and retry delays apply. A failed bond lookup or unavailable relay does not keep overriding delays for other makers. Known expired bonds are removed even if discovery is incomplete. If at least one relay supplies its snapshot, cleanup of absent and stale makers can proceed after the startup grace period; the incomplete-discovery warning remains until every configured relay responds.
 
 ```bash
 Waiting for offerbook synchronization to complete…

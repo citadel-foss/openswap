@@ -598,6 +598,7 @@ fn handle_relay_message(
         RelayMessage::EndOfStoredEvents(sub_id) => {
             let expected_sub_id = format!("market-discovery-{}", relay_url);
             if sub_id.as_str() == expected_sub_id {
+                registry.record_discovery_snapshot()?;
                 log::info!("EOSE received for subscription {sub_id} via {relay_url}");
                 return Ok(true);
             } else {
@@ -895,13 +896,20 @@ mod tests {
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!initial_sync_complete.load(Ordering::SeqCst));
+        assert!(!registry.has_discovery_snapshot().unwrap());
 
         // One relay's matching EOSE is only a partial snapshot.
         let expected_sub = format!("market-discovery-{}", first_relay);
         let eose_msg =
             RelayMessage::EndOfStoredEvents(Cow::Owned(SubscriptionId::new(expected_sub)));
         event_tx.send((first_relay, eose_msg)).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..40 {
+            if registry.has_discovery_snapshot().unwrap() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(registry.has_discovery_snapshot().unwrap());
         assert!(!initial_sync_complete.load(Ordering::SeqCst));
 
         let expected_sub = format!("market-discovery-{}", second_relay);
