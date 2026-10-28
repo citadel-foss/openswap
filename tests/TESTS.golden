@@ -267,6 +267,7 @@ openswap taker::offers::tests::suppression_carries_the_failure_run_back
 openswap taker::offers::tests::suppression_state_round_trips_and_missing_map_defaults
 openswap taker::offers::tests::sync_removes_cached_fidelity_without_exact_registry_match
 openswap taker::offers::tests::timed_sync_uses_current_book_when_ack_is_missing
+openswap taker::offers::tests::unresolved_discovery_preserves_cached_maker_after_cleanup_grace
 openswap taker::payment::tests::confiscatory_fee_schedule_is_rejected
 openswap taker::payment::tests::dust_floor_scales_with_the_declared_tx_count
 openswap taker::payment::tests::hop_solve_round_trips_exactly
@@ -620,12 +621,15 @@ openswap wallet::swapcoin::timelock_spend_tests::taproot_key_path_spend_is_not_o
 openswap wallet::swapcoin::timelock_spend_tests::taproot_timelock_recovery_is_ours
 openswap wallet::swapcoin::timelock_spend_tests::timelock_witness_on_another_outpoint_is_not_ours
 openswap watch_tower::nostr::tests::closing_the_relay_socket_stops_a_parked_read
+openswap watch_tower::nostr::tests::confirmation_lookup_failure_blocks_market_sync_until_retry_succeeds
 openswap watch_tower::nostr::tests::duplicate_event_across_relays_skips_blockchain_and_advances_cursor
 openswap watch_tower::nostr::tests::eose_message_returns_true
 openswap watch_tower::nostr::tests::future_dated_event_never_moves_the_cursor
 openswap watch_tower::nostr::tests::garbage_frame_is_skipped_not_fatal
+openswap watch_tower::nostr::tests::output_lookup_failure_blocks_market_sync_until_retry_succeeds
 openswap watch_tower::nostr::tests::shutdown_stops_discovery_without_waiting_for_a_silent_relay
 openswap watch_tower::nostr::tests::tampered_event_is_rejected_before_claiming_txid
+openswap watch_tower::nostr::tests::transaction_lookup_failure_blocks_market_sync_until_retry_succeeds
 openswap watch_tower::nostr::tests::worker_handles_eose_and_exits_on_disconnect
 openswap watch_tower::registry_storage::tests::test_fidelity_insert_and_remove
 openswap watch_tower::registry_storage::tests::test_fidelity_rejects_invalid_address

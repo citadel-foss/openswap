@@ -49,6 +49,7 @@ struct RegistryData {
     fidelity: HashSet<Fidelity>,
     nostr_cursors: HashMap<String, u64>,
     discovery_snapshot_received: bool,
+    pending_discovery: HashSet<Txid>,
 }
 
 /// Registry used by the watcher. Memory-only: watch state is rebuilt from the
@@ -137,6 +138,25 @@ impl FileRegistry {
     /// Whether at least one relay supplied its initial discovery snapshot.
     pub(crate) fn has_discovery_snapshot(&self) -> Result<bool, WatcherError> {
         self.with_data(|data| data.discovery_snapshot_received)
+    }
+
+    /// Keeps backend failures distinct from receipt of a relay snapshot.
+    pub(crate) fn defer_discovery_lookup(&self, txid: Txid) -> Result<(), WatcherError> {
+        self.with_data(|data| {
+            data.pending_discovery.insert(txid);
+        })
+    }
+
+    /// Clears a lookup once the backend supplies a conclusive answer.
+    pub(crate) fn resolve_discovery_lookup(&self, txid: &Txid) -> Result<(), WatcherError> {
+        self.with_data(|data| {
+            data.pending_discovery.remove(txid);
+        })
+    }
+
+    /// Transaction IDs whose announcements could not yet be checked.
+    pub(crate) fn pending_discovery_txids(&self) -> Result<HashSet<Txid>, WatcherError> {
+        self.with_data(|data| data.pending_discovery.clone())
     }
 
     /// Inserts a new fidelity record.

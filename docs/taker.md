@@ -301,6 +301,8 @@ This blocks until the offerbook sync cycle completes (including Nostr-based make
 
 Each discovered maker receives one initial poll before its normal freshness and retry delays apply. A failed bond lookup or unavailable relay does not keep overriding delays for other makers. Known expired bonds are removed even if discovery is incomplete. If at least one relay supplies its snapshot, cleanup of absent and stale makers can proceed after the startup grace period; the incomplete-discovery warning remains until every configured relay responds.
 
+Announcements that cannot be checked because of a blockchain backend error are retained and retried automatically. Receiving the relay snapshot does not mark synchronization complete while these lookups remain unresolved. Cached makers awaiting those checks are preserved until the backend supplies a conclusive answer or the announcement expires.
+
 ```bash
 Waiting for offerbook synchronization to complete…
 Offerbook synchronized in <elapsed>

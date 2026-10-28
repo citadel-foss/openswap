@@ -6,16 +6,17 @@
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{Shutdown, TcpStream},
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 
-use bitcoin::Network;
+use bitcoin::{Network, Txid};
 use nostr::{
     event::Kind,
     filter::Filter,
@@ -41,8 +42,98 @@ use crate::{
 /// clock skew only; anything further would poison the saved cursor.
 const MAX_FUTURE_SKEW_SECS: u64 = 300;
 
-/// Maximum queued Nostr discovery events before relay readers apply backpressure.
+/// Bound both queued events and retained backend failures. A full retry set
+/// pauses consumption so the relay readers apply backpressure as well.
 const DISCOVERY_EVENT_BUFFER_SIZE: usize = 1024;
+
+/// Retry failed backend lookups without waiting for a relay to replay its events.
+#[cfg(not(test))]
+const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+struct PendingDiscoveryLookup {
+    relay_url: Arc<str>,
+    event: nostr::Event,
+    retry_at: Instant,
+}
+
+/// Completed txids are deduplicated; backend failures retain the signed event
+/// until it can be checked or its announcement expires.
+struct DiscoveryLookups {
+    seen: SeenTxids,
+    pending: HashMap<Txid, PendingDiscoveryLookup>,
+}
+
+impl DiscoveryLookups {
+    fn new() -> Self {
+        Self {
+            seen: SeenTxids::new(),
+            pending: HashMap::new(),
+        }
+    }
+
+    fn defer(
+        &mut self,
+        txid: Txid,
+        relay_url: &str,
+        event: nostr::Event,
+        registry: &FileRegistry,
+    ) -> Result<(), WatcherError> {
+        self.seen.release(&txid);
+        registry.defer_discovery_lookup(txid)?;
+        self.pending.insert(
+            txid,
+            PendingDiscoveryLookup {
+                relay_url: Arc::from(relay_url),
+                event,
+                retry_at: Instant::now() + DISCOVERY_RETRY_INTERVAL,
+            },
+        );
+        Ok(())
+    }
+
+    fn resolve(&mut self, txid: &Txid, registry: &FileRegistry) -> Result<(), WatcherError> {
+        registry.resolve_discovery_lookup(txid)?;
+        self.pending.remove(txid);
+        Ok(())
+    }
+
+    fn retry_due(
+        &mut self,
+        registry: &FileRegistry,
+    ) -> Result<Option<(Arc<str>, RelayMessage<'static>)>, WatcherError> {
+        let now = Timestamp::now().as_secs();
+        let expired: Vec<_> = self
+            .pending
+            .iter()
+            .filter_map(|(txid, lookup)| {
+                (lookup.event.is_expired()
+                    || now.saturating_sub(lookup.event.created_at.as_secs()) > EXPIRATION_SECS)
+                    .then_some(*txid)
+            })
+            .collect();
+        for txid in expired {
+            self.resolve(&txid, registry)?;
+        }
+        Ok(self
+            .pending
+            .values()
+            .find(|lookup| lookup.retry_at <= Instant::now())
+            .map(|lookup| {
+                (
+                    lookup.relay_url.clone(),
+                    RelayMessage::Event {
+                        subscription_id: Cow::Owned(SubscriptionId::new(format!(
+                            "market-discovery-{}",
+                            lookup.relay_url
+                        ))),
+                        event: Cow::Owned(lookup.event.clone()),
+                    },
+                )
+            }))
+    }
+}
 
 /// Runs the main discovery routine for maker's fidelity bonds by subscribing to network-specific Nostr events.
 /// Blocks until every relay session exits (normally at shutdown).
@@ -193,13 +284,46 @@ fn run_discovery_event_processor(
     initial_sync_complete: Arc<AtomicBool>,
     mut pending_relays: HashSet<Arc<str>>,
 ) {
-    let mut seen_txid = SeenTxids::new();
+    let mut lookups = DiscoveryLookups::new();
+    let mut retried_last = false;
 
     while !shutdown.load(Ordering::SeqCst) {
-        let (relay_url, msg) = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(item) => item,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        let retry = match lookups.retry_due(&registry) {
+            Ok(retry) => retry,
+            Err(e) => {
+                log::warn!("Failed to read pending discovery lookups: {e}");
+                initial_sync_complete.store(false, Ordering::SeqCst);
+                break;
+            }
+        };
+        let next = if lookups.pending.len() >= DISCOVERY_EVENT_BUFFER_SIZE {
+            match retry {
+                Some(item) => Some(item),
+                None => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    None
+                }
+            }
+        } else {
+            match (retry, retried_last) {
+                (Some(item), false) => {
+                    retried_last = true;
+                    Some(item)
+                }
+                _ => {
+                    retried_last = false;
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(item) => Some(item),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            }
+        };
+
+        let Some((relay_url, msg)) = next else {
+            update_discovery_completion(&pending_relays, &lookups, &initial_sync_complete);
+            continue;
         };
 
         let registry_clone = Arc::clone(&registry);
@@ -210,7 +334,7 @@ fn run_discovery_event_processor(
                 &blockchain,
                 &relay_url,
                 kind,
-                &mut seen_txid,
+                &mut lookups,
             )
         }));
 
@@ -240,11 +364,19 @@ fn run_discovery_event_processor(
                 "Initial Nostr snapshot received from {relay_url}; {} relay(s) pending",
                 pending_relays.len()
             );
-            if pending_relays.is_empty() {
-                initial_sync_complete.store(true, Ordering::SeqCst);
-                log::info!("Initial Nostr discovery sync complete across all relays");
-            }
         }
+        update_discovery_completion(&pending_relays, &lookups, &initial_sync_complete);
+    }
+}
+
+fn update_discovery_completion(
+    pending_relays: &HashSet<Arc<str>>,
+    lookups: &DiscoveryLookups,
+    initial_sync_complete: &AtomicBool,
+) {
+    let complete = pending_relays.is_empty() && lookups.pending.is_empty();
+    if !initial_sync_complete.swap(complete, Ordering::SeqCst) && complete {
+        log::info!("Initial Nostr discovery sync complete across all relays and backend lookups");
     }
 }
 
@@ -440,7 +572,7 @@ fn handle_relay_message(
     blockchain: &AnyBlockchain,
     relay_url: &str,
     kind: Kind,
-    seen_txid: &mut SeenTxids,
+    lookups: &mut DiscoveryLookups,
 ) -> Result<bool, WatcherError> {
     match msg {
         RelayMessage::Event { event, .. } => {
@@ -513,7 +645,14 @@ fn handle_relay_message(
 
             // Claim the txid before any RPC work, so duplicate events across
             // relays don't repeat the fetch and validation.
-            if !seen_txid.claim(txid) {
+            if lookups
+                .pending
+                .get(&txid)
+                .is_some_and(|lookup| lookup.retry_at > Instant::now())
+            {
+                return Ok(false);
+            }
+            if !lookups.seen.claim(txid) {
                 log::info!("Skipping already-seen txid {txid} via {relay_url}");
                 registry.save_nostr_cursor(relay_url, cursor)?;
                 return Ok(false);
@@ -523,8 +662,12 @@ fn handle_relay_message(
                 Ok(tx) => tx,
                 Err(e) => {
                     log::warn!("Failed to fetch raw tx {txid:?} via {relay_url}: {e}");
-                    // A transient fetch failure leaves the txid eligible for retry.
-                    seen_txid.release(&txid);
+                    if blockchain.is_tx_unknown(&txid).unwrap_or(false) {
+                        lookups.seen.release(&txid);
+                        lookups.resolve(&txid, &registry)?;
+                        return Ok(false);
+                    }
+                    lookups.defer(txid, relay_url, event.into_owned(), &registry)?;
                     return Ok(false);
                 }
             };
@@ -532,14 +675,15 @@ fn handle_relay_message(
                 Ok(Some(height)) => height,
                 Ok(None) => {
                     log::debug!("Ignoring unconfirmed fidelity transaction {txid} via {relay_url}");
-                    seen_txid.release(&txid);
+                    lookups.seen.release(&txid);
+                    lookups.resolve(&txid, &registry)?;
                     return Ok(false);
                 }
                 Err(e) => {
                     log::warn!(
                         "Failed to fetch confirmation height for {txid} via {relay_url}: {e}"
                     );
-                    seen_txid.release(&txid);
+                    lookups.defer(txid, relay_url, event.into_owned(), &registry)?;
                     return Ok(false);
                 }
             };
@@ -548,7 +692,8 @@ fn handle_relay_message(
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     log::debug!("Ignoring spent fidelity output {txid}:{vout} via {relay_url}");
-                    seen_txid.insert(txid);
+                    lookups.seen.insert(txid);
+                    lookups.resolve(&txid, &registry)?;
                     registry.save_nostr_cursor(relay_url, cursor)?;
                     return Ok(false);
                 }
@@ -556,14 +701,14 @@ fn handle_relay_message(
                     log::warn!(
                         "Failed to fetch fidelity output {txid}:{vout} via {relay_url}: {e}"
                     );
-                    seen_txid.release(&txid);
+                    lookups.defer(txid, relay_url, event.into_owned(), &registry)?;
                     return Ok(false);
                 }
             }
 
             // Once chain state is known, remember even structurally invalid transactions so a
             // relay replay cannot force validation work repeatedly.
-            seen_txid.insert(txid);
+            lookups.seen.insert(txid);
             log::info!("Added txid to Nostr discovery cache: {txid}");
 
             match process_fidelity(&tx, confirmation_height) {
@@ -593,6 +738,7 @@ fn handle_relay_message(
                 }
             }
             registry.save_nostr_cursor(relay_url, cursor)?;
+            lookups.resolve(&txid, &registry)?;
         }
 
         RelayMessage::EndOfStoredEvents(sub_id) => {
@@ -616,13 +762,184 @@ fn handle_relay_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::{BackendConfig, CoreRpcConfig};
+    use crate::{
+        taker::offers::{OfferBookHandle, OfferSyncService},
+        wallet::{
+            blockchain::mock_electrum, BackendConfig, CoreRpcConfig, ElectrumConfig,
+            MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
+        },
+    };
     use bitcoin::{hashes::Hash, Txid};
     use nostr::{
         event::{EventBuilder, Tag, TagStandard},
         key::Keys,
     };
     use std::{net::TcpListener, str::FromStr, time::Duration};
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(Instant::now() < deadline, "discovery condition timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn discovery_backend_failure_recovers(failing_method: &'static str) {
+        use bitcoin::{
+            absolute::LockTime, consensus::encode::serialize_hex, Amount, ScriptBuf, Sequence,
+            TxOut,
+        };
+        use serde_json::json;
+
+        #[cfg(not(feature = "integration-test"))]
+        let address = "aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaea37ead";
+        #[cfg(feature = "integration-test")]
+        let address = "127.0.0.1:6128";
+        let payload = format!("{address}#{}", 1 + MIN_FIDELITY_TIMELOCK);
+        let mut op_return = vec![0x6a, payload.len() as u8];
+        op_return.extend_from_slice(payload.as_bytes());
+        let mut transaction = bitcoin::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        transaction.lock_time = LockTime::from_height(1).unwrap();
+        transaction.input[0].sequence = Sequence::ZERO;
+        transaction.output = vec![
+            TxOut {
+                value: Amount::from_sat(MIN_FIDELITY_BOND_AMOUNT_SATS),
+                script_pubkey: ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::all_zeros()),
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(op_return),
+            },
+        ];
+        assert!(process_fidelity(&transaction, 1).is_some());
+        let txid = transaction.compute_txid();
+        let failing = Arc::new(AtomicBool::new(true));
+        let server_failing = failing.clone();
+        let server = mock_electrum(move |method, _| {
+            if method == failing_method && server_failing.load(Ordering::SeqCst) {
+                return Err(json!({"code": -32603, "message": "temporary backend failure"}));
+            }
+            match method {
+                "blockchain.transaction.get" => Ok(json!(serialize_hex(&transaction))),
+                "blockchain.scripthash.get_history" => Ok(json!([{"tx_hash": txid, "height": 1}])),
+                "blockchain.scripthash.listunspent" => Ok(json!([{
+                    "tx_hash": txid, "tx_pos": 0, "height": 1,
+                    "value": MIN_FIDELITY_BOND_AMOUNT_SATS
+                }])),
+                _ => panic!("unexpected method: {}", method),
+            }
+        });
+        let config = BackendConfig::Electrum(ElectrumConfig {
+            url: server.url,
+            max_retries: 0,
+            ..Default::default()
+        });
+        let blockchain = AnyBlockchain::from_config(&config).unwrap();
+        let registry = Arc::new(FileRegistry::new());
+        let initial_sync_complete = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let relay: Arc<str> = Arc::from("wss://relay.example");
+        let kind = Kind::Custom(37778);
+        let (event_tx, event_rx) = crossbeam_channel::bounded(DISCOVERY_EVENT_BUFFER_SIZE);
+        let (worker_registry, worker_sync, worker_shutdown, worker_relay) = (
+            registry.clone(),
+            initial_sync_complete.clone(),
+            shutdown.clone(),
+            relay.clone(),
+        );
+        let worker = std::thread::spawn(move || {
+            run_discovery_event_processor(
+                event_rx,
+                blockchain,
+                worker_registry,
+                kind,
+                worker_shutdown,
+                worker_sync,
+                HashSet::from([worker_relay]),
+            )
+        });
+        let keys = Keys::generate();
+        let event = EventBuilder::new(kind, format!("{txid}:0"))
+            .tag(Tag::from_standardized(TagStandard::Expiration(
+                Timestamp::from_secs(Timestamp::now().as_secs() + 60),
+            )))
+            .build(keys.public_key)
+            .sign_with_keys(&keys)
+            .unwrap();
+        event_tx
+            .send((
+                relay.clone(),
+                RelayMessage::Event {
+                    subscription_id: Cow::Owned(SubscriptionId::new("discovery")),
+                    event: Cow::Owned(event),
+                },
+            ))
+            .unwrap();
+        event_tx
+            .send((
+                relay.clone(),
+                RelayMessage::EndOfStoredEvents(Cow::Owned(SubscriptionId::new(format!(
+                    "market-discovery-{relay}"
+                )))),
+            ))
+            .unwrap();
+        wait_until(|| registry.has_discovery_snapshot().unwrap());
+        assert!(registry.pending_discovery_txids().unwrap().contains(&txid));
+        assert!(registry.list_fidelity(0).unwrap().is_empty());
+        assert!(!initial_sync_complete.load(Ordering::SeqCst));
+
+        // Even an otherwise successful offer-sync cycle with an empty registry
+        // must not report that the announced maker was synchronized.
+        let dir = tempfile::tempdir().unwrap();
+        let book = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let mut sync = OfferSyncService::new(
+            book.clone(),
+            (*registry).clone(),
+            0,
+            Arc::new(AnyBlockchain::from_config(&config).unwrap()),
+            initial_sync_complete.clone(),
+            shutdown.clone(),
+        )
+        .start()
+        .unwrap();
+        wait_until(|| book.last_sync_ts() > 0);
+        assert!(!sync.initial_market_sync_complete());
+
+        // No second event or EOSE is sent. The retained lookup retries itself.
+        failing.store(false, Ordering::SeqCst);
+        wait_until(|| initial_sync_complete.load(Ordering::SeqCst));
+        assert!(registry.pending_discovery_txids().unwrap().is_empty());
+        assert!(registry
+            .list_fidelity(0)
+            .unwrap()
+            .iter()
+            .any(|fidelity| fidelity.txid == txid));
+        sync.sync_and_wait().unwrap();
+        assert!(sync.initial_market_sync_complete());
+        assert!(book.snapshot().unwrap().all_makers().iter().any(|maker| {
+            maker
+                .fidelity_outpoint
+                .is_some_and(|outpoint| outpoint.txid == txid)
+        }));
+        sync.shutdown();
+        drop(event_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn transaction_lookup_failure_blocks_market_sync_until_retry_succeeds() {
+        discovery_backend_failure_recovers("blockchain.transaction.get");
+    }
+
+    #[test]
+    fn confirmation_lookup_failure_blocks_market_sync_until_retry_succeeds() {
+        discovery_backend_failure_recovers("blockchain.scripthash.get_history");
+    }
+
+    #[test]
+    fn output_lookup_failure_blocks_market_sync_until_retry_succeeds() {
+        discovery_backend_failure_recovers("blockchain.scripthash.listunspent");
+    }
 
     #[test]
     fn future_dated_event_never_moves_the_cursor() {
@@ -672,7 +989,7 @@ mod tests {
         let registry = Arc::new(FileRegistry::new());
         let blockchain =
             AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default())).unwrap();
-        let mut seen_txid = SeenTxids::new();
+        let mut lookups = DiscoveryLookups::new();
 
         assert!(!handle_relay_message(
             registry.clone(),
@@ -680,11 +997,11 @@ mod tests {
             &blockchain,
             "wss://relay.example",
             kind,
-            &mut seen_txid,
+            &mut lookups,
         )
         .unwrap());
         assert!(registry.list_fidelity(0).unwrap().is_empty());
-        assert!(seen_txid.claim(txid));
+        assert!(lookups.seen.claim(txid));
     }
 
     #[test]
@@ -705,11 +1022,11 @@ mod tests {
             .unwrap();
 
         let registry = Arc::new(FileRegistry::new());
-        let mut seen_txid = SeenTxids::new();
+        let mut lookups = DiscoveryLookups::new();
         let txid = bitcoin::Txid::from_str(txid_str).unwrap();
 
         // Mark txid as already seen by a previous relay
-        seen_txid.insert(txid);
+        lookups.seen.insert(txid);
 
         let dummy_blockchain =
             AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default())).unwrap();
@@ -727,7 +1044,7 @@ mod tests {
             &dummy_blockchain,
             relay_url,
             kind,
-            &mut seen_txid,
+            &mut lookups,
         )
         .unwrap();
 
@@ -738,7 +1055,7 @@ mod tests {
     #[test]
     fn eose_message_returns_true() {
         let registry = Arc::new(FileRegistry::new());
-        let mut seen_txid = SeenTxids::new();
+        let mut lookups = DiscoveryLookups::new();
         let dummy_blockchain =
             AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default())).unwrap();
 
@@ -753,7 +1070,7 @@ mod tests {
             &dummy_blockchain,
             relay_url,
             Kind::Custom(37778),
-            &mut seen_txid,
+            &mut lookups,
         )
         .unwrap();
         assert!(!is_eose_unrelated);
@@ -768,7 +1085,7 @@ mod tests {
             &dummy_blockchain,
             relay_url,
             Kind::Custom(37778),
-            &mut seen_txid,
+            &mut lookups,
         )
         .unwrap();
         assert!(is_eose_matching);

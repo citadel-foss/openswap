@@ -644,7 +644,7 @@ pub struct OfferSyncService {
     socks_port: u16,
     /// Shared so per-maker offer-fetch workers can each hold a handle.
     blockchain: Arc<AnyBlockchain>,
-    /// Set to `true` after every configured Nostr relay sends its initial EOSE.
+    /// Set after every relay sends EOSE and discovery backend lookups resolve.
     initial_sync_complete: Arc<AtomicBool>,
     /// Reports whether full discovery and the initial offer checks completed.
     startup_refresh_complete: Arc<AtomicBool>,
@@ -700,7 +700,7 @@ impl OfferSyncClient {
 }
 
 impl OfferSyncHandle {
-    /// Whether every relay completed its snapshot and the first offer refresh ran.
+    /// Whether relay snapshots, discovery lookups and the first offer refresh completed.
     pub fn initial_market_sync_complete(&self) -> bool {
         self.initial_sync_complete.load(Ordering::SeqCst)
             && self.startup_refresh_complete.load(Ordering::Relaxed)
@@ -863,7 +863,8 @@ impl OfferSyncService {
                 (0, false)
             }
         };
-        let mut chain_checks_complete = height_known;
+        let pending_discovery = self.registry.pending_discovery_txids()?;
+        let mut chain_checks_complete = height_known && pending_discovery.is_empty();
         let mut deferred_makers = HashSet::new();
         let fidelities = self.registry.list_fidelity(height)?;
         let mut registry_candidates = HashSet::new();
@@ -906,6 +907,14 @@ impl OfferSyncService {
                 changed |= book.prune_expired_makers(height) > 0;
                 changed |= book.prune_expired_suppressions(height) > 0;
             }
+            // An announced bond awaiting a backend lookup is not absent. Keep
+            // its cached maker eligible for its first refresh after recovery.
+            deferred_makers.extend(book.makers.iter().filter_map(|maker| {
+                maker
+                    .fidelity_outpoint
+                    .filter(|outpoint| pending_discovery.contains(&outpoint.txid))
+                    .map(|_| maker.address.clone())
+            }));
             // A partial snapshot becomes usable for absence cleanup after the
             // grace period; no snapshot leaves the saved offerbook intact.
             if cleanup_ready {
@@ -915,7 +924,8 @@ impl OfferSyncService {
                 book.makers.retain(|maker| {
                     matches!(maker.state, MakerState::Banned(_))
                         || maker.fidelity_outpoint.is_none_or(|outpoint| {
-                            registry_candidates.contains(&(maker.address.clone(), outpoint))
+                            pending_discovery.contains(&outpoint.txid)
+                                || registry_candidates.contains(&(maker.address.clone(), outpoint))
                         })
                 });
                 changed |= book.makers.len() != before;
@@ -1290,7 +1300,8 @@ impl OfferSyncService {
         })
     }
 
-    /// Waits up to DISCOVERY_WAIT_MAX for initial Nostr EOSE before running a manual sync.
+    /// Waits up to DISCOVERY_WAIT_MAX for relay snapshots and discovery lookups
+    /// before running a manual sync.
     fn wait_for_discovery(&self, shutdown_flag: &AtomicBool) {
         if self.initial_sync_complete.load(Ordering::SeqCst) {
             return;
@@ -3257,6 +3268,61 @@ pub(crate) mod tests {
             assert!(book.active_makers(&MakerProtocol::Taproot).is_empty());
         }
         assert!(!service.startup_refresh_complete.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn unresolved_discovery_preserves_cached_maker_after_cleanup_grace() {
+        let dir = tempdir().unwrap();
+        let handle = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let registry = FileRegistry::new();
+        let address = addr("6129");
+        let offer = dummy_offer(&address.to_string());
+        let outpoint = offer.fidelity.bond.outpoint;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stale_ts = now - STALE_MAKER_AGE.as_secs() * 2;
+        {
+            let mut book = handle.inner.write().unwrap();
+            book.insert_candidate(address.clone(), Some(outpoint), Some(1_000), stale_ts, None);
+            book.mark_success(
+                &address,
+                offer,
+                MakerProtocol::Taproot,
+                Vec::new(),
+                stale_ts,
+            );
+            book.write_to_disk(&handle.path).unwrap();
+        }
+        registry.record_discovery_snapshot().unwrap();
+        registry.defer_discovery_lookup(outpoint.txid).unwrap();
+        let mut service = OfferSyncService::new(
+            handle.clone(),
+            registry.clone(),
+            0,
+            Arc::new(chain_at_height(1)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        service.startup_refresh_started = Instant::now() - STARTUP_REFRESH_GRACE;
+        service.run_once().unwrap();
+        for book in [
+            handle.snapshot().unwrap(),
+            OfferBook::read_from_disk(&handle.path).unwrap(),
+        ] {
+            assert_eq!(book.makers.len(), 1);
+            assert_eq!(book.makers[0].state, MakerState::Good);
+            assert_eq!(book.makers[0].last_offer_update_ts, Some(stale_ts));
+            assert!(book.suppressed_makers.is_empty());
+        }
+        assert!(!service.startup_polled.contains(&address));
+        assert!(!service.startup_refresh_complete.load(Ordering::Relaxed));
+
+        // A conclusive rejection releases the cache protection as well.
+        registry.resolve_discovery_lookup(&outpoint.txid).unwrap();
+        service.run_once().unwrap();
+        assert!(handle.snapshot().unwrap().makers.is_empty());
     }
 
     #[test]
