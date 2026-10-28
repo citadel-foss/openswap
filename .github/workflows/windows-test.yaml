@@ -55,6 +55,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           $zip = Join-Path $dest "libclang.zip"
           curl.exe -fsSL -o $zip "https://api.nuget.org/v3-flatcontainer/libclang.runtime.win-x64/13.0.0/libclang.runtime.win-x64.13.0.0.nupkg"
+          # SHA256 of libclang.runtime.win-x64 13.0.0 from the NuGet flat container.
+          $expected = "a07959866d2adb66622e4251fc9ff2c21e9f5282d76e9e73d1528c0fda95678a"
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "libclang nupkg checksum mismatch: $actual" }
           Expand-Archive -Path $zip -DestinationPath (Join-Path $dest "pkg")
           $dll = Get-ChildItem -Recurse (Join-Path $dest "pkg") -Filter libclang.dll | Select-Object -First 1
           if (-not $dll) { throw "libclang.dll was not in the NuGet package" }
