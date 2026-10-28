@@ -52,6 +52,11 @@ OPENSWAP_TOR_IT=1 cargo nextest run --features integration-test \
 The onion services are created with `Flags=Detach` and outlive the test
 process; CI's tor is ephemeral and drops them on restart.
 
+Proxied Electrum integration tests use a five-minute maker idle budget because
+their backend reads allow 120 seconds plus a reconnect and retry before a
+keepalive can be checked. Local backends use 30 seconds; production uses
+15 minutes. Refund deadlines still trigger recovery independently of this timer.
+
 Each test keeps its data in `$TMPDIR/openswap-<random>/`: logs in
 `taker/debug.log` (every taker and maker writes there) and wallets.
 It is deleted when the test passes and kept when it fails; the log's first

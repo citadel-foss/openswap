@@ -199,6 +199,30 @@ fn slow_taker_is_readmitted_before_funding(world: &mut World) {
         .expect("the re-check must re-admit the drained swap");
 }
 
+/// Backend work before protocol exchange must not let revalidated maker
+/// admissions expire while the taker is still preparing its funding.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [StallAfterFundingInitialization],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+    cases = [
+        taproot_funding_setup_keeps_admission_alive(protocol = ProtocolVersion::Taproot),
+        legacy_funding_setup_keeps_admission_alive(protocol = ProtocolVersion::Legacy),
+    ],
+)]
+fn funding_setup_keeps_admission_alive(world: &mut World, protocol: ProtocolVersion) {
+    let log_path = world.taker_log_path();
+    world
+        .taker_mut()
+        .swap(SwapParams::new(protocol, Amount::from_sat(500_000), 1).with_tx_count(1))
+        .expect("slow funding setup must preserve the maker's admission");
+    assert_log!(log_path; {
+        has "Resetting timer",
+        lacks "Released idle unfunded swap",
+    });
+}
+
 /// A failed sweep puts the completed swap's state back after it was removed.
 /// That store must pass the stale-plan guard, or the maker loses the state.
 #[world_test(

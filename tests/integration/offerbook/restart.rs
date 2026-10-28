@@ -16,12 +16,81 @@
 //!    the relay. A corrupted offerbook.json must stop the taker untouched.
 
 use bitcoin::Amount;
-use openswap::{taker::Taker, wallet::AddressType};
+use bitcoind::bitcoincore_rpc::RpcApi;
+use openswap::{
+    taker::{MakerState, Taker},
+    wallet::AddressType,
+};
 
 use crate::test_framework::*;
 
 use log::info;
-use std::{thread, time::Duration};
+use std::{
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, Normal],
+    takers = [Normal],
+    setup = [
+        fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
+        start_makers_without_sync(120),
+    ],
+)]
+fn long_idle_restart_refreshes_cached_and_missing_offers(world: &mut World) {
+    let taker = world.take_taker();
+    taker.inner().sync_offerbook_and_wait().unwrap();
+    let cached_address = world.makers()[0].address();
+    let missing_address = world.makers()[1].address();
+    let listed = listed_addresses(taker.inner());
+    assert!(listed.contains(&cached_address));
+    assert!(listed.contains(&missing_address));
+    drop(taker);
+
+    // Model a taker that has not run for longer than the stale-maker age.
+    let book_path = world.temp_dir().join("taker1").join("offerbook.json");
+    let mut book: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&book_path).unwrap()).unwrap();
+    let stale_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 3 * 24 * 60 * 60;
+    let makers = book["makers"].as_array_mut().unwrap();
+    makers.retain(|maker| maker["address"] == cached_address);
+    assert_eq!(makers.len(), 1);
+    makers[0]["last_offer_update_ts"] = stale_ts.into();
+    makers[0]["first_seen_ts"] = stale_ts.into();
+    std::fs::write(&book_path, serde_json::to_vec_pretty(&book).unwrap()).unwrap();
+
+    let restarted = Taker::init(world.framework().taker_init_config::<BitcoindBackend>(0))
+        .expect("restart after a long idle period");
+    restarted.sync_offerbook_and_wait().unwrap();
+    assert!(
+        restarted.initial_market_sync_complete(),
+        "discovery and the initial offer refresh must complete after restart"
+    );
+    let refreshed_book = restarted.fetch_offers().unwrap();
+    let refreshed_makers = refreshed_book.all_makers();
+    let refreshed = refreshed_makers
+        .iter()
+        .find(|maker| maker.address.to_string() == cached_address)
+        .expect("cached live maker must remain visible after a long idle period");
+    assert_eq!(refreshed.state, MakerState::Good);
+    assert!(refreshed.last_offer_update_ts.unwrap() > stale_ts);
+    assert!(
+        refreshed_makers
+            .iter()
+            .any(|maker| maker.address.to_string() == missing_address
+                && maker.state == MakerState::Good),
+        "a live maker absent from the saved offerbook must be discovered"
+    );
+
+    drop(restarted);
+    world.shutdown_makers();
+}
 
 /// Maker addresses currently in the taker's offerbook, as strings.
 fn listed_addresses(taker: &Taker) -> Vec<String> {
@@ -32,6 +101,53 @@ fn listed_addresses(taker: &Taker) -> Vec<String> {
         .iter()
         .map(|m| m.address.to_string())
         .collect()
+}
+
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2TR),
+        start_makers_without_sync(120),
+    ],
+)]
+fn partial_relay_discovery_removes_expired_cached_makers(world: &mut World) {
+    let taker = world.take_taker();
+    taker.inner().sync_offerbook_and_wait().unwrap();
+    let address = world.makers()[0].address();
+    let book = taker.inner().fetch_offers().unwrap();
+    let makers = book.all_makers();
+    let maker = makers
+        .iter()
+        .find(|maker| maker.address.to_string() == address)
+        .expect("maker must be cached before restart");
+    assert_eq!(maker.state, MakerState::Good);
+    let expiry = maker.fidelity_expiry_height.unwrap() as u64;
+    drop(taker);
+
+    // Stop renewal, then expire the actual bond backing the cached Good offer.
+    world.shutdown_makers();
+    let tip = world.bitcoind().client.get_block_count().unwrap();
+    world.mine(expiry.saturating_sub(tip) + 1);
+
+    // The real relay completes its snapshot; the second relay never connects.
+    let config = world
+        .framework()
+        .taker_init_config::<BitcoindBackend>(0)
+        .with_nostr_relays(vec![
+            world.framework().nostr_relay_url.clone(),
+            "ws://127.0.0.1:0".to_string(),
+        ]);
+    let restarted = Taker::init(config).expect("restart with partial relay availability");
+    restarted.sync_offerbook_and_wait().unwrap();
+    assert!(!restarted.initial_market_sync_complete());
+    assert!(
+        !listed_addresses(&restarted).contains(&address),
+        "an expired cached Good maker must be removed despite incomplete discovery"
+    );
+    assert_log!(world; { has "1 relay(s) pending" });
+    drop(restarted);
 }
 
 #[world_test(
@@ -79,6 +195,11 @@ fn removal_survives_restart(world: &mut World) {
     // Give the startup sync time to fail against the dead relay, so a pass
     // here cannot be credited to a sync that merely had not run yet.
     thread::sleep(Duration::from_secs(5));
+    restarted.sync_offerbook_and_wait().unwrap();
+    assert!(
+        !restarted.initial_market_sync_complete(),
+        "an unavailable relay must leave initial market sync incomplete"
+    );
 
     // ---- 4a. The removal holds across the restart ----
     let listed = listed_addresses(&restarted);

@@ -26,7 +26,9 @@ use crate::{
         now_secs, HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE,
         UNBROADCAST_DISCARD_GRACE,
     },
-    wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, SwapRole, Wallet},
+    wallet::{
+        AnyBlockchain, BackendConfig, Blockchain, RecoveryOutcome, RecoveryReport, SwapRole, Wallet,
+    },
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
 
@@ -181,11 +183,21 @@ fn admit_heartbeat(
 #[cfg(not(feature = "integration-test"))]
 pub const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(900);
 
-/// Idle connection timeout (testing). Must sit above a single slow electrum
-/// call (~10s over Tor) since keepalives can only land between RPCs; the slow
-/// test miner keeps the refund locktime margin regardless of wall clock.
+/// Idle connection timeout for local integration backends. Proxied backends
+/// use the longer budget selected by `idle_connection_timeout`.
 #[cfg(feature = "integration-test")]
 pub const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Local integration backends can use a short idle timer. A proxied Electrum
+/// backend needs time for its 120s reads and retries before a checked keepalive
+/// can refresh the timer, just as it does in production.
+fn idle_connection_timeout(_backend: &BackendConfig) -> Duration {
+    #[cfg(feature = "integration-test")]
+    if matches!(_backend, BackendConfig::Electrum(config) if config.socks5.is_some()) {
+        return Duration::from_secs(300);
+    }
+    IDLE_CONNECTION_TIMEOUT
+}
 
 /// Socket read timeout for swap connections, kept separate from
 /// `IDLE_CONNECTION_TIMEOUT`. Sized for the quiet phases of a healthy swap —
@@ -644,7 +656,7 @@ fn handle_connection(
             break;
         }
 
-        if state.is_timed_out(IDLE_CONNECTION_TIMEOUT.as_secs()) {
+        if state.is_timed_out(idle_connection_timeout(&maker.config.backend).as_secs()) {
             log::info!("[{}] Connection timed out", maker.config.network_port);
             break;
         }
@@ -944,7 +956,7 @@ fn handle_connection(
 /// A swap is quiet when neither this connection nor any keepalive connection
 /// has shown activity within the idle timeout.
 fn swap_is_quiet(maker: &Arc<MakerServer>, state: &ConnectionState) -> bool {
-    let timeout = IDLE_CONNECTION_TIMEOUT.as_secs();
+    let timeout = idle_connection_timeout(&maker.config.backend).as_secs();
     match state.swap_id {
         Some(ref id) => match maker.get_connection_state(id) {
             Ok(Some(stored)) => stored.is_timed_out(timeout),
@@ -961,7 +973,7 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             break;
         }
 
-        let idle_swaps = maker.drain_idle_swaps(IDLE_CONNECTION_TIMEOUT)?;
+        let idle_swaps = maker.drain_idle_swaps(idle_connection_timeout(&maker.config.backend))?;
 
         for idle in idle_swaps {
             log::error!(
@@ -2151,6 +2163,25 @@ mod tests {
         io::{Read, Write},
         net::Shutdown,
     };
+
+    #[cfg(feature = "integration-test")]
+    #[test]
+    fn proxied_backend_idle_budget_outlasts_electrum_read_retries() {
+        use crate::wallet::{CoreRpcConfig, ElectrumConfig};
+
+        let proxied = BackendConfig::Electrum(ElectrumConfig {
+            socks5: Some("127.0.0.1:9050".into()),
+            ..Default::default()
+        });
+        // A proxied read allows 120s, followed by a reconnect and one retry.
+        assert!(idle_connection_timeout(&proxied) > Duration::from_secs(120 * 2));
+        for local in [
+            BackendConfig::Electrum(ElectrumConfig::default()),
+            BackendConfig::CoreRpc(CoreRpcConfig::default()),
+        ] {
+            assert_eq!(idle_connection_timeout(&local), IDLE_CONNECTION_TIMEOUT);
+        }
+    }
 
     // The handshake variants and fields from v0.2.3 stay independent of
     // the new enums so removing the deliberate refusal breaks this test.

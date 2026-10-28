@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     convert::TryFrom,
     fs,
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     path::PathBuf,
     sync::{atomic::AtomicBool, mpsc, Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard},
     thread,
@@ -1401,6 +1401,9 @@ impl Taker {
         if !self.watch_service.is_alive() {
             return Err(TakerError::General("watchtower is down".into()));
         }
+        // Revalidating later hops and building funding can block on the backend.
+        // Keep earlier admissions alive throughout that work as well as exchange.
+        let mut route_heartbeat = self.start_route_heartbeat(swap_id);
         // A maker drops a swap left idle since admission; learn that before
         // funding, while failing still costs nothing.
         self.revalidate_admissions()?;
@@ -1423,6 +1426,13 @@ impl Taker {
         self.funding_initialize()?;
 
         #[cfg(feature = "integration-test")]
+        if self.behavior == TakerBehavior::StallAfterFundingInitialization {
+            std::thread::sleep(
+                crate::maker::server::IDLE_CONNECTION_TIMEOUT + Duration::from_secs(10),
+            );
+        }
+
+        #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::PayFromPlannedCoinsBeforeBroadcast {
             self.pay_from_planned_coins()?;
         }
@@ -1433,12 +1443,11 @@ impl Taker {
         // exchange and finalization. Legacy owns an exchange-local heartbeat
         // because spare substitution may change its route; after exchange we
         // reconnect a heartbeat to the settled route for finalization.
-        let mut route_heartbeat = if protocol == ProtocolVersion::Taproot {
-            let swap_id = self.swap_state()?.id.clone();
-            self.start_route_heartbeat(&swap_id)
-        } else {
-            None
-        };
+        if protocol == ProtocolVersion::Legacy {
+            // Legacy starts its exchange heartbeat with the current route so
+            // spare substitution can replace it when needed.
+            drop(route_heartbeat.take());
+        }
 
         match protocol {
             ProtocolVersion::Legacy => {
@@ -2894,15 +2903,15 @@ pub(crate) fn connect_to_maker(
 ) -> Result<TcpStream, TakerError> {
     {
         log::debug!("Connecting to maker at {}", address);
-        let timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
+        let timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS).min(read_timeout);
 
         #[cfg(feature = "integration-test")]
-        let socket = TcpStream::connect(address)
+        let socket = connect_clearnet_maker(address, timeout)
             .map_err(|e| TakerError::General(format!("Failed to connect to {}: {}", address, e)))?;
 
         #[cfg(not(feature = "integration-test"))]
         let socket = match connection_type {
-            ConnectionType::Clearnet => TcpStream::connect(address).map_err(|e| {
+            ConnectionType::Clearnet => connect_clearnet_maker(address, timeout).map_err(|e| {
                 TakerError::General(format!("Failed to connect to {}: {}", address, e))
             })?,
             ConnectionType::Tor => {
@@ -2923,6 +2932,30 @@ pub(crate) fn connect_to_maker(
 
         Ok(socket)
     }
+}
+
+/// Use timed TCP connects and share the remaining dial budget across resolved
+/// addresses so an unreachable peer cannot leave a heartbeat dial waiting on TCP.
+fn connect_clearnet_maker(address: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    let started = Instant::now();
+    let mut last_error = std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "no maker address resolved",
+    );
+    for address in address.to_socket_addrs()? {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "maker dial deadline elapsed",
+            ));
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 impl Taker {
@@ -3663,6 +3696,11 @@ impl Taker {
         self.offer_sync_handle.sync_and_wait()
     }
 
+    /// Whether discovery and the first offer refresh both completed.
+    pub fn initial_market_sync_complete(&self) -> bool {
+        self.offer_sync_handle.initial_market_sync_complete()
+    }
+
     /// Returns a clone-able client for triggering offer sync operations from
     /// other threads (e.g. background workers) without requiring access to the
     /// `Taker` itself. Useful for callers that want to run a manual sync off
@@ -3902,6 +3940,9 @@ pub enum TakerBehavior {
     /// Normal behavior.
     #[default]
     Normal,
+    /// Hold funding initialization open past the maker's idle deadline, before
+    /// exchange starts, to model a slow wallet/backend operation.
+    StallAfterFundingInitialization,
     /// Try to broadcast the funding txs a Legacy maker hands out with its
     /// contract-sig request, then stop: the handout must not be broadcastable.
     BroadcastHandedOutFunding,
@@ -4026,6 +4067,38 @@ mod tests {
     use super::*;
     use serde_cbor::{value::to_value, Value};
     use std::{collections::BTreeMap, net::TcpListener, thread};
+
+    #[test]
+    fn expired_dial_deadline_does_not_open_a_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(connect_to_maker(
+            &listener.local_addr().unwrap().to_string(),
+            ConnectionType::Clearnet,
+            0,
+            Duration::ZERO,
+        )
+        .is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn heartbeat_dial_applies_the_callers_write_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let deadline = Duration::from_millis(300);
+        let stream = connect_to_maker(
+            &listener.local_addr().unwrap().to_string(),
+            ConnectionType::Clearnet,
+            0,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), Some(deadline));
+        assert_eq!(stream.write_timeout().unwrap(), Some(deadline));
+    }
 
     fn compat_hello_reply(reply: Value, needed: &[String]) -> Result<Vec<String>, TakerError> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
