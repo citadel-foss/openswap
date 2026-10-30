@@ -70,6 +70,20 @@ impl Wallet {
     ) -> Result<Transaction, WalletError> {
         log::info!("Creating Direct-Spend from Wallet.");
 
+        // The caller selected these coins earlier, maybe under another guard:
+        // a swap may have claimed one since, or a broadcast spent it.
+        if let Some(held) = coins_to_spend
+            .iter()
+            .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+            .find(|outpoint| {
+                self.is_swap_reserved(outpoint) || self.locked_utxos.contains(outpoint)
+            })
+        {
+            return Err(WalletError::General(format!(
+                "coin {held} is reserved by a swap or already spent; select coins again"
+            )));
+        }
+
         let mut coins = Vec::<(ListUnspentResultEntry, UTXOSpendInfo)>::new();
 
         for coin in coins_to_spend {
@@ -536,6 +550,61 @@ mod tests {
 
     const fn sats(n: u64) -> Amount {
         Amount::from_sat(n)
+    }
+
+    /// A direct spend refuses a coin a swap reserved after the caller selected
+    /// it, and one already spent by our own broadcast.
+    #[test]
+    fn direct_spend_refuses_coins_held_elsewhere() {
+        use crate::wallet::{api::test_support::test_wallet, AddressType, UTXOSpendInfo};
+        use bitcoin::{hashes::Hash, ScriptBuf, Txid};
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let coin = |n: u8| {
+            let entry = ListUnspentResultEntry {
+                txid: Txid::from_byte_array([n; 32]),
+                vout: 0,
+                address: None,
+                label: None,
+                redeem_script: None,
+                witness_script: None,
+                script_pub_key: ScriptBuf::new(),
+                amount: sats(100_000),
+                confirmations: 1,
+                spendable: true,
+                solvable: true,
+                descriptor: None,
+                safe: true,
+            };
+            let info = UTXOSpendInfo::SeedCoin {
+                path: "m/84'/1'/0'/0/0".to_string(),
+                input_value: sats(100_000),
+                address_type: AddressType::P2WPKH,
+            };
+            (entry, info)
+        };
+        let outpoint = |n: u8| OutPoint::new(Txid::from_byte_array([n; 32]), 0);
+        // Any address will do: the check runs before the output is used.
+        let to = Destination::Sweep(Address::p2wsh(&ScriptBuf::new(), bitcoin::Network::Regtest));
+        let refused = |result: Result<Transaction, WalletError>| matches!(result, Err(WalletError::General(e)) if e.contains("select coins again"));
+
+        wallet.reserve_swap_locks("swap", &[outpoint(1)]);
+        assert!(refused(wallet.spend_from_wallet(
+            1.0,
+            to.clone(),
+            &[coin(1)]
+        )));
+
+        wallet.lock_utxos(&[outpoint(2)]);
+        assert!(refused(wallet.spend_from_wallet(
+            1.0,
+            to.clone(),
+            &[coin(2)]
+        )));
+
+        // A free coin gets past the check; this wallet has no backend to sign with.
+        assert!(!refused(wallet.spend_from_wallet(1.0, to, &[coin(3)])));
     }
 
     #[test]
