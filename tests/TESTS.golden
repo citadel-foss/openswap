@@ -228,6 +228,7 @@ openswap utill::tests::test_parse_checked_address_rejects_testnet_on_mainnet
 openswap utill::tests::test_parse_checked_address_rejects_truncated_address
 openswap utill::tests::test_parse_checked_address_rejects_wrong_network_mainnet_on_regtest
 openswap utill::tests::test_parse_checked_address_rejects_wrong_network_mainnet_on_testnet
+openswap utill::tests::test_parse_proxy_auth
 openswap utill::tests::test_read_message_rejects_oversized_payload
 openswap utill::tests::test_redeemscript_to_scriptpubkey_1of2musig
 openswap utill::tests::test_redeemscript_to_scriptpubkey_custom
