@@ -256,20 +256,21 @@ fn handle_request<M: MakerRpc>(
                     change_address_type: AddressType::P2TR,
                 };
 
-                let coins_to_send = lock_debug!(maker.wallet().read())?.coin_select(
-                    amount,
-                    feerate,
-                    address_type,
-                    None,
-                    None,
-                )?;
-                let tx = lock_debug!(maker.wallet().write())?.spend_from_wallet(
-                    feerate,
-                    destination,
-                    &coins_to_send,
-                )?;
-
-                let txid = lock_debug!(maker.wallet().read())?.send_tx(&tx)?;
+                // One guard from selection through broadcast, so a swap thread
+                // cannot claim the selected coins in between.
+                let txid = {
+                    let mut wallet = lock_debug!(maker.wallet().write())?;
+                    let coins_to_send =
+                        wallet.coin_select(amount, feerate, address_type, None, None)?;
+                    let tx = wallet.spend_from_wallet(feerate, destination, &coins_to_send)?;
+                    let txid = wallet.send_tx(&tx)?;
+                    // The cache lists the spent coins until the sync below; lock
+                    // them so no swap plans them in between.
+                    let spent: Vec<_> =
+                        tx.input.iter().map(|input| input.previous_output).collect();
+                    wallet.lock_utxos(&spent);
+                    txid
+                };
 
                 log::info!("Sync at:----handle_request----");
                 lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;

@@ -459,6 +459,7 @@ openswap wallet::seed_cli::tests::quiz_positions_are_distinct_sorted_and_in_rang
 openswap wallet::seed_cli::tests::seed_commands_write_only_when_no_process_runs_on_the_wallet
 openswap wallet::seed_cli::tests::sentinel_open_failures_refuse_every_wallet_lock_mode
 openswap wallet::spend::tests::change_at_the_dust_limit_is_kept
+openswap wallet::spend::tests::direct_spend_refuses_coins_held_elsewhere
 openswap wallet::spend::tests::exact_spend_refuses_a_fee_below_the_real_size
 openswap wallet::spend::tests::exact_spend_refuses_dust_change
 openswap wallet::spend::tests::exact_spend_refuses_inputs_below_the_spend
