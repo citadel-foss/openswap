@@ -213,10 +213,7 @@ fn run() -> Result<(), MakerError> {
             ..Default::default()
         }),
         None => BackendConfig::CoreRpc(CoreRpcConfig {
-            zmq_addr: match args.zmq {
-                Some(addr) => CoreRpcConfig::zmq_endpoint(&addr),
-                None => CoreRpcConfig::default_zmq_addr(&args.rpc),
-            },
+            zmq_addr: CoreRpcConfig::resolve_zmq_addr(args.zmq.as_deref(), &args.rpc),
             url: args.rpc,
             auth: Auth::UserPass(args.auth.0, args.auth.1),
             wallet_name,

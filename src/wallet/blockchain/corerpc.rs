@@ -54,13 +54,14 @@ impl CoreRpcConfig {
         format!("tcp://{host}:{ZMQ_DEFAULT_PORT}")
     }
 
-    /// ZMQ endpoint for a user-given `--zmq` value. The flag is documented as
-    /// `address:port`, which libzmq refuses without a transport, so add `tcp://`.
-    pub fn zmq_endpoint(addr: &str) -> String {
-        if addr.contains("://") {
-            addr.to_string()
-        } else {
-            format!("tcp://{addr}")
+    /// ZMQ endpoint for the `--zmq` value, or the default on the RPC host. The
+    /// flag is documented as `address:port`, which libzmq refuses without a
+    /// transport, so a bare value gets `tcp://`.
+    pub fn resolve_zmq_addr(zmq: Option<&str>, rpc_url: &str) -> String {
+        match zmq {
+            Some(addr) if addr.contains("://") => addr.to_string(),
+            Some(addr) => format!("tcp://{addr}"),
+            None => Self::default_zmq_addr(rpc_url),
         }
     }
 }
@@ -816,13 +817,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn zmq_endpoint_without_transport_defaults_to_tcp() {
+    fn resolve_zmq_addr_adds_tcp_to_a_bare_address() {
+        let rpc = "10.0.0.5:38332";
         for (given, expected) in [
-            ("127.0.0.1:28332", "tcp://127.0.0.1:28332"),
-            ("tcp://127.0.0.1:28332", "tcp://127.0.0.1:28332"),
-            ("ipc:///tmp/bitcoind.zmq", "ipc:///tmp/bitcoind.zmq"),
+            (Some("127.0.0.1:28332"), "tcp://127.0.0.1:28332"),
+            (Some("tcp://127.0.0.1:28332"), "tcp://127.0.0.1:28332"),
+            (Some("ipc:///tmp/bitcoind.zmq"), "ipc:///tmp/bitcoind.zmq"),
+            (None, "tcp://10.0.0.5:28332"),
         ] {
-            assert_eq!(CoreRpcConfig::zmq_endpoint(given), expected);
+            assert_eq!(CoreRpcConfig::resolve_zmq_addr(given, rpc), expected);
         }
     }
 
