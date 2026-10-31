@@ -177,6 +177,9 @@ pub struct TakerInitConfig {
     pub password: Option<String>,
     /// Connection type (Tor or Clearnet).
     pub connection_type: ConnectionType,
+    /// Whether `init` requires a reachable Tor control port. On by default.
+    /// Wallet-only callers can turn it off: they never open a Tor circuit.
+    pub check_tor: bool,
     /// Nostr relay URLs for maker discovery.
     pub nostr_relays: Vec<String>,
     /// LDK Server gRPC address (`host:port`, no scheme) for Lightning swaps.
@@ -208,6 +211,7 @@ impl Default for TakerInitConfig {
             check_blocklist: None,
             password: None,
             connection_type: ConnectionType::Tor,
+            check_tor: true,
             nostr_relays: NOSTR_RELAYS.iter().map(|s| s.to_string()).collect(),
             ldk_server_url: None,
             ldk_api_key_path: None,
@@ -226,6 +230,12 @@ impl TakerInitConfig {
     /// Set the blockchain backend (Bitcoin Core or Electrum).
     pub fn with_backend(mut self, backend: BackendConfig) -> Self {
         self.backend = backend;
+        self
+    }
+
+    /// Skip the Tor control port check at init, for commands that never use Tor.
+    pub fn without_tor_check(mut self) -> Self {
+        self.check_tor = false;
         self
     }
 
@@ -975,7 +985,7 @@ impl Taker {
         }
 
         #[cfg(not(feature = "integration-test"))]
-        if config.connection_type == ConnectionType::Tor {
+        if config.check_tor && config.connection_type == ConnectionType::Tor {
             check_tor_status(
                 taker_config.control_port,
                 taker_config.tor_auth_password.as_str(),
@@ -4277,6 +4287,24 @@ mod tests {
     /// so anything `init_taker_config` fails to write is lost at the next
     /// start. For the Lightning settings that would mean a taker restarting
     /// without a backend, unable to recover a swap still in flight.
+    #[cfg(not(feature = "integration-test"))]
+    #[test]
+    fn tor_check_can_be_skipped_for_wallet_only_use() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        // Nothing listens on this port, so the check can only fail.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let config = TakerInitConfig {
+            control_port: Some(dead),
+            ..TakerInitConfig::default()
+        };
+        assert!(Taker::init_taker_config(&config, dir.path()).is_err());
+        assert!(Taker::init_taker_config(&config.clone().without_tor_check(), dir.path()).is_ok());
+    }
+
     #[test]
     fn init_taker_config_persists_lightning_settings() {
         let dir = std::env::temp_dir().join(format!(

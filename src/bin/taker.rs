@@ -348,6 +348,39 @@ enum Commands {
     },
 }
 
+impl Commands {
+    /// Whether the command opens Tor circuits. The rest only need the
+    /// blockchain backend, so they run without a Tor control port.
+    fn needs_tor(&self) -> bool {
+        match self {
+            Commands::FetchOffers
+            | Commands::ListOffers
+            | Commands::PollMaker { .. }
+            | Commands::RemoveMaker { .. }
+            | Commands::OpenSwap { .. } => true,
+            #[cfg(feature = "lightning")]
+            Commands::LnSwapIn { .. }
+            | Commands::LnSwapOut { .. }
+            | Commands::LnSwapRouted { .. } => true,
+            Commands::ListUtxo
+            | Commands::ListUtxoRegular
+            | Commands::ListUtxoSwap
+            | Commands::ListUtxoContract
+            | Commands::GetBalances
+            | Commands::GetNewAddress
+            | Commands::SendToAddress { .. }
+            | Commands::BlocklistAdd { .. }
+            | Commands::BlocklistRemove { .. }
+            | Commands::Recover
+            | Commands::Backup
+            | Commands::Restore { .. }
+            | Commands::ShowSeed
+            | Commands::AttachSeed
+            | Commands::VerifyDeniability { .. } => false,
+        }
+    }
+}
+
 fn parse_protocol(s: &str) -> Result<ProtocolVersion, TakerError> {
     match s.to_lowercase().as_str() {
         "legacy" => Ok(ProtocolVersion::Legacy),
@@ -589,6 +622,11 @@ fn run() -> Result<(), TakerError> {
         ..TakerInitConfig::default()
     }
     .with_backend(backend.clone());
+    let config = if args.command.needs_tor() {
+        config
+    } else {
+        config.without_tor_check()
+    };
 
     let mut taker = Taker::init(config)?;
 
@@ -1025,6 +1063,24 @@ mod tests {
                 .unwrap();
         assert!(material.is_some());
         assert_eq!(backup.file_name, "w1");
+    }
+
+    #[test]
+    fn only_market_commands_need_tor() {
+        let needs = |args: &[&str]| parse(args).unwrap().command.needs_tor();
+        assert!(needs(&["fetch-offers"]));
+        assert!(needs(&["open-swap"]));
+        assert!(needs(&["poll-maker", "-m", "x.onion"]));
+        for cmd in [
+            "get-balances",
+            "get-new-address",
+            "list-utxo",
+            "recover",
+            "backup",
+        ] {
+            assert!(!needs(&[cmd]), "{} must not need Tor", cmd);
+        }
+        assert!(!needs(&["blocklist-remove", "bcrt1qxyz"]));
     }
 
     #[test]

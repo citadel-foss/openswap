@@ -151,6 +151,8 @@ If you build the taker with `--features lightning`, it also has the `ln-swap-in`
 
 > **Note:** Every `taker` command opens the encrypted wallet, so each invocation needs `--password-file` or `-p` (except `restore`, which prompts for the new wallet's passphrase, and `show-seed` and `attach-seed`, which prompt for the current one). The tutorial's bare `taker <SUBCOMMAND>` examples assume one is supplied.
 
+> **Note:** Only the market commands need Tor: `fetch-offers`, `list-offers`, `poll-maker`, `remove-maker`, `open-swap` and the `ln-swap-*` commands. They check the Tor control port at start. Wallet commands such as `get-new-address`, `get-balances`, `send-to-address`, `recover` and `backup` need only the blockchain backend.
+
 ## For this tutorial, we'll assume a custom configuration with port 38332. Output examples will reflect this setup.
 
 > **Note:** The sample outputs were captured on **regtest**, so they show `bcrt1...` addresses and `Bitcoin Network: regtest` log lines. On the custom signet, addresses are `tb1...` and the network name differs — the commands are the same.

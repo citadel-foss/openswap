@@ -567,6 +567,7 @@ openswap::bin/makerd tests::restore_and_backup_read_their_options
 openswap::bin/makerd tests::restore_needs_exactly_one_source
 openswap::bin/makerd tests::seed_commands_take_the_wallet_flag_the_docs_print
 openswap::bin/taker tests::bond_hint_rejects_malformed_values
+openswap::bin/taker tests::only_market_commands_need_tor
 openswap::bin/taker tests::password_file_excludes_the_argv_password
 openswap::bin/taker tests::restore_needs_exactly_one_source
 openswap::bin/taker tests::restore_reads_options_and_keeps_wallet_name_unset
