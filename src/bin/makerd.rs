@@ -214,7 +214,7 @@ fn run() -> Result<(), MakerError> {
         }),
         None => BackendConfig::CoreRpc(CoreRpcConfig {
             zmq_addr: match args.zmq {
-                Some(addr) => addr,
+                Some(addr) => CoreRpcConfig::zmq_endpoint(&addr),
                 None => CoreRpcConfig::default_zmq_addr(&args.rpc),
             },
             url: args.rpc,

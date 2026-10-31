@@ -53,6 +53,16 @@ impl CoreRpcConfig {
         let host = rpc_url.rsplit_once(':').map(|(h, _)| h).unwrap_or(rpc_url);
         format!("tcp://{host}:{ZMQ_DEFAULT_PORT}")
     }
+
+    /// ZMQ endpoint for a user-given `--zmq` value. The flag is documented as
+    /// `address:port`, which libzmq refuses without a transport, so add `tcp://`.
+    pub fn zmq_endpoint(addr: &str) -> String {
+        if addr.contains("://") {
+            addr.to_string()
+        } else {
+            format!("tcp://{addr}")
+        }
+    }
 }
 
 impl Default for CoreRpcConfig {
@@ -803,6 +813,17 @@ pub(crate) mod tests {
         })
         .unwrap();
         (core, server)
+    }
+
+    #[test]
+    fn zmq_endpoint_without_transport_defaults_to_tcp() {
+        for (given, expected) in [
+            ("127.0.0.1:28332", "tcp://127.0.0.1:28332"),
+            ("tcp://127.0.0.1:28332", "tcp://127.0.0.1:28332"),
+            ("ipc:///tmp/bitcoind.zmq", "ipc:///tmp/bitcoind.zmq"),
+        ] {
+            assert_eq!(CoreRpcConfig::zmq_endpoint(given), expected);
+        }
     }
 
     #[test]
