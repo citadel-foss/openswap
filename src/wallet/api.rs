@@ -2477,6 +2477,14 @@ impl Wallet {
         self.locked_utxos.extend(outpoints.iter().copied());
     }
 
+    /// Remove `outpoints` from the wallet-side lock set, undoing
+    /// [`Wallet::lock_utxos`].
+    pub(crate) fn unlock_utxos(&mut self, outpoints: &[OutPoint]) {
+        for outpoint in outpoints {
+            self.locked_utxos.remove(outpoint);
+        }
+    }
+
     /// Outpoints currently held in the wallet-side lock set (see
     /// [`Wallet::locked_utxos`]).
     pub(crate) fn list_lock_unspent(&self) -> Vec<OutPoint> {
