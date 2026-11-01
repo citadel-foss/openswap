@@ -4287,6 +4287,7 @@ mod tests {
     /// so anything `init_taker_config` fails to write is lost at the next
     /// start. For the Lightning settings that would mean a taker restarting
     /// without a backend, unable to recover a swap still in flight.
+    /// A dead control port fails init by default, and not with the opt-out.
     #[cfg(not(feature = "integration-test"))]
     #[test]
     fn tor_check_can_be_skipped_for_wallet_only_use() {

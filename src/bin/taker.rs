@@ -1065,6 +1065,7 @@ mod tests {
         assert_eq!(backup.file_name, "w1");
     }
 
+    /// Wallet and recovery commands skip the Tor check; market commands keep it.
     #[test]
     fn only_market_commands_need_tor() {
         let needs = |args: &[&str]| parse(args).unwrap().command.needs_tor();
