@@ -603,8 +603,15 @@ mod tests {
             &[coin(2)]
         )));
 
-        // A free coin gets past the check; this wallet has no backend to sign with.
-        assert!(!refused(wallet.spend_from_wallet(1.0, to, &[coin(3)])));
+        // A free coin passes the check and reaches the block-height query that
+        // `spend_coins` makes for the locktime; this wallet's backend is offline,
+        // so that query, and nothing earlier, is what fails.
+        let result = wallet.spend_from_wallet(1.0, to, &[coin(3)]);
+        assert!(
+            matches!(result, Err(WalletError::Rpc(_))),
+            "free coin should fail only at the backend, got {:?}",
+            result
+        );
     }
 
     #[test]
