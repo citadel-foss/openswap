@@ -1533,26 +1533,58 @@ impl Blockchain for Electrum {
             .filter(|spk| !matches!(state.wallet_scripts.get(*spk), Some(Some(_))))
             .cloned()
             .collect();
-        let mut watcher_answers = HashMap::new();
+        let query_connection = state.wallet_connection;
+        drop(guard);
+
+        // These are the slowest calls in a wallet sync. Do not hold the
+        // notifier mutex while waiting for the server: the watchtower needs it
+        // to drain spend and block notifications. A generation check below
+        // prevents an answer from an old connection being cached as subscribed
+        // state on a replacement connection.
+        let mut fetched_answers = HashMap::new();
         for chunk in stale.chunks(LIST_UNSPENT_BATCH) {
             let results = self.call(LIST_UNSPENT, |c| batch_list_unspent_signed(c, chunk))?;
             for (spk, entries) in chunk.iter().zip(results) {
-                match state.wallet_scripts.get_mut(spk) {
-                    Some(answer) => *answer = Some(entries),
-                    None => {
-                        watcher_answers.insert(spk, entries);
-                    }
+                fetched_answers.insert(spk.clone(), entries);
+            }
+        }
+
+        let mut guard = lock_debug!(self.notifier.lock()).map_err(poisoned)?;
+        let state = &mut *guard;
+        if state.wallet_connection != query_connection
+            || self.reconnects.load(Ordering::Relaxed) != query_connection
+        {
+            return Err(electrum_err(
+                "electrum connection changed during listunspent; retrying avoids mixing snapshots"
+                    .to_string(),
+            ));
+        }
+        for (spk, entries) in &fetched_answers {
+            // A watcher may have claimed the script while the mutex was
+            // released. Its subscription owns notifications from now on,
+            // so leave wallet subscription state out of the way.
+            if !state.subscriptions.contains_key(spk) {
+                if let Some(answer) = state.wallet_scripts.get_mut(spk) {
+                    *answer = Some(entries.clone());
                 }
             }
         }
 
+        // Snapshot answers and release the notifier before validating and
+        // converting potentially large result sets.
+        let mut answers = fetched_answers;
+        for script in &watched {
+            if let Some(Some(entries)) = state.wallet_scripts.get(script) {
+                answers
+                    .entry(script.clone())
+                    .or_insert_with(|| entries.clone());
+            }
+        }
+        drop(guard);
+
         let mut out = Vec::new();
         for script in &watched {
-            let entries = state
-                .wallet_scripts
-                .get(script)
-                .and_then(Option::as_ref)
-                .or_else(|| watcher_answers.get(script));
+            let entries = answers.get(script);
             for e in entries.into_iter().flatten() {
                 // A value past 21M BTC is a server lie; letting it through
                 // would panic the `Amount` folds in `get_balances` on every sync.
