@@ -17,7 +17,7 @@ use crate::{
             AckSwapDetails, FidelityProof, GetOffer, Hello, MakerToTakerMessage, Offer,
             ProtocolVersion, SwapDetails, TakerToMakerMessage, UnsupportedMessage,
         },
-        features::{check_bounds, check_pins, supported, unmet_at_hello},
+        features::{check_names, check_pins, supported, unmet_at_hello},
         legacy_messages::LegacyTakerMessage,
         taproot_messages::TaprootTakerMessage,
     },
@@ -1099,7 +1099,7 @@ fn handle_hello<M: Maker>(
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     state.expect_phase(&[SwapPhase::AwaitingHello])?;
 
-    if let Err(reason) = check_bounds(&hello.features) {
+    if let Err(reason) = check_names(&hello.features) {
         return Ok(Some(MakerToTakerMessage::Unsupported(UnsupportedMessage {
             what: "Hello".to_string(),
             reason,
