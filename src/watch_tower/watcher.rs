@@ -518,6 +518,21 @@ impl<R: Role> Watcher<R> {
                 log::info!("watch rebuild rescan aborted before funding lookup: shutdown");
                 return Ok(());
             }
+            // A currently unspent output cannot have a confirmed spender, so
+            // it contributes nothing to the recovery range. This cheap UTXO
+            // lookup avoids replaying the whole chain on the common restart
+            // where every rebuilt contract is still live. On an inconclusive
+            // lookup, fall through to the conservative block scan.
+            match self
+                .blockchain
+                .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+            {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(e) => log::warn!(
+                    "UTXO lookup failed before rebuild scan for {outpoint}: {e}; scanning conservatively"
+                ),
+            }
             match self.blockchain.tx_block_height(&outpoint.txid) {
                 Ok(Some(height)) => {
                     oldest = Some(oldest.map_or(height, |old| old.min(height)));
@@ -1489,6 +1504,34 @@ mod tests {
             .into_iter()
             .find(|watch| watch.outpoint == outpoint)
             .and_then(|watch| watch.spent_tx)
+    }
+
+    #[test]
+    fn rebuild_skips_block_scan_when_every_watch_is_still_unspent() {
+        let node = Arc::new(Mutex::new(Node::default()));
+        node.lock().unwrap().mine(Vec::new());
+        let (url, calls) = mock_core_rpc({
+            let node = node.clone();
+            move |method, params| {
+                let node = node.lock().unwrap();
+                if method == "gettxout" {
+                    return Ok(unspent_output(&node));
+                }
+                node.answer(method, params)
+            }
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        let watch = (
+            OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            ScriptBuf::new(),
+        );
+
+        watcher.rescan_for_missed_spends(&[watch]).unwrap();
+
+        assert_eq!(calls.lock().unwrap().as_slice(), ["gettxout"]);
     }
 
     /// Core dropped `rawtx` seq 1, the spend of a watched outpoint. The gap in
