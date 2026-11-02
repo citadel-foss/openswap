@@ -1198,6 +1198,26 @@ fn retry_fetch(attempts: &mut HashMap<Txid, u8>, txid: Txid, cap: u8) -> bool {
     *tries <= cap
 }
 
+/// Returns Core-compatible oldest-first output for the requested newest-first
+/// window, sorting no more than `skip + count` history entries.
+fn transaction_page(heights: HashMap<Txid, i32>, skip: usize, count: usize) -> Vec<(Txid, i32)> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut ordered: Vec<(Txid, i32)> = heights.into_iter().collect();
+    let rank = |height: i32| if height > 0 { height } else { i32::MAX };
+    let compare = |a: &(Txid, i32), b: &(Txid, i32)| rank(b.1).cmp(&rank(a.1)).then(a.0.cmp(&b.0));
+    let window_end = skip.saturating_add(count);
+    if ordered.len() > window_end {
+        ordered.select_nth_unstable_by(window_end, compare);
+        ordered.truncate(window_end);
+    }
+    ordered.sort_by(compare);
+    let mut page: Vec<_> = ordered.into_iter().skip(skip).take(count).collect();
+    page.reverse();
+    page
+}
+
 impl Blockchain for Electrum {
     fn is_electrum(&self) -> bool {
         true
@@ -1680,6 +1700,11 @@ impl Blockchain for Electrum {
         skip: Option<usize>,
         _include_watchonly: Option<bool>,
     ) -> Result<Vec<ListTransactionResult>, WalletError> {
+        let count = count.unwrap_or(10);
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let skip = skip.unwrap_or(0);
         let watched: Vec<ScriptBuf> = lock_debug!(self.watched.lock())
             .map_err(poisoned)?
             .iter()
@@ -1704,16 +1729,10 @@ impl Blockchain for Electrum {
 
         // Page over the txid list before fetching anything, so a long history
         // costs one batched round-trip instead of a `transaction.get` per entry.
-        let mut ordered: Vec<(Txid, i32)> = heights.into_iter().collect();
-        let rank = |height: i32| if height > 0 { height } else { i32::MAX };
-        ordered.sort_by(|a, b| rank(b.1).cmp(&rank(a.1)).then(a.0.cmp(&b.0)));
-        let mut page: Vec<(Txid, i32)> = ordered
-            .into_iter()
-            .skip(skip.unwrap_or(0))
-            .take(count.unwrap_or(10))
-            .collect();
-        // Core hands back the requested window oldest-first.
-        page.reverse();
+        // Partition first and sort only the requested prefix: callers usually
+        // ask for ten entries, so a large wallet history does not pay O(n log n)
+        // just to discard almost all of it.
+        let page = transaction_page(heights, skip, count);
 
         // The page's txs, then the txs their inputs spend, each in batched
         // round-trips; the per-tx reads below are then answered from the cache.
@@ -2130,6 +2149,28 @@ pub(crate) mod tests {
             socks5: socks5.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn transaction_history_pages_are_ordered_without_sorting_the_discarded_tail() {
+        let txid = |n| Txid::from_byte_array([n; 32]);
+        let heights = HashMap::from([
+            (txid(1), 10),
+            (txid(2), 20),
+            (txid(3), 30),
+            (txid(4), 0),
+            (txid(5), -1),
+        ]);
+        // Mempool entries rank newest; the returned Core-style page is reversed.
+        assert_eq!(
+            transaction_page(heights.clone(), 0, 3),
+            vec![(txid(3), 30), (txid(5), -1), (txid(4), 0)]
+        );
+        assert_eq!(
+            transaction_page(heights.clone(), 2, 2),
+            vec![(txid(2), 20), (txid(3), 30)]
+        );
+        assert!(transaction_page(heights, usize::MAX, 10).is_empty());
     }
 
     fn read_request(reader: &mut BufReader<std::net::TcpStream>) -> Value {
