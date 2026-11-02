@@ -1548,37 +1548,55 @@ impl Blockchain for Electrum {
             }
         }
 
-        let stale: Vec<ScriptBuf> = watched
+        let mut stale: Vec<ScriptBuf> = watched
             .iter()
             .filter(|spk| !matches!(state.wallet_scripts.get(*spk), Some(Some(_))))
             .cloned()
             .collect();
-        let query_connection = state.wallet_connection;
+        let mut query_connection = state.wallet_connection;
         drop(guard);
 
         // These are the slowest calls in a wallet sync. Do not hold the
         // notifier mutex while waiting for the server: the watchtower needs it
-        // to drain spend and block notifications. A generation check below
-        // prevents an answer from an old connection being cached as subscribed
-        // state on a replacement connection.
-        let mut fetched_answers = HashMap::new();
-        for chunk in stale.chunks(LIST_UNSPENT_BATCH) {
-            let results = self.call(LIST_UNSPENT, |c| batch_list_unspent_signed(c, chunk))?;
-            for (spk, entries) in chunk.iter().zip(results) {
-                fetched_answers.insert(spk.clone(), entries);
+        // to drain spend and block notifications. If a call reconnects, throw
+        // away the mixed-generation answers and repeat the whole snapshot on
+        // the replacement connection instead of surfacing a transient error.
+        let mut snapshot_retries = 0_u8;
+        let (fetched_answers, mut guard) = loop {
+            let mut fetched_answers = HashMap::new();
+            for chunk in stale.chunks(LIST_UNSPENT_BATCH) {
+                let results = self.call(LIST_UNSPENT, |c| batch_list_unspent_signed(c, chunk))?;
+                for (spk, entries) in chunk.iter().zip(results) {
+                    fetched_answers.insert(spk.clone(), entries);
+                }
             }
-        }
 
-        let mut guard = lock_debug!(self.notifier.lock()).map_err(poisoned)?;
+            let mut guard = lock_debug!(self.notifier.lock()).map_err(poisoned)?;
+            let connection = self.reconnects.load(Ordering::Relaxed);
+            if guard.wallet_connection == query_connection && connection == query_connection {
+                break (fetched_answers, guard);
+            }
+
+            guard.wallet_scripts.clear();
+            guard.wallet_connection = connection;
+            drop(guard);
+
+            snapshot_retries = snapshot_retries.saturating_add(1);
+            if snapshot_retries > self.config.max_retries.max(1) {
+                return Err(electrum_err(format!(
+                    "electrum connection changed during listunspent snapshot {snapshot_retries} times"
+                )));
+            }
+            log::debug!(
+                "electrum connection changed during listunspent; retrying snapshot on generation {connection}"
+            );
+            query_connection = connection;
+            // Cached answers belonged to the old connection. Query every
+            // wallet script directly; the next sync will re-arm subscriptions.
+            stale.clone_from(&watched);
+        };
+
         let state = &mut *guard;
-        if state.wallet_connection != query_connection
-            || self.reconnects.load(Ordering::Relaxed) != query_connection
-        {
-            return Err(electrum_err(
-                "electrum connection changed during listunspent; retrying avoids mixing snapshots"
-                    .to_string(),
-            ));
-        }
         for (spk, entries) in &fetched_answers {
             // A watcher may have claimed the script while the mutex was
             // released. Its subscription owns notifications from now on,
