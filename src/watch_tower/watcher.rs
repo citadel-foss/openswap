@@ -544,7 +544,12 @@ impl<R: Role> Watcher<R> {
                 Err(e) => log::warn!("funding height lookup failed for {outpoint}: {e}"),
             }
         }
-        let Some(from) = oldest else { return Ok(()) };
+        let Some(from) = oldest else {
+            // Keep the usual rescan marker so operators can tell that rebuild
+            // recovery completed, even when there is no range worth replaying.
+            log::info!("Rescanning blocks skipped: every rebuilt watch is still unspent");
+            return Ok(());
+        };
         self.scan_blocks(from).map_err(|e| {
             log::error!("block rescan from height {from} failed: {e:?}");
             format!("block rescan from height {from} failed: {e:?}")
