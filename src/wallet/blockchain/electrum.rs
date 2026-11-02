@@ -216,6 +216,13 @@ fn backoff_after(attempt: u8, last: &electrum_client::Error) -> Duration {
     }
 }
 
+/// Whether retrying `last` needs a fresh socket. A rate limit is a reply from
+/// the current server session, so keeping that session preserves subscriptions
+/// and lets multi-batch wallet reads retain the work completed before it.
+fn reconnect_before_retry(last: &electrum_client::Error) -> bool {
+    !is_rate_limited(last)
+}
+
 /// True only for protocol errors that explicitly say the transaction is
 /// unknown. Electrs and Fulcrum usually use bitcoind's wording, while some
 /// servers return the shorter "missing transaction" message.
@@ -407,6 +414,10 @@ pub struct Electrum {
     network: bitcoin::Network,
     /// Watchtower notification bookkeeping.
     notifier: Mutex<NotifierState>,
+    /// Serializes complete wallet UTXO refreshes. Individual RPC calls already
+    /// serialize on `inner`, but allowing two refreshes to interleave can let an
+    /// older answer overwrite a newer one after the newer call drains its alert.
+    wallet_refresh: Mutex<()>,
     /// Set by the owner on shutdown so a retry loop stuck in backoff aborts
     /// instead of stalling the join.
     shutdown: Arc<AtomicBool>,
@@ -751,6 +762,7 @@ impl Electrum {
                 last_hash: Some(last_hash),
                 ..Default::default()
             }),
+            wallet_refresh: Mutex::new(()),
             shutdown,
             cache: Mutex::new(Cache::default()),
             requests: Mutex::new(HashMap::new()),
@@ -921,16 +933,22 @@ impl Electrum {
         // The connection failed and took its server-side subscriptions with
         // it, whether or not a reconnect below succeeds. A rate limit is the
         // server answering, so the subscriptions still stand.
-        if !is_rate_limited(&last) {
+        if reconnect_before_retry(&last) {
             self.needs_rearm.store(true, Ordering::SeqCst);
         }
 
         for attempt in 1..=self.config.max_retries {
             let backoff = backoff_after(attempt, &last);
+            let reconnect = reconnect_before_retry(&last);
             // An idle server dropping the session is routine, so only the first
             // attempt is a warning; the rest are noise until we actually fail.
+            let action = if reconnect {
+                "reconnecting"
+            } else {
+                "retrying on the current connection"
+            };
             let msg = format!(
-                "electrum call to {} failed ({last:?}); reconnecting in {}s (attempt {attempt}/{})",
+                "electrum call to {} failed ({last:?}); {action} in {}s (attempt {attempt}/{})",
                 self.config.url,
                 backoff.as_secs(),
                 self.config.max_retries
@@ -955,14 +973,21 @@ impl Electrum {
                 remaining -= slice;
             }
 
-            if let Err(e) = self.reconnect_client() {
-                last = e;
-                continue;
+            if reconnect {
+                if let Err(e) = self.reconnect_client() {
+                    last = e;
+                    continue;
+                }
             }
             match self.try_call(method, &f) {
                 Ok(v) => return Ok(v),
                 Err(e) if is_terminal(&e) => return Err(e.into()),
-                Err(e) => last = e,
+                Err(e) => {
+                    if reconnect_before_retry(&e) {
+                        self.needs_rearm.store(true, Ordering::SeqCst);
+                    }
+                    last = e;
+                }
             }
         }
 
@@ -1478,6 +1503,10 @@ impl Blockchain for Electrum {
         minconf: Option<usize>,
         maxconf: Option<usize>,
     ) -> Result<Vec<ListUnspentResultEntry>, WalletError> {
+        // Keep the whole read/validate/cache sequence ordered. Serializing only
+        // socket calls is insufficient: an older refresh can otherwise resume
+        // after a newer one and mark stale answers clean.
+        let _refresh = lock_debug!(self.wallet_refresh.lock()).map_err(poisoned)?;
         let watched: Vec<ScriptBuf> = lock_debug!(self.watched.lock())
             .map_err(poisoned)?
             .iter()
@@ -1535,7 +1564,12 @@ impl Blockchain for Electrum {
                     // The client records a subscription before the server confirms it and
                     // refuses to arm it again. Rebuild, and ask every script directly.
                     log::warn!("electrum wallet subscribe failed: {e:?}");
-                    let _ = self.reconnect_client();
+                    if self.reconnect_client().is_ok() {
+                        // Cached answers are cleared below, so direct queries can
+                        // belong to the replacement generation immediately instead
+                        // of completing once and then being discarded as stale.
+                        state.wallet_connection = self.reconnects.load(Ordering::Relaxed);
+                    }
                     state.wallet_scripts.clear();
                     break;
                 }
@@ -2694,6 +2728,38 @@ pub(crate) mod tests {
         assert_eq!(subscribes, 2, "the retry never asked the server");
     }
 
+    /// Once a refused wallet subscription rebuilds the connection, its direct
+    /// fallback queries already belong to that replacement generation and must
+    /// not be thrown away and repeated.
+    #[test]
+    fn a_refused_wallet_subscription_queries_each_script_once() {
+        let server = mock_electrum(move |method, _params| match method {
+            "blockchain.scripthash.subscribe" => {
+                Err(json!({ "code": 1, "message": "subscription refused" }))
+            }
+            "blockchain.scripthash.listunspent" => Ok(json!([])),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        backend.watch_script(&ScriptBuf::from_bytes(vec![0x51]), None);
+
+        assert!(backend.list_unspent(None, None).unwrap().is_empty());
+        let list_unspent_calls = server
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|method| method.as_str() == LIST_UNSPENT)
+            .count();
+        assert_eq!(list_unspent_calls, 1);
+        assert_eq!(backend.reconnect_count(), 1);
+    }
+
     /// A dropped connection takes its subscriptions with it, whether or not a
     /// reconnect follows. Until they are re-armed and replayed, nothing heard
     /// on them can be trusted.
@@ -2921,6 +2987,45 @@ pub(crate) mod tests {
             !overlapped,
             "two requests reached the shared electrum socket concurrently"
         );
+    }
+
+    /// Socket calls being serialized is not enough: a second wallet refresh
+    /// must not enter between the first one's calls and cache an answer that the
+    /// older refresh can subsequently overwrite.
+    #[test]
+    fn wallet_utxo_refreshes_are_serialized() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let server = {
+            let entered = entered.clone();
+            let release = release.clone();
+            mock_electrum(move |method, _params| match method {
+                "blockchain.scripthash.subscribe" => {
+                    entered.wait();
+                    release.wait();
+                    Ok(Value::Null)
+                }
+                method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+            })
+        };
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url,
+            max_retries: 0,
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        backend.watch_script(&ScriptBuf::from_bytes(vec![0x51]), None);
+
+        thread::scope(|scope| {
+            let refresh = scope.spawn(|| backend.list_unspent(None, None));
+            entered.wait();
+            assert!(
+                backend.wallet_refresh.try_lock().is_err(),
+                "the refresh lock was released while the snapshot was in flight"
+            );
+            release.wait();
+            assert!(refresh.join().unwrap().unwrap().is_empty());
+        });
     }
 
     #[test]
@@ -3212,6 +3317,7 @@ pub(crate) mod tests {
             assert!(is_rate_limited(e));
             assert!(!is_terminal(e));
             assert_eq!(backoff_after(1, e), RATE_LIMIT_BACKOFF);
+            assert!(!reconnect_before_retry(e));
         }
         // Any other protocol error is still an answer, not a reason to wait.
         let other = Error::Protocol(json!({ "code": -32600, "message": "bad request" }));
@@ -3219,6 +3325,7 @@ pub(crate) mod tests {
         assert!(is_terminal(&other));
         let transport = Error::Message("socket closed".into());
         assert_eq!(backoff_after(1, &transport), retry_backoff(1));
+        assert!(reconnect_before_retry(&transport));
     }
 
     #[test]
