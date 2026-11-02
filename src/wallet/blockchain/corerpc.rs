@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     convert::TryFrom,
-    net::{TcpStream, ToSocketAddrs},
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::Mutex,
     time::Duration,
 };
@@ -403,17 +403,34 @@ impl CoreRPC {
             ));
         }
 
-        // The node's own list of ZMQ publishers must carry both topics we subscribe to.
+        // The node's own list of ZMQ publishers must carry both topics we
+        // subscribe to, on the endpoint we subscribe to.
         #[derive(Deserialize)]
         struct ZmqNotification {
             #[serde(rename = "type")]
             kind: String,
+            address: String,
         }
         let pubs: Vec<ZmqNotification> = self.rpc.call("getzmqnotifications", &[])?;
         for topic in ["pubrawtx", "pubrawblock"] {
-            if !pubs.iter().any(|p| p.kind == topic) {
+            let addresses: Vec<&str> = pubs
+                .iter()
+                .filter(|p| p.kind == topic)
+                .map(|p| p.address.as_str())
+                .collect();
+            if addresses.is_empty() {
                 return Err(WalletError::Zmq(format!(
                     "Bitcoin Core does not publish {topic}; set -zmq{topic}=<addr>"
+                )));
+            }
+            if !addresses
+                .iter()
+                .any(|published| zmq_endpoint_matches(published, &self.config.zmq_addr))
+            {
+                return Err(WalletError::Zmq(format!(
+                    "Bitcoin Core publishes {topic} on {}, but --zmq is {}",
+                    addresses.join(", "),
+                    self.config.zmq_addr
                 )));
             }
         }
@@ -742,6 +759,26 @@ impl Blockchain for CoreRPC {
     }
 }
 
+/// Whether a subscriber at `configured` reaches a publisher bound at `published`.
+/// A bind on the unspecified address (`0.0.0.0`, `[::]`) listens on every host.
+fn zmq_endpoint_matches(published: &str, configured: &str) -> bool {
+    let resolve = |endpoint: &str| -> Vec<SocketAddr> {
+        endpoint
+            .strip_prefix("tcp://")
+            .and_then(|hostport| hostport.to_socket_addrs().ok())
+            .map(Iterator::collect)
+            .unwrap_or_default()
+    };
+    let wanted = resolve(configured);
+    published == configured
+        || resolve(published).iter().any(|bound| {
+            wanted.iter().any(|addr| {
+                bound.port() == addr.port()
+                    && (bound.ip().is_unspecified() || bound.ip() == addr.ip())
+            })
+        })
+}
+
 /// List the wallet names known to the node (`listwalletdir`).
 fn list_wallet_dir(client: &Client) -> Result<Vec<String>, WalletError> {
     #[derive(Deserialize)]
@@ -808,6 +845,62 @@ pub(crate) mod tests {
             reply.len()
         )
         .and_then(|()| writer.flush());
+    }
+
+    /// A node with `-txindex` whose ZMQ topics are published on `rawtx` and
+    /// `rawblock`, checked against `zmq_addr`.
+    fn check_zmq(zmq_addr: &str, rawtx: &str, rawblock: &str) -> Result<(), WalletError> {
+        let (core, server) = mock_core(vec![
+            (
+                "getindexinfo",
+                json!({ "txindex": { "synced": true, "best_block_height": 0 } }),
+            ),
+            (
+                "getzmqnotifications",
+                json!([
+                    { "type": "pubrawtx", "address": rawtx, "hwm": 1000 },
+                    { "type": "pubrawblock", "address": rawblock, "hwm": 1000 },
+                ]),
+            ),
+        ]);
+        let core = CoreRPC::new(&CoreRpcConfig {
+            zmq_addr: zmq_addr.to_string(),
+            ..core.config.clone()
+        })
+        .unwrap();
+        let result = core.check_node_requirements();
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn zmq_address_mismatch_is_reported() {
+        let zmq = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let configured = format!("tcp://{}", zmq.local_addr().unwrap());
+        let rawblock = format!("tcp://{}", other.local_addr().unwrap());
+        let err = check_zmq(&configured, &configured, &rawblock).unwrap_err();
+        assert!(matches!(err, WalletError::Zmq(_)), "{:?}", err);
+        let message = format!("{err:?}");
+        assert!(message.contains("pubrawblock"), "{}", message);
+        assert!(message.contains(&configured), "{}", message);
+        assert!(message.contains(&rawblock), "{}", message);
+    }
+
+    #[test]
+    fn zmq_wildcard_bind_matches() {
+        let zmq = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = zmq.local_addr().unwrap().port();
+        let wildcard = format!("tcp://0.0.0.0:{port}");
+        check_zmq(&format!("tcp://127.0.0.1:{port}"), &wildcard, &wildcard).unwrap();
+    }
+
+    #[test]
+    fn zmq_hostname_matches_its_resolved_address() {
+        let zmq = TcpListener::bind("localhost:0").unwrap();
+        let port = zmq.local_addr().unwrap().port();
+        let published = format!("tcp://127.0.0.1:{port}");
+        check_zmq(&format!("tcp://localhost:{port}"), &published, &published).unwrap();
     }
 
     /// Serves one canned reply per JSON-RPC method, failing on any other.
