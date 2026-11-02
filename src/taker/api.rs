@@ -4283,10 +4283,6 @@ mod tests {
         assert!(!format!("{config:?}").contains("wallet-secret"));
     }
 
-    /// The CLI rebuilds `TakerInitConfig` from `config.toml` on every launch,
-    /// so anything `init_taker_config` fails to write is lost at the next
-    /// start. For the Lightning settings that would mean a taker restarting
-    /// without a backend, unable to recover a swap still in flight.
     /// A dead control port fails init by default, and not with the opt-out.
     #[cfg(not(feature = "integration-test"))]
     #[test]
@@ -4306,6 +4302,10 @@ mod tests {
         assert!(Taker::init_taker_config(&config.clone().without_tor_check(), dir.path()).is_ok());
     }
 
+    /// The CLI rebuilds `TakerInitConfig` from `config.toml` on every launch,
+    /// so anything `init_taker_config` fails to write is lost at the next
+    /// start. For the Lightning settings that would mean a taker restarting
+    /// without a backend, unable to recover a swap still in flight.
     #[test]
     fn init_taker_config_persists_lightning_settings() {
         let dir = std::env::temp_dir().join(format!(
