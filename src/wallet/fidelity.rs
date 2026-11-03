@@ -273,6 +273,24 @@ fn read_pubkey_from_fidelity_script(redeemscript: &ScriptBuf) -> Result<PublicKe
     }
 }
 
+/// Adds a live bond's valuation to its `show-fidelity` entry. A bond whose
+/// lock has ended but that is not redeemed yet is listed as expired with no
+/// value, instead of failing the whole listing.
+fn list_bond_valuation(
+    bond_info: &mut serde_json::Value,
+    valuation: Result<Amount, WalletError>,
+) -> Result<(), WalletError> {
+    match valuation {
+        Ok(bond_value) => bond_info["bond_value"] = serde_json::json!(bond_value),
+        Err(WalletError::Fidelity(FidelityError::BondLocktimeExpired)) => {
+            bond_info["status"] = serde_json::json!("Expired");
+            bond_info["bond_value"] = serde_json::json!(Amount::ZERO);
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 /// When a bond matures, as a timestamp.
 ///
 /// A fidelity locktime is height-based everywhere else it is handled, so a
@@ -505,8 +523,8 @@ impl Wallet {
                             t
                         }
                     };
-                    let bond_value = self.calculate_bond_value(bond, tip_height, tip_time)?;
-                    bond_info["bond_value"] = serde_json::json!(bond_value);
+                    let valuation = self.calculate_bond_value(bond, tip_height, tip_time);
+                    list_bond_valuation(&mut bond_info, valuation)?;
                 }
 
                 Ok(bond_info)
