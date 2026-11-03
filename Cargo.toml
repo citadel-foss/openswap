@@ -57,7 +57,9 @@ tar = {version = "0.4.43"}
 zip = "2"
 # No `electrs_*` feature: those enable electrsd's `download`, which needs the yanked
 # `zip` 0.6. The tests take the binary from ELECTRS_EXEC; see tests/install_electrs.sh.
-# The crate itself does not build on Windows. Windows tests spawn ELECTRS_EXEC.
+# electrsd 0.28 binds 0.0.0.0 and then connects to that address, which Windows
+# rejects, so it stays in the unix dev-dependencies below. Windows tests spawn
+# ELECTRS_EXEC. See tests/test_framework/procs/electrs.rs.
 openswap-test-macros = { path = "tests/macros" }
 
 [target.'cfg(unix)'.dev-dependencies]

@@ -2673,7 +2673,11 @@ pub(crate) mod tests {
             let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
             perms.set_mode(0o555);
             std::fs::set_permissions(dir.path(), perms).unwrap();
-            assert!(book.write_to_disk(&path).is_err());
+            // Root, or CAP_DAC_OVERRIDE, can still create the staging file.
+            // Skip the failure assert then; the bytes check below still runs.
+            if std::fs::File::create(dir.path().join(".write-probe")).is_err() {
+                assert!(book.write_to_disk(&path).is_err());
+            }
         }
 
         #[cfg(windows)]
