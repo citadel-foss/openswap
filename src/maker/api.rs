@@ -1422,7 +1422,8 @@ impl MakerServer {
     ///
     /// With `fund_replacement` false, a still-locked bond that takers reject
     /// ends setup with [`MakerError::FidelityBondTooLate`] instead of waiting
-    /// for funds to replace it, so startup is not held up.
+    /// for funds to replace it, so startup is not held up. With it true, setup
+    /// keeps funding bonds until one that takers accept confirms.
     pub fn setup_fidelity_bond(
         &self,
         maker_address: &str,
@@ -1688,10 +1689,19 @@ impl MakerServer {
                             .update_fidelity_bond_conf_details(index, conf_height)
                             .map_err(MakerError::Wallet)?;
 
-                        // Not retried here: waiting for funds for a replacement
-                        // would hold up startup. The renewal loop funds one.
                         if !self.bond_timelock_accepted(locktime, Some(conf_height)) {
-                            return Err(MakerError::FidelityBondTooLate { index, conf_height });
+                            // At startup, waiting for funds for a replacement
+                            // would hold up serving; the renewal loop funds one.
+                            if !fund_replacement {
+                                return Err(MakerError::FidelityBondTooLate { index, conf_height });
+                            }
+                            log::warn!(
+                                "[{}] Fidelity bond {} confirmed at height {}, too late for its timelock; funding a replacement",
+                                self.config.network_port,
+                                index,
+                                conf_height
+                            );
+                            continue;
                         }
 
                         log::info!(
