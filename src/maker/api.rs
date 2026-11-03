@@ -1329,16 +1329,17 @@ impl MakerServer {
         // Snapshot the pending bonds once: an unrecoverable bond stays
         // pending in the wallet, so re-finding inside the loop would spin
         // on it forever.
-        let mut pending: Vec<(u32, bitcoin::Txid)> = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .store
-            .fidelity_bond
-            .iter()
-            .filter(|b| !b.is_spent && b.conf_height.is_none())
-            .map(|b| (b.bond_index, b.outpoint.txid))
-            .collect();
+        let mut pending: Vec<(u32, bitcoin::Txid, bitcoin::absolute::LockTime)> =
+            lock_debug!(self.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                .store
+                .fidelity_bond
+                .iter()
+                .filter(|b| !b.is_spent && b.conf_height.is_none())
+                .map(|b| (b.bond_index, b.outpoint.txid, b.lock_time))
+                .collect();
         if !live_bond {
-            for (_, txid) in &pending {
+            for (_, txid, _) in &pending {
                 log::info!(
                     "[{}] Found unconfirmed fidelity bond {}, waiting for confirmation instead of creating a new one",
                     self.config.network_port,
@@ -1353,7 +1354,7 @@ impl MakerServer {
         let chain = self.bond_chain()?;
         while !pending.is_empty() {
             let mut unconfirmed = Vec::new();
-            for (index, txid) in pending {
+            for (index, txid, lock_time) in pending {
                 match self.check_bond_confirmation(index, &chain) {
                     Ok(Some(conf_height)) => {
                         lock_debug!(self.wallet.write())
@@ -1366,9 +1367,13 @@ impl MakerServer {
                             txid,
                             conf_height
                         );
-                        live_bond = true;
+                        // One that confirmed too late is never advertised, so
+                        // it must not end the wait for the other pending bonds.
+                        if self.bond_timelock_accepted(lock_time, Some(conf_height)) {
+                            live_bond = true;
+                        }
                     }
-                    Ok(None) => unconfirmed.push((index, txid)),
+                    Ok(None) => unconfirmed.push((index, txid, lock_time)),
                     // The bond was evicted and there is no stored transaction to
                     // rebroadcast: it can never confirm. Losing the bond must not
                     // take the maker down — log it and start up anyway.
@@ -1387,7 +1392,7 @@ impl MakerServer {
             }
             pending = unconfirmed;
             if live_bond {
-                for (_, txid) in &pending {
+                for (_, txid, _) in &pending {
                     log::info!(
                         "[{}] Fidelity bond {} still unconfirmed; advertising the live bond meanwhile",
                         self.config.network_port,
