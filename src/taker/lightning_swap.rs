@@ -899,8 +899,14 @@ impl Taker {
         let out_locktime = params.locktime.unwrap_or(DEFAULT_SWAP_OUT_LOCKTIME);
 
         // ---- Hop 2 first: maker 1 cannot pay an invoice that does not exist ----
-        let address2 =
-            self.select_lightning_maker(params.second_maker.clone(), false, params.amount, None)?;
+        // Most makers serve both directions, so an auto-picked hop must skip
+        // the maker the other hop uses.
+        let address2 = self.select_lightning_maker(
+            params.second_maker.clone(),
+            false,
+            params.amount,
+            params.first_maker.as_deref(),
+        )?;
         let mut conn2 = self.connect_ln_maker(&address2, false, params.amount)?;
         let expected_fee2 = advertised_fee(&conn2.ln_offer, params.amount);
 
@@ -945,8 +951,12 @@ impl Taker {
         }
 
         // ---- Hop 1: hand maker 2's invoice to maker 1 ----
-        let address1 =
-            self.select_lightning_maker(params.first_maker.clone(), true, middle_amount, None)?;
+        let address1 = self.select_lightning_maker(
+            params.first_maker.clone(),
+            true,
+            middle_amount,
+            Some(&address2),
+        )?;
         if address1 == address2 {
             return Err(general(
                 "routed swap needs two distinct makers; one maker would see both ends",
