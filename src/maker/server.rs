@@ -349,6 +349,15 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             "[{}] Setting up fidelity bond...",
             maker.config.network_port
         );
+        // A reorg may have moved a bond since the last run, and the range
+        // check below reads the stored height.
+        if let Err(e) = refresh_fidelity_conf_heights(&maker) {
+            log::warn!(
+                "[{}] Could not refresh fidelity bond heights: {:?}",
+                maker.config.network_port,
+                e
+            );
+        }
         setup_startup_fidelity_bond(&maker, maker_address)?;
         spawn_nostr_broadcast_thread(&maker)?;
         log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
