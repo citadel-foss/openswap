@@ -14,7 +14,10 @@ use bitcoin::{
     secp256k1::{Keypair, Message, Secp256k1},
     Address, Amount, OutPoint, PublicKey, ScriptBuf, Transaction, Txid,
 };
-use bitcoind::bitcoincore_rpc::json::GetTransactionResultDetailCategory;
+use bitcoind::bitcoincore_rpc::{
+    json::GetTransactionResultDetailCategory, jsonrpc::error::Error as JsonRpcError,
+    Error as BitcoinRpcError,
+};
 use serde::{Deserialize, Serialize};
 use serde_cbor::Value;
 use std::{
@@ -483,6 +486,50 @@ impl FidelityBond {
     }
 }
 
+/// The backend's own answer to a broadcast it refused: Core's RPC error, or an
+/// Electrum server's error reply. A timeout or a dropped connection is no such
+/// answer and says nothing about whether the transaction went out.
+struct BroadcastRefusal {
+    code: Option<i64>,
+    message: String,
+}
+
+impl BroadcastRefusal {
+    /// The refusal only says the transaction is already in the mempool or a block.
+    fn is_already_known(&self) -> bool {
+        // RPC_VERIFY_ALREADY_IN_UTXO_SET, formerly RPC_VERIFY_ALREADY_IN_CHAIN.
+        self.code == Some(-27) || {
+            let message = self.message.to_ascii_lowercase();
+            message.contains("already in block chain")
+                || message.contains("already in mempool")
+                || message.contains("already in utxo set")
+                || message.contains("txn-already-in-mempool")
+                || message.contains("txn-already-known")
+        }
+    }
+}
+
+fn broadcast_refusal(error: &WalletError) -> Option<BroadcastRefusal> {
+    match error {
+        WalletError::Rpc(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(e))) => {
+            Some(BroadcastRefusal {
+                code: Some(i64::from(e.code)),
+                message: e.message.clone(),
+            })
+        }
+        WalletError::Electrum(electrum_client::Error::Protocol(reply)) => Some(BroadcastRefusal {
+            code: reply.get("code").and_then(serde_json::Value::as_i64),
+            message: reply
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| reply.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        _ => None,
+    }
+}
+
 // Wallet APIs related to fidelity bonds.
 impl Wallet {
     /// Get a reference to the fidelity bond store
@@ -737,29 +784,84 @@ impl Wallet {
 
         let tx = self.spend_coins(&coins, destination, feerate)?;
 
-        let txid = self.send_tx(&tx)?;
-
-        // Register this bond even if it is in mempool and not yet confirmed to avoid the edge case when the Maker server
-        // unexpectedly shutdown while it was waiting for the fidelity transaction confirmation.
-        // Otherwise the wallet wouldn't know about this bond in this case and would attempt to create a new bond again.
-        {
-            let bond = FidelityBond {
-                outpoint: OutPoint::new(txid, 0),
-                amount,
-                lock_time: locktime,
-                pubkey: fidelity_pubkey,
-                // `conf_height` is None because it can't be known before confirmation.
-                conf_height: None,
-                is_spent: false,
-                bond_index: index,
-                tx: Some(tx),
-                extra: BTreeMap::new(),
-            };
-            self.store.fidelity_bond.push(bond);
-            self.save_to_disk()?;
-        }
+        let bond = FidelityBond {
+            outpoint: OutPoint::new(tx.compute_txid(), 0),
+            amount,
+            lock_time: locktime,
+            pubkey: fidelity_pubkey,
+            // `conf_height` is None because it can't be known before confirmation.
+            conf_height: None,
+            is_spent: false,
+            bond_index: index,
+            tx: Some(tx),
+            extra: BTreeMap::new(),
+        };
+        let txid = self.register_and_broadcast_bond(bond)?;
 
         Ok((index, txid))
+    }
+
+    /// Saves `bond`, then broadcasts its transaction.
+    ///
+    /// Saving first means a funded bond output always has a record. A maker
+    /// that dies mid-broadcast, or loses the backend's reply, adopts the bond
+    /// on restart, or rebroadcasts it from the stored transaction, instead of
+    /// losing track of it and funding a second one.
+    ///
+    /// The record is dropped again only when the backend refused the
+    /// transaction and does not know it. When the outcome cannot be told, the
+    /// record stays and the error is returned; startup then confirms the bond
+    /// or rebroadcasts it.
+    pub(super) fn register_and_broadcast_bond(
+        &mut self,
+        bond: FidelityBond,
+    ) -> Result<Txid, WalletError> {
+        let txid = bond.outpoint.txid;
+        let index = bond.bond_index;
+        let tx = bond
+            .tx
+            .clone()
+            .ok_or(FidelityError::BondTransactionMissing { index })?;
+
+        self.store.fidelity_bond.push(bond);
+        if let Err(e) = self.save_to_disk() {
+            self.store.fidelity_bond.retain(|b| b.bond_index != index);
+            return Err(e);
+        }
+
+        let Err(error) = self.send_tx(&tx) else {
+            return Ok(txid);
+        };
+        let refusal = broadcast_refusal(&error);
+        if refusal
+            .as_ref()
+            .is_some_and(BroadcastRefusal::is_already_known)
+        {
+            log::info!("Fidelity bond tx {txid} was already broadcast: {error:?}");
+            return Ok(txid);
+        }
+        match self.blockchain.is_tx_unknown(&txid) {
+            Ok(false) => {
+                log::warn!("Fidelity bond tx {txid} reached the backend despite {error:?}");
+                Ok(txid)
+            }
+            Ok(true) if refusal.is_some() => {
+                self.store.fidelity_bond.retain(|b| b.bond_index != index);
+                if let Err(e) = self.save_to_disk() {
+                    log::error!(
+                        "Fidelity bond tx {txid} was refused, but dropping its record failed: {e:?}"
+                    );
+                }
+                Err(error)
+            }
+            unknown => {
+                log::warn!(
+                    "Fidelity bond tx {txid} may have been broadcast ({error:?}, lookup {unknown:?}); \
+                     keeping its record so startup confirms or rebroadcasts it"
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Update the confirmation height of a fidelity bond after it confirms.

@@ -7334,15 +7334,18 @@ mod mempool_deferral_tests {
         wallet::{
             blockchain::SCRIPT_CACHE_TTL,
             swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
+            FidelityBond,
         },
     };
     use bitcoin::{
+        absolute::LockTime,
         consensus::encode::{deserialize_hex, serialize_hex},
         hashes::Hash,
         Witness,
     };
     use bitcoind::tempfile::tempdir;
     use std::{
+        collections::BTreeMap,
         io::{BufRead, BufReader, Write as IoWrite},
         net::TcpListener,
         sync::{Arc, Mutex, RwLock},
@@ -7359,6 +7362,9 @@ mod mempool_deferral_tests {
         txs: HashMap<Txid, (Transaction, i64)>,
         broadcast: Vec<Txid>,
         reject_broadcast: bool,
+        /// Answers a broadcast with this error instead of its txid, after
+        /// taking the tx into the chain when the flag is set.
+        broadcast_error: Option<(Value, bool)>,
         /// Lookups of these txs fail as a down backend would, never as "unknown".
         fail_lookups: HashSet<Txid>,
         /// Every fee estimate, in sat/vB.
@@ -7374,6 +7380,7 @@ mod mempool_deferral_tests {
                     .collect(),
                 broadcast: Vec::new(),
                 reject_broadcast: false,
+                broadcast_error: None,
                 fail_lookups: HashSet::new(),
                 feerate: 1.0,
             }))
@@ -7490,6 +7497,12 @@ mod mempool_deferral_tests {
                                 }
                                 let tx: Transaction = deserialize_hex(param).unwrap();
                                 let txid = tx.compute_txid();
+                                if let Some((error, accepted)) = chain.broadcast_error.clone() {
+                                    if accepted {
+                                        chain.txs.insert(txid, (tx, TIP));
+                                    }
+                                    return json!({"jsonrpc": "2.0", "id": req["id"], "error": error});
+                                }
                                 chain.txs.insert(txid, (tx, TIP));
                                 chain.broadcast.push(txid);
                                 json!(txid.to_string())
@@ -8526,6 +8539,121 @@ mod mempool_deferral_tests {
         // A node with a higher increment rejects what the default accepts.
         assert!(!outbids(fee(100), fee(250), 150, 5.0));
         assert!(outbids(fee(100), fee(850), 150, 5.0));
+    }
+
+    /// A bond paying from `funding`, ready for broadcast.
+    fn unsent_bond(funding: &Transaction) -> FidelityBond {
+        let bond_tx = tx(
+            OutPoint::new(funding.compute_txid(), 0),
+            40_000,
+            ScriptBuf::new_p2wsh(&ScriptBuf::new().wscript_hash()),
+        );
+        FidelityBond {
+            outpoint: OutPoint::new(bond_tx.compute_txid(), 0),
+            amount: Amount::from_sat(40_000),
+            lock_time: LockTime::from_height(700).unwrap(),
+            pubkey: pubkey(9),
+            conf_height: None,
+            is_spent: false,
+            bond_index: 0,
+            tx: Some(bond_tx),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    /// The bonds the wallet file holds, as a restarted maker would read them.
+    fn saved_bonds(path: &Path) -> Vec<Txid> {
+        let (store, _) = WalletStore::read_from_disk(path, Some(PASSWORD.to_string())).unwrap();
+        store
+            .fidelity_bond
+            .iter()
+            .map(|bond| bond.outpoint.txid)
+            .collect()
+    }
+
+    /// Broadcasts a bond against a stub set up by `setup`, returning the
+    /// result and the bonds left in memory and on disk.
+    fn broadcast_bond(
+        setup: impl FnOnce(&mut StubChain, Txid),
+    ) -> (Result<Txid, WalletError>, Txid, Vec<Txid>, Vec<Txid>) {
+        let funding = tx(OutPoint::null(), 50_000, ScriptBuf::new());
+        let chain = StubChain::with(&[(&funding, 50)]);
+        let bond = unsent_bond(&funding);
+        let txid = bond.outpoint.txid;
+        setup(&mut chain.lock().unwrap(), txid);
+        let url = start_electrum_stub(chain);
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet.cbor");
+        let mut wallet = stub_wallet(&path, electrum(&url));
+
+        let result = wallet.register_and_broadcast_bond(bond);
+        let in_memory = wallet
+            .store
+            .fidelity_bond
+            .iter()
+            .map(|bond| bond.outpoint.txid)
+            .collect();
+        (result, txid, in_memory, saved_bonds(&path))
+    }
+
+    #[test]
+    fn a_broadcast_bond_is_saved_with_its_transaction() {
+        let (result, txid, in_memory, on_disk) = broadcast_bond(|_, _| {});
+        assert_eq!(result.unwrap(), txid);
+        assert_eq!(in_memory, vec![txid]);
+        assert_eq!(on_disk, vec![txid]);
+    }
+
+    /// The backend took the bond but its reply was lost to an error. Losing
+    /// the record here would leave the funded bond unmanaged.
+    #[test]
+    fn a_bond_accepted_despite_an_error_reply_is_kept() {
+        let (result, txid, in_memory, on_disk) = broadcast_bond(|chain, _| {
+            chain.broadcast_error = Some((json!({"code": -32603, "message": "timeout"}), true));
+        });
+        assert_eq!(result.unwrap(), txid);
+        assert_eq!(in_memory, vec![txid]);
+        assert_eq!(on_disk, vec![txid]);
+    }
+
+    /// An "already in mempool" refusal is a success even when an indexer that
+    /// lags the node cannot find the tx yet.
+    #[test]
+    fn a_bond_refused_as_already_known_is_kept() {
+        let (result, txid, in_memory, on_disk) = broadcast_bond(|chain, _| {
+            chain.broadcast_error = Some((
+                json!({"code": -27, "message": "txn-already-in-mempool"}),
+                false,
+            ));
+        });
+        assert_eq!(result.unwrap(), txid);
+        assert_eq!(in_memory, vec![txid]);
+        assert_eq!(on_disk, vec![txid]);
+    }
+
+    /// A refused bond the backend does not know never went out: keeping its
+    /// record would leave startup waiting on a tx that cannot confirm.
+    #[test]
+    fn a_refused_unknown_bond_is_dropped() {
+        let (result, _, in_memory, on_disk) = broadcast_bond(|chain, _| {
+            chain.reject_broadcast = true;
+        });
+        assert!(result.is_err());
+        assert!(in_memory.is_empty());
+        assert!(on_disk.is_empty());
+    }
+
+    /// When the backend cannot say whether the bond went out, the record stays
+    /// so startup confirms or rebroadcasts it, and the failure is reported.
+    #[test]
+    fn a_bond_with_an_unknown_outcome_is_kept_and_reported() {
+        let (result, txid, in_memory, on_disk) = broadcast_bond(|chain, txid| {
+            chain.reject_broadcast = true;
+            chain.fail_lookups.insert(txid);
+        });
+        assert!(result.is_err());
+        assert_eq!(in_memory, vec![txid]);
+        assert_eq!(on_disk, vec![txid]);
     }
 }
 

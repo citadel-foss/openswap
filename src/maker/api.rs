@@ -1299,9 +1299,9 @@ impl MakerServer {
     /// Waits for live but unconfirmed fidelity bonds to confirm and records
     /// their confirmation height. No-op if no such bond exists.
     ///
-    /// A bond is registered with `conf_height: None` as soon as it is
-    /// broadcast, so a maker that shut down while waiting for confirmation
-    /// restarts with a pending bond in the wallet. Such a bond fails
+    /// A bond is registered with `conf_height: None` just before it is
+    /// broadcast, so a maker that shut down while broadcasting or waiting for
+    /// confirmation restarts with a pending bond in the wallet. Such a bond fails
     /// valuation (`calculate_bond_value` needs the confirmation height) and
     /// would be silently discarded by `get_highest_fidelity_index`, making
     /// the maker create a second bond and doubly lock funds. Finalizing it
