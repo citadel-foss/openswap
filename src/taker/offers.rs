@@ -1811,10 +1811,13 @@ impl OfferBook {
         result
     }
 
+    /// Makers in the `Good` state, whatever protocols they speak. A maker
+    /// that failed since its last offer keeps that offer, so the state is
+    /// what keeps an unreachable maker or an expired bond out.
     fn good_makers(&self) -> Vec<OfferAndAddress> {
         self.makers
             .iter()
-            .filter(|m| !matches!(m.state, MakerState::Banned(_)))
+            .filter(|m| m.state == MakerState::Good)
             .filter_map(|m| m.as_offer_and_address())
             .collect()
     }
@@ -2484,6 +2487,44 @@ pub(crate) mod tests {
             name: "maker".to_string(),
             lightning: None,
         }
+    }
+
+    /// Lightning swaps pick from `good_makers`. A maker that failed after
+    /// its last offer keeps that offer, so only its state shows it is out.
+    #[test]
+    fn good_makers_leaves_out_unavailable_and_banned_makers() {
+        let maker = |id: &str, state: MakerState| {
+            let mut maker = candidate(addr(id));
+            maker.offer = Some(dummy_offer(&maker.address.to_string()));
+            maker.protocol = Some(MakerProtocol::Taproot);
+            maker.state = state;
+            maker
+        };
+        let book = OfferBook {
+            makers: vec![
+                maker(
+                    "6102",
+                    MakerState::Unavailable(UnavailableState {
+                        reason: UnavailableReason::BondExpired,
+                        since_ts: Some(1),
+                        last_attempt_ts: Some(1),
+                        attempts: 1,
+                    }),
+                ),
+                maker("16102", MakerState::Good),
+                maker(
+                    "26102",
+                    MakerState::Banned(BanRecord {
+                        reason: BanReason::ProvenViolation,
+                        recorded_at_ts: 1,
+                    }),
+                ),
+            ],
+            suppressed_makers: HashMap::new(),
+        };
+
+        let good: Vec<_> = book.good_makers().into_iter().map(|m| m.address).collect();
+        assert_eq!(good, [addr("16102")]);
     }
 
     #[test]
