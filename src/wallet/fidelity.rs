@@ -1449,6 +1449,59 @@ mod test {
         let (next, _, _) = wallet.get_next_fidelity_address(lock_time(1000)).unwrap();
         assert_eq!(next, 13, "a new bond must not reuse a recovered key");
     }
+
+    /// An expired bond the maker has not redeemed yet is listed as expired,
+    /// not as an error that hides every other bond.
+    #[test]
+    fn listing_marks_an_expired_bond_instead_of_failing() {
+        let entry = || serde_json::json!({ "status": "Live" });
+
+        let mut live = entry();
+        list_bond_valuation(&mut live, Ok(Amount::from_sat(42))).unwrap();
+        assert_eq!(live["status"], "Live");
+        assert_eq!(live["bond_value"], serde_json::json!(Amount::from_sat(42)));
+
+        let mut expired = entry();
+        list_bond_valuation(
+            &mut expired,
+            Err(WalletError::Fidelity(FidelityError::BondLocktimeExpired)),
+        )
+        .unwrap();
+        assert_eq!(expired["status"], "Expired");
+        assert_eq!(expired["bond_value"], serde_json::json!(Amount::ZERO));
+
+        // Anything else, such as a backend failure, still fails the listing.
+        assert!(list_bond_valuation(
+            &mut entry(),
+            Err(WalletError::Fidelity(FidelityError::BondDoesNotExist)),
+        )
+        .is_err());
+    }
+
+    /// A bond still in the mempool is listed as unconfirmed, without a chain
+    /// call: there is no confirmation time to value it from yet.
+    #[test]
+    fn listing_shows_an_unconfirmed_bond() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let secret = SecretKey::from_slice(&[5; 32]).unwrap();
+        wallet.store.fidelity_bond.push(FidelityBond {
+            outpoint: OutPoint::null(),
+            amount: Amount::from_sat(50_000),
+            lock_time: LockTime::from_height(1_000).unwrap(),
+            pubkey: PublicKey::new(secret.public_key(&Secp256k1::new())),
+            conf_height: None,
+            is_spent: false,
+            bond_index: 0,
+            tx: None,
+            extra: BTreeMap::new(),
+        });
+
+        let listing: serde_json::Value =
+            serde_json::from_str(&wallet.display_fidelity_bonds().unwrap()).unwrap();
+        assert_eq!(listing[0]["status"], "Unconfirmed");
+        assert!(listing[0].get("bond_value").is_none());
+    }
 }
 
 #[test]
