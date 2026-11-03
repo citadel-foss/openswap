@@ -236,7 +236,23 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     if maker.behavior == super::handlers::MakerBehavior::StopWatcherOnStartup {
         maker.watch_service.stop_watcher_for_test();
     }
-    let listener = if maker.watch_service.is_alive() {
+    // Fees no swap can pay leave nothing to serve, but contracts from a
+    // previous run still need recovering, so start recovery-only instead of
+    // failing: an error here would shut down the recovery started below.
+    let fees_priceable = match super::api::check_fees_can_price_a_swap(&maker.config) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!(
+                "[{}] {:?}; recovery-only mode: no fidelity bond and no new swaps until the fee settings are fixed",
+                maker.config.network_port,
+                e
+            );
+            false
+        }
+    };
+    let listener = if !fees_priceable {
+        None
+    } else if maker.watch_service.is_alive() {
         // Tests reserve the port at allocation and hand the socket over, so a
         // parallel test cannot take it between allocation and start.
         #[cfg(feature = "integration-test")]
@@ -346,9 +362,6 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             "[{}] Setting up fidelity bond...",
             maker.config.network_port
         );
-        // Recovery above has started; refuse fees no swap can pay before the
-        // bond locks any coins.
-        super::api::check_fees_can_price_a_swap(&maker.config)?;
         maker.setup_fidelity_bond(maker_address)?;
         spawn_nostr_broadcast_thread(&maker)?;
         log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
