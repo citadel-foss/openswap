@@ -1251,4 +1251,58 @@ mod tests {
         );
         assert!(total_with_fee(Amount::from_sat(u64::MAX), Amount::from_sat(1)).is_err());
     }
+
+    /// A routed swap needs two distinct makers, and most makers serve both
+    /// directions. Without an exclusion both auto-picked hops land on the
+    /// first maker in the offerbook and the swap aborts.
+    #[test]
+    fn auto_picked_lightning_maker_skips_the_other_hop() {
+        use crate::taker::offers::{
+            tests::{addr, dummy_offer},
+            MakerProtocol, MakerState,
+        };
+
+        let maker = |id: &str| {
+            let address = addr(id);
+            let mut offer = dummy_offer(&address.to_string());
+            offer.lightning = Some(LightningOffer {
+                swap_in: true,
+                swap_out: true,
+                base_fee: 100,
+                amount_relative_fee_pct: 0.1,
+                min_size: 10_000,
+                max_swap_in: 100_000,
+                max_swap_out: 100_000,
+            });
+            OfferAndAddress {
+                offer,
+                address,
+                state: MakerState::Good,
+                protocol: MakerProtocol::Taproot,
+                features: Vec::new(),
+            }
+        };
+        let makers = [maker("6102"), maker("16102")];
+        let first = makers[0].address.to_string();
+        let second = makers[1].address.to_string();
+        let amount = Amount::from_sat(50_000);
+
+        assert_eq!(
+            pick_lightning_maker(&makers, false, amount, None),
+            Some(first.clone())
+        );
+        assert_eq!(
+            pick_lightning_maker(&makers, true, amount, Some(&first)),
+            Some(second.clone())
+        );
+        assert_eq!(
+            pick_lightning_maker(&makers[..1], true, amount, Some(&first)),
+            None
+        );
+        // An amount outside the advertised terms still matches no one.
+        assert_eq!(
+            pick_lightning_maker(&makers, true, Amount::from_sat(1_000), None),
+            None
+        );
+    }
 }
