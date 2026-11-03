@@ -2653,4 +2653,51 @@ mod tests {
         assert!(reader.join().unwrap().is_err());
     }
 
+    /// A bond that confirmed too late for its timelock leaves less than the
+    /// minimum takers accept. Startup setup must report it instead of
+    /// advertising it, and the maker must still start.
+    #[test]
+    fn startup_skips_a_bond_that_confirmed_too_late() {
+        use crate::wallet::FidelityBond;
+        use bitcoin::{
+            absolute::LockTime,
+            secp256k1::{Secp256k1, SecretKey},
+            Amount, OutPoint, PublicKey,
+        };
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let tip = 800_000u32;
+        let secret = SecretKey::from_slice(&[3; 32]).unwrap();
+        maker
+            .wallet
+            .write()
+            .unwrap()
+            .store
+            .fidelity_bond
+            .push(FidelityBond {
+                outpoint: OutPoint::new(Txid::all_zeros(), 0),
+                amount: Amount::from_sat(50_000),
+                // Built at `tip` with the minimum timelock, confirmed one block late.
+                lock_time: LockTime::from_height(tip + 1 + MIN_FIDELITY_TIMELOCK).unwrap(),
+                pubkey: PublicKey::new(secret.public_key(&Secp256k1::new())),
+                conf_height: Some(tip + 2),
+                is_spent: false,
+                bond_index: 0,
+                tx: None,
+                extra: BTreeMap::new(),
+            });
+
+        let address = "127.0.0.1:6102";
+        match maker.setup_fidelity_bond(address, false) {
+            Err(MakerError::FidelityBondTooLate { index, conf_height }) => {
+                assert_eq!((index, conf_height), (0, tip + 2));
+            }
+            other => panic!("expected FidelityBondTooLate, got {:?}", other),
+        }
+        assert!(maker.highest_fidelity_proof.read().unwrap().is_none());
+
+        setup_startup_fidelity_bond(&maker, address).unwrap();
+        assert!(maker.highest_fidelity_proof.read().unwrap().is_none());
+    }
 }
