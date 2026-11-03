@@ -156,6 +156,9 @@ openswap taker::offers::tests::a_ban_is_never_pruned_or_polled
 openswap taker::offers::tests::a_ban_is_terminal_and_persists
 openswap taker::offers::tests::a_ban_is_visible_by_address_wherever_it_sits
 openswap taker::offers::tests::a_corrupt_offerbook_stops_the_taker_and_is_never_overwritten
+openswap taker::offers::tests::a_disputed_maker_is_tied_to_the_bond_it_proves
+openswap taker::offers::tests::a_forged_bond_claim_cannot_remove_an_authenticated_maker
+openswap taker::offers::tests::a_lone_claim_against_the_cached_bond_is_proven_not_trusted
 openswap taker::offers::tests::a_violation_clears_the_suppression_record
 openswap taker::offers::tests::an_unpriceable_offer_does_not_ban_its_maker
 openswap taker::offers::tests::backend_down_leaves_maker_state_unchanged
@@ -169,7 +172,7 @@ openswap taker::offers::tests::draining_sync_requests_preserves_polls_and_remova
 openswap taker::offers::tests::expired_bond_removes_its_suppression_record
 openswap taker::offers::tests::failed_offerbook_write_preserves_existing_file
 openswap taker::offers::tests::fidelity_candidate_transitions_enforce_one_live_bond
-openswap taker::offers::tests::groups_distinct_live_bonds_for_one_address_as_conflicted
+openswap taker::offers::tests::groups_every_live_bond_claiming_an_address
 openswap taker::offers::tests::legacy_candidate_fields_deserialize_and_backfill
 openswap taker::offers::tests::legacy_states_migrate_without_inventing_evidence
 openswap taker::offers::tests::maker_address_try_from_uses_strict_validation
