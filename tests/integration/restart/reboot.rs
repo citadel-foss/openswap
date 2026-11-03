@@ -29,6 +29,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// How the victim maker comes back in [`run_reboot_recovery`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Restart {
+    /// Ready to serve again: recovery runs alongside a normal startup.
+    Serving,
+    /// With its watcher stopped, so it starts recovery-only.
+    WatcherDown,
+}
+
 /// Test: maker reboot recovery preserves funded Taproot swapcoins. Maker2 funds
 /// its contracts, then drops at private key handover before idle recovery runs.
 /// Startup recovery keeps or hashlock-recovers the committed coins.
@@ -39,7 +48,7 @@ use std::{
 /// incoming contract from Maker1 — the same end state as a completed swap.
 ///
 /// `watchtower_liveness` runs the same body with the maker's watcher stopped.
-pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, watcher_available: bool) {
+pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart: Restart) {
     world.mine(1);
 
     let summary = world
@@ -90,7 +99,7 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, watcher
     // Only Maker2 comes back; the world now holds it alone.
     world.drop_makers();
     let mut restarted_server = MakerServer::init(victim_config).unwrap();
-    if !watcher_available {
+    if restart == Restart::WatcherDown {
         restarted_server.behavior = MakerBehavior::StopWatcherOnStartup;
     }
     world.adopt_makers([Arc::new(restarted_server)]);
@@ -98,7 +107,7 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, watcher
 
     // Recovery takes longer under parallel load; wait for the markers instead
     // of asserting at a fixed wall-clock point.
-    if watcher_available {
+    if restart == Restart::Serving {
         world.wait_for_makers_setup(120);
         let restarted = world.makers()[0].inner();
         wait_logged!(
@@ -182,7 +191,7 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, watcher
     swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
 )]
 fn taproot_maker_reboot_preserves_funded_swapcoins(world: &mut World, params: SwapParams) {
-    run_reboot_recovery(world, params, true);
+    run_reboot_recovery(world, params, Restart::Serving);
 }
 
 /// Test: everyone in the route crashes with funding on chain, then each restarts
