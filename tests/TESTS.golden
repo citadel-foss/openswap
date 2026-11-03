@@ -169,6 +169,7 @@ openswap taker::offers::tests::draining_sync_requests_preserves_polls_and_remova
 openswap taker::offers::tests::expired_bond_removes_its_suppression_record
 openswap taker::offers::tests::failed_offerbook_write_preserves_existing_file
 openswap taker::offers::tests::fidelity_candidate_transitions_enforce_one_live_bond
+openswap taker::offers::tests::good_makers_leaves_out_unavailable_and_banned_makers
 openswap taker::offers::tests::groups_distinct_live_bonds_for_one_address_as_conflicted
 openswap taker::offers::tests::legacy_candidate_fields_deserialize_and_backfill
 openswap taker::offers::tests::legacy_states_migrate_without_inventing_evidence
