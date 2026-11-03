@@ -1646,11 +1646,9 @@ pub fn interactive_select(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::TcpListener,
-        os::unix::fs::{symlink, PermissionsExt},
-        thread,
-    };
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::{net::TcpListener, thread};
 
     use bitcoin::{
         blockdata::{opcodes::all, script::Builder},
@@ -2383,13 +2381,19 @@ mod tests {
         let original = "# keep\r\n  port  =  1  \r\nfuture_key = [\"x\"]";
         fs::write(&path, original).unwrap();
         // An in-place write would change the bytes seen through this handle.
+        // Windows rejects `MoveFileExW` while any handle is open, even with
+        // delete sharing, so that proof stays off Windows.
+        #[cfg(not(windows))]
         let mut handle = fs::File::open(&path).unwrap();
         set_config_key(&path, "port", "1").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         set_config_key(&path, "port", "2").unwrap();
-        let mut previous = String::new();
-        handle.read_to_string(&mut previous).unwrap();
-        assert_eq!(previous, original);
+        #[cfg(not(windows))]
+        {
+            let mut previous = String::new();
+            handle.read_to_string(&mut previous).unwrap();
+            assert_eq!(previous, original);
+        }
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "# keep\r\nport = 2\r\nfuture_key = [\"x\"]"
@@ -2412,8 +2416,10 @@ mod tests {
     }
 
     /// Puts directory write permission back so the temp dir can be removed.
+    #[cfg(unix)]
     struct RestoreDirectoryMode<'a>(&'a std::path::Path);
 
+    #[cfg(unix)]
     impl Drop for RestoreDirectoryMode<'_> {
         fn drop(&mut self) {
             if let Ok(metadata) = fs::metadata(self.0) {
@@ -2424,6 +2430,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn compat_set_config_key_failed_write_keeps_original() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
@@ -2441,6 +2448,27 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
+    /// Share read and write, but not delete, so `MoveFileExW` cannot replace
+    /// the destination. Unix covers the same failure with a non-writable parent.
+    #[cfg(windows)]
+    #[test]
+    fn compat_set_config_key_failed_replace_keeps_original() {
+        use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "port = 1\nfuture_key = keep\n";
+        fs::write(&path, original).unwrap();
+        let _guard = OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .unwrap();
+        assert!(set_config_key(&path, "port", "2").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn compat_set_config_key_preserves_permissions() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
@@ -2459,6 +2487,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn compat_atomic_write_creates_private_files() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
@@ -2491,6 +2520,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn compat_set_config_key_replaces_stale_files_and_symlinks() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
