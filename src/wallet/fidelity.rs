@@ -474,8 +474,9 @@ impl Wallet {
 
     /// Display the fidelity bonds
     pub fn display_fidelity_bonds(&self) -> Result<String, WalletError> {
-        // Only a live bond needs a valuation, so the tip is fetched on the
-        // first one that does. An empty or all-spent list makes no chain call.
+        // Only a confirmed live bond needs a valuation, so the tip is fetched
+        // on the first one that does. An empty, all-spent or all-unconfirmed
+        // list makes no chain call.
         let mut tip = None;
         let serialized = self
             .store
@@ -490,6 +491,12 @@ impl Wallet {
                 });
 
                 if !bond.is_spent {
+                    // A bond still waiting to confirm has no confirmation time
+                    // to value it from.
+                    if bond.conf_height.is_none() {
+                        bond_info["status"] = serde_json::json!("Unconfirmed");
+                        return Ok(bond_info);
+                    }
                     let (tip_height, tip_time) = match tip {
                         Some(t) => t,
                         None => {
