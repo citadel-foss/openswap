@@ -48,6 +48,7 @@ use crate::{
 use super::{
     api::{Taker, TakerInitConfig},
     error::TakerError,
+    offers::OfferAndAddress,
 };
 
 /// Bound on every wait for a maker message or Lightning event.
@@ -320,6 +321,26 @@ impl LnMakerConn {
     }
 }
 
+/// The first of `makers` whose Lightning terms serve `amount` in this
+/// direction, skipping the maker at `exclude`.
+fn pick_lightning_maker(
+    makers: &[OfferAndAddress],
+    swap_in: bool,
+    amount: Amount,
+    exclude: Option<&str>,
+) -> Option<String> {
+    makers
+        .iter()
+        .filter(|m| {
+            m.offer.lightning.is_some_and(|ln| {
+                let (served, max_size) = ln.direction_limits(swap_in);
+                served && amount.to_sat() >= ln.min_size && amount.to_sat() <= max_size
+            })
+        })
+        .map(|m| m.address.to_string())
+        .find(|address| Some(address.as_str()) != exclude)
+}
+
 impl Taker {
     /// Injects a Lightning backend (tests only).
     #[cfg(feature = "integration-test")]
@@ -334,26 +355,20 @@ impl Taker {
     }
 
     /// Picks a maker for a Lightning swap: the explicit address, or the
-    /// first good offerbook maker advertising suitable Lightning terms.
+    /// first good offerbook maker advertising suitable Lightning terms other
+    /// than `exclude`.
     fn select_lightning_maker(
         &self,
         explicit: Option<String>,
         swap_in: bool,
         amount: Amount,
+        exclude: Option<&str>,
     ) -> Result<String, TakerError> {
         if let Some(address) = explicit {
             return Ok(address);
         }
         let makers = self.offerbook.good_makers()?;
-        makers
-            .iter()
-            .find(|m| {
-                m.offer.lightning.is_some_and(|ln| {
-                    let (served, max_size) = ln.direction_limits(swap_in);
-                    served && amount.to_sat() >= ln.min_size && amount.to_sat() <= max_size
-                })
-            })
-            .map(|m| m.address.to_string())
+        pick_lightning_maker(&makers, swap_in, amount, exclude)
             .ok_or_else(|| general("no maker in the offerbook advertises suitable Lightning terms"))
     }
 
@@ -549,7 +564,7 @@ impl Taker {
     pub fn lightning_swap_in(&mut self, params: LnSwapParams) -> Result<LnSwapReport, TakerError> {
         let ln = self.ln_backend()?;
         let address =
-            self.select_lightning_maker(params.maker_address.clone(), true, params.amount)?;
+            self.select_lightning_maker(params.maker_address.clone(), true, params.amount, None)?;
         let mut conn = self.connect_ln_maker(&address, true, params.amount)?;
         let expected_fee = advertised_fee(&conn.ln_offer, params.amount);
 
@@ -691,7 +706,7 @@ impl Taker {
     pub fn lightning_swap_out(&mut self, params: LnSwapParams) -> Result<LnSwapReport, TakerError> {
         let ln = self.ln_backend()?;
         let address =
-            self.select_lightning_maker(params.maker_address.clone(), false, params.amount)?;
+            self.select_lightning_maker(params.maker_address.clone(), false, params.amount, None)?;
         let mut conn = self.connect_ln_maker(&address, false, params.amount)?;
         let expected_fee = advertised_fee(&conn.ln_offer, params.amount);
 
@@ -885,7 +900,7 @@ impl Taker {
 
         // ---- Hop 2 first: maker 1 cannot pay an invoice that does not exist ----
         let address2 =
-            self.select_lightning_maker(params.second_maker.clone(), false, params.amount)?;
+            self.select_lightning_maker(params.second_maker.clone(), false, params.amount, None)?;
         let mut conn2 = self.connect_ln_maker(&address2, false, params.amount)?;
         let expected_fee2 = advertised_fee(&conn2.ln_offer, params.amount);
 
@@ -931,7 +946,7 @@ impl Taker {
 
         // ---- Hop 1: hand maker 2's invoice to maker 1 ----
         let address1 =
-            self.select_lightning_maker(params.first_maker.clone(), true, middle_amount)?;
+            self.select_lightning_maker(params.first_maker.clone(), true, middle_amount, None)?;
         if address1 == address2 {
             return Err(general(
                 "routed swap needs two distinct makers; one maker would see both ends",
