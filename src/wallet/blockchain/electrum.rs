@@ -216,11 +216,14 @@ fn backoff_after(attempt: u8, last: &electrum_client::Error) -> Duration {
     }
 }
 
-/// Whether retrying `last` needs a fresh socket. A rate limit is a reply from
-/// the current server session, so keeping that session preserves subscriptions
-/// and lets multi-batch wallet reads retain the work completed before it.
-fn reconnect_before_retry(last: &electrum_client::Error) -> bool {
-    !is_rate_limited(last)
+/// Whether retrying `method` after `last` needs a fresh socket. Rate-limited
+/// reads stay on the current session so multi-batch wallet reads retain their
+/// progress. A refused script subscription is different: electrum-client keeps
+/// a local subscription marker even though the server rejected it, so only a
+/// rebuild lets the retry reach the server instead of returning
+/// `AlreadySubscribed` locally.
+fn reconnect_before_retry(method: &'static str, last: &electrum_client::Error) -> bool {
+    method == SUBSCRIBE || !is_rate_limited(last)
 }
 
 /// True only for protocol errors that explicitly say the transaction is
@@ -930,16 +933,17 @@ impl Electrum {
             Err(e) if is_terminal(&e) => return Err(e.into()),
             Err(e) => e,
         };
-        // The connection failed and took its server-side subscriptions with
-        // it, whether or not a reconnect below succeeds. A rate limit is the
-        // server answering, so the subscriptions still stand.
-        if reconnect_before_retry(&last) {
+        // A transport failure takes the server-side subscriptions with it. A
+        // rate-limited read leaves them standing, while a rate-limited script
+        // subscription still needs a rebuild to clear the client's false local
+        // marker; `reconnect_before_retry` captures that distinction.
+        if reconnect_before_retry(method, &last) {
             self.needs_rearm.store(true, Ordering::SeqCst);
         }
 
         for attempt in 1..=self.config.max_retries {
             let backoff = backoff_after(attempt, &last);
-            let reconnect = reconnect_before_retry(&last);
+            let reconnect = reconnect_before_retry(method, &last);
             // An idle server dropping the session is routine, so only the first
             // attempt is a warning; the rest are noise until we actually fail.
             let action = if reconnect {
@@ -983,7 +987,7 @@ impl Electrum {
                 Ok(v) => return Ok(v),
                 Err(e) if is_terminal(&e) => return Err(e.into()),
                 Err(e) => {
-                    if reconnect_before_retry(&e) {
+                    if reconnect_before_retry(method, &e) {
                         self.needs_rearm.store(true, Ordering::SeqCst);
                     }
                     last = e;
@@ -3317,7 +3321,8 @@ pub(crate) mod tests {
             assert!(is_rate_limited(e));
             assert!(!is_terminal(e));
             assert_eq!(backoff_after(1, e), RATE_LIMIT_BACKOFF);
-            assert!(!reconnect_before_retry(e));
+            assert!(!reconnect_before_retry(LIST_UNSPENT, e));
+            assert!(reconnect_before_retry(SUBSCRIBE, e));
         }
         // Any other protocol error is still an answer, not a reason to wait.
         let other = Error::Protocol(json!({ "code": -32600, "message": "bad request" }));
@@ -3325,7 +3330,7 @@ pub(crate) mod tests {
         assert!(is_terminal(&other));
         let transport = Error::Message("socket closed".into());
         assert_eq!(backoff_after(1, &transport), retry_backoff(1));
-        assert!(reconnect_before_retry(&transport));
+        assert!(reconnect_before_retry(LIST_UNSPENT, &transport));
     }
 
     #[test]
