@@ -349,19 +349,7 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             "[{}] Setting up fidelity bond...",
             maker.config.network_port
         );
-        match maker.setup_fidelity_bond(maker_address, false) {
-            Ok(_) => {}
-            // Start without a bond rather than wait here for a replacement: the
-            // renewal loop funds one, and redeems the late bond once it expires.
-            Err(MakerError::FidelityBondTooLate { index, conf_height }) => log::error!(
-                "[{}] Fidelity bond {} confirmed at height {}, too late for its timelock to stay above the {} block minimum takers accept. Starting without a bond; the renewal loop will fund a new one.",
-                maker.config.network_port,
-                index,
-                conf_height,
-                MIN_FIDELITY_TIMELOCK
-            ),
-            Err(e) => return Err(e),
-        }
+        setup_startup_fidelity_bond(&maker, maker_address)?;
         spawn_nostr_broadcast_thread(&maker)?;
         log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
         maker.check_swap_liquidity()?;
@@ -1084,6 +1072,29 @@ fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result
     }
 
     Ok(())
+}
+
+/// Runs the startup bond setup. A bond that confirmed too late for takers to
+/// accept does not stop startup: the maker serves without a bond, and the
+/// renewal loop, which starts once the maker is serving, funds a replacement.
+fn setup_startup_fidelity_bond(
+    maker: &Arc<MakerServer>,
+    maker_address: &str,
+) -> Result<(), MakerError> {
+    match maker.setup_fidelity_bond(maker_address, false) {
+        Ok(_) => Ok(()),
+        Err(MakerError::FidelityBondTooLate { index, conf_height }) => {
+            log::error!(
+                "[{}] Fidelity bond {} confirmed at height {}, too late for its timelock to stay above the {} block minimum takers accept. Starting without a bond; the renewal loop will fund a new one.",
+                maker.config.network_port,
+                index,
+                conf_height,
+                MIN_FIDELITY_TIMELOCK
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Corrects the advertised confirmation height of every unspent bond after a
@@ -2632,4 +2643,5 @@ mod tests {
 
         assert!(reader.join().unwrap().is_err());
     }
+
 }
