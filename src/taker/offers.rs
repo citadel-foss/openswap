@@ -1455,17 +1455,25 @@ impl OfferBook {
         changed
     }
 
-    /// The bonds a maker may prove: any of its disputed claims, else its cached
-    /// bond. `None` accepts any bond, as for a manual entry.
+    /// The bonds a maker may prove: its cached bond and any of its disputed
+    /// claims. `None` accepts any bond, as for a manual entry.
     fn expected_bonds(&self, address: &MakerAddress) -> Option<Vec<OutPoint>> {
-        if let Some(bonds) = self.contested.get(address) {
-            return Some(bonds.keys().copied().collect());
-        }
-        self.makers
+        let cached = self
+            .makers
             .iter()
             .find(|m| &m.address == address)
-            .and_then(|m| m.fidelity_outpoint)
-            .map(|outpoint| vec![outpoint])
+            .and_then(|m| m.fidelity_outpoint);
+        let Some(bonds) = self.contested.get(address) else {
+            return cached.map(|outpoint| vec![outpoint]);
+        };
+        let mut expected: Vec<OutPoint> = bonds.keys().copied().collect();
+        // A cached bond can be missing from one sync, when its output check
+        // failed or its announcement has not arrived yet. A lone forged claim
+        // must not make the maker's proof of it fail meanwhile.
+        if let Some(outpoint) = cached.filter(|outpoint| !bonds.contains_key(outpoint)) {
+            expected.push(outpoint);
+        }
+        Some(expected)
     }
 
     /// Caches the bond a disputed maker proved as its own.
@@ -2734,7 +2742,13 @@ pub(crate) mod tests {
 
         let due = now + OFFER_MAX_AGE_BEFORE_REFRESH.as_secs();
         assert_eq!(book.makers_to_poll(due, &live), vec![address.clone()]);
-        assert_eq!(book.expected_bonds(&address), Some(vec![claimed]));
+        let expected = book.expected_bonds(&address).unwrap();
+        assert_eq!(expected, vec![claimed, cached]);
+        assert!(ensure_announced_outpoint_matches(Some(&expected), cached).is_ok());
+
+        // Proving the cached bond keeps it; it is not one of the claims.
+        book.adopt_proven_bond(&address, cached);
+        assert_eq!(book.makers[0].fidelity_outpoint, Some(cached));
 
         // A banned maker is never re-tied to a bond.
         book.ban(&address, BanReason::ProvenViolation, now);
