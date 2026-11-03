@@ -1811,10 +1811,13 @@ impl OfferBook {
         result
     }
 
+    /// Makers in the `Good` state, whatever protocols they speak. A maker
+    /// that failed since its last offer keeps that offer, so the state is
+    /// what keeps an unreachable maker or an expired bond out.
     fn good_makers(&self) -> Vec<OfferAndAddress> {
         self.makers
             .iter()
-            .filter(|m| !matches!(m.state, MakerState::Banned(_)))
+            .filter(|m| m.state == MakerState::Good)
             .filter_map(|m| m.as_offer_and_address())
             .collect()
     }
