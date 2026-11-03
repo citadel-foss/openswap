@@ -58,6 +58,7 @@ Commands:
   stop                Shutdown the makerd server
   show-fidelity       Show all the fidelity bonds, current and previous, with an (index, {bond_proof, is_spent}) tuple
   sync-wallet         Sync the Maker wallet with the current blockchain state
+  list-swaps          List the swaps this maker has done, with the fees earned. With --swap-id, show the full report of that swap
   verify-deniability  Verify the deniability proof for a specific swap
   blocklist-add       Add or update an address in the funding-source blocklist
   blocklist-remove    Remove an address from the funding-source blocklist
@@ -517,9 +518,54 @@ After sending `10,000 sats` with a `284 sats` mining fee (142 vB at 2 sats/vByte
 
 ---
 
+### ListSwaps
+
+Shows every swap the maker has done, newest first, and how much fee it earned:
+
+```bash
+$ ./maker-cli list-swaps
+{
+  "totals": {
+    "succeeded": 1,
+    "failed": 0,
+    "recovered": 0,
+    "fees_paid": 0,
+    "fees_earned": 658,
+    "unreadable_reports": 0
+  },
+  "swaps": [
+    {
+      "swap_id": "<swap_id>",
+      "role": "Maker",
+      "status": "Success",
+      "network": "regtest",
+      "end_timestamp": 1767225600,
+      "incoming_amount": 499827,
+      "outgoing_amount": 498569,
+      "fee_earned": 658
+    }
+  ]
+}
+```
+
+- `fees_earned` adds up the service fee of every completed swap. It leaves out the mining fee the maker gets back.
+- A maker only writes a report when a swap completes or is recovered. A swap that failed before that does not show up.
+- A recovery shows as `RecoveryHashlock` or `RecoveryTimelock`, with no amounts.
+- `unreadable_reports` counts reports saved by a newer version that this one cannot read. They are kept, but not listed.
+
+To see the whole report of one swap, pass its id:
+
+```bash
+$ ./maker-cli list-swaps --swap-id <swap_id>
+```
+
+This prints the UTXOs too, but not the deniability proof. Use `verify-deniability` to check that.
+
+---
+
 ### VerifyDeniability
 
-After a completed swap, you can verify the deniability proof for a specific swap ID:
+After a completed swap, you can verify the deniability proof for a specific swap ID (`list-swaps` shows the ids):
 
 ```bash
 $ ./maker-cli verify-deniability --swap-id <swap_id>

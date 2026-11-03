@@ -73,6 +73,13 @@ enum Commands {
     ShowFidelity,
     /// Sync the Maker wallet with the current blockchain state.
     SyncWallet,
+    /// List the swaps this maker has done, with the fees earned.
+    /// With --swap-id, show the full report of that swap.
+    ListSwaps {
+        /// Show only this swap, in full.
+        #[arg(long, short = 's')]
+        swap_id: Option<String>,
+    },
     /// Verify the deniability proof for a specific swap.
     VerifyDeniability {
         /// The swap ID to verify.
@@ -167,6 +174,9 @@ fn main() -> Result<(), MakerError> {
         }
         Commands::SyncWallet => {
             send_rpc_req(stream, &rpc_cookie, RpcMsgReq::SyncWallet)?;
+        }
+        Commands::ListSwaps { swap_id } => {
+            send_rpc_req(stream, &rpc_cookie, RpcMsgReq::ListSwaps { swap_id })?;
         }
         Commands::VerifyDeniability { swap_id } => {
             send_rpc_req(

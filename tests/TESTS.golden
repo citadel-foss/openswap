@@ -521,8 +521,12 @@ openswap wallet::funding::tests::smallest_covering_combo_keeps_later_splits_feas
 openswap wallet::funding::tests::split_floor_forces_fewer_splits
 openswap wallet::funding::tests::stays_within_input_budget_when_possible
 openswap wallet::funding::tests::three_inputs_fund_a_split_whenever_the_top_three_cover
+openswap wallet::report::tests::an_empty_wallet_has_an_empty_history
 openswap wallet::report::tests::compat_future_reports_and_nested_fields_survive_typed_views_and_saves
 openswap wallet::report::tests::compat_report_writers_save_proofs_and_changes_in_the_wallet
+openswap wallet::report::tests::history_counts_reports_it_cannot_read
+openswap wallet::report::tests::history_lists_newest_first_and_sums_fees_of_finished_swaps
+openswap wallet::report::tests::one_swap_shows_all_its_reports_without_the_proof
 openswap wallet::report::tests::payswap_omits_taker_incoming_fields_and_round_trips
 openswap wallet::report::tests::report_schema_uses_swap_boundary_utxos_without_contract_fields
 openswap wallet::report::tests::reports_live_in_the_wallet_and_unreadable_ones_survive_a_save

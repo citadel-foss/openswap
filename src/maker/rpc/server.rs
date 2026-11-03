@@ -314,6 +314,12 @@ fn handle_request<M: MakerRpc>(
                 Err(e) => RpcMsgResp::ServerError(e.to_string()),
             }
         }
+        RpcMsgReq::ListSwaps { swap_id } => {
+            match lock_debug!(maker.wallet().read())?.swap_list_json(swap_id.as_deref()) {
+                Ok(json) => RpcMsgResp::SwapList(json),
+                Err(e) => RpcMsgResp::ServerError(e.to_string()),
+            }
+        }
         RpcMsgReq::BlocklistAdd { entries } => {
             match AddressBlocklist::load(maker.data_dir(), maker.config().network)
                 .and_then(|mut blocklist| blocklist.add(entries))

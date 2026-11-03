@@ -78,6 +78,80 @@ impl Wallet {
         }
     }
 
+    /// A short row for every swap and recovery in this wallet, newest first,
+    /// with totals. It only reads.
+    pub fn swap_history(&self) -> SwapHistory {
+        let reports = self.swap_reports();
+        let stored: usize = [TAKER_REPORTS, MAKER_REPORTS, RECOVERY_REPORTS]
+            .iter()
+            .map(|kind| self.store.reports.get(*kind).map_or(0, Vec::len))
+            .sum();
+        let readable = reports.taker.len()
+            + reports.maker.values().map(Vec::len).sum::<usize>()
+            + reports.recovery.len();
+        SwapHistory::from_reports(&reports, stored.saturating_sub(readable))
+    }
+
+    /// The text `list-swaps` prints: the whole history, or with `swap_id` the
+    /// reports of that one swap.
+    pub fn swap_list_json(&self, swap_id: Option<&str>) -> Result<String, WalletError> {
+        let json = match swap_id {
+            None => serde_json::to_string_pretty(&self.swap_history()),
+            Some(id) => {
+                let detail = self.swap_detail(id).ok_or_else(|| {
+                    WalletError::General(format!("no swap with id {id} in this wallet"))
+                })?;
+                serde_json::to_string_pretty(&detail)
+            }
+        };
+        json.map_err(|e| WalletError::General(e.to_string()))
+    }
+
+    /// Every report stored for `swap_id`, as JSON, or `None` if there is none.
+    /// The deniability proof is left out: it is long, and `verify-deniability`
+    /// checks it.
+    pub fn swap_detail(&self, swap_id: &str) -> Option<serde_json::Value> {
+        let reports = self.swap_reports();
+        let mut detail = serde_json::Map::new();
+        let mut add = |kind: &str, rows: Vec<serde_json::Value>| {
+            if !rows.is_empty() {
+                detail.insert(kind.to_string(), rows.into());
+            }
+        };
+        fn rows<'a, T: Serialize + 'a>(
+            reports: impl Iterator<Item = &'a T>,
+            matches: impl Fn(&T) -> bool,
+        ) -> Vec<serde_json::Value> {
+            reports
+                .filter(|report| matches(report))
+                .filter_map(|report| serde_json::to_value(report).ok())
+                .map(|mut row| {
+                    if let Some(fields) = row.as_object_mut() {
+                        fields.remove("deniability_proof");
+                    }
+                    row
+                })
+                .collect()
+        }
+        add(
+            "taker",
+            rows(reports.taker.iter(), |r: &TakerReport| r.swap_id == swap_id),
+        );
+        add(
+            "maker",
+            rows(reports.maker.values().flatten(), |r: &MakerReport| {
+                r.swap_id == swap_id
+            }),
+        );
+        add(
+            "recovery",
+            rows(reports.recovery.iter(), |r: &RecoveryReport| {
+                r.swap_id == swap_id
+            }),
+        );
+        (!detail.is_empty()).then(|| detail.into())
+    }
+
     /// The deniability proofs in the saved file, so a test sees only what
     /// reached the disk. Reads a copy; the live store is left alone.
     #[cfg(feature = "integration-test")]
@@ -730,6 +804,140 @@ impl SwapReportFile {
     }
 }
 
+/// One line of the swap history.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SwapSummary {
+    /// Swap identifier, the same one `verify-deniability` takes.
+    pub swap_id: String,
+    /// Which side of the swap this wallet was on.
+    pub role: SwapRole,
+    /// How the swap ended. A recovery event shows `RecoveryHashlock` or
+    /// `RecoveryTimelock`.
+    pub status: SwapStatus,
+    /// Bitcoin network.
+    pub network: String,
+    /// Unix time the swap ended, or the recovery happened.
+    pub end_timestamp: u64,
+    /// Satoshis received. Not set for a recovery event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incoming_amount: Option<u64>,
+    /// Satoshis sent. Not set for a recovery event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outgoing_amount: Option<u64>,
+    /// Fee a taker paid, mining fees included. Set for a taker swap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_paid: Option<u64>,
+    /// Service fee a maker earned. Set for a maker swap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_earned: Option<u64>,
+}
+
+/// Counts and fee sums over the whole history.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SwapTotals {
+    /// Swaps that completed.
+    pub succeeded: usize,
+    /// Swaps that failed.
+    pub failed: usize,
+    /// Recovery events, plus swaps whose report says they were recovered.
+    pub recovered: usize,
+    /// Fees paid by this wallet as a taker, over completed swaps only.
+    pub fees_paid: u64,
+    /// Service fees earned by this wallet as a maker, over completed swaps only.
+    pub fees_earned: u64,
+    /// Stored reports this build can't read. They are kept, but not listed or counted.
+    pub unreadable_reports: usize,
+}
+
+/// What `list-swaps` prints.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SwapHistory {
+    /// Counts and fee sums.
+    pub totals: SwapTotals,
+    /// One row per swap or recovery, newest first.
+    pub swaps: Vec<SwapSummary>,
+}
+
+impl SwapHistory {
+    fn from_reports(reports: &SwapReportFile, unreadable_reports: usize) -> Self {
+        let mut totals = SwapTotals {
+            unreadable_reports,
+            ..SwapTotals::default()
+        };
+        let mut swaps = Vec::new();
+
+        for report in &reports.taker {
+            totals.count(&report.status);
+            // The fee of a swap that did not finish is not final.
+            let fee_paid = (report.status == SwapStatus::Success).then_some(report.fee_paid);
+            totals.fees_paid = totals.fees_paid.saturating_add(fee_paid.unwrap_or(0));
+            swaps.push(SwapSummary {
+                swap_id: report.swap_id.clone(),
+                role: SwapRole::Taker,
+                status: report.status.clone(),
+                network: report.network.clone(),
+                end_timestamp: report.end_timestamp,
+                incoming_amount: Some(report.incoming_amount),
+                outgoing_amount: Some(report.outgoing_amount),
+                fee_paid,
+                fee_earned: None,
+            });
+        }
+        for report in reports.maker.values().flatten() {
+            totals.count(&report.status);
+            let fee_earned = (report.status == SwapStatus::Success).then_some(report.fee_earned);
+            totals.fees_earned = totals.fees_earned.saturating_add(fee_earned.unwrap_or(0));
+            swaps.push(SwapSummary {
+                swap_id: report.swap_id.clone(),
+                role: SwapRole::Maker,
+                status: report.status.clone(),
+                network: report.network.clone(),
+                end_timestamp: report.end_timestamp,
+                incoming_amount: Some(report.incoming_amount),
+                outgoing_amount: Some(report.outgoing_amount),
+                fee_paid: None,
+                fee_earned,
+            });
+        }
+        for report in &reports.recovery {
+            let status = if report.recovery_type == "hashlock" {
+                SwapStatus::RecoveryHashlock
+            } else {
+                SwapStatus::RecoveryTimelock
+            };
+            totals.count(&status);
+            swaps.push(SwapSummary {
+                swap_id: report.swap_id.clone(),
+                role: report.role,
+                status,
+                network: report.network.clone(),
+                end_timestamp: report.timestamp,
+                incoming_amount: None,
+                outgoing_amount: None,
+                fee_paid: None,
+                fee_earned: None,
+            });
+        }
+
+        swaps.sort_by(|a, b| {
+            b.end_timestamp
+                .cmp(&a.end_timestamp)
+                .then_with(|| a.swap_id.cmp(&b.swap_id))
+        });
+        Self { totals, swaps }
+    }
+}
+
+impl SwapTotals {
+    fn count(&mut self, status: &SwapStatus) {
+        match status {
+            SwapStatus::Success => self.succeeded += 1,
+            SwapStatus::Failed => self.failed += 1,
+            SwapStatus::RecoveryHashlock | SwapStatus::RecoveryTimelock => self.recovered += 1,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn compat_reports() -> SwapReportFile {
     let proof: SwapReportFile = serde_json::from_slice(include_bytes!(
@@ -1138,5 +1346,144 @@ mod tests {
         let reports = wallet.swap_reports();
         assert_eq!(reports.taker.len(), 1);
         assert_eq!(reports.taker[0].swap_id, "swap-1");
+    }
+
+    /// A wallet with a finished and a failed taker swap, a maker swap and a
+    /// recovery, saved at times 11, 50, 30 and 40.
+    fn wallet_with_history(path: &Path) -> Wallet {
+        let mut wallet = test_wallet(path);
+        sample_taker_report().save_to_wallet(&mut wallet).unwrap();
+        let mut failed = sample_taker_report();
+        failed.swap_id = "swap-failed".into();
+        failed.status = SwapStatus::Failed;
+        failed.end_timestamp = 50;
+        failed.fee_paid = 777;
+        failed.save_to_wallet(&mut wallet).unwrap();
+        let mut maker = MakerReport::success(
+            "maker-swap".into(),
+            Instant::now(),
+            10_000,
+            9_000,
+            500,
+            vec![],
+            vec![],
+            60,
+            "regtest".into(),
+            None,
+            None,
+        );
+        maker.end_timestamp = 30;
+        maker.save_to_wallet(&mut wallet).unwrap();
+        RecoveryReport {
+            swap_id: "swap-failed".into(),
+            role: SwapRole::Taker,
+            node: None,
+            recovery_type: "hashlock".into(),
+            recovery_txids: vec![],
+            network: "regtest".into(),
+            timestamp: 40,
+        }
+        .store_in_wallet(&mut wallet)
+        .unwrap();
+        wallet
+    }
+
+    #[test]
+    fn history_lists_newest_first_and_sums_fees_of_finished_swaps() {
+        let dir = tempdir().unwrap();
+        let wallet = wallet_with_history(&dir.path().join("wallet.cbor"));
+
+        let history = wallet.swap_history();
+        let ids: Vec<_> = history.swaps.iter().map(|s| s.swap_id.as_str()).collect();
+        assert_eq!(ids, ["swap-failed", "swap-failed", "maker-swap", "swap-1"]);
+        assert_eq!(
+            history.totals,
+            SwapTotals {
+                succeeded: 2,
+                failed: 1,
+                recovered: 1,
+                fees_paid: 1_000,
+                fees_earned: 500,
+                unreadable_reports: 0,
+            }
+        );
+
+        // The failed swap shows no fee: it is not final, and not in the totals.
+        let failed = &history.swaps[0];
+        assert_eq!(failed.status, SwapStatus::Failed);
+        assert_eq!(failed.fee_paid, None);
+        let recovery = &history.swaps[1];
+        assert_eq!(recovery.status, SwapStatus::RecoveryHashlock);
+        assert_eq!(recovery.outgoing_amount, None);
+        let maker = &history.swaps[2];
+        assert_eq!((maker.role, maker.fee_earned), (SwapRole::Maker, Some(500)));
+        let taker = &history.swaps[3];
+        assert_eq!(taker.fee_paid, Some(1_000));
+        assert_eq!(taker.fee_earned, None);
+    }
+
+    #[test]
+    fn an_empty_wallet_has_an_empty_history() {
+        let dir = tempdir().unwrap();
+        let wallet = test_wallet(&dir.path().join("wallet.cbor"));
+        let history = wallet.swap_history();
+        assert!(history.swaps.is_empty());
+        assert_eq!(history.totals, SwapTotals::default());
+        let json: serde_json::Value =
+            serde_json::from_str(&wallet.swap_list_json(None).unwrap()).unwrap();
+        assert_eq!(json["swaps"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn history_counts_reports_it_cannot_read() {
+        let dir = tempdir().unwrap();
+        let mut wallet = wallet_with_history(&dir.path().join("wallet.cbor"));
+        // A newer build's report: a status this build doesn't know.
+        let Value::Map(mut fields) = to_value(sample_taker_report()).unwrap() else {
+            panic!("a report encodes as a map");
+        };
+        fields.insert(Value::Text("status".into()), Value::Text("Future".into()));
+        wallet
+            .store
+            .reports
+            .entry(TAKER_REPORTS.to_string())
+            .or_default()
+            .push(Value::Map(fields));
+
+        let history = wallet.swap_history();
+        assert_eq!(history.swaps.len(), 4);
+        assert_eq!(history.totals.unreadable_reports, 1);
+        assert_eq!(history.totals.succeeded, 2);
+    }
+
+    #[test]
+    fn one_swap_shows_all_its_reports_without_the_proof() {
+        let dir = tempdir().unwrap();
+        let mut wallet = wallet_with_history(&dir.path().join("wallet.cbor"));
+        let mut with_proof = sample_taker_report();
+        with_proof.swap_id = "swap-proof".into();
+        with_proof.deniability_proof =
+            Some(compat_reports().taker[0].deniability_proof.clone().unwrap());
+        with_proof.save_to_wallet(&mut wallet).unwrap();
+
+        // A taker swap that failed and was later recovered has two kinds.
+        let detail = wallet.swap_detail("swap-failed").unwrap();
+        assert_eq!(detail["taker"][0]["status"], "Failed");
+        assert_eq!(detail["recovery"][0]["recovery_type"], "hashlock");
+        assert!(detail.get("maker").is_none());
+
+        let detail = wallet.swap_detail("swap-proof").unwrap();
+        assert_eq!(detail["taker"][0]["swap_id"], "swap-proof");
+        assert!(detail["taker"][0].get("deniability_proof").is_none());
+        // The stored report keeps its proof.
+        assert!(wallet.swap_reports().taker[2].deniability_proof.is_some());
+
+        assert!(wallet.swap_detail("nobody").is_none());
+        let error = wallet.swap_list_json(Some("nobody")).unwrap_err();
+        assert!(
+            error.to_string().contains("no swap with id nobody"),
+            "{}",
+            error
+        );
     }
 }

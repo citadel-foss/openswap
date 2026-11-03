@@ -117,7 +117,7 @@ $ makerd --password-file <path> backup -o maker-backup.json
 
 `--password-file` (or `-p`) is the wallet's own passphrase. It only unlocks the wallet file at startup; it does not authorize the seed export. The command then asks for two more passphrases at hidden prompts. First it asks for the current wallet passphrase again, which opens the seed phrase to put it into the backup. Then it asks for a backup password, which is separate: it encrypts only the backup file. It writes an encrypted file. Without `-o`, the file is `<wallet>-backup.json` in the current directory. The file always ends in `.json`: `-o maker.bak` writes `maker.json`. The log shows the path written. The command needs an existing wallet. It never creates one.
 
-The backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. Finish open swaps first. Copy `<wallet>_swap_report.json` by hand. There is no backup command in `maker-cli`.
+The backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or your swap history. The reports live inside the wallet file, and a backup or a seed restore cannot rebuild them, so keep the wallet file if you want them. Finish open swaps first. There is no backup command in `maker-cli`.
 
 ### Restore
 

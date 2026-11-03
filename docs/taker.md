@@ -71,6 +71,7 @@ Commands:
   recover             Recover from all failed swaps
   backup              Backup the selected wallet.
   restore             Restore a wallet from a backup file
+  list-swaps          List the swaps in this wallet, with the fees paid. With --swap-id, show the full report of that swap
   verify-deniability  Verify the deniability proof for a specific swap
   help                Print this message or the help of the given subcommand(s)
 
@@ -456,7 +457,7 @@ Estimated receive:   <amount> BTC
 Proceed with this swap? [y/N]
 ```
 
-The swap ID is randomly generated and independent of the swap's cryptographic material, so it cannot be used to locate the swap's contracts on-chain. It is a local handle for referring to the swap, for example with `verify-deniability`.
+The swap ID is randomly generated and independent of the swap's cryptographic material, so it cannot be used to locate the swap's contracts on-chain. It is a local handle for referring to the swap, for example with `verify-deniability`. `list-swaps` shows it again later.
 
 Confirm with `y` (or pass `-y`/`--yes` upfront) to execute the swap.
 
@@ -541,7 +542,7 @@ The backup is created in the current working directory as `<wallet_name>-backup.
 
 Backup and restore both need your Bitcoin Core or Electrum backend running and reachable. They stop with an error if it is not.
 
-A backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. If swaps are open, `taker backup` prints how many. Finish them first, and copy `<wallet_name>_swap_report.json` by hand. See [wallet security](wallet-security.md) for the full list.
+A backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or your swap history. The reports live inside the wallet file, and a backup or a seed restore cannot rebuild them, so keep the wallet file if you want them. If swaps are open, `taker backup` prints how many. Finish them first. See [wallet security](wallet-security.md) for the full list.
 
 ### Your Seed Phrase
 
@@ -588,6 +589,44 @@ Three options control how far the restore searches:
 After the restore, the command lists the bond indexes it found. It also names each hint that found no bond. Check that hint for a typo.
 
 A restore that stops early resumes with the same options the next time you open the wallet.
+
+### Listing Your Swaps
+
+```bash
+$ taker list-swaps
+{
+  "totals": {
+    "succeeded": 1,
+    "failed": 0,
+    "recovered": 0,
+    "fees_paid": 3706,
+    "fees_earned": 0,
+    "unreadable_reports": 0
+  },
+  "swaps": [
+    {
+      "swap_id": "<swap_id>",
+      "role": "Taker",
+      "status": "Success",
+      "network": "regtest",
+      "end_timestamp": 1767225600,
+      "incoming_amount": 496294,
+      "outgoing_amount": 500000,
+      "fee_paid": 3706
+    }
+  ]
+}
+```
+
+The swaps are newest first. `fee_paid` includes the mining fee. A failed swap shows no fee, because it is not final, and it is left out of `fees_paid`. A recovery shows as `RecoveryHashlock` or `RecoveryTimelock`.
+
+The command only reads the wallet file. It needs no Bitcoin node, no Tor and no sync, and it asks for the wallet passphrase unless you pass `-p` or `--password-file`.
+
+To see the whole report of one swap, pass its id. This prints the UTXOs too, but not the deniability proof:
+
+```bash
+$ taker list-swaps --swap-id <swap_id>
+```
 
 ### Verifying a Deniability Proof
 

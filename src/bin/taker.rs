@@ -340,6 +340,16 @@ enum Commands {
     /// and the phrase at hidden prompts, and accepts only the phrase that
     /// derives this wallet's key.
     AttachSeed,
+    /// List the swaps in this wallet, with the fees paid.
+    /// With --swap-id, show the full report of that swap.
+    ///
+    /// Works offline: it only reads the wallet file, so no backend or Tor is
+    /// needed. It asks for the wallet passphrase unless one is given.
+    ListSwaps {
+        /// Show only this swap, in full.
+        #[clap(long, short = 's')]
+        swap_id: Option<String>,
+    },
     /// Verify the deniability proof for a specific swap.
     VerifyDeniability {
         /// The swap ID to verify.
@@ -548,6 +558,20 @@ fn run() -> Result<(), TakerError> {
     }
     if let Some(file) = &args.password_file {
         wallet_password = Some(openswap::utill::read_password_file(file)?);
+    }
+    // Offline too: the reports are in the wallet file.
+    if let Commands::ListSwaps { swap_id } = &args.command {
+        let path = data_dir.join("wallets").join(&wallet_name);
+        if !path.exists() {
+            return Err(TakerError::General(format!("no wallet file at {path:?}")));
+        }
+        let password = match wallet_password {
+            Some(password) => password,
+            None => openswap::utill::prompt_password("Enter wallet passphrase: ".to_string())?,
+        };
+        let wallet = Wallet::open_offline(&path, password)?;
+        println!("{}", wallet.swap_list_json(swap_id.as_deref())?);
+        return Ok(());
     }
     // Static settings live in the file (auto-created with defaults if missing).
     // Read it here, before the backend bakes the proxy address in, so a
@@ -1019,6 +1043,10 @@ fn run() -> Result<(), TakerError> {
             Wallet::backup_interactive(&wallet, None)?;
         }
         Commands::Restore { .. } | Commands::ShowSeed | Commands::AttachSeed => {
+            // Handled above before taker init
+            unreachable!()
+        }
+        Commands::ListSwaps { .. } => {
             // Handled above before taker init
             unreachable!()
         }

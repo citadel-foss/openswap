@@ -74,6 +74,11 @@ pub enum RpcMsgReq {
         /// Addresses to remove.
         addresses: Vec<String>,
     },
+    /// List the swap history, or show the reports of one swap.
+    ListSwaps {
+        /// Show only this swap, in full.
+        swap_id: Option<String>,
+    },
 }
 
 /// Enum representing RPC message responses.
@@ -128,6 +133,8 @@ pub enum RpcMsgResp {
     BlocklistAddResp(AddOutcome),
     /// Response containing the number of removed blocklist entries.
     BlocklistRemoveResp(usize),
+    /// Response with the swap history, or the reports of one swap, as JSON.
+    SwapList(String),
 }
 
 impl Display for RpcMsgResp {
@@ -177,6 +184,7 @@ impl Display for RpcMsgResp {
                 write!(f, "Added: {}, updated: {}", outcome.added, outcome.updated)
             }
             Self::BlocklistRemoveResp(removed) => write!(f, "Removed: {removed}"),
+            Self::SwapList(json) => write!(f, "{json}"),
         }
     }
 }
