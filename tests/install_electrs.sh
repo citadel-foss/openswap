@@ -16,7 +16,10 @@ set -euo pipefail
 VERSION=v0.9.11
 BASE_URL=https://github.com/RCasatta/electrsd/releases/download/electrs_releases
 
-case "$(uname -s)-$(uname -m)" in
+ARCH="$(uname -m)"
+# A shell running under Rosetta reports x86_64 on Apple Silicon; sysctl.proc_translated=1 tells them apart.
+[ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = 1 ] && ARCH=arm64
+case "$(uname -s)-$ARCH" in
     Linux-x86_64)  OS=linux; SHA256=2b2f8aef35cd8e16e109b948a903d010aa472f6cdf2147d47e01fd95cd1785da ;;
     Darwin-x86_64) OS=macos; SHA256=b794287a5d98e590deadf07a3eb391cc1a53ef160c8cdcb8e6b14d856c7b181d ;;
     Darwin-arm64)
