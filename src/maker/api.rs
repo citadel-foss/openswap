@@ -1455,15 +1455,17 @@ impl MakerServer {
                 let accepted = self.bond_timelock_accepted(bond.lock_time, bond.conf_height);
                 if !accepted {
                     rejected.set(bond.conf_height.map(|height| (bond.bond_index, height)));
-                    log::warn!(
-                        "[{}] Skipping fidelity bond {}: its timelock from confirmation is outside the accepted range",
-                        self.config.network_port,
-                        bond.bond_index
-                    );
                 }
                 accepted
             })
             .map_err(MakerError::Wallet)?;
+        if let Some((index, _)) = rejected.get() {
+            log::warn!(
+                "[{}] Skipping fidelity bond {}: its timelock from confirmation is outside the accepted range",
+                self.config.network_port,
+                index
+            );
+        }
 
         if highest_index.is_none() && !fund_replacement {
             if let Some((index, conf_height)) = rejected.get() {
