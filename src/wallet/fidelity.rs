@@ -545,8 +545,14 @@ impl Wallet {
         &self,
         accept: impl Fn(&FidelityBond) -> bool,
     ) -> Result<Option<u32>, WalletError> {
-        // No live bond means no valuation and no chain calls.
-        if self.store.fidelity_bond.iter().all(|b| b.is_spent) {
+        // No live bond `accept` lets through means no valuation and no chain
+        // calls.
+        if self
+            .store
+            .fidelity_bond
+            .iter()
+            .all(|b| b.is_spent || !accept(b))
+        {
             return Ok(None);
         }
         let (tip_height, tip_time) = self.chain_tip()?;
