@@ -36,6 +36,8 @@ pub(crate) enum Restart {
     Serving,
     /// With its watcher stopped, so it starts recovery-only.
     WatcherDown,
+    /// With fee settings no swap can pay, so it starts recovery-only.
+    UnpriceableFees,
 }
 
 /// Test: maker reboot recovery preserves funded Taproot swapcoins. Maker2 funds
@@ -47,7 +49,9 @@ pub(crate) enum Restart {
 /// maker's watchtower sees that spend and uses the preimage to sweep its
 /// incoming contract from Maker1 — the same end state as a completed swap.
 ///
-/// `watchtower_liveness` runs the same body with the maker's watcher stopped.
+/// `watchtower_liveness` runs the same body with the maker's watcher stopped,
+/// and `maker_restart_with_unpriceable_fees_still_recovers` with fee settings
+/// that cannot price a swap. Both restart the maker recovery-only.
 pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart: Restart) {
     world.mine(1);
 
@@ -98,6 +102,11 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart
 
     // Only Maker2 comes back; the world now holds it alone.
     world.drop_makers();
+    if restart == Restart::UnpriceableFees {
+        // Each pct passes `check_fee_pcts`, but together no swap can be priced.
+        victim_config.amount_relative_fee_pct = 50.0;
+        victim_config.time_relative_fee_pct = 5.0;
+    }
     let mut restarted_server = MakerServer::init(victim_config).unwrap();
     if restart == Restart::WatcherDown {
         restarted_server.behavior = MakerBehavior::StopWatcherOnStartup;
@@ -153,6 +162,13 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart
             "Incomplete swaps detected on startup",
             Duration::from_secs(120)
         );
+        if restart == Restart::UnpriceableFees {
+            wait_logged!(
+                world,
+                "recovery-only mode: no fidelity bond and no new swaps",
+                Duration::from_secs(120)
+            );
+        }
         assert!(
             TcpStream::connect(("127.0.0.1", restarted.config.network_port)).is_err(),
             "recovery-only maker must not accept swap connections"
@@ -192,6 +208,20 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart
 )]
 fn taproot_maker_reboot_preserves_funded_swapcoins(world: &mut World, params: SwapParams) {
     run_reboot_recovery(world, params, Restart::Serving);
+}
+
+/// Test: a maker restarted with fee settings no swap can pay still recovers
+/// the funded swap it left behind. It must not fail startup, which would
+/// shut down the recovery it had just started; it serves recovery-only.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtPrivateKeyHandover],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn maker_restart_with_unpriceable_fees_still_recovers(world: &mut World, params: SwapParams) {
+    run_reboot_recovery(world, params, Restart::UnpriceableFees);
 }
 
 /// Test: everyone in the route crashes with funding on chain, then each restarts
