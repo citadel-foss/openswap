@@ -70,14 +70,6 @@ pub enum MakerError {
     Watcher(WatcherError),
     /// The server's stop flag ended a wait.
     Shutdown,
-    /// A new fidelity bond confirmed too late for its timelock to stay in the
-    /// range takers accept, so it is not advertised.
-    FidelityBondTooLate {
-        /// The bond's index in the wallet.
-        index: u32,
-        /// The height it confirmed at.
-        conf_height: u32,
-    },
 }
 
 impl MakerError {

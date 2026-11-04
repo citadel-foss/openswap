@@ -34,7 +34,7 @@ use crate::{
 };
 
 use super::{
-    api::MakerServer,
+    api::{BondSetupError, MakerServer},
     error::MakerError,
     handlers::{
         emit_maker_success_report, handle_message, ConnectionState, Maker, MAX_CONCURRENT_SWAPS,
@@ -1071,7 +1071,7 @@ fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result
         }
 
         // Re-run setup to create new bond if needed
-        if let Err(e) = maker.setup_fidelity_bond(maker_address, true) {
+        if let Err(e) = maker.setup_fidelity_bond(maker_address) {
             log::warn!(
                 "[{}] Fidelity bond renewal failed: {:?}",
                 maker.config.network_port,
@@ -1090,9 +1090,9 @@ fn setup_startup_fidelity_bond(
     maker: &Arc<MakerServer>,
     maker_address: &str,
 ) -> Result<(), MakerError> {
-    match maker.setup_fidelity_bond(maker_address, false) {
+    match maker.setup_fidelity_bond_with(maker_address, false) {
         Ok(_) => Ok(()),
-        Err(MakerError::FidelityBondTooLate { index, conf_height }) => {
+        Err(BondSetupError::TooLate { index, conf_height }) => {
             log::error!(
                 "[{}] Fidelity bond {} confirmed at height {}, too late for its timelock to stay above the {} block minimum takers accept. Starting without a bond; the renewal loop will fund a new one.",
                 maker.config.network_port,
@@ -1102,7 +1102,7 @@ fn setup_startup_fidelity_bond(
             );
             Ok(())
         }
-        Err(e) => Err(e),
+        Err(BondSetupError::Maker(e)) => Err(e),
     }
 }
 
@@ -2689,11 +2689,11 @@ mod tests {
             });
 
         let address = "127.0.0.1:6102";
-        match maker.setup_fidelity_bond(address, false) {
-            Err(MakerError::FidelityBondTooLate { index, conf_height }) => {
+        match maker.setup_fidelity_bond_with(address, false) {
+            Err(BondSetupError::TooLate { index, conf_height }) => {
                 assert_eq!((index, conf_height), (0, tip + 2));
             }
-            other => panic!("expected FidelityBondTooLate, got {:?}", other),
+            other => panic!("expected BondSetupError::TooLate, got {:?}", other),
         }
         assert!(maker.highest_fidelity_proof.read().unwrap().is_none());
 
