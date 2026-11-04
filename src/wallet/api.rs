@@ -7334,7 +7334,7 @@ mod mempool_deferral_tests {
         wallet::{
             blockchain::SCRIPT_CACHE_TTL,
             swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
-            FidelityBond,
+            FidelityBond, FidelityError,
         },
     };
     use bitcoin::{
@@ -8641,6 +8641,62 @@ mod mempool_deferral_tests {
         assert!(result.is_err());
         assert!(in_memory.is_empty());
         assert!(on_disk.is_empty());
+    }
+
+    /// A refused bond kept because its lookup failed must not hold a restart
+    /// forever: resending the stored tx is refused again, and that refusal is
+    /// reported as final so startup skips the bond instead of waiting on it.
+    #[test]
+    fn a_kept_refused_bond_is_reported_unbroadcastable_on_restart() {
+        let funding = tx(OutPoint::null(), 50_000, ScriptBuf::new());
+        let chain = StubChain::with(&[(&funding, 50)]);
+        let bond = unsent_bond(&funding);
+        let txid = bond.outpoint.txid;
+        {
+            let mut chain = chain.lock().unwrap();
+            chain.broadcast_error = Some((
+                json!({"code": -26, "message": "min relay fee not met"}),
+                false,
+            ));
+            chain.fail_lookups.insert(txid);
+        }
+        let url = start_electrum_stub(chain.clone());
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet.cbor");
+        let mut wallet = stub_wallet(&path, electrum(&url));
+
+        assert!(wallet.register_and_broadcast_bond(bond).is_err());
+        assert_eq!(saved_bonds(&path), vec![txid]);
+
+        // Restart: the lookup now answers, and the stored tx is refused again.
+        chain.lock().unwrap().fail_lookups.clear();
+        let (store, _) = WalletStore::read_from_disk(&path, Some(PASSWORD.to_string())).unwrap();
+        let restarted = electrum(&url);
+        assert!(matches!(
+            store.fidelity_bond[0].ensure_broadcast(&restarted),
+            Err(WalletError::Fidelity(FidelityError::BondBroadcastRefused {
+                index: 0,
+                ..
+            }))
+        ));
+
+        // Already in the mempool is not a refusal of the bond.
+        chain.lock().unwrap().broadcast_error = Some((
+            json!({"code": -27, "message": "txn-already-in-mempool"}),
+            false,
+        ));
+        assert_eq!(
+            store.fidelity_bond[0].ensure_broadcast(&restarted).unwrap(),
+            txid
+        );
+
+        // Once the backend takes it, the rebroadcast goes through.
+        chain.lock().unwrap().broadcast_error = None;
+        assert_eq!(
+            store.fidelity_bond[0].ensure_broadcast(&restarted).unwrap(),
+            txid
+        );
+        assert_eq!(chain.lock().unwrap().broadcast, vec![txid]);
     }
 
     /// When the backend cannot say whether the bond went out, the record stays

@@ -1351,17 +1351,20 @@ impl MakerServer {
                         live_bond = true;
                     }
                     Ok(None) => unconfirmed.push((index, txid)),
-                    // The bond was evicted and there is no stored transaction to
-                    // rebroadcast: it can never confirm. Losing the bond must not
-                    // take the maker down — log it and start up anyway.
+                    // The bond was evicted with no stored transaction to
+                    // rebroadcast, or the backend refuses the stored one: this
+                    // maker cannot get it confirmed. Waiting on it would hold
+                    // startup forever — log it, skip it, and fund a new bond.
                     Err(MakerError::Wallet(WalletError::Fidelity(
-                        FidelityError::BondTransactionMissing { .. },
+                        e @ (FidelityError::BondTransactionMissing { .. }
+                        | FidelityError::BondBroadcastRefused { .. }),
                     ))) => {
                         log::error!(
-                            "[{}] Pending fidelity bond {} was evicted and has no stored transaction; \
-                             it is unrecoverable. Skipping it and continuing startup.",
+                            "[{}] Pending fidelity bond {} cannot be broadcast: {}. \
+                             Skipping it and continuing startup.",
                             self.config.network_port,
-                            txid
+                            txid,
+                            e
                         );
                     }
                     Err(e) => return Err(e),
