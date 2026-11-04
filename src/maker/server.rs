@@ -2654,41 +2654,59 @@ mod tests {
     }
 
     /// A bond that confirmed too late for its timelock leaves less than the
-    /// minimum takers accept. Startup setup must report it instead of
-    /// advertising it, and the maker must still start.
+    /// minimum takers accept. Startup setup must report it, stop advertising
+    /// it (a reorg can move an advertised bond's height), and the maker must
+    /// still start.
     #[test]
     fn startup_skips_a_bond_that_confirmed_too_late() {
-        use crate::wallet::FidelityBond;
+        use crate::{protocol::common_messages::FidelityProof, wallet::FidelityBond};
         use bitcoin::{
             absolute::LockTime,
-            secp256k1::{Secp256k1, SecretKey},
+            secp256k1::{Message, Secp256k1, SecretKey},
             Amount, OutPoint, PublicKey,
         };
 
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let maker = compat_test_maker(dir.path(), Vec::new());
         let tip = 800_000u32;
+        let secp = Secp256k1::new();
         let secret = SecretKey::from_slice(&[3; 32]).unwrap();
+        let pubkey = PublicKey::new(secret.public_key(&secp));
+        let bond = FidelityBond {
+            outpoint: OutPoint::new(Txid::all_zeros(), 0),
+            amount: Amount::from_sat(50_000),
+            // Built at `tip` with the minimum timelock, confirmed one block late.
+            lock_time: LockTime::from_height(tip + 1 + MIN_FIDELITY_TIMELOCK).unwrap(),
+            pubkey,
+            conf_height: Some(tip + 2),
+            is_spent: false,
+            bond_index: 0,
+            tx: None,
+            extra: BTreeMap::new(),
+        };
+        let address = "127.0.0.1:6102";
+
+        // The bond is already advertised, as it would be if a reorg moved its
+        // confirmation height after an earlier setup accepted it.
+        let advertise = || {
+            let cert_hash = bond.generate_cert_hash(address, &pubkey);
+            let cert_sig =
+                secp.sign_ecdsa(&Message::from_digest(cert_hash.to_byte_array()), &secret);
+            *maker.highest_fidelity_proof.write().unwrap() = Some(FidelityProof {
+                bond: bond.clone(),
+                cert_hash,
+                cert_sig,
+            });
+        };
         maker
             .wallet
             .write()
             .unwrap()
             .store
             .fidelity_bond
-            .push(FidelityBond {
-                outpoint: OutPoint::new(Txid::all_zeros(), 0),
-                amount: Amount::from_sat(50_000),
-                // Built at `tip` with the minimum timelock, confirmed one block late.
-                lock_time: LockTime::from_height(tip + 1 + MIN_FIDELITY_TIMELOCK).unwrap(),
-                pubkey: PublicKey::new(secret.public_key(&Secp256k1::new())),
-                conf_height: Some(tip + 2),
-                is_spent: false,
-                bond_index: 0,
-                tx: None,
-                extra: BTreeMap::new(),
-            });
+            .push(bond.clone());
 
-        let address = "127.0.0.1:6102";
+        advertise();
         match maker.setup_fidelity_bond_with(address, false) {
             Err(BondSetupError::TooLate { index, conf_height }) => {
                 assert_eq!((index, conf_height), (0, tip + 2));
@@ -2697,6 +2715,7 @@ mod tests {
         }
         assert!(maker.highest_fidelity_proof.read().unwrap().is_none());
 
+        advertise();
         setup_startup_fidelity_bond(&maker, address).unwrap();
         assert!(maker.highest_fidelity_proof.read().unwrap().is_none());
     }
