@@ -90,6 +90,13 @@ pub enum FidelityError {
     BondTransactionMissing {
         index: u32,
     },
+    /// The backend refused to rebroadcast the bond's stored transaction, and
+    /// resending it unchanged cannot help: its fee or inputs no longer pass.
+    /// The record stays, so the bond is adopted if it confirms elsewhere.
+    BondBroadcastRefused {
+        index: u32,
+        reason: String,
+    },
     /// The configured bond amount is below `MIN_FIDELITY_BOND_AMOUNT_SATS`, so
     /// the bond would fund but never be discovered by any taker.
     BondAmountTooLow {
@@ -124,6 +131,10 @@ impl std::fmt::Display for FidelityError {
             FidelityError::BondTransactionMissing { index } => write!(
                 f,
                 "fidelity bond at index {index} was evicted and has no stored transaction to rebroadcast"
+            ),
+            FidelityError::BondBroadcastRefused { index, reason } => write!(
+                f,
+                "the backend refused to rebroadcast fidelity bond at index {index}: {reason}"
             ),
             FidelityError::BondAmountTooLow {
                 configured,
@@ -481,8 +492,21 @@ impl FidelityBond {
             })?;
         // The stored tx is this bond's, so its txid is known: the backend's
         // answer is never trusted to name what we wait on.
-        chain.send_raw_transaction(tx)?;
-        Ok(self.outpoint.txid)
+        let Err(error) = chain.send_raw_transaction(tx) else {
+            return Ok(self.outpoint.txid);
+        };
+        // A refusal is the backend's verdict on this exact transaction, and
+        // resending it will not change that. Only a transport failure is
+        // worth retrying.
+        match broadcast_refusal(&error) {
+            Some(refusal) if refusal.is_already_known() => Ok(self.outpoint.txid),
+            Some(refusal) => Err(FidelityError::BondBroadcastRefused {
+                index: self.bond_index,
+                reason: refusal.message,
+            }
+            .into()),
+            None => Err(error),
+        }
     }
 }
 

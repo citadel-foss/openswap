@@ -327,6 +327,7 @@ openswap wallet::api::mempool_deferral_tests::a_bond_accepted_despite_an_error_r
 openswap wallet::api::mempool_deferral_tests::a_bond_refused_as_already_known_is_kept
 openswap wallet::api::mempool_deferral_tests::a_bond_with_an_unknown_outcome_is_kept_and_reported
 openswap wallet::api::mempool_deferral_tests::a_broadcast_bond_is_saved_with_its_transaction
+openswap wallet::api::mempool_deferral_tests::a_kept_refused_bond_is_reported_unbroadcastable_on_restart
 openswap wallet::api::mempool_deferral_tests::a_refused_unknown_bond_is_dropped
 openswap wallet::api::mempool_deferral_tests::committed_legacy_resends_unknown_funding_before_its_contract
 openswap wallet::api::mempool_deferral_tests::compat_committed_taproot_survives_absence_until_confirmation
