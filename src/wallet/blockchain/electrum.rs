@@ -309,16 +309,15 @@ fn refusal_backoff(refusals: u8) -> Duration {
 /// An answer that does not decode is terminal too, except a JSON error at EOF,
 /// which is how the client reports a connection the server closed.
 fn is_terminal(e: &electrum_client::Error) -> bool {
-    use electrum_client::Error as E;
     !is_rate_limited(e)
         && match e {
-            E::Protocol(_)
-            | E::AlreadySubscribed(_)
-            | E::NotSubscribed(_)
-            | E::InvalidResponse(_)
-            | E::Hex(_)
-            | E::Bitcoin(_) => true,
-            E::JSON(json) => !json.is_eof() && !json.is_io(),
+            electrum_client::Error::Protocol(_)
+            | electrum_client::Error::AlreadySubscribed(_)
+            | electrum_client::Error::NotSubscribed(_)
+            | electrum_client::Error::InvalidResponse(_)
+            | electrum_client::Error::Hex(_)
+            | electrum_client::Error::Bitcoin(_) => true,
+            electrum_client::Error::JSON(json) => !json.is_eof() && !json.is_io(),
             _ => false,
         }
 }
