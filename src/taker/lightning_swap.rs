@@ -469,6 +469,77 @@ impl Taker {
         Ok(())
     }
 
+    /// Drop recovery records whose HTLC already has a confirmed spend.
+    ///
+    /// This is deliberately only a pruning pass: startup must not allocate
+    /// destinations or broadcast transactions merely to clean up completed
+    /// swaps.
+    pub(super) fn prune_confirmed_lightning_swaps(&self) -> Result<(), TakerError> {
+        use crate::wallet::blockchain::Blockchain;
+
+        let records: Vec<(String, LnPendingSwap)> = self
+            .read_wallet()?
+            .store
+            .ln_pending_swaps
+            .iter()
+            .map(|(id, record)| (id.clone(), record.clone()))
+            .collect();
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let chain = self.backend.connect()?;
+        let mut confirmed = Vec::new();
+        for (swap_id, record) in records {
+            let Some(outpoint) = record.outpoint else {
+                continue;
+            };
+            let htlc = SwapHtlc::from_redeemscript(record.redeemscript, record.locktime);
+            let script = htlc
+                .script_pubkey()
+                .map_err(|e| general(format!("htlc spk: {e}")))?;
+            if chain.is_confirmed_spend(&outpoint, &script)? {
+                confirmed.push(swap_id);
+            }
+        }
+        if confirmed.is_empty() {
+            return Ok(());
+        }
+
+        let mut wallet = self.write_wallet()?;
+        for swap_id in &confirmed {
+            wallet.store.ln_pending_swaps.remove(swap_id);
+            log::info!("Lightning swap {swap_id}: confirmed on-chain; recovery record removed");
+        }
+        wallet.save_to_disk()?;
+        Ok(())
+    }
+
+    fn pending_swap_payout_script(&self, swap_id: &str) -> Result<bitcoin::ScriptBuf, TakerError> {
+        if let Some(script) = self
+            .read_wallet()?
+            .store
+            .ln_pending_swaps
+            .get(swap_id)
+            .and_then(|record| record.payout_script.clone())
+        {
+            return Ok(script);
+        }
+
+        let mut wallet = self.write_wallet()?;
+        let script = wallet
+            .get_next_external_address(AddressType::P2WPKH)?
+            .script_pubkey();
+        let record = wallet
+            .store
+            .ln_pending_swaps
+            .get_mut(swap_id)
+            .ok_or_else(|| general(format!("missing recovery record for {swap_id}")))?;
+        record.payout_script = Some(script.clone());
+        wallet.save_to_disk()?;
+        Ok(script)
+    }
+
     /// Funds `address` with `value` from the wallet and returns the
     /// confirmed outpoint.
     fn fund_htlc_output(
@@ -635,6 +706,7 @@ impl Taker {
                 privkey: timelock_privkey,
                 outpoint: None,
                 value: None,
+                payout_script: None,
             },
         )?;
         let funding_value = total_with_fee(params.amount, accept.fee)?;
@@ -676,7 +748,11 @@ impl Taker {
             Err(e) => log::debug!("no completion message from maker: {e:?}"),
         }
 
-        self.remove_pending_swap(&swap_id)?;
+        // Keep the randomly generated claim key until the outpoint has a
+        // confirmed spend. A successful broadcast is not durable resolution:
+        // the claim can be evicted after its preimage settles Lightning.
+        // `recover_lightning_swaps` removes this record once confirmation is
+        // observed and can rebuild/rebroadcast the claim after a restart.
         Ok(LnSwapReport {
             swap_id,
             maker: conn.address,
@@ -749,6 +825,7 @@ impl Taker {
                 privkey: hashlock_privkey,
                 outpoint: None,
                 value: None,
+                payout_script: None,
             },
         )?;
 
@@ -807,10 +884,7 @@ impl Taker {
             wallet.save_to_disk()?;
         }
 
-        let destination = self
-            .write_wallet()?
-            .get_next_external_address(AddressType::P2WPKH)?
-            .script_pubkey();
+        let destination = self.pending_swap_payout_script(&swap_id)?;
         let claim_tx = htlc
             .create_hashlock_spend(
                 funded.outpoint,
@@ -845,7 +919,9 @@ impl Taker {
             log::warn!("swap-out {swap_id}: settlement not observed: {e:?}");
         }
 
-        self.remove_pending_swap(&swap_id)?;
+        // Broadcasting the claim is not durable resolution. Keep the random
+        // hashlock key and preimage until recovery observes a confirmed spend;
+        // an evicted claim can then be rebuilt after a restart.
         let _ = self.write_wallet()?.sync_and_save(&Default::default());
         Ok(LnSwapReport {
             swap_id,
@@ -987,6 +1063,7 @@ impl Taker {
                 privkey: timelock_privkey,
                 outpoint: None,
                 value: None,
+                payout_script: None,
             },
         )?;
         self.save_pending_swap(
@@ -999,6 +1076,7 @@ impl Taker {
                 privkey: hashlock_privkey,
                 outpoint: None,
                 value: None,
+                payout_script: None,
             },
         )?;
 
@@ -1064,10 +1142,7 @@ impl Taker {
         }
 
         // ---- Claim hop 2: publishes the preimage that unlocks hop 1 ----
-        let destination = self
-            .write_wallet()?
-            .get_next_external_address(AddressType::P2WPKH)?
-            .script_pubkey();
+        let destination = self.pending_swap_payout_script(&out_key)?;
         let claim_tx = htlc2
             .create_hashlock_spend(
                 funded2.outpoint,
@@ -1090,8 +1165,9 @@ impl Taker {
             Err(e) => log::debug!("no completion message from second maker: {e:?}"),
         }
 
-        self.remove_pending_swap(&out_key)?;
-        self.remove_pending_swap(&in_key)?;
+        // Keep both randomly generated branch keys until their HTLCs have
+        // confirmed spends. Recovery attributes resolution from the chain and
+        // can rebuild the hop-2 claim or hop-1 refund after a restart.
         let _ = self.write_wallet()?.sync_and_save(&Default::default());
 
         Ok(LnRoutedSwapReport {
@@ -1131,10 +1207,27 @@ impl Taker {
                 }
             };
             let htlc = SwapHtlc::from_redeemscript(record.redeemscript.clone(), record.locktime);
-            let destination = self
-                .write_wallet()?
-                .get_next_external_address(AddressType::P2WPKH)?
-                .script_pubkey();
+            let script = htlc
+                .script_pubkey()
+                .map_err(|e| general(format!("htlc spk: {e}")))?;
+            let already_settled = {
+                use crate::wallet::blockchain::Blockchain;
+                self.read_wallet()?
+                    .blockchain
+                    .is_confirmed_spend(&outpoint, &script)
+            };
+            match already_settled {
+                Ok(true) => {
+                    self.remove_pending_swap(&swap_id)?;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    outcomes.push(format!("{swap_id}: spend status unknown: {e:?}"));
+                    continue;
+                }
+            }
+            let destination = self.pending_swap_payout_script(&swap_id)?;
             let spend = if record.is_swap_in {
                 // Our money, refund branch (CSV-gated).
                 htlc.create_timelock_spend(outpoint, value, &record.privkey, destination)
@@ -1161,9 +1254,6 @@ impl Taker {
                 Err(e) => log::debug!("{swap_id}: recovery spend not accepted: {e:?}"),
             }
 
-            let script = htlc
-                .script_pubkey()
-                .map_err(|e| general(format!("htlc spk: {e}")))?;
             let settled = {
                 use crate::wallet::blockchain::Blockchain;
                 self.read_wallet()?

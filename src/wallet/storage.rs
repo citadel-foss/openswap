@@ -528,6 +528,10 @@ pub struct LnPendingSwap {
     pub outpoint: Option<OutPoint>,
     /// The HTLC funding value, once known.
     pub value: Option<bitcoin::Amount>,
+    /// Destination fixed for this swap's recovery spend. Persisting it keeps
+    /// retries from consuming a fresh wallet receive index on every pass.
+    #[serde(default)]
+    pub payout_script: Option<ScriptBuf>,
 }
 
 /// Redacted: the preimage is the secret the whole swap turns on, and
@@ -540,6 +544,7 @@ impl std::fmt::Debug for LnPendingSwap {
             .field("locktime", &self.locktime)
             .field("outpoint", &self.outpoint)
             .field("value", &self.value)
+            .field("payout_script", &self.payout_script)
             .finish_non_exhaustive()
     }
 }
@@ -589,6 +594,7 @@ impl Requires for LnPendingSwap {
             privkey: _,
             outpoint: _,
             value: _,
+            payout_script: _,
         } = self;
         out.insert(if *is_swap_in {
             "ln-swap-in"
@@ -1183,6 +1189,7 @@ pub(crate) mod compat_support {
                     privkey: mine,
                     outpoint: Some(point),
                     value: Some(Amount::from_sat(100_000)),
+                    payout_script: None,
                 },
             );
         }
@@ -1999,6 +2006,7 @@ mod tests {
                     privkey: SecretKey::from_slice(&[9; 32]).unwrap(),
                     outpoint: Some(cache_entry(0).0),
                     value: Some(Amount::from_sat(50_000)),
+                    payout_script: None,
                 };
                 let mut pending_names = BTreeSet::new();
                 pending.requires(&mut pending_names);

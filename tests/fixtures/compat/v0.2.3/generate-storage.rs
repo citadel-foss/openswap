@@ -205,6 +205,7 @@ mod compat_storage_fixture_generation {
                     privkey: mine,
                     outpoint: Some(point),
                     value: Some(Amount::from_sat(100_000)),
+                    payout_script: None,
                 },
             );
         }

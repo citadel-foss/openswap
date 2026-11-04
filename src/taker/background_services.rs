@@ -823,6 +823,7 @@ mod tests {
                 privkey: key,
                 outpoint: None,
                 value: None,
+                payout_script: None,
             },
         );
         wallet.store.ln_maker_swaps.insert(

@@ -805,6 +805,10 @@ impl Taker {
         if let Err(e) = taker.release_orphan_reservations() {
             log::error!("Startup: could not release orphan funding claims: {:?}", e);
         }
+        #[cfg(feature = "lightning")]
+        if let Err(e) = taker.prune_confirmed_lightning_swaps() {
+            log::warn!("Startup: could not prune completed Lightning swaps: {e:?}");
+        }
         taker.init_recover_wallet();
         Ok(taker)
     }
