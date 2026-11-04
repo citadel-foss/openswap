@@ -122,6 +122,14 @@ fn funding_confirmation_is_safe(swap: &LnMakerSwap, height: u32) -> bool {
         })
 }
 
+fn reconnect_funding_is_safe(
+    swap: &LnMakerSwap,
+    height: u32,
+    inbound_status: InboundPaymentStatus,
+) -> bool {
+    funding_confirmation_is_safe(swap, height) && inbound_status == InboundPaymentStatus::Claimable
+}
+
 /// Wait until the funding transaction has anchored its CSV window in a block.
 /// The taker must not learn the outpoint while the Lightning hold can
 /// still fail: otherwise a late confirmation leaves a hashlock spendable after
@@ -1162,7 +1170,18 @@ fn handle_swap_out_paid<M: Maker>(
             // permission to reveal late or insufficiently confirmed funding.
             let ready = if let Some(height) = maker.tx_confirmation_height(&outpoint.txid)? {
                 if swap.funding_deadline.is_some() && swap.claim_deadline.is_some() {
-                    funding_confirmation_is_safe(&swap, height)
+                    if !funding_confirmation_is_safe(&swap, height) {
+                        false
+                    } else {
+                        let inbound_status = ctx
+                            .ln
+                            .inbound_payment_status(swap.payment_hash)
+                            .map_err(|e| {
+                                log::warn!("lightning: inbound payment lookup failed: {e:?}");
+                                MakerError::General("inbound payment lookup failed")
+                            })?;
+                        reconnect_funding_is_safe(&swap, height, inbound_status)
+                    }
                 } else {
                     // Pre-deadline records were persisted only after this
                     // outpoint had already been disclosed. Preserve their
@@ -2046,6 +2065,26 @@ mod tests {
         let mut short_hold = swap;
         short_hold.claim_deadline = Some(812_089);
         assert!(!funding_confirmation_is_safe(&short_hold, 812_024));
+    }
+
+    #[test]
+    fn reconnect_requires_the_inbound_hold_to_remain_claimable() {
+        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        assert!(reconnect_funding_is_safe(
+            &swap,
+            812_024,
+            InboundPaymentStatus::Claimable
+        ));
+        assert!(!reconnect_funding_is_safe(
+            &swap,
+            812_024,
+            InboundPaymentStatus::Failed
+        ));
+        assert!(!reconnect_funding_is_safe(
+            &swap,
+            812_024,
+            InboundPaymentStatus::Settled
+        ));
     }
 
     fn channel(outbound_sat: u64, inbound_sat: u64, is_usable: bool) -> ChannelInfo {

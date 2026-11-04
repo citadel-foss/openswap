@@ -54,6 +54,10 @@ use super::{
 /// Bound on every wait for a maker message or Lightning event.
 const LN_STEP_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The maker may spend up to 30 minutes waiting for safe funding. Allow a
+/// small delivery margin, but never let an unresponsive peer block forever.
+const FUNDING_REPLY_TIMEOUT: Duration = Duration::from_secs(1830);
+
 /// Safety margin (blocks) added over the invoice CLTV delta when deriving
 /// the default swap-in locktime.
 const CLTV_SAFETY_MARGIN: u16 = 12;
@@ -369,18 +373,17 @@ impl LnMakerConn {
         }
     }
 
-    /// Waits for the maker's block-bound funding decision without applying
-    /// the ordinary request timeout. The maker may wait across its complete
-    /// confirmation window before returning funded or cancelling; timing out
-    /// this socket first would strand the paid hold invoice and leave the
-    /// persisted taker record without the funding outpoint.
+    /// Waits for the maker's block-bound funding decision beyond the ordinary
+    /// request timeout. If the maker exceeds its funding window plus delivery
+    /// margin, the swap returns an error while retaining its pending record
+    /// for recovery.
     fn read_funding_reply(&mut self) -> Result<LightningMakerMessage, TakerError> {
         let previous = self
             .socket
             .read_timeout()
             .map_err(|e| general(format!("read maker timeout: {e}")))?;
         self.socket
-            .set_read_timeout(None)
+            .set_read_timeout(Some(FUNDING_REPLY_TIMEOUT))
             .map_err(|e| general(format!("extend maker funding timeout: {e}")))?;
         let result = self.read_ln();
         if let Err(e) = self.socket.set_read_timeout(previous) {
