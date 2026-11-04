@@ -3983,10 +3983,10 @@ fn funding_spender(
     swap_id: &str,
 ) -> Result<Option<Txid>, MakerError> {
     match watch_service.watch_request(funding_outpoint) {
-        // A watched outpoint with no recorded spend replies `spending_tx: None`.
         Ok(WatcherEvent::UtxoSpent { spending_tx, .. }) => {
             Ok(spending_tx.map(|tx| tx.compute_txid()))
         }
+        Ok(WatcherEvent::Unspent { .. }) => Ok(None),
         // `NoOutpoint` means the watch armed at ProofOfFunding is gone; the
         // service already turns a watcher `Error` reply into `Err`.
         other => Err(MakerError::Watcher(WatcherError::General(format!(

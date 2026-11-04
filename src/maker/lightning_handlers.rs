@@ -1594,7 +1594,11 @@ fn watchdog_resolve_swap_out(
             // fail the hold invoice while the confirmed transaction carried
             // the preimage, handing the taker both sides.
             if !maker.is_htlc_spend_confirmed(&outpoint, &spk)? {
-                return Ok(());
+                // A watcher snapshot can retain an evicted mempool refund.
+                // Rebuild and rebroadcast it once mature; an already-known
+                // transaction is harmless and an evicted one becomes live
+                // again instead of leaving this swap stuck forever.
+                return broadcast_swap_out_refund(maker, swap_id, &swap, outpoint, value);
             }
             let ours_confirmed = match swap.refund_txid {
                 Some(txid) => maker.is_tx_confirmed(&txid)?,
@@ -1618,9 +1622,9 @@ fn watchdog_resolve_swap_out(
             let _ = maker.sync_and_save_wallet();
             Ok(())
         }
-        Ok(WatcherEvent::UtxoSpent {
-            spending_tx: None, ..
-        }) => Ok(()), // spent but tx unknown yet; retry next tick
+        Ok(WatcherEvent::Unspent { .. }) => {
+            broadcast_swap_out_refund(maker, swap_id, &swap, outpoint, value)
+        }
         Ok(WatcherEvent::NoOutpoint) => {
             // Not "unspent" — the watcher has no entry for this outpoint at
             // all, which happens when a startup rescan failed. Treating it
@@ -1634,45 +1638,12 @@ fn watchdog_resolve_swap_out(
             maker.register_watch_outpoint(outpoint, spk)?;
             Ok(())
         }
-        Ok(_) => {
-            // Unspent: refund once the CSV window has passed. An early
-            // attempt fails non-BIP68-final harmlessly and is retried.
-            let current = maker.get_current_height()?;
-            let refundable = swap
-                .funding_height
-                .map(|h| current >= h.saturating_add(swap.locktime as u32))
-                .unwrap_or(false);
-            if !refundable {
-                return Ok(());
-            }
-            let mut swap = swap.clone();
-            let destination = payout_script(maker, swap_id, &mut swap)?;
-            let refund_tx = swap
-                .htlc
-                .create_timelock_spend(outpoint, value, &swap.privkey, destination)
-                .map_err(|e| {
-                    log::warn!("lightning: refund build failed: {e}");
-                    MakerError::General("refund build failed")
-                })?;
-            // Broadcast but keep the record: the refund is only ours once it
-            // confirms, and until then this record holds the only key that
-            // can rebuild it. The confirmed-spend branch above closes the
-            // swap and fails the held payment on a later tick.
-            match maker.broadcast_transaction(&refund_tx) {
-                Ok(txid) => {
-                    log::info!(
-                        "Swap-out {swap_id} refund broadcast: {txid} (held until confirmed)"
-                    );
-                    // Remembered so a later confirmed spend can be attributed
-                    // to us rather than assumed to be ours.
-                    let mut updated = swap.clone();
-                    updated.refund_txid = Some(txid);
-                    updated.touch();
-                    maker.store_ln_swap(swap_id, updated)?;
-                }
-                Err(e) => log::debug!("swap-out {swap_id} refund not yet broadcastable: {e:?}"),
-            }
-            Ok(())
+        Ok(WatcherEvent::UtxoSpent {
+            spending_tx: None, ..
+        }) => Ok(()), // spent but tx unknown yet; retry next tick
+        Ok(WatcherEvent::Error(e)) => {
+            log::warn!("swap-out {swap_id}: watch request failed: {e}");
+            Err(MakerError::General("watch request failed"))
         }
         Err(e) => {
             // Logged rather than formatted into the error: MakerError::General
@@ -1682,6 +1653,44 @@ fn watchdog_resolve_swap_out(
             Err(MakerError::General("watch request failed"))
         }
     }
+}
+
+fn broadcast_swap_out_refund(
+    maker: &Arc<MakerServer>,
+    swap_id: &str,
+    swap: &LnMakerSwap,
+    outpoint: OutPoint,
+    value: Amount,
+) -> Result<(), MakerError> {
+    let current = maker.get_current_height()?;
+    let refundable = swap
+        .funding_height
+        .is_some_and(|height| current >= height.saturating_add(swap.locktime as u32));
+    if !refundable {
+        return Ok(());
+    }
+
+    let mut swap = swap.clone();
+    let destination = payout_script(maker, swap_id, &mut swap)?;
+    let refund_tx = swap
+        .htlc
+        .create_timelock_spend(outpoint, value, &swap.privkey, destination)
+        .map_err(|e| {
+            log::warn!("lightning: refund build failed: {e}");
+            MakerError::General("refund build failed")
+        })?;
+    // Keep the record until confirmation: it holds the key and destination
+    // needed to reproduce this exact transaction after eviction or restart.
+    match maker.broadcast_transaction(&refund_tx) {
+        Ok(txid) => {
+            log::info!("Swap-out {swap_id} refund broadcast: {txid} (held until confirmed)");
+            swap.refund_txid = Some(txid);
+            swap.touch();
+            maker.store_ln_swap(swap_id, swap)?;
+        }
+        Err(e) => log::debug!("swap-out {swap_id} refund not yet broadcastable: {e:?}"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -64,6 +64,11 @@ pub struct Watcher<R: Role> {
 /// Events emitted by the watcher to its clients.
 #[derive(Debug, Clone)]
 pub enum WatcherEvent {
+    /// Indicates that a watched outpoint is currently unspent.
+    Unspent {
+        /// Monitored outpoint.
+        outpoint: OutPoint,
+    },
     /// Indicates that a watched outpoint was spent.
     UtxoSpent {
         /// Monitored outpoint.
@@ -398,9 +403,14 @@ impl<R: Role> Watcher<R> {
                         watch.spent_tx
                     };
                     spent = true;
-                    _ = reply.send(WatcherEvent::UtxoSpent {
-                        outpoint: watch.outpoint,
-                        spending_tx,
+                    _ = reply.send(match spending_tx {
+                        Some(spending_tx) => WatcherEvent::UtxoSpent {
+                            outpoint: watch.outpoint,
+                            spending_tx: Some(spending_tx),
+                        },
+                        None => WatcherEvent::Unspent {
+                            outpoint: watch.outpoint,
+                        },
                     });
                 }
                 if !spent {
@@ -2483,10 +2493,12 @@ mod tests {
         }
     }
 
-    /// The spend in a `UtxoSpent` answer; any other answer fails the test.
+    /// The spend in an answer for a watched outpoint; an explicit unspent
+    /// answer maps to `None`, while missing/unknown answers fail the test.
     fn answered_spend(answer: WatcherEvent) -> Option<Transaction> {
         match answer {
             WatcherEvent::UtxoSpent { spending_tx, .. } => spending_tx,
+            WatcherEvent::Unspent { .. } => None,
             other => panic!("expected the watched outpoint, got {:?}", other),
         }
     }

@@ -1143,6 +1143,7 @@ fn watched_spend(
         MakerError::General("watchtower query failed")
     })? {
         WatcherEvent::UtxoSpent { spending_tx, .. } => Ok(spending_tx),
+        WatcherEvent::Unspent { .. } => Ok(None),
         other => {
             log::warn!("watch request for {outpoint} has no answer: {other:?}");
             Err(MakerError::General(
