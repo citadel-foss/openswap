@@ -412,27 +412,44 @@ impl CoreRPC {
             address: String,
         }
         let pubs: Vec<ZmqNotification> = self.rpc.call("getzmqnotifications", &[])?;
-        for topic in ["pubrawtx", "pubrawblock"] {
-            let addresses: Vec<&str> = pubs
-                .iter()
+        let [rawtx, rawblock] = ["pubrawtx", "pubrawblock"].map(|topic| {
+            pubs.iter()
                 .filter(|p| p.kind == topic)
                 .map(|p| p.address.as_str())
-                .collect();
+                .collect::<Vec<_>>()
+        });
+        for (topic, addresses) in [("pubrawtx", &rawtx), ("pubrawblock", &rawblock)] {
             if addresses.is_empty() {
                 return Err(WalletError::Zmq(format!(
                     "Bitcoin Core does not publish {topic}; set -zmq{topic}=<addr>"
                 )));
             }
-            if !addresses
-                .iter()
-                .any(|published| zmq_endpoint_matches(published, &self.config.zmq_addr))
-            {
-                return Err(WalletError::Zmq(format!(
-                    "Bitcoin Core publishes {topic} on {}, but --zmq is {}",
-                    addresses.join(", "),
-                    self.config.zmq_addr
-                )));
-            }
+        }
+        let shared: Vec<&str> = rawtx
+            .iter()
+            .copied()
+            .filter(|address| rawblock.contains(address))
+            .collect();
+        if shared.is_empty() {
+            return Err(WalletError::Zmq(format!(
+                "Bitcoin Core publishes pubrawtx on {} and pubrawblock on {}, but --zmq {} \
+                 subscribes to both on one endpoint",
+                rawtx.join(", "),
+                rawblock.join(", "),
+                self.config.zmq_addr
+            )));
+        }
+        // A tunnel or port mapping makes a working endpoint differ from Core's bind.
+        if !shared
+            .iter()
+            .any(|published| zmq_endpoint_matches(published, &self.config.zmq_addr))
+        {
+            log::warn!(
+                "Bitcoin Core publishes pubrawtx and pubrawblock on {}, but --zmq is {}; \
+                 this only works through a tunnel or port mapping",
+                shared.join(", "),
+                self.config.zmq_addr
+            );
         }
 
         // A ZMQ SUB connect() to a dead endpoint "succeeds" and then stays
@@ -891,6 +908,19 @@ pub(crate) mod tests {
         assert!(message.contains("pubrawblock"), "{}", message);
         assert!(message.contains(&configured), "{}", message);
         assert!(message.contains(&rawblock), "{}", message);
+    }
+
+    #[test]
+    fn zmq_forwarded_endpoint_is_accepted() {
+        let zmq = TcpListener::bind("127.0.0.1:0").unwrap();
+        let core_bind = TcpListener::bind("127.0.0.1:0").unwrap();
+        let published = format!("tcp://{}", core_bind.local_addr().unwrap());
+        check_zmq(
+            &format!("tcp://{}", zmq.local_addr().unwrap()),
+            &published,
+            &published,
+        )
+        .unwrap();
     }
 
     #[test]
