@@ -40,8 +40,8 @@ use super::{
     config::{default_cert_path, LightningConfig},
     error::LightningError,
     types::{
-        Balances, Bolt11Invoice, ChannelId, ChannelInfo, ChannelState, InvoiceParams, LnEvent,
-        NodeInfo, OpenChannelRequest, PaymentId, PaymentOutcome, Preimage,
+        Balances, Bolt11Invoice, ChannelId, ChannelInfo, ChannelState, InboundPaymentStatus,
+        InvoiceParams, LnEvent, NodeInfo, OpenChannelRequest, PaymentId, PaymentOutcome, Preimage,
     },
 };
 
@@ -410,6 +410,14 @@ impl LightningBackend for LdkServerBackend {
         Ok(payment_outcome_of(payment.as_ref()))
     }
 
+    fn inbound_payment_status(
+        &self,
+        payment_hash: sha256::Hash,
+    ) -> Result<InboundPaymentStatus, LightningError> {
+        let payment = self.payment_record(payment_hash)?;
+        Ok(inbound_payment_status_of(payment.as_ref()))
+    }
+
     fn has_payment_record(&self, payment_hash: sha256::Hash) -> Result<bool, LightningError> {
         Ok(self.payment_record(payment_hash)?.is_some())
     }
@@ -543,6 +551,27 @@ fn payment_outcome_of(payment: Option<&proto_types::Payment>) -> PaymentOutcome 
         PaymentOutcome::Failed
     } else {
         PaymentOutcome::Pending
+    }
+}
+
+fn inbound_payment_status_of(payment: Option<&proto_types::Payment>) -> InboundPaymentStatus {
+    let Some(payment) = payment else {
+        return InboundPaymentStatus::NotClaimable;
+    };
+    if payment.direction() != proto_types::PaymentDirection::Inbound {
+        return InboundPaymentStatus::NotClaimable;
+    }
+    if extract_payment_fields(Some(payment)).preimage.is_some()
+        || payment.status() == proto_types::PaymentStatus::Succeeded
+    {
+        return InboundPaymentStatus::Settled;
+    }
+    if payment.status() == proto_types::PaymentStatus::Failed {
+        InboundPaymentStatus::Failed
+    } else if payment.status() == proto_types::PaymentStatus::Pending {
+        InboundPaymentStatus::Claimable
+    } else {
+        InboundPaymentStatus::NotClaimable
     }
 }
 
@@ -776,6 +805,39 @@ mod tests {
         settled.direction = PaymentDirection::Inbound.into();
         settled.status = PaymentStatus::Succeeded.into();
         assert_eq!(payment_outcome_of(Some(&settled)), PaymentOutcome::NotFound);
+    }
+
+    #[test]
+    fn inbound_status_reads_only_inbound_hold_records() {
+        use proto_types::{PaymentDirection, PaymentStatus};
+
+        let status = |direction, state| {
+            inbound_payment_status_of(Some(&unsettled_payment(direction, state)))
+        };
+        assert_eq!(
+            inbound_payment_status_of(None),
+            InboundPaymentStatus::NotClaimable
+        );
+        assert_eq!(
+            status(PaymentDirection::Inbound, PaymentStatus::Pending),
+            InboundPaymentStatus::Claimable
+        );
+        assert_eq!(
+            status(PaymentDirection::Inbound, PaymentStatus::Failed),
+            InboundPaymentStatus::Failed
+        );
+        assert_eq!(
+            status(PaymentDirection::Outbound, PaymentStatus::Failed),
+            InboundPaymentStatus::NotClaimable
+        );
+
+        let preimage = Preimage([0x44; 32]);
+        let mut settled = bolt11_payment(Some(&preimage));
+        settled.direction = PaymentDirection::Inbound.into();
+        assert_eq!(
+            inbound_payment_status_of(Some(&settled)),
+            InboundPaymentStatus::Settled
+        );
     }
 
     #[test]

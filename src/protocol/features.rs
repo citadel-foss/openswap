@@ -44,6 +44,15 @@ pub const KNOWN: &[Feature] = &[
         flows: &["ln-swap-out"],
         lightning: true,
     },
+    // Persisted maker funding cancellation state. Keeping this separate from
+    // the base swap-out name makes old binaries refuse wallets whose safety
+    // state they would otherwise deserialize into flattened `extra` fields
+    // and discard on the next save.
+    Feature {
+        name: "ln-funding-cancel",
+        flows: &["ln-swap-out"],
+        lightning: true,
+    },
 ];
 
 /// Names this build can serve.

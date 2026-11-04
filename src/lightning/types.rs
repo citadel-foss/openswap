@@ -93,6 +93,19 @@ pub enum PaymentOutcome {
     NotFound,
 }
 
+/// Where an inbound hold-invoice payment stands in the backend's store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundPaymentStatus {
+    /// The invoice exists, but no claimable HTLC is currently held.
+    NotClaimable,
+    /// A claimable HTLC is parked and can still be settled or failed.
+    Claimable,
+    /// The held HTLC was failed and can no longer be collected.
+    Failed,
+    /// The inbound payment was settled.
+    Settled,
+}
+
 /// Coarse lifecycle state of a channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelState {

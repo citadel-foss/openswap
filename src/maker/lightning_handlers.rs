@@ -30,7 +30,10 @@ use std::{
 use bitcoin::{hashes::sha256, secp256k1::SecretKey, Amount, OutPoint};
 
 use crate::{
-    lightning::{swap::SwapHtlc, ChannelInfo, LightningBackend, LnEvent, PaymentOutcome, Preimage},
+    lightning::{
+        swap::SwapHtlc, ChannelInfo, InboundPaymentStatus, LightningBackend, LnEvent,
+        PaymentOutcome, Preimage,
+    },
     protocol::{
         common_messages::MakerToTakerMessage,
         features::check_pins,
@@ -53,6 +56,10 @@ use super::{
 /// How long a message handler waits for a Lightning event before giving up
 /// and leaving the swap to the watchdog.
 const INLINE_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Wall-clock ceiling for a connection worker waiting on funding. Chain
+/// height is the protocol deadline, but it does not advance during an outage.
+const FUNDING_WAIT_LIMIT: Duration = Duration::from_secs(1800);
 
 /// Safety margin (blocks) the on-chain locktime must clear beyond the
 /// invoice's final CLTV delta for a swap-in to be acceptable.
@@ -100,6 +107,10 @@ const FUNDING_CONF_BUDGET: u32 = 24;
 /// funding has already become unsafe.
 const FUNDING_CANCEL_BUDGET: u32 = 6;
 
+/// Confirmation depth after which a funding cancellation is treated as
+/// final enough to discard the only persisted copy of the refund key.
+const CANCELLATION_FINALITY_DEPTH: u32 = 6;
+
 fn funding_confirmation_is_safe(swap: &LnMakerSwap, height: u32) -> bool {
     swap.funding_deadline
         .is_some_and(|deadline| height <= deadline)
@@ -122,16 +133,22 @@ fn wait_for_funding_confirmation<M: Maker>(
     txid: &bitcoin::Txid,
     deadline: u32,
 ) -> Result<Option<u32>, MakerError> {
+    let started = Instant::now();
     loop {
         if let Some(height) = maker.tx_confirmation_height(txid)? {
             return Ok(Some(height));
         }
         let payment_failed = matches!(
-            ctx.ln.payment_outcome(payment_hash),
-            Ok(PaymentOutcome::Failed)
+            ctx.ln.inbound_payment_status(payment_hash),
+            Ok(InboundPaymentStatus::Failed)
         );
         if payment_failed || maker.shutdown_requested() || maker.get_current_height()? >= deadline {
             return Ok(None);
+        }
+        if started.elapsed() >= FUNDING_WAIT_LIMIT {
+            return Err(MakerError::General(
+                "funding confirmation wait exceeded its limit",
+            ));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1143,9 +1160,30 @@ fn handle_swap_out_paid<M: Maker>(
             // A reconnect must obey the same disclosure boundary as the
             // original handler. The persisted outpoint is recovery state, not
             // permission to reveal late or insufficiently confirmed funding.
-            let ready = maker
-                .tx_confirmation_height(&outpoint.txid)?
-                .is_some_and(|height| funding_confirmation_is_safe(&swap, height));
+            let ready = if let Some(height) = maker.tx_confirmation_height(&outpoint.txid)? {
+                if swap.funding_deadline.is_some() && swap.claim_deadline.is_some() {
+                    funding_confirmation_is_safe(&swap, height)
+                } else {
+                    // Pre-deadline records were persisted only after this
+                    // outpoint had already been disclosed. Preserve their
+                    // reconnect behavior, but require the real confirmation
+                    // height, the negotiated depth, and a still-claimable
+                    // inbound hold instead of trusting the legacy
+                    // broadcast-time `funding_height` field.
+                    let current = maker.get_current_height()?;
+                    let depth = current.saturating_sub(height).saturating_add(1);
+                    let held = ctx
+                        .ln
+                        .inbound_payment_status(swap.payment_hash)
+                        .map_err(|e| {
+                            log::warn!("lightning: inbound payment lookup failed: {e:?}");
+                            MakerError::General("inbound payment lookup failed")
+                        })?;
+                    depth >= swap.min_confirmations && held == InboundPaymentStatus::Claimable
+                }
+            } else {
+                false
+            };
             if !ready {
                 return Ok(reject(swap_id, "funding is not safely confirmed"));
             }
@@ -1323,6 +1361,13 @@ fn handle_swap_out_paid<M: Maker>(
             "funding did not confirm within the Lightning safety window",
         ));
     };
+    if !funding_confirmation_is_safe(&swap, funding_height) {
+        log::error!(
+            "swap-out {swap_id}: funding confirmed at unsafe height {funding_height}; \
+             withholding the outpoint and leaving recovery to the watchdog"
+        );
+        return Ok(reject(swap_id, "funding is not safely confirmed"));
+    }
     swap.funding_height = Some(funding_height);
     swap.touch();
     store_swap(maker, swap_id, swap.clone())?;
@@ -1676,11 +1721,31 @@ fn watchdog_resolve_swap_out(
         .funding
         .ok_or(MakerError::General("OutFunded without funding"))?;
 
+    let spk = swap.htlc.script_pubkey().map_err(|e| {
+        log::warn!("lightning: htlc script build failed: {e}");
+        MakerError::General("htlc script build failed")
+    })?;
+    let watch_result = maker.watch_service.watch_request(outpoint);
+
+    // A child can be in the mempool while its parent is still unconfirmed.
+    // The preimage is already sufficient to settle Lightning, so inspect it
+    // before any parent-confirmation or cancellation gate can return early.
+    if let Ok(WatcherEvent::UtxoSpent {
+        spending_tx: Some(spending_tx),
+        ..
+    }) = &watch_result
+    {
+        if swap.htlc.extract_preimage(spending_tx).is_some() {
+            settle_swap_out_from_spend(maker, ctx, swap_id, swap, spending_tx)?;
+            return Ok(());
+        }
+    }
+
     // Funding may have been broadcast but not yet confirmed when the handler
-    // handed the state to the watchdog. Recover the real CSV anchor here; the
-    // broadcast-time tip is intentionally never used as a substitute.
-    let swap = if swap.funding_height.is_none() {
-        if let Some(height) = maker.tx_confirmation_height(&outpoint.txid)? {
+    // handed the state to the watchdog. Recheck confirmation on every pass:
+    // a persisted height does not prove the block survived a reorg.
+    let swap = if let Some(height) = maker.tx_confirmation_height(&outpoint.txid)? {
+        if swap.funding_height.is_none() {
             if !funding_confirmation_is_safe(swap, height) {
                 // The replacement was broadcast before the last safe height.
                 // If funding nevertheless won, retain all recovery state and
@@ -1691,68 +1756,74 @@ fn watchdog_resolve_swap_out(
                      keeping the Lightning hold and recovery state"
                 );
             }
-            let mut recovered = swap.clone();
-            recovered.funding_height = Some(height);
-            recovered.touch();
-            maker.store_ln_swap(swap_id, recovered.clone())?;
-            recovered
-        } else {
-            let current = maker.get_current_height()?;
-            let payment_failed = matches!(
-                ctx.ln.payment_outcome(swap.payment_hash),
-                Ok(PaymentOutcome::Failed)
-            );
-            let cancellation_due = payment_failed
-                || swap.funding_deadline.is_some_and(|deadline| {
-                    current >= deadline.saturating_sub(FUNDING_CANCEL_BUDGET)
-                });
-            if !cancellation_due {
+            if !maker.fill_ln_funding_height(swap_id, LnMakerPhase::OutFunded, outpoint, height)? {
+                // Another handler settled or removed this snapshot while the
+                // backend lookup was in flight. Never recreate it.
                 return Ok(());
             }
-            let Some(cancel) = &swap.funding_cancel_tx else {
-                log::error!(
-                    "swap-out {swap_id}: late unconfirmed funding has no persisted cancellation"
-                );
-                return Ok(());
-            };
-            let cancel_txid = cancel.compute_txid();
-            if !maker.is_tx_confirmed(&cancel_txid)? {
-                match maker.broadcast_transaction(cancel) {
-                    Ok(txid) => log::warn!(
-                        "swap-out {swap_id}: cancellation broadcast while funding remains unconfirmed: {txid}"
-                    ),
-                    Err(e) => log::warn!(
-                        "swap-out {swap_id}: cancellation not yet accepted: {e:?}"
-                    ),
-                }
-                return Ok(());
-            }
-
-            // A confirmed input conflict makes the HTLC funding impossible;
-            // only now is it safe to return the Lightning payment.
-            log::info!("swap-out {swap_id}: funding cancellation confirmed; closing");
-            let _ = ctx.ln.fail_held_payment(swap.payment_hash);
-            if let Ok(spk) = swap.htlc.script_pubkey() {
-                maker.unwatch_outpoint(outpoint, spk);
-            }
-            ctx.router.unsubscribe(&swap.payment_hash);
-            maker.remove_ln_swap(swap_id)?;
-            let _ = maker.sync_and_save_wallet();
+        }
+        let mut recovered = swap.clone();
+        // Use the current chain's anchor for maturity decisions even if a
+        // reorg mined the transaction at a different height.
+        recovered.funding_height = Some(height);
+        recovered
+    } else {
+        let current = maker.get_current_height()?;
+        let payment_failed = matches!(
+            ctx.ln.inbound_payment_status(swap.payment_hash),
+            Ok(InboundPaymentStatus::Failed)
+        );
+        let cancellation_due = payment_failed
+            || swap
+                .funding_deadline
+                .is_some_and(|deadline| current >= deadline.saturating_sub(FUNDING_CANCEL_BUDGET));
+        if !cancellation_due {
             return Ok(());
         }
-    } else {
-        swap.clone()
+        let Some(cancel) = &swap.funding_cancel_tx else {
+            log::error!(
+                "swap-out {swap_id}: late unconfirmed funding has no persisted cancellation"
+            );
+            return Ok(());
+        };
+        let cancel_txid = cancel.compute_txid();
+        let Some(cancel_height) = maker.tx_confirmation_height(&cancel_txid)? else {
+            match maker.broadcast_transaction(cancel) {
+                Ok(txid) => log::warn!(
+                    "swap-out {swap_id}: cancellation broadcast while funding remains unconfirmed: {txid}"
+                ),
+                Err(e) => log::warn!(
+                    "swap-out {swap_id}: cancellation not yet accepted: {e:?}"
+                ),
+            }
+            return Ok(());
+        };
+        let depth = current.saturating_sub(cancel_height).saturating_add(1);
+        if depth < CANCELLATION_FINALITY_DEPTH {
+            log::debug!(
+                "swap-out {swap_id}: cancellation depth {depth}/{CANCELLATION_FINALITY_DEPTH}; \
+                 retaining refund key"
+            );
+            return Ok(());
+        }
+
+        log::info!(
+            "swap-out {swap_id}: funding cancellation reached depth \
+             {CANCELLATION_FINALITY_DEPTH}; closing"
+        );
+        let _ = ctx.ln.fail_held_payment(swap.payment_hash);
+        maker.unwatch_outpoint(outpoint, spk);
+        ctx.router.unsubscribe(&swap.payment_hash);
+        maker.remove_ln_swap(swap_id)?;
+        let _ = maker.sync_and_save_wallet();
+        return Ok(());
     };
 
-    match maker.watch_service.watch_request(outpoint) {
+    match watch_result {
         Ok(WatcherEvent::UtxoSpent {
             spending_tx: Some(spending_tx),
             ..
         }) => {
-            let spk = swap.htlc.script_pubkey().map_err(|e| {
-                log::warn!("lightning: htlc script build failed: {e}");
-                MakerError::General("htlc script build failed")
-            })?;
             // Settling on a preimage we can see is safe even before the
             // spend confirms — learning it early only helps us.
             let reveals_preimage = swap.htlc.extract_preimage(&spending_tx).is_some();
@@ -1807,10 +1878,6 @@ fn watchdog_resolve_swap_out(
             // all, which happens when a startup rescan failed. Treating it
             // as unspent would hide a taker claim forever. Re-arm and read
             // the real state next tick.
-            let spk = swap.htlc.script_pubkey().map_err(|e| {
-                log::warn!("lightning: htlc script build failed: {e}");
-                MakerError::General("htlc script build failed")
-            })?;
             log::warn!("Swap-out {swap_id}: HTLC was not being watched; re-arming");
             maker.register_watch_outpoint(outpoint, spk)?;
             Ok(())

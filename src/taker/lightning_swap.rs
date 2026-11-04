@@ -19,7 +19,7 @@
 
 use std::{
     net::TcpStream,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -33,6 +33,7 @@ use crate::{
     lightning::{
         invoice::verify_invoice, swap::SwapHtlc, InvoiceParams, LightningBackend, LnEvent, Preimage,
     },
+    lock_debug,
     protocol::{
         common_messages::{GetOffer, MakerToTakerMessage, Offer, TakerToMakerMessage},
         features::{choose_pins, unmet_for_flow},
@@ -42,7 +43,7 @@ use crate::{
         },
     },
     utill::{generate_keypair, read_message, send_message, MIN_RELAY_FEE_RATE},
-    wallet::{AddressType, LnPendingSwap},
+    wallet::{AddressType, AnyBlockchain, Blockchain, LnPendingSwap, Wallet},
 };
 
 use super::{
@@ -244,6 +245,55 @@ fn general(msg: impl Into<String>) -> TakerError {
     TakerError::General(msg.into())
 }
 
+/// Remove Lightning recovery records whose outpoints have confirmed spends.
+/// A failure for one record is isolated so it cannot starve later records.
+pub(super) fn prune_confirmed_lightning_records(
+    wallet: &Arc<RwLock<Wallet>>,
+    chain: &AnyBlockchain,
+) -> Result<(), TakerError> {
+    let records: Vec<(String, LnPendingSwap)> = lock_debug!(wallet.read())
+        .map_err(|_| general("wallet lock poisoned"))?
+        .store
+        .ln_pending_swaps
+        .iter()
+        .map(|(id, record)| (id.clone(), record.clone()))
+        .collect();
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    let mut confirmed = Vec::new();
+    for (swap_id, record) in records {
+        let Some(outpoint) = record.outpoint else {
+            continue;
+        };
+        let htlc = SwapHtlc::from_redeemscript(record.redeemscript, record.locktime);
+        let script = match htlc.script_pubkey() {
+            Ok(script) => script,
+            Err(e) => {
+                log::warn!("Lightning swap {swap_id}: HTLC script build failed: {e}");
+                continue;
+            }
+        };
+        match chain.is_confirmed_spend(&outpoint, &script) {
+            Ok(true) => confirmed.push(swap_id),
+            Ok(false) => {}
+            Err(e) => log::warn!("Lightning swap {swap_id}: spend check failed: {e:?}"),
+        }
+    }
+    if confirmed.is_empty() {
+        return Ok(());
+    }
+
+    let mut wallet = lock_debug!(wallet.write()).map_err(|_| general("wallet lock poisoned"))?;
+    for swap_id in &confirmed {
+        wallet.store.ln_pending_swaps.remove(swap_id);
+        log::info!("Lightning swap {swap_id}: confirmed on-chain; recovery record removed");
+    }
+    wallet.save_to_disk()?;
+    Ok(())
+}
+
 /// A maker connection with the hello/offer handshake completed.
 struct LnMakerConn {
     socket: TcpStream,
@@ -317,6 +367,26 @@ impl LnMakerConn {
             ))),
             other => Err(general(format!("unexpected maker message: {other:?}"))),
         }
+    }
+
+    /// Waits for the maker's block-bound funding decision without applying
+    /// the ordinary request timeout. The maker may wait across its complete
+    /// confirmation window before returning funded or cancelling; timing out
+    /// this socket first would strand the paid hold invoice and leave the
+    /// persisted taker record without the funding outpoint.
+    fn read_funding_reply(&mut self) -> Result<LightningMakerMessage, TakerError> {
+        let previous = self
+            .socket
+            .read_timeout()
+            .map_err(|e| general(format!("read maker timeout: {e}")))?;
+        self.socket
+            .set_read_timeout(None)
+            .map_err(|e| general(format!("extend maker funding timeout: {e}")))?;
+        let result = self.read_ln();
+        if let Err(e) = self.socket.set_read_timeout(previous) {
+            log::warn!("could not restore maker response timeout: {e}");
+        }
+        result
     }
 }
 
@@ -475,44 +545,8 @@ impl Taker {
     /// destinations or broadcast transactions merely to clean up completed
     /// swaps.
     pub(super) fn prune_confirmed_lightning_swaps(&self) -> Result<(), TakerError> {
-        use crate::wallet::blockchain::Blockchain;
-
-        let records: Vec<(String, LnPendingSwap)> = self
-            .read_wallet()?
-            .store
-            .ln_pending_swaps
-            .iter()
-            .map(|(id, record)| (id.clone(), record.clone()))
-            .collect();
-        if records.is_empty() {
-            return Ok(());
-        }
-
         let chain = self.backend.connect()?;
-        let mut confirmed = Vec::new();
-        for (swap_id, record) in records {
-            let Some(outpoint) = record.outpoint else {
-                continue;
-            };
-            let htlc = SwapHtlc::from_redeemscript(record.redeemscript, record.locktime);
-            let script = htlc
-                .script_pubkey()
-                .map_err(|e| general(format!("htlc spk: {e}")))?;
-            if chain.is_confirmed_spend(&outpoint, &script)? {
-                confirmed.push(swap_id);
-            }
-        }
-        if confirmed.is_empty() {
-            return Ok(());
-        }
-
-        let mut wallet = self.write_wallet()?;
-        for swap_id in &confirmed {
-            wallet.store.ln_pending_swaps.remove(swap_id);
-            log::info!("Lightning swap {swap_id}: confirmed on-chain; recovery record removed");
-        }
-        wallet.save_to_disk()?;
-        Ok(())
+        prune_confirmed_lightning_records(&self.wallet, &chain)
     }
 
     fn pending_swap_payout_script(&self, swap_id: &str) -> Result<bitcoin::ScriptBuf, TakerError> {
@@ -840,7 +874,7 @@ impl Taker {
         conn.send(LightningTakerMessage::SwapOutPaid(LnSwapOutPaid {
             swap_id: swap_id.clone(),
         }))?;
-        let funded = match conn.read_ln()? {
+        let funded = match conn.read_funding_reply()? {
             LightningMakerMessage::SwapOutFunded(funded) => funded,
             other => return Err(general(format!("expected SwapOutFunded, got {other}"))),
         };
@@ -1099,7 +1133,7 @@ impl Taker {
         conn2.send(LightningTakerMessage::SwapOutPaid(LnSwapOutPaid {
             swap_id: swap_id.clone(),
         }))?;
-        let funded2 = match conn2.read_ln()? {
+        let funded2 = match conn2.read_funding_reply()? {
             LightningMakerMessage::SwapOutFunded(funded) => funded,
             other => return Err(general(format!("expected SwapOutFunded, got {other}"))),
         };

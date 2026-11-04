@@ -587,9 +587,9 @@ impl Requires for LnMakerSwapRecord {
             funding_outpoint: _,
             funding_value: _,
             funding_height: _,
-            funding_cancel_tx: _,
-            funding_deadline: _,
-            claim_deadline: _,
+            funding_cancel_tx,
+            funding_deadline,
+            claim_deadline,
         } = self;
         out.insert(match direction {
             LnMakerDirection::SwapIn => "ln-swap-in",
@@ -601,6 +601,9 @@ impl Requires for LnMakerSwapRecord {
             | LnMakerPhase::InSwept
             | LnMakerPhase::OutAccepted
             | LnMakerPhase::OutFunded => {}
+        }
+        if funding_cancel_tx.is_some() || funding_deadline.is_some() || claim_deadline.is_some() {
+            out.insert("ln-funding-cancel");
         }
     }
 }
@@ -2054,6 +2057,27 @@ mod tests {
                 assert_eq!(std::fs::read(&path).unwrap(), bytes);
             }
         }
+        {
+            let maker = store.ln_maker_swaps.get_mut("maker").unwrap();
+            maker.funding_deadline = Some(100);
+            maker.claim_deadline = Some(200);
+            let mut cancellation_names = BTreeSet::new();
+            maker.requires(&mut cancellation_names);
+            assert_eq!(
+                cancellation_names,
+                BTreeSet::from(["ln-funding-cancel", "ln-swap-out"])
+            );
+        }
+        store.write_to_disk(&path, &material).unwrap();
+        let cancellation_file: EncryptedDataV2 =
+            serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            cancellation_file.requires,
+            ["ln-funding-cancel", "ln-swap-out", WALLET_STORE_FORMAT]
+        );
+        let maker = store.ln_maker_swaps.get_mut("maker").unwrap();
+        maker.funding_deadline = None;
+        maker.claim_deadline = None;
         store.ln_pending_swaps.get_mut("taker").unwrap().is_swap_in = true;
         store.write_to_disk(&path, &material).unwrap();
         let union: EncryptedDataV2 =
