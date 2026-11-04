@@ -38,7 +38,7 @@ pub(crate) use fidelity::{
 };
 pub use report::{
     MakerFeeInfo, MakerReport, PaymentResult, RecoveryReport, ReportUtxo, SwapHistory, SwapRole,
-    SwapStatus, SwapSummary, SwapTotals, TakerReport,
+    SwapStatus, SwapSummary, SwapTotals, TakerReport, DEFAULT_LISTED_SWAPS, MAX_LISTED_SWAPS,
 };
 pub use seed::SecretMnemonic;
 pub use spend::Destination;

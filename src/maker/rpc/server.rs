@@ -314,8 +314,10 @@ fn handle_request<M: MakerRpc>(
                 Err(e) => RpcMsgResp::ServerError(e.to_string()),
             }
         }
-        RpcMsgReq::ListSwaps { swap_id } => {
-            match lock_debug!(maker.wallet().read())?.swap_list_json(swap_id.as_deref()) {
+        RpcMsgReq::ListSwaps { swap_id, limit } => {
+            match lock_debug!(maker.wallet().read())?
+                .swap_list_json(swap_id.as_deref(), limit.map(|n| n as usize))
+            {
                 Ok(json) => RpcMsgResp::SwapList(json),
                 Err(e) => RpcMsgResp::ServerError(e.to_string()),
             }

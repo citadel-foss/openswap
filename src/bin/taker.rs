@@ -349,6 +349,10 @@ enum Commands {
         /// Show only this swap, in full.
         #[clap(long, short = 's')]
         swap_id: Option<String>,
+        /// Most swaps to list, newest first. The default is 100, the most 10000.
+        /// The totals always cover every swap.
+        #[clap(long, short = 'n')]
+        limit: Option<u32>,
     },
     /// Verify the deniability proof for a specific swap.
     VerifyDeniability {
@@ -560,7 +564,7 @@ fn run() -> Result<(), TakerError> {
         wallet_password = Some(openswap::utill::read_password_file(file)?);
     }
     // Offline too: the reports are in the wallet file.
-    if let Commands::ListSwaps { swap_id } = &args.command {
+    if let Commands::ListSwaps { swap_id, limit } = &args.command {
         let path = data_dir.join("wallets").join(&wallet_name);
         if !path.exists() {
             return Err(TakerError::General(format!("no wallet file at {path:?}")));
@@ -569,8 +573,15 @@ fn run() -> Result<(), TakerError> {
             Some(password) => password,
             None => openswap::utill::prompt_password("Enter wallet passphrase: ".to_string())?,
         };
-        let wallet = Wallet::open_offline(&path, password)?;
-        println!("{}", wallet.swap_list_json(swap_id.as_deref())?);
+        println!(
+            "{}",
+            Wallet::swap_list_json_from_file(
+                &path,
+                password,
+                swap_id.as_deref(),
+                limit.map(|n| n as usize)
+            )?
+        );
         return Ok(());
     }
     // Static settings live in the file (auto-created with defaults if missing).

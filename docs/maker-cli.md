@@ -544,10 +544,12 @@ $ ./maker-cli list-swaps
       "outgoing_amount": 498569,
       "fee_earned": 658
     }
-  ]
+  ],
+  "omitted": 0
 }
 ```
 
+- It lists the newest 100 swaps. Use `--limit <N>` for more, up to 10000. `omitted` says how many older swaps were left out. The totals always cover every swap.
 - `fees_earned` adds up the service fee of every completed swap. It leaves out the mining fee the maker gets back.
 - A maker only writes a report when a swap completes or is recovered. A swap that failed before that does not show up.
 - A recovery shows as `RecoveryHashlock` or `RecoveryTimelock`, with no amounts.
@@ -559,7 +561,7 @@ To see the whole report of one swap, pass its id:
 $ ./maker-cli list-swaps --swap-id <swap_id>
 ```
 
-This prints the UTXOs too, but not the deniability proof. Use `verify-deniability` to check that.
+This prints the UTXOs too, but not the deniability proof. Use `verify-deniability` to check that. If the id is not in the wallet, the command prints an error on stderr and exits with status 1.
 
 ---
 

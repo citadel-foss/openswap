@@ -100,6 +100,7 @@ fn history_has_swap(json: &str, swap_id: &str, fee: u64) -> bool {
         && history["totals"]["succeeded"] == 1
         && history["totals"]["fees_earned"] == fee
         && history["totals"]["unreadable_reports"] == 0
+        && history["omitted"] == 0
 }
 
 /// Whether a one-swap `ListSwaps` reply holds the maker report of `swap_id`
@@ -275,11 +276,17 @@ fn rpc_server(world: &mut World) {
         Req::VerifyDeniability { swap_id: swap_id.clone() } => Resp::VerifyDeniabilityResp(true),
         // An unknown swap id is an error, not `false`.
         Req::VerifyDeniability { swap_id: "no-such-swap".to_string() } => Resp::ServerError(_),
-        Req::ListSwaps { swap_id: None } => Resp::SwapList(json)
+        Req::ListSwaps { swap_id: None, limit: None } => Resp::SwapList(json)
             if history_has_swap(&json, &swap_id, fee_earned),
-        Req::ListSwaps { swap_id: Some(swap_id.clone()) } => Resp::SwapList(json)
+        Req::ListSwaps { swap_id: Some(swap_id.clone()), limit: None } => Resp::SwapList(json)
             if detail_has_swap(&json, &swap_id, fee_earned),
-        Req::ListSwaps { swap_id: Some("no-such-swap".to_string()) } => Resp::ServerError(_),
+        Req::ListSwaps { swap_id: Some("no-such-swap".to_string()), limit: None }
+            => Resp::ServerError(_),
+        // A limit of 0 lists no rows, but the totals still count the swap.
+        Req::ListSwaps { swap_id: None, limit: Some(0) } => Resp::SwapList(json)
+            if serde_json::from_str::<Value>(&json).is_ok_and(|h| {
+                h["swaps"] == json!([]) && h["omitted"] == 1 && h["totals"]["succeeded"] == 1
+            }),
     });
 
     // ---- Mutating ----
@@ -396,6 +403,23 @@ fn rpc_server(world: &mut World) {
         stdout
     );
 
+    // An id that does not exist is an error: stderr, and a failing exit code.
+    let output = Command::new(env!("CARGO_BIN_EXE_maker-cli"))
+        .args([
+            "-p",
+            &format!("127.0.0.1:{}", rpc.port),
+            "-d",
+            data_dir.to_str().unwrap(),
+            "list-swaps",
+            "--swap-id",
+            "no-such-swap",
+        ])
+        .output()
+        .expect("failed to run maker-cli");
+    assert!(!output.status.success(), "an unknown swap id must fail");
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no swap with id no-such-swap"));
+
     // The taker lists its swap from the wallet file alone: its bitcoind
     // address is left out, and nothing connects to Tor.
     let output = Command::new(env!("CARGO_BIN_EXE_taker"))
@@ -423,6 +447,34 @@ fn rpc_server(world: &mut World) {
     assert_eq!(swaps[0]["status"], "Success");
     assert!(swaps[0]["fee_paid"].as_u64().unwrap() > 0, "{}", history);
     assert_eq!(history["totals"]["fees_paid"], swaps[0]["fee_paid"]);
+    assert_eq!(history["omitted"], 0);
+
+    // The file is only read: a limit of 0 lists no rows, and the wallet stays as it was.
+    let wallet_file = world
+        .temp_dir()
+        .join("taker1")
+        .join("wallets")
+        .join("taker1");
+    let before = fs::read(&wallet_file).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_taker"))
+        .args([
+            "--data-directory",
+            world.temp_dir().join("taker1").to_str().unwrap(),
+            "--WALLET",
+            "taker1",
+            "--PASSWORD",
+            "integration-test",
+            "list-swaps",
+            "--limit",
+            "0",
+        ])
+        .output()
+        .expect("failed to run taker");
+    assert!(output.status.success());
+    let limited: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(limited["swaps"], json!([]));
+    assert_eq!(limited["omitted"], 1);
+    assert_eq!(fs::read(&wallet_file).unwrap(), before);
 
     // ---- Stop, last: it shuts the server down ----
     assert_rpc!(rpc, { Req::Stop => Resp::Shutdown });

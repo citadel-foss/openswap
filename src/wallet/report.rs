@@ -15,14 +15,18 @@ use serde_cbor::{
     value::{from_value, to_value},
     Value,
 };
-use std::{collections::HashMap, path::Path, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    time::Instant,
+};
+use zeroize::Zeroizing;
 
-use crate::utill::now_secs;
+use crate::{security::SecurityError, utill::now_secs};
 
-#[cfg(feature = "integration-test")]
-use super::storage::WalletStore;
 use super::{
     deniability::{proof_from_swapcoins, DeniabilityProof},
+    storage::WalletStore,
     swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
     Wallet, WalletError,
 };
@@ -48,19 +52,7 @@ impl Wallet {
     /// Decodes the stored reports of one kind. One this build can't read is
     /// skipped here but stays stored.
     fn decoded_reports<T: DeserializeOwned>(&self, kind: &str) -> Vec<T> {
-        self.store
-            .reports
-            .get(kind)
-            .into_iter()
-            .flatten()
-            .filter_map(|value| {
-                from_value(value.clone())
-                    .inspect_err(|e| {
-                        log::warn!("Skipping a stored {kind} report this build can't read: {e}")
-                    })
-                    .ok()
-            })
-            .collect()
+        decode_kind(&self.store.reports, kind)
     }
 
     /// This wallet's swap reports. Maker reports are keyed by the wallet name.
@@ -78,78 +70,60 @@ impl Wallet {
         }
     }
 
-    /// A short row for every swap and recovery in this wallet, newest first,
-    /// with totals. It only reads.
-    pub fn swap_history(&self) -> SwapHistory {
-        let reports = self.swap_reports();
-        let stored: usize = [TAKER_REPORTS, MAKER_REPORTS, RECOVERY_REPORTS]
-            .iter()
-            .map(|kind| self.store.reports.get(*kind).map_or(0, Vec::len))
-            .sum();
-        let readable = reports.taker.len()
-            + reports.maker.values().map(Vec::len).sum::<usize>()
-            + reports.recovery.len();
-        SwapHistory::from_reports(&reports, stored.saturating_sub(readable))
+    /// A short row for each of the newest `limit` swaps and recoveries in this
+    /// wallet, with totals over all of them. It only reads, and skips the
+    /// deniability proofs. `None` means [`DEFAULT_LISTED_SWAPS`].
+    pub fn swap_history(&self, limit: Option<usize>) -> SwapHistory {
+        history_of(&self.store.reports, limit)
     }
 
-    /// The text `list-swaps` prints: the whole history, or with `swap_id` the
+    /// The text `list-swaps` prints: the history, or with `swap_id` the
     /// reports of that one swap.
-    pub fn swap_list_json(&self, swap_id: Option<&str>) -> Result<String, WalletError> {
-        let json = match swap_id {
-            None => serde_json::to_string_pretty(&self.swap_history()),
-            Some(id) => {
-                let detail = self.swap_detail(id).ok_or_else(|| {
-                    WalletError::General(format!("no swap with id {id} in this wallet"))
-                })?;
-                serde_json::to_string_pretty(&detail)
-            }
-        };
-        json.map_err(|e| WalletError::General(e.to_string()))
+    pub fn swap_list_json(
+        &self,
+        swap_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<String, WalletError> {
+        list_json(&self.store.reports, swap_id, limit)
     }
 
     /// Every report stored for `swap_id`, as JSON, or `None` if there is none.
     /// The deniability proof is left out: it is long, and `verify-deniability`
     /// checks it.
     pub fn swap_detail(&self, swap_id: &str) -> Option<serde_json::Value> {
-        let reports = self.swap_reports();
-        let mut detail = serde_json::Map::new();
-        let mut add = |kind: &str, rows: Vec<serde_json::Value>| {
-            if !rows.is_empty() {
-                detail.insert(kind.to_string(), rows.into());
-            }
-        };
-        fn rows<'a, T: Serialize + 'a>(
-            reports: impl Iterator<Item = &'a T>,
-            matches: impl Fn(&T) -> bool,
-        ) -> Vec<serde_json::Value> {
-            reports
-                .filter(|report| matches(report))
-                .filter_map(|report| serde_json::to_value(report).ok())
-                .map(|mut row| {
-                    if let Some(fields) = row.as_object_mut() {
-                        fields.remove("deniability_proof");
-                    }
-                    row
-                })
-                .collect()
+        detail_of(&self.store.reports, swap_id)
+    }
+
+    /// Like [`Self::swap_list_json`], for a wallet file that is not open. It
+    /// never writes, takes no lock and needs no backend, so it works beside a
+    /// running process. A file that still needs its one-time upgrade is
+    /// refused: reading it would rewrite it.
+    pub fn swap_list_json_from_file(
+        path: &Path,
+        password: Zeroizing<String>,
+        swap_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<String, WalletError> {
+        if !path.exists() {
+            return Err(WalletError::General(format!("no wallet file at {path:?}")));
         }
-        add(
-            "taker",
-            rows(reports.taker.iter(), |r: &TakerReport| r.swap_id == swap_id),
-        );
-        add(
-            "maker",
-            rows(reports.maker.values().flatten(), |r: &MakerReport| {
-                r.swap_id == swap_id
-            }),
-        );
-        add(
-            "recovery",
-            rows(reports.recovery.iter(), |r: &RecoveryReport| {
-                r.swap_id == swap_id
-            }),
-        );
-        (!detail.is_empty()).then(|| detail.into())
+        if password.is_empty() {
+            return Err(WalletError::WrongPassword);
+        }
+        let loaded = WalletStore::read_without_upgrade(path, Some(password.to_string())).map_err(
+            |e| match e {
+                WalletError::Security(SecurityError::Decryption) => WalletError::WrongPassword,
+                e => e,
+            },
+        )?;
+        let Some((store, _)) = loaded else {
+            return Err(WalletError::General(
+                "this wallet file is from an older version and needs its one-time upgrade \
+                 first; run another command, such as get-balances, to upgrade it"
+                    .to_string(),
+            ));
+        };
+        list_json(&store.reports, swap_id, limit)
     }
 
     /// The deniability proofs in the saved file, so a test sees only what
@@ -804,6 +778,116 @@ impl SwapReportFile {
     }
 }
 
+/// Rows `list-swaps` shows when no limit is given.
+pub const DEFAULT_LISTED_SWAPS: usize = 100;
+
+/// Most rows `list-swaps` ever shows. About 450 bytes each, so a full list
+/// stays far below the 10 MiB limit on one RPC message.
+pub const MAX_LISTED_SWAPS: usize = 10_000;
+
+/// The raw reports of the wallet store, by kind.
+type StoredReports = BTreeMap<String, Vec<Value>>;
+
+/// Decodes the stored reports of one kind. One this build can't read is
+/// skipped here but stays stored.
+fn decode_kind<T: DeserializeOwned>(stored: &StoredReports, kind: &str) -> Vec<T> {
+    stored
+        .get(kind)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            from_value(value.clone())
+                .inspect_err(|e| {
+                    log::warn!("Skipping a stored {kind} report this build can't read: {e}")
+                })
+                .ok()
+        })
+        .collect()
+}
+
+/// The history over `stored`. Only the taker, maker and recovery reports are
+/// decoded; the deniability proofs, which are large, are not.
+fn history_of(stored: &StoredReports, limit: Option<usize>) -> SwapHistory {
+    let reports = SwapReportFile {
+        taker: decode_kind(stored, TAKER_REPORTS),
+        maker: HashMap::from([(String::new(), decode_kind(stored, MAKER_REPORTS))]),
+        recovery: decode_kind(stored, RECOVERY_REPORTS),
+        deniability_proofs: Vec::new(),
+    };
+    let readable = reports.taker.len()
+        + reports.maker.values().map(Vec::len).sum::<usize>()
+        + reports.recovery.len();
+    let stored_count: usize = [TAKER_REPORTS, MAKER_REPORTS, RECOVERY_REPORTS]
+        .iter()
+        .map(|kind| stored.get(*kind).map_or(0, Vec::len))
+        .sum();
+    let limit = limit.unwrap_or(DEFAULT_LISTED_SWAPS).min(MAX_LISTED_SWAPS);
+    SwapHistory::from_reports(&reports, stored_count.saturating_sub(readable), limit)
+}
+
+/// The reports of `swap_id` over `stored`, without proofs.
+fn detail_of(stored: &StoredReports, swap_id: &str) -> Option<serde_json::Value> {
+    fn rows<T: Serialize>(reports: Vec<T>, matches: impl Fn(&T) -> bool) -> Vec<serde_json::Value> {
+        reports
+            .iter()
+            .filter(|report| matches(report))
+            .filter_map(|report| serde_json::to_value(report).ok())
+            .map(|mut row| {
+                if let Some(fields) = row.as_object_mut() {
+                    fields.remove("deniability_proof");
+                }
+                row
+            })
+            .collect()
+    }
+    let mut detail = serde_json::Map::new();
+    let found = [
+        (
+            "taker",
+            rows(decode_kind(stored, TAKER_REPORTS), |r: &TakerReport| {
+                r.swap_id == swap_id
+            }),
+        ),
+        (
+            "maker",
+            rows(decode_kind(stored, MAKER_REPORTS), |r: &MakerReport| {
+                r.swap_id == swap_id
+            }),
+        ),
+        (
+            "recovery",
+            rows(
+                decode_kind(stored, RECOVERY_REPORTS),
+                |r: &RecoveryReport| r.swap_id == swap_id,
+            ),
+        ),
+    ];
+    for (kind, rows) in found {
+        if !rows.is_empty() {
+            detail.insert(kind.to_string(), rows.into());
+        }
+    }
+    (!detail.is_empty()).then(|| detail.into())
+}
+
+/// What `list-swaps` prints over `stored`.
+fn list_json(
+    stored: &StoredReports,
+    swap_id: Option<&str>,
+    limit: Option<usize>,
+) -> Result<String, WalletError> {
+    let json = match swap_id {
+        None => serde_json::to_string_pretty(&history_of(stored, limit)),
+        Some(id) => {
+            let detail = detail_of(stored, id).ok_or_else(|| {
+                WalletError::General(format!("no swap with id {id} in this wallet"))
+            })?;
+            serde_json::to_string_pretty(&detail)
+        }
+    };
+    json.map_err(|e| WalletError::General(e.to_string()))
+}
+
 /// One line of the swap history.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SwapSummary {
@@ -854,12 +938,14 @@ pub struct SwapTotals {
 pub struct SwapHistory {
     /// Counts and fee sums.
     pub totals: SwapTotals,
-    /// One row per swap or recovery, newest first.
+    /// The newest swaps and recoveries, newest first.
     pub swaps: Vec<SwapSummary>,
+    /// How many older ones are in the totals but not in `swaps`.
+    pub omitted: usize,
 }
 
 impl SwapHistory {
-    fn from_reports(reports: &SwapReportFile, unreadable_reports: usize) -> Self {
+    fn from_reports(reports: &SwapReportFile, unreadable_reports: usize, limit: usize) -> Self {
         let mut totals = SwapTotals {
             unreadable_reports,
             ..SwapTotals::default()
@@ -900,10 +986,15 @@ impl SwapHistory {
             });
         }
         for report in &reports.recovery {
-            let status = if report.recovery_type == "hashlock" {
-                SwapStatus::RecoveryHashlock
-            } else {
-                SwapStatus::RecoveryTimelock
+            // Only the two documented kinds; anything else is from a build
+            // this one doesn't understand.
+            let status = match report.recovery_type.as_str() {
+                "hashlock" => SwapStatus::RecoveryHashlock,
+                "timelock" => SwapStatus::RecoveryTimelock,
+                _ => {
+                    totals.unreadable_reports += 1;
+                    continue;
+                }
             };
             totals.count(&status);
             swaps.push(SwapSummary {
@@ -924,7 +1015,13 @@ impl SwapHistory {
                 .cmp(&a.end_timestamp)
                 .then_with(|| a.swap_id.cmp(&b.swap_id))
         });
-        Self { totals, swaps }
+        let omitted = swaps.len().saturating_sub(limit);
+        swaps.truncate(limit);
+        Self {
+            totals,
+            swaps,
+            omitted,
+        }
     }
 }
 
@@ -1385,15 +1482,17 @@ mod tests {
         }
         .store_in_wallet(&mut wallet)
         .unwrap();
+        wallet.save_to_disk().unwrap();
         wallet
     }
 
     #[test]
+    /// Rows come newest first, and only finished swaps add to the fee totals.
     fn history_lists_newest_first_and_sums_fees_of_finished_swaps() {
         let dir = tempdir().unwrap();
         let wallet = wallet_with_history(&dir.path().join("wallet.cbor"));
 
-        let history = wallet.swap_history();
+        let history = wallet.swap_history(None);
         let ids: Vec<_> = history.swaps.iter().map(|s| s.swap_id.as_str()).collect();
         assert_eq!(ids, ["swap-failed", "swap-failed", "maker-swap", "swap-1"]);
         assert_eq!(
@@ -1407,6 +1506,7 @@ mod tests {
                 unreadable_reports: 0,
             }
         );
+        assert_eq!(history.omitted, 0);
 
         // The failed swap shows no fee: it is not final, and not in the totals.
         let failed = &history.swaps[0];
@@ -1423,18 +1523,20 @@ mod tests {
     }
 
     #[test]
+    /// A wallet with no reports lists nothing.
     fn an_empty_wallet_has_an_empty_history() {
         let dir = tempdir().unwrap();
         let wallet = test_wallet(&dir.path().join("wallet.cbor"));
-        let history = wallet.swap_history();
+        let history = wallet.swap_history(None);
         assert!(history.swaps.is_empty());
         assert_eq!(history.totals, SwapTotals::default());
         let json: serde_json::Value =
-            serde_json::from_str(&wallet.swap_list_json(None).unwrap()).unwrap();
+            serde_json::from_str(&wallet.swap_list_json(None, None).unwrap()).unwrap();
         assert_eq!(json["swaps"], serde_json::json!([]));
     }
 
     #[test]
+    /// A report this build can't read is counted, not listed.
     fn history_counts_reports_it_cannot_read() {
         let dir = tempdir().unwrap();
         let mut wallet = wallet_with_history(&dir.path().join("wallet.cbor"));
@@ -1450,13 +1552,14 @@ mod tests {
             .or_default()
             .push(Value::Map(fields));
 
-        let history = wallet.swap_history();
+        let history = wallet.swap_history(None);
         assert_eq!(history.swaps.len(), 4);
         assert_eq!(history.totals.unreadable_reports, 1);
         assert_eq!(history.totals.succeeded, 2);
     }
 
     #[test]
+    /// One swap shows every report for its id, and never the proof.
     fn one_swap_shows_all_its_reports_without_the_proof() {
         let dir = tempdir().unwrap();
         let mut wallet = wallet_with_history(&dir.path().join("wallet.cbor"));
@@ -1479,11 +1582,126 @@ mod tests {
         assert!(wallet.swap_reports().taker[2].deniability_proof.is_some());
 
         assert!(wallet.swap_detail("nobody").is_none());
-        let error = wallet.swap_list_json(Some("nobody")).unwrap_err();
+        let error = wallet.swap_list_json(Some("nobody"), None).unwrap_err();
         assert!(
             error.to_string().contains("no swap with id nobody"),
             "{}",
             error
         );
+    }
+
+    #[test]
+    /// A recovery of a kind this build doesn't know is not passed off as a timelock.
+    fn an_unknown_recovery_type_is_counted_as_unreadable() {
+        let dir = tempdir().unwrap();
+        let mut wallet = wallet_with_history(&dir.path().join("wallet.cbor"));
+        RecoveryReport {
+            swap_id: "swap-future".into(),
+            role: SwapRole::Maker,
+            node: None,
+            recovery_type: "future-path".into(),
+            recovery_txids: vec![],
+            network: "regtest".into(),
+            timestamp: 60,
+        }
+        .store_in_wallet(&mut wallet)
+        .unwrap();
+
+        let history = wallet.swap_history(None);
+        assert!(history.swaps.iter().all(|s| s.swap_id != "swap-future"));
+        assert_eq!(history.totals.unreadable_reports, 1);
+        assert_eq!(history.totals.recovered, 1);
+    }
+
+    #[test]
+    /// A limit cuts the rows to the newest ones; the totals still cover all.
+    fn a_limit_keeps_the_newest_rows_and_all_the_totals() {
+        let dir = tempdir().unwrap();
+        let wallet = wallet_with_history(&dir.path().join("wallet.cbor"));
+
+        let history = wallet.swap_history(Some(2));
+        let ids: Vec<_> = history.swaps.iter().map(|s| s.swap_id.as_str()).collect();
+        assert_eq!(ids, ["swap-failed", "swap-failed"]);
+        assert_eq!(history.omitted, 2);
+        assert_eq!(history.totals.succeeded, 2);
+        assert_eq!(history.totals.fees_earned, 500);
+
+        assert_eq!(wallet.swap_history(Some(0)).swaps.len(), 0);
+        assert_eq!(wallet.swap_history(Some(1_000_000)).swaps.len(), 4);
+    }
+
+    #[test]
+    /// The longest list still fits in one RPC message.
+    fn the_longest_list_fits_in_one_rpc_message() {
+        let row = SwapSummary {
+            swap_id: "f".repeat(64),
+            role: SwapRole::Taker,
+            status: SwapStatus::RecoveryTimelock,
+            network: "testnet4".into(),
+            end_timestamp: u64::MAX,
+            incoming_amount: Some(u64::MAX),
+            outgoing_amount: Some(u64::MAX),
+            fee_paid: Some(u64::MAX),
+            fee_earned: Some(u64::MAX),
+        };
+        let history = SwapHistory {
+            totals: SwapTotals::default(),
+            swaps: vec![row; MAX_LISTED_SWAPS],
+            omitted: usize::MAX,
+        };
+        let size = serde_json::to_string_pretty(&history).unwrap().len();
+        assert!(size < crate::utill::MAX_RPC_MESSAGE_SIZE, "{} bytes", size);
+    }
+
+    #[test]
+    /// Reading a wallet file by path matches the open wallet and writes nothing.
+    fn listing_from_a_file_changes_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.cbor");
+        let wallet = wallet_with_history(&path);
+        let before = std::fs::read(&path).unwrap();
+        let password = || Zeroizing::new("test-password".to_string());
+
+        for (swap_id, limit) in [(None, None), (None, Some(1)), (Some("maker-swap"), None)] {
+            assert_eq!(
+                Wallet::swap_list_json_from_file(&path, password(), swap_id, limit).unwrap(),
+                wallet.swap_list_json(swap_id, limit).unwrap()
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let wrong = Zeroizing::new("wrong".to_string());
+        assert!(matches!(
+            Wallet::swap_list_json_from_file(&path, wrong, None, None),
+            Err(WalletError::WrongPassword)
+        ));
+        let missing = dir.path().join("nothing");
+        let error = Wallet::swap_list_json_from_file(&missing, password(), None, None);
+        assert!(error.unwrap_err().to_string().contains("no wallet file"));
+    }
+
+    #[test]
+    /// An older wallet file is refused as it is: no upgrade, no archive, no deleted report.
+    fn listing_refuses_an_older_wallet_without_upgrading_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let report_path = dir.path().join("wallet_swap_report.json");
+        let wallet = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed.wallet");
+        let report = include_bytes!("../../tests/fixtures/compat/v0.2.3/closed_swap_report.json");
+        std::fs::write(&path, wallet).unwrap();
+        std::fs::write(&report_path, report).unwrap();
+
+        let error = Wallet::swap_list_json_from_file(
+            &path,
+            Zeroizing::new("compat-v023".to_string()),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("one-time upgrade"), "{}", error);
+        assert_eq!(std::fs::read(&path).unwrap(), wallet);
+        assert_eq!(std::fs::read(&report_path).unwrap(), report);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 }

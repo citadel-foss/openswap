@@ -78,6 +78,9 @@ pub enum RpcMsgReq {
     ListSwaps {
         /// Show only this swap, in full.
         swap_id: Option<String>,
+        /// Most swaps to list, newest first. The default is 100; more than
+        /// 10,000 is cut to 10,000.
+        limit: Option<u32>,
     },
 }
 
