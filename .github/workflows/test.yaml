@@ -79,6 +79,11 @@ jobs:
         # `--no-capture`: it would run the partition's tests one at a time. The
         # `ci` profile in .config/nextest.toml prints each test's captured
         # output when it finishes and carries the timeouts.
+        #
+        # `lightning` is on so the Lightning swap suites (tests/integration/
+        # lightning, against mock Lightning nodes) run; without it they are
+        # compiled out. Keep the feature list in step with
+        # tests/check_test_names.sh.
         env:
           ELECTRS_LOG: "1"
           NEXTEST_PROFILE: ci
@@ -88,7 +93,7 @@ jobs:
           NEXTEST_NO_OUTPUT_INDENT: "1"
         run: |
           mkdir -p ./coverage/reports/
-          cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 2:immediate --partition hash:${{ matrix.partition }}/${{strategy.job-total}} --features integration-test
+          cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 2:immediate --partition hash:${{ matrix.partition }}/${{strategy.job-total}} --features integration-test,lightning
           cargo llvm-cov report --cobertura --output-path ./coverage/reports/cobertura-${{ strategy.job-index }}.xml
 
       # A failing test keeps its data dir (logs, wallets, swap trackers) as
