@@ -513,6 +513,7 @@ impl<R: Role> Watcher<R> {
         watches: &[(OutPoint, ScriptBuf)],
     ) -> Result<(), String> {
         let mut oldest: Option<u64> = None;
+        let mut every_watch_unspent = true;
         for (outpoint, _) in watches {
             if self.shutdown.load(Ordering::Relaxed) {
                 log::info!("watch rebuild rescan aborted before funding lookup: shutdown");
@@ -528,10 +529,13 @@ impl<R: Role> Watcher<R> {
                 .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
             {
                 Ok(Some(_)) => continue,
-                Ok(None) => {}
-                Err(e) => log::warn!(
-                    "UTXO lookup failed before rebuild scan for {outpoint}: {e}; scanning conservatively"
-                ),
+                Ok(None) => every_watch_unspent = false,
+                Err(e) => {
+                    every_watch_unspent = false;
+                    log::warn!(
+                        "UTXO lookup failed before rebuild scan for {outpoint}: {e}; scanning conservatively"
+                    );
+                }
             }
             match self.blockchain.tx_block_height(&outpoint.txid) {
                 Ok(Some(height)) => {
@@ -545,9 +549,13 @@ impl<R: Role> Watcher<R> {
             }
         }
         let Some(from) = oldest else {
-            // Keep the usual rescan marker so operators can tell that rebuild
-            // recovery completed, even when there is no range worth replaying.
-            log::info!("Rescanning blocks skipped: every rebuilt watch is still unspent");
+            if every_watch_unspent {
+                log::info!("Rescanning blocks skipped: every rebuilt watch is still unspent");
+            } else {
+                log::warn!(
+                    "Rescanning blocks skipped: rebuild recovery is inconclusive; no confirmed funding height was available"
+                );
+            }
             return Ok(());
         };
         self.scan_blocks(from).map_err(|e| {
