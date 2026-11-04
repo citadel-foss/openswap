@@ -479,10 +479,19 @@ pub struct LnMakerSwapRecord {
     pub funding_outpoint: Option<OutPoint>,
     /// The HTLC funding value, once known.
     pub funding_value: Option<bitcoin::Amount>,
-    /// Refund timing. Swap-in: the block that confirmed the funding, where the
-    /// taker's CSV refund window starts. Swap-out: the chain tip when the
-    /// maker broadcast its funding.
+    /// Block that confirmed the funding, where its CSV refund window starts.
     pub funding_height: Option<u32>,
+    /// Pre-signed replacement that returns the funding inputs to the maker.
+    /// Confirming it makes an over-deadline HTLC funding transaction invalid.
+    #[serde(default)]
+    pub funding_cancel_tx: Option<bitcoin::Transaction>,
+    /// Last chain height at which the funding transaction may remain
+    /// unconfirmed before its replacement is broadcast.
+    #[serde(default)]
+    pub funding_deadline: Option<u32>,
+    /// Backend deadline for claiming the held Lightning payment.
+    #[serde(default)]
+    pub claim_deadline: Option<u32>,
 }
 
 /// Redacted like [`LnPendingSwap`]: `Wallet` formats its store.
@@ -502,6 +511,15 @@ impl std::fmt::Debug for LnMakerSwapRecord {
             .field("funding_outpoint", &self.funding_outpoint)
             .field("funding_value", &self.funding_value)
             .field("funding_height", &self.funding_height)
+            .field(
+                "funding_cancel_txid",
+                &self
+                    .funding_cancel_tx
+                    .as_ref()
+                    .map(bitcoin::Transaction::compute_txid),
+            )
+            .field("funding_deadline", &self.funding_deadline)
+            .field("claim_deadline", &self.claim_deadline)
             .finish_non_exhaustive()
     }
 }
@@ -569,6 +587,9 @@ impl Requires for LnMakerSwapRecord {
             funding_outpoint: _,
             funding_value: _,
             funding_height: _,
+            funding_cancel_tx: _,
+            funding_deadline: _,
+            claim_deadline: _,
         } = self;
         out.insert(match direction {
             LnMakerDirection::SwapIn => "ln-swap-in",
@@ -1220,6 +1241,9 @@ pub(crate) mod compat_support {
                     funding_outpoint: Some(point),
                     funding_value: Some(Amount::from_sat(101_000)),
                     funding_height: Some(125),
+                    funding_cancel_tx: None,
+                    funding_deadline: None,
+                    claim_deadline: None,
                 },
             );
         }
@@ -1993,6 +2017,9 @@ mod tests {
                     funding_outpoint: Some(cache_entry(0).0),
                     funding_value: Some(Amount::from_sat(50_000)),
                     funding_height: Some(43),
+                    funding_cancel_tx: None,
+                    funding_deadline: None,
+                    claim_deadline: None,
                 };
                 let mut names = BTreeSet::new();
                 record.requires(&mut names);
@@ -2747,6 +2774,9 @@ mod tests {
             funding_outpoint: None,
             funding_value: None,
             funding_height: None,
+            funding_cancel_tx: None,
+            funding_deadline: None,
+            claim_deadline: None,
         };
         let debug = format!("{record:?}");
         assert!(debug.contains("preimage: Some(\"<redacted>\")"));

@@ -48,6 +48,9 @@ use crate::{
     watch_tower::{service::WatchService, watcher::WatcherEvent, watcher_error::WatcherError},
 };
 
+#[cfg(feature = "lightning")]
+use crate::wallet::Destination;
+
 #[cfg(feature = "integration-test")]
 pub use super::handlers::MakerBehavior;
 
@@ -3839,7 +3842,7 @@ impl MakerTrait for MakerServer {
         swap_id: &str,
         amount: Amount,
         address: bitcoin::Address,
-    ) -> Result<(Transaction, u32), MakerError> {
+    ) -> Result<(Transaction, u32, Transaction), MakerError> {
         let mut wallet = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
         let htlc_spk = address.script_pubkey();
@@ -3882,6 +3885,16 @@ impl MakerTrait for MakerServer {
             .iter()
             .flat_map(|split| split.utxos.iter().copied())
             .collect();
+        let selected_coins: Vec<_> = wallet
+            .list_all_utxo_spend_info()
+            .into_iter()
+            .filter(|(entry, _)| selected.contains(&OutPoint::new(entry.txid, entry.vout)))
+            .collect();
+        if selected_coins.len() != selected.len() {
+            return Err(MakerError::General(
+                "lightning funding inputs disappeared before signing",
+            ));
+        }
         wallet.reserve_swap_locks(swap_id, &selected);
         let result = wallet.execute_funding_plan(&plan, &[address], feerate);
         let result = match result {
@@ -3908,7 +3921,65 @@ impl MakerTrait for MakerServer {
             .iter()
             .position(|output| output.script_pubkey == htlc_spk)
             .ok_or(MakerError::General("funding tx has no HTLC output"))? as u32;
-        Ok((tx, vout))
+        // Pre-sign a conflicting transaction before broadcasting the HTLC.
+        // If funding misses its bounded confirmation window, confirming this
+        // transaction makes the late HTLC funding permanently invalid before
+        // the held Lightning payment is failed.
+        let cancel_tx = (|| {
+            let cancel_address = wallet.get_next_external_address(AddressType::P2WPKH)?;
+            // The replacement must beat both the original's absolute fee and
+            // the backend's incremental-relay requirement. It has fewer
+            // outputs than funding, so merely adding the increment to the
+            // feerate can still leave its total fee lower; doubling provides
+            // headroom for that size difference.
+            let cancel_feerate =
+                feerate * 2.0 + wallet.blockchain.replacement_increment_rate() + MIN_RELAY_FEE_RATE;
+            wallet.spend_coins(
+                &selected_coins,
+                Destination::Sweep(cancel_address),
+                cancel_feerate,
+            )
+        })();
+        let cancel_tx = match cancel_tx {
+            Ok(tx) => tx,
+            Err(e) => {
+                if wallet.release_swap_locks(swap_id, None) {
+                    let _ = wallet.save_to_disk();
+                }
+                return Err(MakerError::Wallet(e));
+            }
+        };
+        let input_value: u64 = selected_coins
+            .iter()
+            .map(|(entry, _)| entry.amount.to_sat())
+            .sum();
+        let funding_outputs: u64 = tx.output.iter().map(|output| output.value.to_sat()).sum();
+        let cancel_outputs: u64 = cancel_tx
+            .output
+            .iter()
+            .map(|output| output.value.to_sat())
+            .sum();
+        let funding_fee = input_value.saturating_sub(funding_outputs);
+        let cancel_fee = input_value.saturating_sub(cancel_outputs);
+        let increment = fee_at_rate_sats(
+            cancel_tx.vsize() as u64,
+            wallet.blockchain.replacement_increment_rate(),
+        );
+        let Some(increment) = increment else {
+            if wallet.release_swap_locks(swap_id, None) {
+                let _ = wallet.save_to_disk();
+            }
+            return Err(MakerError::General("lightning cancellation fee overflow"));
+        };
+        if cancel_fee < funding_fee.saturating_add(increment) {
+            if wallet.release_swap_locks(swap_id, None) {
+                let _ = wallet.save_to_disk();
+            }
+            return Err(MakerError::General(
+                "lightning cancellation does not outbid funding",
+            ));
+        }
+        Ok((tx, vout, cancel_tx))
     }
 
     #[cfg(feature = "lightning")]

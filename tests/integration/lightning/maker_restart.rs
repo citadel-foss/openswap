@@ -404,6 +404,9 @@ fn accepted_swap_in_with_locktime(preimage: &Preimage, locktime: u16) -> LnMaker
         payout_script: None,
         funding: None,
         funding_height: None,
+        funding_cancel_tx: None,
+        funding_deadline: None,
+        claim_deadline: None,
         updated_at: Instant::now(),
     }
 }
