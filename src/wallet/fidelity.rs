@@ -1478,76 +1478,26 @@ mod test {
         .is_err());
     }
 
-    /// Electrum stand-in whose tip is `tip`. It serves the regtest genesis
-    /// header for every height, which is all `chain_tip` needs.
-    fn electrum_tip_stub(tip: u64) -> crate::wallet::AnyBlockchain {
-        use serde_json::{json, Value};
-        use std::{
-            io::{BufRead, BufReader, Write},
-            net::TcpListener,
-            thread,
-        };
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
-        let url = format!("tcp://{}", listener.local_addr().unwrap());
-        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
-        let genesis_hash = genesis.block_hash().to_string();
-        let header_hex = bitcoin::consensus::encode::serialize_hex(&genesis.header);
-        thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let (genesis_hash, header_hex) = (genesis_hash.clone(), header_hex.clone());
-                thread::spawn(move || {
-                    let answer = |req: &Value| {
-                        let result = match req["method"].as_str().unwrap_or_default() {
-                            "server.features" => json!({
-                                "server_version": "stub",
-                                "genesis_hash": genesis_hash,
-                                "protocol_min": "1.4",
-                                "protocol_max": "1.4",
-                                "hash_function": "sha256",
-                                "pruning": Value::Null,
-                            }),
-                            "blockchain.headers.subscribe" => {
-                                json!({"height": tip, "hex": header_hex})
-                            }
-                            "blockchain.block.header" => json!(header_hex),
-                            _ => Value::Null,
-                        };
-                        json!({"jsonrpc": "2.0", "id": req["id"], "result": result})
-                    };
-                    let mut out = stream.try_clone().expect("clone stub stream");
-                    for line in BufReader::new(stream).lines() {
-                        let Ok(req) = line.map(|l| serde_json::from_str::<Value>(&l)) else {
-                            return;
-                        };
-                        let Ok(req) = req else { return };
-                        let resp = match req.as_array() {
-                            Some(batch) => Value::Array(batch.iter().map(answer).collect()),
-                            None => answer(&req),
-                        };
-                        if writeln!(out, "{resp}").is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
-        });
-        crate::wallet::AnyBlockchain::Electrum(
-            crate::wallet::Electrum::new(&crate::wallet::ElectrumConfig {
-                url,
-                ..Default::default()
-            })
-            .expect("connect to stub"),
-        )
-    }
-
     /// A confirmed bond whose lock has ended but that is not redeemed yet is
     /// listed as expired through the whole listing path, not just the helper.
     #[test]
     fn listing_shows_an_expired_bond() {
         let dir = tempdir().unwrap();
         let mut wallet = test_wallet(&dir.path().join("wallet"));
-        wallet.blockchain = electrum_tip_stub(2_000);
+        // Every header is the regtest genesis header, which is all
+        // `chain_tip` needs.
+        let server = crate::wallet::blockchain::mock_electrum(|_, _| Ok(serde_json::Value::Null));
+        server.set_tip(
+            2_000,
+            &bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
+        );
+        wallet.blockchain = crate::wallet::AnyBlockchain::Electrum(
+            crate::wallet::Electrum::new(&crate::wallet::ElectrumConfig {
+                url: server.url.clone(),
+                ..Default::default()
+            })
+            .expect("connect to mock electrum"),
+        );
         let secret = SecretKey::from_slice(&[6; 32]).unwrap();
         wallet.store.fidelity_bond.push(FidelityBond {
             outpoint: OutPoint::null(),
