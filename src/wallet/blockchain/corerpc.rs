@@ -760,12 +760,18 @@ impl Blockchain for CoreRPC {
 }
 
 /// Whether a subscriber at `configured` reaches a publisher bound at `published`.
-/// A bind on the unspecified address (`0.0.0.0`, `[::]`) listens on every host.
+/// A bind on the unspecified address (`*`, `0.0.0.0`, `[::]`) listens on every host.
 fn zmq_endpoint_matches(published: &str, configured: &str) -> bool {
     let resolve = |endpoint: &str| -> Vec<SocketAddr> {
-        endpoint
-            .strip_prefix("tcp://")
-            .and_then(|hostport| hostport.to_socket_addrs().ok())
+        let Some(hostport) = endpoint.strip_prefix("tcp://") else {
+            return Vec::new();
+        };
+        let hostport = match hostport.strip_prefix("*:") {
+            Some(port) => format!("0.0.0.0:{port}"),
+            None => hostport.to_string(),
+        };
+        hostport
+            .to_socket_addrs()
             .map(Iterator::collect)
             .unwrap_or_default()
     };
@@ -891,8 +897,9 @@ pub(crate) mod tests {
     fn zmq_wildcard_bind_matches() {
         let zmq = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = zmq.local_addr().unwrap().port();
-        let wildcard = format!("tcp://0.0.0.0:{port}");
-        check_zmq(&format!("tcp://127.0.0.1:{port}"), &wildcard, &wildcard).unwrap();
+        for wildcard in [format!("tcp://0.0.0.0:{port}"), format!("tcp://*:{port}")] {
+            check_zmq(&format!("tcp://127.0.0.1:{port}"), &wildcard, &wildcard).unwrap();
+        }
     }
 
     #[test]
