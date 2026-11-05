@@ -676,3 +676,26 @@ fn a_stalled_connect_leaves_the_wallet_writable(node: &mut Node) {
     let result = handle.join().expect("connect thread panicked");
     assert!(result.is_err(), "a stalled connect should time out");
 }
+
+/// Funding waits up to 30 s for the new balance. With electrs gone every sync
+/// retries, so the wait must stop at its deadline and the funding check fail,
+/// instead of the test hanging until nextest kills it. It stops electrs rather
+/// than using a [`Forwarder`]: the world's taker is wired to electrs directly.
+#[world_test(backend = ElectrumBackend, takers = [Normal])]
+fn funding_fails_at_its_deadline_when_electrs_is_gone(world: &mut World) {
+    drop(world.framework().electrsd.lock().unwrap().take());
+
+    let start = std::time::Instant::now();
+    let funded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        world.fund_taker_default(1);
+    }));
+    let elapsed = start.elapsed();
+
+    assert!(funded.is_err(), "funding succeeded with electrs gone");
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "funding took {:?} to fail",
+        elapsed
+    );
+    assert_log!(world; { has "wallet sync interrupted at the 30s deadline" });
+}

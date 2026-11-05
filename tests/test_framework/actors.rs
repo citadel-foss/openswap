@@ -2,17 +2,21 @@
 
 use bitcoin::Amount;
 use std::{
-    sync::{atomic::Ordering::Relaxed, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering::Relaxed},
+        mpsc::{self, RecvTimeoutError},
+        Arc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use log::info;
+use log::{info, warn};
 use openswap::{
     maker::{start_server, MakerServer},
     taker::Taker,
     utill::NO_SHUTDOWN,
-    wallet::AddressType,
+    wallet::{AddressType, WalletError},
 };
 
 use super::procs::bitcoind::{generate_blocks, send_to_address};
@@ -125,18 +129,36 @@ fn wait_for_balance(
     timeout_secs: u64,
 ) -> openswap::wallet::Balances {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let mut last;
-    loop {
-        {
-            let mut w = wallet.write().unwrap();
-            w.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
-            last = w.get_balances().unwrap();
+    // `sync_and_save` keeps retrying an unreachable backend until its shutdown flag is set, so
+    // a watcher sets one at the deadline; with `NO_SHUTDOWN` a dead backend hangs the test.
+    let timed_out = AtomicBool::new(false);
+    thread::scope(|s| {
+        // Dropping `_done` on return wakes the watcher, so the scope never waits for the deadline.
+        let (_done, done_rx) = mpsc::channel::<()>();
+        let flag = &timed_out;
+        s.spawn(move || {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if done_rx.recv_timeout(left) == Err(RecvTimeoutError::Timeout) {
+                flag.store(true, Relaxed);
+            }
+        });
+        loop {
+            let last = {
+                let mut w = wallet.write().unwrap();
+                match w.sync_and_save(&timed_out) {
+                    Err(e @ WalletError::Interrupted(_)) if timed_out.load(Relaxed) => {
+                        warn!("wallet sync interrupted at the {timeout_secs}s deadline: {e:?}")
+                    }
+                    result => result.expect("wallet sync failed"),
+                }
+                w.get_balances().unwrap()
+            };
+            if last.regular >= expected_regular || Instant::now() >= deadline {
+                return last;
+            }
+            thread::sleep(Duration::from_millis(500));
         }
-        if last.regular >= expected_regular || Instant::now() >= deadline {
-            return last;
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
+    })
 }
 
 /// Fund makers and verify their balances

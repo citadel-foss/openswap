@@ -1018,6 +1018,7 @@ openswap::integration wallet::electrum_transport::an_idle_watcher_sends_nothing
 openswap::integration wallet::electrum_transport::confirmed_spend_requires_an_input_consuming_the_outpoint
 openswap::integration wallet::electrum_transport::connect_gives_up_with_unreachable
 openswap::integration wallet::electrum_transport::connect_retries_until_the_server_answers
+openswap::integration wallet::electrum_transport::funding_fails_at_its_deadline_when_electrs_is_gone
 openswap::integration wallet::electrum_transport::held_connection_is_reused_across_calls
 openswap::integration wallet::electrum_transport::reconnects_after_the_connection_drops
 openswap::integration wallet::electrum_transport::shutdown_interrupts_an_active_retry_and_allows_join
