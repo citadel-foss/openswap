@@ -92,7 +92,9 @@ impl Wallet {
             .iter()
             .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
             .find(|outpoint| {
-                self.is_swap_reserved(outpoint) || self.locked_utxos.contains(outpoint)
+                self.is_swap_reserved(outpoint)
+                    || self.locked_utxos.contains(outpoint)
+                    || self.pending_sends.contains_key(outpoint)
             })
         {
             return Err(WalletError::General(format!(
@@ -604,10 +606,26 @@ mod tests {
             &[coin(2)]
         )));
 
-        // A free coin passes the check and reaches the block-height query that
+        wallet.hold_for_send(&[outpoint(4)], Txid::from_byte_array([9; 32]));
+        assert!(refused(wallet.spend_from_wallet(
+            1.0,
+            to.clone(),
+            &[coin(4)]
+        )));
+
+        // A locked fidelity bond is skipped, not refused, so the free coin next
+        // to it passes the check and reaches the block-height query that
         // `spend_coins` makes for the locktime; this wallet's backend is offline,
         // so that query, and nothing earlier, is what fails.
-        let result = wallet.spend_from_wallet(1.0, to, &[coin(3)]);
+        wallet.lock_utxos(&[outpoint(5)]);
+        let bond = (
+            coin(5).0,
+            UTXOSpendInfo::FidelityBondCoin {
+                index: 0,
+                input_value: sats(100_000),
+            },
+        );
+        let result = wallet.spend_from_wallet(1.0, to, &[bond, coin(3)]);
         assert!(
             matches!(result, Err(WalletError::Rpc(_))),
             "free coin should fail only at the backend, got {:?}",
@@ -638,6 +656,52 @@ mod tests {
         let dust = sats(294);
         assert_eq!(change_output(sats(294), dust), Some(sats(294)));
         assert_eq!(change_output(sats(293), dust), None);
+    }
+
+    #[test]
+    fn sync_releases_only_settled_send_inputs() {
+        use crate::wallet::{api::test_support::test_wallet, AddressType, UTXOSpendInfo};
+        use bitcoin::{hashes::Hash, ScriptBuf, Txid};
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let outpoint = |n: u8| OutPoint::new(Txid::from_byte_array([n; 32]), 0);
+        let send = Txid::from_byte_array([9; 32]);
+        let entry = ListUnspentResultEntry {
+            txid: outpoint(2).txid,
+            vout: 0,
+            address: None,
+            label: None,
+            redeem_script: None,
+            witness_script: None,
+            script_pub_key: ScriptBuf::new(),
+            amount: sats(100_000),
+            confirmations: 1,
+            spendable: true,
+            solvable: true,
+            descriptor: None,
+            safe: true,
+        };
+        let info = UTXOSpendInfo::SeedCoin {
+            path: "m/84'/1'/0'/0/0".to_string(),
+            input_value: sats(100_000),
+            address_type: AddressType::P2WPKH,
+        };
+        // Coin 1 left the synced cache; coin 2 is still cached and the offline
+        // backend cannot say whether the send is known, as a lagging one can't.
+        wallet.store.utxo_cache.insert(outpoint(2), (entry, info));
+        wallet.hold_for_send(&[outpoint(1), outpoint(2)], send);
+
+        wallet.release_settled_sends();
+        assert!(!wallet.pending_sends.contains_key(&outpoint(1)));
+        assert!(wallet.list_lock_unspent().contains(&outpoint(2)));
+
+        // A wallet-lock rebuild must not drop a held send.
+        wallet.locked_utxos.clear();
+        assert!(wallet.list_lock_unspent().contains(&outpoint(2)));
+
+        wallet.release_send(&[outpoint(2)]);
+        assert!(wallet.list_lock_unspent().is_empty());
     }
 
     #[test]
