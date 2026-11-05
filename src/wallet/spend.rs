@@ -70,20 +70,6 @@ impl Wallet {
     ) -> Result<Transaction, WalletError> {
         log::info!("Creating Direct-Spend from Wallet.");
 
-        // The caller selected these coins earlier, maybe under another guard:
-        // a swap may have claimed one since, or a broadcast spent it.
-        if let Some(held) = coins_to_spend
-            .iter()
-            .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
-            .find(|outpoint| {
-                self.is_swap_reserved(outpoint) || self.locked_utxos.contains(outpoint)
-            })
-        {
-            return Err(WalletError::General(format!(
-                "coin {held} is reserved by a swap or already spent; select coins again"
-            )));
-        }
-
         let mut coins = Vec::<(ListUnspentResultEntry, UTXOSpendInfo)>::new();
 
         for coin in coins_to_spend {
@@ -97,6 +83,21 @@ impl Wallet {
             } else {
                 coins.push(coin.to_owned());
             }
+        }
+
+        // The caller selected these coins earlier, maybe under another guard:
+        // a swap may have claimed one since, or a broadcast spent it. Checked
+        // after the filter, since skipped fidelity and contract coins stay locked.
+        if let Some(held) = coins
+            .iter()
+            .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+            .find(|outpoint| {
+                self.is_swap_reserved(outpoint) || self.locked_utxos.contains(outpoint)
+            })
+        {
+            return Err(WalletError::General(format!(
+                "coin {held} is reserved by a swap or already spent; select coins again"
+            )));
         }
 
         let tx = self.spend_coins(&coins, destination, feerate)?;
