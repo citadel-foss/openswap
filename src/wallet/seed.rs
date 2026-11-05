@@ -4,7 +4,10 @@
 
 use bip39::Mnemonic;
 use bitcoin::{bip32::Xpriv, Network};
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 use zeroize::Zeroizing;
 
 use crate::security::{SealedSecret, SecurityError};
@@ -137,6 +140,7 @@ impl Wallet {
             store,
             store_enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
             _in_use: None,
         })
     }

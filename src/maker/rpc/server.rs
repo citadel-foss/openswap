@@ -256,7 +256,7 @@ fn handle_request<M: MakerRpc>(
                     change_address_type: AddressType::P2TR,
                 };
 
-                // Select and sign under one guard, then lock the inputs so no
+                // Select and sign under one guard, then hold the inputs so no
                 // swap thread claims them while the broadcast runs unguarded.
                 let (tx, spent) = {
                     let mut wallet = lock_debug!(maker.wallet().write())?;
@@ -265,29 +265,23 @@ fn handle_request<M: MakerRpc>(
                     let tx = wallet.spend_from_wallet(feerate, destination, &coins_to_send)?;
                     let spent: Vec<_> =
                         tx.input.iter().map(|input| input.previous_output).collect();
-                    wallet.lock_utxos(&spent);
+                    wallet.hold_for_send(&spent, tx.compute_txid());
                     (tx, spent)
                 };
 
-                // The cache lists the spent coins until the sync below, so they
-                // stay locked through it; a failed broadcast frees them at once.
+                // A failed broadcast frees the inputs at once; after a good one,
+                // syncs release them once the backend settles the spend.
                 let sent = lock_debug!(maker.wallet().read())?.send_tx(&tx);
                 let txid = match sent {
                     Ok(txid) => txid,
                     Err(e) => {
-                        lock_debug!(maker.wallet().write())?.unlock_utxos(&spent);
+                        lock_debug!(maker.wallet().write())?.release_send(&spent);
                         return Err(e.into());
                     }
                 };
 
                 log::info!("Sync at:----handle_request----");
-                {
-                    let mut wallet = lock_debug!(maker.wallet().write())?;
-                    wallet.sync_and_save(maker.shutdown())?;
-                    // The synced cache no longer lists them; if the send is later
-                    // evicted or reorged out, a sync makes them spendable again.
-                    wallet.unlock_utxos(&spent);
-                }
+                lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;
 
                 RpcMsgResp::SendToAddressResp(txid.to_string())
             }

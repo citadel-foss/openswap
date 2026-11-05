@@ -467,6 +467,7 @@ openswap wallet::spend::tests::exact_spend_refuses_outputs_above_the_spend
 openswap wallet::spend::tests::exact_spend_with_no_change
 openswap wallet::spend::tests::exact_spend_with_the_smallest_change
 openswap wallet::spend::tests::sweep_refuses_a_dust_or_empty_output
+openswap wallet::spend::tests::sync_releases_only_settled_send_inputs
 openswap wallet::storage::compat_support::compat_fixtures_nested_bond_rename_cannot_hide_in_extra
 openswap wallet::storage::compat_support::compat_fixtures_wallet_index_rename_cannot_hide_in_extra
 openswap wallet::storage::tests::compat_cache_future_spend_info_drops_only_its_entry

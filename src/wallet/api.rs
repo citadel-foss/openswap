@@ -103,6 +103,11 @@ pub struct Wallet {
     pub(crate) store_enc_material: KeyMaterial,
     /// Wallet-side set of outpoints excluded from coin selection.
     pub(crate) locked_utxos: HashSet<OutPoint>,
+    /// Inputs of our own direct sends, keyed to the spending txid, held out of
+    /// coin selection until a sync settles them (see
+    /// [`Wallet::release_settled_sends`]). Kept apart from `locked_utxos`,
+    /// which [`Wallet::lock_unspendable_utxos`] rebuilds from scratch.
+    pub(crate) pending_sends: HashMap<OutPoint, Txid>,
     /// Shared for library wallets, exclusive for daemons, held for the
     /// wallet's lifetime. `None` only offline.
     pub(crate) _in_use: Option<WalletInUse>,
@@ -522,6 +527,7 @@ impl Wallet {
             store,
             store_enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
             _in_use: Some(in_use),
         })
     }
@@ -649,6 +655,7 @@ impl Wallet {
             store,
             store_enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
             _in_use: Some(in_use),
         };
         wallet.warn_if_seed_not_backed_up();
@@ -2477,18 +2484,50 @@ impl Wallet {
         self.locked_utxos.extend(outpoints.iter().copied());
     }
 
-    /// Remove `outpoints` from the wallet-side lock set, undoing
-    /// [`Wallet::lock_utxos`].
-    pub(crate) fn unlock_utxos(&mut self, outpoints: &[OutPoint]) {
+    /// Hold `outpoints`, spent by our own `txid`, out of coin selection until
+    /// a sync settles them. Call before the broadcast, so no other thread can
+    /// select them while it runs.
+    pub(crate) fn hold_for_send(&mut self, outpoints: &[OutPoint], txid: Txid) {
+        self.pending_sends
+            .extend(outpoints.iter().map(|outpoint| (*outpoint, txid)));
+    }
+
+    /// Drop the hold on `outpoints` at once; for a send whose broadcast failed.
+    pub(crate) fn release_send(&mut self, outpoints: &[OutPoint]) {
         for outpoint in outpoints {
-            self.locked_utxos.remove(outpoint);
+            self.pending_sends.remove(outpoint);
+        }
+    }
+
+    /// Release held send inputs a sync has settled. Runs after every
+    /// successful sync, so a failed one only delays the release.
+    ///
+    /// * Gone from the synced cache: the backend saw the spend, so selection
+    ///   can no longer pick the coin.
+    /// * Still cached and the backend positively reports the send unknown:
+    ///   it was evicted or reorged out, so the coin is ours to spend again.
+    /// * Anything else, a failed query included: the backend has not caught up
+    ///   (Electrum may still answer from a stale script entry), so keep holding.
+    pub(crate) fn release_settled_sends(&mut self) {
+        let held: Vec<(OutPoint, Txid)> =
+            self.pending_sends.iter().map(|(o, t)| (*o, *t)).collect();
+        for (outpoint, txid) in held {
+            let settled = !self.store.utxo_cache.contains_key(&outpoint)
+                || matches!(self.blockchain.is_tx_unknown(&txid), Ok(true));
+            if settled {
+                self.pending_sends.remove(&outpoint);
+            }
         }
     }
 
     /// Outpoints currently held in the wallet-side lock set (see
     /// [`Wallet::locked_utxos`]).
     pub(crate) fn list_lock_unspent(&self) -> Vec<OutPoint> {
-        self.locked_utxos.iter().copied().collect()
+        self.locked_utxos
+            .iter()
+            .chain(self.pending_sends.keys())
+            .copied()
+            .collect()
     }
 
     /// Reserve `outpoints` for the swap `swap_key`; they stay out of coin
@@ -5021,7 +5060,10 @@ impl Wallet {
         loop {
             Self::check_shutdown(shutdown)?;
             match self.sync(shutdown) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.release_settled_sends();
+                    return Ok(());
+                }
                 Err(e) if Self::sync_error_is_final(&e) => return Err(e),
                 Err(e) => log::error!("Blockchain sync failed. Retrying. | {e:?}"),
             }
@@ -5253,6 +5295,7 @@ pub(crate) mod test_support {
             store,
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
             _in_use: None,
         }
     }
@@ -5629,6 +5672,7 @@ mod restore_history_probe_tests {
             store,
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
             _in_use: None,
         }
     }
@@ -6824,6 +6868,7 @@ mod timelock_reconcile_tests {
             store,
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
             _in_use: None,
         }
     }
