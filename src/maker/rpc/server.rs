@@ -270,7 +270,7 @@ fn handle_request<M: MakerRpc>(
                 };
 
                 // The cache lists the spent coins until the sync below, so they
-                // stay locked after a successful broadcast; a failed one frees them.
+                // stay locked through it; a failed broadcast frees them at once.
                 let sent = lock_debug!(maker.wallet().read())?.send_tx(&tx);
                 let txid = match sent {
                     Ok(txid) => txid,
@@ -281,7 +281,13 @@ fn handle_request<M: MakerRpc>(
                 };
 
                 log::info!("Sync at:----handle_request----");
-                lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;
+                {
+                    let mut wallet = lock_debug!(maker.wallet().write())?;
+                    wallet.sync_and_save(maker.shutdown())?;
+                    // The synced cache no longer lists them; if the send is later
+                    // evicted or reorged out, a sync makes them spendable again.
+                    wallet.unlock_utxos(&spent);
+                }
 
                 RpcMsgResp::SendToAddressResp(txid.to_string())
             }
