@@ -264,16 +264,6 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         None
     };
 
-    #[cfg(feature = "integration-test")]
-    let maker_address = listener
-        .is_some()
-        .then(|| format!("127.0.0.1:{}", maker.config.network_port));
-    #[cfg(not(feature = "integration-test"))]
-    let maker_address = listener
-        .is_some()
-        .then(|| maker.get_tor_hostname())
-        .transpose()?;
-
     maker.release_orphan_reservations()?;
 
     // Before the fidelity and liquidity waits, not after: both loop until the
@@ -338,6 +328,30 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             }
         }
     }
+
+    // Only after recovery has started, and never fatal: a failed `serve` shuts
+    // down every thread it started, recovery included, so a Tor that is down
+    // or refuses the onion service must not fail it. Without an address the
+    // maker cannot be reached or advertised, so it runs recovery-only, as it
+    // does when the watchtower is down.
+    #[cfg(feature = "integration-test")]
+    let maker_address = listener
+        .is_some()
+        .then(|| format!("127.0.0.1:{}", maker.config.network_port));
+    #[cfg(not(feature = "integration-test"))]
+    let maker_address = match listener.as_ref().map(|_| maker.get_tor_hostname()) {
+        None => None,
+        Some(Ok(hostname)) => Some(hostname),
+        Some(Err(e)) => {
+            log::error!(
+                "[{}] Tor onion service unavailable: {:?}; recovery-only mode",
+                maker.config.network_port,
+                e
+            );
+            None
+        }
+    };
+    let listener = listener.filter(|_| maker_address.is_some());
 
     // Only after recovery has started: the bond wait has no deadline, and
     // contracts left from a previous run must not wait on it.
