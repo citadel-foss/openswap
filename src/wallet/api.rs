@@ -2492,13 +2492,6 @@ impl Wallet {
             .extend(outpoints.iter().map(|outpoint| (*outpoint, txid)));
     }
 
-    /// Drop the hold on `outpoints` at once; for a send whose broadcast failed.
-    pub(crate) fn release_send(&mut self, outpoints: &[OutPoint]) {
-        for outpoint in outpoints {
-            self.pending_sends.remove(outpoint);
-        }
-    }
-
     /// Release held send inputs a sync has settled. Runs after every
     /// successful sync, so a failed one only delays the release.
     ///
@@ -2511,9 +2504,13 @@ impl Wallet {
     pub(crate) fn release_settled_sends(&mut self) {
         let held: Vec<(OutPoint, Txid)> =
             self.pending_sends.iter().map(|(o, t)| (*o, *t)).collect();
+        // One backend query per send, not per input.
+        let mut unknown = HashMap::<Txid, bool>::new();
         for (outpoint, txid) in held {
             let settled = !self.store.utxo_cache.contains_key(&outpoint)
-                || matches!(self.blockchain.is_tx_unknown(&txid), Ok(true));
+                || *unknown
+                    .entry(txid)
+                    .or_insert_with(|| matches!(self.blockchain.is_tx_unknown(&txid), Ok(true)));
             if settled {
                 self.pending_sends.remove(&outpoint);
             }

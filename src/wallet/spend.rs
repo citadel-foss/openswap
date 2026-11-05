@@ -699,9 +699,6 @@ mod tests {
         // A wallet-lock rebuild must not drop a held send.
         wallet.locked_utxos.clear();
         assert!(wallet.list_lock_unspent().contains(&outpoint(2)));
-
-        wallet.release_send(&[outpoint(2)]);
-        assert!(wallet.list_lock_unspent().is_empty());
     }
 
     #[test]
