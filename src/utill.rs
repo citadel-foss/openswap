@@ -34,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::OnceLock,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -764,14 +764,18 @@ impl From<serde_cbor::Error> for TorError {
 /// How long to wait for the Tor control port to accept a connection.
 const TOR_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long each read or write on the Tor control port may block. `ADD_ONION`
-/// with `Flags=Detach` answers before the descriptor is published, so a
-/// healthy Tor replies well within this.
+/// How long a Tor control command may take, its whole reply included, and how
+/// long each write may block. `ADD_ONION` with `Flags=Detach` answers before
+/// the descriptor is published, so a healthy Tor replies well within this.
 const TOR_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Longest control-port reply line accepted, so a misbehaving peer cannot
 /// grow a line without bound.
-const TOR_CONTROL_MAX_LINE: u64 = 64 * 1024;
+const TOR_CONTROL_MAX_LINE: usize = 64 * 1024;
+
+/// Most lines kept from one control-port reply, so a peer that keeps sending
+/// continuation lines cannot grow the reply without bound.
+const TOR_CONTROL_MAX_REPLY_LINES: usize = 256;
 
 /// One reply from the Tor control port: its status code and the text of each
 /// line, without the code and separator.
@@ -829,7 +833,7 @@ impl TorControl {
             .write_all(command.as_bytes())
             .and_then(|()| self.stream.write_all(b"\r\n"));
         sent.map_err(|e| self.io_error(e))?;
-        self.read_reply()
+        self.read_reply(Instant::now() + self.io_timeout)
     }
 
     fn authenticate(&mut self, password: &str) -> Result<(), TorError> {
@@ -845,13 +849,14 @@ impl TorControl {
 
     /// Read one reply: `NNN-text` lines continue it, `NNN+text` opens a data
     /// block that ends at a lone `.`, and `NNN text` ends it.
-    fn read_reply(&mut self) -> Result<TorReply, TorError> {
+    fn read_reply(&mut self, deadline: Instant) -> Result<TorReply, TorError> {
         let mut code = None;
         let mut lines = Vec::new();
         loop {
-            let line = self.read_line()?;
+            let line = self.read_line(deadline)?;
             let bytes = line.as_bytes();
-            if bytes.len() < 4 || !bytes[..3].iter().all(u8::is_ascii_digit) {
+            if bytes.len() < 4 || !bytes[..3].iter().all(u8::is_ascii_digit) || !bytes[3].is_ascii()
+            {
                 return Err(TorError::General(format!(
                     "malformed Tor control reply line: {line:?}"
                 )));
@@ -864,6 +869,11 @@ impl TorControl {
                     "Tor control reply changed status code mid-reply: {line:?}"
                 )));
             }
+            if lines.len() == TOR_CONTROL_MAX_REPLY_LINES {
+                return Err(TorError::General(
+                    "Tor control reply has too many lines".to_string(),
+                ));
+            }
             lines.push(line[4..].to_string());
             match bytes[3] {
                 b' ' => {
@@ -874,7 +884,7 @@ impl TorControl {
                 }
                 b'-' => {}
                 b'+' => loop {
-                    if self.read_line()? == "." {
+                    if self.read_line(deadline)? == "." {
                         break;
                     }
                 },
@@ -887,22 +897,42 @@ impl TorControl {
         }
     }
 
-    fn read_line(&mut self) -> Result<String, TorError> {
-        let mut line = String::new();
-        let read = (&mut self.reader)
-            .take(TOR_CONTROL_MAX_LINE)
-            .read_line(&mut line)
-            .map_err(|e| self.io_error(e))?;
-        if read == 0 {
-            return Err(TorError::General(
-                "Tor control port closed the connection mid-reply".to_string(),
-            ));
+    /// Read one line by `deadline`. Each socket read waits only for the time
+    /// left, so a peer trickling bytes cannot stretch the reply past it.
+    fn read_line(&mut self, deadline: Instant) -> Result<String, TorError> {
+        let mut line = Vec::new();
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(|| self.io_error(ErrorKind::TimedOut.into()))?;
+            self.reader.get_ref().set_read_timeout(Some(remaining))?;
+            let buf = match self.reader.fill_buf() {
+                Ok(buf) => buf,
+                Err(e) => return Err(self.io_error(e)),
+            };
+            if buf.is_empty() {
+                return Err(TorError::General(
+                    "Tor control port closed the connection mid-reply".to_string(),
+                ));
+            }
+            let (taken, ended) = match buf.iter().position(|&b| b == b'\n') {
+                Some(newline) => (newline + 1, true),
+                None => (buf.len(), false),
+            };
+            if line.len() + taken > TOR_CONTROL_MAX_LINE {
+                return Err(TorError::General(
+                    "Tor control reply line too long".to_string(),
+                ));
+            }
+            line.extend_from_slice(&buf[..taken]);
+            self.reader.consume(taken);
+            if ended {
+                break;
+            }
         }
-        if !line.ends_with('\n') {
-            return Err(TorError::General(
-                "Tor control reply line too long".to_string(),
-            ));
-        }
+        let line = String::from_utf8(line)
+            .map_err(|_| TorError::General("Tor control reply line is not UTF-8".to_string()))?;
         Ok(line.trim_end_matches(['\r', '\n']).to_string())
     }
 
@@ -1861,6 +1891,52 @@ mod tests {
             "250+extra=\r\nline one\r\n.\r\n250-ServiceID=efgh\r\n250 OK\r\n",
         ]);
         assert_eq!(publish_on_fake(port, None).unwrap(), "efgh.onion");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_non_ascii_separator_is_malformed_not_a_panic() {
+        // Byte 4 falls inside the `é`, so slicing there would panic.
+        let (port, server) = fake_tor_control(vec!["250 OK\r\n", "250é\r\n"]);
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(error.contains("malformed"), "{}", error);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_reply_line_count_is_capped() {
+        let flood = "250-x\r\n".repeat(TOR_CONTROL_MAX_REPLY_LINES + 1);
+        let (port, server) = fake_tor_control(vec!["250 OK\r\n", Box::leak(flood.into()) as &str]);
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(error.contains("too many lines"), "{}", error);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_trickling_reply_hits_command_deadline() {
+        // One byte every 200ms never trips a per-read timeout of 1s; only a
+        // deadline for the whole reply stops it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"250 OK\r\n").unwrap();
+            reader.read_line(&mut line).unwrap();
+            while stream.write_all(b"2").is_ok() {
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(
+            started.elapsed() < 3 * TEST_TOR_TIMEOUT,
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("did not answer"), "{}", error);
         server.join().unwrap();
     }
 

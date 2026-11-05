@@ -344,7 +344,7 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         Some(Ok(hostname)) => Some(hostname),
         Some(Err(e)) => {
             log::error!(
-                "[{}] Tor onion service unavailable: {:?}; recovery-only mode",
+                "[{}] Tor onion service unavailable: {:?}; recovery-only mode, restart makerd once Tor is reachable to take swaps again",
                 maker.config.network_port,
                 e
             );
