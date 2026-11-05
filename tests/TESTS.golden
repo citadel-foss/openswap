@@ -243,6 +243,7 @@ openswap utill::tests::tor_non_ascii_separator_is_malformed_not_a_panic
 openswap utill::tests::tor_password_is_quoted
 openswap utill::tests::tor_reply_data_block_is_skipped
 openswap utill::tests::tor_reply_line_count_is_capped
+openswap utill::tests::tor_reply_line_length_is_capped
 openswap utill::tests::tor_silent_control_port_times_out
 openswap utill::tests::tor_trickling_reply_hits_command_deadline
 openswap wallet::api::coin_select_cap_tests::coin_select_rejects_amounts_above_the_cap

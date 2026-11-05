@@ -1913,6 +1913,15 @@ mod tests {
     }
 
     #[test]
+    fn tor_reply_line_length_is_capped() {
+        let long = format!("250-{}\r\n", "x".repeat(TOR_CONTROL_MAX_LINE));
+        let (port, server) = fake_tor_control(vec!["250 OK\r\n", Box::leak(long.into()) as &str]);
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(error.contains("too long"), "{}", error);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn tor_trickling_reply_hits_command_deadline() {
         // One byte every 200ms never trips a per-read timeout of 1s; only a
         // deadline for the whole reply stops it.
