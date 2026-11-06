@@ -67,6 +67,7 @@ openswap maker::server::tests::heartbeat_socket_cannot_switch_swap_id
 openswap maker::server::tests::pending_connections_are_bounded
 openswap maker::server::tests::pending_deadline_stops_slow_reads
 openswap maker::server::tests::preimage_check_stops_on_an_unknown_answer
+openswap maker::server::tests::startup_replaces_an_expired_rejected_bond
 openswap maker::server::tests::startup_skips_a_bond_that_confirmed_too_late
 openswap maker::server::tests::token_bucket_limits_connection_burst
 openswap maker::taproot_verification::tests::rejects_amount_that_does_not_match_contract_output

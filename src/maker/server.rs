@@ -2719,4 +2719,57 @@ mod tests {
         setup_startup_fidelity_bond(&maker, address).unwrap();
         assert!(maker.highest_fidelity_proof.read().unwrap().is_none());
     }
+
+    /// An expired bond is redeemed to fund its replacement, so startup goes on
+    /// to fund one instead of reporting the bond as too late.
+    #[test]
+    fn startup_replaces_an_expired_rejected_bond() {
+        use crate::wallet::{AnyBlockchain, Electrum, ElectrumConfig, FidelityBond};
+        use bitcoin::{
+            absolute::LockTime,
+            secp256k1::{Secp256k1, SecretKey},
+            Amount, OutPoint, PublicKey,
+        };
+        use std::sync::atomic::Ordering;
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let conf_height = 800_000u32;
+        let lock = conf_height - 1 + MIN_FIDELITY_TIMELOCK;
+        // The chain has passed the bond's lock, so it is expired.
+        let server = crate::wallet::blockchain::mock_electrum(|_, _| Ok(serde_json::Value::Null));
+        server.set_tip(
+            u64::from(lock) + 1,
+            &bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
+        );
+        let secret = SecretKey::from_slice(&[4; 32]).unwrap();
+        {
+            let mut wallet = maker.wallet.write().unwrap();
+            wallet.blockchain = AnyBlockchain::Electrum(
+                Electrum::new(&ElectrumConfig {
+                    url: server.url.clone(),
+                    ..Default::default()
+                })
+                .expect("connect to mock electrum"),
+            );
+            wallet.store.fidelity_bond.push(FidelityBond {
+                outpoint: OutPoint::new(Txid::all_zeros(), 0),
+                amount: Amount::from_sat(50_000),
+                lock_time: LockTime::from_height(lock).unwrap(),
+                pubkey: PublicKey::new(secret.public_key(&Secp256k1::new())),
+                conf_height: Some(conf_height),
+                is_spent: false,
+                bond_index: 0,
+                tx: None,
+                extra: BTreeMap::new(),
+            });
+        }
+        // Stop before waiting for funds: reaching the wait is what matters.
+        maker.shutdown.store(true, Ordering::SeqCst);
+
+        match maker.setup_fidelity_bond_with("127.0.0.1:6102", false) {
+            Err(BondSetupError::Maker(_)) => {}
+            other => panic!("expected setup to reach the funding wait, got {:?}", other),
+        }
+    }
 }
