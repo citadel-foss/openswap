@@ -1486,18 +1486,24 @@ impl MakerServer {
 
         // A bond that confirmed too late for its timelock is never offered:
         // takers would reject it, and a new bond is funded instead.
-        let rejected = std::cell::Cell::new(None);
+        // Keeps the rejected bond that stays locked longest.
+        let rejected = std::cell::Cell::new(None::<(u32, u32, u32)>);
         let highest_index = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
             .get_highest_fidelity_index_where(|bond| {
                 let accepted = self.bond_timelock_accepted(bond.lock_time, bond.conf_height);
                 if !accepted {
-                    rejected.set(bond.conf_height.map(|height| (bond.bond_index, height)));
+                    if let Some(height) = bond.conf_height {
+                        let lock = bond.lock_time.to_consensus_u32();
+                        if rejected.get().is_none_or(|(_, _, kept)| lock > kept) {
+                            rejected.set(Some((bond.bond_index, height, lock)));
+                        }
+                    }
                 }
                 accepted
             })
             .map_err(MakerError::Wallet)?;
-        if let Some((index, _)) = rejected.get() {
+        if let Some((index, _, _)) = rejected.get() {
             log::warn!(
                 "[{}] Skipping fidelity bond {}: its timelock from confirmation is outside the accepted range",
                 self.config.network_port,
@@ -1506,8 +1512,18 @@ impl MakerServer {
         }
 
         if highest_index.is_none() && !fund_replacement {
-            if let Some((index, conf_height)) = rejected.get() {
-                return Err(BondSetupError::TooLate { index, conf_height });
+            if let Some((index, conf_height, lock)) = rejected.get() {
+                // An expired bond is redeemed while the replacement is funded,
+                // so only a still-locked one, whose coins can't fund it, stops
+                // setup here. Same expiry rule as `redeem_expired_fidelity_bonds`.
+                let still_locked = lock_debug!(self.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                    .blockchain
+                    .get_block_count()
+                    .map_or(true, |tip| tip <= u64::from(lock));
+                if still_locked {
+                    return Err(BondSetupError::TooLate { index, conf_height });
+                }
             }
         }
 
