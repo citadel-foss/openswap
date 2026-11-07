@@ -99,8 +99,10 @@ openswap maker::handlers::tests::taproot_refund_deadline_is_exact_at_the_boundar
 openswap maker::legacy_verification::tests::locktime_that_overflows_the_refund_step_is_rejected
 openswap maker::legacy_verification::tests::normal_locktime_is_accepted
 openswap maker::lightning_handlers::tests::a_draining_maker_refuses_new_lightning_swaps
+openswap maker::lightning_handlers::tests::closed_swap_out_is_not_recreated_after_the_lookup_guard
 openswap maker::lightning_handlers::tests::compat_lightning_pins_require_exact_direction_and_requirements
 openswap maker::lightning_handlers::tests::directions_are_bounded_by_opposite_channel_sides
+openswap maker::lightning_handlers::tests::old_core_can_refund_an_unspent_swap_out
 openswap maker::lightning_handlers::tests::only_a_rejection_leaves_the_connection_unpromoted
 openswap maker::lightning_handlers::tests::only_the_recorded_refund_is_ours
 openswap maker::lightning_handlers::tests::persisted_record_survives_serialization_and_still_spends
@@ -108,6 +110,7 @@ openswap maker::lightning_handlers::tests::recorded_spend_stays_spent
 openswap maker::lightning_handlers::tests::refund_waits_for_the_chain_to_say_unspent
 openswap maker::lightning_handlers::tests::swap_out_limit_leaves_inbound_room_for_the_fee
 openswap maker::lightning_handlers::tests::unfunded_record_round_trips_without_funding
+openswap maker::lightning_handlers::tests::unseen_swap_out_claim_retries_and_settles_before_csv
 openswap maker::lightning_handlers::tests::unusable_channels_and_dust_capacity_disable_a_direction
 openswap maker::lightning_handlers::tests::wallet_caps_only_the_swap_out_direction
 openswap maker::lightning_handlers::tests::watched_htlc_without_a_spend_is_unspent
@@ -421,6 +424,7 @@ openswap wallet::blockchain::corerpc::tests::estimate_feerate_forwards_target_an
 openswap wallet::blockchain::corerpc::tests::imported_range_covers_legacy_wallet_without_listdescriptors
 openswap wallet::blockchain::corerpc::tests::imported_range_covers_needs_the_range_to_start_at_zero
 openswap wallet::blockchain::corerpc::tests::init_interactive_refuses_core_before_v22_without_a_wallet_file
+openswap wallet::blockchain::corerpc::tests::legacy_mempool_spend_lookup_preserves_errors_and_finds_claims
 openswap wallet::blockchain::corerpc::tests::load_or_init_refuses_core_before_v22_for_an_existing_wallet
 openswap wallet::blockchain::corerpc::tests::load_or_init_refuses_core_before_v22_without_a_wallet_file
 openswap wallet::blockchain::corerpc::tests::prepare_backend_wallet_refuses_core_before_v22
@@ -745,11 +749,13 @@ openswap::integration lightning::maker_restart::lightning_maker_does_not_refund_
 openswap::integration lightning::maker_restart::lightning_maker_keeps_a_shallow_refund_through_a_reorg
 openswap::integration lightning::maker_restart::lightning_maker_keeps_a_swap_out_while_its_funding_height_is_unknown
 openswap::integration lightning::maker_restart::lightning_maker_rebroadcasts_an_evicted_refund
+openswap::integration lightning::maker_restart::lightning_maker_recovers_an_unseen_claim_before_csv_without_funding_height
 openswap::integration lightning::maker_restart::lightning_maker_refunds_a_swap_out_stored_without_funding_height
 openswap::integration lightning::maker_restart::lightning_maker_restart_recovers_an_interrupted_refund
 openswap::integration lightning::maker_restart::lightning_maker_restart_recovers_funded_swap
 openswap::integration lightning::maker_restart::lightning_maker_restart_refunds_unclaimed_swap_out
 openswap::integration lightning::maker_restart::lightning_maker_stale_snapshot_keeps_newer_swap_out_state
+openswap::integration lightning::maker_restart::lightning_maker_warns_before_claim_deadline_after_restart_without_funding_height
 openswap::integration lightning::maker_restart::restarted_watchdog_follows_payment_of_swap_in_missing_funding_height
 openswap::integration lightning::maker_restart::stale_swap_in_refusal_keeps_paid_swap
 openswap::integration lightning::maker_restart::stale_watchdog_expiry_keeps_paid_swap
