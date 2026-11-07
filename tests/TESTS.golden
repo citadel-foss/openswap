@@ -106,6 +106,7 @@ openswap maker::lightning_handlers::tests::old_core_can_refund_an_unspent_swap_o
 openswap maker::lightning_handlers::tests::only_a_rejection_leaves_the_connection_unpromoted
 openswap maker::lightning_handlers::tests::only_the_recorded_refund_is_ours
 openswap maker::lightning_handlers::tests::persisted_record_survives_serialization_and_still_spends
+openswap maker::lightning_handlers::tests::recorded_refund_recovery_survives_direct_lookup_failure
 openswap maker::lightning_handlers::tests::recorded_spend_stays_spent
 openswap maker::lightning_handlers::tests::refund_waits_for_the_chain_to_say_unspent
 openswap maker::lightning_handlers::tests::swap_out_limit_leaves_inbound_room_for_the_fee
@@ -678,6 +679,7 @@ openswap watch_tower::watcher::tests::failing_electrum_watch_does_not_starve_the
 openswap watch_tower::watcher::tests::failing_subscription_costs_one_attempt_and_starves_none
 openswap watch_tower::watcher::tests::failing_watch_does_not_starve_the_queue
 openswap watch_tower::watcher::tests::funding_lookup_racing_the_end_of_the_txindex_sync_stays_queued
+openswap watch_tower::watcher::tests::legacy_spend_lookup_prioritizes_mined_claims_and_keeps_mempool_claims
 openswap watch_tower::watcher::tests::mempool_rival_cannot_replace_a_confirmed_spend_while_the_txindex_syncs
 openswap watch_tower::watcher::tests::missed_zmq_spend_is_recorded_after_a_sequence_gap
 openswap watch_tower::watcher::tests::never_broadcast_outpoint_leaves_the_queue
