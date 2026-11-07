@@ -1406,6 +1406,8 @@ pub fn watchdog_expire_swap_in_snapshot(
     watchdog_expire_swap_in(maker, swap_id, swap)
 }
 
+/// Recovers a swap-in preimage, or releases its state after the refund window
+/// only when payment failure or a confirmed refund leaves nothing to sweep.
 fn watchdog_finish_swap_in(
     maker: &Arc<MakerServer>,
     ctx: &LnContext,
@@ -1560,6 +1562,8 @@ pub fn watchdog_finish_swap_in_snapshot(
     watchdog_finish_swap_in(maker, &LnContext { ln, router }, swap_id, swap)
 }
 
+/// Settles a funded swap-out from its claim, or refunds an unclaimed HTLC
+/// after its CSV window, keeping the record until the refund confirms.
 fn watchdog_resolve_swap_out(
     maker: &Arc<MakerServer>,
     ctx: &LnContext,

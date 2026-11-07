@@ -29,7 +29,7 @@ use openswap::{
         lightning_handlers::{
             ln_watchdog_tick_now, refuse_swap_in_after_wait, watchdog_expire_swap_in_snapshot,
             watchdog_finish_swap_in_snapshot, watchdog_resolve_swap_out_snapshot, LnDirection,
-            LnMakerPhase, LnMakerSwap,
+            LnMakerPhase, LnMakerSwap, HIDE_HTLC_SPENDS,
         },
         MakerBehavior, MakerError, MakerServer,
     },
@@ -637,8 +637,6 @@ fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
 ) {
-    use openswap::maker::lightning_handlers::HIDE_HTLC_SPENDS;
-
     let framework = world.framework().clone();
     let bitcoind = &framework.bitcoind;
     let maker = world.makers()[0].inner().clone();
@@ -1089,8 +1087,6 @@ fn lightning_maker_does_not_refund_a_claimed_swap_out_without_funding_height(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
 ) {
-    use openswap::maker::lightning_handlers::HIDE_HTLC_SPENDS;
-
     let framework = world.framework().clone();
     let bitcoind = &framework.bitcoind;
     let maker = world.makers()[0].inner().clone();
