@@ -581,6 +581,7 @@ openswap::integration cli::taker::taker_cli_shows_maker_states
 openswap::integration cli::taker::wallet_commands
 openswap::integration fidelity::creation::bond_creation_and_redemption
 openswap::integration fidelity::renewal::bond_auto_renewal
+openswap::integration fidelity::renewal::late_bond_is_redeemed_during_the_liquidity_wait
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart_electrum
 openswap::integration fidelity::restart::live_bond_is_advertised_while_another_is_pending
