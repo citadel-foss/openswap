@@ -1822,6 +1822,16 @@ impl MakerServer {
                     "Low Swap Liquidity | Min: {min_required} sats | Available: {offer_max_size} sats. Add funds to {addr:?}"
                 );
 
+                // The renewal loop starts only after this wait, so a bond whose
+                // lock ends meanwhile, such as one that confirmed too late to
+                // advertise, is redeemed here or its coins stay out of reach.
+                if let Err(e) = lock_debug!(self.wallet.write())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                    .redeem_expired_fidelity_bonds(MIN_RELAY_FEE_RATE, AddressType::P2TR)
+                {
+                    log::warn!("Failed to redeem expired fidelity bonds: {:?}", e);
+                }
+
                 log::info!("Next sync in {} secs", SYNC_INTERVAL.as_secs());
                 if !self.wait_for_shutdown(SYNC_INTERVAL) {
                     break;
