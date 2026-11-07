@@ -1202,6 +1202,35 @@ where
     }
 }
 
+// Layout of the UTXO grid drawn by `interactive_select`.
+const BOX_WIDTH: usize = 18;
+const COL_SPACING: usize = 20;
+const MIN_MARGIN: usize = 4; // Minimum margin from terminal edges
+const HEADER_LINES: usize = 3; // Header + warning + blank line
+const LINES_PER_ROW: usize = 7; // 7 lines per row (5 for box + 2 spacing)
+
+/// Number of grid rows needed to show `len` UTXO boxes, `cols` per row.
+fn grid_rows(len: usize, cols: usize) -> usize {
+    len.div_ceil(cols)
+}
+
+/// Index of the UTXO box under a click at terminal cell (`column`, `row`), or
+/// `None` when the click lands on the header or outside the drawn grid.
+fn grid_click_index(
+    column: u16,
+    row: u16,
+    cols: usize,
+    visible_rows: usize,
+    scroll_offset: usize,
+) -> Option<usize> {
+    let display_row = (row as usize).checked_sub(HEADER_LINES)? / LINES_PER_ROW;
+    let box_col = column as usize / COL_SPACING;
+    if display_row >= visible_rows || box_col >= cols {
+        return None;
+    }
+    Some((scroll_offset + display_row) * cols + box_col)
+}
+
 /// Interactive Selection by User for Utxos
 pub fn interactive_select(
     mut choices: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>,
@@ -1237,18 +1266,13 @@ pub fn interactive_select(
     )?;
 
     let (terminal_width, terminal_height) = size().unwrap_or((100, 30));
-    const BOX_WIDTH: usize = 18;
-    const COL_SPACING: usize = 20;
-    const MIN_MARGIN: usize = 4; // Minimum margin from terminal edges
-    const HEADER_LINES: usize = 3; // Header + warning + blank line
-    const LINES_PER_ROW: usize = 7; // 7 lines per row (5 for box + 2 spacing)
 
-    let available_width = terminal_width as usize - MIN_MARGIN;
+    let available_width = (terminal_width as usize).saturating_sub(MIN_MARGIN);
     let cols = max(1, available_width / COL_SPACING);
 
-    let total_rows = (choices.len() + cols - 1).div_ceil(cols);
+    let total_rows = grid_rows(choices.len(), cols);
 
-    let available_height = terminal_height as usize - HEADER_LINES;
+    let available_height = (terminal_height as usize).saturating_sub(HEADER_LINES);
     let visible_rows = max(1, available_height / LINES_PER_ROW);
 
     let mut scroll_offset = 0;
@@ -1363,20 +1387,18 @@ pub fn interactive_select(
             Event::Mouse(mouse_event)
                 if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) =>
             {
-                let click_row = mouse_event.row;
-                let click_col = mouse_event.column;
+                let clicked = grid_click_index(
+                    mouse_event.column,
+                    mouse_event.row,
+                    cols,
+                    visible_rows,
+                    scroll_offset,
+                );
 
-                if click_row >= HEADER_LINES as u16 {
-                    let display_row = (click_row - HEADER_LINES as u16) / LINES_PER_ROW as u16;
-                    let actual_row = scroll_offset + display_row as usize;
-                    let box_col = click_col / COL_SPACING as u16;
-                    let i = actual_row * cols + box_col as usize;
+                if let Some(i) = clicked.filter(|&i| i < choices.len()) {
+                    selected[i] = !selected[i];
 
-                    if i < choices.len() {
-                        selected[i] = !selected[i];
-
-                        render_utxo_grid(&mut stdout, &choices, &selected, scroll_offset)?;
-                    }
+                    render_utxo_grid(&mut stdout, &choices, &selected, scroll_offset)?;
                 }
             }
             Event::Key(key_event) => match key_event.code {
@@ -1442,6 +1464,32 @@ mod tests {
     use crate::protocol::common_messages::{Hello, MakerToTakerMessage};
 
     use super::*;
+
+    #[test]
+    fn utxo_grid_rows_round_up_once() {
+        assert_eq!(grid_rows(8, 4), 2);
+        assert_eq!(grid_rows(9, 4), 3);
+        assert_eq!(grid_rows(1, 4), 1);
+        assert_eq!(grid_rows(5, 1), 5);
+        assert_eq!(grid_rows(0, 4), 0);
+    }
+
+    #[test]
+    fn utxo_grid_click_maps_only_inside_the_visible_grid() {
+        // 4 columns, 3 visible rows, scrolled down by one row.
+        let click = |column, row| grid_click_index(column, row, 4, 3, 1);
+        // Header lines are not part of the grid.
+        assert_eq!(click(0, 2), None);
+        // First visible box is the first box of row 1.
+        assert_eq!(click(0, 3), Some(4));
+        assert_eq!(click(79, 9), Some(7));
+        assert_eq!(click(20, 10), Some(9));
+        assert_eq!(click(79, 23), Some(15));
+        // Right of the last column must not wrap onto the next row.
+        assert_eq!(click(80, 3), None);
+        // Below the last visible row must not reach an off-screen box.
+        assert_eq!(click(0, 24), None);
+    }
 
     #[test]
     fn password_file_drops_one_trailing_newline() {

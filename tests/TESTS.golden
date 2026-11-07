@@ -236,6 +236,8 @@ openswap utill::tests::test_redeemscript_to_scriptpubkey_1of2musig
 openswap utill::tests::test_redeemscript_to_scriptpubkey_custom
 openswap utill::tests::test_redeemscript_to_scriptpubkey_p2pkh
 openswap utill::tests::test_send_message
+openswap utill::tests::utxo_grid_click_maps_only_inside_the_visible_grid
+openswap utill::tests::utxo_grid_rows_round_up_once
 openswap wallet::api::coin_select_cap_tests::coin_select_rejects_amounts_above_the_cap
 openswap wallet::api::legacy_recovery_tests::compat_funding_inputs_distinguish_confirmed_conflicts_from_own_funding
 openswap wallet::api::legacy_recovery_tests::compat_legacy_contract_funding_output_requires_a_confirmed_conflict
