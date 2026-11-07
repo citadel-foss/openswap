@@ -314,10 +314,15 @@ impl CoreRPC {
                 if self.is_confirmed_spend(outpoint, Script::new())? {
                     return Ok(None);
                 }
-                // A funding transaction neither mined nor in the mempool has
-                // no spender. Read the sync state first: a syncing txindex
-                // misses mined transactions.
-                if self.txindex_synced()? && self.tx_confirmations(&outpoint.txid)?.is_none() {
+                // Only an output in the mempool or the confirmed UTXO set can
+                // have a mempool spender. Look the funding up first: a block
+                // mining it in between moves it into the UTXO set, where an
+                // index lagging that block cannot hide it.
+                if self.tx_confirmations(&outpoint.txid)?.is_none()
+                    && self
+                        .get_tx_out(&outpoint.txid, outpoint.vout, Some(false))?
+                        .is_none()
+                {
                     return Ok(None);
                 }
                 for txid in self.rpc.get_raw_mempool()? {
@@ -829,10 +834,14 @@ pub(crate) mod tests {
                     "bestblock": "00".repeat(32), "confirmations": 100, "value": 0.0004,
                     "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"}, "coinbase": false
                 })),
+                // The funding is unknown to getrawtransaction, as when a block
+                // mines it mid-lookup, yet its output is in the confirmed UTXO
+                // set, so the mempool must still be searched.
+                "gettxout" if params[2] == json!(false) => Ok(json!({
+                    "bestblock": "00".repeat(32), "confirmations": 1, "value": 0.0004,
+                    "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"}, "coinbase": false
+                })),
                 "gettxout" => Ok(Value::Null),
-                // A syncing txindex cannot see the funding, so the mempool
-                // must still be searched.
-                "getindexinfo" => Ok(json!({"txindex": {"synced": false}})),
                 "getrawmempool" if state.load(Ordering::SeqCst) == 3 => {
                     Err(json!({"code": -28, "message": "mempool unavailable"}))
                 }
@@ -893,8 +902,9 @@ pub(crate) mod tests {
     fn legacy_spend_lookup_skips_the_mempool_for_an_unknown_funding_tx() {
         use crate::watch_tower::watcher::tests::mock_core_rpc;
         use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn};
-        // A contract never broadcast: with the txindex synced, nothing can
-        // spend its output, so no mempool entry is fetched.
+        // A contract never broadcast: its output is in neither the mempool
+        // nor the UTXO set, so nothing can spend it and no mempool entry is
+        // fetched.
         let outpoint = OutPoint::new(Txid::from_byte_array([11; 32]), 0);
         let unrelated = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -912,7 +922,6 @@ pub(crate) mod tests {
                     Err(json!({"code": -32601, "message": "Method not found"}))
                 }
                 "gettxout" => Ok(Value::Null),
-                "getindexinfo" => Ok(json!({"txindex": {"synced": true}})),
                 "getrawtransaction" if params[0] == json!(outpoint.txid) => {
                     Err(json!({"code": -5, "message": "No such transaction"}))
                 }
