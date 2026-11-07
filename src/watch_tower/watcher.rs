@@ -450,22 +450,23 @@ impl<R: Role> Watcher<R> {
         }
     }
 
-    /// Whether a watch may have missed a spend: Electrum has not armed or
-    /// replayed its subscription, or could not fetch a transaction in its
-    /// history. On Core, a pending re-check leaves the answers as they were.
+    /// Whether a watch may have missed a spend: it is queued for a re-check,
+    /// or Electrum has not armed or replayed its subscription, or could not
+    /// fetch a transaction in its history.
     fn is_blind(&self, watch: &WatchRequest) -> bool {
         match &self.blockchain {
             AnyBlockchain::Electrum(electrum) => {
                 self.pending_reconcile.contains(&watch.outpoint)
                     || electrum.may_have_missed(&watch.script_pubkey)
             }
-            AnyBlockchain::CoreRPC(_) => false,
+            AnyBlockchain::CoreRPC(_) => self.pending_reconcile.contains(&watch.outpoint),
         }
     }
 
     /// Ask the server for the spend of a blind watch, recording any found, and
     /// answer with the spend on record after it. A completed check settles a
-    /// queued re-check of the watch too.
+    /// queued re-check of the watch too. While Core cannot tell yet, the
+    /// watch stays queued, and with no spend on record it has no answer.
     fn check_blind_watch(
         &mut self,
         watch: &WatchRequest,
@@ -476,16 +477,29 @@ impl<R: Role> Watcher<R> {
             pending_reconcile,
             ..
         } = self;
-        let AnyBlockchain::Electrum(electrum) = blockchain else {
-            return Ok(watch.spent_tx.clone());
+        let settled = match &*blockchain {
+            AnyBlockchain::CoreRPC(core) => reconcile_watch(core, registry, watch)?,
+            AnyBlockchain::Electrum(electrum) => {
+                recheck_electrum_watch(electrum, registry, watch)?;
+                true
+            }
         };
-        recheck_electrum_watch(electrum, registry, watch)?;
-        pending_reconcile.retain(|outpoint| *outpoint != watch.outpoint);
-        Ok(registry
+        if settled {
+            pending_reconcile.retain(|outpoint| *outpoint != watch.outpoint);
+        }
+        // Core may have found a spend it cannot confirm yet, and that spend
+        // may carry the only copy of a preimage, so it is answered.
+        let spend = registry
             .list_watches()?
             .into_iter()
             .find(|recorded| recorded.outpoint == watch.outpoint)
-            .and_then(|recorded| recorded.spent_tx))
+            .and_then(|recorded| recorded.spent_tx);
+        if settled || spend.is_some() {
+            return Ok(spend);
+        }
+        Err(WatcherError::General(
+            "Core cannot tell yet whether it was spent".to_string(),
+        ))
     }
 
     /// Whether a recorded confirmed spend is still on chain. A failed query
@@ -2304,6 +2318,120 @@ mod tests {
         assert!(watcher.pending_reconcile.is_empty());
         assert_eq!(recorded_spend(&watcher, outpoint), Some(mined));
         assert!(is_recorded_confirmed(&watcher, outpoint));
+    }
+
+    /// While Core cannot tell whether a queued watch was spent, having no
+    /// spend on record proves nothing: a query is answered unknown, never
+    /// unspent, and answered from Core once it can tell.
+    #[test]
+    fn undecided_core_watch_answers_unknown_until_core_can_tell() {
+        let funding = spend(OutPoint::new(Txid::from_byte_array([9; 32]), 0));
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let mined = spend(outpoint);
+        let node = Arc::new(Mutex::new(Node::default()));
+        {
+            let mut node = node.lock().unwrap();
+            node.mine(Vec::new());
+            node.mine(vec![funding]);
+            node.mine(vec![mined.clone()]);
+            node.txindex_syncing = true;
+        }
+        let (url, _calls) = mock_node(&node);
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        register(&mut watcher, outpoint, ScriptBuf::new());
+
+        watcher.handle_event(WatchEvent::Missed);
+        watcher.retry_pending_work();
+        assert_eq!(watcher.pending_reconcile, [outpoint]);
+        assert_unknown(ask(&mut watcher, outpoint));
+        assert_eq!(watcher.pending_reconcile, [outpoint]);
+
+        node.lock().unwrap().txindex_syncing = false;
+        assert_eq!(answered_spend(ask(&mut watcher, outpoint)), Some(mined));
+        assert!(watcher.pending_reconcile.is_empty());
+    }
+
+    /// A spend Core finds in a block its txindex has not reached keeps the
+    /// watch queued, but it may carry the only copy of a preimage, so a query
+    /// is answered with it rather than as unknown.
+    #[test]
+    fn spend_core_cannot_confirm_yet_is_answered() {
+        let funding = spend(OutPoint::new(Txid::from_byte_array([9; 32]), 0));
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let claim = claim_with_preimage(outpoint, [7; 32]);
+        let node = Arc::new(Mutex::new(Node::default()));
+        {
+            let mut node = node.lock().unwrap();
+            node.mine(Vec::new());
+            node.mine(vec![funding]);
+            node.mine(vec![claim.clone()]);
+            node.txindex_syncing = true;
+            node.indexed_below = 2;
+        }
+        let (url, _calls) = mock_node(&node);
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        register(&mut watcher, outpoint, ScriptBuf::new());
+
+        watcher.handle_event(WatchEvent::Missed);
+        assert_eq!(answered_spend(ask(&mut watcher, outpoint)), Some(claim));
+        assert_eq!(watcher.pending_reconcile, [outpoint]);
+    }
+
+    /// A failed re-check is no answer either, though a spend on record still
+    /// stands. It holds up no other watch: one Core can check is answered at
+    /// once, without waiting for the retry pass.
+    #[test]
+    fn failed_core_recheck_answers_unknown_but_keeps_a_recorded_spend() {
+        let failing = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let recorded = OutPoint::new(Txid::from_byte_array([2; 32]), 0);
+        let unbroadcast = OutPoint::new(Txid::from_byte_array([3; 32]), 0);
+        let claim = spend(recorded);
+        let lookups_fail = Arc::new(AtomicBool::new(true));
+        let node = Node::default();
+        let (url, _calls) = mock_core_rpc({
+            let lookups_fail = lookups_fail.clone();
+            move |method, params| {
+                if method == "gettxspendingprevout"
+                    && params[0][0]["txid"] != json!(unbroadcast.txid)
+                    && lookups_fail.load(Ordering::Relaxed)
+                {
+                    return Err(json!({ "code": -28, "message": "Verifying blocks" }));
+                }
+                node.answer(method, params)
+            }
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        register(&mut watcher, failing, ScriptBuf::new());
+        register(&mut watcher, unbroadcast, ScriptBuf::new());
+        watcher
+            .registry
+            .upsert_watch(&WatchRequest {
+                outpoint: recorded,
+                script_pubkey: ScriptBuf::new(),
+                in_block: false,
+                spent_tx: Some(claim.clone()),
+            })
+            .unwrap();
+
+        watcher.handle_event(WatchEvent::Missed);
+        assert_unknown(ask(&mut watcher, failing));
+        assert_eq!(answered_spend(ask(&mut watcher, recorded)), Some(claim));
+        assert_eq!(answered_spend(ask(&mut watcher, unbroadcast)), None);
+        assert_eq!(watcher.pending_reconcile.len(), 2);
+        assert!(!watcher.pending_reconcile.contains(&unbroadcast));
+
+        lookups_fail.store(false, Ordering::Relaxed);
+        assert_eq!(answered_spend(ask(&mut watcher, failing)), None);
+        assert_eq!(watcher.pending_reconcile, [recorded]);
     }
 
     /// Contract outpoints are watched long before their transaction is
