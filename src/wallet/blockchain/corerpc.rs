@@ -309,8 +309,21 @@ impl CoreRPC {
                 {
                     return Ok(None);
                 }
+                // Do not scan unrelated mempool entries for an output spent
+                // on chain. Both callers follow None with the mined lookup.
+                if self.is_confirmed_spend(outpoint, Script::new())? {
+                    return Ok(None);
+                }
                 for txid in self.rpc.get_raw_mempool()? {
-                    let tx = self.get_raw_transaction(&txid, None)?;
+                    let tx = match self.get_raw_transaction(&txid, None) {
+                        Ok(tx) => tx,
+                        // The mempool snapshot can outlive an entry. Keep
+                        // searching; the caller also checks mined spends.
+                        Err(WalletError::Rpc(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(
+                            ref e,
+                        )))) if e.code == -5 => continue,
+                        Err(e) => return Err(e),
+                    };
                     if tx
                         .input
                         .iter()
@@ -791,11 +804,15 @@ pub(crate) mod tests {
             }],
             output: Vec::new(),
         };
+        let mut unrelated = tx.clone();
+        unrelated.input[0].previous_output.vout += 1;
+        let missing = Txid::from_byte_array([10; 32]);
         let state = Arc::new(AtomicUsize::new(0));
         let (url, _) = mock_core_rpc({
             let state = state.clone();
             let tx = tx.clone();
-            move |method, _| match method {
+            let unrelated = unrelated.clone();
+            move |method, params| match method {
                 "gettxspendingprevout" if state.load(Ordering::SeqCst) == 2 => {
                     Err(json!({"code": -28, "message": "warming up"}))
                 }
@@ -810,11 +827,30 @@ pub(crate) mod tests {
                 "getrawmempool" if state.load(Ordering::SeqCst) == 3 => {
                     Err(json!({"code": -28, "message": "mempool unavailable"}))
                 }
-                "getrawmempool" => Ok(json!([tx.compute_txid()])),
-                "getrawtransaction" if state.load(Ordering::SeqCst) == 4 => {
+                "getrawmempool" if state.load(Ordering::SeqCst) == 4 => Ok(json!([
+                    missing,
+                    unrelated.compute_txid(),
+                    tx.compute_txid()
+                ])),
+                "getrawmempool" if state.load(Ordering::SeqCst) == 5 => {
+                    Ok(json!([unrelated.compute_txid()]))
+                }
+                "getrawmempool" if state.load(Ordering::SeqCst) == 6 => Ok(json!([])),
+                "getrawmempool" => Ok(json!([unrelated.compute_txid(), tx.compute_txid()])),
+                "getrawtransaction"
+                    if params[0] == json!(outpoint.txid) || params[0] == json!(missing) =>
+                {
                     Err(json!({"code": -5, "message": "transaction disappeared"}))
                 }
-                "getrawtransaction" => Ok(json!(serialize_hex(&tx))),
+                "getrawtransaction" if state.load(Ordering::SeqCst) == 7 => {
+                    Err(json!({"code": -28, "message": "transaction lookup failed"}))
+                }
+                "getrawtransaction" if params[0] == json!(unrelated.compute_txid()) => {
+                    Ok(json!(serialize_hex(&unrelated)))
+                }
+                "getrawtransaction" if params[0] == json!(tx.compute_txid()) => {
+                    Ok(json!(serialize_hex(&tx)))
+                }
                 other => panic!("unexpected RPC {}", other),
             }
         });
@@ -827,12 +863,18 @@ pub(crate) mod tests {
             .mempool_spending_transaction(&outpoint)
             .unwrap()
             .is_none());
-        state.store(1, Ordering::SeqCst);
-        assert_eq!(
-            core.mempool_spending_transaction(&outpoint).unwrap(),
-            Some(tx)
-        );
-        for mode in [2, 3, 4] {
+        for mode in [1, 4] {
+            state.store(mode, Ordering::SeqCst);
+            assert_eq!(
+                core.mempool_spending_transaction(&outpoint).unwrap(),
+                Some(tx.clone())
+            );
+        }
+        for mode in [5, 6] {
+            state.store(mode, Ordering::SeqCst);
+            assert_eq!(core.mempool_spending_transaction(&outpoint).unwrap(), None);
+        }
+        for mode in [2, 3, 7] {
             state.store(mode, Ordering::SeqCst);
             assert!(core.mempool_spending_transaction(&outpoint).is_err());
         }

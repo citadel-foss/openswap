@@ -235,7 +235,6 @@ mod compat_storage_fixture_generation {
                     funding_outpoint: Some(point),
                     funding_value: Some(Amount::from_sat(101_000)),
                     funding_height: Some(125),
-                    claim_deadline: None,
                 },
             );
         }
