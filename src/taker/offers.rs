@@ -6,7 +6,7 @@
 //! It uses asynchronous channels for concurrent processing of maker offers.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     convert::TryFrom,
     fmt,
     path::{Path, PathBuf},
@@ -779,20 +779,16 @@ fn sync_and_wait(cmd_tx: &mpsc::Sender<SyncCommand>, timeout: Duration) -> Resul
     }
 }
 
-/// Groups verified bonds by maker; `None` marks distinct live outpoints.
+/// Every live bond discovered for a maker address, with its announced expiry.
+type LiveBonds = BTreeMap<OutPoint, Option<u32>>;
+
+/// Groups live discovered bonds by the maker address they claim.
 fn group_live_fidelity_candidates(
-    candidates: impl IntoIterator<Item = (MakerAddress, OutPoint)>,
-) -> HashMap<MakerAddress, Option<OutPoint>> {
-    let mut grouped = HashMap::new();
-    for (address, outpoint) in candidates {
-        grouped
-            .entry(address)
-            .and_modify(|current: &mut Option<OutPoint>| {
-                if current.is_some_and(|existing| existing != outpoint) {
-                    *current = None;
-                }
-            })
-            .or_insert(Some(outpoint));
+    candidates: impl IntoIterator<Item = (MakerAddress, OutPoint, Option<u32>)>,
+) -> HashMap<MakerAddress, LiveBonds> {
+    let mut grouped: HashMap<MakerAddress, LiveBonds> = HashMap::new();
+    for (address, outpoint, expiry) in candidates {
+        grouped.entry(address).or_default().insert(outpoint, expiry);
     }
     grouped
 }
@@ -839,7 +835,6 @@ impl OfferSyncService {
         let mut registry_candidates = HashSet::new();
         let mut spent_outpoints = Vec::new();
         let mut live_outpoints = Vec::new();
-        let mut live_expiries = HashMap::new();
         for fidelity in fidelities {
             let outpoint = OutPoint::new(fidelity.txid, 0);
             let address = match MakerAddress::try_from(fidelity.onion_address) {
@@ -855,8 +850,7 @@ impl OfferSyncService {
                 .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
             {
                 Ok(Some(_)) => {
-                    live_expiries.insert(outpoint, fidelity.expire_height);
-                    live_outpoints.push((address, outpoint));
+                    live_outpoints.push((address, outpoint, Some(fidelity.expire_height)));
                 }
                 Ok(None) => spent_outpoints.push(outpoint),
                 Err(e) => log::warn!(
@@ -889,45 +883,7 @@ impl OfferSyncService {
             for outpoint in spent_outpoints {
                 changed |= book.remove_fidelity_outpoint(outpoint);
             }
-            for (address, live_outpoint) in &live_candidates {
-                let suppress = match *live_outpoint {
-                    Some(outpoint) => {
-                        if book.makers.iter().any(|maker| {
-                            &maker.address == address
-                                && !matches!(maker.state, MakerState::Banned(_))
-                                && maker
-                                    .fidelity_outpoint
-                                    .is_some_and(|existing| existing != outpoint)
-                        }) {
-                            log::warn!(
-                                "Suppressing maker {address}: cached fidelity outpoint conflicts with live {outpoint}"
-                            );
-                            true
-                        } else {
-                            changed |= book.upsert_discovered(
-                                address.clone(),
-                                Some(outpoint),
-                                live_expiries.get(&outpoint).copied(),
-                                now,
-                            );
-                            false
-                        }
-                    }
-                    None => {
-                        log::warn!(
-                            "Suppressing maker {address}: multiple live fidelity bonds claim this address"
-                        );
-                        true
-                    }
-                };
-                if suppress {
-                    let before = book.makers.len();
-                    book.makers.retain(|maker| {
-                        &maker.address != address || matches!(maker.state, MakerState::Banned(_))
-                    });
-                    changed |= book.makers.len() != before;
-                }
-            }
+            changed |= book.apply_live_candidates(&live_candidates, now);
             if pruned > 0 {
                 log::info!("Pruned {pruned} makers not synced for at least two days");
             }
@@ -973,12 +929,8 @@ impl OfferSyncService {
         if shutdown.load(Ordering::Relaxed) {
             return None;
         }
-        let announced_outpoint = match lock_debug!(offerbook.read()) {
-            Ok(book) => book
-                .makers
-                .iter()
-                .find(|maker| maker.address == addr)
-                .and_then(|maker| maker.fidelity_outpoint),
+        let expected_bonds = match lock_debug!(offerbook.read()) {
+            Ok(book) => book.expected_bonds(&addr),
             Err(_) => {
                 log::error!("offerbook lock poisoned; skipping maker {addr}");
                 return None;
@@ -1004,7 +956,7 @@ impl OfferSyncService {
                         blockchain,
                         &oa.offer.fidelity,
                         &oa.address.to_string(),
-                        announced_outpoint,
+                        expected_bonds.as_deref(),
                         &oa.offer.tweakable_point,
                         &oa.offer.tweak_chain_code,
                     )
@@ -1027,6 +979,7 @@ impl OfferSyncService {
         };
         match outcome {
             Some((oa, Ok(_))) => {
+                book.adopt_proven_bond(&oa.address, oa.offer.fidelity.bond.outpoint);
                 book.mark_success(&oa.address, oa.offer, oa.protocol, oa.features, now)
             }
             Some((oa, Err(e))) => book.record_offer_failure(&oa.address, &e, now),
@@ -1330,16 +1283,18 @@ fn classify_bond_failure(error: WalletError) -> OfferCheckError {
     OfferCheckError::Lifecycle(reason, TakerError::Wallet(error))
 }
 
+/// Checks the bond a maker proves against the bonds discovery found for it.
+/// `None` means discovery knows no bond for this maker, as for a manual entry.
 fn ensure_announced_outpoint_matches(
-    announced_outpoint: Option<OutPoint>,
+    expected_bonds: Option<&[OutPoint]>,
     offered_outpoint: OutPoint,
 ) -> Result<(), OfferCheckError> {
-    if let Some(expected) = announced_outpoint {
-        if expected != offered_outpoint {
+    if let Some(expected) = expected_bonds {
+        if !expected.contains(&offered_outpoint) {
             return Err(OfferCheckError::Lifecycle(
                 UnavailableReason::BondUnverified,
                 TakerError::General(format!(
-                    "Maker offered fidelity bond {offered_outpoint}, but discovery announced {expected}"
+                    "Maker offered fidelity bond {offered_outpoint}, but discovery announced {expected:?}"
                 )),
             ));
         }
@@ -1353,12 +1308,12 @@ fn verify_fidelity_with_backend(
     blockchain: &AnyBlockchain,
     proof: &FidelityProof,
     onion_addr: &str,
-    announced_outpoint: Option<OutPoint>,
+    expected_bonds: Option<&[OutPoint]>,
     tweakable_point: &bitcoin::PublicKey,
     tweak_chain_code: &bitcoin::bip32::ChainCode,
 ) -> Result<u32, OfferCheckError> {
     let backend_down = |e: WalletError| OfferCheckError::BackendDown(TakerError::Wallet(e));
-    ensure_announced_outpoint_matches(announced_outpoint, proof.bond.outpoint)?;
+    ensure_announced_outpoint_matches(expected_bonds, proof.bond.outpoint)?;
 
     let txid = proof.bond.outpoint.txid;
     let vout = proof.bond.outpoint.vout;
@@ -1438,9 +1393,110 @@ pub struct OfferBook {
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     suppressed_makers: HashMap<MakerAddress, SuppressedMaker>,
+
+    /// Addresses whose live discovered bonds disagree with each other or with
+    /// the cached bond. Rebuilt on every sync, never persisted.
+    #[serde(skip)]
+    contested: HashMap<MakerAddress, LiveBonds>,
 }
 
 impl OfferBook {
+    /// Admits makers from the live discovered bonds.
+    ///
+    /// Discovery cannot tell which of several claims on one address is the
+    /// maker's own: anyone can confirm a transaction naming any onion. So a
+    /// disputed address is never removed on discovery alone. Its maker is
+    /// polled, and the bond its own signed proof names becomes the cached one.
+    fn apply_live_candidates(
+        &mut self,
+        live: &HashMap<MakerAddress, LiveBonds>,
+        now_ts: u64,
+    ) -> bool {
+        self.contested.clear();
+        let mut changed = false;
+        for (address, bonds) in live {
+            let cached = self
+                .makers
+                .iter()
+                .find(|m| &m.address == address)
+                .and_then(|m| m.fidelity_outpoint);
+            let undisputed = match bonds.first_key_value() {
+                Some((&outpoint, &expiry))
+                    if bonds.len() == 1 && cached.is_none_or(|c| c == outpoint) =>
+                {
+                    Some((outpoint, expiry))
+                }
+                _ => None,
+            };
+            if let Some((outpoint, expiry)) = undisputed {
+                changed |= self.upsert_discovered(address.clone(), Some(outpoint), expiry, now_ts);
+                continue;
+            }
+
+            log::warn!(
+                "Maker {address} has disputed fidelity claims {:?}; its own proof decides",
+                bonds.keys().collect::<Vec<_>>()
+            );
+            self.contested.insert(address.clone(), bonds.clone());
+            // A new entry needs some discovered bond to tie it to the registry
+            // until a proof replaces it. Prefer the one it was suppressed with,
+            // so the dispute cannot skip that cooldown.
+            let seed = self
+                .suppressed_makers
+                .get(address)
+                .and_then(|suppressed| suppressed.fidelity_outpoint)
+                .filter(|outpoint| bonds.contains_key(outpoint))
+                .or_else(|| bonds.keys().next().copied());
+            if let Some(outpoint) = seed {
+                let expiry = bonds.get(&outpoint).copied().flatten();
+                changed |= self.upsert_discovered(address.clone(), Some(outpoint), expiry, now_ts);
+            }
+        }
+        changed
+    }
+
+    /// The bonds a maker may prove: its cached bond and any of its disputed
+    /// claims. `None` accepts any bond, as for a manual entry.
+    fn expected_bonds(&self, address: &MakerAddress) -> Option<Vec<OutPoint>> {
+        let cached = self
+            .makers
+            .iter()
+            .find(|m| &m.address == address)
+            .and_then(|m| m.fidelity_outpoint);
+        let Some(bonds) = self.contested.get(address) else {
+            return cached.map(|outpoint| vec![outpoint]);
+        };
+        let mut expected: Vec<OutPoint> = bonds.keys().copied().collect();
+        // A cached bond can be missing from one sync, when its output check
+        // failed or its announcement has not arrived yet. A lone forged claim
+        // must not make the maker's proof of it fail meanwhile.
+        if let Some(outpoint) = cached.filter(|outpoint| !bonds.contains_key(outpoint)) {
+            expected.push(outpoint);
+        }
+        Some(expected)
+    }
+
+    /// Caches the bond a disputed maker proved as its own.
+    fn adopt_proven_bond(&mut self, address: &MakerAddress, outpoint: OutPoint) {
+        let Some(&expiry) = self
+            .contested
+            .get(address)
+            .and_then(|bonds| bonds.get(&outpoint))
+        else {
+            return;
+        };
+        if let Some(maker) = self
+            .makers
+            .iter_mut()
+            .find(|m| &m.address == address && !matches!(m.state, MakerState::Banned(_)))
+        {
+            maker.fidelity_outpoint = Some(outpoint);
+            if expiry.is_some() {
+                maker.fidelity_expiry_height = expiry;
+            }
+        }
+    }
+
     fn retain_valid_addresses(&mut self) -> usize {
         let before = self.makers.len() + self.suppressed_makers.len();
         self.makers
@@ -1746,14 +1802,19 @@ impl OfferBook {
     fn makers_to_poll(
         &self,
         now_ts: u64,
-        live_candidates: &HashMap<MakerAddress, Option<OutPoint>>,
+        live_candidates: &HashMap<MakerAddress, LiveBonds>,
     ) -> Vec<MakerAddress> {
         self.makers
             .iter()
             .filter(|m| !matches!(m.state, MakerState::Banned(_)))
             .filter(|m| match m.fidelity_outpoint {
                 None => true,
-                Some(outpoint) => live_candidates.get(&m.address) == Some(&Some(outpoint)),
+                Some(outpoint) => {
+                    self.contested.contains_key(&m.address)
+                        || live_candidates
+                            .get(&m.address)
+                            .is_some_and(|bonds| bonds.contains_key(&outpoint))
+                }
             })
             .filter(|m| match m.next_offer_check_ts {
                 Some(next_ts) => now_ts >= next_ts,
@@ -2512,9 +2573,10 @@ pub(crate) mod tests {
         let offered = OutPoint::new(Txid::from_slice(&[2; 32]).unwrap(), 0);
 
         assert!(ensure_announced_outpoint_matches(None, offered).is_ok());
-        assert!(ensure_announced_outpoint_matches(Some(offered), offered).is_ok());
+        assert!(ensure_announced_outpoint_matches(Some(&[offered]), offered).is_ok());
+        assert!(ensure_announced_outpoint_matches(Some(&[announced, offered]), offered).is_ok());
         assert!(matches!(
-            ensure_announced_outpoint_matches(Some(announced), offered),
+            ensure_announced_outpoint_matches(Some(&[announced]), offered),
             Err(OfferCheckError::Lifecycle(
                 UnavailableReason::BondUnverified,
                 _
@@ -2548,18 +2610,150 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn groups_distinct_live_bonds_for_one_address_as_conflicted() {
+    fn groups_every_live_bond_claiming_an_address() {
         let address = addr("6108");
         let first = OutPoint::new(Txid::from_slice(&[4; 32]).unwrap(), 0);
         let second = OutPoint::new(Txid::from_slice(&[5; 32]).unwrap(), 0);
 
-        let repeated =
-            group_live_fidelity_candidates([(address.clone(), first), (address.clone(), first)]);
-        assert_eq!(repeated.get(&address), Some(&Some(first)));
+        let repeated = group_live_fidelity_candidates([
+            (address.clone(), first, Some(500)),
+            (address.clone(), first, Some(500)),
+        ]);
+        assert_eq!(
+            repeated.get(&address),
+            Some(&BTreeMap::from([(first, Some(500))]))
+        );
 
-        let conflicted =
-            group_live_fidelity_candidates([(address.clone(), first), (address.clone(), second)]);
-        assert_eq!(conflicted.get(&address), Some(&None));
+        let disputed = group_live_fidelity_candidates([
+            (address.clone(), first, Some(500)),
+            (address.clone(), second, Some(600)),
+        ]);
+        assert_eq!(
+            disputed.get(&address),
+            Some(&BTreeMap::from([(first, Some(500)), (second, Some(600))]))
+        );
+    }
+
+    fn good_maker(address: MakerAddress, outpoint: OutPoint, now: u64) -> MakerOfferCandidate {
+        MakerOfferCandidate {
+            address: address.clone(),
+            fidelity_outpoint: Some(outpoint),
+            fidelity_expiry_height: Some(500),
+            offer: Some(dummy_offer(&address.to_string())),
+            state: MakerState::Good,
+            legacy_proven_violation: false,
+            protocol: Some(MakerProtocol::Taproot),
+            features: Vec::new(),
+            last_offer_update_ts: Some(now),
+            first_seen_ts: Some(now),
+            backend_retry_pending: false,
+            next_offer_check_ts: None,
+        }
+    }
+
+    #[test]
+    fn a_forged_bond_claim_cannot_remove_an_authenticated_maker() {
+        let now = 170_000;
+        let address = addr("6114");
+        let real = OutPoint::new(Txid::from_slice(&[20; 32]).unwrap(), 0);
+        let forged = OutPoint::new(Txid::from_slice(&[21; 32]).unwrap(), 0);
+        let mut book = OfferBook {
+            makers: vec![good_maker(address.clone(), real, now)],
+            ..Default::default()
+        };
+
+        // Anyone can confirm a bond-shaped transaction naming this onion.
+        let live = HashMap::from([(
+            address.clone(),
+            BTreeMap::from([(real, Some(500)), (forged, Some(600))]),
+        )]);
+        book.apply_live_candidates(&live, now);
+
+        assert_eq!(book.makers.len(), 1);
+        assert_eq!(book.makers[0].state, MakerState::Good);
+        assert_eq!(book.makers[0].fidelity_outpoint, Some(real));
+        assert_eq!(book.good_makers().len(), 1);
+
+        // The maker stays polled, and its own proof of the real bond is accepted.
+        let due = now + OFFER_MAX_AGE_BEFORE_REFRESH.as_secs();
+        assert_eq!(book.makers_to_poll(due, &live), vec![address.clone()]);
+        let expected = book.expected_bonds(&address).unwrap();
+        assert!(ensure_announced_outpoint_matches(Some(&expected), real).is_ok());
+        book.adopt_proven_bond(&address, real);
+        assert_eq!(book.makers[0].fidelity_outpoint, Some(real));
+        assert_eq!(book.makers[0].fidelity_expiry_height, Some(500));
+    }
+
+    #[test]
+    fn a_disputed_maker_is_tied_to_the_bond_it_proves() {
+        let now = 170_000;
+        let address = addr("6115");
+        let forged = OutPoint::new(Txid::from_slice(&[22; 32]).unwrap(), 0);
+        let real = OutPoint::new(Txid::from_slice(&[23; 32]).unwrap(), 0);
+        let unrelated = OutPoint::new(Txid::from_slice(&[24; 32]).unwrap(), 0);
+        let mut book = OfferBook::default();
+
+        let live = HashMap::from([(
+            address.clone(),
+            BTreeMap::from([(forged, Some(600)), (real, Some(700))]),
+        )]);
+        assert!(book.apply_live_candidates(&live, now));
+        assert_eq!(book.makers.len(), 1);
+        assert_eq!(book.makers_to_poll(now, &live), vec![address.clone()]);
+
+        // Only a bond discovery found for this address can be proven.
+        let expected = book.expected_bonds(&address).unwrap();
+        assert!(ensure_announced_outpoint_matches(Some(&expected), unrelated).is_err());
+        assert!(ensure_announced_outpoint_matches(Some(&expected), real).is_ok());
+
+        book.adopt_proven_bond(&address, real);
+        assert_eq!(book.makers[0].fidelity_outpoint, Some(real));
+        assert_eq!(book.makers[0].fidelity_expiry_height, Some(700));
+
+        // A bond outside the dispute is never adopted.
+        book.adopt_proven_bond(&address, unrelated);
+        assert_eq!(book.makers[0].fidelity_outpoint, Some(real));
+
+        // Once the forged claim is gone, the maker is undisputed again.
+        let settled = HashMap::from([(address.clone(), BTreeMap::from([(real, Some(700))]))]);
+        book.apply_live_candidates(&settled, now);
+        assert!(book.contested.is_empty());
+        assert_eq!(book.expected_bonds(&address), Some(vec![real]));
+    }
+
+    #[test]
+    fn a_lone_claim_against_the_cached_bond_is_proven_not_trusted() {
+        let now = 170_000;
+        let address = addr("6116");
+        let cached = OutPoint::new(Txid::from_slice(&[25; 32]).unwrap(), 0);
+        let claimed = OutPoint::new(Txid::from_slice(&[26; 32]).unwrap(), 0);
+        let mut book = OfferBook {
+            makers: vec![good_maker(address.clone(), cached, now)],
+            ..Default::default()
+        };
+
+        // Before the cached bond's own announcement reaches the registry, a
+        // single other claim must not evict the maker either.
+        let live = HashMap::from([(address.clone(), BTreeMap::from([(claimed, Some(600))]))]);
+        book.apply_live_candidates(&live, now);
+        assert_eq!(book.makers.len(), 1);
+        assert_eq!(book.makers[0].state, MakerState::Good);
+        assert_eq!(book.makers[0].fidelity_outpoint, Some(cached));
+
+        let due = now + OFFER_MAX_AGE_BEFORE_REFRESH.as_secs();
+        assert_eq!(book.makers_to_poll(due, &live), vec![address.clone()]);
+        let expected = book.expected_bonds(&address).unwrap();
+        assert_eq!(expected, vec![claimed, cached]);
+        assert!(ensure_announced_outpoint_matches(Some(&expected), cached).is_ok());
+
+        // Proving the cached bond keeps it; it is not one of the claims.
+        book.adopt_proven_bond(&address, cached);
+        assert_eq!(book.makers[0].fidelity_outpoint, Some(cached));
+
+        // A banned maker is never re-tied to a bond.
+        book.ban(&address, BanReason::ProvenViolation, now);
+        book.adopt_proven_bond(&address, claimed);
+        assert_eq!(book.makers[0].fidelity_outpoint, Some(cached));
     }
 
     #[test]
@@ -2613,6 +2807,7 @@ pub(crate) mod tests {
                 (valid_suppression.clone(), suppression.clone()),
                 (invalid_address, suppression),
             ]),
+            ..Default::default()
         };
         let mut sanitized = book.clone();
         assert_eq!(sanitized.retain_valid_addresses(), 2);
@@ -2859,7 +3054,8 @@ pub(crate) mod tests {
 
         let address = book.makers[0].address.clone();
         let outpoint = book.makers[0].fidelity_outpoint.unwrap();
-        let live_candidates = HashMap::from([(address.clone(), Some(outpoint))]);
+        let live_candidates =
+            HashMap::from([(address.clone(), BTreeMap::from([(outpoint, None)]))]);
 
         let to_poll = book.makers_to_poll(now_ts, &live_candidates);
         assert!(to_poll.is_empty());
@@ -2882,7 +3078,8 @@ pub(crate) mod tests {
         let recovery_ts = prune_ts + ttl;
         let retry_at = recovery_ts + OFFER_SYNC_INTERVAL.as_secs();
         let address = addr("backend-retry");
-        let outpoint = Some(OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0));
+        let bond = OutPoint::new(Txid::from_slice(&[1; 32]).unwrap(), 0);
+        let outpoint = Some(bond);
         let mut book = OfferBook::default();
 
         book.insert_candidate(address.clone(), outpoint, Some(500), prune_ts - ttl, None);
@@ -2902,7 +3099,7 @@ pub(crate) mod tests {
         assert!(book.makers[0].backend_retry_pending);
         assert_eq!(book.makers[0].next_offer_check_ts, Some(retry_at));
         assert_eq!(book.prune_stale_makers(recovery_ts + 1), 0);
-        let live_candidates = HashMap::from([(address.clone(), outpoint)]);
+        let live_candidates = HashMap::from([(address.clone(), BTreeMap::from([(bond, None)]))]);
         assert!(book
             .makers_to_poll(retry_at - 1, &live_candidates)
             .is_empty());
@@ -2935,7 +3132,8 @@ pub(crate) mod tests {
         let prune_ts = ttl * 2;
         let now_ts = prune_ts + ttl;
         let address = addr("violator");
-        let outpoint = Some(OutPoint::new(Txid::from_slice(&[2; 32]).unwrap(), 0));
+        let bond = OutPoint::new(Txid::from_slice(&[2; 32]).unwrap(), 0);
+        let outpoint = Some(bond);
         let mut book = OfferBook::default();
 
         book.insert_candidate(address.clone(), outpoint, Some(500), 0, None);
@@ -2963,7 +3161,7 @@ pub(crate) mod tests {
         );
         assert!(matches!(book.makers[0].state, MakerState::Banned(_)));
         assert!(book.active_makers(&MakerProtocol::Taproot).is_empty());
-        let live_candidates = HashMap::from([(address, outpoint)]);
+        let live_candidates = HashMap::from([(address, BTreeMap::from([(bond, None)]))]);
         assert!(book.makers_to_poll(now_ts, &live_candidates).is_empty());
     }
 
