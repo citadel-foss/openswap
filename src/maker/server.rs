@@ -2175,10 +2175,19 @@ mod tests {
     use super::*;
     use crate::{
         maker::api::tests::compat_test_maker,
-        protocol::common_messages::{Hello, PrivateKeyHandover},
+        protocol::common_messages::{FidelityProof, Hello, PrivateKeyHandover},
+        wallet::{
+            blockchain::{mock_electrum, MockElectrum},
+            Electrum, ElectrumConfig, FidelityBond,
+        },
         watch_tower::service::answering,
     };
-    use bitcoin::{hashes::Hash, Txid};
+    use bitcoin::{
+        absolute::LockTime,
+        hashes::Hash,
+        secp256k1::{Message, Secp256k1, SecretKey},
+        Amount, PublicKey, Txid,
+    };
     use serde::{Deserialize, Serialize};
     use serde_cbor::{value::to_value, Value};
     use std::{
@@ -2659,13 +2668,6 @@ mod tests {
     /// still start.
     #[test]
     fn startup_skips_a_bond_that_confirmed_too_late() {
-        use crate::{protocol::common_messages::FidelityProof, wallet::FidelityBond};
-        use bitcoin::{
-            absolute::LockTime,
-            secp256k1::{Message, Secp256k1, SecretKey},
-            Amount, OutPoint, PublicKey,
-        };
-
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let maker = compat_test_maker(dir.path(), Vec::new());
         let tip = 800_000u32;
@@ -2685,6 +2687,10 @@ mod tests {
             extra: BTreeMap::new(),
         };
         let address = "127.0.0.1:6102";
+        // The bond's last locked block: still locked, so it can't be redeemed.
+        let _server = use_mock_electrum_tip(&maker, u64::from(bond.lock_time.to_consensus_u32()));
+        // Fail fast instead of waiting for funds if setup misses `TooLate`.
+        maker.shutdown.store(true, Ordering::SeqCst);
 
         // The bond is already advertised, as it would be if a reorg moved its
         // confirmation height after an earlier setup accepted it.
@@ -2724,35 +2730,20 @@ mod tests {
     /// to fund one instead of reporting the bond as too late.
     #[test]
     fn startup_replaces_an_expired_rejected_bond() {
-        use crate::wallet::{AnyBlockchain, Electrum, ElectrumConfig, FidelityBond};
-        use bitcoin::{
-            absolute::LockTime,
-            secp256k1::{Secp256k1, SecretKey},
-            Amount, OutPoint, PublicKey,
-        };
-        use std::sync::atomic::Ordering;
-
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let maker = compat_test_maker(dir.path(), Vec::new());
         let conf_height = 800_000u32;
         let lock = conf_height - 1 + MIN_FIDELITY_TIMELOCK;
         // The chain has passed the bond's lock, so it is expired.
-        let server = crate::wallet::blockchain::mock_electrum(|_, _| Ok(serde_json::Value::Null));
-        server.set_tip(
-            u64::from(lock) + 1,
-            &bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
-        );
+        let _server = use_mock_electrum_tip(&maker, u64::from(lock) + 1);
         let secret = SecretKey::from_slice(&[4; 32]).unwrap();
-        {
-            let mut wallet = maker.wallet.write().unwrap();
-            wallet.blockchain = AnyBlockchain::Electrum(
-                Electrum::new(&ElectrumConfig {
-                    url: server.url.clone(),
-                    ..Default::default()
-                })
-                .expect("connect to mock electrum"),
-            );
-            wallet.store.fidelity_bond.push(FidelityBond {
+        maker
+            .wallet
+            .write()
+            .unwrap()
+            .store
+            .fidelity_bond
+            .push(FidelityBond {
                 outpoint: OutPoint::new(Txid::all_zeros(), 0),
                 amount: Amount::from_sat(50_000),
                 lock_time: LockTime::from_height(lock).unwrap(),
@@ -2763,13 +2754,30 @@ mod tests {
                 tx: None,
                 extra: BTreeMap::new(),
             });
-        }
         // Stop before waiting for funds: reaching the wait is what matters.
         maker.shutdown.store(true, Ordering::SeqCst);
 
         match maker.setup_fidelity_bond_with("127.0.0.1:6102", false) {
-            Err(BondSetupError::Maker(_)) => {}
+            Err(BondSetupError::Maker(MakerError::General("No fidelity proof after setup"))) => {}
             other => panic!("expected setup to reach the funding wait, got {:?}", other),
         }
+    }
+
+    /// Points the maker's wallet at a mock Electrum server whose tip is `tip`.
+    /// Keep the returned server alive for the rest of the test.
+    fn use_mock_electrum_tip(maker: &MakerServer, tip: u64) -> MockElectrum {
+        let server = mock_electrum(|_, _| Ok(serde_json::Value::Null));
+        server.set_tip(
+            tip,
+            &bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
+        );
+        maker.wallet.write().unwrap().blockchain = AnyBlockchain::Electrum(
+            Electrum::new(&ElectrumConfig {
+                url: server.url.clone(),
+                ..Default::default()
+            })
+            .expect("connect to mock electrum"),
+        );
+        server
     }
 }
