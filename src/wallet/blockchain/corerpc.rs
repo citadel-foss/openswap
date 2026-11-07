@@ -314,6 +314,12 @@ impl CoreRPC {
                 if self.is_confirmed_spend(outpoint, Script::new())? {
                     return Ok(None);
                 }
+                // A funding transaction neither mined nor in the mempool has
+                // no spender. Read the sync state first: a syncing txindex
+                // misses mined transactions.
+                if self.txindex_synced()? && self.tx_confirmations(&outpoint.txid)?.is_none() {
+                    return Ok(None);
+                }
                 for txid in self.rpc.get_raw_mempool()? {
                     let tx = match self.get_raw_transaction(&txid, None) {
                         Ok(tx) => tx,
@@ -824,6 +830,9 @@ pub(crate) mod tests {
                     "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"}, "coinbase": false
                 })),
                 "gettxout" => Ok(Value::Null),
+                // A syncing txindex cannot see the funding, so the mempool
+                // must still be searched.
+                "getindexinfo" => Ok(json!({"txindex": {"synced": false}})),
                 "getrawmempool" if state.load(Ordering::SeqCst) == 3 => {
                     Err(json!({"code": -28, "message": "mempool unavailable"}))
                 }
@@ -878,6 +887,52 @@ pub(crate) mod tests {
             state.store(mode, Ordering::SeqCst);
             assert!(core.mempool_spending_transaction(&outpoint).is_err());
         }
+    }
+
+    #[test]
+    fn legacy_spend_lookup_skips_the_mempool_for_an_unknown_funding_tx() {
+        use crate::watch_tower::watcher::tests::mock_core_rpc;
+        use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn};
+        // A contract never broadcast: with the txindex synced, nothing can
+        // spend its output, so no mempool entry is fetched.
+        let outpoint = OutPoint::new(Txid::from_byte_array([11; 32]), 0);
+        let unrelated = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([12; 32]), 0),
+                ..Default::default()
+            }],
+            output: Vec::new(),
+        };
+        let (url, calls) = mock_core_rpc({
+            let unrelated = unrelated.clone();
+            move |method, params| match method {
+                "gettxspendingprevout" => {
+                    Err(json!({"code": -32601, "message": "Method not found"}))
+                }
+                "gettxout" => Ok(Value::Null),
+                "getindexinfo" => Ok(json!({"txindex": {"synced": true}})),
+                "getrawtransaction" if params[0] == json!(outpoint.txid) => {
+                    Err(json!({"code": -5, "message": "No such transaction"}))
+                }
+                "getrawmempool" => Ok(json!([unrelated.compute_txid()])),
+                "getrawtransaction" => Ok(json!(serialize_hex(&unrelated))),
+                other => panic!("unexpected RPC {}", other),
+            }
+        });
+        let core = CoreRPC::new(&CoreRpcConfig {
+            url,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(core.spending_transaction(&outpoint).unwrap(), None);
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|call| call == "getrawmempool"),
+            "{:?}",
+            calls
+        );
     }
 
     /// Serves one canned reply per JSON-RPC method, failing on any other.
