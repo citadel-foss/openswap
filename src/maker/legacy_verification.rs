@@ -8,8 +8,9 @@ use bitcoin::PublicKey;
 use crate::{
     protocol::{
         contract::{
-            calculate_pubkey_from_nonce, check_multisig_has_pubkey, check_reedemscript_is_multisig,
-            create_multisig_redeemscript, is_contract_out_valid, verify_contract_tx_sig,
+            calculate_pubkey_from_nonce, check_contract_sig_sighash, check_multisig_has_pubkey,
+            check_reedemscript_is_multisig, create_multisig_redeemscript, is_contract_out_valid,
+            verify_contract_tx_sig,
         },
         legacy_messages::ContractTxInfoForSender,
         Hash160,
@@ -138,6 +139,9 @@ pub(crate) fn verify_contract_sigs(
             .ok_or(MakerError::General("Incoming swapcoin missing my_pubkey"))?;
         let multisig_redeemscript = create_multisig_redeemscript(&my_pubkey, &other_pubkey);
 
+        check_contract_sig_sighash(sig).map_err(|_| {
+            MakerError::General(format!("Receiver signature {} is not SIGHASH_ALL", i).leak())
+        })?;
         verify_contract_tx_sig(
             &incoming.contract_tx,
             &multisig_redeemscript,
@@ -167,6 +171,9 @@ pub(crate) fn verify_contract_sigs(
             .ok_or(MakerError::General("Outgoing swapcoin missing my_pubkey"))?;
         let multisig_redeemscript = create_multisig_redeemscript(&my_pubkey, &other_pubkey);
 
+        check_contract_sig_sighash(sig).map_err(|_| {
+            MakerError::General(format!("Sender signature {} is not SIGHASH_ALL", i).leak())
+        })?;
         verify_contract_tx_sig(
             &outgoing.contract_tx,
             &multisig_redeemscript,

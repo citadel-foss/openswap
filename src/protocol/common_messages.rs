@@ -1,10 +1,11 @@
 //! Common OpenSwap Protocol Messages and Top-Level Message Enums.
 
-use bitcoin::{bip32::ChainCode, hashes::sha256d::Hash, Amount, PublicKey};
+use bitcoin::{bip32::ChainCode, hashes::sha256d::Hash, Amount, PublicKey, XOnlyPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_cbor::Value;
 
 use super::{
+    funding_bump::{BumpFunding, BumpFundingCommit, BumpFundingProposal, FundingBumped},
     legacy_messages::{
         ProofOfFunding, ReqContractSigsAsRecvrAndSender, ReqContractSigsForRecvr,
         ReqContractSigsForSender, RespContractSigsForRecvr, RespContractSigsForRecvrAndSender,
@@ -97,6 +98,14 @@ pub struct Offer {
     /// unknown keys are ignored and missing keys fall back to `None`.
     #[serde(default)]
     pub lightning: Option<LightningOffer>,
+    /// Highest feerate in sat/vB this maker replaces its own funding at when
+    /// the taker asks. Zero: the maker refuses every funding bump.
+    #[serde(default)]
+    pub max_funding_bump_feerate: u64,
+    /// Most extra fee in sats one hop's funding may take across all its
+    /// bumps. The maker loses this much if the swap then fails, so it caps it.
+    #[serde(default)]
+    pub max_funding_bump_sats: u64,
 }
 
 impl Offer {
@@ -181,6 +190,13 @@ pub struct SwapDetails {
     /// offset, not the funding height, so it is fixed at negotiation and identical on both
     /// sides. Not bound to the real lock duration; assess the CSV transition as the real fix.
     pub refund_locktime_offset: u16,
+    /// Key the taker signs funding bumps with, sent when the swap pins
+    /// [`FUNDING_BUMP_FEATURE`](super::funding_bump::FUNDING_BUMP_FEATURE).
+    /// Every maker on the route knows the swap id, so only a signature by
+    /// this key may move a hop's funding. A peer that predates the feature
+    /// neither sends nor reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taker_auth_pubkey: Option<XOnlyPublicKey>,
 }
 
 impl SwapDetails {
@@ -267,6 +283,10 @@ pub enum TakerToMakerMessage {
     TaprootPrivateKeyHandover(PrivateKeyHandover),
     /// Taker keepalive while waiting for funding confirmation.
     WaitingFundingConfirmation(String),
+    /// Replace a hop's stuck funding at a higher feerate.
+    BumpFunding(BumpFunding),
+    /// Legacy: the next hop's signatures on a bump proposal's contracts.
+    BumpFundingCommit(BumpFundingCommit),
     /// Lightning submarine-swap message family. Send only to makers whose
     /// [`Offer::lightning`] advertised support; older peers fail to decode
     /// unknown variants and drop the connection.
@@ -299,6 +319,10 @@ pub enum MakerToTakerMessage {
     TaprootContractData(Box<TaprootContractData>),
     /// Taproot private key handover.
     TaprootPrivateKeyHandover(PrivateKeyHandover),
+    /// Legacy: replacement funding awaiting the next hop's contract signatures.
+    BumpFundingProposal(BumpFundingProposal),
+    /// The replacement funding is broadcast.
+    FundingBumped(FundingBumped),
     /// Lightning submarine-swap message family.
     Lightning(Box<LightningMakerMessage>),
     /// The peer sent a message family this side does not support. See
@@ -465,6 +489,7 @@ mod tests {
             feerate: 5,
             timelock: 800_100,
             refund_locktime_offset: 60,
+            taker_auth_pubkey: None,
         };
         let mut value = to_value(TakerToMakerMessage::SwapDetails(details.clone())).unwrap();
         let Value::Map(outer) = &mut value else {

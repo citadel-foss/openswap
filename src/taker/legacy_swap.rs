@@ -25,13 +25,14 @@ use crate::{
     utill::{generate_keypair, generate_maker_keys, read_message, send_message},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
-        Wallet,
+        UTXOSpendInfo, Wallet,
     },
 };
 
 use super::{
     api::{commit_sent_swapcoin, fund_all_or_nothing, spent_inputs, Hop0Plan, Taker},
-    error::{breach_or_wallet_error, TakerError},
+    error::TakerError,
+    funding_bump::{BreachCheck, FundingVersion, HopFunding},
     legacy_verification::fetch_tx_with_retry,
 };
 
@@ -51,7 +52,7 @@ impl Taker {
         swap_id: &str,
         network: Network,
         feerate: f64,
-    ) -> Result<Vec<OutgoingSwapCoin>, TakerError> {
+    ) -> Result<(Vec<OutgoingSwapCoin>, Vec<Vec<UTXOSpendInfo>>), TakerError> {
         let secp = Secp256k1::new();
         let mut swapcoins = Vec::new();
         let mut contract_data = Vec::new();
@@ -126,7 +127,7 @@ impl Taker {
             swapcoins.push(outgoing);
         }
 
-        Ok(swapcoins)
+        Ok((swapcoins, funding_result.input_infos))
     }
 
     /// Execute the multi-hop Legacy openswap flow.
@@ -174,7 +175,7 @@ impl Taker {
             let outgoing_locktime = self.swap_state()?.makers[maker_idx].negotiated_timelock as u16;
 
             let (
-                funding_txs,
+                mut funding_txs,
                 contract_redeemscripts,
                 multisig_redeemscripts,
                 multisig_nonces,
@@ -286,6 +287,7 @@ impl Taker {
                 )?;
                 let swap = self.swap_state_mut()?;
                 for (swapcoin, sig) in swap.outgoing_swapcoins.iter_mut().zip(sender_sigs) {
+                    crate::protocol::contract::check_contract_sig_sighash(&sig)?;
                     swapcoin.others_contract_sig = Some(sig);
                 }
             }
@@ -325,10 +327,20 @@ impl Taker {
                         // A failed send keeps the claim until recovery settles
                         // the swap. Recovery refunds the tx if it landed anyway,
                         // and otherwise drops the coin without sending it.
-                        wallet.send_tx(funding_tx).map_err(|e| {
+                        let txid = wallet.send_tx(funding_tx).map_err(|e| {
                             TakerError::General(format!("Failed to broadcast funding tx: {:?}", e))
                         })?;
                         commit_sent_swapcoin(&mut wallet, swapcoin)?;
+                        #[cfg(feature = "integration-test")]
+                        if matches!(
+                            self.behavior,
+                            super::api::TakerBehavior::StallFunding
+                                | super::api::TakerBehavior::StallFundingAndLoseBroadcastReply
+                        ) {
+                            log::warn!("Test behavior: keeping funding tx {txid} out of blocks");
+                            wallet.blockchain.deprioritise_for_test(&txid)?;
+                        }
+                        let _ = txid;
                         // Its inputs are spent now, but the coin cache only learns
                         // that at the next sync; until then a new swap must not
                         // plan them. The lock is in memory only: once synced the
@@ -340,13 +352,32 @@ impl Taker {
                     }
                     wallet.save_to_disk()?;
                 }
-                let funding_txids: Vec<_> = self
-                    .swap_state()?
-                    .outgoing_swapcoins
-                    .iter()
-                    .filter_map(|sc| sc.funding_tx.as_ref().map(|tx| tx.compute_txid()))
-                    .collect();
-                let required_confirms = self.swap_state()?.params.required_confirms;
+                let feerate = self.swap_state()?.params.feerate;
+                let mut funding = HopFunding::new(
+                    0,
+                    self.swap_state()?
+                        .outgoing_swapcoins
+                        .iter()
+                        .map(|sc| {
+                            Ok(FundingVersion {
+                                funding_tx: sc.funding_tx.clone().ok_or_else(|| {
+                                    TakerError::General(
+                                        "Outgoing swapcoin missing funding_tx".to_string(),
+                                    )
+                                })?,
+                                contract_tx: Some(sc.contract_tx.clone()),
+                                feerate,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, TakerError>>()?,
+                    Self::legacy_contract_vouts(
+                        self.swap_state()?
+                            .outgoing_swapcoins
+                            .iter()
+                            .map(|sc| &sc.contract_tx),
+                    )?,
+                    feerate,
+                );
                 // Test hook: send the proof while the funding is mempool-only.
                 #[cfg(feature = "integration-test")]
                 let skip_wait =
@@ -356,12 +387,22 @@ impl Taker {
                 prev_confirm_height = if skip_wait {
                     0
                 } else {
-                    self.wait_for_legacy_funding_confirmation(
-                        &funding_txids,
-                        required_confirms,
-                        crate::utill::TX_BROADCAST_TIMEOUT,
-                    )?
+                    let (height, winners) =
+                        self.wait_for_legacy_hop(&mut funding, crate::utill::TX_BROADCAST_TIMEOUT)?;
+                    self.settle_hop_funding(&funding, &winners)?;
+                    height
                 };
+                // The proof names whichever version of each split confirmed.
+                funding_txs = self
+                    .swap_state()?
+                    .outgoing_swapcoins
+                    .iter()
+                    .map(|sc| {
+                        sc.funding_tx.clone().ok_or_else(|| {
+                            TakerError::General("Outgoing swapcoin missing funding_tx".to_string())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 _taker_funding_confirmed = true;
 
                 // Register outgoing funding outpoints as sentinels with the breach detector.
@@ -650,9 +691,6 @@ impl Taker {
                 senders_sigs,
             )?;
 
-            // Store this maker's outgoing info for next hop
-            prev_senders_info = Some(senders_contract_txs_info.clone());
-
             // A maker's outgoing pays the next maker, except the last one's, which
             // is our incoming. Track the maker-to-maker ones as watch-only.
             if !is_last_peer {
@@ -691,32 +729,83 @@ impl Taker {
             std::thread::sleep(MAKER_BROADCAST_DELAY);
 
             // Wait for the maker's specific funding txs to be confirmed
+            let feerate = self.swap_state()?.params.feerate;
+            let mut funding = HopFunding::new(
+                maker_idx + 1,
+                senders_contract_txs_info
+                    .iter()
+                    .map(|info| FundingVersion {
+                        funding_tx: info.funding_tx.clone(),
+                        contract_tx: Some(info.contract_tx.clone()),
+                        feerate,
+                    })
+                    .collect(),
+                Self::legacy_contract_vouts(
+                    senders_contract_txs_info
+                        .iter()
+                        .map(|info| &info.contract_tx),
+                )?,
+                feerate,
+            );
+            funding.senders_info = senders_contract_txs_info.clone();
+            if is_last_peer {
+                funding.receiver_privkeys = taker_multisig_privkeys.clone();
+            }
+
+            // Absence the backend confirmed for every tx is the maker
+            // withholding funding it committed to.
+            let (maker_confirm_height, winners) = self
+                .wait_for_legacy_hop(&mut funding, super::api::MAKER_FUNDING_TIMEOUT)
+                .inspect_err(|e| self.note_withheld_funding(maker_idx, e))?;
+            self.settle_hop_funding(&funding, &winners)?;
+
+            // From here on the hop is whichever version of each split
+            // confirmed, and that is what the next hop is handed.
+            let mut senders_contract_txs_info = senders_contract_txs_info;
+            for (split, &winner) in winners.iter().enumerate() {
+                let version = &funding.versions[split][winner];
+                let info = &mut senders_contract_txs_info[split];
+                info.funding_amount =
+                    version.funding_tx.output[funding.contract_vouts[split]].value;
+                info.funding_tx = version.funding_tx.clone();
+                info.contract_tx = version.contract_tx.clone().ok_or_else(|| {
+                    TakerError::General("Legacy funding version has no contract".to_string())
+                })?;
+            }
+            prev_senders_info = Some(senders_contract_txs_info.clone());
             let maker_funding_txids: Vec<Txid> = senders_contract_txs_info
                 .iter()
                 .map(|i| i.funding_tx.compute_txid())
                 .collect();
-
-            let required_confirms = self.swap_state()?.params.required_confirms;
-            // Absence the backend confirmed for every tx is the maker
-            // withholding funding it committed to.
-            let maker_confirm_height = self
-                .wait_for_legacy_funding_confirmation(
-                    &maker_funding_txids,
-                    required_confirms,
-                    super::api::MAKER_FUNDING_TIMEOUT,
-                )
-                .inspect_err(|e| self.note_withheld_funding(maker_idx, e))?;
+            // A bump is the taker's to pay: it comes out of the contract
+            // and the re-signed tx may come out a vbyte or so larger. What
+            // the maker owes is the swap feerate on its own original, so a
+            // bumped winner is judged by the signed original it replaced.
+            let original_txids: Vec<Txid> = funding
+                .versions
+                .iter()
+                .map(|versions| versions[0].funding_tx.compute_txid())
+                .collect();
 
             // The handed-out funding txs carry no signatures, so the feerate,
-            // which prices the real size, is checked on the confirmed txs. By
+            // which prices the real size, is checked on the signed txs. By
             // now the fee is paid and every earlier hop has funded: a shortfall
             // costs the maker a ban, never the route, since aborting here would
             // only send every funded hop into timelock recovery.
             let chain = self.backend.connect();
             let confirmed_funding = chain.and_then(|chain| {
-                maker_funding_txids
+                winners
                     .iter()
-                    .map(|txid| fetch_tx_with_retry(&chain, txid))
+                    .enumerate()
+                    .map(|(split, &winner)| {
+                        if winner == 0 {
+                            fetch_tx_with_retry(&chain, &maker_funding_txids[split])
+                        } else if let Some(signed) = &funding.signed_originals[split] {
+                            Ok(signed.clone())
+                        } else {
+                            fetch_tx_with_retry(&chain, &original_txids[split])
+                        }
+                    })
                     .collect::<Result<Vec<_>, _>>()
             });
             match confirmed_funding {
@@ -876,6 +965,7 @@ impl Taker {
             // Store the maker's signatures on the incoming swapcoins
             let swap = self.swap_state_mut()?;
             for (incoming, sig) in swap.incoming_swapcoins.iter_mut().zip(receiver_sigs.iter()) {
+                crate::protocol::contract::check_contract_sig_sighash(sig)?;
                 incoming.others_contract_sig = Some(*sig);
             }
             log::info!(
@@ -887,6 +977,38 @@ impl Taker {
             // maker signature needed to publish its contract during recovery.
             self.payment_stamp_targets()?;
             self.persist_incoming_swapcoins()?;
+
+            // Every losing version of this hop is a copy of its split's coin on
+            // its own contract. Same keys and scripts: a reorg that mines it
+            // leaves the coins ours to claim, with the key the handover brings.
+            let losers =
+                std::mem::take(&mut self.swap_state_mut()?.funding_bump.legacy_last_hop_losers);
+            if !losers.is_empty() {
+                let mut copies = Vec::with_capacity(losers.len());
+                for (split, funding_tx, contract_tx, funding_amount) in losers {
+                    let Some(winner) = self.swap_state()?.incoming_swapcoins.get(split) else {
+                        continue;
+                    };
+                    let mut copy = winner.clone();
+                    copy.contract_tx = contract_tx;
+                    copy.funding_amount = funding_amount;
+                    copy.others_contract_sig = None;
+                    copy.replaced = true;
+                    copy.replaced_funding_tx = Some(funding_tx);
+                    copies.push((split, copy));
+                }
+                {
+                    let mut wallet = self.write_wallet()?;
+                    for (_, copy) in &copies {
+                        wallet.add_incoming_swapcoin(copy);
+                    }
+                    wallet.save_to_disk()?;
+                }
+                self.swap_state_mut()?
+                    .funding_bump
+                    .replaced_incoming
+                    .extend(copies);
+            }
         }
 
         // Breach detector keeps running through finalization.
@@ -895,37 +1017,42 @@ impl Taker {
         Ok(())
     }
 
-    /// Wait for Legacy funding to reach `required_confirms`, returning the
-    /// highest height any of them was mined at. Waits on a fresh backend
-    /// connection so no wallet lock is held for the wait's duration.
-    fn wait_for_legacy_funding_confirmation(
-        &self,
-        funding_txids: &[Txid],
-        required_confirms: u32,
+    /// Wait for a Legacy hop's funding to reach the required confirmations,
+    /// bumping it under the swap's policy, and return the highest height any
+    /// split was mined at with the index of each split's confirmed version.
+    /// Waits on a fresh backend connection so no wallet lock is held for the
+    /// wait's duration.
+    fn wait_for_legacy_hop(
+        &mut self,
+        funding: &mut HopFunding,
         arrival_timeout: Duration,
-    ) -> Result<u32, TakerError> {
+    ) -> Result<(u32, Vec<usize>), TakerError> {
         #[cfg(feature = "integration-test")]
         if self.behavior == super::api::TakerBehavior::SkipFundingConfirmWait {
-            return Ok(0);
+            return Ok((0, vec![0; funding.versions.len()]));
         }
-        if funding_txids.is_empty() {
-            return Ok(0);
-        }
-
-        let chain = self.backend.connect()?;
-        crate::wallet::wait_for_tx_confirmation(
-            &chain,
-            funding_txids,
+        let required_confirms = self.swap_state()?.params.required_confirms;
+        self.wait_for_hop_funding(
+            funding,
             required_confirms,
             arrival_timeout,
-            None,
-            Some(&|| {
-                self.breach_detector
-                    .as_ref()
-                    .is_some_and(|detector| detector.requires_abort())
-            }),
+            BreachCheck::RequiresAbort,
         )
-        .map_err(breach_or_wallet_error)
+    }
+
+    /// The funding output each sender contract spends.
+    fn legacy_contract_vouts<'a>(
+        contracts: impl Iterator<Item = &'a Transaction>,
+    ) -> Result<Vec<usize>, TakerError> {
+        contracts
+            .map(|contract| {
+                contract
+                    .input
+                    .first()
+                    .map(|input| input.previous_output.vout as usize)
+                    .ok_or_else(|| TakerError::General("Contract tx has no inputs".to_string()))
+            })
+            .collect()
     }
 
     /// Request contract signatures for sender from a maker.
@@ -1322,6 +1449,23 @@ impl Taker {
         receivers_sigs: Vec<bitcoin::ecdsa::Signature>,
         senders_sigs: Vec<bitcoin::ecdsa::Signature>,
     ) -> Result<(), TakerError> {
+        #[cfg(feature = "integration-test")]
+        let (receivers_sigs, senders_sigs) = if self.behavior
+            == super::api::TakerBehavior::SendNonSighashAllContractSigs
+        {
+            log::warn!("Test behavior: sending contract signatures with a non-SIGHASH_ALL flag");
+            let reflag = |sigs: Vec<bitcoin::ecdsa::Signature>| {
+                sigs.into_iter()
+                    .map(|sig| bitcoin::ecdsa::Signature {
+                        sighash_type: bitcoin::sighash::EcdsaSighashType::SinglePlusAnyoneCanPay,
+                        ..sig
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (reflag(receivers_sigs), reflag(senders_sigs))
+        } else {
+            (receivers_sigs, senders_sigs)
+        };
         let mut stream = self.net_connect(maker_address)?;
         let resp = RespContractSigsForRecvrAndSender {
             id: swap_id.to_string(),

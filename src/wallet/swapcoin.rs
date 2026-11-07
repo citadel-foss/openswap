@@ -131,10 +131,20 @@ pub struct IncomingSwapCoin {
     /// difference and can leave the sweep underpriced.
     #[serde(default = "default_negotiated_feerate")]
     pub negotiated_feerate: u64,
+    /// A funding version a fee bump replaced, kept until the version that
+    /// beat it is buried deep: a reorg can still mine it. Needs
+    /// `funding-bump-v1`, so no build without bumps reads such a coin.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replaced: bool,
+    /// The funding tx of a replaced Legacy version: its contract spends it,
+    /// and retirement judges the version by it. Taproot's contract tx is
+    /// its funding already.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_funding_tx: Option<Transaction>,
 }
 
 impl Requires for IncomingSwapCoin {
-    fn requires(&self, _out: &mut BTreeSet<&'static str>) {
+    fn requires(&self, out: &mut BTreeSet<&'static str>) {
         let Self {
             protocol,
             my_privkey: _,
@@ -157,8 +167,13 @@ impl Requires for IncomingSwapCoin {
             spending_tx: _,
             payment_target,
             negotiated_feerate: _,
+            replaced,
+            replaced_funding_tx: _,
         } = self;
         protocol_requires(protocol);
+        if *replaced {
+            out.insert(crate::protocol::funding_bump::FUNDING_BUMP_FEATURE);
+        }
         if let Some(PaymentTarget {
             script_pubkey: _,
             amount: _,
@@ -208,6 +223,8 @@ impl IncomingSwapCoin {
             spending_tx: None,
             payment_target: None,
             negotiated_feerate,
+            replaced: false,
+            replaced_funding_tx: None,
         }
     }
 
@@ -242,6 +259,8 @@ impl IncomingSwapCoin {
             spending_tx: None,
             payment_target: None,
             negotiated_feerate,
+            replaced: false,
+            replaced_funding_tx: None,
         }
     }
 
@@ -916,6 +935,11 @@ pub struct OutgoingSwapCoin {
     /// refund early. Missing reads as `true`, the safe answer.
     #[serde(default = "yes")]
     pub incoming_claimed: bool,
+    /// A funding version a fee bump replaced, kept until the version that
+    /// beat it is buried deep: a reorg can still mine it. Needs
+    /// `funding-bump-v1`, so no build without bumps reads such a coin.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replaced: bool,
 }
 
 fn yes() -> bool {
@@ -923,7 +947,7 @@ fn yes() -> bool {
 }
 
 impl Requires for OutgoingSwapCoin {
-    fn requires(&self, _out: &mut BTreeSet<&'static str>) {
+    fn requires(&self, out: &mut BTreeSet<&'static str>) {
         let Self {
             protocol,
             my_privkey: _,
@@ -946,8 +970,12 @@ impl Requires for OutgoingSwapCoin {
             negotiated_feerate: _,
             committed: _,
             incoming_claimed: _,
+            replaced,
         } = self;
         protocol_requires(protocol);
+        if *replaced {
+            out.insert(crate::protocol::funding_bump::FUNDING_BUMP_FEATURE);
+        }
     }
 }
 
@@ -990,6 +1018,7 @@ impl OutgoingSwapCoin {
             negotiated_feerate,
             committed: false,
             incoming_claimed: false,
+            replaced: false,
         }
     }
 
@@ -1024,6 +1053,7 @@ impl OutgoingSwapCoin {
             negotiated_feerate,
             committed: false,
             incoming_claimed: false,
+            replaced: false,
         }
     }
 
@@ -1461,6 +1491,17 @@ impl WatchOnlySwapCoin {
             Some(&self.contract_redeemscript),
             self.timelock_script.as_deref(),
         )
+    }
+
+    /// Whether `other` is this contract in another version of its funding,
+    /// as a fee bump leaves it: the same keys and scripts, other coins.
+    pub(crate) fn is_version_of(&self, other: &WatchOnlySwapCoin) -> bool {
+        self.protocol == other.protocol
+            && self.sender_pubkey == other.sender_pubkey
+            && self.receiver_pubkey == other.receiver_pubkey
+            && self.contract_redeemscript == other.contract_redeemscript
+            && self.hashlock_script == other.hashlock_script
+            && self.timelock_script == other.timelock_script
     }
 
     /// The contract output this coin watches: the one paying the funding amount.

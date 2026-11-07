@@ -48,6 +48,10 @@ required_confirms = 1
 check_blocklist = false
 # Public name shown to takers (required, at most 32 characters, no control characters)
 name = "default-maker"
+# Highest feerate (sat/vB) we replace our own swap funding at when a taker asks; 0 refuses
+max_funding_bump_feerate = 0
+# Most extra fee (sats) one hop's funding may take across its bumps; lost if the swap fails
+max_funding_bump_sats = 0
 ```
 - `network_port`: TCP port where the Maker listens for incoming OpenSwap protocol messages.
 - `rpc_port`: The port through which `makerd` listens for RPC commands from `maker-cli`.
@@ -62,6 +66,7 @@ name = "default-maker"
 - `time_relative_fee_pct`: A percentage fee based on the swap duration.
 - `required_confirms`: Number of confirmations required for funding transactions (default: 1). Must be at least 1: the maker refuses to start with 0.
 - `check_blocklist`: When `true`, your node refuses a swap if the coins paid into it come straight from an address on your blocklist. Defaults to `false`. See [the blocklist doc](./blocklist.md).
+- `max_funding_bump_feerate`, `max_funding_bump_sats`: Limits on funding bumps. A taker may ask you to replace your funding of its swap at a higher feerate when fees jump. The extra fee comes out of the contract you fund, and the taker pays it when the swap succeeds. If the swap fails, you refund the smaller contract, so a bump costs you that fee. The first setting caps the feerate you replace at; the second caps how much all bumps of one hop may take. Both are 0 by default, which refuses every bump. Both go out in your offer. See [Funding bumps](./fee-policy.md#funding-bumps).
 - `name`: The public name takers see for your maker. Defaults to `default-maker`. It must be 1 to 32 characters long. It must not contain control characters, the invisible characters such as tabs and line breaks. Otherwise the maker refuses to start.
 - `ldk_server_url`, `ldk_api_key_path`, `ldk_tls_cert_path`: Optional settings that connect your maker to a Lightning node. They are absent by default. See [the Lightning doc](./lightning.md).
 - The per-hop parameters the taker negotiates (`tx_count`, `max_input_budget`, `feerate`) — and what the maker is reimbursed on top of its service fees — are covered in [the fee policy](./fee-policy.md).

@@ -1,7 +1,5 @@
 //! Taproot (MuSig2) specific swap methods for the Taker.
 
-use std::time::Duration;
-
 use bitcoin::{
     hashes::Hash,
     secp256k1::{self, rand::rngs::OsRng, Secp256k1, SecretKey},
@@ -19,13 +17,14 @@ use crate::{
     utill::{read_message, send_message},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
-        Blockchain, Wallet,
+        Blockchain, UTXOSpendInfo, Wallet,
     },
 };
 
 use super::{
     api::{commit_sent_swapcoin, fund_all_or_nothing, spent_inputs, Hop0Plan, Taker},
-    error::{breach_or_wallet_error, TakerError},
+    error::TakerError,
+    funding_bump::{BreachCheck, FundingVersion, HopFunding},
 };
 
 #[cfg(feature = "integration-test")]
@@ -68,7 +67,7 @@ impl Taker {
         network: Network,
         reference_height: Option<u32>,
         feerate: f64,
-    ) -> Result<Vec<OutgoingSwapCoin>, TakerError> {
+    ) -> Result<(Vec<OutgoingSwapCoin>, Vec<Vec<UTXOSpendInfo>>), TakerError> {
         let secp = Secp256k1::new();
         let mut swapcoins = Vec::new();
 
@@ -195,7 +194,7 @@ impl Taker {
             swapcoins.push(outgoing);
         }
 
-        Ok(swapcoins)
+        Ok((swapcoins, funding_result.input_infos))
     }
 
     /// Broadcast outgoing contract transactions and exchange contract data
@@ -565,33 +564,54 @@ impl Taker {
                     // not yet be visible/confirmed on the taker's node. Without this
                     // wait, finalization races ahead and the incoming-swapcoin sweep
                     // fails with "swept 0/1 incoming swapcoins".
-                    let maker_funding_txids: Vec<bitcoin::Txid> = maker_contract
-                        .contract_txs
-                        .iter()
-                        .map(|tx| tx.compute_txid())
-                        .collect();
                     let required_confirms = self.swap_state()?.params.required_confirms;
                     log::info!(
                         "Waiting for maker {}'s Taproot funding to confirm ({} tx), keeping the swap alive...",
                         i,
-                        maker_funding_txids.len()
+                        maker_contract.contract_txs.len()
+                    );
+                    let feerate = self.swap_state()?.params.feerate;
+                    // The contract is output 0 of each funding tx: verified above.
+                    let mut funding = HopFunding::new(
+                        i + 1,
+                        maker_contract
+                            .contract_txs
+                            .iter()
+                            .map(|tx| FundingVersion {
+                                funding_tx: tx.clone(),
+                                contract_tx: None,
+                                feerate,
+                            })
+                            .collect(),
+                        vec![0; maker_contract.contract_txs.len()],
+                        feerate,
                     );
                     // Absence the backend confirmed for every tx is the maker
                     // withholding funding it committed to.
-                    self.wait_for_funding_confirmation(
-                        &maker_funding_txids,
-                        required_confirms,
-                        super::api::MAKER_FUNDING_TIMEOUT,
-                    )
-                    .inspect_err(|e| self.note_withheld_funding(i, e))?;
+                    let (_, winners) = self
+                        .wait_for_hop_funding(
+                            &mut funding,
+                            required_confirms,
+                            super::api::MAKER_FUNDING_TIMEOUT,
+                            BreachCheck::Breached,
+                        )
+                        .inspect_err(|e| self.note_withheld_funding(i, e))?;
+                    self.settle_hop_funding(&funding, &winners)?;
 
-                    received_contracts.push(*maker_contract);
+                    // The next maker is handed whichever version confirmed.
+                    let mut maker_contract = *maker_contract;
+                    for (split, &winner) in winners.iter().enumerate() {
+                        let funding_tx = &funding.versions[split][winner].funding_tx;
+                        maker_contract.contract_txs[split] = funding_tx.clone();
+                        maker_contract.amounts[split] = funding_tx.output[0].value;
+                    }
+                    received_contracts.push(maker_contract);
                     #[cfg(debug_assertions)]
                     log::debug!(
                         "[TAPROOT_HOP] Source: taker::taproot_swap::exchange_taproot | SwapID: {} | MakerIndex: {} | ContractTxs: {} | RequiredConfirms: {} | IncomingTotal: {} | WatchOnlyTotal: {}",
                         self.swap_state()?.id,
                         i,
-                        maker_funding_txids.len(),
+                        winners.len(),
                         required_confirms,
                         self.swap_state()?.incoming_swapcoins.len(),
                         self.swap_state()?.watchonly_swapcoins.len()
@@ -785,6 +805,15 @@ impl Taker {
             commit_sent_swapcoin(&mut wallet, swapcoin)?;
 
             log::info!("Broadcast contract tx: {}", txid);
+            #[cfg(feature = "integration-test")]
+            if matches!(
+                self.behavior,
+                super::api::TakerBehavior::StallFunding
+                    | super::api::TakerBehavior::StallFundingAndLoseBroadcastReply
+            ) {
+                log::warn!("Test behavior: keeping funding tx {txid} out of blocks");
+                wallet.blockchain.deprioritise_for_test(&txid)?;
+            }
             // Its inputs are spent now, but the coin cache only learns that
             // at the next sync; until then a new swap must not plan them. The
             // lock is in memory only: once synced the coins are gone anyway.
@@ -817,12 +846,7 @@ impl Taker {
         wallet.save_to_disk()?;
         drop(wallet);
 
-        let contract_txids: Vec<_> = self
-            .swap_state()?
-            .outgoing_swapcoins
-            .iter()
-            .map(|sc| sc.contract_tx.compute_txid())
-            .collect();
+        let outgoing = self.swap_state()?.outgoing_swapcoins.clone();
         let required_confirms = self.swap_state()?.params.required_confirms;
 
         // Test hook: send contract data while the funding is mempool-only or
@@ -840,54 +864,40 @@ impl Taker {
         if skip_wait {
             log::warn!("Test behavior: skipping the funding confirmation wait");
         } else {
-            self.wait_for_funding_confirmation(
-                &contract_txids,
+            let feerate = self.swap_state()?.params.feerate;
+            let mut funding = HopFunding::new(
+                0,
+                outgoing
+                    .iter()
+                    .map(|sc| FundingVersion {
+                        funding_tx: sc.contract_tx.clone(),
+                        contract_tx: None,
+                        feerate,
+                    })
+                    .collect(),
+                outgoing
+                    .iter()
+                    .map(|sc| sc.get_contract_output_vout() as usize)
+                    .collect(),
+                feerate,
+            );
+            let (_, winners) = self.wait_for_hop_funding(
+                &mut funding,
                 required_confirms,
                 crate::utill::TX_BROADCAST_TIMEOUT,
+                BreachCheck::Breached,
             )?;
+            self.settle_hop_funding(&funding, &winners)?;
         }
 
         #[cfg(debug_assertions)]
         log::debug!(
            "[FUNDING_STATE] Source: taker::taproot_swap::funding_broadcast | SwapID: {} | Protocol: Taproot | ContractTxs: {} | RequiredConfirms: {} | Status: confirmed",
             self.swap_state()?.id,
-            contract_txids.len(),
+            outgoing.len(),
             required_confirms
         );
         log::info!("Contract transactions broadcast and confirmed");
-        Ok(())
-    }
-
-    /// Wait for contract (funding) txs to reach `required_confirms`.
-    /// Waits on a fresh backend connection so no wallet lock is held for the
-    /// wait's duration; the shared wait bounds arrival and confirmation.
-    fn wait_for_funding_confirmation(
-        &self,
-        contract_txids: &[bitcoin::Txid],
-        required_confirms: u32,
-        arrival_timeout: Duration,
-    ) -> Result<(), TakerError> {
-        if contract_txids.is_empty() {
-            return Ok(());
-        }
-
-        let chain = self.backend.connect()?;
-        crate::wallet::wait_for_tx_confirmation(
-            &chain,
-            contract_txids,
-            required_confirms,
-            arrival_timeout,
-            None,
-            // Inert on taproot: no detector is started for it, and none is
-            // needed — no counterparty can spend the contract output
-            // mid-swap. Kept only for the shared wait helper's signature.
-            Some(&|| {
-                self.breach_detector
-                    .as_ref()
-                    .is_some_and(|d| d.is_breached())
-            }),
-        )
-        .map_err(breach_or_wallet_error)?;
         Ok(())
     }
 }

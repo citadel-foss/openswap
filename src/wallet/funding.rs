@@ -11,7 +11,7 @@ use bitcoind::bitcoincore_rpc::bitcoincore_rpc_json::ListUnspentResultEntry;
 use crate::{
     protocol::ProtocolVersion,
     utill::{fee_at_rate_sats, funding_fee_policy_sats, funding_tx_vsize},
-    wallet::{min_contract_value_sats, Destination},
+    wallet::{api::UTXOSpendInfo, min_contract_value_sats, Destination},
 };
 
 use super::Wallet;
@@ -23,6 +23,10 @@ pub struct CreateFundingTxesResult {
     pub funding_txes: Vec<Transaction>,
     pub payment_output_positions: Vec<u32>,
     pub total_miner_fee: u64,
+    /// How to sign each funding tx's inputs, one list per tx in input order.
+    /// A funding bump re-signs the same inputs, and once the original is out
+    /// the wallet's coin cache no longer lists them.
+    pub input_infos: Vec<Vec<UTXOSpendInfo>>,
 }
 
 /// One planned funding transaction: the UTXOs that fund it and the value it sends.
@@ -290,6 +294,35 @@ pub fn net_policy_fees(
         split.value = Amount::from_sat(value);
     }
     Ok(())
+}
+
+/// Takes `shortfall` out of a frozen plan's values, largest split first, so a
+/// hop that arrived short of its admitted amount forwards that much less.
+/// No split may fall below `min_split`. The coins and the split count stay.
+pub(crate) fn shave_plan(
+    plan: &[SplitPlan],
+    shortfall: u64,
+    min_split: u64,
+) -> Result<Vec<SplitPlan>, WalletError> {
+    let mut shaved = plan.to_vec();
+    let mut order: Vec<usize> = (0..shaved.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(shaved[i].value));
+    let mut left = shortfall;
+    for i in order {
+        if left == 0 {
+            break;
+        }
+        let spare = shaved[i].value.to_sat().saturating_sub(min_split);
+        let taken = spare.min(left);
+        shaved[i].value -= Amount::from_sat(taken);
+        left -= taken;
+    }
+    if left > 0 {
+        return Err(WalletError::General(
+            "the shortfall pushes the funding splits below the contract floor".to_string(),
+        ));
+    }
+    Ok(shaved)
 }
 
 /// Fits a re-plan to the input counts the taker was charged for: split `i`
@@ -666,6 +699,7 @@ impl Wallet {
         let mut funding_txes = Vec::<Transaction>::new();
         let mut payment_output_positions = Vec::<u32>::new();
         let mut total_miner_fee = 0;
+        let mut input_infos = Vec::with_capacity(plan.len());
 
         for (i, (split, address)) in plan.iter().zip(destinations.iter()).enumerate() {
             let coins_to_spend: Vec<_> = split
@@ -722,12 +756,14 @@ impl Wallet {
 
             funding_txes.push(funding_tx);
             payment_output_positions.push(payment_pos);
+            input_infos.push(coins_to_spend.into_iter().map(|(_, info)| info).collect());
         }
 
         Ok(CreateFundingTxesResult {
             funding_txes,
             payment_output_positions,
             total_miner_fee,
+            input_infos,
         })
     }
 }
@@ -1288,6 +1324,22 @@ mod tests {
             ProtocolVersion::Taproot
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_shortfall_comes_off_the_largest_splits_above_the_floor() {
+        let plan = vec![split(&[1], 30_000), split(&[2], 50_000)];
+        let shaved = shave_plan(&plan, 4_000, FLOOR).unwrap();
+        assert_eq!(shaved[0].value.to_sat(), 30_000);
+        assert_eq!(shaved[1].value.to_sat(), 46_000);
+        assert_eq!(shaved[1].utxos, plan[1].utxos);
+        // Past the largest split's room, the next split gives the rest.
+        let shaved = shave_plan(&plan, 50_000, FLOOR).unwrap();
+        assert_eq!(shaved[1].value.to_sat(), FLOOR);
+        assert_eq!(shaved[0].value.to_sat(), 30_000 - 5_000);
+        // No split goes below the floor.
+        assert!(shave_plan(&plan, 70_001, FLOOR).is_err());
+        assert_eq!(shave_plan(&plan, 0, FLOOR).unwrap(), plan);
     }
 
     #[test]

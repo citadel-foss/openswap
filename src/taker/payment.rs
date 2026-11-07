@@ -236,6 +236,15 @@ impl Taker {
             return Ok(None);
         };
 
+        // A bump takes its fee out of the hop's contract, and the route
+        // reserves no budget for it: the receiver could go short of the
+        // exact amount pinned for it. Refuse the pair before any funding.
+        if params.funding_bump.is_some() {
+            return Err(TakerError::General(
+                "A payment swap cannot use funding bumps".to_string(),
+            ));
+        }
+
         // The route solver prices one per-hop mining fee, so an uneven route
         // has no exact gross; refuse it rather than misprice a hop.
         let hop_tx_counts = params.hop_tx_counts();

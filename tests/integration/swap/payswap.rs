@@ -10,7 +10,7 @@
 use bitcoin::Amount;
 use openswap::{
     protocol::common_messages::ProtocolVersion,
-    taker::{MakerState, SwapParams},
+    taker::{FundingBumpPolicy, MakerState, SwapParams},
     wallet::AddressType,
 };
 
@@ -422,6 +422,16 @@ fn quotes_on_per_hop_counts(world: &mut World) {
         format!("{uneven_err:?}").contains("one transaction count for every hop"),
         "unexpected refusal error: {:?}",
         uneven_err
+    );
+
+    // A bump would come out of the exact amount pinned for the receiver.
+    let bump_err = taker
+        .prepare(payment(100_000).with_funding_bump(FundingBumpPolicy::new(10)))
+        .expect_err("a payment swap with funding bumps must be refused");
+    assert!(
+        format!("{:?}", bump_err).contains("cannot use funding bumps"),
+        "unexpected refusal error: {:?}",
+        bump_err
     );
 
     // Three settlement outputs, each budgeted at the 155 vB taproot

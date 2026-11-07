@@ -441,6 +441,12 @@ impl std::fmt::Debug for Electrum {
 }
 
 impl Electrum {
+    /// The server endpoint this backend talks to.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn url(&self) -> &str {
+        &self.config.url
+    }
+
     /// The transaction under `txid`, from the cache when we have fetched it
     /// before. Only a tx that hashes to the txid asked for is returned or kept.
     pub(crate) fn transaction_get_validating(

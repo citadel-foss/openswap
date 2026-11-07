@@ -170,6 +170,8 @@ pub(super) fn generate(release: &Path) {
         tweak_chain_code: ChainCode::from([3; 32]),
         name: "fixture-maker".into(),
         lightning: Some(lightning_offer),
+        max_funding_bump_feerate: 0,
+        max_funding_bump_sats: 0,
     };
     let hello = Hello {
         features: vec![
@@ -189,6 +191,7 @@ pub(super) fn generate(release: &Path) {
         feerate: 2,
         timelock: 144,
         refund_locktime_offset: 144,
+        taker_auth_pubkey: None,
     };
     let handover = PrivateKeyHandover {
         id: swap_id.clone(),

@@ -273,6 +273,10 @@ pub struct SwapParams {
     /// third-party address. When set, `send_amount` is the exact amount the
     /// receiver gets; the gross route amount is solved during `prepare_swap`.
     pub payment_address: Option<bitcoin::Address<bitcoin::address::NetworkUnchecked>>,
+    /// (optional) Replace a hop's funding at a higher feerate while it sits
+    /// unconfirmed. The extra fee comes out of the swap amount, so we pay it.
+    /// `None`, the default, never bumps.
+    pub funding_bump: Option<super::funding_bump::FundingBumpPolicy>,
 }
 
 impl SwapParams {
@@ -290,6 +294,7 @@ impl SwapParams {
             manually_selected_outpoints: None,
             preferred_makers: None,
             payment_address: None,
+            funding_bump: None,
         }
     }
 
@@ -388,6 +393,12 @@ impl SwapParams {
         self
     }
 
+    /// Bump stuck funding under `policy`; see [`SwapParams::funding_bump`].
+    pub fn with_funding_bump(mut self, policy: super::funding_bump::FundingBumpPolicy) -> Self {
+        self.funding_bump = Some(policy);
+        self
+    }
+
     /// Set the payment address: settle the swap to a third-party receiver's address.
     pub fn with_payment_address(
         mut self,
@@ -440,7 +451,7 @@ pub struct SwapSummary {
 }
 
 /// State for an ongoing swap.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct OngoingSwapState {
     /// Unique swap ID.
     pub(crate) id: String,
@@ -472,6 +483,11 @@ pub(crate) struct OngoingSwapState {
     /// PaySwap state; `None` for regular swaps. When set, `params.send_amount`
     /// holds the solved gross route amount.
     pub(crate) payment: Option<PaymentQuote>,
+    /// Key this swap's funding bumps are signed with. Its public half goes to
+    /// every maker in `SwapDetails`; the swap id alone authorizes nothing.
+    pub(crate) taker_auth_key: SecretKey,
+    /// Funding bumps of this swap's hops.
+    pub(crate) funding_bump: super::funding_bump::SwapBumps,
 }
 
 /// The taker's own hop-0 funding plan.
@@ -514,6 +530,9 @@ pub(crate) struct MakerConnection {
     pub(crate) amount: Amount,
     /// Exact incoming contract count declared to this hop.
     pub(crate) incoming_count: u32,
+    /// How far this hop's incoming fell short of `amount` once its funding
+    /// confirmed: what bumps of it, and of every hop before it, took off.
+    pub(crate) incoming_shortfall: Amount,
     /// The maker's frozen plan shape from its ack: one entry per planned
     /// funding tx, valued by input count. Empty until the ack arrives.
     pub(crate) funding_splits: Vec<u32>,
@@ -536,6 +555,7 @@ impl MakerConnection {
             negotiated_timelock: 0,
             amount: Amount::ZERO,
             incoming_count: 0,
+            incoming_shortfall: Amount::ZERO,
             funding_splits: Vec::new(),
         }
     }
@@ -553,8 +573,10 @@ impl MakerConnection {
 
 impl Taker {
     /// What a maker may forward for one hop: its declared incoming amount less
-    /// its advertised swap fee and the sweep price of the declared count. The
-    /// funding fee is priced later, at verification. `None` without an offer.
+    /// its advertised swap fee and the sweep price of the declared count, and
+    /// less whatever funding bumps took off its incoming. The fee stays the one
+    /// priced on the declared amount. The funding fee is priced later, at
+    /// verification. `None` without an offer.
     pub(crate) fn forwardable_for_hop(&self, maker_idx: usize) -> Option<Amount> {
         let swap = self.swap_state().ok()?;
         let maker = &swap.makers[maker_idx];
@@ -569,11 +591,12 @@ impl Taker {
         };
         let sweep_fee = sweep_fee_policy_sats(maker.protocol, swap.params.swap_feerate())
             .and_then(|per_contract| per_contract.checked_mul(maker.incoming_count as u64))?;
-        Some(Amount::from_sat(hop_net_sats(
+        Amount::from_sat(hop_net_sats(
             &HopFeeTerms::from_offer(offer, locktime),
             sweep_fee,
             maker.amount.to_sat(),
-        )))
+        ))
+        .checked_sub(maker.incoming_shortfall)
     }
 }
 
@@ -1128,6 +1151,9 @@ impl Taker {
         }
 
         params.validate_tx_counts()?;
+        if let Some(policy) = &params.funding_bump {
+            policy.validate(params.protocol, params.feerate)?;
+        }
 
         // The maker enforces the same bound on the input budget; an
         // out-of-range value would otherwise only fail mid-negotiation.
@@ -1193,6 +1219,8 @@ impl Taker {
             reference_height: None,
             hop0_plan: Hop0Plan::default(),
             payment: None,
+            taker_auth_key: SecretKey::new(&mut OsRng),
+            funding_bump: Default::default(),
         });
 
         // Only auto-discovery needs a fresh offerbook. Preferred makers are
@@ -1557,6 +1585,10 @@ impl Taker {
             return Err(err);
         }
 
+        #[cfg(feature = "integration-test")]
+        if self.behavior == TakerBehavior::ReorgAndBumpFirstMakerHop {
+            self.reorg_and_bump_first_maker_hop()?;
+        }
         // Crash with every contract funded and persisted but nothing settled, so
         // no counterparty has been handed a key either.
         #[cfg(feature = "integration-test")]
@@ -1623,15 +1655,43 @@ impl Taker {
             Some(&swept),
         )?;
 
-        {
+        let leftovers = {
             let swap_id = self.swap_state()?.id.clone();
+            let outgoing_winners: Vec<String> = self
+                .swap_state()?
+                .outgoing_swapcoins
+                .iter()
+                .map(|coin| coin.contract_tx.compute_txid().to_string())
+                .collect();
             let mut live = lock_debug!(self.live_swap.lock())
                 .map_err(|_| TakerError::General("live swap lock poisoned".into()))?;
             let mut wallet = self.write_wallet()?;
-            wallet.remove_swap_coins_and_save(&swap_id, false, true)?;
+            // Funding versions a bump left behind stay, incoming and
+            // outgoing, until the winner is buried deep: a reorg can still
+            // confirm one, and recovering it needs the coin. Recovery drops
+            // them once they are safe to; the sweep took the incoming winners.
+            for key in &outgoing_winners {
+                wallet.remove_outgoing_swapcoin(key);
+            }
+            wallet.remove_watchonly_swapcoins(&swap_id);
+            wallet.release_swap_locks(&swap_id, None);
+            wallet.save_to_disk()?;
             *live = None;
-        }
+            !wallet.outgoing_keys_for_swap(&swap_id).is_empty()
+                || !wallet.incoming_keys_for_swap(&swap_id).is_empty()
+        };
         self.ongoing_swap = None;
+        if leftovers && self.recovery_loop.as_ref().is_none_or(|l| l.is_complete()) {
+            match RecoveryLoop::start(
+                self.wallet.clone(),
+                self.backend.clone(),
+                self.live_swap.clone(),
+                self.watch_service.clone(),
+            ) {
+                Ok(started) => self.recovery_loop = Some(started),
+                Err(e) => log::error!("Failed to spawn recovery loop: {e}"),
+            }
+        }
         log::info!("OpenSwap completed successfully: {:?}", report);
         Ok(report)
     }
@@ -2110,6 +2170,7 @@ impl Taker {
             feerate: self.swap_state()?.params.swap_feerate() as u64,
             timelock,
             refund_locktime_offset,
+            taker_auth_pubkey: self.taker_auth_pubkey(&pins)?,
         };
 
         #[cfg(feature = "integration-test")]
@@ -2296,10 +2357,29 @@ impl Taker {
             feerate: swap.params.swap_feerate() as u64,
             timelock: swap.makers[maker_idx].negotiated_timelock,
             refund_locktime_offset,
+            taker_auth_pubkey: self.taker_auth_pubkey(&swap.makers[maker_idx].needed())?,
         };
         #[cfg(feature = "integration-test")]
         let details = self.forge_swap_details(details);
         Ok(details)
+    }
+
+    /// The key every maker of this swap checks our funding bumps against,
+    /// for a maker whose `pins` include funding bumps.
+    fn taker_auth_pubkey(
+        &self,
+        pins: &[String],
+    ) -> Result<Option<bitcoin::XOnlyPublicKey>, TakerError> {
+        if !pins
+            .iter()
+            .any(|feature| feature == crate::protocol::funding_bump::FUNDING_BUMP_FEATURE)
+        {
+            return Ok(None);
+        }
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        Ok(Some(
+            self.swap_state()?.taker_auth_key.x_only_public_key(&secp).0,
+        ))
     }
 
     /// Apply the declaration-forging test hooks, so a resend repeats exactly
@@ -2765,8 +2845,8 @@ impl Taker {
         };
         // Nothing was signed for the network, so the claim must not outlive
         // the failed build.
-        let swapcoins = match built {
-            Ok(swapcoins) => swapcoins,
+        let (swapcoins, input_infos) = match built {
+            Ok(built) => built,
             Err(e) => {
                 // A failed save leaves the claim on disk for the startup sweep;
                 // the build error is the one the caller needs.
@@ -2789,6 +2869,7 @@ impl Taker {
         let swap = self.swap_state_mut()?;
         let num_swapcoins = swapcoins.len();
         swap.outgoing_swapcoins = swapcoins;
+        swap.funding_bump.hop0_input_infos = input_infos;
 
         #[cfg(debug_assertions)]
         log::debug!(
@@ -3121,6 +3202,28 @@ impl Taker {
                     .zip(received_privkeys.iter())
                 {
                     incoming.set_other_privkey(*received_privkey);
+                }
+                // The kept copies of a bumped hop's losing versions share each
+                // split's keys, so they take the same key, saved now.
+                let replaced: Vec<IncomingSwapCoin> = {
+                    let swap = self.swap_state_mut()?;
+                    for (split, copy) in swap.funding_bump.replaced_incoming.iter_mut() {
+                        if let Some(key) = received_privkeys.get(*split) {
+                            copy.set_other_privkey(*key);
+                        }
+                    }
+                    swap.funding_bump
+                        .replaced_incoming
+                        .iter()
+                        .map(|(_, copy)| copy.clone())
+                        .collect()
+                };
+                if !replaced.is_empty() {
+                    let mut wallet = self.write_wallet()?;
+                    for copy in &replaced {
+                        wallet.add_incoming_swapcoin(copy);
+                    }
+                    wallet.save_to_disk()?;
                 }
                 log::info!(
                     "Validated and set taker's incoming swapcoin other_privkeys from last maker ({})",
@@ -4019,6 +4122,27 @@ pub enum TakerBehavior {
     /// its planned coins through the public wallet API. The funding claim must
     /// refuse the payment, and the swap must go on.
     PayFromPlannedCoinsBeforeBroadcast,
+    /// Keep our hop-0 funding out of blocks once broadcast, as a fee spike
+    /// would, so only a funding bump gets the hop confirmed.
+    StallFunding,
+    /// Send each funding bump signed by a key the makers never agreed to, as
+    /// another party on the route who knows the swap id could.
+    ForgeFundingBumpKey,
+    /// Lose each maker's answer that its replacement funding is out, so only
+    /// finding it on chain lets the swap follow it.
+    DropBumpReply,
+    /// Send the first maker our contract signatures with a sighash flag other
+    /// than `SIGHASH_ALL`: each still verifies, but would not sign the
+    /// contract it goes into. The maker must drop the swap and free its claim.
+    SendNonSighashAllContractSigs,
+    /// As [`TakerBehavior::StallFunding`], and lose our node's answer to
+    /// each replacement's broadcast, as a dropped connection would after the
+    /// node took it: the replacement must still be tracked.
+    StallFundingAndLoseBroadcastReply,
+    /// Once every hop has funded, orphan the block that mined the first
+    /// maker's funding and ask that maker to bump it, as a taker exploiting a
+    /// reorg would: the next maker already built on the original.
+    ReorgAndBumpFirstMakerHop,
 }
 
 #[cfg(test)]
@@ -4068,7 +4192,10 @@ mod tests {
         );
         let features = compat_hello_reply(reply, &["taproot".into()]).unwrap();
         assert_eq!(features, KNOWN.iter().map(|f| f.name).collect::<Vec<_>>());
-        assert_eq!(choose_pins("taproot", &features), ["taproot"]);
+        assert_eq!(
+            choose_pins("taproot", &features),
+            ["taproot", "funding-bump-v1"]
+        );
         assert!(unmet_for_flow(&["future-0-v1".into()], &["taproot".into()], "taproot").is_err());
     }
 

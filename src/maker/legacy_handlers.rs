@@ -7,7 +7,7 @@ use bitcoin::{secp256k1::SecretKey, Amount, PublicKey, ScriptBuf, Txid};
 use super::{
     error::MakerError,
     handlers::{
-        incoming_matches_swap_amount, is_already_broadcast_error, ConnectionState, Maker, SwapPhase,
+        incoming_fits_swap_amount, is_already_broadcast_error, ConnectionState, Maker, SwapPhase,
     },
 };
 #[cfg(feature = "integration-test")]
@@ -73,7 +73,10 @@ fn process_req_contract_sigs_for_sender<M: Maker>(
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     // Allow re-processing in AwaitingSignaturesOrPreimage: when the taker retries
     // after substituting a failed next-hop maker, it reconnects and re-sends this
-    // message. The re-signing is safe since no funding has been broadcast yet.
+    // message. The re-signing is safe since no funding of ours has been
+    // broadcast yet. A funding bump of the previous hop asks again too, for the
+    // replacement's contracts: they spend coins that conflict with the original's,
+    // so at most one of the two funding txs we signed for can ever exist.
     state.expect_phase(&[
         SwapPhase::AwaitingContractData,
         SwapPhase::AwaitingSignaturesOrPreimage,
@@ -258,15 +261,19 @@ fn process_proof_of_funding<M: Maker>(
             .checked_add(funding_output.value)
             .ok_or(MakerError::General("Funding output amounts overflow"))?;
     }
-    if !incoming_matches_swap_amount(declared_incoming, state.swap_amount) {
+    if !incoming_fits_swap_amount(
+        declared_incoming,
+        state.swap_amount,
+        state.taker_auth_pubkey.is_some(),
+    ) {
         log::error!(
-            "[{}] ProofOfFunding incoming amount {} != declared swap amount {}",
+            "[{}] ProofOfFunding incoming amount {} does not fit declared swap amount {}",
             maker.network_port(),
             declared_incoming,
             state.swap_amount
         );
         return Err(MakerError::General(
-            "ProofOfFunding incoming amount differs from the declared swap amount",
+            "ProofOfFunding incoming amount does not fit the declared swap amount",
         ));
     }
 
@@ -400,7 +407,9 @@ fn process_proof_of_funding<M: Maker>(
         incoming_amount
     );
 
-    let swap_fee = maker.calculate_swap_fee(incoming_amount, pof.refund_locktime as u32);
+    // Fixed at admission on the declared amount: a hop that upstream funding
+    // bumps left short still pays our full fee, since the bump is the taker's.
+    let swap_fee = Amount::from_sat(state.service_fee_sats);
     // The sweep reimbursement prices each incoming contract's cooperative
     // spend; the funding fee comes out in the split plan, not here.
     // The feerate is negotiated with the peer; an overflowing product would
@@ -412,8 +421,9 @@ fn process_proof_of_funding<M: Maker>(
             })
             .ok_or(MakerError::General("Sweep fee overflow"))?,
     );
-    // Incoming amount and count are exact now, so this equals the forwardable
-    // the admission plan was frozen on; `initialize_swap` rejects any drift.
+    // The count is exact, so this is the forwardable the admission plan was
+    // frozen on, less any upstream bump shortfall, which `initialize_swap`
+    // takes out of the plan's splits.
     let forwardable = incoming_amount
         .checked_sub(swap_fee)
         .and_then(|amt| amt.checked_sub(sweep_fee))
@@ -794,6 +804,8 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
                     maker.network_port(),
                     txid
                 );
+                #[cfg(feature = "integration-test")]
+                maker.stall_funding_for_test(&txid);
             }
             Err(e) if is_already_broadcast_error(&e) => {
                 log::info!(
@@ -876,6 +888,9 @@ fn process_req_contract_sigs_for_recvr<M: Maker>(
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     state.expect_phase(&[SwapPhase::AwaitingPrivateKeyHandover])?;
     state.check_swap_id(&req.id)?;
+    // The next hop's contract spends whichever version of our funding
+    // confirmed, so that version is the one we sign for.
+    super::funding_bump::resolve_funding_versions(maker, state)?;
 
     #[cfg(feature = "integration-test")]
     {
@@ -995,6 +1010,7 @@ fn process_legacy_handover<M: Maker>(
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     state.expect_phase(&[SwapPhase::AwaitingPrivateKeyHandover])?;
     state.check_swap_id(&handover.id)?;
+    super::funding_bump::resolve_funding_versions(maker, state)?;
 
     #[cfg(feature = "integration-test")]
     {

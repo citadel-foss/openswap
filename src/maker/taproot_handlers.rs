@@ -9,8 +9,8 @@ use super::handlers::MakerBehavior;
 use super::{
     error::MakerError,
     handlers::{
-        incoming_matches_swap_amount, is_already_broadcast_error, ConnectionState, Maker,
-        SwapPhase, MIN_CONTRACT_REACTION_TIME,
+        incoming_fits_swap_amount, is_already_broadcast_error, ConnectionState, Maker, SwapPhase,
+        MIN_CONTRACT_REACTION_TIME,
     },
 };
 #[cfg(feature = "integration-test")]
@@ -166,15 +166,19 @@ fn process_taproot_contract<M: Maker>(
             .checked_add(*amount)
             .ok_or(MakerError::General("Taproot contract amounts overflow"))?;
     }
-    if !incoming_matches_swap_amount(total_incoming, state.swap_amount) {
+    if !incoming_fits_swap_amount(
+        total_incoming,
+        state.swap_amount,
+        state.taker_auth_pubkey.is_some(),
+    ) {
         log::error!(
-            "[{}] Taproot incoming amount {} does not match negotiated swap amount {}",
+            "[{}] Taproot incoming amount {} does not fit negotiated swap amount {}",
             maker.network_port(),
             total_incoming,
             state.swap_amount
         );
         return Err(MakerError::General(
-            "Taproot incoming amount does not match the negotiated swap amount",
+            "Taproot incoming amount does not fit the negotiated swap amount",
         ));
     }
 
@@ -251,14 +255,12 @@ fn process_taproot_contract<M: Maker>(
         incoming_swapcoins.push(incoming_swapcoin);
     }
 
-    // The fee is priced on the negotiated offset, so it is fixed at negotiation
-    // and matches the taker's mirror. The offset is not bound to the real lock
-    // duration; assess the CSV transition (binding it in the script) later.
-    let swap_fee = maker.calculate_swap_fee(total_incoming, state.refund_locktime_offset as u32);
-    // The fee stored at swap-details time was computed from the proposed
-    // amount; overwrite with the fee on the actual incoming amount so
-    // success reports match what was really earned.
-    state.service_fee_sats = swap_fee.to_sat();
+    // The fee is fixed at admission, priced on the declared amount and the
+    // negotiated offset, and matches the taker's mirror. An incoming hop that
+    // upstream funding bumps left short still pays it: the bump is the
+    // taker's, so our percentage must not shrink with it. The offset is not
+    // bound to the real lock duration; assess the CSV transition later.
+    let swap_fee = Amount::from_sat(state.service_fee_sats);
     // #1018's zero guard stays even though shares no longer divide by the
     // total: a zero-incoming swap is refused here, not downstream.
     if total_incoming == Amount::ZERO {
@@ -579,6 +581,8 @@ fn process_taproot_contract<M: Maker>(
                     txid,
                     data.id
                 );
+                #[cfg(feature = "integration-test")]
+                maker.stall_funding_for_test(&txid);
             }
             Err(e) if is_already_broadcast_error(&e) => {
                 log::info!(
@@ -704,6 +708,12 @@ fn process_taproot_handover<M: Maker>(
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
     state.expect_phase(&[SwapPhase::AwaitingPrivateKeyHandover])?;
     state.check_swap_id(&handover.id)?;
+    // The taker hands keys over only once every hop confirmed, so whichever
+    // version of a bumped funding did is now our outgoing contract.
+    super::funding_bump::resolve_funding_versions(maker, state)?;
+    // And whichever version of our incoming funding was mined is what we
+    // claim: a bump after a reorg may have replaced the one we accepted.
+    maker.follow_replaced_incoming(&handover.id, &mut state.incoming_swapcoins)?;
 
     #[cfg(feature = "integration-test")]
     {

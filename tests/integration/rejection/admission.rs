@@ -356,7 +356,7 @@ fn drain_maker_liquidity_after_fidelity(maker: &MakerServer, bitcoind: &bitcoind
 }
 
 /// The taker funds honestly; the hook forges only the SwapDetails
-/// declaration, so the maker's own equality check is what refuses.
+/// declaration, so the maker's own amount check is what refuses.
 #[world_test(
     backend = BitcoindBackend,
     maker_behaviors = [Normal],
@@ -364,10 +364,11 @@ fn drain_maker_liquidity_after_fidelity(maker: &MakerServer, bitcoind: &bitcoind
     setup = [fund_taker_default(3), fund_makers_default(), start_makers(120), mine(1)],
     swap(protocol = Taproot, sats = 500_000, makers = 1, tx_count = 3),
     cases = [
-        /// Same under-delivery on Taproot: the declared amount is exact there too.
+        /// Same under-delivery on Taproot: a sixth short is far past what
+        /// upstream funding bumps may take off a hop.
         maker_rejects_underdelivered_taproot_amount(
             behavior = TakerBehavior::ForgeBounds(Amount::from_sat(600_000)),
-            expected = "does not match negotiated swap amount",
+            expected = "does not fit negotiated swap amount",
         ),
         /// The taker funds 2 incoming contracts but skews one a sat below the
         /// contract floor, keeping the total exact. The equality and count checks
