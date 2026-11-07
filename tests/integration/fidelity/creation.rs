@@ -56,6 +56,10 @@ fn bond_creation_and_redemption(world: &mut World) {
         has "(fidelity bond + fees + minimum swap liquidity) to be visible in the market",
     });
 
+    // Mine after the failed attempt, so the funded attempt reads a newer tip.
+    generate_blocks(bitcoind, 5);
+    let mined_height = bitcoind.client.get_block_count().unwrap();
+
     log::info!("Sending exactly the quoted amount");
     // Setup completes only after the bond is made and the leftover passes the
     // swap liquidity check, so this proves one deposit of the quote is enough.
@@ -112,6 +116,18 @@ fn bond_creation_and_redemption(world: &mut World) {
 
         bond.lock_time.to_consensus_u32()
     };
+
+    // The bond counts its 950 blocks from the block after the tip its funded
+    // attempt read. That tip is at least `mined_height` and at most the tip
+    // now; the range allows for blocks mined in the background meanwhile.
+    let tip_after_setup = bitcoind.client.get_block_count().unwrap();
+    let lock_height = u64::from(first_maturity_height);
+    assert!(
+        (mined_height + 951..=tip_after_setup + 951).contains(&lock_height),
+        "bond locktime {lock_height} is outside {}..={}",
+        mined_height + 951,
+        tip_after_setup + 951
+    );
 
     // ----- Restore the maker from a backup and restart it -----
     // The backup's bond record is checked on-chain, so the restarted maker

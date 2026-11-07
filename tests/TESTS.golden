@@ -27,6 +27,8 @@ openswap maker::api::lightning_config_tests::lightning_settings_round_trip_throu
 openswap maker::api::tests::advertised_min_swap_is_the_smallest_passing_round_amount
 openswap maker::api::tests::breach_query_without_an_answer_is_an_error
 openswap maker::api::tests::compat_maker_reservations_and_readmission_use_saved_coins
+openswap maker::api::tests::fidelity_bond_locktime_counts_from_the_next_block
+openswap maker::api::tests::fidelity_bond_that_confirms_late_is_out_of_range
 openswap maker::api::tests::init_rejects_zero_required_confirms
 openswap maker::api::tests::maker_config_checks_file_values
 openswap maker::api::tests::maker_config_debug_hides_wallet_password
@@ -65,6 +67,8 @@ openswap maker::server::tests::heartbeat_socket_cannot_switch_swap_id
 openswap maker::server::tests::pending_connections_are_bounded
 openswap maker::server::tests::pending_deadline_stops_slow_reads
 openswap maker::server::tests::preimage_check_stops_on_an_unknown_answer
+openswap maker::server::tests::startup_replaces_an_expired_rejected_bond
+openswap maker::server::tests::startup_skips_a_bond_that_confirmed_too_late
 openswap maker::server::tests::token_bucket_limits_connection_burst
 openswap maker::taproot_verification::tests::rejects_amount_that_does_not_match_contract_output
 openswap maker::taproot_verification::tests::rejects_duplicate_contract_outpoints
@@ -577,6 +581,7 @@ openswap::integration cli::taker::taker_cli_shows_maker_states
 openswap::integration cli::taker::wallet_commands
 openswap::integration fidelity::creation::bond_creation_and_redemption
 openswap::integration fidelity::renewal::bond_auto_renewal
+openswap::integration fidelity::renewal::late_bond_is_redeemed_during_the_liquidity_wait
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart_electrum
 openswap::integration fidelity::restart::live_bond_is_advertised_while_another_is_pending

@@ -63,6 +63,44 @@ use super::{
 /// How often a pending fidelity bond is checked for confirmation.
 const BOND_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Blocks a new bond keeps above `MIN_FIDELITY_TIMELOCK`. Its timelock is
+/// counted from the next block, so each block it takes beyond that to confirm
+/// comes off what takers measure; about a day of slack keeps a slow
+/// confirmation in range.
+#[cfg(not(feature = "integration-test"))]
+const BOND_CONFIRMATION_MARGIN: u32 = 144;
+
+/// Locktime for a new fidelity bond meant to stay locked `relative_timelock`
+/// blocks.
+///
+/// Takers measure a bond's timelock from its confirmation height, and a bond
+/// built at `tip_height` confirms in the next block at the earliest. Counting
+/// from that block keeps a bond configured at `MIN_FIDELITY_TIMELOCK` in range,
+/// and one at `MAX_FIDELITY_TIMELOCK` never exceeds it.
+fn fidelity_bond_locktime(
+    tip_height: u32,
+    relative_timelock: u32,
+) -> Result<bitcoin::absolute::LockTime, MakerError> {
+    let height = tip_height
+        .checked_add(1)
+        .and_then(|next_block| next_block.checked_add(relative_timelock))
+        .ok_or(MakerError::General("fidelity locktime height overflows"))?;
+    bitcoin::absolute::LockTime::from_height(height)
+        .map_err(|e| MakerError::Wallet(WalletError::Locktime(e)))
+}
+
+/// Whether takers accept a bond that confirmed at `conf_height`: they check
+/// `lock_time - conf_height` against the allowed range. The lock counts from
+/// the block after the tip it was built at, so a bond that took longer to
+/// confirm holds less than the configured timelock and can fall below the
+/// minimum.
+fn bond_timelock_in_range(lock_time: bitcoin::absolute::LockTime, conf_height: u32) -> bool {
+    lock_time
+        .to_consensus_u32()
+        .checked_sub(conf_height)
+        .is_some_and(|timelock| (MIN_FIDELITY_TIMELOCK..=MAX_FIDELITY_TIMELOCK).contains(&timelock))
+}
+
 // Covers all production response timeouts and finalization retry delays.
 const COMPLETED_HANDOVER_TTL: Duration = Duration::from_secs(65 * 60);
 
@@ -827,6 +865,26 @@ impl std::ops::Deref for ShutdownSignal {
     }
 }
 
+/// Why [`MakerServer::setup_fidelity_bond_with`] stopped without a bond.
+#[derive(Debug)]
+pub(crate) enum BondSetupError {
+    /// A new fidelity bond confirmed too late for its timelock to stay in the
+    /// range takers accept, so it is not advertised.
+    TooLate {
+        /// The bond's index in the wallet.
+        index: u32,
+        /// The height it confirmed at.
+        conf_height: u32,
+    },
+    Maker(MakerError),
+}
+
+impl From<MakerError> for BondSetupError {
+    fn from(e: MakerError) -> Self {
+        BondSetupError::Maker(e)
+    }
+}
+
 /// Maker server implementing the swap protocols and their background services.
 pub struct MakerServer {
     /// Configuration.
@@ -1291,16 +1349,17 @@ impl MakerServer {
         // Snapshot the pending bonds once: an unrecoverable bond stays
         // pending in the wallet, so re-finding inside the loop would spin
         // on it forever.
-        let mut pending: Vec<(u32, bitcoin::Txid)> = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .store
-            .fidelity_bond
-            .iter()
-            .filter(|b| !b.is_spent && b.conf_height.is_none())
-            .map(|b| (b.bond_index, b.outpoint.txid))
-            .collect();
+        let mut pending: Vec<(u32, bitcoin::Txid, bitcoin::absolute::LockTime)> =
+            lock_debug!(self.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                .store
+                .fidelity_bond
+                .iter()
+                .filter(|b| !b.is_spent && b.conf_height.is_none())
+                .map(|b| (b.bond_index, b.outpoint.txid, b.lock_time))
+                .collect();
         if !live_bond {
-            for (_, txid) in &pending {
+            for (_, txid, _) in &pending {
                 log::info!(
                     "[{}] Found unconfirmed fidelity bond {}, waiting for confirmation instead of creating a new one",
                     self.config.network_port,
@@ -1315,7 +1374,7 @@ impl MakerServer {
         let chain = self.bond_chain()?;
         while !pending.is_empty() {
             let mut unconfirmed = Vec::new();
-            for (index, txid) in pending {
+            for (index, txid, lock_time) in pending {
                 match self.check_bond_confirmation(index, &chain) {
                     Ok(Some(conf_height)) => {
                         lock_debug!(self.wallet.write())
@@ -1328,9 +1387,13 @@ impl MakerServer {
                             txid,
                             conf_height
                         );
-                        live_bond = true;
+                        // One that confirmed too late is never advertised, so
+                        // it must not end the wait for the other pending bonds.
+                        if self.bond_timelock_accepted(lock_time, Some(conf_height)) {
+                            live_bond = true;
+                        }
                     }
-                    Ok(None) => unconfirmed.push((index, txid)),
+                    Ok(None) => unconfirmed.push((index, txid, lock_time)),
                     // The bond was evicted and there is no stored transaction to
                     // rebroadcast: it can never confirm. Losing the bond must not
                     // take the maker down — log it and start up anyway.
@@ -1349,7 +1412,7 @@ impl MakerServer {
             }
             pending = unconfirmed;
             if live_bond {
-                for (_, txid) in &pending {
+                for (_, txid, _) in &pending {
                     log::info!(
                         "[{}] Fidelity bond {} still unconfirmed; advertising the live bond meanwhile",
                         self.config.network_port,
@@ -1365,16 +1428,54 @@ impl MakerServer {
         Ok(())
     }
 
-    /// Setup fidelity bond for this maker.
-    pub fn setup_fidelity_bond(&self, maker_address: &str) -> Result<FidelityProof, MakerError> {
-        use bitcoin::absolute::LockTime;
+    /// [`bond_timelock_in_range`] for a bond of ours. A bond that hasn't
+    /// confirmed yet can't be judged, so it passes.
+    fn bond_timelock_accepted(
+        &self,
+        lock_time: bitcoin::absolute::LockTime,
+        conf_height: Option<u32>,
+    ) -> bool {
+        // This test maker advertises an out-of-range bond on purpose.
+        #[cfg(feature = "integration-test")]
+        if self.behavior == MakerBehavior::InvalidFidelityTimelock {
+            return true;
+        }
+        conf_height.is_none_or(|height| bond_timelock_in_range(lock_time, height))
+    }
 
+    /// Setup fidelity bond for this maker.
+    ///
+    /// Keeps funding bonds until one that takers accept confirms.
+    pub fn setup_fidelity_bond(&self, maker_address: &str) -> Result<FidelityProof, MakerError> {
+        self.setup_fidelity_bond_with(maker_address, true)
+            .map_err(|e| match e {
+                BondSetupError::Maker(e) => e,
+                // Only returned when no replacement is funded.
+                BondSetupError::TooLate { .. } => {
+                    MakerError::General("fidelity bond confirmed too late")
+                }
+            })
+    }
+
+    /// Like [`Self::setup_fidelity_bond`], but with `fund_replacement` false a
+    /// still-locked bond that takers reject ends setup with
+    /// [`BondSetupError::TooLate`] instead of waiting for funds to replace it,
+    /// so startup is not held up.
+    pub(crate) fn setup_fidelity_bond_with(
+        &self,
+        maker_address: &str,
+        fund_replacement: bool,
+    ) -> Result<FidelityProof, BondSetupError> {
         // Adopt any bond that was broadcast but not yet confirmed (e.g. the
         // maker shut down while waiting for confirmation) before deciding
         // whether a new bond is needed.
+        // Only a bond takers accept counts: one that confirmed too late must
+        // not stop us from waiting for a pending bond that may still be fine.
         let live_bond = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .has_live_fidelity_bond()
+            .has_live_fidelity_bond_where(|bond| {
+                self.bond_timelock_accepted(bond.lock_time, bond.conf_height)
+            })
             .map_err(MakerError::Wallet)?;
         // A just-redeemed bond must not stay advertised while a new one confirms.
         if !live_bond {
@@ -1383,10 +1484,48 @@ impl MakerServer {
         }
         self.finalize_pending_fidelity_bonds(live_bond)?;
 
+        // A bond that confirmed too late for its timelock is never offered:
+        // takers would reject it, and a new bond is funded instead.
+        // Keeps the rejected bond that stays locked longest.
+        let rejected = std::cell::Cell::new(None::<(u32, u32, u32)>);
         let highest_index = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .get_highest_fidelity_index()
+            .get_highest_fidelity_index_where(|bond| {
+                let accepted = self.bond_timelock_accepted(bond.lock_time, bond.conf_height);
+                if !accepted {
+                    if let Some(height) = bond.conf_height {
+                        let lock = bond.lock_time.to_consensus_u32();
+                        if rejected.get().is_none_or(|(_, _, kept)| lock > kept) {
+                            rejected.set(Some((bond.bond_index, height, lock)));
+                        }
+                    }
+                }
+                accepted
+            })
             .map_err(MakerError::Wallet)?;
+        if let Some((index, _, _)) = rejected.get() {
+            log::warn!(
+                "[{}] Skipping fidelity bond {}: its timelock from confirmation is outside the accepted range",
+                self.config.network_port,
+                index
+            );
+        }
+
+        if highest_index.is_none() && !fund_replacement {
+            if let Some((index, conf_height, lock)) = rejected.get() {
+                // An expired bond is redeemed while the replacement is funded,
+                // so only a still-locked one, whose coins can't fund it, stops
+                // setup here. Same expiry rule as `redeem_expired_fidelity_bonds`.
+                let still_locked = lock_debug!(self.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                    .blockchain
+                    .get_block_count()
+                    .map_or(true, |tip| tip <= u64::from(lock));
+                if still_locked {
+                    return Err(BondSetupError::TooLate { index, conf_height });
+                }
+            }
+        }
 
         if let Some(i) = highest_index {
             // Existing fidelity bond found
@@ -1426,46 +1565,43 @@ impl MakerServer {
             // Need to create new fidelity bond
             log::info!("No active Fidelity Bonds found. Creating one.");
 
+            // A live bond takers would reject may still be advertised; stop
+            // offering it while the new one is funded.
+            *lock_debug!(self.highest_fidelity_proof.write())
+                .map_err(|_| MakerError::General("Failed to lock fidelity proof"))? = None;
+
             let amount = Amount::from_sat(self.config.fidelity_amount);
             log::info!("Fidelity value chosen = {:?} sats", amount.to_sat());
 
-            let current_height = lock_debug!(self.wallet.read())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .blockchain
-                .get_block_count()
-                .map_err(MakerError::Wallet)?;
-            let current_height = u32::try_from(current_height)
-                .map_err(|_| MakerError::General("backend tip does not fit u32"))?;
-
-            // Set locktime for test (950 blocks) or production
+            // Set timelock for test (950 blocks) or production
             #[cfg(feature = "integration-test")]
-            let locktime = {
+            let relative_timelock = {
                 use super::handlers::MakerBehavior;
-                let offset = if self.behavior == MakerBehavior::InvalidFidelityTimelock {
+                if self.behavior == MakerBehavior::InvalidFidelityTimelock {
                     log::warn!("Test behavior: using invalid (too short) fidelity timelock");
                     10
                 } else {
                     950
-                };
-                let height = current_height
-                    .checked_add(offset)
-                    .ok_or(MakerError::General("fidelity locktime height overflows"))?;
-                LockTime::from_height(height).map_err(WalletError::Locktime)?
+                }
             };
             #[cfg(not(feature = "integration-test"))]
-            let locktime = {
-                let height = self
-                    .config
-                    .fidelity_timelock
-                    .checked_add(current_height)
-                    .ok_or(MakerError::General("fidelity locktime height overflows"))?;
-                LockTime::from_height(height).map_err(WalletError::Locktime)?
+            let relative_timelock = {
+                let timelock = self.config.fidelity_timelock.clamp(
+                    MIN_FIDELITY_TIMELOCK + BOND_CONFIRMATION_MARGIN,
+                    MAX_FIDELITY_TIMELOCK,
+                );
+                if timelock != self.config.fidelity_timelock {
+                    log::info!(
+                        "Using a {} block fidelity timelock instead of {}, so a bond that confirms late still meets the {} block minimum",
+                        timelock,
+                        self.config.fidelity_timelock,
+                        MIN_FIDELITY_TIMELOCK
+                    );
+                }
+                timelock
             };
 
-            log::info!(
-                "Fidelity timelock {:?} blocks",
-                locktime.to_consensus_u32() - current_height
-            );
+            log::info!("Fidelity timelock {:?} blocks", relative_timelock);
 
             // Wait for funds and create fidelity bond
             const SYNC_INTERVAL: Duration = Duration::from_secs(10);
@@ -1481,6 +1617,32 @@ impl MakerServer {
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?
                     .sync_and_save(&self.shutdown)
                     .map_err(MakerError::Wallet)?;
+
+                // Read the tip on every attempt: blocks mined while we wait for
+                // funds would otherwise come out of the bond's timelock.
+                let tip = lock_debug!(self.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                    .blockchain
+                    .get_block_count();
+                // Being read on every attempt, a transient backend error here
+                // should not end the setup. Try again on the next sync.
+                let current_height = match tip {
+                    Ok(height) => height,
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to read the chain tip, retrying in {} secs: {:?}",
+                            SYNC_INTERVAL.as_secs(),
+                            e
+                        );
+                        if !self.wait_for_shutdown(SYNC_INTERVAL) {
+                            return Err(MakerError::Shutdown.into());
+                        }
+                        continue;
+                    }
+                };
+                let current_height = u32::try_from(current_height)
+                    .map_err(|_| MakerError::General("backend tip does not fit u32"))?;
+                let locktime = fidelity_bond_locktime(current_height, relative_timelock)?;
 
                 let fidelity_result = lock_debug!(self.wallet.write())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -1541,9 +1703,21 @@ impl MakerServer {
                                 addr
                             );
 
+                            // Funds in a bond whose lock has ended come back here,
+                            // even while the renewal loop is blocked on this wait.
+                            if let Err(e) = lock_debug!(self.wallet.write())
+                                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                                .redeem_expired_fidelity_bonds(
+                                    MIN_RELAY_FEE_RATE,
+                                    AddressType::P2TR,
+                                )
+                            {
+                                log::warn!("Failed to redeem expired fidelity bonds: {:?}", e);
+                            }
+
                             log::info!("Next sync in {} secs", SYNC_INTERVAL.as_secs());
                             if !self.wait_for_shutdown(SYNC_INTERVAL) {
-                                return Err(MakerError::Shutdown);
+                                return Err(MakerError::Shutdown.into());
                             }
                         } else {
                             log::error!(
@@ -1551,7 +1725,7 @@ impl MakerServer {
                                 self.config.network_port,
                                 e
                             );
-                            return Err(MakerError::Wallet(e));
+                            return Err(MakerError::Wallet(e).into());
                         }
                     }
                     Ok((index, txid)) => {
@@ -1567,6 +1741,21 @@ impl MakerServer {
                             .map_err(|_| MakerError::General("Failed to lock wallet"))?
                             .update_fidelity_bond_conf_details(index, conf_height)
                             .map_err(MakerError::Wallet)?;
+
+                        if !self.bond_timelock_accepted(locktime, Some(conf_height)) {
+                            // At startup, waiting for funds for a replacement
+                            // would hold up serving; the renewal loop funds one.
+                            if !fund_replacement {
+                                return Err(BondSetupError::TooLate { index, conf_height });
+                            }
+                            log::warn!(
+                                "[{}] Fidelity bond {} confirmed at height {}, too late for its timelock; funding a replacement",
+                                self.config.network_port,
+                                index,
+                                conf_height
+                            );
+                            continue;
+                        }
 
                         log::info!(
                             "[{}] Successfully created fidelity bond",
@@ -1596,7 +1785,7 @@ impl MakerServer {
         lock_debug!(self.highest_fidelity_proof.read())
             .map_err(|_| MakerError::General("Failed to lock fidelity proof"))?
             .clone()
-            .ok_or(MakerError::General("No fidelity proof after setup"))
+            .ok_or(MakerError::General("No fidelity proof after setup").into())
     }
 
     /// Check if maker has enough liquidity for swaps.
@@ -1632,6 +1821,16 @@ impl MakerServer {
                 log::warn!(
                     "Low Swap Liquidity | Min: {min_required} sats | Available: {offer_max_size} sats. Add funds to {addr:?}"
                 );
+
+                // The renewal loop starts only after this wait, so a bond whose
+                // lock ends meanwhile, such as one that confirmed too late to
+                // advertise, is redeemed here or its coins stay out of reach.
+                if let Err(e) = lock_debug!(self.wallet.write())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                    .redeem_expired_fidelity_bonds(MIN_RELAY_FEE_RATE, AddressType::P2TR)
+                {
+                    log::warn!("Failed to redeem expired fidelity bonds: {:?}", e);
+                }
 
                 log::info!("Next sync in {} secs", SYNC_INTERVAL.as_secs());
                 if !self.wait_for_shutdown(SYNC_INTERVAL) {
@@ -4000,16 +4199,17 @@ pub(crate) mod tests {
     #[cfg(feature = "integration-test")]
     use super::MakerBehavior;
     use super::{
-        min_swap_amount, swap_cost_floor, BackendConnector, ConnectionState, MakerError,
-        MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal, ThreadPool, WatchService,
-        MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
+        bond_timelock_in_range, fidelity_bond_locktime, min_swap_amount, swap_cost_floor,
+        BackendConnector, ConnectionState, MakerError, MakerServer, MakerServerConfig, MakerTrait,
+        ShutdownSignal, ThreadPool, WatchService, MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
         utill::MIN_RELAY_FEE_RATE,
         wallet::{
             seed_cli::WalletInUse, swapcoin::OutgoingSwapCoin, test_wallet, FidelityError,
-            WalletError, MIN_FIDELITY_BOND_AMOUNT_SATS,
+            WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS,
+            MIN_FIDELITY_TIMELOCK,
         },
         watch_tower::{service::answering, watcher::WatcherEvent},
     };
@@ -4226,6 +4426,57 @@ pub(crate) mod tests {
                 .fidelity_amount,
             MIN_FIDELITY_BOND_AMOUNT_SATS * 50
         );
+    }
+
+    /// Takers check `lock_time - confirmation_height`, and a bond built at
+    /// `tip` confirms at `tip + 1` at the earliest. Counting from the tip left
+    /// a maker configured at the minimum timelock one block short, so every
+    /// taker refused its bond.
+    #[test]
+    fn fidelity_bond_locktime_counts_from_the_next_block() {
+        let tip = 800_000u32;
+        for timelock in [MIN_FIDELITY_TIMELOCK, MAX_FIDELITY_TIMELOCK] {
+            let locktime = fidelity_bond_locktime(tip, timelock).unwrap();
+            let relative = locktime.to_consensus_u32() - (tip + 1);
+            assert_eq!(relative, timelock);
+            assert!((MIN_FIDELITY_TIMELOCK..=MAX_FIDELITY_TIMELOCK).contains(&relative));
+        }
+
+        // Heights that are not valid block-height locktimes are refused.
+        assert!(fidelity_bond_locktime(u32::MAX, MIN_FIDELITY_TIMELOCK).is_err());
+        // Locktimes from 500,000,000 up are timestamps, not heights.
+        let last_height = 499_999_999u32;
+        assert!(fidelity_bond_locktime(
+            last_height - MIN_FIDELITY_TIMELOCK - 1,
+            MIN_FIDELITY_TIMELOCK
+        )
+        .is_ok());
+        assert!(
+            fidelity_bond_locktime(last_height - MIN_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK)
+                .is_err()
+        );
+    }
+
+    /// A bond at the minimum timelock is only in range if it confirms in the
+    /// block right after the tip it was built at. Confirming later leaves it
+    /// short, and setup must not advertise it.
+    #[test]
+    fn fidelity_bond_that_confirms_late_is_out_of_range() {
+        let tip = 800_000u32;
+
+        let min_bond = fidelity_bond_locktime(tip, MIN_FIDELITY_TIMELOCK).unwrap();
+        assert!(bond_timelock_in_range(min_bond, tip + 1));
+        assert!(!bond_timelock_in_range(min_bond, tip + 2));
+
+        let max_bond = fidelity_bond_locktime(tip, MAX_FIDELITY_TIMELOCK).unwrap();
+        assert!(bond_timelock_in_range(max_bond, tip + 1));
+        assert!(bond_timelock_in_range(max_bond, tip + 100));
+
+        // A confirmation height past the lock itself is never in range.
+        assert!(!bond_timelock_in_range(
+            min_bond,
+            min_bond.to_consensus_u32() + 1
+        ));
     }
 
     #[test]

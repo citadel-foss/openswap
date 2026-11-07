@@ -26,12 +26,15 @@ use crate::{
         now_secs, HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE,
         UNBROADCAST_DISCARD_GRACE,
     },
-    wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, SwapRole, Wallet},
+    wallet::{
+        AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, SwapRole, Wallet,
+        MIN_FIDELITY_TIMELOCK,
+    },
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
 
 use super::{
-    api::MakerServer,
+    api::{BondSetupError, MakerServer},
     error::MakerError,
     handlers::{
         emit_maker_success_report, handle_message, ConnectionState, Maker, MAX_CONCURRENT_SWAPS,
@@ -346,7 +349,16 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             "[{}] Setting up fidelity bond...",
             maker.config.network_port
         );
-        maker.setup_fidelity_bond(maker_address)?;
+        // A reorg may have moved a bond since the last run, and the range
+        // check below reads the stored height.
+        if let Err(e) = refresh_fidelity_conf_heights(&maker) {
+            log::warn!(
+                "[{}] Could not refresh fidelity bond heights: {:?}",
+                maker.config.network_port,
+                e
+            );
+        }
+        setup_startup_fidelity_bond(&maker, maker_address)?;
         spawn_nostr_broadcast_thread(&maker)?;
         log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
         maker.check_swap_liquidity()?;
@@ -1069,6 +1081,29 @@ fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result
     }
 
     Ok(())
+}
+
+/// Runs the startup bond setup. A bond that confirmed too late for takers to
+/// accept does not stop startup: the maker serves without a bond, and the
+/// renewal loop, which starts once the maker is serving, funds a replacement.
+fn setup_startup_fidelity_bond(
+    maker: &Arc<MakerServer>,
+    maker_address: &str,
+) -> Result<(), MakerError> {
+    match maker.setup_fidelity_bond_with(maker_address, false) {
+        Ok(_) => Ok(()),
+        Err(BondSetupError::TooLate { index, conf_height }) => {
+            log::error!(
+                "[{}] Fidelity bond {} confirmed at height {}, too late for its timelock to stay above the {} block minimum takers accept. Starting without a bond; the renewal loop will fund a new one.",
+                maker.config.network_port,
+                index,
+                conf_height,
+                MIN_FIDELITY_TIMELOCK
+            );
+            Ok(())
+        }
+        Err(BondSetupError::Maker(e)) => Err(e),
+    }
 }
 
 /// Corrects the advertised confirmation height of every unspent bond after a
@@ -2140,10 +2175,19 @@ mod tests {
     use super::*;
     use crate::{
         maker::api::tests::compat_test_maker,
-        protocol::common_messages::{Hello, PrivateKeyHandover},
+        protocol::common_messages::{FidelityProof, Hello, PrivateKeyHandover},
+        wallet::{
+            blockchain::{mock_electrum, MockElectrum},
+            Electrum, ElectrumConfig, FidelityBond,
+        },
         watch_tower::service::answering,
     };
-    use bitcoin::{hashes::Hash, Txid};
+    use bitcoin::{
+        absolute::LockTime,
+        hashes::Hash,
+        secp256k1::{Message, Secp256k1, SecretKey},
+        Amount, PublicKey, Txid,
+    };
     use serde::{Deserialize, Serialize};
     use serde_cbor::{value::to_value, Value};
     use std::{
@@ -2616,5 +2660,124 @@ mod tests {
         thread::sleep(Duration::from_millis(150));
 
         assert!(reader.join().unwrap().is_err());
+    }
+
+    /// A bond that confirmed too late for its timelock leaves less than the
+    /// minimum takers accept. Startup setup must report it, stop advertising
+    /// it (a reorg can move an advertised bond's height), and the maker must
+    /// still start.
+    #[test]
+    fn startup_skips_a_bond_that_confirmed_too_late() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let tip = 800_000u32;
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[3; 32]).unwrap();
+        let pubkey = PublicKey::new(secret.public_key(&secp));
+        let bond = FidelityBond {
+            outpoint: OutPoint::new(Txid::all_zeros(), 0),
+            amount: Amount::from_sat(50_000),
+            // Built at `tip` with the minimum timelock, confirmed one block late.
+            lock_time: LockTime::from_height(tip + 1 + MIN_FIDELITY_TIMELOCK).unwrap(),
+            pubkey,
+            conf_height: Some(tip + 2),
+            is_spent: false,
+            bond_index: 0,
+            tx: None,
+            extra: BTreeMap::new(),
+        };
+        let address = "127.0.0.1:6102";
+        // The bond's last locked block: still locked, so it can't be redeemed.
+        let _server = use_mock_electrum_tip(&maker, u64::from(bond.lock_time.to_consensus_u32()));
+        // Fail fast instead of waiting for funds if setup misses `TooLate`.
+        maker.shutdown.store(true, Ordering::SeqCst);
+
+        // The bond is already advertised, as it would be if a reorg moved its
+        // confirmation height after an earlier setup accepted it.
+        let advertise = || {
+            let cert_hash = bond.generate_cert_hash(address, &pubkey);
+            let cert_sig =
+                secp.sign_ecdsa(&Message::from_digest(cert_hash.to_byte_array()), &secret);
+            *maker.highest_fidelity_proof.write().unwrap() = Some(FidelityProof {
+                bond: bond.clone(),
+                cert_hash,
+                cert_sig,
+            });
+        };
+        maker
+            .wallet
+            .write()
+            .unwrap()
+            .store
+            .fidelity_bond
+            .push(bond.clone());
+
+        advertise();
+        match maker.setup_fidelity_bond_with(address, false) {
+            Err(BondSetupError::TooLate { index, conf_height }) => {
+                assert_eq!((index, conf_height), (0, tip + 2));
+            }
+            other => panic!("expected BondSetupError::TooLate, got {:?}", other),
+        }
+        assert!(maker.highest_fidelity_proof.read().unwrap().is_none());
+
+        advertise();
+        setup_startup_fidelity_bond(&maker, address).unwrap();
+        assert!(maker.highest_fidelity_proof.read().unwrap().is_none());
+    }
+
+    /// An expired bond is redeemed to fund its replacement, so startup goes on
+    /// to fund one instead of reporting the bond as too late.
+    #[test]
+    fn startup_replaces_an_expired_rejected_bond() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let conf_height = 800_000u32;
+        let lock = conf_height - 1 + MIN_FIDELITY_TIMELOCK;
+        // The chain has passed the bond's lock, so it is expired.
+        let _server = use_mock_electrum_tip(&maker, u64::from(lock) + 1);
+        let secret = SecretKey::from_slice(&[4; 32]).unwrap();
+        maker
+            .wallet
+            .write()
+            .unwrap()
+            .store
+            .fidelity_bond
+            .push(FidelityBond {
+                outpoint: OutPoint::new(Txid::all_zeros(), 0),
+                amount: Amount::from_sat(50_000),
+                lock_time: LockTime::from_height(lock).unwrap(),
+                pubkey: PublicKey::new(secret.public_key(&Secp256k1::new())),
+                conf_height: Some(conf_height),
+                is_spent: false,
+                bond_index: 0,
+                tx: None,
+                extra: BTreeMap::new(),
+            });
+        // Stop before waiting for funds: reaching the wait is what matters.
+        maker.shutdown.store(true, Ordering::SeqCst);
+
+        match maker.setup_fidelity_bond_with("127.0.0.1:6102", false) {
+            Err(BondSetupError::Maker(MakerError::General("No fidelity proof after setup"))) => {}
+            other => panic!("expected setup to reach the funding wait, got {:?}", other),
+        }
+    }
+
+    /// Points the maker's wallet at a mock Electrum server whose tip is `tip`.
+    /// Keep the returned server alive for the rest of the test.
+    fn use_mock_electrum_tip(maker: &MakerServer, tip: u64) -> MockElectrum {
+        let server = mock_electrum(|_, _| Ok(serde_json::Value::Null));
+        server.set_tip(
+            tip,
+            &bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
+        );
+        maker.wallet.write().unwrap().blockchain = AnyBlockchain::Electrum(
+            Electrum::new(&ElectrumConfig {
+                url: server.url.clone(),
+                ..Default::default()
+            })
+            .expect("connect to mock electrum"),
+        );
+        server
     }
 }

@@ -509,14 +509,18 @@ impl Wallet {
         serde_json::to_string_pretty(&serialized).map_err(|e| WalletError::General(e.to_string()))
     }
 
-    /// Whether a confirmed, unspent bond is still locked at the tip. Read from
-    /// the bond records, so a failed valuation never reads as no live bond.
-    pub(crate) fn has_live_fidelity_bond(&self) -> Result<bool, WalletError> {
+    /// Whether a confirmed, unspent bond that `accept` lets through is still
+    /// locked at the tip. Read from the bond records, so a failed valuation
+    /// never reads as no live bond.
+    pub(crate) fn has_live_fidelity_bond_where(
+        &self,
+        accept: impl Fn(&FidelityBond) -> bool,
+    ) -> Result<bool, WalletError> {
         let mut confirmed = self
             .store
             .fidelity_bond
             .iter()
-            .filter(|bond| !bond.is_spent && bond.conf_height.is_some())
+            .filter(|bond| !bond.is_spent && bond.conf_height.is_some() && accept(bond))
             .peekable();
         if confirmed.peek().is_none() {
             return Ok(false);
@@ -532,8 +536,23 @@ impl Wallet {
 
     /// Get the highest value fidelity bond. Returns None, if no bond exists.
     pub fn get_highest_fidelity_index(&self) -> Result<Option<u32>, WalletError> {
-        // No live bond means no valuation and no chain calls.
-        if self.store.fidelity_bond.iter().all(|b| b.is_spent) {
+        self.get_highest_fidelity_index_where(|_| true)
+    }
+
+    /// [`Self::get_highest_fidelity_index`], among the bonds `accept` lets
+    /// through.
+    pub(crate) fn get_highest_fidelity_index_where(
+        &self,
+        accept: impl Fn(&FidelityBond) -> bool,
+    ) -> Result<Option<u32>, WalletError> {
+        // No live bond `accept` lets through means no valuation and no chain
+        // calls.
+        if self
+            .store
+            .fidelity_bond
+            .iter()
+            .all(|b| b.is_spent || !accept(b))
+        {
             return Ok(None);
         }
         let (tip_height, tip_time) = self.chain_tip()?;
@@ -543,7 +562,7 @@ impl Wallet {
             .iter()
             .filter_map(|bond| {
                 let i = bond.bond_index;
-                if !bond.is_spent {
+                if !bond.is_spent && accept(bond) {
                     match self.calculate_bond_value(bond, tip_height, tip_time) {
                         Ok(v) => {
                             log::info!("Fidelity Bond found | Index: {i} | Bond Value : {v}");

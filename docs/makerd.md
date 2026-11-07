@@ -55,7 +55,7 @@ name = "default-maker"
 - `control_port`: The Tor Control Port. Check the [tor doc](tor.md) for more details.
 - `tor_auth_password`: Optional password for Tor control authentication; empty by default.
 - `fidelity_amount`: Amount (in satoshis) locked as a fidelity bond to deter Sybil attacks. Defaults to 10,000 sats, which is also the minimum; lower values are refused at startup, because takers drop announcements for bonds below that floor and the maker would never be discovered.
-- `fidelity_timelock`: Lock duration in block heights for the fidelity bond. Defaults to 15,000 blocks; must be within the accepted range of 12,960–25,920 blocks.
+- `fidelity_timelock`: Lock duration in block heights for the fidelity bond, counted from the block after the tip it is built at. Defaults to 15,000 blocks; must be within the accepted range of 12,960–25,920 blocks. Values below 13,104 are raised to 13,104, so a bond that takes up to 144 blocks longer to confirm still meets the minimum takers accept.
 - `fidelity_feerate`: Fee rate (in sats/vB) for the fidelity bond transaction. Defaults to 1.0, the relay minimum; lower values are clamped to it.
 - `base_fee`: A fixed fee charged by the Maker for providing its services (in satoshis).
 - `amount_relative_fee_pct`: A percentage fee based on the swap amount.

@@ -3,13 +3,18 @@
 //! These tests verify that the Maker server automatically renews fidelity bonds
 //! when they expire while the server is running.
 
-use bitcoin::Amount;
+use bitcoin::{absolute::LockTime, Amount};
 use bitcoind::bitcoincore_rpc::RpcApi;
-use openswap::{maker::start_server, wallet::AddressType};
+use openswap::{maker::start_server, utill::MIN_RELAY_FEE_RATE, wallet::AddressType};
 
 use crate::test_framework::*;
 
-use std::{sync::atomic::Ordering::Relaxed, thread, time::Duration};
+use std::{
+    fs,
+    sync::atomic::Ordering::Relaxed,
+    thread,
+    time::{Duration, Instant},
+};
 
 /// Test automatic fidelity bond renewal for the maker server.
 #[world_test(
@@ -191,4 +196,90 @@ fn bond_auto_renewal(world: &mut World) {
     // Shutdown
     maker.shutdown.store(true, Relaxed);
     let _ = maker_thread.join();
+}
+
+/// A bond that confirmed too late is never advertised, and with no other
+/// coins startup then waits for swap liquidity before the renewal loop runs.
+/// Once the bond's lock ends, that wait must redeem it, so its coins come back
+/// and setup completes without an outside deposit.
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 1,
+)]
+fn late_bond_is_redeemed_during_the_liquidity_wait(world: &mut World) {
+    let bitcoind = world.bitcoind();
+    let maker = world.makers()[0].inner().clone();
+
+    // Almost every sat goes into the bond, leaving less than the minimum swap
+    // amount spendable.
+    world.fund_makers(1, Amount::from_sat(100_000), AddressType::P2TR);
+    world.framework().set_block_gen_paused(true);
+    // Far below the minimum timelock, so takers reject it once it confirms.
+    let lock_blocks = 50u32;
+    let lock_height = bitcoind.client.get_block_count().unwrap() as u32 + lock_blocks;
+    let (bond_index, _) = maker
+        .wallet
+        .write()
+        .unwrap()
+        .create_fidelity(
+            Amount::from_sat(99_000),
+            LockTime::from_height(lock_height).unwrap(),
+            None,
+            MIN_RELAY_FEE_RATE,
+            AddressType::P2TR,
+        )
+        .unwrap();
+    world.mine(1);
+
+    let log_path = world.taker_log_path();
+    let mark = log_mark(&log_path);
+    let maker_clone = maker.clone();
+    let maker_thread = thread::spawn(move || {
+        let _ = start_server(maker_clone);
+    });
+
+    // Read before stopping, assert after: a failed assert must not leave the
+    // maker running.
+    let in_new_log = |needle: &str| {
+        fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .get(mark as usize..)
+            .is_some_and(|new| new.contains(needle))
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !in_new_log("Low Swap Liquidity") && Instant::now() < deadline {
+        thread::sleep(POLL);
+    }
+    let waiting_for_liquidity =
+        in_new_log("Low Swap Liquidity") && !maker.is_setup_complete.load(Relaxed);
+
+    // End the bond's lock, then let the redemption confirm.
+    world.mine(u64::from(lock_blocks) + 1);
+    world.framework().set_block_gen_paused(false);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !maker.is_setup_complete.load(Relaxed) && Instant::now() < deadline {
+        thread::sleep(POLL);
+    }
+    let setup_complete = maker.is_setup_complete.load(Relaxed);
+    let bond_spent =
+        maker.wallet.read().unwrap().get_fidelity_bonds()[bond_index as usize].is_spent();
+    maker.shutdown.store(true, Relaxed);
+    let _ = maker_thread.join();
+
+    assert!(
+        waiting_for_liquidity,
+        "startup must skip the late bond and wait for swap liquidity"
+    );
+    assert!(
+        bond_spent,
+        "the liquidity wait must redeem the bond once its lock ends"
+    );
+    assert!(
+        setup_complete,
+        "setup must complete once the redeemed bond's coins come back"
+    );
+    assert_log!(log_path, since mark; {
+        has format!("Fidelity bond {bond_index} confirmed at height"),
+        has format!("Fidelity Bond at index: {bond_index} expired | Redeeming it."),
+    });
 }
