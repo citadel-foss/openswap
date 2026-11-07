@@ -614,12 +614,8 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
     );
 }
 
-/// While a Core re-check after lost notifications is pending, the watcher
-/// answers "no spend" for an HTLC the taker may already have claimed. Past
-/// the CSV that answer must not send the maker's refund, which the chain
-/// would reject anyway; the chain decides, here and after a restart. Once
-/// the watcher has the claim, the maker settles the held payment from its
-/// preimage.
+/// A missed claim must settle through a direct chain lookup after restart,
+/// even when the watcher never learns the spending transaction.
 #[world_test(
     backend = BitcoindBackend,
     bind = [ln = maker_node()],
@@ -632,12 +628,34 @@ fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
 ) {
+    recover_unseen_claim(world, ln, true);
+}
+
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_recovers_an_unseen_claim_before_csv_without_funding_height(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    recover_unseen_claim(world, ln, false);
+}
+
+fn recover_unseen_claim(world: &mut World, ln: Arc<MockLightningBackend>, mature: bool) {
     use openswap::maker::lightning_handlers::HIDE_HTLC_SPENDS;
 
     let framework = world.framework().clone();
     let bitcoind = &framework.bitcoind;
     let maker = world.makers()[0].inner().clone();
     let locktime: u16 = 30;
+    pause_block_generation(&framework);
+    let claim_deadline = bitcoind.client.get_block_count().unwrap() as u32 + 100;
+    ln.set_claim_deadline(Some(claim_deadline));
 
     let preimage = Preimage([0x7b; 32]);
     let swap_id = preimage.payment_hash().to_string();
@@ -652,8 +670,14 @@ fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
     let funded_at = bitcoind.client.get_block_count().unwrap()
         - confirmations(bitcoind, &funded.outpoint.txid) as u64
         + 1;
-    // Past the CSV, so only the chain stands between the watchdog and a refund.
-    mine_to(bitcoind, funded_at + locktime as u64 + 1);
+    if mature {
+        // Only the chain stands between the watchdog and a refund.
+        mine_to(bitcoind, funded_at + locktime as u64 + 1);
+    } else {
+        let mut swap = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+        swap.funding_height = None;
+        maker.store_ln_swap(&swap_id, swap).unwrap();
+    }
 
     // ---- The taker claims, and the watcher does not say so ----
     let hidden = Switch::on(&HIDE_HTLC_SPENDS);
@@ -694,7 +718,6 @@ fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
             "the maker refunded an HTLC the taker had claimed"
         );
     };
-    ln_watchdog_tick_now(&maker);
     no_refund(&maker);
 
     // ---- Still unseen after a restart ----
@@ -708,35 +731,100 @@ fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
     restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
     world.adopt_makers([Arc::new(restarted)]);
     let maker = world.makers()[0].inner().clone();
-    ln_watchdog_tick_now(&maker);
-    no_refund(&maker);
-
-    // ---- Once the watcher has the claim, the preimage settles the swap ----
-    drop(hidden);
-    wait_until!(
-        Duration::from_secs(30),
-        every Duration::from_millis(200),
-        "the maker to settle from the taker's claim",
-        {
-            ln_watchdog_tick_now(&maker);
-            maker.get_ln_swap(&swap_id).unwrap().is_none()
-        }
+    // Recovery must work while the watcher remains blind, including after restart.
+    assert_eq!(
+        maker.get_ln_swap(&swap_id).unwrap().unwrap().claim_deadline,
+        Some(claim_deadline)
     );
-    let mut released = None;
+    assert!(bitcoind.client.get_block_count().unwrap() < claim_deadline as u64);
+    if !mature {
+        assert!(bitcoind.client.get_block_count().unwrap() < funded_at + locktime as u64);
+    }
+    ln_watchdog_tick_now(&maker);
+    assert!(
+        maker.get_ln_swap(&swap_id).unwrap().is_none(),
+        "the watchdog never recovered the unseen claim preimage"
+    );
+    // A later pass must not settle twice.
+    ln_watchdog_tick_now(&maker);
+    drop(hidden);
+    let mut released = Vec::new();
     while let Some(event) = ln.poll_event().unwrap() {
         if let LnEvent::PaymentSuccessful {
             preimage: Some(preimage),
             ..
         } = event
         {
-            released = Some(preimage);
+            released.push(preimage);
         }
     }
     assert_eq!(
         released,
-        Some(preimage),
+        vec![preimage],
         "the held payment must be settled with the claim's preimage"
     );
+    framework.set_block_gen_paused(false);
+}
+
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_warns_before_claim_deadline_after_restart_without_funding_height(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    pause_block_generation(&framework);
+    let maker = world.makers()[0].inner().clone();
+    let deadline = bitcoind.client.get_block_count().unwrap() as u32 + 100;
+    ln.set_claim_deadline(Some(deadline));
+    let hash = Preimage([0x7c; 32]).payment_hash();
+    let id = hash.to_string();
+    fund_swap_out(&maker, &ln, hash, Amount::from_sat(40_000), 30);
+    let mut swap = maker.get_ln_swap(&id).unwrap().unwrap();
+    swap.funding_height = None;
+    maker.store_ln_swap(&id, swap).unwrap();
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(maker);
+    world.drop_makers();
+    let mut restarted = MakerServer::init(config).unwrap();
+    restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
+    world.adopt_makers([Arc::new(restarted)]);
+    let maker = world.makers()[0].inner().clone();
+    assert_eq!(
+        maker.get_ln_swap(&id).unwrap().unwrap().claim_deadline,
+        Some(deadline)
+    );
+    let warning = format!("Swap-out {id}: preimage unrecovered; hold-invoice claim deadline");
+    let log_path = world.taker_log_path();
+    mine_to(bitcoind, deadline as u64 - 7);
+    ln_watchdog_tick_now(&maker);
+    assert!(!std::fs::read_to_string(&log_path)
+        .unwrap()
+        .contains(&warning));
+    // The existing six-block settlement margin is also the warning lead time.
+    mine_to(bitcoind, deadline as u64 - 6);
+    ln_watchdog_tick_now(&maker);
+    wait_for_log(&log_path, &warning, Duration::from_secs(5));
+    mine_to(bitcoind, deadline as u64);
+    ln_watchdog_tick_now(&maker);
+    let pending = maker.get_ln_swap(&id).unwrap().unwrap();
+    assert_eq!(pending.funding_height, None);
+    assert_eq!(
+        pending.refund_txid, None,
+        "a deadline warning authorized a refund"
+    );
+    assert_eq!(pending.phase, LnMakerPhase::OutFunded);
+    framework.set_block_gen_paused(false);
 }
 
 /// An unfunded swap-in as the maker stores it on acceptance.
@@ -772,6 +860,7 @@ fn accepted_swap_in_with_locktime(preimage: &Preimage, locktime: u16) -> LnMaker
         payout_script: None,
         funding: None,
         funding_height: None,
+        claim_deadline: None,
         updated_at: Instant::now(),
     }
 }

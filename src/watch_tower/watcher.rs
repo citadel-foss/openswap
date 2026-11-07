@@ -986,7 +986,7 @@ fn lookup_spend(core: &CoreRPC, outpoint: &OutPoint) -> Result<Spend, WatcherErr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bitcoin::{
         consensus::{encode::serialize_hex, serialize},
@@ -1248,7 +1248,7 @@ mod tests {
     /// Serves Core JSON-RPC from `answer` on every connection and records each
     /// method called; an `Err` is sent as the JSON-RPC error object. Runs
     /// until the test process exits.
-    fn mock_core_rpc(
+    pub(crate) fn mock_core_rpc(
         answer: impl Fn(&str, &Value) -> Result<Value, Value> + Send + Sync + 'static,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Core RPC");

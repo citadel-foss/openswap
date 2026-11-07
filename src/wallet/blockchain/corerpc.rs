@@ -295,10 +295,34 @@ impl CoreRPC {
         &self,
         outpoint: &OutPoint,
     ) -> Result<Option<Transaction>, WalletError> {
-        let spends: Vec<SpendingPrevout> = self.rpc.call(
+        let spends: Vec<SpendingPrevout> = match self.rpc.call(
             "gettxspendingprevout",
             &[json!([{ "txid": outpoint.txid, "vout": outpoint.vout }])],
-        )?;
+        ) {
+            // Core 22/23 predate this RPC. Preserve their recovery support
+            // using the existing UTXO and mempool queries. Other RPC errors
+            // remain errors, never an assertion that the output is unspent.
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -32601 => {
+                if self
+                    .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))?
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+                for txid in self.rpc.get_raw_mempool()? {
+                    let tx = self.get_raw_transaction(&txid, None)?;
+                    if tx
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output == *outpoint)
+                    {
+                        return Ok(Some(tx));
+                    }
+                }
+                return Ok(None);
+            }
+            result => result?,
+        };
         match spends.first().and_then(|spend| spend.spendingtxid) {
             Some(txid) => self.get_raw_transaction(&txid, None).map(Some),
             None => Ok(None),
@@ -748,6 +772,71 @@ pub(crate) mod tests {
         wallet::{api::test_support::test_wallet, AnyBlockchain, BackendConfig, Wallet},
     };
     use zeroize::Zeroizing;
+
+    #[test]
+    fn legacy_mempool_spend_lookup_preserves_errors_and_finds_claims() {
+        use crate::watch_tower::watcher::tests::mock_core_rpc;
+        use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let outpoint = OutPoint::new(Txid::from_byte_array([9; 32]), 0);
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                ..Default::default()
+            }],
+            output: Vec::new(),
+        };
+        let state = Arc::new(AtomicUsize::new(0));
+        let (url, _) = mock_core_rpc({
+            let state = state.clone();
+            let tx = tx.clone();
+            move |method, _| match method {
+                "gettxspendingprevout" if state.load(Ordering::SeqCst) == 2 => {
+                    Err(json!({"code": -28, "message": "warming up"}))
+                }
+                "gettxspendingprevout" => {
+                    Err(json!({"code": -32601, "message": "Method not found"}))
+                }
+                "gettxout" if state.load(Ordering::SeqCst) == 0 => Ok(json!({
+                    "bestblock": "00".repeat(32), "confirmations": 100, "value": 0.0004,
+                    "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"}, "coinbase": false
+                })),
+                "gettxout" => Ok(Value::Null),
+                "getrawmempool" if state.load(Ordering::SeqCst) == 3 => {
+                    Err(json!({"code": -28, "message": "mempool unavailable"}))
+                }
+                "getrawmempool" => Ok(json!([tx.compute_txid()])),
+                "getrawtransaction" if state.load(Ordering::SeqCst) == 4 => {
+                    Err(json!({"code": -5, "message": "transaction disappeared"}))
+                }
+                "getrawtransaction" => Ok(json!(serialize_hex(&tx))),
+                other => panic!("unexpected RPC {}", other),
+            }
+        });
+        let core = CoreRPC::new(&CoreRpcConfig {
+            url,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(core
+            .mempool_spending_transaction(&outpoint)
+            .unwrap()
+            .is_none());
+        state.store(1, Ordering::SeqCst);
+        assert_eq!(
+            core.mempool_spending_transaction(&outpoint).unwrap(),
+            Some(tx)
+        );
+        for mode in [2, 3, 4] {
+            state.store(mode, Ordering::SeqCst);
+            assert!(core.mempool_spending_transaction(&outpoint).is_err());
+        }
+    }
 
     /// Serves one canned reply per JSON-RPC method, failing on any other.
     fn mock_core(
