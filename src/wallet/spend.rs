@@ -298,14 +298,11 @@ impl Wallet {
                         ))
                     })?;
 
-                // I don't know if this case is even possible?
-                if fee > total_input_value {
-                    return Err(WalletError::InsufficientFund {
-                        available: total_input_value.to_sat(),
-                        required: fee.to_sat(),
-                    });
-                }
-                tx.output[0].value = total_input_value - fee;
+                tx.output[0].value = sweep_output_value(
+                    total_input_value,
+                    fee,
+                    addr.script_pubkey().minimal_non_dust(),
+                )?;
             }
             SpendTarget::Destination(Destination::Multi {
                 outputs,
@@ -377,10 +374,10 @@ impl Wallet {
                         });
                     };
 
-                if remaining_wchange > minimal_nondust {
+                if let Some(change) = change_output(remaining_wchange, minimal_nondust) {
                     tx.output.push(TxOut {
                         script_pubkey: internal_spk,
-                        value: remaining_wchange,
+                        value: change,
                     });
                 } else {
                     log::info!(
@@ -455,6 +452,36 @@ impl Wallet {
     }
 }
 
+/// The single output a sweep leaves after its fee. Refuses one below the
+/// output script's dust limit, a zero output included: no node relays it.
+fn sweep_output_value(
+    total_input: Amount,
+    fee: Amount,
+    dust_limit: Amount,
+) -> Result<Amount, WalletError> {
+    let value = total_input
+        .checked_sub(fee)
+        .ok_or(WalletError::InsufficientFund {
+            available: total_input.to_sat(),
+            required: fee.to_sat(),
+        })?;
+    if value < dust_limit {
+        return Err(WalletError::General(format!(
+            "sweep leaves {} sats after a {} sat fee, below the {} sat dust limit",
+            value.to_sat(),
+            fee.to_sat(),
+            dust_limit.to_sat()
+        )));
+    }
+    Ok(value)
+}
+
+/// Change worth an output: at least the change script's dust limit, which is
+/// the smallest value that is not dust. Smaller change goes to the miner.
+fn change_output(remaining: Amount, dust_limit: Amount) -> Option<Amount> {
+    (remaining >= dust_limit).then_some(remaining)
+}
+
 /// The change an exact spend returns. Refuses outputs above `spend`, inputs
 /// below it, and dust change, which cannot go to the miner without spending
 /// more than `spend`. Dust is checked against P2TR, the highest-dust change
@@ -509,6 +536,31 @@ mod tests {
 
     const fn sats(n: u64) -> Amount {
         Amount::from_sat(n)
+    }
+
+    #[test]
+    fn sweep_refuses_a_dust_or_empty_output() {
+        // 330 sats is the P2TR dust limit.
+        let dust = sats(330);
+        assert_eq!(
+            sweep_output_value(sats(1_000), sats(670), dust).unwrap(),
+            dust
+        );
+        for fee in [sats(671), sats(1_000)] {
+            let result = sweep_output_value(sats(1_000), fee, dust);
+            assert!(matches!(result, Err(WalletError::General(e)) if e.contains("dust")));
+        }
+        assert!(matches!(
+            sweep_output_value(sats(1_000), sats(1_001), dust),
+            Err(WalletError::InsufficientFund { .. })
+        ));
+    }
+
+    #[test]
+    fn change_at_the_dust_limit_is_kept() {
+        let dust = sats(294);
+        assert_eq!(change_output(sats(294), dust), Some(sats(294)));
+        assert_eq!(change_output(sats(293), dust), None);
     }
 
     #[test]
