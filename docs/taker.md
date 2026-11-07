@@ -619,11 +619,11 @@ $ taker list-swaps
 }
 ```
 
-The newest 100 swaps are listed. Use `--limit <N>` for more, up to 10000. `omitted` says how many older swaps were left out, and the totals always cover every swap. `fee_paid` includes the mining fee. A failed swap shows no fee, because it is not final, and it is left out of `fees_paid`. A recovery shows as `RecoveryHashlock` or `RecoveryTimelock`.
+The newest 100 rows are listed. Use `--limit <N>` for more, up to 10000. `omitted` says how many older rows were left out, and the totals always cover every row. A swap can take two rows: a failed swap that was later recovered has its report and a recovery. `fee_paid` includes the mining fee. A failed swap shows no fee, because it is not final, and it is left out of `fees_paid`. A recovery shows as `RecoveryHashlock` or `RecoveryTimelock`.
 
 The command only reads the wallet file. It never writes to it, and it works while another taker is running. It needs no Bitcoin node, no Tor and no sync, and it asks for the wallet passphrase unless you pass `-p` or `--password-file`. A wallet file from an older version has to be upgraded first, which reading would not do for you. Run any other command, such as `get-balances`, to upgrade it.
 
-To see the whole report of one swap, pass its id. This prints the UTXOs too, but not the deniability proof:
+To see the whole report of one swap, pass its id. This prints the UTXOs too, but not the deniability proof. If a report for that id was saved by a newer version, the command says so instead of saying the swap is unknown:
 
 ```bash
 $ taker list-swaps --swap-id <swap_id>

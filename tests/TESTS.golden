@@ -522,6 +522,7 @@ openswap wallet::funding::tests::split_floor_forces_fewer_splits
 openswap wallet::funding::tests::stays_within_input_budget_when_possible
 openswap wallet::funding::tests::three_inputs_fund_a_split_whenever_the_top_three_cover
 openswap wallet::report::tests::a_limit_keeps_the_newest_rows_and_all_the_totals
+openswap wallet::report::tests::a_swap_id_with_an_unreadable_report_is_not_called_unknown
 openswap wallet::report::tests::an_empty_wallet_has_an_empty_history
 openswap wallet::report::tests::an_unknown_recovery_type_is_counted_as_unreadable
 openswap wallet::report::tests::compat_future_reports_and_nested_fields_survive_typed_views_and_saves

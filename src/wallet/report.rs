@@ -778,7 +778,7 @@ impl SwapReportFile {
     }
 }
 
-/// Rows `list-swaps` shows when no limit is given.
+/// Rows `list-swaps` shows when no limit is given. A swap can take two rows.
 pub const DEFAULT_LISTED_SWAPS: usize = 100;
 
 /// Most rows `list-swaps` ever shows. About 450 bytes each, so a full list
@@ -825,7 +825,35 @@ fn history_of(stored: &StoredReports, limit: Option<usize>) -> SwapHistory {
     SwapHistory::from_reports(&reports, stored_count.saturating_sub(readable), limit)
 }
 
-/// The reports of `swap_id` over `stored`, without proofs.
+/// The swap id written in a stored report, read without decoding the rest.
+fn raw_swap_id(value: &Value) -> Option<&str> {
+    match value {
+        Value::Map(fields) => match fields.get(&Value::Text("swap_id".into())) {
+            Some(Value::Text(id)) => Some(id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// How many stored reports for `swap_id` this build can't decode.
+fn unreadable_for(stored: &StoredReports, swap_id: &str) -> usize {
+    fn count<T: DeserializeOwned>(stored: &StoredReports, kind: &str, swap_id: &str) -> usize {
+        stored
+            .get(kind)
+            .into_iter()
+            .flatten()
+            .filter(|value| from_value::<T>((*value).clone()).is_err())
+            .filter(|value| raw_swap_id(value) == Some(swap_id))
+            .count()
+    }
+    count::<TakerReport>(stored, TAKER_REPORTS, swap_id)
+        + count::<MakerReport>(stored, MAKER_REPORTS, swap_id)
+        + count::<RecoveryReport>(stored, RECOVERY_REPORTS, swap_id)
+}
+
+/// The reports of `swap_id` over `stored`, without proofs. Reports for the id
+/// that this build can't read are counted under `unreadable_reports`.
 fn detail_of(stored: &StoredReports, swap_id: &str) -> Option<serde_json::Value> {
     fn rows<T: Serialize>(reports: Vec<T>, matches: impl Fn(&T) -> bool) -> Vec<serde_json::Value> {
         reports
@@ -867,7 +895,14 @@ fn detail_of(stored: &StoredReports, swap_id: &str) -> Option<serde_json::Value>
             detail.insert(kind.to_string(), rows.into());
         }
     }
-    (!detail.is_empty()).then(|| detail.into())
+    if detail.is_empty() {
+        return None;
+    }
+    let unreadable = unreadable_for(stored, swap_id);
+    if unreadable > 0 {
+        detail.insert("unreadable_reports".to_string(), unreadable.into());
+    }
+    Some(detail.into())
 }
 
 /// What `list-swaps` prints over `stored`.
@@ -880,7 +915,15 @@ fn list_json(
         None => serde_json::to_string_pretty(&history_of(stored, limit)),
         Some(id) => {
             let detail = detail_of(stored, id).ok_or_else(|| {
-                WalletError::General(format!("no swap with id {id} in this wallet"))
+                let unreadable = unreadable_for(stored, id);
+                WalletError::General(if unreadable > 0 {
+                    format!(
+                        "swap {id} has {unreadable} stored report(s) this build can't read; \
+                         they are kept in the wallet, and a newer version can show them"
+                    )
+                } else {
+                    format!("no swap with id {id} in this wallet")
+                })
             })?;
             serde_json::to_string_pretty(&detail)
         }
@@ -938,9 +981,10 @@ pub struct SwapTotals {
 pub struct SwapHistory {
     /// Counts and fee sums.
     pub totals: SwapTotals,
-    /// The newest swaps and recoveries, newest first.
+    /// The newest rows, newest first. A swap can have more than one row: a
+    /// failed taker swap that was later recovered has its report and a recovery.
     pub swaps: Vec<SwapSummary>,
-    /// How many older ones are in the totals but not in `swaps`.
+    /// How many older rows are in the totals but not in `swaps`.
     pub omitted: usize,
 }
 
@@ -1703,5 +1747,53 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), wallet);
         assert_eq!(std::fs::read(&report_path).unwrap(), report);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    /// An id whose only report is unreadable says so, not "no swap".
+    fn a_swap_id_with_an_unreadable_report_is_not_called_unknown() {
+        let dir = tempdir().unwrap();
+        let mut wallet = wallet_with_history(&dir.path().join("wallet.cbor"));
+        let future = |swap_id: &str| {
+            let mut report = sample_taker_report();
+            report.swap_id = swap_id.into();
+            let Value::Map(mut fields) = to_value(report).unwrap() else {
+                panic!("a report encodes as a map");
+            };
+            fields.insert(Value::Text("status".into()), Value::Text("Future".into()));
+            Value::Map(fields)
+        };
+        let taker = wallet
+            .store
+            .reports
+            .entry(TAKER_REPORTS.into())
+            .or_default();
+        taker.push(future("swap-future"));
+        taker.push(future("swap-1"));
+
+        // Only an unreadable report: an error that says so, with the count.
+        assert!(wallet.swap_detail("swap-future").is_none());
+        let error = wallet
+            .swap_list_json(Some("swap-future"), None)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("1 stored report(s)"), "{}", message);
+        assert!(!message.contains("no swap with id"), "{}", message);
+
+        // Readable and unreadable reports for one id: the readable one is
+        // shown, with the count of the other.
+        let detail = wallet.swap_detail("swap-1").unwrap();
+        assert_eq!(detail["taker"][0]["swap_id"], "swap-1");
+        assert_eq!(detail["unreadable_reports"], 1);
+
+        // A swap with nothing unreadable has no such key.
+        assert!(wallet
+            .swap_detail("maker-swap")
+            .unwrap()
+            .get("unreadable_reports")
+            .is_none());
+        // A truly unknown id is still unknown.
+        let error = wallet.swap_list_json(Some("nobody"), None).unwrap_err();
+        assert!(error.to_string().contains("no swap with id nobody"));
     }
 }

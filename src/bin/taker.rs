@@ -349,8 +349,8 @@ enum Commands {
         /// Show only this swap, in full.
         #[clap(long, short = 's')]
         swap_id: Option<String>,
-        /// Most swaps to list, newest first. The default is 100, the most 10000.
-        /// The totals always cover every swap.
+        /// Most rows to list, newest first. The default is 100, the most 10000.
+        /// A swap can take two rows. The totals always cover every row.
         #[clap(long, short = 'n')]
         limit: Option<u32>,
     },
