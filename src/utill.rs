@@ -29,12 +29,12 @@ use std::{
     cmp::max,
     collections::HashMap,
     env, fs,
-    io::{self, stdout, BufReader, BufWriter, ErrorKind, Read, Write},
+    io::{self, stdout, BufRead, BufReader, BufWriter, ErrorKind, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     str::FromStr,
     sync::OnceLock,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -761,58 +761,240 @@ impl From<serde_cbor::Error> for TorError {
     }
 }
 
+/// How long to wait for the Tor control port to accept a connection.
+const TOR_CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a Tor control command may take, its whole reply included, and how
+/// long each write may block. `ADD_ONION` with `Flags=Detach` answers before
+/// the descriptor is published, so a healthy Tor replies well within this.
+const TOR_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest control-port reply line accepted, so a misbehaving peer cannot
+/// grow a line without bound.
+const TOR_CONTROL_MAX_LINE: usize = 64 * 1024;
+
+/// Most lines kept from one control-port reply, so a peer that keeps sending
+/// continuation lines cannot grow the reply without bound.
+const TOR_CONTROL_MAX_REPLY_LINES: usize = 256;
+
+/// One reply from the Tor control port: its status code and the text of each
+/// line, without the code and separator.
+struct TorReply {
+    code: u16,
+    lines: Vec<String>,
+}
+
+impl TorReply {
+    fn is_ok(&self) -> bool {
+        self.code == 250
+    }
+
+    fn message(&self) -> String {
+        format!("{} {}", self.code, self.lines.join(" / "))
+    }
+}
+
+/// A Tor control-port connection that sends one command at a time and reads
+/// its whole reply before sending the next. Every socket operation is bounded,
+/// so a Tor that refuses a command or stops answering fails the caller instead
+/// of blocking it.
+struct TorControl {
+    stream: TcpStream,
+    reader: BufReader<TcpStream>,
+    io_timeout: Duration,
+}
+
+impl TorControl {
+    fn connect(
+        control_port: u16,
+        connect_timeout: Duration,
+        io_timeout: Duration,
+    ) -> Result<Self, TorError> {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], control_port));
+        let stream = TcpStream::connect_timeout(&addr, connect_timeout).map_err(|e| {
+            TorError::General(format!(
+                "Cannot connect to Tor control port {control_port}. Is Tor running? Error: {e}"
+            ))
+        })?;
+        stream.set_read_timeout(Some(io_timeout))?;
+        stream.set_write_timeout(Some(io_timeout))?;
+        let reader = BufReader::new(stream.try_clone()?);
+        Ok(Self {
+            stream,
+            reader,
+            io_timeout,
+        })
+    }
+
+    /// Send `command` and return Tor's reply, whatever its status code.
+    fn command(&mut self, command: &str) -> Result<TorReply, TorError> {
+        let sent = self
+            .stream
+            .write_all(command.as_bytes())
+            .and_then(|()| self.stream.write_all(b"\r\n"));
+        sent.map_err(|e| self.io_error(e))?;
+        self.read_reply(Instant::now() + self.io_timeout)
+    }
+
+    fn authenticate(&mut self, password: &str) -> Result<(), TorError> {
+        let reply = self.command(&format!("AUTHENTICATE {}", quote_control_string(password)))?;
+        if !reply.is_ok() {
+            return Err(TorError::General(format!(
+                "Tor authentication failed: {}",
+                reply.message()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read one reply: `NNN-text` lines continue it, `NNN+text` opens a data
+    /// block that ends at a lone `.`, and `NNN text` ends it.
+    fn read_reply(&mut self, deadline: Instant) -> Result<TorReply, TorError> {
+        let mut code = None;
+        let mut lines = Vec::new();
+        loop {
+            let line = self.read_line(deadline)?;
+            let bytes = line.as_bytes();
+            if bytes.len() < 4 || !bytes[..3].iter().all(u8::is_ascii_digit) || !bytes[3].is_ascii()
+            {
+                return Err(TorError::General(format!(
+                    "malformed Tor control reply line: {line:?}"
+                )));
+            }
+            // The first four bytes are ASCII, so these slices fall on char
+            // boundaries.
+            let line_code: u16 = line[..3].parse().expect("three ASCII digits");
+            if *code.get_or_insert(line_code) != line_code {
+                return Err(TorError::General(format!(
+                    "Tor control reply changed status code mid-reply: {line:?}"
+                )));
+            }
+            if lines.len() == TOR_CONTROL_MAX_REPLY_LINES {
+                return Err(TorError::General(
+                    "Tor control reply has too many lines".to_string(),
+                ));
+            }
+            lines.push(line[4..].to_string());
+            match bytes[3] {
+                b' ' => {
+                    return Ok(TorReply {
+                        code: line_code,
+                        lines,
+                    })
+                }
+                b'-' => {}
+                b'+' => loop {
+                    if self.read_line(deadline)? == "." {
+                        break;
+                    }
+                },
+                _ => {
+                    return Err(TorError::General(format!(
+                        "malformed Tor control reply line: {line:?}"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Read one line by `deadline`. Each socket read waits only for the time
+    /// left, so a peer trickling bytes cannot stretch the reply past it.
+    fn read_line(&mut self, deadline: Instant) -> Result<String, TorError> {
+        let mut line = Vec::new();
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(|| self.io_error(ErrorKind::TimedOut.into()))?;
+            self.reader.get_ref().set_read_timeout(Some(remaining))?;
+            let buf = match self.reader.fill_buf() {
+                Ok(buf) => buf,
+                Err(e) => return Err(self.io_error(e)),
+            };
+            if buf.is_empty() {
+                return Err(TorError::General(
+                    "Tor control port closed the connection mid-reply".to_string(),
+                ));
+            }
+            let (taken, ended) = match buf.iter().position(|&b| b == b'\n') {
+                Some(newline) => (newline + 1, true),
+                None => (buf.len(), false),
+            };
+            if line.len() + taken > TOR_CONTROL_MAX_LINE {
+                return Err(TorError::General(
+                    "Tor control reply line too long".to_string(),
+                ));
+            }
+            line.extend_from_slice(&buf[..taken]);
+            self.reader.consume(taken);
+            if ended {
+                break;
+            }
+        }
+        let line = String::from_utf8(line)
+            .map_err(|_| TorError::General("Tor control reply line is not UTF-8".to_string()))?;
+        Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    }
+
+    /// A timed-out socket reports `WouldBlock` or `TimedOut`, which reads as
+    /// a spurious "resource temporarily unavailable"; name the timeout instead.
+    fn io_error(&self, e: io::Error) -> TorError {
+        match e.kind() {
+            ErrorKind::WouldBlock | ErrorKind::TimedOut => TorError::General(format!(
+                "Tor control port did not answer within {:?}",
+                self.io_timeout
+            )),
+            _ => TorError::IO(e),
+        }
+    }
+}
+
+/// Quote `s` as a control-protocol QuotedString, so a password holding `"`,
+/// `\` or a line break cannot end the argument or the command early.
+fn quote_control_string(s: &str) -> String {
+    let mut quoted = String::with_capacity(s.len() + 2);
+    quoted.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\r' => quoted.push_str("\\r"),
+            '\n' => quoted.push_str("\\n"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// Authenticate against the Tor control port and report bootstrap progress.
 ///
 /// Returns `Ok(())` once the control connection authenticates. A still-starting
 /// Tor is logged as a warning rather than an error, since callers only need the
 /// daemon to be reachable.
 pub fn check_tor_status(control_port: u16, password: &str) -> Result<(), TorError> {
-    use std::{
-        io::BufRead,
-        net::{SocketAddr, ToSocketAddrs},
-    };
-
-    let addr: SocketAddr = format!("127.0.0.1:{control_port}")
-        .to_socket_addrs()
-        .map_err(|e| TorError::General(format!("Invalid address: {}", e)))?
-        .next()
-        .ok_or_else(|| TorError::General("Could not resolve address".to_string()))?;
-
-    // Use connect_timeout to avoid blocking indefinitely if Tor is not running
-    let timeout = Duration::from_secs(5);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| {
-        log::error!(
-            "Failed to connect to Tor control port {}: {}",
-            control_port,
-            e
-        );
-        TorError::General(format!(
-            "Cannot connect to Tor control port {}. Is Tor running? Error: {}",
-            control_port, e
-        ))
+    let mut control = TorControl::connect(
+        control_port,
+        TOR_CONTROL_CONNECT_TIMEOUT,
+        TOR_CONTROL_IO_TIMEOUT,
+    )
+    .map_err(|e| {
+        log::error!("Failed to connect to Tor control port {control_port}: {e:?}");
+        e
+    })?;
+    control.authenticate(password).map_err(|e| {
+        log::error!("{e:?}, please provide correct password");
+        e
     })?;
 
-    // Set read/write timeouts to avoid hanging on slow responses
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let auth_command = format!("AUTHENTICATE \"{password}\"\r\n");
-    stream.write_all(auth_command.as_bytes())?;
-    let mut response = String::new();
-    reader.read_line(&mut response)?;
-    if !response.starts_with("250") {
-        log::error!("Tor authentication failed: {response}, please provide correct password");
-        return Err(TorError::General("Tor authentication failed".to_string()));
-    }
-    stream.write_all(b"GETINFO status/bootstrap-phase\r\n")?;
-    response.clear();
-    reader.read_line(&mut response)?;
-
-    if response.contains("PROGRESS=100") {
+    let reply = control.command("GETINFO status/bootstrap-phase")?;
+    if reply.is_ok() && reply.lines.iter().any(|l| l.contains("PROGRESS=100")) {
         log::info!("Tor is fully started and operational!");
     } else {
-        log::warn!("Tor is still starting, try again later: {response}");
+        log::warn!(
+            "Tor is still starting, try again later: {}",
+            reply.message()
+        );
     }
     Ok(())
 }
@@ -1086,41 +1268,62 @@ pub fn get_ephemeral_address(
     private_key_data: &str,
     service_id_data: Option<&str>,
 ) -> Result<String, TorError> {
+    publish_ephemeral_onion(
+        control_port,
+        local_port,
+        password,
+        private_key_data,
+        service_id_data,
+        TOR_CONTROL_CONNECT_TIMEOUT,
+        TOR_CONTROL_IO_TIMEOUT,
+    )
+}
+
+/// [`get_ephemeral_address`] with its timeouts as arguments, for tests.
+fn publish_ephemeral_onion(
+    control_port: u16,
+    local_port: u16,
+    password: &str,
+    private_key_data: &str,
+    service_id_data: Option<&str>,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<String, TorError> {
     use crate::protocol::common_messages::OPENSWAP_PORT;
-    use std::io::BufRead;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{control_port}"))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut response = String::new();
-    let mut service_id = String::new();
-    let auth_command = format!("AUTHENTICATE \"{password}\"\r\n");
-    stream.write_all(auth_command.as_bytes())?;
+
+    let mut control = TorControl::connect(control_port, connect_timeout, io_timeout)?;
+    control.authenticate(password)?;
+
     if let Some(service_id) = service_id_data {
-        let remove_command = format!("DEL_ONION {service_id}\r\n");
-        stream.write_all(remove_command.as_bytes())?;
-    }
-
-    let add_onion_command = format!(
-        "ADD_ONION {private_key_data} Flags=Detach Port={OPENSWAP_PORT},127.0.0.1:{local_port}\r\n"
-    );
-
-    stream.write_all(add_onion_command.as_bytes())?;
-
-    while reader.read_line(&mut response)? > 0 {
-        if response.starts_with("250-ServiceID=") {
-            service_id = response
-                .trim_start_matches("250-ServiceID=")
-                .trim()
-                .to_string();
-            break;
+        let reply = control.command(&format!("DEL_ONION {service_id}"))?;
+        // 552: Tor no longer has the service, as after a Tor restart (a
+        // detached service does not outlive the daemon). Nothing to remove.
+        if !reply.is_ok() && reply.code != 552 {
+            return Err(TorError::General(format!(
+                "Tor refused DEL_ONION: {}",
+                reply.message()
+            )));
         }
-        response.clear();
     }
 
-    if service_id.is_empty() {
-        return Err(TorError::General(
-            "Failed to retrieve ephemeral onion service details".to_string(),
-        ));
+    let reply = control.command(&format!(
+        "ADD_ONION {private_key_data} Flags=Detach Port={OPENSWAP_PORT},127.0.0.1:{local_port}"
+    ))?;
+    if !reply.is_ok() {
+        return Err(TorError::General(format!(
+            "Tor refused ADD_ONION: {}",
+            reply.message()
+        )));
     }
+    let service_id = reply
+        .lines
+        .iter()
+        .find_map(|line| line.strip_prefix("ServiceID="))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            TorError::General("Tor's ADD_ONION reply carried no ServiceID".to_string())
+        })?;
     Ok(format!("{service_id}.onion"))
 }
 
@@ -1538,6 +1741,219 @@ mod tests {
 
         assert!(matches!(error, NetError::MessageTooLarge));
         sender.join().unwrap();
+    }
+
+    /// A fake Tor control port. Answers each command it reads with the next
+    /// scripted reply, stays silent once the script runs out, and keeps the
+    /// connection open until the client hangs up. Returns the commands it read.
+    fn fake_tor_control(replies: Vec<&'static str>) -> (u16, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut replies = replies.into_iter();
+            let mut commands = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return commands;
+                }
+                commands.push(line.trim_end().to_string());
+                if let Some(reply) = replies.next() {
+                    stream.write_all(reply.as_bytes()).unwrap();
+                }
+            }
+        });
+        (port, server)
+    }
+
+    const TEST_TOR_TIMEOUT: Duration = Duration::from_secs(1);
+
+    fn publish_on_fake(port: u16, service_id: Option<&str>) -> Result<String, TorError> {
+        publish_ephemeral_onion(
+            port,
+            6102,
+            "pw",
+            "NEW:ED25519-V3",
+            service_id,
+            TEST_TOR_TIMEOUT,
+            TEST_TOR_TIMEOUT,
+        )
+    }
+
+    fn tor_error_text(e: TorError) -> String {
+        match e {
+            TorError::General(text) => text,
+            other => panic!("expected TorError::General, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tor_add_onion_error_on_open_connection_fails_fast() {
+        // Tor answers the error and keeps the connection open: the old helper
+        // ignored the error and read forever.
+        let (port, server) = fake_tor_control(vec!["250 OK\r\n", "512 Bad arguments\r\n"]);
+        let started = std::time::Instant::now();
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(
+            started.elapsed() < TEST_TOR_TIMEOUT,
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.contains("ADD_ONION") && error.contains("512"),
+            "{}",
+            error
+        );
+        let commands = server.join().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[1].starts_with("ADD_ONION NEW:ED25519-V3 Flags=Detach Port="));
+    }
+
+    #[test]
+    fn tor_silent_control_port_times_out() {
+        let (port, server) = fake_tor_control(vec![]);
+        let started = std::time::Instant::now();
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(
+            started.elapsed() < 5 * TEST_TOR_TIMEOUT,
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("did not answer"), "{}", error);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_authentication_failure_stops_before_add_onion() {
+        let (port, server) = fake_tor_control(vec![
+            "515 Authentication failed: Password did not match HashedControlPassword\r\n",
+        ]);
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(
+            error.contains("authentication failed") && error.contains("515"),
+            "{}",
+            error
+        );
+        assert_eq!(server.join().unwrap(), [r#"AUTHENTICATE "pw""#]);
+    }
+
+    #[test]
+    fn tor_del_onion_of_unknown_service_is_not_an_error() {
+        // After a Tor restart the detached service is gone and DEL_ONION
+        // answers 552; republishing must still go ahead.
+        let (port, server) = fake_tor_control(vec![
+            "250 OK\r\n",
+            "552 Unknown Onion Service id: abcd\r\n",
+            "250-ServiceID=abcd\r\n250 OK\r\n",
+        ]);
+        assert_eq!(publish_on_fake(port, Some("abcd")).unwrap(), "abcd.onion");
+        let commands = server.join().unwrap();
+        assert_eq!(commands[1], "DEL_ONION abcd");
+        assert!(commands[2].starts_with("ADD_ONION "));
+    }
+
+    #[test]
+    fn tor_del_onion_other_errors_fail() {
+        let (port, server) = fake_tor_control(vec!["250 OK\r\n", "551 Internal error\r\n"]);
+        let error = tor_error_text(publish_on_fake(port, Some("abcd")).unwrap_err());
+        assert!(
+            error.contains("DEL_ONION") && error.contains("551"),
+            "{}",
+            error
+        );
+        assert_eq!(server.join().unwrap().len(), 2, "ADD_ONION was sent");
+    }
+
+    #[test]
+    fn tor_add_onion_multi_line_reply() {
+        let (port, server) = fake_tor_control(vec![
+            "250 OK\r\n",
+            "250-ServiceID=xyz\r\n250-PrivateKey=ED25519-V3:AAAA\r\n250 OK\r\n",
+        ]);
+        assert_eq!(publish_on_fake(port, None).unwrap(), "xyz.onion");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_add_onion_success_without_service_id_fails() {
+        let (port, server) = fake_tor_control(vec!["250 OK\r\n", "250 OK\r\n"]);
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(error.contains("ServiceID"), "{}", error);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_reply_data_block_is_skipped() {
+        let (port, server) = fake_tor_control(vec![
+            "250 OK\r\n",
+            "250+extra=\r\nline one\r\n.\r\n250-ServiceID=efgh\r\n250 OK\r\n",
+        ]);
+        assert_eq!(publish_on_fake(port, None).unwrap(), "efgh.onion");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_non_ascii_separator_is_malformed_not_a_panic() {
+        // Byte 4 falls inside the `é`, so slicing there would panic.
+        let (port, server) = fake_tor_control(vec!["250 OK\r\n", "250é\r\n"]);
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(error.contains("malformed"), "{}", error);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_reply_line_count_is_capped() {
+        let flood = "250-x\r\n".repeat(TOR_CONTROL_MAX_REPLY_LINES + 1);
+        let (port, server) = fake_tor_control(vec!["250 OK\r\n", Box::leak(flood.into()) as &str]);
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(error.contains("too many lines"), "{}", error);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_reply_line_length_is_capped() {
+        let long = format!("250-{}\r\n", "x".repeat(TOR_CONTROL_MAX_LINE));
+        let (port, server) = fake_tor_control(vec!["250 OK\r\n", Box::leak(long.into()) as &str]);
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(error.contains("too long"), "{}", error);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_trickling_reply_hits_command_deadline() {
+        // One byte every 200ms never trips a per-read timeout of 1s; only a
+        // deadline for the whole reply stops it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"250 OK\r\n").unwrap();
+            reader.read_line(&mut line).unwrap();
+            while stream.write_all(b"2").is_ok() {
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = tor_error_text(publish_on_fake(port, None).unwrap_err());
+        assert!(
+            started.elapsed() < 3 * TEST_TOR_TIMEOUT,
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("did not answer"), "{}", error);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tor_password_is_quoted() {
+        assert_eq!(quote_control_string("plain"), r#""plain""#);
+        assert_eq!(quote_control_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(quote_control_string("x\r\ny"), r#""x\r\ny""#);
     }
 
     #[test]
