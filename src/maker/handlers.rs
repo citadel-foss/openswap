@@ -808,7 +808,8 @@ pub trait Maker: Send + Sync {
     }
 
     /// Funds `address` with exactly `amount` for a Lightning HTLC, returning
-    /// the transaction and the output's index.
+    /// the funding transaction, the output's index, and a pre-signed
+    /// replacement that cancels the funding transaction.
     ///
     /// Separate from the coinswap funding path, which executes a plan frozen
     /// at admission: a Lightning HTLC is one exact output with no hop to
@@ -819,7 +820,7 @@ pub trait Maker: Send + Sync {
         _swap_id: &str,
         _amount: Amount,
         _address: bitcoin::Address,
-    ) -> Result<(Transaction, u32), MakerError> {
+    ) -> Result<(Transaction, u32, Transaction), MakerError> {
         Err(MakerError::General("lightning swaps not supported"))
     }
 

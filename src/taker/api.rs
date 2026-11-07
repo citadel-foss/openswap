@@ -66,6 +66,9 @@ use super::{
     payment::{hop_net_sats, HopFeeTerms, PaymentQuote},
 };
 
+#[cfg(feature = "lightning")]
+use super::background_services::LightningPruneLoop;
+
 #[cfg(feature = "integration-test")]
 use crate::protocol::taproot_messages::TaprootContractData;
 #[cfg(not(feature = "integration-test"))]
@@ -601,6 +604,9 @@ pub struct Taker {
     pub(crate) live_swap: Arc<Mutex<Option<String>>>,
     /// Background recovery loop (active when incomplete swap recovery is in progress).
     recovery_loop: Option<RecoveryLoop>,
+    /// Periodic cleanup for confirmed Lightning recovery records.
+    #[cfg(feature = "lightning")]
+    lightning_prune_loop: Option<LightningPruneLoop>,
     /// Breach detector for legacy swaps (monitors funding outpoints for adversarial contract broadcasts).
     pub(crate) breach_detector: Option<BreachDetector>,
     /// Lightning backend for submarine swaps, when configured.
@@ -620,6 +626,11 @@ impl Drop for Taker {
         if let Some(recovery) = self.recovery_loop.take() {
             log::info!("Shutting down recovery loop");
             drop(recovery);
+        }
+        #[cfg(feature = "lightning")]
+        if let Some(pruner) = self.lightning_prune_loop.take() {
+            log::info!("Shutting down Lightning prune loop");
+            drop(pruner);
         }
         // Shut down breach detector (if running)
         if let Some(detector) = self.breach_detector.take() {
@@ -785,6 +796,8 @@ impl Taker {
             ongoing_swap: None,
             live_swap: Arc::new(Mutex::new(None)),
             recovery_loop: None,
+            #[cfg(feature = "lightning")]
+            lightning_prune_loop: None,
             breach_detector: None,
             #[cfg(feature = "lightning")]
             lightning: None,
@@ -804,6 +817,15 @@ impl Taker {
         // a failed sweep leaves the claims for the next start.
         if let Err(e) = taker.release_orphan_reservations() {
             log::error!("Startup: could not release orphan funding claims: {:?}", e);
+        }
+        #[cfg(feature = "lightning")]
+        if let Err(e) = taker.prune_confirmed_lightning_swaps() {
+            log::warn!("Startup: could not prune completed Lightning swaps: {e:?}");
+        }
+        #[cfg(feature = "lightning")]
+        match LightningPruneLoop::start(taker.wallet.clone(), taker.backend.clone()) {
+            Ok(loop_handle) => taker.lightning_prune_loop = Some(loop_handle),
+            Err(e) => log::warn!("Startup: could not start Lightning prune loop: {e}"),
         }
         taker.init_recover_wallet();
         Ok(taker)

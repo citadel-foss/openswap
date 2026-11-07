@@ -19,8 +19,8 @@ use super::{
     backend::LightningBackend,
     error::LightningError,
     types::{
-        Balances, Bolt11Invoice, ChannelId, ChannelInfo, ChannelState, InvoiceParams, LnEvent,
-        NodeInfo, OpenChannelRequest, PaymentId, PaymentOutcome, Preimage,
+        Balances, Bolt11Invoice, ChannelId, ChannelInfo, ChannelState, InboundPaymentStatus,
+        InvoiceParams, LnEvent, NodeInfo, OpenChannelRequest, PaymentId, PaymentOutcome, Preimage,
     },
 };
 
@@ -660,6 +660,26 @@ impl LightningBackend for MockLightningBackend {
         })
     }
 
+    fn inbound_payment_status(
+        &self,
+        payment_hash: sha256::Hash,
+    ) -> Result<InboundPaymentStatus, LightningError> {
+        let ledger = self.ledger.lock()?;
+        let Some(invoice) = ledger
+            .invoices
+            .get(&payment_hash)
+            .filter(|invoice| invoice.owner == self.node_index)
+        else {
+            return Ok(InboundPaymentStatus::NotClaimable);
+        };
+        Ok(match invoice.status {
+            InvoiceStatus::Held { .. } => InboundPaymentStatus::Claimable,
+            InvoiceStatus::Cancelled => InboundPaymentStatus::Failed,
+            InvoiceStatus::Settled => InboundPaymentStatus::Settled,
+            InvoiceStatus::Open => InboundPaymentStatus::NotClaimable,
+        })
+    }
+
     fn has_payment_record(&self, payment_hash: sha256::Hash) -> Result<bool, LightningError> {
         self.payment_record_lookups.fetch_add(1, Ordering::SeqCst);
         if self.fail_payment_record_lookups.load(Ordering::SeqCst) {
@@ -816,8 +836,16 @@ mod tests {
             .pay_invoice(&invoice.invoice, Some(1_000), Some(200))
             .unwrap();
         let _ = owner.poll_event().unwrap();
+        assert_eq!(
+            owner.inbound_payment_status(payment_hash).unwrap(),
+            InboundPaymentStatus::Claimable
+        );
 
         owner.fail_held_payment(payment_hash).unwrap();
+        assert_eq!(
+            owner.inbound_payment_status(payment_hash).unwrap(),
+            InboundPaymentStatus::Failed
+        );
         assert!(matches!(
             payer.poll_event().unwrap(),
             Some(LnEvent::PaymentFailed { .. })

@@ -34,6 +34,61 @@ const RECOVERY_LOOP_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(feature = "integration-test")]
 const RECOVERY_LOOP_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Periodically removes completed Lightning recovery records during normal
+/// operation, without allocating destinations or broadcasting transactions.
+#[cfg(feature = "lightning")]
+pub(crate) struct LightningPruneLoop {
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[cfg(feature = "lightning")]
+impl LightningPruneLoop {
+    pub(crate) fn start(
+        wallet: Arc<RwLock<Wallet>>,
+        backend: BackendConnector,
+    ) -> std::io::Result<Self> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let handle = thread::Builder::new()
+            .name("Lightning prune loop".to_string())
+            .spawn(move || {
+                let mut chain: Option<AnyBlockchain> = None;
+                while !shutdown_clone.load(Relaxed) {
+                    if chain.is_none() {
+                        match backend.connect() {
+                            Ok(connected) => chain = Some(connected),
+                            Err(e) => log::warn!("Lightning prune loop: no connection: {e:?}"),
+                        }
+                    }
+                    if let Some(connected) = chain.as_ref() {
+                        if let Err(e) = super::lightning_swap::prune_confirmed_lightning_records(
+                            &wallet, connected,
+                        ) {
+                            log::warn!("Lightning prune loop: prune failed: {e:?}");
+                        }
+                    }
+                    thread::park_timeout(RECOVERY_LOOP_INTERVAL);
+                }
+            })?;
+        Ok(Self {
+            shutdown,
+            handle: Some(handle),
+        })
+    }
+}
+
+#[cfg(feature = "lightning")]
+impl Drop for LightningPruneLoop {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Background thread that periodically retries wallet-level recovery
 /// (hashlock sweep + timelock recovery) until all contract UTXOs are resolved.
 ///
@@ -823,6 +878,7 @@ mod tests {
                 privkey: key,
                 outpoint: None,
                 value: None,
+                payout_script: None,
             },
         );
         wallet.store.ln_maker_swaps.insert(
@@ -845,6 +901,9 @@ mod tests {
                 funding_outpoint: None,
                 funding_value: None,
                 funding_height: None,
+                funding_cancel_tx: None,
+                funding_deadline: None,
+                claim_deadline: None,
             },
         );
         let wallet = RwLock::new(wallet);

@@ -44,6 +44,15 @@ pub const KNOWN: &[Feature] = &[
         flows: &["ln-swap-out"],
         lightning: true,
     },
+    // Persisted maker funding cancellation state. Keeping this separate from
+    // the base swap-out name makes old binaries refuse wallets whose safety
+    // state they would otherwise deserialize into flattened `extra` fields
+    // and discard on the next save.
+    Feature {
+        name: "ln-funding-cancel",
+        flows: &["ln-swap-out"],
+        lightning: true,
+    },
 ];
 
 /// Names this build can serve.
@@ -384,11 +393,22 @@ mod tests {
         for flow in ["legacy", "taproot", "ln-swap-in", "ln-swap-out"] {
             let pins = choose_pins(flow, &theirs);
             let served = supported().contains(&flow);
-            assert_eq!(pins, if served { names(&[flow]) } else { vec![] });
-            assert_eq!(check_pins(&names(&[flow]), &[]).is_ok(), served);
-            assert!(check_pins(&names(&[flow, flow]), &[]).is_err());
-            assert!(check_pins(&names(&[flow]), &names(&["future-v1"])).is_err());
-            assert!(check_pins(&names(&[flow]), &names(&[&format!("{flow}-v1")])).is_err());
+            let expected = KNOWN
+                .iter()
+                .filter(|feature| feature.flows.contains(&flow))
+                .map(|feature| feature.name.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(pins, if served { expected } else { vec![] });
+            if served {
+                assert!(check_pins(&pins, &[]).is_ok());
+                let mut duplicate = pins.clone();
+                duplicate.push(pins[0].clone());
+                assert!(check_pins(&duplicate, &[]).is_err());
+                assert!(check_pins(&pins, &names(&["future-v1"])).is_err());
+                assert!(check_pins(&pins, &names(&[&format!("{flow}-v1")])).is_err());
+            } else {
+                assert!(check_pins(&names(&[flow]), &[]).is_err());
+            }
         }
         assert_eq!(
             unmet_for_flow(&names(&["ln-swap-in-v1"]), &names(&["taproot"]), "taproot"),

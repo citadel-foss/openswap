@@ -259,11 +259,6 @@ fn backdate_past_watchdog_idle(maker: &MakerServer, swap_id: &str) {
     maker_lightning = [ln.clone()],
     setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
 )]
-// The watcher answers a query for a watched, unspent outpoint with
-// `UtxoSpent { spending_tx: None }`, which `watchdog_resolve_swap_out` reads
-// as "spent, tx not known yet" and retries forever, so the refund branch is
-// never reached. Un-ignore once that is fixed.
-#[ignore = "the watchdog never reaches its swap-out refund branch (issue #1127)"]
 fn lightning_maker_restart_refunds_unclaimed_swap_out(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
@@ -409,6 +404,9 @@ fn accepted_swap_in_with_locktime(preimage: &Preimage, locktime: u16) -> LnMaker
         payout_script: None,
         funding: None,
         funding_height: None,
+        funding_cancel_tx: None,
+        funding_deadline: None,
+        claim_deadline: None,
         updated_at: Instant::now(),
     }
 }

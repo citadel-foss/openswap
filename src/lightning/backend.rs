@@ -6,8 +6,8 @@ use bitcoin::{hashes::sha256, secp256k1::PublicKey, Address, Amount, Txid};
 use super::{
     error::LightningError,
     types::{
-        Balances, Bolt11Invoice, ChannelId, ChannelInfo, InvoiceParams, LnEvent, NodeInfo,
-        OpenChannelRequest, PaymentId, PaymentOutcome, Preimage,
+        Balances, Bolt11Invoice, ChannelId, ChannelInfo, InboundPaymentStatus, InvoiceParams,
+        LnEvent, NodeInfo, OpenChannelRequest, PaymentId, PaymentOutcome, Preimage,
     },
 };
 
@@ -110,6 +110,16 @@ pub trait LightningBackend: Send + Sync {
     /// failed write in between leaves a payment in flight with no record.
     fn payment_outcome(&self, payment_hash: sha256::Hash)
         -> Result<PaymentOutcome, LightningError>;
+
+    /// Looks up the lifecycle of an inbound hold-invoice payment.
+    ///
+    /// This is deliberately separate from [`payment_outcome`](Self::payment_outcome),
+    /// whose contract is outbound-only. Swap-out safety decisions must not
+    /// interpret an inbound record as an unknown outbound payment.
+    fn inbound_payment_status(
+        &self,
+        payment_hash: sha256::Hash,
+    ) -> Result<InboundPaymentStatus, LightningError>;
 
     /// Whether the node holds any payment record under this hash, inbound or
     /// outbound, whatever its status. An invoice the node created counts:
