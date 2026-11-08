@@ -496,7 +496,13 @@ impl Blockchain for CoreRPC {
             Err(e) => return Err(e.into()),
         };
         match info.blockhash {
-            Some(hash) => Ok(Some(self.rpc.get_block_header_info(&hash)?.height as u64)),
+            Some(hash) => {
+                // The txindex keeps the entry of a tx whose block a reorg
+                // orphaned, so the hash alone does not make it mined: only a
+                // block in the active chain does (its header has confirmations).
+                let header = self.rpc.get_block_header_info(&hash)?;
+                Ok((header.confirmations > 0).then_some(header.height as u64))
+            }
             None => Ok(None),
         }
     }
@@ -942,6 +948,66 @@ pub(crate) mod tests {
             "{:?}",
             calls
         );
+    }
+
+    /// Core's txindex keeps the entry of a tx whose block a reorg orphaned, and
+    /// `getrawtransaction` still names that block. Only a block in the active
+    /// chain makes the tx mined.
+    #[test]
+    fn tx_in_an_orphaned_block_is_not_mined() {
+        use crate::watch_tower::watcher::tests::mock_core_rpc;
+        use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn};
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: Vec::new(),
+        };
+        let block = BlockHash::from_byte_array([7; 32]);
+        // (header confirmations, getrawtransaction confirmations, expected)
+        for (in_chain, tx_confirmations, expected) in [(-1, 0, None), (1, 1, Some(102))] {
+            let raw = tx.clone();
+            let (url, _) = mock_core_rpc(move |method, _| match method {
+                "getrawtransaction" => Ok(json!({
+                    "hex": serialize_hex(&raw),
+                    "txid": raw.compute_txid(),
+                    "hash": raw.compute_wtxid(),
+                    "size": raw.total_size(),
+                    "vsize": raw.vsize(),
+                    "version": 2,
+                    "locktime": 0,
+                    "vin": [{ "txid": raw.input[0].previous_output.txid, "vout": 0, "sequence": raw.input[0].sequence.0 }],
+                    "vout": [],
+                    "blockhash": block,
+                    "confirmations": tx_confirmations,
+                })),
+                "getblockheader" => Ok(json!({
+                    "hash": block,
+                    "confirmations": in_chain,
+                    "height": 102,
+                    "version": 0x2000_0000,
+                    "merkleroot": raw.compute_txid(),
+                    "time": 0,
+                    "mediantime": 0,
+                    "nonce": 0,
+                    "bits": "207fffff",
+                    "difficulty": 1.0,
+                    "chainwork": "00",
+                    "nTx": 1,
+                })),
+                other => Err(json!({ "code": -32601, "message": format!("unexpected {other}") })),
+            });
+            let core = CoreRPC::new(&CoreRpcConfig {
+                url,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                core.tx_block_height(&tx.compute_txid()).unwrap(),
+                expected,
+                "header confirmations {in_chain}"
+            );
+        }
     }
 
     /// Serves one canned reply per JSON-RPC method, failing on any other.

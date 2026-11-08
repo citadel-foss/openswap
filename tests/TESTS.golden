@@ -350,6 +350,7 @@ openswap wallet::blockchain::corerpc::tests::load_or_init_refuses_core_before_v2
 openswap wallet::blockchain::corerpc::tests::load_or_init_refuses_core_before_v22_without_a_wallet_file
 openswap wallet::blockchain::corerpc::tests::prepare_backend_wallet_refuses_core_before_v22
 openswap wallet::blockchain::corerpc::tests::restore_refuses_core_before_v22_without_a_wallet_file
+openswap wallet::blockchain::corerpc::tests::tx_in_an_orphaned_block_is_not_mined
 openswap wallet::blockchain::corerpc::tests::zmq_malformed_message_is_reported_as_missed
 openswap wallet::blockchain::corerpc::tests::zmq_publisher_restart_is_reported
 openswap wallet::blockchain::corerpc::tests::zmq_receive_error_is_reported_and_reconnects
