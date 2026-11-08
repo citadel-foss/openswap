@@ -745,6 +745,7 @@ openswap::integration lightning::e2e::lightning_swap_in_refuses_blocklisted_fund
 openswap::integration lightning::e2e::lightning_swap_out_refuses_blocklisted_funding
 openswap::integration lightning::maker_restart::conditional_paid_store_refuses_stale_copy
 openswap::integration lightning::maker_restart::forged_swap_in_funding_keeps_accepted_swap
+openswap::integration lightning::maker_restart::lightning_maker_closes_a_confirmed_refund_without_a_block_scan
 openswap::integration lightning::maker_restart::lightning_maker_closes_a_refund_at_finality_depth
 openswap::integration lightning::maker_restart::lightning_maker_closes_a_refund_at_finality_depth_on_electrum
 openswap::integration lightning::maker_restart::lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen
