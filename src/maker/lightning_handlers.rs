@@ -1810,9 +1810,12 @@ fn watchdog_resolve_swap_out(
 /// an approaching deadline nor a failed height read authorizes a refund.
 fn warn_swap_out_claim_deadline(maker: &Arc<MakerServer>, swap_id: &str, swap: &LnMakerSwap) {
     let Some(deadline) = swap.claim_deadline else {
-        log::warn!(
+        // Runs on every pass, healthy or not. A failed lookup or an unseen
+        // spend warns on its own path; without a deadline there is nothing
+        // more to warn about here.
+        log::debug!(
             "Swap-out {swap_id}: held Lightning claim deadline is unknown in this legacy \
-            record; retrying preimage recovery without a deadline estimate"
+            record; checking the chain for the claim without a deadline estimate"
         );
         return;
     };

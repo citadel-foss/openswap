@@ -827,6 +827,53 @@ fn lightning_maker_warns_before_claim_deadline_after_restart_without_funding_hei
     framework.set_block_gen_paused(false);
 }
 
+/// A record saved before claim deadlines were kept has none. While its HTLC
+/// is simply unclaimed, nothing is wrong, so the watchdog must not warn about
+/// the missing deadline on every pass.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_does_not_warn_each_pass_for_a_legacy_unclaimed_swap_out(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    pause_block_generation(&framework);
+    let maker = world.makers()[0].inner().clone();
+    ln.set_claim_deadline(Some(
+        bitcoind.client.get_block_count().unwrap() as u32 + 100,
+    ));
+    let hash = Preimage([0x7d; 32]).payment_hash();
+    let id = hash.to_string();
+    fund_swap_out(&maker, &ln, hash, Amount::from_sat(40_000), 30);
+    let mut swap = maker.get_ln_swap(&id).unwrap().unwrap();
+    swap.claim_deadline = None;
+    maker.store_ln_swap(&id, swap).unwrap();
+    for _ in 0..3 {
+        ln_watchdog_tick_now(&maker);
+    }
+    let notice = format!("Swap-out {id}: held Lightning claim deadline is unknown");
+    let warnings = std::fs::read_to_string(world.taker_log_path())
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains(&notice))
+        .count();
+    assert_eq!(
+        warnings, 0,
+        "an unclaimed legacy swap-out warned on each pass"
+    );
+    let pending = maker.get_ln_swap(&id).unwrap().unwrap();
+    assert_eq!(pending.phase, LnMakerPhase::OutFunded);
+    assert_eq!(pending.refund_txid, None);
+    framework.set_block_gen_paused(false);
+}
+
 /// An unfunded swap-in as the maker stores it on acceptance.
 fn accepted_swap_in(preimage: &Preimage) -> LnMakerSwap {
     accepted_swap_in_with_locktime(preimage, 144)
