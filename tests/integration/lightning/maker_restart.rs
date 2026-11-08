@@ -859,6 +859,7 @@ fn lightning_maker_does_not_warn_each_pass_for_a_legacy_unclaimed_swap_out(
         ln_watchdog_tick_now(&maker);
     }
     let notice = format!("Swap-out {id}: held Lightning claim deadline is unknown");
+    assert_log!(world; { has &notice });
     let warnings = std::fs::read_to_string(world.taker_log_path())
         .unwrap()
         .lines()
