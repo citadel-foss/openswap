@@ -405,6 +405,7 @@ openswap wallet::funding::tests::guard_rejection_falls_through_to_the_swap_pool
 openswap wallet::funding::tests::guard_rejection_in_both_pools_keeps_the_loss_error
 openswap wallet::funding::tests::infeasible_input_counts_are_skipped_without_changing_the_plan
 openswap wallet::funding::tests::insufficient_when_neither_pool_covers_the_plan
+openswap wallet::funding::tests::last_slot_cover_does_not_cost_a_split
 openswap wallet::funding::tests::manual_selection_caps_the_pool
 openswap wallet::funding::tests::manual_selection_degrades_the_split_count
 openswap wallet::funding::tests::min_change_skips_a_coin_that_leaves_dust
