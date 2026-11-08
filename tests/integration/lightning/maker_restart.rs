@@ -875,6 +875,95 @@ fn lightning_maker_does_not_warn_each_pass_for_a_legacy_unclaimed_swap_out(
     framework.set_block_gen_paused(false);
 }
 
+/// Once the watcher holds our refund and it is mined, nothing else can have
+/// claimed the HTLC. Closing the swap must not read every block since funding
+/// looking for a claim.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_closes_a_confirmed_refund_without_a_block_scan(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    use openswap::watch_tower::watcher::WatcherEvent;
+
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    pause_block_generation(&framework);
+    let maker = world.makers()[0].inner().clone();
+    let locktime: u16 = 30;
+    let preimage = Preimage([0x6e; 32]);
+    let id = preimage.payment_hash().to_string();
+    let funded = fund_swap_out(
+        &maker,
+        &ln,
+        preimage.payment_hash(),
+        Amount::from_sat(40_000),
+        locktime,
+    );
+    generate_blocks(bitcoind, 1);
+    let funded_at = bitcoind.client.get_block_count().unwrap()
+        - confirmations(bitcoind, &funded.outpoint.txid) as u64
+        + 1;
+    mine_to(bitcoind, funded_at + locktime as u64 + 1);
+    ln_watchdog_tick_now(&maker);
+    let refund = maker
+        .get_ln_swap(&id)
+        .unwrap()
+        .and_then(|swap| swap.refund_txid)
+        .expect("the refund was recorded");
+    let watcher_holds_refund = || {
+        matches!(
+            maker.watch_service.watch_request(funded.outpoint),
+            Ok(WatcherEvent::UtxoSpent { spending_tx: Some(tx), .. })
+                if tx.compute_txid() == refund
+        )
+    };
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the watcher to record the refund",
+        watcher_holds_refund()
+    );
+    generate_blocks(bitcoind, 1);
+    assert!(confirmations(bitcoind, &refund) >= 1);
+    assert!(watcher_holds_refund());
+
+    // bitcoind logs each RPC it serves once the category is on.
+    let _: serde_json::Value = bitcoind
+        .client
+        .call(
+            "logging",
+            &[serde_json::json!(["rpc"]), serde_json::json!([])],
+        )
+        .unwrap();
+    let node_log = bitcoind.workdir().join("regtest").join("debug.log");
+    let block_reads = || {
+        std::fs::read_to_string(&node_log)
+            .unwrap()
+            .matches("method=getblock user=")
+            .count()
+    };
+    let before = block_reads();
+    ln_watchdog_tick_now(&maker);
+    assert_eq!(
+        block_reads() - before,
+        0,
+        "closing a confirmed refund read full blocks"
+    );
+    assert!(maker.get_ln_swap(&id).unwrap().is_none());
+    assert!(
+        ln.claim_held_payment(&preimage).is_err(),
+        "the refunded swap's held payment must be failed back"
+    );
+    framework.set_block_gen_paused(false);
+}
+
 /// An unfunded swap-in as the maker stores it on acceptance.
 fn accepted_swap_in(preimage: &Preimage) -> LnMakerSwap {
     accepted_swap_in_with_locktime(preimage, 144)

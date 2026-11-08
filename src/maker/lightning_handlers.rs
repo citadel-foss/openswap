@@ -1594,6 +1594,18 @@ fn watchdog_resolve_swap_out(
             spending_tx: Some(tx),
             ..
         }) if swap.htlc.extract_preimage(tx).is_some() => answer,
+        // The watcher holds our recorded refund, and it is mined: no claim can
+        // confirm against it, so the lookup could only return this refund,
+        // and on Core it reads every block since funding to do so. Unmined,
+        // or if the check fails, the lookup still runs to find a rival claim.
+        Ok(WatcherEvent::UtxoSpent {
+            spending_tx: Some(tx),
+            ..
+        }) if is_our_refund(swap, tx)
+            && matches!(maker.is_tx_confirmed(&tx.compute_txid()), Ok(true)) =>
+        {
+            answer
+        }
         _ => {
             warn_swap_out_claim_deadline(maker, swap_id, swap);
             let spk = swap
