@@ -2300,6 +2300,7 @@ impl Taker {
         // A replay can target a swap that already aborted and cleared the live
         // state, so the maker must list what the replayed details use.
         let (mut stream, _) = self.net_connect_with(maker_address, &details.features)?;
+        self.authenticate_route_maker(&stream, maker_address)?;
         stream.send_message(&TakerToMakerMessage::GetOffer(GetOffer))?;
         stream.read_frame(None)?;
         stream.send_message(&TakerToMakerMessage::SwapDetails(details.clone()))?;
@@ -2845,14 +2846,29 @@ impl Taker {
             Some(maker) => maker.needed(),
             None => vec![swap.params.protocol.feature_name().to_string()],
         };
-        let identity = maker
+        let (stream, _) = self.net_connect_with(address, &needed)?;
+        self.authenticate_route_maker(&stream, address)?;
+        Ok(stream)
+    }
+
+    /// Check that `stream`'s peer holds the tweakable key of the offer this
+    /// swap recorded for `address`, when one is recorded.
+    fn authenticate_route_maker(
+        &self,
+        stream: &Bip324Stream,
+        address: &str,
+    ) -> Result<(), TakerError> {
+        let swap = self.swap_state()?;
+        let identity = swap
+            .makers
+            .iter()
+            .find(|m| m.address.to_string() == address)
             .and_then(|m| m.offer.as_ref())
             .map(|offer| offer.tweakable_point);
-        let (stream, _) = self.net_connect_with(address, &needed)?;
         if let Some(tweakable_point) = identity {
             stream.authenticate(&tweakable_point)?;
         }
-        Ok(stream)
+        Ok(())
     }
 
     /// Connect to a maker directly or through Tor and exchange Hellos. The
@@ -2962,11 +2978,13 @@ pub(crate) fn connect_to_maker(
             .and_then(|_| socket.set_write_timeout(Some(timeout)))
             .map_err(|e| TakerError::General(format!("Failed to set socket timeout: {}", e)))?;
 
+        // One absolute budget for the whole handshake, so a maker trickling
+        // bytes cannot keep it open past the read timeout.
         Ok(Bip324Stream::new(
             socket,
             network,
             bip324::Role::Initiator,
-            None,
+            Some(Instant::now() + read_timeout),
         )?)
     }
 }
@@ -2981,10 +2999,16 @@ impl Taker {
         swap_id: &str,
     ) -> Option<super::background_services::RouteHeartbeat> {
         let state = self.swap_state().ok()?;
-        let peers: Vec<(String, Vec<String>)> = state
+        let peers: Vec<(String, Vec<String>, Option<PublicKey>)> = state
             .makers
             .iter()
-            .map(|maker| (maker.address.to_string(), maker.needed()))
+            .map(|maker| {
+                (
+                    maker.address.to_string(),
+                    maker.needed(),
+                    maker.offer.as_ref().map(|offer| offer.tweakable_point),
+                )
+            })
             .collect();
         let dial = super::background_services::PeerDial {
             connection_type: self.config.connection_type,

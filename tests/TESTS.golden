@@ -1,6 +1,7 @@
 openswap atomic_file::tests::compat_wallet_lock_is_exclusive_until_its_process_exits
 openswap atomic_file::tests::compat_wallet_lock_survives_atomic_wallet_replacement
 openswap bip324_stream::tests::clean_close_is_connection_closed
+openswap bip324_stream::tests::decoys_do_not_extend_the_idle_wait
 openswap bip324_stream::tests::idle_timeout_leaves_stream_usable
 openswap bip324_stream::tests::oversized_packet_is_refused_before_allocating
 openswap bip324_stream::tests::roundtrip_and_session_binding

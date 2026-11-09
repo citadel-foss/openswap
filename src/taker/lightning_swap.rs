@@ -382,6 +382,18 @@ impl Taker {
             MakerToTakerMessage::Offer(offer) => *offer,
             other => return Err(general(format!("expected Offer, got {other:?}"))),
         };
+        // A maker from the verified offerbook must still present that offer's
+        // key; otherwise whoever answered could substitute its own.
+        let known = self
+            .offerbook
+            .good_makers()?
+            .into_iter()
+            .find(|m| m.address.to_string() == address);
+        if let Some(known) = known {
+            if known.offer.tweakable_point != offer.tweakable_point {
+                return Err(general("maker's offer key differs from the offerbook"));
+            }
+        }
         // Whoever answered must hold the key the offer advertises.
         socket
             .authenticate(&offer.tweakable_point)

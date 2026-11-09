@@ -1976,7 +1976,14 @@ impl MakerAddress {
         socket.set_read_timeout(Some(Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC)))?;
         socket.set_write_timeout(Some(Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC)))?;
 
-        let mut socket = Bip324Stream::new(socket, network, bip324::Role::Initiator, None)?;
+        let handshake_deadline =
+            std::time::Instant::now() + Duration::from_secs(FIRST_CONNECT_ATTEMPT_TIMEOUT_SEC);
+        let mut socket = Bip324Stream::new(
+            socket,
+            network,
+            bip324::Role::Initiator,
+            Some(handshake_deadline),
+        )?;
         let features = handshake_with_maker(&mut socket, &[])?;
 
         // Send GetOffer
