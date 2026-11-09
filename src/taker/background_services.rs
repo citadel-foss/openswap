@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use bitcoin::{OutPoint, ScriptBuf, Txid};
+use bitcoin::{OutPoint, PublicKey, ScriptBuf, Txid};
 
 use crate::{
     bip324_stream::Bip324Stream,
@@ -531,6 +531,9 @@ struct HeartbeatPeer {
     address: String,
     /// Names the maker's Hello must list for this swap.
     needed: Vec<String>,
+    /// The tweakable point of the maker's offer, when known. The maker must
+    /// prove it holds this key before it receives the swap id.
+    identity: Option<PublicKey>,
     /// `None` while disconnected and waiting to retry.
     stream: Option<Bip324Stream>,
     /// Ticks still to wait before the next connect attempt.
@@ -540,10 +543,11 @@ struct HeartbeatPeer {
 }
 
 impl HeartbeatPeer {
-    fn new((address, needed): (String, Vec<String>)) -> Self {
+    fn new((address, needed, identity): (String, Vec<String>, Option<PublicKey>)) -> Self {
         Self {
             address,
             needed,
+            identity,
             stream: None,
             retry_in: 0,
             backoff: RECONNECT_BACKOFF_MIN_TICKS,
@@ -565,8 +569,13 @@ impl HeartbeatPeer {
                 dial_timeout,
                 dial.network,
             )
-            .and_then(|mut stream| handshake_with_maker(&mut stream, &self.needed).map(|_| stream))
-            {
+            .and_then(|mut stream| {
+                handshake_with_maker(&mut stream, &self.needed)?;
+                if let Some(identity) = &self.identity {
+                    stream.authenticate(identity)?;
+                }
+                Ok(stream)
+            }) {
                 Ok(stream) => {
                     log::debug!("route heartbeat: connected to {}", self.address);
                     self.stream = Some(stream);
@@ -624,7 +633,7 @@ impl RouteHeartbeat {
     /// that is unreachable at start is retried instead of dropped from the route.
     pub(crate) fn start(
         swap_id: &str,
-        peers: Vec<(String, Vec<String>)>,
+        peers: Vec<(String, Vec<String>, Option<PublicKey>)>,
         dial: PeerDial,
     ) -> std::io::Result<Self> {
         let (stop, stop_rx) = mpsc::channel();
@@ -924,7 +933,7 @@ mod tests {
     }
 
     fn peer_on(address: &str) -> HeartbeatPeer {
-        HeartbeatPeer::new((address.to_string(), Vec::new()))
+        HeartbeatPeer::new((address.to_string(), Vec::new(), None))
     }
 
     fn test_dial() -> PeerDial {
@@ -1038,6 +1047,7 @@ mod tests {
         let mut peer = HeartbeatPeer {
             address,
             needed: Vec::new(),
+            identity: None,
             stream: Some(stream),
             retry_in: 0,
             backoff: RECONNECT_BACKOFF_MAX_TICKS,
