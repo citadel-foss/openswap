@@ -142,6 +142,8 @@ pub(crate) struct Bip324Stream {
     outbound: OutboundCipher,
     session_id: SessionId,
     deadline: SharedDeadline,
+    /// The socket's read timeout, which is also the wait between messages.
+    idle_timeout: Option<Duration>,
     /// Taker only: the maker's signature over `session_id`, from its Hello.
     maker_session_sig: Option<Signature>,
 }
@@ -165,8 +167,9 @@ impl Bip324Stream {
         deadline: Option<Instant>,
     ) -> Result<Self, NetError> {
         let deadline = Arc::new(Mutex::new(deadline));
+        let idle_timeout = stream.read_timeout()?;
         let reader = BufReader::new(DeadlineReader {
-            idle_timeout: stream.read_timeout()?,
+            idle_timeout,
             applied: None,
             socket: stream.try_clone()?,
             deadline: deadline.clone(),
@@ -190,6 +193,7 @@ impl Bip324Stream {
             outbound,
             session_id,
             deadline,
+            idle_timeout,
             maker_session_sig: None,
         })
     }
@@ -219,6 +223,7 @@ impl Bip324Stream {
     }
 
     fn read_frame_inner(&mut self, deadline: Option<Instant>) -> Result<Vec<u8>, NetError> {
+        let started = Instant::now();
         loop {
             let mut len_bytes = [0u8; NUM_LENGTH_BYTES];
             self.set_deadline(deadline);
@@ -241,7 +246,13 @@ impl Bip324Stream {
                 .map_err(Bip324Error::Cipher)?;
             match packet_type {
                 // We never send decoys, but they are valid BIP324 traffic.
-                PacketType::Decoy => continue,
+                // Decoys are not activity: once they fill an idle period,
+                // report it as one so the caller rechecks inactivity.
+                PacketType::Decoy => {
+                    if self.idle_timeout.is_some_and(|t| started.elapsed() >= t) {
+                        return Err(NetError::IO(ErrorKind::TimedOut.into()));
+                    }
+                }
                 PacketType::Genuine => {
                     plaintext.drain(..NUM_HEADER_BYTES);
                     return Ok(plaintext);
@@ -430,6 +441,33 @@ mod tests {
         );
         taker.send_message(&1u8).unwrap();
         assert_eq!(maker.read_message::<u8>().unwrap(), 1);
+    }
+
+    #[test]
+    fn decoys_do_not_extend_the_idle_wait() {
+        let idle = Duration::from_millis(300);
+        let (mut taker, mut maker) = pair_with_maker_idle(Network::Regtest, Some(idle));
+        let decoy = |t: &mut Bip324Stream| t.outbound.encrypt_to_vec(&[], PacketType::Decoy, None);
+        let writer = thread::spawn(move || {
+            // Decoys well inside the idle timeout, for far longer than it.
+            for _ in 0..30 {
+                let packet = decoy(&mut taker);
+                if taker.writer.write_all(&packet).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        let err = maker.read_frame(None).unwrap_err();
+        assert!(
+            matches!(&err, NetError::IO(e) if e.kind() == ErrorKind::TimedOut),
+            "{:?}",
+            err
+        );
+        assert!(started.elapsed() < idle * 3, "{:?}", started.elapsed());
+        drop(maker);
+        writer.join().unwrap();
     }
 
     #[test]
