@@ -492,27 +492,39 @@ impl FidelityBond {
             })?;
         // The stored tx is this bond's, so its txid is known: the backend's
         // answer is never trusted to name what we wait on.
+        let txid = self.outpoint.txid;
         let Err(error) = chain.send_raw_transaction(tx) else {
-            return Ok(self.outpoint.txid);
+            return Ok(txid);
         };
-        // A refusal is the backend's verdict on this exact transaction, and
-        // resending it will not change that. Only a transport failure is
-        // worth retrying.
-        match broadcast_refusal(&error) {
-            Some(refusal) if refusal.is_already_known() => Ok(self.outpoint.txid),
-            Some(refusal) => Err(FidelityError::BondBroadcastRefused {
+        let refusal = broadcast_refusal(&error);
+        if refusal
+            .as_ref()
+            .is_some_and(BroadcastRefusal::is_already_known)
+        {
+            return Ok(txid);
+        }
+        // The backend may have taken the tx despite the error reply. Only a
+        // refusal of a tx it still does not know is final: resending it will
+        // not change that. Anything else stays retryable.
+        match (refusal, chain.is_tx_unknown(&txid)) {
+            (_, Ok(false)) => {
+                log::warn!("Fidelity bond tx {txid} reached the backend despite {error:?}");
+                Ok(txid)
+            }
+            (Some(refusal), Ok(true)) => Err(FidelityError::BondBroadcastRefused {
                 index: self.bond_index,
                 reason: refusal.message,
             }
             .into()),
-            None => Err(error),
+            _ => Err(error),
         }
     }
 }
 
 /// The backend's own answer to a broadcast it refused: Core's RPC error, or an
-/// Electrum server's error reply. A timeout or a dropped connection is no such
-/// answer and says nothing about whether the transaction went out.
+/// Electrum server's error reply. A timeout, a dropped connection or a server
+/// fault is no such answer and says nothing about whether the transaction went
+/// out.
 struct BroadcastRefusal {
     code: Option<i64>,
     message: String,
@@ -533,8 +545,16 @@ impl BroadcastRefusal {
     }
 }
 
+/// JSON-RPC's internal error (-32603) and its implementation-defined server
+/// errors (-32099 to -32000) report a fault in the server, not a verdict on the
+/// transaction. Bitcoin Core and Electrum servers (electrs, ElectrumX, Fulcrum)
+/// reject a transaction with their own codes, such as -26, 1 or 2.
+fn is_server_fault(code: Option<i64>) -> bool {
+    matches!(code, Some(-32603 | -32099..=-32000))
+}
+
 fn broadcast_refusal(error: &WalletError) -> Option<BroadcastRefusal> {
-    match error {
+    let refusal = match error {
         WalletError::Rpc(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(e))) => {
             Some(BroadcastRefusal {
                 code: Some(i64::from(e.code)),
@@ -551,7 +571,8 @@ fn broadcast_refusal(error: &WalletError) -> Option<BroadcastRefusal> {
                 .to_string(),
         }),
         _ => None,
-    }
+    }?;
+    (!is_server_fault(refusal.code)).then_some(refusal)
 }
 
 // Wallet APIs related to fidelity bonds.
@@ -784,13 +805,45 @@ impl Wallet {
         feerate: f64,
         change_address_type: AddressType,
     ) -> Result<(u32, Txid), WalletError> {
+        self.create_fidelity_replacing(
+            amount,
+            locktime,
+            maker_address,
+            feerate,
+            change_address_type,
+            &[],
+        )
+    }
+
+    /// [`Self::create_fidelity`] for a maker whose bonds at `replaced` were
+    /// refused by the backend.
+    ///
+    /// A refused bond can still confirm, from a peer's mempool or once the
+    /// node's minimum fee falls. The new bond spends every coin of those bonds
+    /// that the wallet can still spend, so the two conflict and at most one of
+    /// them ever locks funds.
+    pub fn create_fidelity_replacing(
+        &mut self,
+        amount: Amount,
+        locktime: LockTime,
+        maker_address: Option<&str>,
+        feerate: f64,
+        change_address_type: AddressType,
+        replaced: &[u32],
+    ) -> Result<(u32, Txid), WalletError> {
         let (index, fidelity_addr, fidelity_pubkey) = self.get_next_fidelity_address(locktime)?;
 
+        let replaced_coins = self.unsent_bond_coins(replaced);
+        if !replaced_coins.is_empty() {
+            log::info!(
+                "New fidelity bond spends {replaced_coins:?}, held by refused bonds {replaced:?}"
+            );
+        }
         let coins = self.coin_select(
             amount,
             feerate,
             infer_address_type(&fidelity_addr.script_pubkey()),
-            None,
+            Some(replaced_coins),
             None,
         )?;
         let outputs = vec![(fidelity_addr, amount)];
@@ -823,6 +876,29 @@ impl Wallet {
         let txid = self.register_and_broadcast_bond(bond)?;
 
         Ok((index, txid))
+    }
+
+    /// The coins that the unconfirmed bonds at `indices` spend and that this
+    /// wallet can still spend: their transactions are in no block or mempool
+    /// the backend knows. Locked and swap-reserved coins are left alone.
+    pub(crate) fn unsent_bond_coins(&self, indices: &[u32]) -> Vec<OutPoint> {
+        let locked = self.list_lock_unspent();
+        let spendable: HashSet<OutPoint> = self
+            .list_descriptor_utxo_spend_info()
+            .iter()
+            .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+            .filter(|outpoint| !locked.contains(outpoint) && !self.is_swap_reserved(outpoint))
+            .collect();
+        self.store
+            .fidelity_bond
+            .iter()
+            .filter(|bond| {
+                indices.contains(&bond.bond_index) && !bond.is_spent && bond.conf_height.is_none()
+            })
+            .filter_map(|bond| bond.tx.as_ref())
+            .flat_map(|tx| tx.input.iter().map(|input| input.previous_output))
+            .filter(|outpoint| spendable.contains(outpoint))
+            .collect()
     }
 
     /// Saves `bond`, then broadcasts its transaction.
