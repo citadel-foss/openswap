@@ -142,6 +142,7 @@ openswap taker::background_services::tests::compat_recovery_scope_excludes_live_
 openswap taker::background_services::tests::compat_recovery_scope_includes_watchonly_and_claim_ready_coins_but_excludes_lightning
 openswap taker::background_services::tests::compat_unfunded_abort_preserves_scope_until_its_coin_removal_is_saved
 openswap taker::background_services::tests::dead_keepalive_socket_is_dropped_and_retried_immediately
+openswap taker::background_services::tests::heartbeat_authenticates_before_sending_the_swap_id
 openswap taker::background_services::tests::stalled_handshake_is_bounded_by_the_dial_timeout
 openswap taker::background_services::tests::unknown_watcher_answer_requires_abort
 openswap taker::background_services::tests::unreachable_peer_backs_off_instead_of_being_dropped

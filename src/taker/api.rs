@@ -2852,19 +2852,30 @@ impl Taker {
     }
 
     /// Check that `stream`'s peer holds the tweakable key of the offer this
-    /// swap recorded for `address`, when one is recorded.
+    /// swap recorded for `address`, or, once the swap is gone (a replay after
+    /// an abort), of its verified offer in the offerbook, when one is known.
     fn authenticate_route_maker(
         &self,
         stream: &Bip324Stream,
         address: &str,
     ) -> Result<(), TakerError> {
-        let swap = self.swap_state()?;
-        let identity = swap
-            .makers
-            .iter()
-            .find(|m| m.address.to_string() == address)
-            .and_then(|m| m.offer.as_ref())
-            .map(|offer| offer.tweakable_point);
+        let recorded = self.swap_state().ok().and_then(|swap| {
+            swap.makers
+                .iter()
+                .find(|m| m.address.to_string() == address)
+                .and_then(|m| m.offer.as_ref())
+                .map(|offer| offer.tweakable_point)
+        });
+        let identity = match recorded {
+            Some(point) => Some(point),
+            None => self
+                .offerbook
+                .all_makers()?
+                .into_iter()
+                .find(|m| m.address.to_string() == address)
+                .and_then(|m| m.offer)
+                .map(|offer| offer.tweakable_point),
+        };
         if let Some(tweakable_point) = identity {
             stream.authenticate(&tweakable_point)?;
         }
