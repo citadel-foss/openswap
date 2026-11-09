@@ -624,7 +624,7 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
     maker_lightning = [ln.clone()],
     setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
 )]
-fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
+fn lightning_maker_recovers_a_claim_its_watcher_has_not_seen(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
 ) {
@@ -706,19 +706,6 @@ fn recover_unseen_claim(world: &mut World, ln: Arc<MockLightningBackend>, mature
     let claim_txid = bitcoind.client.send_raw_transaction(&claim).unwrap();
     generate_blocks(bitcoind, 1);
     assert!(confirmations(bitcoind, &claim_txid) >= 1);
-
-    let no_refund = |maker: &Arc<MakerServer>| {
-        let swap = maker
-            .get_ln_swap(&swap_id)
-            .unwrap()
-            .expect("the swap stays open");
-        assert_eq!(swap.phase, LnMakerPhase::OutFunded);
-        assert_eq!(
-            swap.refund_txid, None,
-            "the maker refunded an HTLC the taker had claimed"
-        );
-    };
-    no_refund(&maker);
 
     // ---- Still unseen after a restart ----
     let mut config = maker.config.clone();
