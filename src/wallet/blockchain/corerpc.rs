@@ -952,7 +952,7 @@ pub(crate) mod tests {
 
     /// Core's txindex keeps the entry of a tx whose block a reorg orphaned, and
     /// `getrawtransaction` still names that block. Only a block in the active
-    /// chain makes the tx mined.
+    /// chain makes the tx mined, or a spend of its output confirmed.
     #[test]
     fn tx_in_an_orphaned_block_is_not_mined() {
         use crate::watch_tower::watcher::tests::mock_core_rpc;
@@ -995,6 +995,8 @@ pub(crate) mod tests {
                     "chainwork": "00",
                     "nTx": 1,
                 })),
+                // The output is in no UTXO set: spent, or its tx was orphaned.
+                "gettxout" => Ok(Value::Null),
                 other => Err(json!({ "code": -32601, "message": format!("unexpected {other}") })),
             });
             let core = CoreRPC::new(&CoreRpcConfig {
@@ -1007,6 +1009,18 @@ pub(crate) mod tests {
                 expected,
                 "header confirmations {in_chain}"
             );
+            let outpoint = OutPoint::new(tx.compute_txid(), 0);
+            assert_eq!(
+                core.is_confirmed_spend(&outpoint, &bitcoin::ScriptBuf::new())
+                    .unwrap(),
+                expected.is_some(),
+                "header confirmations {in_chain}"
+            );
+            if expected.is_none() {
+                // Any block scan starts with `getblockcount`, which the mock
+                // refuses, so this also proves none is attempted.
+                assert_eq!(core.mined_spending_transaction(&outpoint).unwrap(), None);
+            }
         }
     }
 
