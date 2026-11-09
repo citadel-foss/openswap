@@ -41,6 +41,7 @@ pub fn wait_for_makers_setup(makers: &[Arc<MakerServer>], timeout_secs: u64) {
                     i, timeout_secs
                 );
             }
+            std::hint::spin_loop();
         }
         fence(Acquire);
     }
