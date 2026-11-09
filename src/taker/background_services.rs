@@ -948,6 +948,62 @@ mod tests {
         TakerToMakerMessage::WaitingFundingConfirmation("swap".to_string())
     }
 
+    /// Run one heartbeat tick against a fake maker that signs the session with
+    /// `signing_key` (or not at all), while the peer expects `expected`'s
+    /// point. Returns whether the maker received a keepalive.
+    fn keepalive_reaches_maker(signing_key: Option<SecretKey>, expected: SecretKey) -> bool {
+        use crate::{
+            bip324_stream::sign_session_id,
+            protocol::common_messages::{Hello, MakerToTakerMessage},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let maker = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut stream = Bip324Stream::new(
+                socket,
+                bitcoin::Network::Regtest,
+                bip324::Role::Responder,
+                None,
+            )
+            .unwrap();
+            let _: TakerToMakerMessage = stream.read_message().unwrap();
+            let hello = Hello {
+                features: Vec::new(),
+                session_id_sig: signing_key.map(|k| sign_session_id(stream.session_id(), &k)),
+            };
+            stream
+                .send_message(&MakerToTakerMessage::Hello(hello))
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            matches!(
+                stream
+                    .read_frame(Some(deadline))
+                    .map(|f| serde_cbor::from_slice(&f)),
+                Ok(Ok(TakerToMakerMessage::WaitingFundingConfirmation(_)))
+            )
+        });
+        let point = PublicKey::new(SecpPublicKey::from_secret_key(&Secp256k1::new(), &expected));
+        let mut peer = HeartbeatPeer::new((address, Vec::new(), Some(point)));
+        peer.tick(&keepalive(), test_dial(), HEARTBEAT_DIAL_TIMEOUT);
+        let authenticated = peer.stream.is_some();
+        drop(peer);
+        let received = maker.join().unwrap();
+        assert_eq!(authenticated, received);
+        received
+    }
+
+    /// The swap id must not reach a peer that cannot prove it holds the
+    /// maker's offer key: an interceptor would learn the route's shared id.
+    #[test]
+    fn heartbeat_authenticates_before_sending_the_swap_id() {
+        let maker_key = SecretKey::from_slice(&[3; 32]).unwrap();
+        let wrong_key = SecretKey::from_slice(&[4; 32]).unwrap();
+        assert!(keepalive_reaches_maker(Some(maker_key), maker_key));
+        assert!(!keepalive_reaches_maker(Some(wrong_key), maker_key));
+        assert!(!keepalive_reaches_maker(None, maker_key));
+    }
+
     /// A maker that cannot be reached must be retried on a widening backoff
     /// rather than abandoned (the old code dropped it from the route entirely)
     /// or hammered once per tick.
