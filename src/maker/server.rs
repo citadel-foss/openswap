@@ -5,7 +5,7 @@ use std::{
     io::{ErrorKind, Read},
     net::{Ipv4Addr, TcpListener, TcpStream},
     sync::{
-        atomic::Ordering::{self, Relaxed},
+        atomic::Ordering::{self, Relaxed, Release},
         Arc, Mutex, MutexGuard,
     },
     thread::{self, sleep},
@@ -382,7 +382,7 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     }
 
     if listener.is_some() {
-        maker.is_setup_complete.store(true, Relaxed);
+        maker.is_setup_complete.store(true, Release);
         log::info!(
             "[{}] Server setup complete! Listening on port {}",
             maker.config.network_port,
