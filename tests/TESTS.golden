@@ -331,7 +331,7 @@ openswap wallet::api::mempool_deferral_tests::a_broadcast_bond_is_saved_with_its
 openswap wallet::api::mempool_deferral_tests::a_kept_refused_bond_is_reported_unbroadcastable_on_restart
 openswap wallet::api::mempool_deferral_tests::a_rebroadcast_taken_despite_an_error_reply_is_not_refused
 openswap wallet::api::mempool_deferral_tests::a_refused_unknown_bond_is_dropped
-openswap wallet::api::mempool_deferral_tests::a_replacement_bond_spends_the_refused_bonds_coins
+openswap wallet::api::mempool_deferral_tests::a_replacement_bond_conflicts_with_every_viable_refused_bond
 openswap wallet::api::mempool_deferral_tests::an_unclear_rebroadcast_failure_stays_retryable
 openswap wallet::api::mempool_deferral_tests::committed_legacy_resends_unknown_funding_before_its_contract
 openswap wallet::api::mempool_deferral_tests::compat_committed_taproot_survives_absence_until_confirmation
@@ -706,6 +706,7 @@ openswap::integration fidelity::renewal::bond_auto_renewal
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart_electrum
 openswap::integration fidelity::restart::live_bond_is_advertised_while_another_is_pending
+openswap::integration fidelity::restart::refused_bond_is_replaced_by_a_conflicting_bond
 openswap::integration fidelity::restart::unconfirmed_bond_not_duplicated
 openswap::integration fidelity::restart::unconfirmed_bond_not_duplicated_electrum
 openswap::integration fidelity::spending::bond_spending

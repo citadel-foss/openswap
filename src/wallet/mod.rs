@@ -31,11 +31,11 @@ pub use blockchain::{
 };
 pub use deniability::{verify_deniability, DeniabilityProof, DeniabilityProofData};
 pub use error::WalletError;
-pub use fidelity::FidelityBond;
 pub(crate) use fidelity::{
     verify_fidelity_checks, FidelityError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS,
     MIN_FIDELITY_TIMELOCK,
 };
+pub use fidelity::{BondReplacement, FidelityBond};
 pub use report::{
     MakerFeeInfo, MakerReport, PaymentResult, RecoveryReport, ReportUtxo, SwapRole, SwapStatus,
     TakerReport,

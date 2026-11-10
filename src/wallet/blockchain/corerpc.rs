@@ -608,6 +608,18 @@ impl Blockchain for CoreRPC {
         Ok(self.rpc.get_raw_transaction_info(txid, block_hash)?)
     }
 
+    fn abandon_transaction(&self, txid: &Txid) -> Result<(), WalletError> {
+        match self
+            .rpc
+            .call::<Value>("abandontransaction", &[json!(txid.to_string())])
+        {
+            Ok(_) => Ok(()),
+            // -5: not a wallet tx, or not eligible (in the mempool or a block).
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -5 => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn is_tx_unknown(&self, txid: &Txid) -> Result<bool, WalletError> {
         let info = match self.rpc.get_raw_transaction_info(txid, None) {
             Ok(info) => info,
