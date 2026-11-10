@@ -382,6 +382,7 @@ openswap wallet::blockchain::electrum::tests::a_transport_failure_leaves_every_s
 openswap wallet::blockchain::electrum::tests::accumulated_total_above_max_money_errors
 openswap wallet::blockchain::electrum::tests::an_unanswered_subscribe_recycles_at_once_during_a_refusal_backoff
 openswap wallet::blockchain::electrum::tests::an_unreachable_history_read_stops_the_script_walk
+openswap wallet::blockchain::electrum::tests::an_unreadable_header_notification_rereads_the_tip
 openswap wallet::blockchain::electrum::tests::an_unsubscribe_recycles_the_connection_during_a_refusal_backoff
 openswap wallet::blockchain::electrum::tests::blind_watch_logs_count_shared_outpoints_and_global_rearm
 openswap wallet::blockchain::electrum::tests::cached_transaction_does_not_hide_server_eviction

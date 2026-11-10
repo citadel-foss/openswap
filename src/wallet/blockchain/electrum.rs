@@ -2323,7 +2323,16 @@ impl Blockchain for Electrum {
         }
 
         // Header tip update.
-        let n = self.call(LOCAL, |c| c.block_headers_pop()).ok().flatten()?;
+        let n = match self.call(LOCAL, |c| c.block_headers_pop()) {
+            Ok(n) => n?,
+            // The client pops a header before decoding it, so one that fails is
+            // gone; the re-arm path re-subscribes and reads the tip again.
+            Err(e) => {
+                log::warn!("electrum header notification unreadable: {e:?}");
+                self.needs_rearm.store(true, Ordering::SeqCst);
+                return None;
+            }
+        };
         let height = n.height as i64;
         let hash = n.header.block_hash();
         if height == state.last_height && state.last_hash == Some(hash) {
@@ -2424,9 +2433,18 @@ pub(crate) mod tests {
         down: Arc<AtomicBool>,
         dropped: Arc<Mutex<Option<String>>>,
         tip: Arc<Mutex<(u64, String)>>,
+        notifications: Arc<Mutex<Vec<Value>>>,
     }
 
     impl MockElectrum {
+        /// Send a `method` notification with `params` ahead of the next reply.
+        pub(crate) fn notify(&self, method: &str, params: Value) {
+            self.notifications
+                .lock()
+                .unwrap()
+                .push(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+        }
+
         /// The tip `blockchain.headers.subscribe` reports from now on.
         pub(crate) fn set_tip(&self, height: u64, header: &bitcoin::block::Header) {
             *self.tip.lock().unwrap() = (height, serialize_hex(header));
@@ -2467,10 +2485,12 @@ pub(crate) mod tests {
         let down = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(Mutex::new(None::<String>));
         let tip = Arc::new(Mutex::new((1, header_hex.clone())));
+        let notifications = Arc::new(Mutex::new(Vec::new()));
         let answer = Arc::new(answer);
         let (server_calls, server_hang_up, server_down) =
             (calls.clone(), hang_up.clone(), down.clone());
         let (server_dropped, server_tip) = (dropped.clone(), tip.clone());
+        let server_notifications = notifications.clone();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
             // Polled rather than blocking in accept, so going down can close
@@ -2504,7 +2524,7 @@ pub(crate) mod tests {
                 let (answer, calls) = (answer.clone(), server_calls.clone());
                 let (header_hex, hang_up) = (header_hex.clone(), server_hang_up.clone());
                 let (down, dropped) = (server_down.clone(), server_dropped.clone());
-                let tip = server_tip.clone();
+                let (tip, notifications) = (server_tip.clone(), server_notifications.clone());
                 thread::spawn(move || {
                     let mut writer = stream.try_clone().expect("clone electrum stream");
                     let mut reader = BufReader::new(stream);
@@ -2538,10 +2558,15 @@ pub(crate) mod tests {
                             Ok(result) => response["result"] = result,
                             Err(error) => response["error"] = error,
                         }
-                        if serde_json::to_writer(&mut writer, &response).is_err()
-                            || writer.write_all(b"\n").is_err()
-                            || writer.flush().is_err()
-                        {
+                        let queued = std::mem::take(&mut *notifications.lock().unwrap());
+                        for message in queued.iter().chain([&response]) {
+                            if serde_json::to_writer(&mut writer, message).is_err()
+                                || writer.write_all(b"\n").is_err()
+                            {
+                                return;
+                            }
+                        }
+                        if writer.flush().is_err() {
                             return;
                         }
                     }
@@ -2555,6 +2580,7 @@ pub(crate) mod tests {
             down,
             dropped,
             tip,
+            notifications,
         }
     }
 
@@ -2739,6 +2765,35 @@ pub(crate) mod tests {
         server.set_tip(2, &replacement);
         assert_eq!(tips(), [(2, serialize(&replacement.block_hash()))]);
         assert!(backend.may_have_missed(&script));
+    }
+
+    #[test]
+    fn an_unreadable_header_notification_rereads_the_tip() {
+        let server = mock_electrum(|method, _params| {
+            Err(json!({ "code": -32601, "message": format!("unexpected {method}") }))
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 1,
+            poll_interval_secs: Some(0),
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        let mined = block_header(2);
+        server.set_tip(2, &mined);
+        server.notify(
+            "blockchain.headers.subscribe",
+            json!([{ "height": 2, "hex": "00" }]),
+        );
+        backend.call(PING, |c| c.ping()).expect("ping");
+
+        assert!(backend.poll_event().is_none(), "the bad header is dropped");
+        match backend.poll_event() {
+            Some(WatchEvent::BlockConnected(b)) => {
+                assert_eq!((b.height, b.hash), (2, serialize(&mined.block_hash())))
+            }
+            other => panic!("expected the tip, got {:?}", other),
+        }
     }
 
     /// Retries spent on a script's earlier subscription must not leave its
