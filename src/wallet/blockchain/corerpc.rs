@@ -249,11 +249,15 @@ impl std::fmt::Debug for CoreRPC {
 
 impl CoreRPC {
     /// Connect an RPC client for the configured wallet endpoint. Cheap — the
-    /// client connects lazily on first use. Used by `AnyBlockchain::from_config`.
+    /// client connects lazily on first use. Nothing can abort its rescans; an
+    /// owner that shuts down uses [`CoreRPC::with_shutdown_flag`].
     pub fn new(config: &CoreRpcConfig) -> Result<Self, WalletError> {
         Self::with_shutdown_flag(config, Arc::new(AtomicBool::new(false)))
     }
 
+    /// Like [`CoreRPC::new`], but setting `shutdown` aborts a pending rescan,
+    /// so a rescan cannot hold the owner's shutdown for hours. Used by
+    /// `AnyBlockchain::from_config_with_shutdown`.
     pub(crate) fn with_shutdown_flag(
         config: &CoreRpcConfig,
         shutdown: Arc<AtomicBool>,
@@ -277,7 +281,8 @@ impl CoreRPC {
         })
     }
 
-    /// Open a fresh, independent Bitcoin Core RPC connection with the same config.
+    /// Open a fresh Bitcoin Core RPC connection with the same config and the
+    /// same shutdown flag, so the owner's shutdown also aborts its rescans.
     ///
     /// Used to give a separate consumer (e.g. the watchtower discovery thread)
     /// its own connection without threading the config around separately.
@@ -285,6 +290,8 @@ impl CoreRPC {
         Self::with_shutdown_flag(&self.config, self.shutdown.clone())
     }
 
+    /// Open a fresh connection whose rescans the consumer's own `shutdown`
+    /// aborts. Used by `AnyBlockchain::new_connection_with_shutdown`.
     pub(crate) fn reconnect_with_shutdown(
         &self,
         shutdown: Arc<AtomicBool>,
@@ -1127,10 +1134,9 @@ pub(crate) mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
-    /// The mock holds each rescan until `abortrescan` arrives, then fails it as
-    /// Core does, or answers after 20 s if no abort comes.
-    #[test]
-    fn shutdown_aborts_a_pending_rescan() {
+    /// A mock Core that holds each rescan until `abortrescan` arrives, then
+    /// fails it as Core does, or answers after 20 s if no abort comes.
+    fn abortable_core() -> CoreRpcConfig {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock core");
         let addr = listener.local_addr().unwrap();
         let aborted = Arc::new(AtomicBool::new(false));
@@ -1177,21 +1183,21 @@ pub(crate) mod tests {
                 });
             }
         });
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let core = CoreRPC::with_shutdown_flag(
-            &CoreRpcConfig {
-                url: addr.to_string(),
-                ..Default::default()
-            },
-            Arc::clone(&shutdown),
-        )
-        .unwrap();
+        CoreRpcConfig {
+            url: addr.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Sets `shutdown` while `backend` waits on an import, which must then
+    /// return `Interrupted` well before the mock's 20 s fallback.
+    fn assert_shutdown_aborts_import(backend: &impl Blockchain, shutdown: Arc<AtomicBool>) {
         let stop = thread::spawn(move || {
             thread::sleep(Duration::from_millis(200));
             shutdown.store(true, Ordering::SeqCst);
         });
         let started = Instant::now();
-        let result = core.import_descriptors(&[json!({ "desc": "raw(51)", "timestamp": 0 })]);
+        let result = backend.import_descriptors(&[json!({ "desc": "raw(51)", "timestamp": 0 })]);
         stop.join().unwrap();
         assert!(
             matches!(result, Err(WalletError::Interrupted(_))),
@@ -1199,10 +1205,43 @@ pub(crate) mod tests {
             result
         );
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn shutdown_aborts_a_pending_rescan() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let core = CoreRPC::with_shutdown_flag(&abortable_core(), Arc::clone(&shutdown)).unwrap();
+        assert_shutdown_aborts_import(&core, shutdown);
         assert!(matches!(
             core.rescan_wallet_from(0),
             Err(WalletError::Interrupted(_))
         ));
+    }
+
+    #[test]
+    fn any_blockchain_gives_core_its_shutdown_flag() {
+        use crate::wallet::blockchain::{AnyBlockchain, BackendConfig};
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let backend = AnyBlockchain::from_config_with_shutdown(
+            &BackendConfig::CoreRpc(abortable_core()),
+            Arc::clone(&shutdown),
+        )
+        .unwrap();
+        assert_shutdown_aborts_import(&backend, shutdown);
+
+        let parent_shutdown = Arc::new(AtomicBool::new(false));
+        let parent = AnyBlockchain::from_config_with_shutdown(
+            &BackendConfig::CoreRpc(abortable_core()),
+            Arc::clone(&parent_shutdown),
+        )
+        .unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let consumer = parent
+            .new_connection_with_shutdown(Arc::clone(&shutdown))
+            .unwrap();
+        assert_shutdown_aborts_import(&consumer, shutdown);
+        assert!(!parent_shutdown.load(Ordering::SeqCst));
     }
 
     fn blockchain_info(chain: &str) -> Value {
