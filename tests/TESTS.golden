@@ -8,6 +8,7 @@ openswap blocklist::tests::compat_blocklist_old_files_and_known_headers_survive_
 openswap blocklist::tests::compat_blocklist_requirements_are_checked_before_entry_shapes
 openswap blocklist::tests::concurrent_adds_preserve_every_entry
 openswap blocklist::tests::malformed_file_returns_error_instead_of_empty_blocklist
+openswap blocklist::tests::rewrites_keep_entries_for_other_networks
 openswap blocklist::tests::rewrites_keep_fields_this_build_does_not_know
 openswap blocklist::tests::unserved_requires_refuse_before_entries_and_writes
 openswap compat_fixtures::compat_fixtures_every_release_decodes_without_losing_fields
