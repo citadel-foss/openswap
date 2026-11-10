@@ -452,6 +452,7 @@ openswap watch_tower::watcher::tests::spender_displaced_by_a_mined_rival_mid_loo
 openswap watch_tower::watcher::tests::successful_core_retry_processes_and_removes_pending_block
 openswap watch_tower::watcher::tests::undecided_watch_does_not_starve_the_queue
 openswap watch_tower::watcher::tests::unsubscribed_watch_is_answered_from_the_server
+openswap watch_tower::watcher::tests::unwatching_a_re_registered_armed_watch_releases_its_hold
 openswap watch_tower::watcher::tests::unwatching_an_armed_watch_releases_it_while_another_waits
 openswap watch_tower::watcher::tests::unwatching_one_of_two_refused_watches_keeps_the_backoff
 openswap watch_tower::watcher::tests::watch_asks_the_server_until_a_reconnect_is_replayed

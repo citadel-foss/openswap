@@ -417,10 +417,20 @@ impl<R: Role> Watcher<R> {
                 }
                 let was_pending = self.pending_subscribes.iter().any(|(o, _)| *o == outpoint);
                 self.pending_subscribes.retain(|(o, _)| *o != outpoint);
-                // A watch still waiting to subscribe holds nothing on the server.
+                // A watch that never subscribed holds nothing on the server.
                 // While another waits on the same script, releasing it would
                 // only recycle the connection and restart the script's backoff.
+                // One that armed and then waits again, registered a second
+                // time while its script was refused, still holds the script
+                // and must be released.
+                let holds_script = match &self.blockchain {
+                    AnyBlockchain::Electrum(electrum) => {
+                        electrum.holds_subscription(&script_pubkey, &outpoint)
+                    }
+                    AnyBlockchain::CoreRPC(_) => false,
+                };
                 let still_wanted = was_pending
+                    && !holds_script
                     && self
                         .pending_subscribes
                         .iter()
@@ -3039,6 +3049,60 @@ mod tests {
         }
         assert!(watcher.pending_subscribes.is_empty());
         assert_eq!(holders(&watcher), 1);
+    }
+
+    /// An armed watch registered again while its script is refused waits to
+    /// subscribe and still holds the subscription. Dropping it must release
+    /// that hold even while another watch waits on the script, or the script
+    /// stays held, and retried, with nothing left watching it.
+    #[test]
+    fn unwatching_a_re_registered_armed_watch_releases_its_hold() {
+        let (armed, waiting) = (
+            OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+            OutPoint::new(Txid::from_byte_array([2; 32]), 0),
+        );
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        let (mut watcher, server) = electrum_watcher_with(&node, 1, 0);
+        let holders = |watcher: &Watcher<MakerRole>| match &watcher.blockchain {
+            AnyBlockchain::Electrum(electrum) => {
+                electrum.subscription_watchers(&contract_script(1))
+            }
+            AnyBlockchain::CoreRPC(_) => unreachable!("an Electrum watcher"),
+        };
+        register(&mut watcher, armed, contract_script(1));
+        node.lock().unwrap().refuse_subscribe = true;
+        server.hang_up();
+        watcher.drain_events();
+        register(&mut watcher, armed, contract_script(1));
+        register(&mut watcher, waiting, contract_script(1));
+        assert_eq!(watcher.pending_subscribes.len(), 2);
+        assert_eq!(holders(&watcher), 1);
+
+        watcher.handle_command(WatcherCommand::Unwatch {
+            outpoint: armed,
+            script_pubkey: contract_script(1),
+        });
+        assert_eq!(
+            holders(&watcher),
+            0,
+            "the dropped watch still holds the script"
+        );
+        watcher.handle_command(WatcherCommand::Unwatch {
+            outpoint: waiting,
+            script_pubkey: contract_script(1),
+        });
+        assert!(watcher.pending_subscribes.is_empty());
+        assert_eq!(holders(&watcher), 0);
+
+        // With nothing watched, the script is not armed again.
+        const SUBSCRIBE: &str = "blockchain.scripthash.subscribe";
+        watcher.drain_events();
+        let sent = requests_for(&server, SUBSCRIBE);
+        for _ in 0..3 {
+            watcher.drain_events();
+            watcher.retry_pending_work();
+        }
+        assert_eq!(requests_for(&server, SUBSCRIBE), sent);
     }
 
     /// Watches armed before an outage, and one registered during it, all get

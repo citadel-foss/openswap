@@ -916,6 +916,19 @@ impl Electrum {
             .map_or(0, |s| s.watchers.len())
     }
 
+    /// Whether `watch` is among the outpoints holding this script's
+    /// subscription open.
+    pub(crate) fn holds_subscription(&self, spk: &Script, watch: &OutPoint) -> bool {
+        lock_debug!(self.notifier.lock())
+            .unwrap_or_else(|e| {
+                log::warn!("electrum notifier lock poisoned; recovering");
+                e.into_inner()
+            })
+            .subscriptions
+            .get(spk)
+            .is_some_and(|s| s.watchers.contains(watch))
+    }
+
     /// Whether a spend paying from `spk` may have gone unheard: the script is
     /// not subscribed, a reconnect has not re-armed it yet, or its history
     /// still needs the re-read that replays what was missed.
