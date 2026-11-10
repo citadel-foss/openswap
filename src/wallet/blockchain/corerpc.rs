@@ -723,7 +723,9 @@ impl Blockchain for CoreRPC {
     }
 
     fn chain_name(&self) -> Result<String, WalletError> {
-        let name = self.rpc.get_blockchain_info()?.chain.to_string();
+        // `chain` is parsed into a `Network`, whose `Display` gives
+        // "bitcoin"/"testnet" rather than Core's "main"/"test".
+        let name = super::chain_name_for(self.rpc.get_blockchain_info()?.chain).to_string();
         super::validate_chain_name(&name)?;
         Ok(name)
     }
@@ -1010,6 +1012,28 @@ pub(crate) mod tests {
             ["getwalletinfo", "deriveaddresses", "getaddressinfo"],
             "a legacy wallet must not reach listdescriptors"
         );
+    }
+
+    /// `chain_name` hands back Core's own name for each chain, which the
+    /// watchtower matches on, not the `Network` display name.
+    #[test]
+    fn chain_name_uses_core_names_for_every_chain() {
+        for chain in ["main", "test", "testnet4", "signet", "regtest"] {
+            let info = json!({ "chain": chain, "blocks": 0, "headers": 0,
+                "bestblockhash": "0".repeat(64), "difficulty": 0.0,
+                "mediantime": 0, "verificationprogress": 1.0, "initialblockdownload": false,
+                "chainwork": "00", "size_on_disk": 0, "pruned": false, "warnings": "" });
+            let (core, server) = mock_core(vec![
+                ("getblockchaininfo", info),
+                // Asked by `get_blockchain_info` itself.
+                ("getnetworkinfo", json!({ "version": 210100 })),
+            ]);
+            assert_eq!(core.chain_name().unwrap(), chain);
+            assert_eq!(
+                server.join().unwrap(),
+                ["getblockchaininfo", "getnetworkinfo"]
+            );
+        }
     }
 
     /// Stands in for Core's ZMQ publisher.
