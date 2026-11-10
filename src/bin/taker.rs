@@ -535,10 +535,7 @@ fn run() -> Result<(), TakerError> {
             url: args.rpc.clone(),
             auth: Auth::UserPass(args.auth.0.clone(), args.auth.1.clone()),
             wallet_name: wallet_name.clone(),
-            zmq_addr: args
-                .zmq
-                .clone()
-                .unwrap_or_else(|| CoreRpcConfig::default_zmq_addr(&args.rpc)),
+            zmq_addr: CoreRpcConfig::resolve_zmq_addr(args.zmq.as_deref(), &args.rpc),
         }),
     };
 
