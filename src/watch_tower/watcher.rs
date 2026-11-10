@@ -417,12 +417,9 @@ impl<R: Role> Watcher<R> {
                 }
                 let was_pending = self.pending_subscribes.iter().any(|(o, _)| *o == outpoint);
                 self.pending_subscribes.retain(|(o, _)| *o != outpoint);
-                // A watch that never subscribed holds nothing on the server.
-                // While another waits on the same script, releasing it would
-                // only recycle the connection and restart the script's backoff.
-                // One that armed and then waits again, registered a second
-                // time while its script was refused, still holds the script
-                // and must be released.
+                // A pending watch that holds no subscription has nothing to release,
+                // and releasing it would restart the script's backoff. A pending
+                // watch that still holds the script must be released.
                 let holds_script = match &self.blockchain {
                     AnyBlockchain::Electrum(electrum) => {
                         electrum.holds_subscription(&script_pubkey, &outpoint)
