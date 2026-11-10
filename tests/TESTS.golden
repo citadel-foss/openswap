@@ -58,6 +58,7 @@ openswap maker::rpc::server::tests::rpc_checks_the_token_before_the_request
 openswap maker::rpc::server::tests::rpc_cookie_is_random_and_authenticated
 openswap maker::rpc::server::tests::send_to_address_clears_the_relay_floor_over_rpc
 openswap maker::rpc::server::tests::send_to_address_rejects_unusable_rates_over_rpc
+openswap maker::server::tests::bind_port_retry_tries_a_given_port_above_the_search_bound
 openswap maker::server::tests::bind_port_retry_tries_the_given_port_first
 openswap maker::server::tests::compat_maker_decode_failure_names_future_variants_without_reply_loops
 openswap maker::server::tests::compat_maker_gate_requires_hello_before_heartbeat_and_handover
