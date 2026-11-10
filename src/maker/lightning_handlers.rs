@@ -858,19 +858,23 @@ fn handle_swap_in_funded<M: Maker>(
 /// The block height that confirmed a swap-in's funding. A missing height is
 /// read again a few times, so a backend that is briefly behind does not fail
 /// the swap; one still missing after that stops the handler, as a reorg may
-/// have taken the block away. A failed query stops it at once.
+/// have taken the block away. A failed query or a shutdown stops it at once.
 fn read_funding_height<M: Maker>(maker: &Arc<M>, txid: &bitcoin::Txid) -> Result<u32, MakerError> {
     for read in 1..=FUNDING_HEIGHT_READS {
         if let Some(height) = maker.tx_confirmation_height(txid)? {
             return Ok(height);
         }
-        if read < FUNDING_HEIGHT_READS && !maker.shutdown_requested() {
-            log::info!(
-                "[{}] Swap-in funding {txid} has no confirmation height yet; reading again",
-                maker.network_port()
-            );
-            std::thread::sleep(FUNDING_HEIGHT_RETRY);
+        if read == FUNDING_HEIGHT_READS {
+            break;
         }
+        if maker.shutdown_requested() {
+            return Err(MakerError::Shutdown);
+        }
+        log::info!(
+            "[{}] Swap-in funding {txid} has no confirmation height yet; reading again",
+            maker.network_port()
+        );
+        std::thread::sleep(FUNDING_HEIGHT_RETRY);
     }
     Err(MakerError::General(
         "swap-in funding has no confirmation height",
