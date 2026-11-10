@@ -1569,6 +1569,53 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_retries_when_funding_height_lookup_fails() {
+        let (url, calls) = mock_core_rpc(|method, _params| match method {
+            "gettxout" => Ok(Value::Null),
+            "getrawtransaction" => Err(json!({ "code": -28, "message": "txindex warming up" })),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        let watch = (
+            OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            ScriptBuf::new(),
+        );
+
+        assert!(watcher.rescan_for_missed_spends(&[watch]).is_err());
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["gettxout", "getrawtransaction"]
+        );
+    }
+
+    #[test]
+    fn rebuild_succeeds_when_funding_transaction_has_no_height() {
+        let funding = spend(OutPoint::new(Txid::from_byte_array([7; 32]), 0));
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let (url, calls) = mock_core_rpc(move |method, _params| match method {
+            "gettxout" => Ok(Value::Null),
+            "getrawtransaction" => Ok(verbose_tx(&funding)),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+
+        watcher
+            .rescan_for_missed_spends(&[(outpoint, ScriptBuf::new())])
+            .unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["gettxout", "getrawtransaction"]
+        );
+    }
+
+    #[test]
     fn rebuild_uses_unspent_watch_as_scan_anchor_when_later_height_lookup_fails() {
         let old_funding = spend(OutPoint::new(Txid::from_byte_array([1; 32]), 0));
         let later_funding = spend(OutPoint::new(Txid::from_byte_array([2; 32]), 0));

@@ -550,7 +550,9 @@ openswap watch_tower::watcher::tests::never_broadcast_outpoint_leaves_the_queue
 openswap watch_tower::watcher::tests::orphaned_spend_is_kept_until_its_replacement_is_found
 openswap watch_tower::watcher::tests::outage_answers_every_request_within_a_bound
 openswap watch_tower::watcher::tests::re_arm_on_a_failing_connection_stops_at_the_first_failure
+openswap watch_tower::watcher::tests::rebuild_retries_when_funding_height_lookup_fails
 openswap watch_tower::watcher::tests::rebuild_skips_block_scan_when_every_watch_is_still_unspent
+openswap watch_tower::watcher::tests::rebuild_succeeds_when_funding_transaction_has_no_height
 openswap watch_tower::watcher::tests::rebuild_uses_unspent_watch_as_scan_anchor_when_later_height_lookup_fails
 openswap watch_tower::watcher::tests::rebuilt_watch_that_cannot_subscribe_is_recovered
 openswap watch_tower::watcher::tests::refused_re_arm_keeps_watches_blind_without_spinning
