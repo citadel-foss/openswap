@@ -362,15 +362,14 @@ openswap wallet::blockchain::corerpc::tests::resolve_zmq_addr_adds_tcp_to_a_bare
 openswap wallet::blockchain::corerpc::tests::restore_refuses_core_before_v22_without_a_wallet_file
 openswap wallet::blockchain::corerpc::tests::zmq_address_mismatch_is_reported
 openswap wallet::blockchain::corerpc::tests::zmq_forwarded_endpoint_is_accepted
-openswap wallet::blockchain::corerpc::tests::zmq_hostname_matches_its_resolved_address
 openswap wallet::blockchain::corerpc::tests::zmq_malformed_message_is_reported_as_missed
+openswap wallet::blockchain::corerpc::tests::zmq_matcher_compares_host_and_port
 openswap wallet::blockchain::corerpc::tests::zmq_publisher_restart_is_reported
 openswap wallet::blockchain::corerpc::tests::zmq_receive_error_is_reported_and_reconnects
 openswap wallet::blockchain::corerpc::tests::zmq_sequence_gap_is_reported
 openswap wallet::blockchain::corerpc::tests::zmq_sequence_reset_is_reported
 openswap wallet::blockchain::corerpc::tests::zmq_sequence_wraparound_is_not_a_gap
 openswap wallet::blockchain::corerpc::tests::zmq_topics_are_sequenced_independently
-openswap wallet::blockchain::corerpc::tests::zmq_wildcard_bind_matches
 openswap wallet::blockchain::electrum::tests::a_cached_tip_below_the_mined_height_is_read_again
 openswap wallet::blockchain::electrum::tests::a_changed_tip_drops_script_answers_and_headers
 openswap wallet::blockchain::electrum::tests::a_fetch_counted_to_the_ceiling_is_still_recovered

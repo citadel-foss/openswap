@@ -924,20 +924,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn zmq_wildcard_bind_matches() {
-        let zmq = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = zmq.local_addr().unwrap().port();
-        for wildcard in [format!("tcp://0.0.0.0:{port}"), format!("tcp://*:{port}")] {
-            check_zmq(&format!("tcp://127.0.0.1:{port}"), &wildcard, &wildcard).unwrap();
+    fn zmq_matcher_compares_host_and_port() {
+        let configured = "tcp://127.0.0.1:28332";
+        for published in [
+            configured,
+            "tcp://*:28332",
+            "tcp://0.0.0.0:28332",
+            "tcp://[::]:28332",
+        ] {
+            assert!(zmq_endpoint_matches(published, configured), "{}", published);
         }
-    }
-
-    #[test]
-    fn zmq_hostname_matches_its_resolved_address() {
-        let zmq = TcpListener::bind("localhost:0").unwrap();
-        let port = zmq.local_addr().unwrap().port();
-        let published = format!("tcp://127.0.0.1:{port}");
-        check_zmq(&format!("tcp://localhost:{port}"), &published, &published).unwrap();
+        assert!(zmq_endpoint_matches(configured, "tcp://localhost:28332"));
+        for published in ["tcp://*:28333", "tcp://127.0.0.2:28332", "ipc:///tmp/zmq"] {
+            assert!(
+                !zmq_endpoint_matches(published, configured),
+                "{}",
+                published
+            );
+        }
     }
 
     /// Serves one canned reply per JSON-RPC method, failing on any other.
