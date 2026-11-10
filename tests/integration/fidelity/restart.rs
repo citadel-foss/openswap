@@ -3,7 +3,7 @@
 //! and rebroadcasts the pending one when it fell out of the mempool, on Bitcoin
 //! Core and on Electrum.
 
-use bitcoin::{absolute::LockTime, Amount, Txid};
+use bitcoin::{absolute::LockTime, consensus::encode::serialize_hex, Amount, Txid};
 use bitcoind::bitcoincore_rpc::{Auth, RpcApi};
 use openswap::{
     maker::{start_server, MakerServer},
@@ -425,61 +425,114 @@ fn evicted_bond_rebroadcast_on_restart(world: &mut World) {
     let _ = new_bitcoind.client.stop();
 }
 
-/// A bond the node refuses on restart is skipped, and the bond funded in its
-/// place spends one of its coins: the refused tx may still confirm from a
-/// peer's mempool, and the two must never both lock funds.
-///
-/// The refusal is made by restarting bitcoind with an empty mempool and a
-/// minimum relay fee above the bond's feerate.
-#[world_test(
-    backend = BitcoindBackend,
-    makers = 1,
-)]
-fn refused_bond_is_replaced_by_a_conflicting_bond(world: &mut World) {
-    let bitcoind = world.bitcoind();
-    let maker = world.makers()[0].inner();
-    let log_path = world.taker_log_path();
+/// A maker restarted on a node that refuses its stored bond.
+struct RefusedRestart {
+    node: bitcoind::BitcoinD,
+    maker: Arc<MakerServer>,
+    thread: thread::JoinHandle<()>,
+    /// The refused bond's transaction.
+    bond: bitcoin::Transaction,
+}
 
+impl RefusedRestart {
+    fn stop(self) {
+        self.maker.shutdown.store(true, Relaxed);
+        let _ = self.thread.join();
+        let _ = self.node.client.stop();
+    }
+}
+
+/// Run 1 broadcasts a bond at 1 sat/vB and stops before it confirms. The node
+/// then restarts with an empty mempool and a 5 sat/vB relay minimum, so it
+/// refuses the stored bond, and the maker restarts funding bonds at
+/// `fidelity_feerate`.
+fn restart_with_refused_bond(world: &World, fidelity_feerate: f64) -> RefusedRestart {
+    let maker = world.makers()[0].inner();
     // Spare coins, so a replacement that ignored the refused bond could
     // fund itself from unrelated ones.
     world.fund_makers(4, Amount::ONE_BTC, AddressType::P2TR);
-
-    // ----- Run 1: broadcast a bond at 1 sat/vB, stop before it confirms -----
 
     world.framework().set_block_gen_paused(true);
     let maker_clone = maker.clone();
     let maker_thread = thread::spawn(move || {
         let _ = start_server(maker_clone);
     });
-    let bond_txid = wait_for_bond_broadcast(&log_path);
-    let bond_inputs: Vec<_> = bitcoind
+    let bond_txid = wait_for_bond_broadcast(&world.taker_log_path());
+    let bond = world
+        .bitcoind()
         .client
         .get_raw_transaction(&bond_txid, None)
-        .unwrap()
-        .input
-        .iter()
-        .map(|input| input.previous_output)
-        .collect();
+        .unwrap();
     maker.shutdown.store(true, Relaxed);
     let _ = maker_thread.join();
 
-    // ----- The node now refuses the stored bond: 5 sat/vB relay minimum -----
-
-    let (new_bitcoind, mut restart_config) =
+    let (node, mut restart_config) =
         evict_mempool_and_restart_node(world, maker, &["-minrelaytxfee=0.00005"]);
-    restart_config.fidelity_feerate = 10.0;
-
-    // ----- Run 2: skip the refused bond, fund a conflicting one -----
-
+    restart_config.fidelity_feerate = fidelity_feerate;
     let restarted = Arc::new(MakerServer::init(restart_config).unwrap());
     let restarted_clone = restarted.clone();
-    let restarted_thread = thread::spawn(move || {
+    let thread = thread::spawn(move || {
         let _ = start_server(restarted_clone);
     });
+    RefusedRestart {
+        node,
+        maker: restarted,
+        thread,
+        bond,
+    }
+}
+
+/// Mines `tx` straight into a block: the node's relay rules don't apply.
+fn mine_tx(node: &bitcoind::BitcoinD, tx: &bitcoin::Transaction) {
+    let miner = node
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+    let _: serde_json::Value = node
+        .client
+        .call(
+            "generateblock",
+            &[
+                serde_json::json!(miner.to_string()),
+                serde_json::json!([serialize_hex(tx)]),
+            ],
+        )
+        .unwrap();
+}
+
+/// Polls the log until `expected` appears `times` times.
+fn wait_for_log_count(log_path: &str, expected: &str, times: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while fs::read_to_string(log_path)
+        .map(|log| log.matches(expected).count())
+        .unwrap_or(0)
+        < times
+    {
+        assert!(
+            Instant::now() < deadline,
+            "'{}' not logged {} times",
+            expected,
+            times
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// A bond the node refuses on restart is skipped, and the bond funded in its
+/// place spends one of its coins: the refused tx may still confirm from a
+/// peer's mempool, and the two must never both lock funds.
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 1,
+)]
+fn refused_bond_is_replaced_by_a_conflicting_bond(world: &mut World) {
+    let run = restart_with_refused_bond(world, 10.0);
+    let bond_txid = run.bond.compute_txid();
 
     let deadline = Instant::now() + Duration::from_secs(120);
     let replacement_txid = loop {
-        if let Some(txid) = new_bitcoind.client.get_raw_mempool().unwrap().first() {
+        if let Some(txid) = run.node.client.get_raw_mempool().unwrap().first() {
             break *txid;
         }
         assert!(
@@ -489,24 +542,26 @@ fn refused_bond_is_replaced_by_a_conflicting_bond(world: &mut World) {
         thread::sleep(Duration::from_millis(500));
     };
     assert_ne!(replacement_txid, bond_txid);
-    let replacement = new_bitcoind
+    let replacement = run
+        .node
         .client
         .get_raw_transaction(&replacement_txid, None)
         .unwrap();
     assert!(
-        replacement
+        replacement.input.iter().any(|input| run
+            .bond
             .input
             .iter()
-            .any(|input| bond_inputs.contains(&input.previous_output)),
+            .any(|spent| spent.previous_output == input.previous_output)),
         "replacement {} must spend a coin of the refused bond {}",
         replacement_txid,
         bond_txid
     );
 
-    generate_blocks(&new_bitcoind, 1);
-    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+    generate_blocks(&run.node, 1);
+    wait_for_makers_setup(std::slice::from_ref(&run.maker), 120);
     {
-        let wallet = restarted.wallet.read().unwrap();
+        let wallet = run.maker.wallet.read().unwrap();
         let index = wallet.get_highest_fidelity_index().unwrap().unwrap();
         let bond = wallet
             .get_fidelity_bonds()
@@ -515,16 +570,86 @@ fn refused_bond_is_replaced_by_a_conflicting_bond(world: &mut World) {
             .unwrap();
         assert_eq!(bond.outpoint().txid, replacement_txid);
     }
-
-    restarted.shutdown.store(true, Relaxed);
-    let _ = restarted_thread.join();
+    run.stop();
 
     assert_log!(world; {
         has "cannot be broadcast",
         has "held by refused bonds",
     });
+}
 
-    let _ = new_bitcoind.client.stop();
+/// A refused bond that confirms while setup waits to fund its replacement is
+/// adopted, and no second bond is funded.
+///
+/// On Core the first planning pass waits for the wallet to list the refused
+/// bond's coins again. The bond is mined during that wait, so the next pass
+/// finds it known.
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 1,
+)]
+fn refused_bond_confirming_before_its_replacement_is_adopted(world: &mut World) {
+    let run = restart_with_refused_bond(world, 10.0);
+    let bond_txid = run.bond.compute_txid();
+
+    wait_logged!(
+        world,
+        "Not creating a fidelity bond yet",
+        Duration::from_secs(120)
+    );
+    mine_tx(&run.node, &run.bond);
+    wait_for_makers_setup(std::slice::from_ref(&run.maker), 120);
+    assert_single_adopted_bond(&run.maker, bond_txid);
+    run.stop();
+
+    assert_log!(world; {
+        has "cannot be broadcast",
+        has "adopting it instead of creating one",
+        lacks "held by refused bonds",
+        // Run 1's bond only; the trailing ": " skips the test's own wait line.
+        count("Fidelity bond broadcast, waiting for confirmation: ") == 1,
+    });
+}
+
+/// A replacement the node refuses does not stop setup: it starts over with
+/// the same deposit address, and adopts the original bond once that confirms.
+///
+/// The maker funds bonds at 2 sat/vB, below the node's 5 sat/vB minimum, so
+/// every replacement is refused.
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 1,
+)]
+fn refused_replacement_restarts_setup_instead_of_stopping(world: &mut World) {
+    let run = restart_with_refused_bond(world, 2.0);
+    let bond_txid = run.bond.compute_txid();
+
+    let passes = |times| {
+        wait_for_log_count(
+            &world.taker_log_path(),
+            "Checking the refused bonds again",
+            times,
+            Duration::from_secs(180),
+        );
+        *run.maker.wallet.read().unwrap().get_external_index()
+    };
+    let after_first = passes(1);
+    let after_second = passes(2);
+    assert!(!run.thread.is_finished(), "setup must not stop");
+    // Every pass asks for funds at the same deposit address.
+    assert_eq!(
+        after_first, after_second,
+        "a new setup pass must not allocate another deposit address"
+    );
+
+    mine_tx(&run.node, &run.bond);
+    wait_for_makers_setup(std::slice::from_ref(&run.maker), 120);
+    assert_single_adopted_bond(&run.maker, bond_txid);
+    run.stop();
+
+    assert_log!(world; {
+        lacks "Fidelity Bond Creation failed",
+    });
 }
 
 /// Electrum variant of `evicted_bond_rebroadcast_on_restart`:

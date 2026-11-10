@@ -524,6 +524,16 @@ impl FidelityBond {
     }
 }
 
+/// A coin of a refused bond, as the chain reports it.
+enum CoinState {
+    /// In the UTXO set or the mempool, unspent.
+    Unspent,
+    /// Spent by a confirmed transaction: the refused bond can never confirm.
+    SpentConfirmed,
+    /// Spent only in the mempool, or its funding tx is unknown.
+    Unclear,
+}
+
 /// How a new bond can be funded while refused bonds may still confirm. See
 /// [`Wallet::plan_bond_replacement`].
 #[derive(Debug, PartialEq)]
@@ -892,13 +902,14 @@ impl Wallet {
     ///
     /// The new bond must spend a coin of every refused bond that can still
     /// confirm, so at most one of them ever locks funds. A refused bond the
-    /// backend now knows is adopted instead. One whose coin another
+    /// backend now knows is adopted instead. One whose coin a confirmed
     /// transaction spent can never confirm and needs no conflict. When some
     /// bond's coins are all locked, reserved for a swap, or in the other coin
     /// pool (one transaction spends from one pool), funding must wait. It also
     /// waits while an unspent coin of a refused bond is missing from the
     /// wallet: the node wallet is told to abandon the refused tx, and the next
-    /// sync lists the coin.
+    /// sync lists the coin. A bond counts as dead only once a confirmed tx
+    /// spends one of its coins; a mempool spend or an unknown funding tx waits.
     pub fn plan_bond_replacement(&self, refused: &[u32]) -> Result<BondReplacement, WalletError> {
         let locked = self.list_lock_unspent();
         let free = |pool: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>| -> HashSet<OutPoint> {
@@ -912,6 +923,7 @@ impl Wallet {
 
         let mut viable = Vec::new();
         let mut hidden = Vec::new();
+        let mut unclear = Vec::new();
         for bond in self.store.fidelity_bond.iter().filter(|bond| {
             refused.contains(&bond.bond_index) && !bond.is_spent && bond.conf_height.is_none()
         }) {
@@ -921,26 +933,31 @@ impl Wallet {
                 return Ok(BondReplacement::Adopt(bond.bond_index));
             }
             let inputs: Vec<OutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
-            // A coin the wallet does not list is either spent, so the bond can
-            // never confirm, or still held by the node wallet for the refused
-            // tx. Only the chain can tell.
+            // A coin the wallet does not list is spent, or still held by the
+            // node wallet for the refused tx. Only the chain can tell, and
+            // only a confirmed spend proves the bond can never confirm: a
+            // mempool spender can still be evicted.
             let mut unlisted = false;
+            let mut undecided = false;
             let mut dead = false;
             for input in inputs
                 .iter()
                 .filter(|input| !self.store.utxo_cache.contains_key(input))
             {
-                if self
-                    .blockchain
-                    .get_tx_out(&input.txid, input.vout, Some(true))?
-                    .is_none()
-                {
-                    dead = true;
-                    break;
+                match self.coin_state(input)? {
+                    CoinState::Unspent => unlisted = true,
+                    CoinState::SpentConfirmed => {
+                        dead = true;
+                        break;
+                    }
+                    CoinState::Unclear => undecided = true,
                 }
-                unlisted = true;
             }
             if dead {
+                continue;
+            }
+            if undecided {
+                unclear.push(bond.bond_index);
                 continue;
             }
             if unlisted {
@@ -951,6 +968,12 @@ impl Wallet {
                 continue;
             }
             viable.push((bond.bond_index, inputs));
+        }
+        if !unclear.is_empty() {
+            return Ok(BondReplacement::Wait(format!(
+                "refused bonds {unclear:?} spend coins whose spend is not confirmed, or whose \
+                 funding tx the backend does not know"
+            )));
         }
         if !hidden.is_empty() {
             return Ok(BondReplacement::Wait(format!(
@@ -978,6 +1001,36 @@ impl Wallet {
             "no new bond can spend a coin of each refused bond {stuck:?}: \
              their coins are locked, reserved for a swap, or split across coin pools"
         )))
+    }
+
+    /// What the chain says about a coin of a refused bond.
+    fn coin_state(&self, coin: &OutPoint) -> Result<CoinState, WalletError> {
+        if self
+            .blockchain
+            .get_tx_out(&coin.txid, coin.vout, Some(true))?
+            .is_some()
+        {
+            return Ok(CoinState::Unspent);
+        }
+        // Not unspent: spent, or its funding tx is unknown. The spend's
+        // confirmation is read from the coin's script, so fetch its parent.
+        if self.blockchain.is_tx_unknown(&coin.txid)? {
+            return Ok(CoinState::Unclear);
+        }
+        let parent = self.blockchain.get_raw_transaction(&coin.txid, None)?;
+        let Some(output) = parent.output.get(coin.vout as usize) else {
+            return Ok(CoinState::Unclear);
+        };
+        Ok(
+            if self
+                .blockchain
+                .is_confirmed_spend(coin, &output.script_pubkey)?
+            {
+                CoinState::SpentConfirmed
+            } else {
+                CoinState::Unclear
+            },
+        )
     }
 
     /// Saves `bond`, then broadcasts its transaction.

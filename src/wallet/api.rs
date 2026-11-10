@@ -8832,20 +8832,44 @@ mod mempool_deferral_tests {
             }
         };
         let unlisted = tx(coin(20), 50_000, ScriptBuf::new());
+        // A coin a confirmed tx spent, and one spent only in the mempool.
+        let mined_parent = tx(coin(21), 50_000, ScriptBuf::new());
+        let mined_spend = tx(
+            OutPoint::new(mined_parent.compute_txid(), 0),
+            49_000,
+            ScriptBuf::new(),
+        );
+        let pooled_parent = tx(coin(22), 50_000, ScriptBuf::new());
+        let pooled_spend = tx(
+            OutPoint::new(pooled_parent.compute_txid(), 0),
+            49_000,
+            ScriptBuf::new(),
+        );
         let bonds = vec![
             bond(0, &[coin(1), coin(2)]),
-            // Coin 9 went to another tx: this bond can never confirm.
-            bond(1, &[coin(3), coin(9)]),
+            // A confirmed tx spent its coin: this bond can never confirm.
+            bond(1, &[coin(3), OutPoint::new(mined_parent.compute_txid(), 0)]),
             bond(2, &[coin(4)]),
             bond(3, &[coin(5)]),
             bond(4, &[coin(6)]),
             bond(5, &[coin(7)]),
             // Its coin is unspent on chain, but the wallet does not list it.
             bond(6, &[OutPoint::new(unlisted.compute_txid(), 0)]),
+            // The mempool spender can still be evicted.
+            bond(7, &[OutPoint::new(pooled_parent.compute_txid(), 0)]),
+            // The backend does not know where coin 9 came from.
+            bond(8, &[coin(9)]),
         ];
         // Bond 5 reached the backend after all.
         let known = bonds[5].tx.clone().unwrap();
-        let url = start_electrum_stub(StubChain::with(&[(&known, 0), (&unlisted, 50)]));
+        let url = start_electrum_stub(StubChain::with(&[
+            (&known, 0),
+            (&unlisted, 50),
+            (&mined_parent, 50),
+            (&mined_spend, 60),
+            (&pooled_parent, 50),
+            (&pooled_spend, 0),
+        ]));
         let temp_dir = tempdir().unwrap();
         let mut wallet = stub_wallet(&temp_dir.path().join("wallet.cbor"), electrum(&url));
 
@@ -8895,9 +8919,9 @@ mod mempool_deferral_tests {
         assert_eq!(plan(&[0, 1]), spend(&[coin(1), coin(2)]));
         assert_eq!(plan(&[3]), spend(&[coin(5)]));
         assert_eq!(plan(&[0, 5]), BondReplacement::Adopt(5));
-        // Locked, reserved, needing both pools in one transaction, or not
-        // listed by the wallet yet.
-        for refused in [&[2][..], &[4], &[0, 3], &[0, 6]] {
+        // Locked, reserved, needing both pools in one transaction, not listed
+        // by the wallet yet, spent only in the mempool, or of unknown origin.
+        for refused in [&[2][..], &[4], &[0, 3], &[0, 6], &[0, 7], &[0, 8]] {
             assert!(
                 matches!(plan(refused), BondReplacement::Wait(_)),
                 "{:?}",
