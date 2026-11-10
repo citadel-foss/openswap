@@ -96,7 +96,7 @@ fn fund_swap_out(
             .public_key(&Secp256k1::new()),
     );
 
-    let mut state = ConnectionState::default();
+    let mut state = ConnectionState::with_test_session();
     handle_message(
         maker,
         &mut state,
@@ -1371,7 +1371,7 @@ fn forged_swap_in_funding_keeps_accepted_swap(world: &mut World, ln: Arc<MockLig
         (value + Amount::from_sat(1), "announced value mismatch"),
         (value, "bad funding output"),
     ] {
-        let mut state = ConnectionState::default();
+        let mut state = ConnectionState::with_test_session();
         handle_message(
             &maker,
             &mut state,
@@ -1667,7 +1667,7 @@ fn swap_in_funded_handler_yields_to_swap_paid_during_wait(
             .public_key(&Secp256k1::new()),
     );
 
-    let mut state = ConnectionState::default();
+    let mut state = ConnectionState::with_test_session();
     handle_message(
         &maker,
         &mut state,
@@ -1728,7 +1728,7 @@ fn swap_in_funded_handler_yields_to_swap_paid_during_wait(
     let handler_maker = maker.clone();
     let funded_id = swap_id.clone();
     thread::spawn(move || {
-        let mut state = ConnectionState::default();
+        let mut state = ConnectionState::with_test_session();
         let result = handle_message(
             &handler_maker,
             &mut state,
@@ -2869,7 +2869,7 @@ fn send_swap_in_request(
     maker: &Arc<MakerServer>,
     req: LnSwapInRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
-    let mut state = ConnectionState::default();
+    let mut state = ConnectionState::with_test_session();
     handle_message(
         maker,
         &mut state,
@@ -2891,7 +2891,7 @@ fn announce_funding(
     funding: OutPoint,
     value: Amount,
 ) -> String {
-    let mut state = ConnectionState::default();
+    let mut state = ConnectionState::with_test_session();
     let result = handle_message(
         maker,
         &mut state,

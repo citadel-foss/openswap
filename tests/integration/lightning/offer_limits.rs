@@ -69,7 +69,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
     let payment_hash = preimage.payment_hash();
     let swap_id = payment_hash.to_string();
 
-    let mut state = ConnectionState::default();
+    let mut state = ConnectionState::with_test_session();
     handle_message(
         &maker,
         &mut state,
@@ -150,11 +150,11 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
         let reply = expect_ln(
             handle_message(
                 &maker,
-                &mut ConnectionState::default(),
+                &mut ConnectionState::with_test_session(),
                 TakerToMakerMessage::Hello(Hello::default()),
             )
             .and_then(|_| {
-                let mut state = ConnectionState::default();
+                let mut state = ConnectionState::with_test_session();
                 handle_message(
                     &maker,
                     &mut state,
@@ -202,7 +202,7 @@ fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
 
     // A second request reusing a live swap's id must not replace it: the
     // stored record holds the only copy of that swap's branch key.
-    let mut state2 = ConnectionState::default();
+    let mut state2 = ConnectionState::with_test_session();
     handle_message(
         &maker,
         &mut state2,
