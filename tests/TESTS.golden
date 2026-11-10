@@ -311,6 +311,7 @@ openswap wallet::api::restore_history_probe_tests::seed_is_readable_after_taker_
 openswap wallet::api::restore_history_probe_tests::sync_does_not_enter_the_backend_after_shutdown
 openswap wallet::api::restore_history_probe_tests::v023_and_pre_port_backups_restore_to_marked_v2
 openswap wallet::api::restore_history_probe_tests::window_cap_and_old_core_are_not_retried
+openswap wallet::api::send_hold_tests::an_in_flight_send_is_never_released_as_unknown
 openswap wallet::api::swap_reservation_tests::a_reservation_survives_a_wallet_reload
 openswap wallet::api::swap_reservation_tests::only_a_spendable_coin_no_swap_holds_can_be_claimed
 openswap wallet::api::timelock_reconcile_tests::cleanup_save_failure_preserves_coins_and_monotonic_flags

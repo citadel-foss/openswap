@@ -141,6 +141,7 @@ impl Wallet {
             store_enc_material,
             locked_utxos: HashSet::new(),
             pending_sends: HashMap::new(),
+            sends_in_flight: HashSet::new(),
             _in_use: None,
         })
     }

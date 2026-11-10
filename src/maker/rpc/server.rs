@@ -272,8 +272,10 @@ fn handle_request<M: MakerRpc>(
                 // Syncs release the inputs once the backend settles the spend.
                 // A broadcast error keeps them held too: the backend may have
                 // taken the tx and lost the reply, so only a sync that finds the
-                // tx unknown may free them.
-                let txid = lock_debug!(maker.wallet().read())?.send_tx(&tx)?;
+                // tx unknown may free them, and only once the broadcast returned.
+                let sent = lock_debug!(maker.wallet().read())?.send_tx(&tx);
+                lock_debug!(maker.wallet().write())?.broadcast_returned(&tx.compute_txid());
+                let txid = sent?;
 
                 log::info!("Sync at:----handle_request----");
                 lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;
