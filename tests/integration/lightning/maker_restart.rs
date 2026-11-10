@@ -936,6 +936,15 @@ fn lightning_maker_closes_a_confirmed_refund_without_a_block_scan(
             .matches("method=getblock user=")
             .count()
     };
+    // A block read made on purpose must show up in the count, or a log in
+    // another format would count nothing and pass the check below.
+    let control = block_reads();
+    let tip = bitcoind.client.get_best_block_hash().unwrap();
+    bitcoind.client.get_block(&tip).unwrap();
+    assert!(
+        block_reads() > control,
+        "bitcoind's log does not show the block reads this test counts"
+    );
     let before = block_reads();
     ln_watchdog_tick_now(&maker);
     assert_eq!(
