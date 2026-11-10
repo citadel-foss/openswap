@@ -107,7 +107,7 @@ A randomly generated authentication token written by `makerd` on startup and rem
 
 ## Backing Up and Restoring the Wallet
 
-Both commands run on their own and then exit. They do not start the maker. Both need the chain backend (Bitcoin Core or Electrum) running and reachable, and stop with an error if it is not. Stop `makerd` before you use them. Pass the same `-d`, `-w` and blockchain flags you use to run the maker.
+Both commands run on their own and then exit. They do not start the maker. Both need the chain backend (Bitcoin Core or Electrum) running and reachable, and stop with an error if it is not. Stop `makerd` before you use them. `maker-cli stop` lets swaps in progress finish first, for an hour at most. It does not wait for Lightning swaps. Pass the same `-d`, `-w` and blockchain flags you use to run the maker.
 
 ### Backup
 

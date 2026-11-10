@@ -745,6 +745,14 @@ pub trait Maker: Send + Sync {
         0
     }
 
+    /// Whether `maker-cli stop` is waiting for the swaps in progress, so no new
+    /// swap may start. Lightning requests skip `store_connection_state`, so
+    /// they check this themselves.
+    #[cfg(feature = "lightning")]
+    fn is_stopping_after_swaps(&self) -> bool {
+        false
+    }
+
     /// Whether this specific transaction is confirmed.
     ///
     /// Distinguishing *which* transaction spent an HTLC needs this: knowing

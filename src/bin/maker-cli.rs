@@ -67,8 +67,12 @@ enum Commands {
     ShowTorAddress,
     /// Show the data directory path
     ShowDataDir,
-    /// Shutdown the makerd server
-    Stop,
+    /// Stop makerd once the swaps in progress finish, or after an hour at most. New swaps are refused meanwhile
+    Stop {
+        /// Stop at once. Swaps in progress then fail and settle on-chain.
+        #[arg(long)]
+        now: bool,
+    },
     /// Show all the fidelity bonds, current and previous, with an (index, {bond_proof, is_spent}) tuple.
     ShowFidelity,
     /// Sync the Maker wallet with the current blockchain state.
@@ -159,8 +163,8 @@ fn main() -> Result<(), MakerError> {
         Commands::ShowDataDir => {
             send_rpc_req(stream, &rpc_cookie, RpcMsgReq::GetDataDir)?;
         }
-        Commands::Stop => {
-            send_rpc_req(stream, &rpc_cookie, RpcMsgReq::Stop)?;
+        Commands::Stop { now } => {
+            send_rpc_req(stream, &rpc_cookie, stop_request(now))?;
         }
         Commands::ShowFidelity => {
             send_rpc_req(stream, &rpc_cookie, RpcMsgReq::ListFidelity)?;
@@ -198,6 +202,15 @@ fn main() -> Result<(), MakerError> {
     Ok(())
 }
 
+/// `stop` waits for the swaps in progress; `stop --now` does not.
+fn stop_request(now: bool) -> RpcMsgReq {
+    if now {
+        RpcMsgReq::Stop
+    } else {
+        RpcMsgReq::StopAfterSwaps
+    }
+}
+
 fn send_rpc_req(
     mut stream: TcpStream,
     rpc_cookie: &str,
@@ -224,4 +237,30 @@ fn send_rpc_req(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The request `maker-cli` sends for these arguments.
+    fn stop_request_for(args: &[&str]) -> RpcMsgReq {
+        let app = App::try_parse_from(args).unwrap();
+        let Commands::Stop { now } = app.command else {
+            panic!("{:?} must parse as stop", args);
+        };
+        stop_request(now)
+    }
+
+    #[test]
+    fn stop_waits_for_swaps_unless_now_is_given() {
+        assert!(matches!(
+            stop_request_for(&["maker-cli", "stop"]),
+            RpcMsgReq::StopAfterSwaps
+        ));
+        assert!(matches!(
+            stop_request_for(&["maker-cli", "stop", "--now"]),
+            RpcMsgReq::Stop
+        ));
+    }
 }

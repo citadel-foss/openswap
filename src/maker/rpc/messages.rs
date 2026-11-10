@@ -74,6 +74,9 @@ pub enum RpcMsgReq {
         /// Addresses to remove.
         addresses: Vec<String>,
     },
+    /// Refuse new swaps and stop the Maker server once the swaps in progress
+    /// are done. [`RpcMsgReq::Stop`] stops at once.
+    StopAfterSwaps,
 }
 
 /// Enum representing RPC message responses.
@@ -128,6 +131,14 @@ pub enum RpcMsgResp {
     BlocklistAddResp(AddOutcome),
     /// Response containing the number of removed blocklist entries.
     BlocklistRemoveResp(usize),
+    /// Response to a stop that waits for the swaps in progress.
+    StoppingAfterSwaps {
+        /// Swaps in progress. Zero means the server is stopping now.
+        live_swaps: usize,
+        /// Seconds the stop still waits for them. Zero with swaps in progress
+        /// means the wait limit has passed and the server is stopping now.
+        wait_left_secs: u64,
+    },
 }
 
 impl Display for RpcMsgResp {
@@ -177,12 +188,55 @@ impl Display for RpcMsgResp {
                 write!(f, "Added: {}, updated: {}", outcome.added, outcome.updated)
             }
             Self::BlocklistRemoveResp(removed) => write!(f, "Removed: {removed}"),
+            Self::StoppingAfterSwaps { live_swaps: 0, .. } => write!(f, "Shutdown Initiated"),
+            Self::StoppingAfterSwaps {
+                live_swaps,
+                wait_left_secs: 0,
+            } => write!(
+                f,
+                "Shutdown Initiated. The {live_swaps} swap(s) in progress settle on-chain after the restart."
+            ),
+            Self::StoppingAfterSwaps {
+                live_swaps,
+                wait_left_secs,
+            } => write!(
+                f,
+                "No new swaps are taken. makerd stops once the {live_swaps} swap(s) in progress finish, or in {} minute(s) at the latest.\n\
+                 Run `maker-cli stop --now` to stop at once. Swaps in progress then settle on-chain.",
+                wait_left_secs.div_ceil(60)
+            ),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// What `maker-cli stop` prints: nothing to wait for, a wait that already
+    /// ran out, and a wait that rounds up to whole minutes.
+    #[test]
+    fn stop_reply_tells_how_long_the_wait_lasts() {
+        use super::RpcMsgResp::StoppingAfterSwaps;
+        let say = |live_swaps, wait_left_secs| {
+            StoppingAfterSwaps {
+                live_swaps,
+                wait_left_secs,
+            }
+            .to_string()
+        };
+        assert_eq!(say(0, 3600), "Shutdown Initiated");
+        assert!(say(2, 0).contains("2 swap(s) in progress settle on-chain after the restart"));
+        assert!(say(1, 3600).contains("in 60 minute(s) at the latest"));
+        // The line continuation in the text must not leave indentation behind.
+        assert_eq!(
+            say(1, 3600).lines().nth(1),
+            Some(
+                "Run `maker-cli stop --now` to stop at once. Swaps in progress then settle on-chain."
+            )
+        );
+        assert!(say(1, 61).contains("in 2 minute(s) at the latest"));
+        assert!(say(1, 1).contains("in 1 minute(s) at the latest"));
+    }
+
     /// A guard on this file only: no message here is named for the seed. The
     /// seed is only handed out by local calls that need the wallet password.
     #[test]

@@ -863,6 +863,18 @@ pub struct MakerServer {
     pub highest_fidelity_proof: RwLock<Option<FidelityProof>>,
     /// Ongoing swap states by swap_id.
     ongoing_swaps: Mutex<HashMap<String, SwapState>>,
+    /// Set by `maker-cli stop`: refuse new swaps and stop once none is left.
+    stop_after_swaps: AtomicBool,
+    /// When that stop gives up on the swaps still running. The first request
+    /// fixes it, so asking again does not extend the wait.
+    stop_deadline: Mutex<Option<Instant>>,
+    /// Completed swaps still sweeping their coins. They have already left
+    /// `ongoing_swaps`, but a stop must still wait for them.
+    ///
+    /// Lock order: only `stop_if_no_swaps_left_at` holds this together with
+    /// another lock, and it takes `ongoing_swaps` first. `settling_swap` and
+    /// the guard's drop lock it alone, for one insert or remove.
+    settling_swaps: Mutex<HashSet<String>>,
     /// Serializes funding claims, so two passes for one swap cannot both claim.
     funding_claims: Mutex<()>,
     /// Swaps whose funding step a handler is running.
@@ -907,6 +919,40 @@ pub struct MakerServer {
     /// Same handoff for the RPC port.
     #[cfg(feature = "integration-test")]
     pub reserved_rpc_listener: Mutex<Option<TcpListener>>,
+}
+
+/// How long `maker-cli stop` waits for the swaps in progress before it stops
+/// anyway. A peer can keep a swap that holds no funds alive with keepalives, and
+/// a later hop cannot tell that apart from one waiting on its upstream maker. So
+/// without a limit, one peer could hold the stop forever.
+pub const STOP_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
+
+/// What a stop that waits for the swaps in progress reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopWait {
+    /// Swaps in progress when the stop was asked for. Zero means the server
+    /// stops now.
+    pub live_swaps: usize,
+    /// How long the stop still waits for them.
+    pub wait_left: Duration,
+}
+
+/// A completed swap that is still sweeping its coins; see
+/// [`MakerServer::settling_swap`].
+pub(crate) struct SettlingSwap<'a> {
+    settling: &'a Mutex<HashSet<String>>,
+    swap_id: String,
+}
+
+impl Drop for SettlingSwap<'_> {
+    fn drop(&mut self) {
+        // A poisoned lock must not leave the id behind: nothing in the guarded
+        // set can be left half-updated, and a stale id would hold the stop.
+        self.settling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.swap_id);
+    }
 }
 
 /// How long a derived Lightning offer is served before it is recomputed.
@@ -1130,6 +1176,9 @@ impl MakerServer {
             is_setup_complete: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
+            stop_after_swaps: AtomicBool::new(false),
+            stop_deadline: Mutex::new(None),
+            settling_swaps: Mutex::new(HashSet::new()),
             funding_claims: Mutex::new(()),
             funding_in_progress: Mutex::new(HashSet::new()),
             watch_service,
@@ -1802,6 +1851,114 @@ impl MakerServer {
             wallet.save_to_disk().map_err(MakerError::Wallet)?;
         }
         Ok(())
+    }
+
+    /// Refuses new swaps and stops the server once the swaps in progress are
+    /// done, or after [`STOP_WAIT_LIMIT`]. With no swap in progress, it stops now.
+    pub fn stop_after_swaps(&self) -> Result<StopWait, MakerError> {
+        self.stop_after_swaps_within(STOP_WAIT_LIMIT)
+    }
+
+    /// [`stop_after_swaps`](Self::stop_after_swaps) with a chosen limit. The
+    /// first request fixes the deadline; a repeated one does not extend it.
+    pub fn stop_after_swaps_within(&self, limit: Duration) -> Result<StopWait, MakerError> {
+        let deadline = *lock_debug!(self.stop_deadline.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .get_or_insert_with(|| Instant::now() + limit);
+        self.stop_after_swaps.store(true, Ordering::SeqCst);
+        let now = Instant::now();
+        let live_swaps = self.stop_if_no_swaps_left_at(now)?;
+        if live_swaps > 0 {
+            log::info!(
+                "[{}] Stop requested: refusing new swaps, stopping once {} swap(s) in progress finish or in {}s at the latest",
+                self.config.network_port,
+                live_swaps,
+                deadline.saturating_duration_since(now).as_secs()
+            );
+        }
+        Ok(StopWait {
+            live_swaps,
+            wait_left: deadline.saturating_duration_since(now),
+        })
+    }
+
+    /// Whether `maker-cli stop` is waiting for the swaps in progress.
+    pub fn is_stopping_after_swaps(&self) -> bool {
+        self.stop_after_swaps.load(Ordering::SeqCst)
+    }
+
+    /// Stops the server if a stop waits for swaps and none is left, or the
+    /// wait limit has passed. Returns how many swaps are still in progress.
+    ///
+    /// A swap in recovery is not counted: it has left `ongoing_swaps`, may wait
+    /// on a timelock for hours, and is saved in the wallet, so the next start
+    /// recovers it.
+    ///
+    /// Reads under the `ongoing_swaps` lock, which admission also holds while it
+    /// checks the stop flag, so a new swap cannot slip in after the last check.
+    pub(crate) fn stop_if_no_swaps_left(&self) -> Result<usize, MakerError> {
+        self.stop_if_no_swaps_left_at(Instant::now())
+    }
+
+    /// [`stop_if_no_swaps_left`](Self::stop_if_no_swaps_left) as of `now`.
+    fn stop_if_no_swaps_left_at(&self, now: Instant) -> Result<usize, MakerError> {
+        let swaps = lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        let settling =
+            lock_debug!(self.settling_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        // A swap is briefly in both while it moves over; count it once.
+        let left = swaps.len()
+            + settling
+                .iter()
+                .filter(|id| !swaps.contains_key(*id))
+                .count();
+        if self.is_stopping_after_swaps() {
+            let limit_reached = lock_debug!(self.stop_deadline.lock())
+                .map_err(|_| MakerError::MutexPossion)?
+                .is_some_and(|deadline| now >= deadline);
+            if left == 0 {
+                log::info!(
+                    "[{}] No swaps left in progress, shutting down",
+                    self.config.network_port
+                );
+                self.shutdown.store(true, Ordering::SeqCst);
+            } else if limit_reached {
+                log::warn!(
+                    "[{}] Stop wait limit reached with {} swap(s) still in progress, shutting down; they settle on-chain after the restart",
+                    self.config.network_port,
+                    left
+                );
+                self.shutdown.store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(left)
+    }
+
+    /// Counts a completed swap as in progress until the guard drops. Take it
+    /// before the swap leaves `ongoing_swaps`, so a stop never sees a gap.
+    pub(crate) fn settling_swap(&self, swap_id: &str) -> SettlingSwap<'_> {
+        self.settling_swaps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(swap_id.to_string());
+        SettlingSwap {
+            settling: &self.settling_swaps,
+            swap_id: swap_id.to_string(),
+        }
+    }
+
+    /// Refuses a new swap while a stop waits for the swaps in progress.
+    fn refuse_if_stopping(&self, swap_id: &str) -> Result<(), MakerError> {
+        if !self.is_stopping_after_swaps() {
+            return Ok(());
+        }
+        log::info!(
+            "[{}] Rejecting swap {}: the maker is stopping",
+            self.config.network_port,
+            swap_id
+        );
+        Err(MakerError::General(
+            "Maker is stopping and takes no new swaps",
+        ))
     }
 
     /// Check if any swaps are currently in progress.
@@ -2884,6 +3041,7 @@ impl MakerTrait for MakerServer {
             if known {
                 None
             } else {
+                self.refuse_if_stopping(swap_id)?;
                 // After a restart `ongoing_swaps` is empty, so a replayed
                 // SwapDetails for a swap still open on disk would re-admit and
                 // double-fund it. The open swap is recovered, never re-admitted.
@@ -2948,6 +3106,13 @@ impl MakerTrait for MakerServer {
             return Err(MakerError::General(
                 "Swap expired while admitting; resend SwapDetails",
             ));
+        }
+
+        // A stop may have come while we planned. Checked under the lock that
+        // `stop_if_no_swaps_left` reads, so the stop never misses this swap.
+        if planned.is_some() && self.is_stopping_after_swaps() {
+            drop(swaps);
+            return self.refuse_if_stopping(swap_id);
         }
 
         // The cap read before planning is only a cheap early reject: planning
@@ -3937,6 +4102,11 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn is_stopping_after_swaps(&self) -> bool {
+        MakerServer::is_stopping_after_swaps(self)
+    }
+
+    #[cfg(feature = "lightning")]
     fn get_receive_address(&self) -> Result<bitcoin::Address, MakerError> {
         let mut wallet = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -3966,6 +4136,10 @@ impl MakerRpc for MakerServer {
 
     fn shutdown(&self) -> &ShutdownSignal {
         &self.shutdown
+    }
+
+    fn stop_after_swaps(&self) -> Result<StopWait, MakerError> {
+        MakerServer::stop_after_swaps(self)
     }
 
     fn rpc_client(&self) -> Option<&Mutex<Option<TcpStream>>> {
@@ -4019,8 +4193,9 @@ pub(crate) mod tests {
     use super::MakerBehavior;
     use super::{
         check_fees_can_price_a_swap, min_swap_amount, swap_cost_floor, BackendConnector,
-        ConnectionState, MakerError, MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal,
-        ThreadPool, WatchService, MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE, UNPRICEABLE_FEES,
+        ConnectionState, MakerError, MakerServer, MakerServerConfig, MakerTrait, NegotiatedTerms,
+        ShutdownSignal, SwapState, ThreadPool, WatchService, MIN_SWAP_STEP_SATS,
+        REFUND_LOCKTIME_BASE, UNPRICEABLE_FEES,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
@@ -4118,6 +4293,9 @@ pub(crate) mod tests {
             is_setup_complete: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
+            stop_after_swaps: AtomicBool::new(false),
+            stop_deadline: Mutex::new(None),
+            settling_swaps: Mutex::new(HashSet::new()),
             funding_claims: Mutex::new(()),
             funding_in_progress: Mutex::new(HashSet::new()),
             completed_handovers: Mutex::new(HashMap::new()),
@@ -4190,6 +4368,103 @@ pub(crate) mod tests {
             error,
             MakerError::General("Swap id belongs to an unfinished swap")
         ));
+    }
+
+    /// `maker-cli stop` with no swaps in progress stops at once, as before.
+    #[test]
+    fn stop_after_swaps_with_none_in_progress_stops_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        assert_eq!(maker.stop_after_swaps().unwrap().live_swaps, 0);
+        assert!(maker.shutdown.load(Ordering::SeqCst));
+    }
+
+    /// A stop refuses new swaps, lets the live one continue (a resent
+    /// SwapDetails is a resume), and waits for a completed swap to settle.
+    #[test]
+    fn stop_after_swaps_refuses_new_swaps_and_waits_for_live_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let state = ConnectionState::new(ProtocolVersion::Legacy);
+        maker.ongoing_swaps.lock().unwrap().insert(
+            "live".to_string(),
+            SwapState {
+                negotiated: NegotiatedTerms::from(&state),
+                ..Default::default()
+            },
+        );
+
+        let wait = maker.stop_after_swaps().unwrap();
+        assert_eq!(wait.live_swaps, 1);
+        assert!(wait.wait_left > Duration::ZERO);
+        assert!(!maker.shutdown.load(Ordering::SeqCst));
+
+        let error = maker
+            .store_connection_state("new", &state, true)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MakerError::General("Maker is stopping and takes no new swaps")
+        ));
+        maker.store_connection_state("live", &state, true).unwrap();
+        assert!(maker.ongoing_swaps.lock().unwrap().contains_key("live"));
+
+        // The swap completes: it leaves the map while its coins are swept.
+        // While it moves over it is in both places, and still counts once.
+        let settling = maker.settling_swap("live");
+        assert_eq!(maker.stop_if_no_swaps_left().unwrap(), 1);
+        maker.remove_connection_state("live").unwrap();
+        assert_eq!(maker.stop_if_no_swaps_left().unwrap(), 1);
+        assert!(!maker.shutdown.load(Ordering::SeqCst));
+
+        drop(settling);
+        assert_eq!(maker.stop_if_no_swaps_left().unwrap(), 0);
+        assert!(maker.shutdown.load(Ordering::SeqCst));
+    }
+
+    /// A swap that never ends cannot hold the stop for ever: after the limit
+    /// the maker stops with the swap still in progress. Asking again does not
+    /// push the limit out.
+    #[test]
+    fn stop_gives_up_on_a_swap_that_outlasts_the_wait_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        let state = ConnectionState::new(ProtocolVersion::Legacy);
+        maker.ongoing_swaps.lock().unwrap().insert(
+            "pinned".to_string(),
+            SwapState {
+                negotiated: NegotiatedTerms::from(&state),
+                ..Default::default()
+            },
+        );
+
+        let limit = Duration::from_secs(600);
+        let wait = maker.stop_after_swaps_within(limit).unwrap();
+        assert_eq!(wait.live_swaps, 1);
+        assert!(wait.wait_left <= limit && wait.wait_left > limit - Duration::from_secs(60));
+
+        // A second request must not extend the deadline.
+        let again = maker
+            .stop_after_swaps_within(Duration::from_secs(86_400))
+            .unwrap();
+        assert!(again.wait_left <= limit);
+
+        let start = Instant::now();
+        assert_eq!(
+            maker
+                .stop_if_no_swaps_left_at(start + limit - Duration::from_secs(5))
+                .unwrap(),
+            1
+        );
+        assert!(!maker.shutdown.load(Ordering::SeqCst), "inside the limit");
+
+        assert_eq!(
+            maker
+                .stop_if_no_swaps_left_at(start + limit + Duration::from_secs(5))
+                .unwrap(),
+            1
+        );
+        assert!(maker.shutdown.load(Ordering::SeqCst), "past the limit");
     }
 
     /// Non-finite or below-minimum fidelity feerates clamp to the relay

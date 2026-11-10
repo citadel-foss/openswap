@@ -25,7 +25,7 @@ use crate::{
     blocklist::AddressBlocklist,
     lock_debug,
     maker::{
-        api::{MakerServerConfig, ShutdownSignal},
+        api::{MakerServerConfig, ShutdownSignal, StopWait},
         error::MakerError,
         rpc::messages::RpcMsgResp,
     },
@@ -134,6 +134,9 @@ pub trait MakerRpc {
     fn data_dir(&self) -> &Path;
     fn config(&self) -> &MakerServerConfig;
     fn shutdown(&self) -> &ShutdownSignal;
+    /// Refuses new swaps and stops once the swaps in progress are done, or the
+    /// wait limit passes. Reports how many swaps it waits for and for how long.
+    fn stop_after_swaps(&self) -> Result<StopWait, MakerError>;
     /// Where the client being served is parked, so shutdown can close it
     /// under a blocked read.
     fn rpc_client(&self) -> Option<&Mutex<Option<TcpStream>>> {
@@ -293,6 +296,13 @@ fn handle_request<M: MakerRpc>(
             maker.shutdown().store(true, Relaxed);
             RpcMsgResp::Shutdown
         }
+        RpcMsgReq::StopAfterSwaps => {
+            let wait = maker.stop_after_swaps()?;
+            RpcMsgResp::StoppingAfterSwaps {
+                live_swaps: wait.live_swaps,
+                wait_left_secs: wait.wait_left.as_secs(),
+            }
+        }
 
         RpcMsgReq::ListFidelity => {
             let list = lock_debug!(maker.wallet().read())?.display_fidelity_bonds()?;
@@ -424,6 +434,13 @@ mod tests {
         fn shutdown(&self) -> &ShutdownSignal {
             &self.shutdown
         }
+        /// A fixed count, so a test can tell the request reached this method.
+        fn stop_after_swaps(&self) -> Result<StopWait, MakerError> {
+            Ok(StopWait {
+                live_swaps: 3,
+                wait_left: Duration::from_secs(1800),
+            })
+        }
         #[cfg(not(feature = "integration-test"))]
         fn get_tor_hostname(&self) -> Result<String, TorError> {
             unreachable!("no request in these tests asks for the hostname")
@@ -434,6 +451,13 @@ mod tests {
     fn rpc_round_trip<T: Serialize>(
         envelope: impl FnOnce(&str) -> T,
     ) -> Result<RpcMsgResp, MakerError> {
+        rpc_round_trip_with_double(envelope).0
+    }
+
+    /// [`rpc_round_trip`], also returning the double so a test can check it.
+    fn rpc_round_trip_with_double<T: Serialize>(
+        envelope: impl FnOnce(&str) -> T,
+    ) -> (Result<RpcMsgResp, MakerError>, Arc<GuardDouble>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
@@ -447,8 +471,9 @@ mod tests {
         });
 
         send_message(&mut client, &envelope(&cookie)).unwrap();
-        handle_request(&double, &mut server, &cookie)?;
-        Ok(serde_cbor::from_slice(&read_message(&mut client).unwrap()).unwrap())
+        let reply = handle_request(&double, &mut server, &cookie)
+            .map(|()| serde_cbor::from_slice(&read_message(&mut client).unwrap()).unwrap());
+        (reply, double)
     }
 
     fn rpc_send_to_address(address: &str, feerate: f64) -> Result<RpcMsgResp, MakerError> {
@@ -567,6 +592,35 @@ mod tests {
             "the floor rate must clear the rate check: {:?}",
             e
         );
+    }
+
+    #[test]
+    fn stop_waits_for_swaps_and_stop_now_does_not() {
+        let request = |request| {
+            move |cookie: &str| AuthenticatedRpcRequest {
+                token: cookie.to_string(),
+                request,
+            }
+        };
+        // With swaps in progress, the graceful stop leaves the server running.
+        let (reply, double) = rpc_round_trip_with_double(request(RpcMsgReq::StopAfterSwaps));
+        let reply = reply.unwrap();
+        assert!(
+            matches!(
+                reply,
+                RpcMsgResp::StoppingAfterSwaps {
+                    live_swaps: 3,
+                    wait_left_secs: 1800
+                }
+            ),
+            "{:?}",
+            reply
+        );
+        assert!(!double.shutdown.load(Relaxed));
+
+        let (reply, double) = rpc_round_trip_with_double(request(RpcMsgReq::Stop));
+        assert!(matches!(reply.unwrap(), RpcMsgResp::Shutdown));
+        assert!(double.shutdown.load(Relaxed));
     }
 
     #[test]

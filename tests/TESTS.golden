@@ -37,6 +37,9 @@ openswap maker::api::tests::maker_config_rejects_fidelity_amount_below_the_disco
 openswap maker::api::tests::maker_init_refuses_bad_fee_pcts
 openswap maker::api::tests::shutdown_join_releases_pool_lock_and_drains_late_child
 openswap maker::api::tests::shutdown_signal_latches_request_and_rearms_backend_after_joins
+openswap maker::api::tests::stop_after_swaps_refuses_new_swaps_and_waits_for_live_ones
+openswap maker::api::tests::stop_after_swaps_with_none_in_progress_stops_now
+openswap maker::api::tests::stop_gives_up_on_a_swap_that_outlasts_the_wait_limit
 openswap maker::api::tests::unpriceable_fees_are_refused_before_the_bond
 openswap maker::handlers::tests::compat_maker_rejects_invalid_pins_before_admission
 openswap maker::handlers::tests::funding_guard_admits_one_handler_per_swap
@@ -51,12 +54,14 @@ openswap maker::legacy_verification::tests::locktime_that_overflows_the_refund_s
 openswap maker::legacy_verification::tests::normal_locktime_is_accepted
 openswap maker::nostr::tests::compat_nostr_kinds_are_frozen_and_separate_from_v023
 openswap maker::rpc::messages::tests::no_rpc_variant_carries_the_seed
+openswap maker::rpc::messages::tests::stop_reply_tells_how_long_the_wait_lasts
 openswap maker::rpc::server::tests::compat_rpc_old_requests_and_future_envelope_fields_keep_working
 openswap maker::rpc::server::tests::compat_rpc_unknown_bodies_authenticate_before_request_decode
 openswap maker::rpc::server::tests::rpc_checks_the_token_before_the_request
 openswap maker::rpc::server::tests::rpc_cookie_is_random_and_authenticated
 openswap maker::rpc::server::tests::send_to_address_clears_the_relay_floor_over_rpc
 openswap maker::rpc::server::tests::send_to_address_rejects_unusable_rates_over_rpc
+openswap maker::rpc::server::tests::stop_waits_for_swaps_and_stop_now_does_not
 openswap maker::server::tests::bind_port_retry_tries_the_given_port_first
 openswap maker::server::tests::compat_maker_decode_failure_names_future_variants_without_reply_loops
 openswap maker::server::tests::compat_maker_gate_requires_hello_before_heartbeat_and_handover
@@ -589,6 +594,7 @@ openswap watch_tower::watcher::tests::unsubscribed_watch_is_answered_from_the_se
 openswap watch_tower::watcher::tests::watch_asks_the_server_until_a_reconnect_is_replayed
 openswap watch_tower::watcher::tests::watch_stays_queued_while_core_cannot_find_the_funding_tx
 openswap watch_tower::watcher::tests::watches_recover_after_an_outage
+openswap::bin/maker-cli tests::stop_waits_for_swaps_unless_now_is_given
 openswap::bin/makerd tests::password_file_excludes_the_argv_password
 openswap::bin/makerd tests::plain_makerd_has_no_subcommand
 openswap::bin/makerd tests::restore_and_backup_read_their_options
@@ -762,6 +768,8 @@ openswap::integration restart::reboot::taproot_maker_reboot_preserves_funded_swa
 openswap::integration restart::reboot::taproot_maker_settles_an_incoming_its_own_sweep_spent
 openswap::integration restart::reboot::taproot_restart_rebuilds_watches
 openswap::integration restart::reboot::unsent_funding_grace_survives_a_maker_restart
+openswap::integration restart::stop_after_swaps::stop_gives_up_on_a_swap_held_open_without_funding
+openswap::integration restart::stop_after_swaps::taproot_stop_waits_for_the_swap_in_progress
 openswap::integration restart::successful_swap::restart_removes_spent_outgoing_swapcoins_legacy
 openswap::integration restart::successful_swap::restart_removes_spent_outgoing_swapcoins_taproot
 openswap::integration restart::successful_swap::restart_sweeps_handed_over_incoming_swapcoins

@@ -55,7 +55,7 @@ Commands:
   send-to-address     Send Bitcoin to an external address and return the txid
   show-tor-address    Show the server tor address
   show-data-dir       Show the data directory path
-  stop                Shutdown the makerd server
+  stop                Stop makerd once the swaps in progress finish, or after an hour at most. New swaps are refused meanwhile
   show-fidelity       Show all the fidelity bonds, current and previous, with an (index, {bond_proof, is_spent}) tuple
   sync-wallet         Sync the Maker wallet with the current blockchain state
   verify-deniability  Verify the deniability proof for a specific swap
@@ -569,7 +569,22 @@ $ ./maker-cli stop
 Shutdown Initiated
 ```
 
-This shuts down the makerd server. Once you run this command, the maker server initiates a shutdown, and we'll see the following logs indicating the shutdown process:
+If swaps are in progress, makerd does not stop right away. It refuses new swaps, lets the live ones finish, and then stops on its own. Takers that ask for a new swap pick another maker. The command tells you how many swaps it waits for:
+
+```bash
+$ ./maker-cli stop
+
+No new swaps are taken. makerd stops once the 1 swap(s) in progress finish, or in 60 minute(s) at the latest.
+Run `maker-cli stop --now` to stop at once. Swaps in progress then settle on-chain.
+```
+
+The wait ends after one hour at most. Then makerd stops anyway, and swaps still in progress settle on-chain after the restart. The limit keeps a peer that holds a swap open without funding it from blocking the stop. Run `maker-cli stop` again to see how much of the hour is left. It does not start the hour over.
+
+The wait covers swaps that are still running with their taker. A swap that is already in recovery does not delay the stop. makerd saves it and carries on with the recovery after the restart. Lightning swaps are not waited for either, and new ones are refused. makerd saves them and picks them up again after a restart, so they can still settle or refund.
+
+A swap that breaks because its maker stopped is not lost. makerd recovers it on-chain after the restart. But the taker then waits for the timelock and pays the recovery fees, so use `--now` only when you must.
+
+Once makerd stops, we'll see the following logs indicating the shutdown process:
 
 ```bash
  INFO openswap::maker::server - [6102] Server shutting down...
