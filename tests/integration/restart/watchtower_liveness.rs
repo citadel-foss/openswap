@@ -89,7 +89,7 @@ fn taker_refuses_swap_before_funding_after_watcher_exit(world: &mut World) {
     swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
 )]
 fn funded_maker_restarts_recovery_only_without_watcher(world: &mut World, params: SwapParams) {
-    super::reboot::run_reboot_recovery(world, params, false);
+    super::reboot::run_reboot_recovery(world, params, super::reboot::Restart::WatcherDown);
 }
 
 #[world_test(

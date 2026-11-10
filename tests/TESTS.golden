@@ -35,6 +35,7 @@ openswap maker::api::tests::maker_config_rejects_fidelity_amount_below_the_disco
 openswap maker::api::tests::maker_init_refuses_bad_fee_pcts
 openswap maker::api::tests::shutdown_join_releases_pool_lock_and_drains_late_child
 openswap maker::api::tests::shutdown_signal_latches_request_and_rearms_backend_after_joins
+openswap maker::api::tests::unpriceable_fees_are_refused_before_the_bond
 openswap maker::handlers::tests::compat_maker_rejects_invalid_pins_before_admission
 openswap maker::handlers::tests::funding_guard_admits_one_handler_per_swap
 openswap maker::handlers::tests::incoming_must_match_the_declared_swap_amount
@@ -746,6 +747,7 @@ openswap::integration restart::legacy_reboot::maker_reboot_preserves_funded_swap
 openswap::integration restart::reboot::legacy_electrum_crash_after_contract_exchange
 openswap::integration restart::reboot::legacy_electrum_maker_settles_an_incoming_its_own_sweep_spent
 openswap::integration restart::reboot::legacy_electrum_restart_rebuilds_watches
+openswap::integration restart::reboot::maker_restart_with_unpriceable_fees_still_recovers
 openswap::integration restart::reboot::orphan_reservation_is_released_on_restart
 openswap::integration restart::reboot::reservations_survive_a_maker_restart
 openswap::integration restart::reboot::reservations_survive_a_maker_restart_electrum
