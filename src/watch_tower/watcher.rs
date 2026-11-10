@@ -545,6 +545,7 @@ impl<R: Role> Watcher<R> {
         watches: &[(OutPoint, ScriptBuf)],
     ) -> Result<(), String> {
         let mut every_watch_unspent = true;
+        let mut utxo_lookup_failed = false;
         for (outpoint, _) in watches {
             if self.shutdown.load(Ordering::Relaxed) {
                 log::info!("watch rebuild rescan aborted before funding lookup: shutdown");
@@ -559,10 +560,14 @@ impl<R: Role> Watcher<R> {
                 .blockchain
                 .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
             {
-                Ok(Some(_)) => continue,
+                Ok(Some(_)) => {
+                    self.queue_reconcile(*outpoint);
+                    continue;
+                }
                 Ok(None) => every_watch_unspent = false,
                 Err(e) => {
                     every_watch_unspent = false;
+                    utxo_lookup_failed = true;
                     log::warn!(
                         "UTXO lookup failed before rebuild scan for {outpoint}: {e}; scanning conservatively"
                     );
@@ -600,7 +605,7 @@ impl<R: Role> Watcher<R> {
             }
         }
         let Some(from) = oldest else {
-            if funding_lookup_failed {
+            if funding_lookup_failed || utxo_lookup_failed {
                 return Err(
                     "rebuild recovery is inconclusive: no confirmed funding height was available"
                         .to_string(),
@@ -1595,10 +1600,12 @@ mod tests {
             OutPoint::new(Txid::from_byte_array([7; 32]), 0),
             ScriptBuf::new(),
         );
+        let outpoint = watch.0;
 
         watcher.rescan_for_missed_spends(&[watch]).unwrap();
 
         assert_eq!(calls.lock().unwrap().as_slice(), ["gettxout"]);
+        assert_eq!(watcher.pending_reconcile, [outpoint]);
     }
 
     #[test]
@@ -1606,6 +1613,31 @@ mod tests {
         let (url, calls) = mock_core_rpc(|method, _params| match method {
             "gettxout" => Ok(Value::Null),
             "getrawtransaction" => Err(json!({ "code": -28, "message": "txindex warming up" })),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        let watch = (
+            OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            ScriptBuf::new(),
+        );
+
+        assert!(watcher.rescan_for_missed_spends(&[watch]).is_err());
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["gettxout", "getrawtransaction"]
+        );
+    }
+
+    #[test]
+    fn rebuild_retries_when_utxo_lookup_fails_and_funding_is_unknown() {
+        let (url, calls) = mock_core_rpc(|method, _params| match method {
+            "gettxout" => Err(json!({ "code": -28, "message": "chainstate warming up" })),
+            "getrawtransaction" => {
+                Err(json!({ "code": -5, "message": "No such mempool or blockchain transaction" }))
+            }
             method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
         });
         let mut watcher = core_watcher(&CoreRpcConfig {

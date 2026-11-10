@@ -226,12 +226,9 @@ fn backoff_after(attempt: u8, last: &electrum_client::Error) -> Duration {
     }
 }
 
-/// Whether retrying `method` after `last` needs a fresh socket. Rate-limited
-/// reads stay on the current session so multi-batch wallet reads retain their
-/// progress. A refused script subscription is different: electrum-client keeps
-/// a local subscription marker even though the server rejected it, so only a
-/// rebuild lets the retry reach the server instead of returning
-/// `AlreadySubscribed` locally.
+/// Whether a retry needs a fresh socket. Rate-limited reads retain their session;
+/// rejected subscriptions rebuild because electrum-client's local marker would
+/// otherwise keep the retry from reaching the server.
 fn reconnect_before_retry(method: &'static str, last: &electrum_client::Error) -> bool {
     method == SUBSCRIBE || !is_rate_limited(last)
 }
@@ -1595,7 +1592,7 @@ impl Blockchain for Electrum {
         // Keep the whole read/validate/cache sequence ordered. Serializing only
         // socket calls is insufficient: an older refresh can otherwise resume
         // after a newer one and mark stale answers clean.
-        let _refresh = lock_debug!(self.wallet_refresh.lock()).map_err(poisoned)?;
+        let _refresh = lock_debug!(self.wallet_refresh.lock()).unwrap_or_else(|e| e.into_inner());
         let watched: Vec<ScriptBuf> = lock_debug!(self.watched.lock())
             .map_err(poisoned)?
             .iter()
@@ -1679,11 +1676,9 @@ impl Blockchain for Electrum {
         let mut query_connection = state.wallet_connection;
         drop(guard);
 
-        // These are the slowest calls in a wallet sync. Do not hold the
-        // notifier mutex while waiting for the server: the watchtower needs it
-        // to drain spend and block notifications. If a call reconnects, throw
-        // away the mixed-generation answers and repeat the whole snapshot on
-        // the replacement connection instead of surfacing a transient error.
+        // Keep the notifier available to the watchtower during slow queries.
+        // A connection change discards mixed-generation answers and retries
+        // the snapshot on the replacement socket.
         // This must be wider than `max_retries`: at the maximum u8 setting we
         // still need one representable value beyond the limit to stop.
         let mut snapshot_retries = 0_u16;
@@ -1870,11 +1865,6 @@ impl Blockchain for Electrum {
             }
         }
 
-        // Page over the txid list before fetching anything, so a long history
-        // costs one batched round-trip instead of a `transaction.get` per entry.
-        // Partition first and sort only the requested prefix: callers usually
-        // ask for ten entries, so a large wallet history does not pay O(n log n)
-        // just to discard almost all of it.
         let page = transaction_page(heights, skip, count);
 
         // The page's txs, then the txs their inputs spend, each in batched
@@ -2336,7 +2326,7 @@ pub(crate) mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
         net::TcpListener,
-        sync::{Arc, Barrier},
+        sync::{atomic::AtomicUsize, mpsc, Arc, Barrier},
         thread,
     };
 
@@ -3757,25 +3747,221 @@ pub(crate) mod tests {
         );
     }
 
-    /// Socket calls being serialized is not enough: a second wallet refresh
-    /// must not enter between the first one's calls and cache an answer that the
-    /// older refresh can subsequently overwrite.
     #[test]
-    fn wallet_utxo_refreshes_are_serialized() {
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let server = {
-            let entered = entered.clone();
-            let release = release.clone();
-            mock_electrum(move |method, _params| match method {
-                "blockchain.scripthash.subscribe" => {
-                    entered.wait();
-                    release.wait();
-                    Ok(Value::Null)
+    fn list_unspent_releases_notifier_during_snapshot_query() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let server = mock_electrum({
+            let release_rx = release_rx.clone();
+            move |method, _params| match method {
+                SUBSCRIBE => Ok(json!("changed")),
+                LIST_UNSPENT => {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("release blocked listunspent");
+                    Ok(json!([]))
                 }
                 method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
-            })
-        };
+            }
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url,
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        backend.watch_script(&ScriptBuf::from_bytes(vec![0x51]), None);
+
+        thread::scope(|scope| {
+            let refresh = scope.spawn(|| backend.list_unspent(None, None));
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("listunspent was not sent");
+            assert!(
+                backend.notifier.try_lock().is_ok(),
+                "notifier stayed locked during listunspent"
+            );
+            release_tx.send(()).unwrap();
+            assert!(refresh.join().unwrap().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn list_unspent_retries_snapshot_after_generation_change() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = mock_electrum({
+            let release_rx = release_rx.clone();
+            let calls = calls.clone();
+            move |method, _params| match method {
+                SUBSCRIBE => Ok(json!("changed")),
+                LIST_UNSPENT => {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("release listunspent attempt");
+                    Ok(json!([]))
+                }
+                method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+            }
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        backend.watch_script(&ScriptBuf::from_bytes(vec![0x51]), None);
+
+        thread::scope(|scope| {
+            let refresh = scope.spawn(|| backend.list_unspent(None, None));
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            backend.reconnects.fetch_add(1, Ordering::SeqCst);
+            release_tx.send(()).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            release_tx.send(()).unwrap();
+            assert!(refresh.join().unwrap().unwrap().is_empty());
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn list_unspent_stops_after_snapshot_retry_limit() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let server = mock_electrum({
+            let release_rx = release_rx.clone();
+            move |method, _params| match method {
+                SUBSCRIBE => Ok(json!("changed")),
+                LIST_UNSPENT => {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("release listunspent attempt");
+                    Ok(json!([]))
+                }
+                method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+            }
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url,
+            max_retries: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        backend.watch_script(&ScriptBuf::from_bytes(vec![0x51]), None);
+
+        thread::scope(|scope| {
+            let refresh = scope.spawn(|| backend.list_unspent(None, None));
+            for _ in 0..2 {
+                entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                backend.reconnects.fetch_add(1, Ordering::SeqCst);
+                release_tx.send(()).unwrap();
+            }
+            let error = refresh.join().unwrap().unwrap_err();
+            assert!(format!("{error:?}").contains("snapshot 2 times"));
+        });
+    }
+
+    #[test]
+    fn list_unspent_does_not_cache_for_a_script_claimed_during_snapshot() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let server = mock_electrum({
+            let release_rx = release_rx.clone();
+            move |method, _params| match method {
+                SUBSCRIBE => Ok(json!("changed")),
+                LIST_UNSPENT => {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("release blocked listunspent");
+                    Ok(json!([{
+                        "height": 1,
+                        "tx_hash": Txid::all_zeros(),
+                        "tx_pos": 0,
+                        "value": 1_000,
+                    }]))
+                }
+                method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+            }
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url,
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        backend.watch_script(&script, None);
+
+        thread::scope(|scope| {
+            let refresh = scope.spawn(|| backend.list_unspent(None, None));
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            backend
+                .notifier
+                .lock()
+                .unwrap()
+                .subscriptions
+                .entry(script.clone())
+                .or_default()
+                .watchers
+                .insert(OutPoint::null());
+            release_tx.send(()).unwrap();
+            let entries = refresh.join().unwrap().unwrap();
+            assert_eq!(entries.len(), 1);
+        });
+        let state = backend.notifier.lock().unwrap();
+        assert!(state.subscriptions.contains_key(&script));
+        assert!(!matches!(state.wallet_scripts.get(&script), Some(Some(_))));
+    }
+
+    /// A second refresh must not enter between the first one's subscription and
+    /// direct query, or its newer cache state can be overwritten by the first.
+    #[test]
+    fn wallet_utxo_refreshes_are_serialized() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let first_subscribe = Arc::new(AtomicBool::new(true));
+        let server = mock_electrum({
+            let release_rx = release_rx.clone();
+            let first_subscribe = first_subscribe.clone();
+            move |method, _params| {
+                event_tx.send(method.to_string()).unwrap();
+                match method {
+                    SUBSCRIBE => {
+                        if first_subscribe.swap(false, Ordering::SeqCst) {
+                            release_rx
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(2))
+                                .expect("release first refresh");
+                        }
+                        Ok(json!("changed"))
+                    }
+                    LIST_UNSPENT => Ok(json!([])),
+                    method => {
+                        Err(json!({ "code": -32601, "message": format!("unexpected {method}") }))
+                    }
+                }
+            }
+        });
         let backend = Electrum::new(&ElectrumConfig {
             url: server.url,
             max_retries: 0,
@@ -3785,15 +3971,49 @@ pub(crate) mod tests {
         backend.watch_script(&ScriptBuf::from_bytes(vec![0x51]), None);
 
         thread::scope(|scope| {
-            let refresh = scope.spawn(|| backend.list_unspent(None, None));
-            entered.wait();
+            let first = scope.spawn(|| backend.list_unspent(None, None));
             assert!(
-                backend.wallet_refresh.try_lock().is_err(),
-                "the refresh lock was released while the snapshot was in flight"
+                event_rx.recv_timeout(Duration::from_secs(2)).unwrap() == SUBSCRIBE,
+                "first refresh did not reach subscribe"
             );
-            release.wait();
-            assert!(refresh.join().unwrap().unwrap().is_empty());
+            let second = scope.spawn(|| backend.list_unspent(None, None));
+            assert!(
+                event_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+                "second refresh reached the server before the first completed"
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                event_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                LIST_UNSPENT,
+                "second refresh interleaved before the first direct query"
+            );
+            assert!(first.join().unwrap().unwrap().is_empty());
+            assert!(second.join().unwrap().unwrap().is_empty());
         });
+    }
+
+    #[test]
+    fn wallet_utxo_refresh_recovers_a_poisoned_serialization_lock() {
+        let server = mock_electrum(|method, _params| {
+            Err(json!({ "code": -32601, "message": format!("unexpected {method}") }))
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url,
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _guard = backend.wallet_refresh.lock().unwrap();
+                    panic!("poison wallet refresh lock");
+                })
+                .join()
+                .is_err());
+        });
+
+        assert!(backend.list_unspent(None, None).unwrap().is_empty());
     }
 
     #[test]
