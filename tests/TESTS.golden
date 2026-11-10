@@ -776,6 +776,7 @@ openswap::integration swap::payswap::taproot_exact_payment
 openswap::integration swap::spare_maker::legacy_first_maker_drops_before_sender_sigs
 openswap::integration swap::spare_maker::legacy_middle_maker_drops_before_sender_sigs
 openswap::integration swap::spare_maker::rebuild_after_replan_uses_the_claimed_coins
+openswap::integration swap::spare_maker::spare_with_a_different_offerbook_key_is_refused
 openswap::integration swap::spare_maker::taproot_middle_maker_drops_after_ack
 openswap::integration swap::spare_pricing::heterogeneous_substitution_aborts_without_cascade
 openswap::integration swap::spare_pricing::last_hop_equal_priced_spare_completes

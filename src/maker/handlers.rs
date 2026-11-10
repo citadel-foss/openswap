@@ -294,6 +294,18 @@ pub enum SwapPhase {
     Completed,
 }
 
+impl ConnectionState {
+    /// A fresh state carrying a real BIP324 session id, for tests that call
+    /// the handlers directly instead of through the encrypted TCP server.
+    #[cfg(feature = "integration-test")]
+    pub fn with_test_session() -> Self {
+        ConnectionState {
+            session_id: Some(crate::bip324_stream::loopback_session_id()),
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ConnectionState {
     fn default() -> Self {
         ConnectionState {

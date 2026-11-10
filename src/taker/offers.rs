@@ -556,6 +556,24 @@ impl OfferBookHandle {
             .write_to_disk(&self.path)
     }
 
+    /// Test hook: overwrite the tweakable point of `address`'s stored offer.
+    /// Returns `false` when the address has no stored offer.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn set_tweakable_point(
+        &self,
+        address: &str,
+        point: bitcoin::PublicKey,
+    ) -> Result<bool, TakerError> {
+        let mut book = lock_debug!(self.inner.write())
+            .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
+        let offer = book
+            .makers
+            .iter_mut()
+            .find(|m| m.address.to_string() == address)
+            .and_then(|m| m.offer.as_mut());
+        Ok(offer.map(|offer| offer.tweakable_point = point).is_some())
+    }
+
     /// Remove a maker from the offerbook by address.
     /// Returns `true` if an entry was removed, `false` if no matching address was found.
     pub fn remove(&self, address: &MakerAddress) -> Result<bool, TakerError> {

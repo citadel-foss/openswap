@@ -717,9 +717,7 @@ impl TakerHandle {
         &self.taker
     }
 
-    /// The taker itself, mutably, for what the handle does not wrap; only the
-    /// Lightning swaps need it so far.
-    #[cfg(feature = "lightning")]
+    /// The taker itself, mutably, for what the handle does not wrap.
     pub fn inner_mut(&mut self) -> &mut Taker {
         &mut self.taker
     }

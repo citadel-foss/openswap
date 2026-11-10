@@ -2051,12 +2051,10 @@ impl Taker {
                     offer.time_relative_fee_pct
                 );
                 // The maker we picked from the offerbook must still own the
-                // same tweakable key, and must prove it for this channel.
-                if let Some(expected) = self.swap_state()?.makers[maker_idx]
-                    .offer
-                    .as_ref()
-                    .map(|offer| offer.tweakable_point)
-                {
+                // same tweakable key, and must prove it for this channel. A
+                // spare carries no route offer, so its offerbook entry counts.
+                let address = self.swap_state()?.makers[maker_idx].address.to_string();
+                if let Some(expected) = self.maker_identity(&address)? {
                     if offer.tweakable_point != expected {
                         return Err(TakerError::General(format!(
                             "Maker {} changed offer tweakable point: expected {}, got {}",
@@ -2859,6 +2857,16 @@ impl Taker {
         stream: &Bip324Stream,
         address: &str,
     ) -> Result<(), TakerError> {
+        if let Some(tweakable_point) = self.maker_identity(address)? {
+            stream.authenticate(&tweakable_point)?;
+        }
+        Ok(())
+    }
+
+    /// The tweakable key `address` must hold: that of the offer this swap
+    /// recorded for it, else of its verified offer in the offerbook (a spare,
+    /// or a replay after an abort). `None` when neither is known.
+    fn maker_identity(&self, address: &str) -> Result<Option<PublicKey>, TakerError> {
         let recorded = self.swap_state().ok().and_then(|swap| {
             swap.makers
                 .iter()
@@ -2866,20 +2874,16 @@ impl Taker {
                 .and_then(|m| m.offer.as_ref())
                 .map(|offer| offer.tweakable_point)
         });
-        let identity = match recorded {
-            Some(point) => Some(point),
-            None => self
-                .offerbook
-                .all_makers()?
-                .into_iter()
-                .find(|m| m.address.to_string() == address)
-                .and_then(|m| m.offer)
-                .map(|offer| offer.tweakable_point),
-        };
-        if let Some(tweakable_point) = identity {
-            stream.authenticate(&tweakable_point)?;
+        if recorded.is_some() {
+            return Ok(recorded);
         }
-        Ok(())
+        Ok(self
+            .offerbook
+            .all_makers()?
+            .into_iter()
+            .find(|m| m.address.to_string() == address)
+            .and_then(|m| m.offer)
+            .map(|offer| offer.tweakable_point))
     }
 
     /// Connect to a maker directly or through Tor and exchange Hellos. The
@@ -3738,6 +3742,19 @@ impl Taker {
     /// Returns the current offerbook snapshot.
     pub fn fetch_offers(&self) -> Result<OfferBook, TakerError> {
         self.offerbook.snapshot()
+    }
+
+    /// Test hook: make the offerbook expect `point` as `address`'s tweakable
+    /// key, as if whoever answers there is not the verified maker. Stops the
+    /// offer sync first, so a refresh cannot restore the real key.
+    #[cfg(feature = "integration-test")]
+    pub fn test_set_offerbook_tweakable_point(
+        &mut self,
+        address: &str,
+        point: PublicKey,
+    ) -> Result<bool, TakerError> {
+        self.offer_sync_handle.shutdown();
+        self.offerbook.set_tweakable_point(address, point)
     }
 
     /// Triggers a manual offerbook sync and blocks until it completes.
