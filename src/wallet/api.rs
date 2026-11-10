@@ -7334,7 +7334,7 @@ mod mempool_deferral_tests {
         wallet::{
             blockchain::SCRIPT_CACHE_TTL,
             swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
-            FidelityBond, FidelityError,
+            BondReplacement, FidelityBond, FidelityError,
         },
     };
     use bitcoin::{
@@ -8709,16 +8709,28 @@ mod mempool_deferral_tests {
     /// answered with one keeps its record.
     #[test]
     fn a_bond_answered_with_a_server_fault_is_kept() {
-        let (result, txid, in_memory, on_disk) = broadcast_bond(|chain, _| {
-            chain.broadcast_error = Some((
-                json!({"code": -32603, "message": "unavailable index"}),
-                false,
-            ));
-        });
-        assert!(result.is_err());
-        assert_eq!(in_memory, vec![txid]);
-        assert_eq!(on_disk, vec![txid]);
+        for code in SERVER_FAULTS {
+            let (result, txid, in_memory, on_disk) = broadcast_bond(|chain, _| {
+                chain.broadcast_error = Some((json!({"code": code, "message": "fault"}), false));
+            });
+            assert!(result.is_err(), "{}", code);
+            assert_eq!(in_memory, vec![txid], "{}", code);
+            assert_eq!(on_disk, vec![txid], "{}", code);
+        }
+        // Just outside the range, the code is the backend's refusal.
+        for code in NOT_SERVER_FAULTS {
+            let (result, _, in_memory, on_disk) = broadcast_bond(|chain, _| {
+                chain.broadcast_error = Some((json!({"code": code, "message": "no"}), false));
+            });
+            assert!(result.is_err(), "{}", code);
+            assert!(in_memory.is_empty() && on_disk.is_empty(), "{}", code);
+        }
     }
+
+    /// JSON-RPC's internal error and both ends of its server-error range.
+    const SERVER_FAULTS: [i64; 3] = [-32603, -32099, -32000];
+    /// The codes just outside the server-error range.
+    const NOT_SERVER_FAULTS: [i64; 2] = [-32100, -31999];
 
     /// A stored bond the backend does not know, and a stub set up by `setup`
     /// to answer its rebroadcast.
@@ -8761,14 +8773,19 @@ mod mempool_deferral_tests {
     /// server fault, or a refusal whose lookup fails, stays retryable.
     #[test]
     fn an_unclear_rebroadcast_failure_stays_retryable() {
-        let (bond, chain, _) = unknown_bond(|stub, _| {
-            stub.broadcast_error = Some((
-                json!({"code": -32603, "message": "unavailable index"}),
-                false,
-            ));
-        });
-        let result = bond.ensure_broadcast(&chain);
-        assert!(result.is_err() && !is_refused(&result));
+        for code in SERVER_FAULTS {
+            let (bond, chain, _) = unknown_bond(|stub, _| {
+                stub.broadcast_error = Some((json!({"code": code, "message": "fault"}), false));
+            });
+            let result = bond.ensure_broadcast(&chain);
+            assert!(result.is_err() && !is_refused(&result), "{}", code);
+        }
+        for code in NOT_SERVER_FAULTS {
+            let (bond, chain, _) = unknown_bond(|stub, _| {
+                stub.broadcast_error = Some((json!({"code": code, "message": "no"}), false));
+            });
+            assert!(is_refused(&bond.ensure_broadcast(&chain)), "{}", code);
+        }
 
         let (bond, chain, stub) = unknown_bond(|stub, _| {
             stub.broadcast_error = Some((
@@ -8794,16 +8811,45 @@ mod mempool_deferral_tests {
         assert!(is_refused(&bond.ensure_broadcast(&chain)));
     }
 
-    /// A refused bond's coins go into its replacement, so the two conflict.
-    /// Coins of other bonds, and locked or reserved coins, are left alone.
+    /// A replacement for refused bonds spends a coin of each one that can
+    /// still confirm, from whichever pool holds them, and adopts one the
+    /// backend knows. It waits while some bond's coins cannot be spent.
     #[test]
-    fn a_replacement_bond_spends_the_refused_bonds_coins() {
-        let url = start_electrum_stub(StubChain::with(&[]));
+    fn a_replacement_bond_conflicts_with_every_viable_refused_bond() {
+        let coin = |seed: u8| OutPoint::new(Txid::from_byte_array([seed; 32]), 0);
+        let bond = |index: u32, inputs: &[OutPoint]| {
+            let mut bond_tx = tx(inputs[0], 40_000, ScriptBuf::new());
+            for input in &inputs[1..] {
+                let mut extra = bond_tx.input[0].clone();
+                extra.previous_output = *input;
+                bond_tx.input.push(extra);
+            }
+            FidelityBond {
+                outpoint: OutPoint::new(bond_tx.compute_txid(), 0),
+                bond_index: index,
+                tx: Some(bond_tx),
+                ..unsent_bond(&tx(OutPoint::null(), 50_000, ScriptBuf::new()))
+            }
+        };
+        let unlisted = tx(coin(20), 50_000, ScriptBuf::new());
+        let bonds = vec![
+            bond(0, &[coin(1), coin(2)]),
+            // Coin 9 went to another tx: this bond can never confirm.
+            bond(1, &[coin(3), coin(9)]),
+            bond(2, &[coin(4)]),
+            bond(3, &[coin(5)]),
+            bond(4, &[coin(6)]),
+            bond(5, &[coin(7)]),
+            // Its coin is unspent on chain, but the wallet does not list it.
+            bond(6, &[OutPoint::new(unlisted.compute_txid(), 0)]),
+        ];
+        // Bond 5 reached the backend after all.
+        let known = bonds[5].tx.clone().unwrap();
+        let url = start_electrum_stub(StubChain::with(&[(&known, 0), (&unlisted, 50)]));
         let temp_dir = tempdir().unwrap();
         let mut wallet = stub_wallet(&temp_dir.path().join("wallet.cbor"), electrum(&url));
 
-        let coin = |seed: u8| OutPoint::new(Txid::from_byte_array([seed; 32]), 0);
-        for seed in 1..=5 {
+        for seed in 1..=7 {
             let outpoint = coin(seed);
             let entry = ListUnspentResultEntry {
                 txid: outpoint.txid,
@@ -8820,38 +8866,44 @@ mod mempool_deferral_tests {
                 descriptor: None,
                 safe: true,
             };
-            let spend = UTXOSpendInfo::SeedCoin {
-                path: format!("m/0/{seed}"),
-                input_value: entry.amount,
-                address_type: AddressType::P2WPKH,
+            let (path, input_value, address_type) =
+                (format!("m/0/{seed}"), entry.amount, AddressType::P2WPKH);
+            // Coins 5 and 6 are swept swap coins; the rest are seed coins.
+            let spend = if matches!(seed, 5 | 6) {
+                UTXOSpendInfo::SweptCoin {
+                    path,
+                    input_value,
+                    address_type,
+                }
+            } else {
+                UTXOSpendInfo::SeedCoin {
+                    path,
+                    input_value,
+                    address_type,
+                }
             };
             wallet.store.utxo_cache.insert(outpoint, (entry, spend));
         }
-        // Coin 6 is already spent: a refused bond spending it cannot confirm.
-        let bond = |index: u32, inputs: &[OutPoint]| {
-            let mut bond_tx = tx(inputs[0], 40_000, ScriptBuf::new());
-            for input in &inputs[1..] {
-                let mut extra = bond_tx.input[0].clone();
-                extra.previous_output = *input;
-                bond_tx.input.push(extra);
-            }
-            FidelityBond {
-                outpoint: OutPoint::new(bond_tx.compute_txid(), 0),
-                bond_index: index,
-                tx: Some(bond_tx),
-                ..unsent_bond(&tx(OutPoint::null(), 50_000, ScriptBuf::new()))
-            }
-        };
-        wallet.store.fidelity_bond = vec![
-            bond(0, &[coin(1), coin(2), coin(6)]),
-            bond(1, &[coin(3)]),
-            bond(2, &[coin(4), coin(5)]),
-        ];
+        wallet.store.fidelity_bond = bonds;
         wallet.lock_utxos(&[coin(4)]);
-        wallet.reserve_swap_locks(SWAP, &[coin(5)]);
+        wallet.reserve_swap_locks(SWAP, &[coin(6)]);
 
-        assert_eq!(wallet.unsent_bond_coins(&[0, 2]), vec![coin(1), coin(2)]);
-        assert!(wallet.unsent_bond_coins(&[]).is_empty());
+        let plan = |refused: &[u32]| wallet.plan_bond_replacement(refused).unwrap();
+        let spend = |coins: &[OutPoint]| BondReplacement::Spend(coins.to_vec());
+        assert_eq!(plan(&[]), spend(&[]));
+        assert_eq!(plan(&[1]), spend(&[]));
+        assert_eq!(plan(&[0, 1]), spend(&[coin(1), coin(2)]));
+        assert_eq!(plan(&[3]), spend(&[coin(5)]));
+        assert_eq!(plan(&[0, 5]), BondReplacement::Adopt(5));
+        // Locked, reserved, needing both pools in one transaction, or not
+        // listed by the wallet yet.
+        for refused in [&[2][..], &[4], &[0, 3], &[0, 6]] {
+            assert!(
+                matches!(plan(refused), BondReplacement::Wait(_)),
+                "{:?}",
+                refused
+            );
+        }
     }
 
     /// When the backend cannot say whether the bond went out, the record stays

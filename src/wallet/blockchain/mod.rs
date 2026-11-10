@@ -223,6 +223,14 @@ pub trait Blockchain: Send + Sync + 'static {
     /// Any transport or server failure is propagated, so a failed query is
     /// never read as absence.
     fn is_tx_unknown(&self, txid: &Txid) -> Result<bool, WalletError>;
+    /// Stop counting the coins an unconfirmed transaction spends as spent,
+    /// once it is in neither the mempool nor a block.
+    ///
+    /// Core's watch-only wallet keeps such a transaction and leaves its coins
+    /// out of `listunspent` until it is abandoned. Electrum has no server-side
+    /// wallet, so there is nothing to do. A transaction the node does not hold,
+    /// or one that is in the mempool or a block, is left as is.
+    fn abandon_transaction(&self, txid: &Txid) -> Result<(), WalletError>;
     /// Unspent output at `txid:vout`, following Core's `gettxout`.
     ///
     /// `include_mempool`:
@@ -632,6 +640,12 @@ impl Blockchain for AnyBlockchain {
         match self {
             AnyBlockchain::CoreRPC(b) => b.is_tx_unknown(txid),
             AnyBlockchain::Electrum(b) => b.is_tx_unknown(txid),
+        }
+    }
+    fn abandon_transaction(&self, txid: &Txid) -> Result<(), WalletError> {
+        match self {
+            AnyBlockchain::CoreRPC(b) => b.abandon_transaction(txid),
+            AnyBlockchain::Electrum(b) => b.abandon_transaction(txid),
         }
     }
     fn get_tx_out(

@@ -71,6 +71,50 @@ fn spawn_replacement_bitcoind(staticdir: PathBuf, extra_args: &[&str]) -> bitcoi
     }
 }
 
+/// Stops the node and starts a fresh one on its datadir with an empty mempool
+/// and `extra_args`, returning it and a restart config for `maker` that points
+/// at it.
+fn evict_mempool_and_restart_node(
+    world: &World,
+    maker: &MakerServer,
+    extra_args: &[&str],
+) -> (bitcoind::BitcoinD, openswap::maker::MakerServerConfig) {
+    let (wallet_name, zmq_addr) = match &maker.config.backend {
+        openswap::wallet::BackendConfig::CoreRpc(cfg) => {
+            (cfg.wallet_name.clone(), cfg.zmq_addr.clone())
+        }
+        _ => panic!("expected a CoreRpc backend"),
+    };
+
+    // Clean stop writes mempool.dat; the replacement node must not load it.
+    let _ = world.framework().bitcoind.client.stop();
+
+    // `-persistmempool=0` is the eviction: the mempool is not reloaded from
+    // mempool.dat. `-walletbroadcast=0` stops the node wallet resurrecting
+    // the evicted tx: Core rebroadcasts the wallet's unconfirmed
+    // transactions on startup, which would put the bond right back.
+    let raw_tx = format!("-zmqpubrawtx={zmq_addr}");
+    let block_hash = format!("-zmqpubrawblock={zmq_addr}");
+    let mut args = vec![
+        "-persistmempool=0",
+        "-walletbroadcast=0",
+        raw_tx.as_str(),
+        block_hash.as_str(),
+    ];
+    args.extend_from_slice(extra_args);
+    let new_bitcoind = spawn_replacement_bitcoind(world.temp_dir().join(".bitcoin"), &args);
+
+    // Point the backend at the replacement node.
+    let mut restart_config = maker_restart_config(maker);
+    restart_config.backend = openswap::wallet::BackendConfig::CoreRpc(CoreRpcConfig {
+        url: new_bitcoind.rpc_url().split_at(7).1.to_string(),
+        auth: Auth::CookieFile(new_bitcoind.params.cookie_file.clone()),
+        wallet_name,
+        zmq_addr,
+    });
+    (new_bitcoind, restart_config)
+}
+
 /// Regression test for <https://github.com/citadel-foss/openswap/issues/990>
 ///
 /// A maker stopped after broadcasting its fidelity bond but before it confirms
@@ -327,31 +371,7 @@ fn evicted_bond_rebroadcast_on_restart(world: &mut World) {
 
     // ----- Evict the bond: restart bitcoind without mempool persistence -----
 
-    let (wallet_name, zmq_addr) = match &maker.config.backend {
-        openswap::wallet::BackendConfig::CoreRpc(cfg) => {
-            (cfg.wallet_name.clone(), cfg.zmq_addr.clone())
-        }
-        _ => panic!("expected a CoreRpc backend"),
-    };
-
-    // Clean stop writes mempool.dat; the replacement node must not load it.
-    let _ = world.framework().bitcoind.client.stop();
-
-    // `-persistmempool=0` is the eviction: the mempool is not reloaded from
-    // mempool.dat. `-walletbroadcast=0` stops the node wallet resurrecting
-    // the evicted tx: Core rebroadcasts the wallet's unconfirmed
-    // transactions on startup, which would put the bond right back.
-    let raw_tx = format!("-zmqpubrawtx={zmq_addr}");
-    let block_hash = format!("-zmqpubrawblock={zmq_addr}");
-    let new_bitcoind = spawn_replacement_bitcoind(
-        world.temp_dir().join(".bitcoin"),
-        &[
-            "-persistmempool=0",
-            "-walletbroadcast=0",
-            &raw_tx,
-            &block_hash,
-        ],
-    );
+    let (new_bitcoind, restart_config) = evict_mempool_and_restart_node(world, maker, &[]);
 
     assert!(
         new_bitcoind.client.get_mempool_entry(&bond_txid).is_err(),
@@ -360,15 +380,6 @@ fn evicted_bond_rebroadcast_on_restart(world: &mut World) {
     );
 
     // ----- Run 2: the restart must rebroadcast the stored bond tx -----
-
-    // Point the backend at the replacement node.
-    let mut restart_config = maker_restart_config(maker);
-    restart_config.backend = openswap::wallet::BackendConfig::CoreRpc(CoreRpcConfig {
-        url: new_bitcoind.rpc_url().split_at(7).1.to_string(),
-        auth: Auth::CookieFile(new_bitcoind.params.cookie_file.clone()),
-        wallet_name,
-        zmq_addr,
-    });
 
     let restarted = Arc::new(MakerServer::init(restart_config).unwrap());
     let restarted_clone = restarted.clone();
@@ -411,6 +422,108 @@ fn evicted_bond_rebroadcast_on_restart(world: &mut World) {
 
     // Teardown: stop the replacement node first; the framework's original
     // node is already down (TestFramework::stop tolerates that).
+    let _ = new_bitcoind.client.stop();
+}
+
+/// A bond the node refuses on restart is skipped, and the bond funded in its
+/// place spends one of its coins: the refused tx may still confirm from a
+/// peer's mempool, and the two must never both lock funds.
+///
+/// The refusal is made by restarting bitcoind with an empty mempool and a
+/// minimum relay fee above the bond's feerate.
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 1,
+)]
+fn refused_bond_is_replaced_by_a_conflicting_bond(world: &mut World) {
+    let bitcoind = world.bitcoind();
+    let maker = world.makers()[0].inner();
+    let log_path = world.taker_log_path();
+
+    // Spare coins, so a replacement that ignored the refused bond could
+    // fund itself from unrelated ones.
+    world.fund_makers(4, Amount::ONE_BTC, AddressType::P2TR);
+
+    // ----- Run 1: broadcast a bond at 1 sat/vB, stop before it confirms -----
+
+    world.framework().set_block_gen_paused(true);
+    let maker_clone = maker.clone();
+    let maker_thread = thread::spawn(move || {
+        let _ = start_server(maker_clone);
+    });
+    let bond_txid = wait_for_bond_broadcast(&log_path);
+    let bond_inputs: Vec<_> = bitcoind
+        .client
+        .get_raw_transaction(&bond_txid, None)
+        .unwrap()
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect();
+    maker.shutdown.store(true, Relaxed);
+    let _ = maker_thread.join();
+
+    // ----- The node now refuses the stored bond: 5 sat/vB relay minimum -----
+
+    let (new_bitcoind, mut restart_config) =
+        evict_mempool_and_restart_node(world, maker, &["-minrelaytxfee=0.00005"]);
+    restart_config.fidelity_feerate = 10.0;
+
+    // ----- Run 2: skip the refused bond, fund a conflicting one -----
+
+    let restarted = Arc::new(MakerServer::init(restart_config).unwrap());
+    let restarted_clone = restarted.clone();
+    let restarted_thread = thread::spawn(move || {
+        let _ = start_server(restarted_clone);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let replacement_txid = loop {
+        if let Some(txid) = new_bitcoind.client.get_raw_mempool().unwrap().first() {
+            break *txid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no replacement bond was broadcast"
+        );
+        thread::sleep(Duration::from_millis(500));
+    };
+    assert_ne!(replacement_txid, bond_txid);
+    let replacement = new_bitcoind
+        .client
+        .get_raw_transaction(&replacement_txid, None)
+        .unwrap();
+    assert!(
+        replacement
+            .input
+            .iter()
+            .any(|input| bond_inputs.contains(&input.previous_output)),
+        "replacement {} must spend a coin of the refused bond {}",
+        replacement_txid,
+        bond_txid
+    );
+
+    generate_blocks(&new_bitcoind, 1);
+    wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+    {
+        let wallet = restarted.wallet.read().unwrap();
+        let index = wallet.get_highest_fidelity_index().unwrap().unwrap();
+        let bond = wallet
+            .get_fidelity_bonds()
+            .iter()
+            .find(|bond| bond.bond_index == index)
+            .unwrap();
+        assert_eq!(bond.outpoint().txid, replacement_txid);
+    }
+
+    restarted.shutdown.store(true, Relaxed);
+    let _ = restarted_thread.join();
+
+    assert_log!(world; {
+        has "cannot be broadcast",
+        has "held by refused bonds",
+    });
+
     let _ = new_bitcoind.client.stop();
 }
 

@@ -41,9 +41,9 @@ use crate::{
         min_contract_value_sats,
         seed_cli::WalletInUse,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
-        AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FeePriority,
-        FidelityError, MakerReport, RecoveryOutcome, RestoreOptions, SwapRole, Wallet, WalletError,
-        MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
+        AddressType, AnyBlockchain, BackendConfig, Blockchain, BondReplacement, CoreRpcConfig,
+        FeePriority, FidelityError, MakerReport, RecoveryOutcome, RestoreOptions, SwapRole, Wallet,
+        WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::{service::WatchService, watcher::WatcherEvent, watcher_error::WatcherError},
 };
@@ -1399,6 +1399,19 @@ impl MakerServer {
 
     /// Setup fidelity bond for this maker.
     pub fn setup_fidelity_bond(&self, maker_address: &str) -> Result<FidelityProof, MakerError> {
+        loop {
+            if let Some(proof) = self.try_setup_fidelity_bond(maker_address)? {
+                return Ok(proof);
+            }
+        }
+    }
+
+    /// One pass of [`Self::setup_fidelity_bond`]. `None` means a bond the
+    /// backend refused needs another look, so setup starts over.
+    fn try_setup_fidelity_bond(
+        &self,
+        maker_address: &str,
+    ) -> Result<Option<FidelityProof>, MakerError> {
         use bitcoin::absolute::LockTime;
 
         // Adopt any bond that was broadcast but not yet confirmed (e.g. the
@@ -1514,6 +1527,35 @@ impl MakerServer {
                     .sync_and_save(&self.shutdown)
                     .map_err(MakerError::Wallet)?;
 
+                // Re-planned after every sync: a refused bond may have reached
+                // the backend, or its coins been freed, while funds were awaited.
+                let plan = lock_debug!(self.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                    .plan_bond_replacement(&refused_bonds);
+                let conflicts = match plan {
+                    Ok(BondReplacement::Spend(coins)) => coins,
+                    Ok(BondReplacement::Adopt(index)) => {
+                        log::info!(
+                            "[{}] Refused fidelity bond {} reached the backend; adopting it instead of creating one",
+                            self.config.network_port,
+                            index
+                        );
+                        return Ok(None);
+                    }
+                    other => {
+                        log::warn!(
+                            "[{}] Not creating a fidelity bond yet: {:?}. Next check in {} secs",
+                            self.config.network_port,
+                            other,
+                            SYNC_INTERVAL.as_secs()
+                        );
+                        if !self.wait_for_shutdown(SYNC_INTERVAL) {
+                            return Err(MakerError::Shutdown);
+                        }
+                        continue;
+                    }
+                };
+
                 let fidelity_result = lock_debug!(self.wallet.write())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?
                     .create_fidelity_replacing(
@@ -1522,7 +1564,7 @@ impl MakerServer {
                         Some(maker_address),
                         self.config.fidelity_feerate,
                         AddressType::P2TR,
-                        &refused_bonds,
+                        &conflicts,
                     );
 
                 match fidelity_result {
@@ -1578,6 +1620,21 @@ impl MakerServer {
                             if !self.wait_for_shutdown(SYNC_INTERVAL) {
                                 return Err(MakerError::Shutdown);
                             }
+                        } else if !refused_bonds.is_empty() {
+                            // A refused bond may have confirmed after the coins
+                            // were picked, so the replacement conflicts with
+                            // it. Start over: setup adopts the bond, or waits on
+                            // or replaces the new one if its record was kept.
+                            log::warn!(
+                                "[{}] Fidelity bond creation failed: {:?}. Checking the refused bonds again in {} secs",
+                                self.config.network_port,
+                                e,
+                                SYNC_INTERVAL.as_secs()
+                            );
+                            if !self.wait_for_shutdown(SYNC_INTERVAL) {
+                                return Err(MakerError::Shutdown);
+                            }
+                            return Ok(None);
                         } else {
                             log::error!(
                                 "[{}] Fidelity Bond Creation failed: {:?}",
@@ -1630,6 +1687,7 @@ impl MakerServer {
             .map_err(|_| MakerError::General("Failed to lock fidelity proof"))?
             .clone()
             .ok_or(MakerError::General("No fidelity proof after setup"))
+            .map(Some)
     }
 
     /// Check if maker has enough liquidity for swaps.
