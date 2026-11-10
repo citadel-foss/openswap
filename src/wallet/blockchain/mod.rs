@@ -430,7 +430,9 @@ impl AnyBlockchain {
         shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, WalletError> {
         match backend {
-            BackendConfig::CoreRpc(cfg) => Ok(AnyBlockchain::CoreRPC(CoreRPC::new(cfg)?)),
+            BackendConfig::CoreRpc(cfg) => Ok(AnyBlockchain::CoreRPC(CoreRPC::with_shutdown_flag(
+                cfg, shutdown,
+            )?)),
             BackendConfig::Electrum(cfg) => Ok(AnyBlockchain::Electrum(
                 Electrum::with_shutdown_flag(cfg, shutdown)?,
             )),
@@ -454,7 +456,9 @@ impl AnyBlockchain {
         shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, WalletError> {
         match self {
-            AnyBlockchain::CoreRPC(b) => Ok(AnyBlockchain::CoreRPC(b.reconnect()?)),
+            AnyBlockchain::CoreRPC(b) => {
+                Ok(AnyBlockchain::CoreRPC(b.reconnect_with_shutdown(shutdown)?))
+            }
             AnyBlockchain::Electrum(b) => Ok(AnyBlockchain::Electrum(
                 b.reconnect_with_shutdown(shutdown)?,
             )),
