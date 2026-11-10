@@ -223,12 +223,16 @@ pub fn screen_funding_tx(
     Ok(())
 }
 
-/// Index entries by script pubkey, skipping any that do not parse.
+/// Index entries by script pubkey, returning the ones that do not parse apart.
+///
+/// The skipped entries may belong to another network sharing the file, so a
+/// rewrite must keep them.
 fn index_entries(
     entries: Vec<BlocklistEntry>,
     network: Network,
-) -> HashMap<ScriptBuf, BlocklistEntry> {
+) -> (HashMap<ScriptBuf, BlocklistEntry>, Vec<BlocklistEntry>) {
     let mut indexed = HashMap::with_capacity(entries.len());
+    let mut skipped = Vec::new();
 
     for entry in entries {
         match parse_checked_address(&entry.address, network) {
@@ -248,10 +252,11 @@ fn index_entries(
                     "Skipping unusable blocklist entry {}: {error}",
                     entry.address
                 );
+                skipped.push(entry);
             }
         }
     }
-    indexed
+    (indexed, skipped)
 }
 
 /// In-memory script index backed by a shared JSON file.
@@ -270,9 +275,10 @@ impl AddressBlocklist {
     pub fn load(data_dir: &Path, network: Network) -> Result<Self, BlocklistError> {
         let path = blocklist_path(data_dir);
         let file = read_blocklist(&path)?;
+        let (inner, _) = index_entries(file.entries, network);
 
         Ok(Self {
-            inner: index_entries(file.entries, network),
+            inner,
             path,
             network,
         })
@@ -303,7 +309,9 @@ impl AddressBlocklist {
         &self,
     ) -> Result<(BlocklistFile, HashMap<ScriptBuf, BlocklistEntry>), BlocklistError> {
         let mut file = read_blocklist(&self.path)?;
-        let entries = index_entries(std::mem::take(&mut file.entries), self.network);
+        let (entries, skipped) = index_entries(std::mem::take(&mut file.entries), self.network);
+        // Entries this network can't parse stay in the file as they are.
+        file.entries = skipped;
         Ok((file, entries))
     }
 
@@ -313,7 +321,7 @@ impl AddressBlocklist {
         mut file: BlocklistFile,
         entries: HashMap<ScriptBuf, BlocklistEntry>,
     ) -> Result<(), BlocklistError> {
-        file.entries = entries.values().cloned().collect();
+        file.entries.extend(entries.values().cloned());
 
         write_json_atomically(&self.path, &file)?;
         self.inner = entries;
@@ -692,6 +700,44 @@ mod tests {
         let saved: Value = read_json(&path).unwrap();
         assert_eq!(saved["entries"][0]["label"], "new");
         assert_eq!(saved["entries"][0]["note"], "x");
+    }
+
+    #[test]
+    fn rewrites_keep_entries_for_other_networks() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("taker");
+        let path = blocklist_path(&data_dir);
+        let mainnet = test_address(1, Network::Bitcoin);
+        let mainnet_entry = BlocklistEntry::new(mainnet.to_string(), Some("listed".into()));
+        let malformed = BlocklistEntry::new("not-an-address".to_string(), None);
+        let entries = vec![mainnet_entry.clone(), malformed.clone()];
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"entries": entries})).unwrap(),
+        )
+        .unwrap();
+
+        // A regtest node sharing the file can't use either entry.
+        let mut book = AddressBlocklist::load(&data_dir, Network::Regtest).unwrap();
+        assert!(book.is_empty());
+        let added = BlocklistEntry::new(test_address(2, Network::Regtest).to_string(), None);
+        book.add(vec![added.clone()]).unwrap();
+        let saved: BlocklistFile = read_json(&path).unwrap();
+        assert_eq!(
+            saved.entries,
+            [mainnet_entry.clone(), malformed.clone(), added.clone()]
+        );
+
+        book.remove(vec![added.address]).unwrap();
+        let saved: BlocklistFile = read_json(&path).unwrap();
+        assert_eq!(saved.entries, [mainnet_entry.clone(), malformed]);
+
+        // The mainnet node still blocks its address.
+        let mainnet_book = AddressBlocklist::load(&data_dir, Network::Bitcoin).unwrap();
+        assert_eq!(
+            mainnet_book.matching(mainnet.script_pubkey().as_script()),
+            Some(&mainnet_entry)
+        );
     }
 
     #[test]

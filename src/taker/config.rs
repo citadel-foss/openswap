@@ -81,16 +81,18 @@ impl TakerConfig {
         );
 
         Ok(TakerConfig {
-            control_port: parse_field(config_map.get("control_port"), default_config.control_port),
-            socks_port: parse_field(config_map.get("socks_port"), default_config.socks_port),
+            control_port: parse_field(&config_map, "control_port", default_config.control_port)?,
+            socks_port: parse_field(&config_map, "socks_port", default_config.socks_port)?,
             tor_auth_password: parse_field(
-                config_map.get("tor_auth_password"),
+                &config_map,
+                "tor_auth_password",
                 default_config.tor_auth_password,
-            ),
+            )?,
             check_blocklist: parse_field(
-                config_map.get("check_blocklist"),
+                &config_map,
+                "check_blocklist",
                 default_config.check_blocklist,
-            ),
+            )?,
             require_features: parse_require_features(config_map.get("require_features"))?,
             ldk_server_url: config_map.get("ldk_server_url").cloned(),
             ldk_api_key_path: config_map.get("ldk_api_key_path").cloned(),
@@ -478,6 +480,31 @@ mod tests {
 
         remove_temp_config(&path);
         remove_temp_config(&rewritten);
+    }
+
+    /// A value the parser cannot read stops startup instead of becoming the
+    /// default, so `check_blocklist = True` cannot quietly switch screening off.
+    #[test]
+    fn unreadable_values_are_refused() {
+        for (line, key) in [
+            ("check_blocklist = True", "check_blocklist"),
+            ("check_blocklist = true # screen", "check_blocklist"),
+            ("socks_port = 9150 # tor browser", "socks_port"),
+            ("control_port = 70000", "control_port"),
+        ] {
+            let path = create_temp_config(&format!("{line}\n"), "taker_unreadable.toml");
+            let error = TakerConfig::new(Some(&path)).unwrap_err().to_string();
+            assert!(error.contains(key), "{}: {}", line, error);
+            remove_temp_config(&path);
+        }
+        let path = create_temp_config(
+            "check_blocklist = true\nsocks_port = 9150\ncontrol_port = 9151\n",
+            "taker_readable.toml",
+        );
+        let loaded = TakerConfig::new(Some(&path)).unwrap();
+        assert!(loaded.check_blocklist);
+        assert_eq!((loaded.socks_port, loaded.control_port), (9150, 9151));
+        remove_temp_config(&path);
     }
 
     /// Absent keys stay absent rather than defaulting to a sidecar that is
