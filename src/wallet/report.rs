@@ -838,6 +838,7 @@ fn raw_swap_id(value: &Value) -> Option<&str> {
 
 /// How many stored reports for `swap_id` this build can't decode.
 fn unreadable_for(stored: &StoredReports, swap_id: &str) -> usize {
+    /// Stored reports of one kind that fail to decode and name `swap_id`.
     fn count<T: DeserializeOwned>(stored: &StoredReports, kind: &str, swap_id: &str) -> usize {
         stored
             .get(kind)
@@ -855,6 +856,7 @@ fn unreadable_for(stored: &StoredReports, swap_id: &str) -> usize {
 /// The reports of `swap_id` over `stored`, without proofs. Reports for the id
 /// that this build can't read are counted under `unreadable_reports`.
 fn detail_of(stored: &StoredReports, swap_id: &str) -> Option<serde_json::Value> {
+    /// The reports that `matches`, as JSON rows without their deniability proof.
     fn rows<T: Serialize>(reports: Vec<T>, matches: impl Fn(&T) -> bool) -> Vec<serde_json::Value> {
         reports
             .iter()
@@ -989,6 +991,7 @@ pub struct SwapHistory {
 }
 
 impl SwapHistory {
+    /// Builds the totals over every report, and the rows of the newest `limit`.
     fn from_reports(reports: &SwapReportFile, unreadable_reports: usize, limit: usize) -> Self {
         let mut totals = SwapTotals {
             unreadable_reports,
@@ -1070,6 +1073,7 @@ impl SwapHistory {
 }
 
 impl SwapTotals {
+    /// Adds one report with this status to the counts.
     fn count(&mut self, status: &SwapStatus) {
         match status {
             SwapStatus::Success => self.succeeded += 1,

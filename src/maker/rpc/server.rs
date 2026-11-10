@@ -155,6 +155,7 @@ struct RawRpcRequest {
     request: Value,
 }
 
+/// Checks the cookie, runs one RPC request against the maker and sends the reply.
 fn handle_request<M: MakerRpc>(
     maker: &Arc<M>,
     socket: &mut TcpStream,

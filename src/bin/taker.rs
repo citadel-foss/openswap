@@ -508,6 +508,7 @@ fn display_offer(
     ))
 }
 
+/// Runs the taker, and exits like SIGINT when a passphrase prompt is cancelled.
 fn main() -> Result<(), TakerError> {
     match run() {
         // Ctrl-C at a passphrase prompt: exit as SIGINT would.
@@ -519,6 +520,8 @@ fn main() -> Result<(), TakerError> {
     }
 }
 
+/// Parses the arguments and runs one command. Commands that only read the
+/// wallet file run before the backend and Tor are set up.
 fn run() -> Result<(), TakerError> {
     let mut args = Cli::parse();
     let mut wallet_password = args.password.take().map(Zeroizing::new);

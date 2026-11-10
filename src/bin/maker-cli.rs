@@ -105,6 +105,7 @@ enum Commands {
     },
 }
 
+/// Reads the RPC cookie, connects to makerd and runs the chosen command.
 fn main() -> Result<(), MakerError> {
     let cli = App::parse();
     let data_dir = match cli.data_directory {
