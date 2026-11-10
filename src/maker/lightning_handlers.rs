@@ -77,6 +77,14 @@ const MAX_MIN_CONFIRMATIONS: u32 = 12;
 /// confirmed after the preimage arrives.
 const MIN_REMAINING_LOCKTIME: u32 = 24;
 
+/// Reads of a swap-in funding's confirmation height before the handler gives
+/// up, and the pause between them. The confirmation wait has just seen the
+/// block, so a missing height is either a reorg or a backend that is briefly
+/// behind; a few seconds covers the second and stays well inside the taker's
+/// wait for the payment.
+const FUNDING_HEIGHT_READS: u32 = 4;
+const FUNDING_HEIGHT_RETRY: Duration = Duration::from_secs(2);
+
 /// Blocks past a taker's refund maturity before the maker gives up on a
 /// swap-in it never learned the preimage for. Generous: dropping too early
 /// would discard a sweep that could still land.
@@ -748,10 +756,19 @@ fn handle_swap_in_funded<M: Maker>(
     // Value and script are not enough. The taker chose this outpoint, so it
     // may be one whose refund is already spendable — or already spent. Paying
     // against either loses the Lightning amount outright.
-    let (unspent, age) = maker.htlc_unspent_and_age(&funded.outpoint)?;
-    if !unspent {
+    //
+    // The taker's CSV refund window opens `locktime` blocks after the block
+    // that confirmed the funding, and the watchdog times it from
+    // `funding_height`. Without that block it could never tell when an
+    // unsettled swap is past its window, so stop while the swap is still
+    // InAccepted, where the unfunded expiry frees it, rather than pay. The
+    // same height dates the window checked here and the one stored, so the
+    // two cannot disagree.
+    let funding_height = read_funding_height(maker, &funded.outpoint.txid)?;
+    if !maker.htlc_unspent(&funded.outpoint)? {
         return refuse_swap_in(maker, &funded.swap_id, "funding output is already spent");
     }
+    let age = maker.get_current_height()?.saturating_sub(funding_height);
     let remaining = (swap.locktime as u32).saturating_sub(age);
     if remaining < MIN_REMAINING_LOCKTIME {
         return refuse_swap_in(
@@ -790,18 +807,6 @@ fn handle_swap_in_funded<M: Maker>(
         log::warn!("lightning: htlc script build failed: {e}");
         MakerError::General("htlc script build failed")
     })?;
-
-    // The taker's CSV refund window opens `locktime` blocks after the block
-    // that confirmed the funding, and the watchdog times it from
-    // `funding_height`. Without that block it could never tell when an
-    // unsettled swap is past its window, so stop while the swap is still
-    // InAccepted, where the unfunded expiry frees it, rather than pay.
-    let Some(funding_height) = maker.tx_confirmation_height(&funded.outpoint.txid)? else {
-        return Err(MakerError::General(
-            "swap-in funding has no confirmation height",
-        ));
-    };
-
     swap.funding = Some((funded.outpoint, output.value));
     swap.funding_height = Some(funding_height);
     swap.phase = LnMakerPhase::InPaid;
@@ -848,6 +853,28 @@ fn handle_swap_in_funded<M: Maker>(
             swap_id: funded.swap_id,
         }),
     ))))
+}
+
+/// The block height that confirmed a swap-in's funding. A missing height is
+/// read again a few times, so a backend that is briefly behind does not fail
+/// the swap; one still missing after that stops the handler, as a reorg may
+/// have taken the block away. A failed query stops it at once.
+fn read_funding_height<M: Maker>(maker: &Arc<M>, txid: &bitcoin::Txid) -> Result<u32, MakerError> {
+    for read in 1..=FUNDING_HEIGHT_READS {
+        if let Some(height) = maker.tx_confirmation_height(txid)? {
+            return Ok(height);
+        }
+        if read < FUNDING_HEIGHT_READS && !maker.shutdown_requested() {
+            log::info!(
+                "[{}] Swap-in funding {txid} has no confirmation height yet; reading again",
+                maker.network_port()
+            );
+            std::thread::sleep(FUNDING_HEIGHT_RETRY);
+        }
+    }
+    Err(MakerError::General(
+        "swap-in funding has no confirmation height",
+    ))
 }
 
 /// Refuses a funded swap-in. Callers must first validate the outpoint, proving
@@ -1714,11 +1741,7 @@ fn watchdog_resolve_swap_out(
             };
             let current = maker.get_current_height()?;
             let refundable = current >= funded_at.saturating_add(swap.locktime as u32);
-            let unspent_on_chain = || {
-                maker
-                    .htlc_unspent_and_age(&outpoint)
-                    .map(|(unspent, _)| unspent)
-            };
+            let unspent_on_chain = || maker.htlc_unspent(&outpoint);
             match UnspentHtlc::decide(refundable, unspent_on_chain)? {
                 UnspentHtlc::Wait => return Ok(()),
                 UnspentHtlc::SpentUnseen => {

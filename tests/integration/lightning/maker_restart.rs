@@ -2911,19 +2911,37 @@ fn announce_funding(
     format!("{result:?}")
 }
 
-/// The taker's CSV refund window starts at the block that confirmed its
-/// funding, so that block, not the tip when the handler runs, is what
-/// handle_swap_in_funded must record as the funding height.
+/// Announces a confirmed funding to a maker whose height lookup behaves as
+/// `behavior` says, and checks that handle_swap_in_funded paid and recorded
+/// the block that confirmed the funding.
 #[world_test(
     backend = BitcoindBackend,
     bind = [ln = maker_node()],
-    maker_behaviors = [Normal],
+    maker_behaviors = [behavior],
     takers = [Normal],
     maker_lightning = [ln.clone()],
+    cases = [
+        /// The taker's CSV refund window starts at the block that confirmed
+        /// its funding, so that block, not the tip when the handler runs, is
+        /// what handle_swap_in_funded must record as the funding height.
+        swap_in_funded_handler_records_confirmation_height(
+            behavior = MakerBehavior::Normal,
+            preimage = Preimage([0xd1; 32]),
+        ),
+        /// A backend that is briefly behind, such as an Electrum server the
+        /// maker failed over to, can answer the first lookup with no height
+        /// although the wait just saw the block. The handler must read again
+        /// and pay rather than fail a sound swap.
+        swap_in_funded_handler_rereads_a_lagging_funding_height(
+            behavior = MakerBehavior::FundingHeightLagsOnce,
+            preimage = Preimage([0xd4; 32]),
+        ),
+    ],
 )]
-fn swap_in_funded_handler_records_confirmation_height(
+fn handler_records_confirmation_height(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
+    preimage: Preimage,
 ) {
     let taker_ln = MockLightningBackend::new();
     let framework = world.framework().clone();
@@ -2931,7 +2949,6 @@ fn swap_in_funded_handler_records_confirmation_height(
     let maker = world.makers()[0].inner().clone();
     pause_block_generation(&framework);
 
-    let preimage = Preimage([0xd1; 32]);
     let swap_id = preimage.payment_hash().to_string();
     accept_swap_in(&maker, &taker_ln, &preimage);
     let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();

@@ -900,6 +900,10 @@ pub struct MakerServer {
     /// Test-only behavior override.
     #[cfg(feature = "integration-test")]
     pub behavior: MakerBehavior,
+    /// Funding height lookups made so far, for
+    /// [`MakerBehavior::FundingHeightLagsOnce`].
+    #[cfg(feature = "integration-test")]
+    pub funding_height_lookups: std::sync::atomic::AtomicU32,
     /// Reserved by the framework at allocation; taken at server start so no
     /// parallel test can snipe the port in between.
     #[cfg(feature = "integration-test")]
@@ -1147,6 +1151,8 @@ impl MakerServer {
             ln_swaps: Mutex::new(restored_ln_swaps),
             #[cfg(feature = "integration-test")]
             behavior: MakerBehavior::default(),
+            #[cfg(feature = "integration-test")]
+            funding_height_lookups: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "integration-test")]
             reserved_network_listener: Mutex::new(None),
             #[cfg(feature = "integration-test")]
@@ -3778,6 +3784,14 @@ impl MakerTrait for MakerServer {
                 return Err(MakerError::General("Test: funding height lookup failed"))
             }
             MakerBehavior::NoFundingHeight => return Ok(None),
+            MakerBehavior::FundingHeightLagsOnce
+                if self
+                    .funding_height_lookups
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    == 0 =>
+            {
+                return Ok(None)
+            }
             _ => {}
         }
         let height = lock_debug!(self.wallet.read())
@@ -3803,34 +3817,16 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
-    fn htlc_unspent_and_age(
-        &self,
-        outpoint: &bitcoin::OutPoint,
-    ) -> Result<(bool, u32), MakerError> {
+    fn htlc_unspent(&self, outpoint: &bitcoin::OutPoint) -> Result<bool, MakerError> {
         use crate::wallet::Blockchain;
-        let wallet = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
         // Mempool included: a spend that is only in the mempool still means
         // the taker is taking this output back.
-        let unspent = wallet
+        Ok(lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
             .blockchain
             .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
             .map_err(MakerError::Wallet)?
-            .is_some();
-        let tip = wallet
-            .blockchain
-            .get_block_count()
-            .map_err(MakerError::Wallet)?;
-        let confirmed_at = wallet
-            .blockchain
-            .tx_block_height(&outpoint.txid)
-            .map_err(MakerError::Wallet)?;
-        // An unconfirmed funding has aged zero blocks; the confirmation wait
-        // is what decides whether that is acceptable.
-        let age = confirmed_at
-            .map(|height| tip.saturating_sub(height) as u32)
-            .unwrap_or(0);
-        Ok((unspent, age))
+            .is_some())
     }
 
     #[cfg(feature = "lightning")]
@@ -4138,6 +4134,8 @@ pub(crate) mod tests {
             ln_swaps: Mutex::new(HashMap::new()),
             #[cfg(feature = "integration-test")]
             behavior: MakerBehavior::default(),
+            #[cfg(feature = "integration-test")]
+            funding_height_lookups: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "integration-test")]
             reserved_network_listener: Mutex::new(None),
             #[cfg(feature = "integration-test")]
