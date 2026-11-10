@@ -1599,7 +1599,9 @@ impl Blockchain for Electrum {
         // to drain spend and block notifications. If a call reconnects, throw
         // away the mixed-generation answers and repeat the whole snapshot on
         // the replacement connection instead of surfacing a transient error.
-        let mut snapshot_retries = 0_u8;
+        // This must be wider than `max_retries`: at the maximum u8 setting we
+        // still need one representable value beyond the limit to stop.
+        let mut snapshot_retries = 0_u16;
         let (fetched_answers, mut guard) = loop {
             let mut fetched_answers = HashMap::new();
             for chunk in stale.chunks(LIST_UNSPENT_BATCH) {
@@ -1619,8 +1621,8 @@ impl Blockchain for Electrum {
             guard.wallet_connection = connection;
             drop(guard);
 
-            snapshot_retries = snapshot_retries.saturating_add(1);
-            if snapshot_retries > self.config.max_retries.max(1) {
+            snapshot_retries += 1;
+            if snapshot_retries > u16::from(self.config.max_retries.max(1)) {
                 return Err(electrum_err(format!(
                     "electrum connection changed during listunspent snapshot {snapshot_retries} times"
                 )));
