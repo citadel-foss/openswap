@@ -347,6 +347,24 @@ fn verify_session_sig(
         .map_err(|e| Bip324Error::SessionIdSigInvalid(e).into())
 }
 
+/// A real session id from a loopback handshake, for tests that drive the
+/// maker's handlers without a socket. `SessionId` has no public constructor.
+#[cfg(feature = "integration-test")]
+pub(crate) fn loopback_session_id() -> SessionId {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("loopback address");
+    let responder = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().expect("accept loopback");
+        Bip324Stream::new(socket, Network::Regtest, bip324::Role::Responder, None)
+            .map(|stream| *stream.session_id())
+    });
+    let socket = TcpStream::connect(addr).expect("connect loopback");
+    let initiator = Bip324Stream::new(socket, Network::Regtest, bip324::Role::Initiator, None)
+        .expect("loopback handshake");
+    let _ = responder.join();
+    *initiator.session_id()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
