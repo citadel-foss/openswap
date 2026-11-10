@@ -745,17 +745,13 @@ pub(crate) fn compute_checksum(descriptor: &str) -> Result<String, WalletError> 
     Ok(checksum_chars)
 }
 
-/// Parse the proxy (Socket:Port) argument from the cli input.
+/// Parse the Bitcoin Core RPC authentication (USER:PASSWORD) argument from the cli input.
+///
+/// Splits on the first `:` only, like Bitcoin Core does, so the password may contain `:`.
 pub fn parse_proxy_auth(s: &str) -> Result<(String, String), NetError> {
-    let parts: Vec<_> = s.split(':').collect();
-    if parts.len() != 2 {
-        return Err(NetError::InvalidNetworkAddress);
-    }
+    let (user, passwd) = s.split_once(':').ok_or(NetError::InvalidNetworkAddress)?;
 
-    let user = parts[0].to_string();
-    let passwd = parts[1].to_string();
-
-    Ok((user, passwd))
+    Ok((user.to_string(), passwd.to_string()))
 }
 
 /// Tor Error grades
@@ -2153,6 +2149,20 @@ mod tests {
             .add_exp_tweak(&secp, &scalar_from_nonce)
             .unwrap();
         assert_eq!(returned_pubkey.to_string(), tweaked_pubkey.to_string());
+    }
+
+    #[test]
+    fn test_parse_proxy_auth() {
+        assert_eq!(
+            parse_proxy_auth("user:password").unwrap(),
+            ("user".to_string(), "password".to_string())
+        );
+        // Only the first ':' separates the user from the password.
+        assert_eq!(
+            parse_proxy_auth("user:pass:word").unwrap(),
+            ("user".to_string(), "pass:word".to_string())
+        );
+        assert!(parse_proxy_auth("userpassword").is_err());
     }
 
     // ── parse_checked_address tests ──────────────────────────────────────────
