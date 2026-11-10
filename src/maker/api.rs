@@ -1399,8 +1399,11 @@ impl MakerServer {
 
     /// Setup fidelity bond for this maker.
     pub fn setup_fidelity_bond(&self, maker_address: &str) -> Result<FidelityProof, MakerError> {
+        // One deposit address for the whole setup, across every pass, so a
+        // pass that starts over doesn't burn and watch a new one.
+        let mut deposit = None;
         loop {
-            if let Some(proof) = self.try_setup_fidelity_bond(maker_address)? {
+            if let Some(proof) = self.try_setup_fidelity_bond(maker_address, &mut deposit)? {
                 return Ok(proof);
             }
         }
@@ -1408,9 +1411,12 @@ impl MakerServer {
 
     /// One pass of [`Self::setup_fidelity_bond`]. `None` means a bond the
     /// backend refused needs another look, so setup starts over.
+    /// `deposit` is the address the funds wait asks for, allocated by the
+    /// first pass that needs one.
     fn try_setup_fidelity_bond(
         &self,
         maker_address: &str,
+        deposit: &mut Option<bitcoin::Address>,
     ) -> Result<Option<FidelityProof>, MakerError> {
         use bitcoin::absolute::LockTime;
 
@@ -1515,10 +1521,16 @@ impl MakerServer {
             // Wait for funds and create fidelity bond
             const SYNC_INTERVAL: Duration = Duration::from_secs(10);
             // One address for the whole wait, so each retry doesn't burn a new one.
-            let addr = lock_debug!(self.wallet.write())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .get_next_external_address(AddressType::P2TR)
-                .map_err(MakerError::Wallet)?;
+            let addr = match deposit {
+                Some(addr) => addr.clone(),
+                None => {
+                    let addr = lock_debug!(self.wallet.write())
+                        .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                        .get_next_external_address(AddressType::P2TR)
+                        .map_err(MakerError::Wallet)?;
+                    deposit.insert(addr).clone()
+                }
+            };
 
             while !self.shutdown.load(Ordering::Relaxed) {
                 log::info!("Sync at:----setup_fidelity_bond----");

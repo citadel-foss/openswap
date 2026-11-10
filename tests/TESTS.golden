@@ -706,7 +706,9 @@ openswap::integration fidelity::renewal::bond_auto_renewal
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart_electrum
 openswap::integration fidelity::restart::live_bond_is_advertised_while_another_is_pending
+openswap::integration fidelity::restart::refused_bond_confirming_before_its_replacement_is_adopted
 openswap::integration fidelity::restart::refused_bond_is_replaced_by_a_conflicting_bond
+openswap::integration fidelity::restart::refused_replacement_restarts_setup_instead_of_stopping
 openswap::integration fidelity::restart::unconfirmed_bond_not_duplicated
 openswap::integration fidelity::restart::unconfirmed_bond_not_duplicated_electrum
 openswap::integration fidelity::spending::bond_spending
