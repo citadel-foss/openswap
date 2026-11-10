@@ -64,6 +64,8 @@ name = "default-maker"
 - `check_blocklist`: When `true`, your node refuses a swap if the coins paid into it come straight from an address on your blocklist. Defaults to `false`. See [the blocklist doc](./blocklist.md).
 - `name`: The public name takers see for your maker. Defaults to `default-maker`. It must be 1 to 32 characters long. It must not contain control characters, the invisible characters such as tabs and line breaks. Otherwise the maker refuses to start.
 - `ldk_server_url`, `ldk_api_key_path`, `ldk_tls_cert_path`: Optional settings that connect your maker to a Lightning node. They are absent by default. See [the Lightning doc](./lightning.md).
+
+Every number and `true`/`false` value must be readable. If one is not, `makerd` stops at startup and names the key. It does not fall back to the default. Put comments on their own line, not after a value. Booleans are lowercase.
 - The per-hop parameters the taker negotiates (`tx_count`, `max_input_budget`, `feerate`) — and what the maker is reimbursed on top of its service fees — are covered in [the fee policy](./fee-policy.md).
 
 There is no minimum swap setting. Your node works out the smallest swap it accepts for each request. The swap must pay your fee and the mining fees. Every coin you receive or send must also stay above dust after you pay to spend it. Dust is an amount too small for the network to forward. At 1 sat/vB, one taproot coin needs at least 485 sats: 330 sats of dust plus 155 sats to spend it.

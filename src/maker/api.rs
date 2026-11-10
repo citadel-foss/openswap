@@ -417,9 +417,10 @@ impl MakerServerConfig {
         log::info!("Loaded config file from: {}", config_path.display());
 
         let fidelity_amount = parse_field(
-            config_map.get("fidelity_amount"),
+            &config_map,
+            "fidelity_amount",
             default_config.fidelity_amount,
-        );
+        )?;
         // A bond under this floor funds and confirms fine, but every taker's
         // discovery drops the announcement, leaving the maker unreachable with
         // its coins locked. Refuse at startup rather than fail silently.
@@ -436,9 +437,10 @@ impl MakerServerConfig {
         }
 
         let fidelity_timelock = parse_field(
-            config_map.get("fidelity_timelock"),
+            &config_map,
+            "fidelity_timelock",
             default_config.fidelity_timelock,
-        );
+        )?;
         if !(MIN_FIDELITY_TIMELOCK..=MAX_FIDELITY_TIMELOCK).contains(&fidelity_timelock) {
             log::warn!(
                 "Invalid fidelity_timelock: {} blocks. Accepted range is [{}-{}] blocks.",
@@ -450,9 +452,10 @@ impl MakerServerConfig {
         }
 
         let fidelity_feerate = parse_field(
-            config_map.get("fidelity_feerate"),
+            &config_map,
+            "fidelity_feerate",
             default_config.fidelity_feerate,
-        );
+        )?;
         // Non-finite values (TOML allows `nan`/`inf`) bypass a `<` comparison,
         // so they must be filtered out explicitly; rates below the relay floor
         // would not propagate.
@@ -469,17 +472,19 @@ impl MakerServerConfig {
             MIN_RELAY_FEE_RATE
         };
 
-        let name = parse_field(config_map.get("name"), default_config.name);
+        let name = parse_field(&config_map, "name", default_config.name)?;
         check_maker_name(&name).map_err(WalletError::General)?;
 
         let amount_relative_fee_pct = parse_field(
-            config_map.get("amount_relative_fee_pct"),
+            &config_map,
+            "amount_relative_fee_pct",
             default_config.amount_relative_fee_pct,
-        );
+        )?;
         let time_relative_fee_pct = parse_field(
-            config_map.get("time_relative_fee_pct"),
+            &config_map,
+            "time_relative_fee_pct",
             default_config.time_relative_fee_pct,
-        );
+        )?;
         check_fee_pcts(amount_relative_fee_pct, time_relative_fee_pct)
             .map_err(WalletError::General)?;
 
@@ -490,29 +495,32 @@ impl MakerServerConfig {
             .and_then(|value| value.parse::<Network>().ok());
 
         Ok(MakerServerConfig {
-            network_port: parse_field(config_map.get("network_port"), default_config.network_port),
-            rpc_port: parse_field(config_map.get("rpc_port"), default_config.rpc_port),
-            base_fee: parse_field(config_map.get("base_fee"), default_config.base_fee),
+            network_port: parse_field(&config_map, "network_port", default_config.network_port)?,
+            rpc_port: parse_field(&config_map, "rpc_port", default_config.rpc_port)?,
+            base_fee: parse_field(&config_map, "base_fee", default_config.base_fee)?,
             amount_relative_fee_pct,
             time_relative_fee_pct,
             required_confirms: parse_field(
-                config_map.get("required_confirms"),
+                &config_map,
+                "required_confirms",
                 default_config.required_confirms,
-            ),
+            )?,
             check_blocklist: parse_field(
-                config_map.get("check_blocklist"),
+                &config_map,
+                "check_blocklist",
                 default_config.check_blocklist,
-            ),
+            )?,
             require_features: parse_require_features(config_map.get("require_features"))?,
             fidelity_amount,
             fidelity_timelock,
             fidelity_feerate,
-            control_port: parse_field(config_map.get("control_port"), default_config.control_port),
-            socks_port: parse_field(config_map.get("socks_port"), default_config.socks_port),
+            control_port: parse_field(&config_map, "control_port", default_config.control_port)?,
+            socks_port: parse_field(&config_map, "socks_port", default_config.socks_port)?,
             tor_auth_password: parse_field(
-                config_map.get("tor_auth_password"),
+                &config_map,
+                "tor_auth_password",
                 default_config.tor_auth_password,
-            ),
+            )?,
             name,
             ldk_server_url: config_map.get("ldk_server_url").cloned(),
             ldk_api_key_path: config_map.get("ldk_api_key_path").cloned(),
@@ -4236,6 +4244,87 @@ pub(crate) mod tests {
                 .fidelity_amount,
             MIN_FIDELITY_BOND_AMOUNT_SATS * 50
         );
+    }
+
+    /// A value the parser cannot read stops startup. It must not become the
+    /// default, which would silently change a fee or safety setting.
+    #[test]
+    fn maker_config_refuses_values_it_cannot_read() {
+        let timelock = if cfg!(feature = "integration-test") {
+            950
+        } else {
+            15_000
+        };
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let load = |line: &str| {
+            std::fs::write(&path, format!("fidelity_timelock = {timelock}\n{line}\n")).unwrap();
+            MakerServerConfig::new(Some(&path))
+        };
+
+        for line in [
+            "network_port = 6102 # tor",
+            "rpc_port = 70000",
+            "socks_port = 9150 # tor browser",
+            "control_port = nine",
+            "base_fee = 1000 # sats",
+            "base_fee = 1_000",
+            "required_confirms = 3 # safer",
+            "check_blocklist = True",
+            "fidelity_amount = 1_000_000",
+            "fidelity_timelock = 20_000",
+            "fidelity_feerate = 5 sat",
+            "amount_relative_fee_pct = 0,5",
+            "time_relative_fee_pct = 0.1 # per block",
+        ] {
+            let key = line.split(' ').next().unwrap();
+            let error = load(line).unwrap_err().to_string();
+            assert!(error.contains(key), "{}: {}", line, error);
+        }
+
+        // The same keys with readable values load as written.
+        let config = load(
+            "network_port = 6200\nrpc_port = 6201\nsocks_port = 9150\ncontrol_port = 9151\n\
+             base_fee = 1000\nrequired_confirms = 3\ncheck_blocklist = true\n\
+             fidelity_amount = 1000000\nfidelity_feerate = 5\n\
+             amount_relative_fee_pct = 0.5\ntime_relative_fee_pct = 0.1\nname = \"My Maker\"",
+        )
+        .unwrap();
+        assert_eq!((config.network_port, config.rpc_port), (6200, 6201));
+        assert_eq!((config.socks_port, config.control_port), (9150, 9151));
+        assert_eq!((config.base_fee, config.required_confirms), (1000, 3));
+        assert!(config.check_blocklist);
+        assert_eq!(config.fidelity_amount, 1_000_000);
+        assert_eq!(config.fidelity_feerate, 5.0);
+        assert_eq!(config.amount_relative_fee_pct, 0.5);
+        assert_eq!(config.time_relative_fee_pct, 0.1);
+        assert_eq!(config.name, "My Maker");
+    }
+
+    /// The config that `docker-compose.yml` writes from its defaults.
+    #[test]
+    fn maker_config_reads_the_docker_compose_config() {
+        let timelock = if cfg!(feature = "integration-test") {
+            950
+        } else {
+            13_104
+        };
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "network_port = 6102\nrpc_port = 6103\nsocks_port = 9050\n\
+                 control_port = 9051\ntor_auth_password = \"\"\n\
+                 fidelity_amount = 50000\nfidelity_timelock = {timelock}\n\
+                 base_fee = 500\namount_relative_fee_pct = 0.0025\n\
+                 time_relative_fee_pct = 0.0001\n"
+            ),
+        )
+        .unwrap();
+        let config = MakerServerConfig::new(Some(&path)).unwrap();
+        assert_eq!(config.fidelity_amount, 50_000);
+        assert_eq!(config.base_fee, 500);
     }
 
     #[test]

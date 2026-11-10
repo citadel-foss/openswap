@@ -31,6 +31,8 @@ openswap maker::api::tests::init_rejects_zero_required_confirms
 openswap maker::api::tests::maker_config_checks_file_values
 openswap maker::api::tests::maker_config_debug_hides_wallet_password
 openswap maker::api::tests::maker_config_network_round_trips_only_once_confirmed
+openswap maker::api::tests::maker_config_reads_the_docker_compose_config
+openswap maker::api::tests::maker_config_refuses_values_it_cannot_read
 openswap maker::api::tests::maker_config_rejects_fidelity_amount_below_the_discovery_floor
 openswap maker::api::tests::maker_init_refuses_bad_fee_pcts
 openswap maker::api::tests::shutdown_join_releases_pool_lock_and_drains_late_child
@@ -153,6 +155,7 @@ openswap taker::config::tests::test_incorrect_data_type
 openswap taker::config::tests::test_missing_fields
 openswap taker::config::tests::test_missing_file
 openswap taker::config::tests::test_valid_config
+openswap taker::config::tests::unreadable_values_are_refused
 openswap taker::offers::tests::a_ban_is_never_pruned_or_polled
 openswap taker::offers::tests::a_ban_is_terminal_and_persists
 openswap taker::offers::tests::a_ban_is_visible_by_address_wherever_it_sits
@@ -215,6 +218,8 @@ openswap utill::tests::compat_set_config_key_preserves_unchanged_bytes
 openswap utill::tests::compat_set_config_key_replaces_stale_files_and_symlinks
 openswap utill::tests::fee_at_rate_sats_rounds_fractional_rates_up
 openswap utill::tests::list_values_parse_only_on_one_well_formed_line
+openswap utill::tests::parse_field_refuses_a_value_it_cannot_read
+openswap utill::tests::parse_field_uses_the_default_only_for_a_missing_key
 openswap utill::tests::password_file_drops_one_trailing_newline
 openswap utill::tests::set_config_key_touches_only_its_line
 openswap utill::tests::test_generate_maker_keys
