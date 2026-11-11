@@ -3001,6 +3001,7 @@ fn handler_records_confirmation_height(
             behavior = MakerBehavior::FailFundingHeightLookup,
             expected_error = "funding height lookup failed",
             preimage = Preimage([0xd2; 32]),
+            lookups = 0,
             min_confirmations = 1,
         ),
         /// The handler waits for the funding to confirm, but the block can be
@@ -3010,6 +3011,7 @@ fn handler_records_confirmation_height(
             behavior = MakerBehavior::NoFundingHeight,
             expected_error = "swap-in funding has no confirmation height",
             preimage = Preimage([0xd3; 32]),
+            lookups = 0,
             min_confirmations = 1,
         ),
         /// A reorg can drop the funding's block after the confirmation wait,
@@ -3019,6 +3021,7 @@ fn handler_records_confirmation_height(
             behavior = MakerBehavior::FundingReminedAtTip,
             expected_error = "swap-in funding has fewer confirmations than the swap requires",
             preimage = Preimage([0xd5; 32]),
+            lookups = 2,
             min_confirmations = 2,
         ),
         /// Shutdown stops the watcher. A handler rereading a missing height
@@ -3027,6 +3030,16 @@ fn handler_records_confirmation_height(
             behavior = MakerBehavior::ShutdownDuringFundingHeightRetry,
             expected_error = "Shutdown",
             preimage = Preimage([0xd6; 32]),
+            lookups = 1,
+            min_confirmations = 1,
+        ),
+        /// Shutdown can also arrive during the pause before a reread. The
+        /// handler must check again after the pause and stop without reading.
+        swap_in_funded_handler_stops_on_shutdown_during_height_pause(
+            behavior = MakerBehavior::ShutdownDuringFundingHeightPause,
+            expected_error = "Shutdown",
+            preimage = Preimage([0xd7; 32]),
+            lookups = 1,
             min_confirmations = 1,
         ),
     ],
@@ -3036,6 +3049,7 @@ fn handler_stops_without_funding_height(
     ln: Arc<MockLightningBackend>,
     expected_error: &str,
     preimage: Preimage,
+    lookups: u32,
     min_confirmations: u32,
 ) {
     let taker_ln = MockLightningBackend::new();
@@ -3068,6 +3082,11 @@ fn handler_stops_without_funding_height(
         ln.last_pay_cltv_bound(),
         None,
         "the handler paid without a funding height"
+    );
+    assert_eq!(
+        maker.funding_height_lookups.load(Relaxed),
+        lookups,
+        "the handler made an unexpected number of funding height lookups"
     );
     let kept = maker
         .get_ln_swap(&swap_id)
