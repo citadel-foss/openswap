@@ -5,7 +5,7 @@ use std::{
     io::{ErrorKind, Read},
     net::{Ipv4Addr, TcpListener, TcpStream},
     sync::{
-        atomic::Ordering::{self, Relaxed, Release},
+        atomic::Ordering::{self, Relaxed},
         Arc, Mutex, MutexGuard,
     },
     thread::{self, sleep},
@@ -385,7 +385,9 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     }
 
     if listener.is_some() {
-        maker.is_setup_complete.store(true, Release);
+        maker.is_setup_complete.store(true, Relaxed);
+        #[cfg(feature = "integration-test")]
+        maker.is_setup_complete.store(true, Ordering::Release);
         log::info!(
             "[{}] Server setup complete! Listening on port {}",
             maker.config.network_port,

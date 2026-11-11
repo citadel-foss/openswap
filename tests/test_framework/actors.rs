@@ -3,10 +3,7 @@
 use bitcoin::Amount;
 use std::{
     sync::{
-        atomic::{
-            fence,
-            Ordering::{Acquire, Relaxed},
-        },
+        atomic::Ordering::{Acquire, Relaxed},
         Arc,
     },
     thread::{self, JoinHandle},
@@ -23,6 +20,8 @@ use openswap::{
 
 use super::procs::bitcoind::{generate_blocks, send_to_address};
 
+use super::wait::POLL;
+
 /// Wait for all makers to complete setup, with a timeout.
 ///
 /// Panics if any maker's `is_setup_complete` flag doesn't become true within `timeout_secs`.
@@ -34,16 +33,15 @@ pub fn wait_for_makers_setup(makers: &[Arc<MakerServer>], timeout_secs: u64) {
         if !maker.is_setup_complete.load(Relaxed) {
             log::info!("Waiting for maker {} setup completion", i);
         }
-        while !maker.is_setup_complete.load(Relaxed) {
+        while !maker.is_setup_complete.load(Acquire) {
             if start.elapsed() > timeout {
                 panic!(
                     "Maker {} did not complete setup within {} seconds",
                     i, timeout_secs
                 );
             }
-            std::hint::spin_loop();
+            thread::sleep(POLL);
         }
-        fence(Acquire);
     }
 }
 
