@@ -75,7 +75,7 @@ Not claiming keeps the preimage private, so the maker can never settle the Light
 | More than 25 inputs, list not empty | Refused without screening |
 | Previous output cannot be resolved | Refused |
 | List empty | Returns without querying the node |
-| Entry's address encodes a different network | Skipped, with address and reason recorded |
+| Entry's address encodes a different network | Skipped, with address and reason recorded; adding or removing an address keeps it in the file |
 | All entries skipped | List behaves as empty |
 
 The input bound exists because each input costs one query against the participant's own node, and the transaction originates with the counterparty.
