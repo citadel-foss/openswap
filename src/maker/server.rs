@@ -374,22 +374,24 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     // either, for the same reason as Tor above: a bond setting the wallet
     // cannot use, or a backend error that outlasts its retries, would shut
     // down the recovery already running. The maker runs recovery-only.
-    let maker_address = match maker_address {
+    let (maker_address, setup_error) = match maker_address {
         Some(maker_address) => match prepare_for_swaps(&maker, &maker_address) {
-            Ok(()) => Some(maker_address),
+            Ok(()) => (Some(maker_address), None),
             Err(e) if e.is_shutdown() => return Err(e),
-            Err(e) => {
-                log::error!(
-                    "[{}] {:?}; recovery-only mode: not ready for new swaps, fix the cause and restart makerd to take swaps again",
-                    maker.config.network_port,
-                    e
-                );
-                None
-            }
+            Err(e) => (None, Some(e)),
         },
-        None => None,
+        None => (None, None),
     };
+    // Close the port before saying so: once this line is out, the maker must
+    // already refuse connections.
     let listener = listener.filter(|_| maker_address.is_some());
+    if let Some(e) = setup_error {
+        log::error!(
+            "[{}] {:?}; recovery-only mode: not ready for new swaps, fix the cause and restart makerd to take swaps again",
+            maker.config.network_port,
+            e
+        );
+    }
 
     {
         let wallet = lock_debug!(maker.wallet.read())
