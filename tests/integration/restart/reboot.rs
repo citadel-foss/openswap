@@ -38,6 +38,8 @@ pub(crate) enum Restart {
     WatcherDown,
     /// With fee settings no swap can pay, so it starts recovery-only.
     UnpriceableFees,
+    /// With fidelity bond setup failing, so it starts recovery-only.
+    BondSetupFails,
 }
 
 /// Test: maker reboot recovery preserves funded Taproot swapcoins. Maker2 funds
@@ -111,6 +113,9 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart
     if restart == Restart::WatcherDown {
         restarted_server.behavior = MakerBehavior::StopWatcherOnStartup;
     }
+    if restart == Restart::BondSetupFails {
+        restarted_server.behavior = MakerBehavior::FailFidelitySetup;
+    }
     world.adopt_makers([Arc::new(restarted_server)]);
     world.spawn_makers();
 
@@ -169,6 +174,13 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart
                 Duration::from_secs(120)
             );
         }
+        if restart == Restart::BondSetupFails {
+            wait_logged!(
+                world,
+                "recovery-only mode: not ready for new swaps",
+                Duration::from_secs(120)
+            );
+        }
         assert!(
             TcpStream::connect(("127.0.0.1", restarted.config.network_port)).is_err(),
             "recovery-only maker must not accept swap connections"
@@ -222,6 +234,20 @@ fn taproot_maker_reboot_preserves_funded_swapcoins(world: &mut World, params: Sw
 )]
 fn maker_restart_with_unpriceable_fees_still_recovers(world: &mut World, params: SwapParams) {
     run_reboot_recovery(world, params, Restart::UnpriceableFees);
+}
+
+/// Test: a maker whose fidelity bond setup fails on restart still recovers the
+/// funded swap it left behind. The failure comes after recovery has started,
+/// so failing startup would shut that recovery down; it serves recovery-only.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtPrivateKeyHandover],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn maker_restart_with_failing_bond_setup_still_recovers(world: &mut World, params: SwapParams) {
+    run_reboot_recovery(world, params, Restart::BondSetupFails);
 }
 
 /// Test: everyone in the route crashes with funding on chain, then each restarts
