@@ -884,7 +884,7 @@ fn read_funding_height<M: Maker>(maker: &Arc<M>, txid: &bitcoin::Txid) -> Result
                 "[{}] Swap-in funding {txid} has no confirmation height yet; reading again",
                 maker.network_port()
             );
-            std::thread::sleep(FUNDING_HEIGHT_RETRY);
+            maker.pause_before_height_reread(FUNDING_HEIGHT_RETRY);
             // A shutdown during the pause has stopped the watcher, so a height
             // read now would let the handler store InPaid with no watch.
             if maker.shutdown_requested() {

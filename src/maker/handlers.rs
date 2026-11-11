@@ -176,8 +176,8 @@ pub enum MakerBehavior {
     /// reread meets the shutdown.
     ShutdownDuringFundingHeightRetry,
     /// Answer the first lookup of a Lightning HTLC funding's confirmation
-    /// height with no height, and request shutdown a second later, inside the
-    /// handler's pause before it reads again.
+    /// height with no height, and request shutdown inside the handler's pause
+    /// before it reads again.
     ShutdownDuringFundingHeightPause,
 }
 
@@ -844,6 +844,13 @@ pub trait Maker: Send + Sync {
     #[cfg(feature = "lightning")]
     fn shutdown_requested(&self) -> bool {
         false
+    }
+
+    /// Pauses `duration` before a swap-in handler reads a missing funding
+    /// height again.
+    #[cfg(feature = "lightning")]
+    fn pause_before_height_reread(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
     }
 }
 

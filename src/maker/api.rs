@@ -3779,39 +3779,32 @@ impl MakerTrait for MakerServer {
     fn tx_confirmation_height(&self, txid: &bitcoin::Txid) -> Result<Option<u32>, MakerError> {
         use crate::wallet::Blockchain;
         #[cfg(feature = "integration-test")]
-        match self.behavior() {
-            MakerBehavior::FailFundingHeightLookup => {
-                return Err(MakerError::General("Test: funding height lookup failed"))
-            }
-            MakerBehavior::NoFundingHeight => return Ok(None),
-            MakerBehavior::FundingHeightLagsOnce
-            | MakerBehavior::FundingReminedAtTip
-            | MakerBehavior::ShutdownDuringFundingHeightRetry
-            | MakerBehavior::ShutdownDuringFundingHeightPause
-                if self
-                    .funding_height_lookups
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    == 0 =>
-            {
-                if self.behavior == MakerBehavior::ShutdownDuringFundingHeightRetry {
+        {
+            let earlier = self
+                .funding_height_lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match self.behavior() {
+                MakerBehavior::FailFundingHeightLookup => {
+                    return Err(MakerError::General("Test: funding height lookup failed"))
+                }
+                MakerBehavior::NoFundingHeight => return Ok(None),
+                MakerBehavior::ShutdownDuringFundingHeightRetry if earlier == 0 => {
                     self.shutdown
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(None);
                 }
-                if self.behavior == MakerBehavior::ShutdownDuringFundingHeightPause {
-                    let requested = Arc::clone(&self.shutdown.requested);
-                    let backend = self.shutdown.backend_flag();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        requested.store(true, std::sync::atomic::Ordering::Relaxed);
-                        backend.store(true, std::sync::atomic::Ordering::Relaxed);
-                    });
+                MakerBehavior::FundingHeightLagsOnce
+                | MakerBehavior::FundingReminedAtTip
+                | MakerBehavior::ShutdownDuringFundingHeightPause
+                    if earlier == 0 =>
+                {
+                    return Ok(None)
                 }
-                return Ok(None);
+                MakerBehavior::FundingReminedAtTip => {
+                    return Ok(Some(self.get_current_height()?));
+                }
+                _ => {}
             }
-            MakerBehavior::FundingReminedAtTip => {
-                return Ok(Some(self.get_current_height()?));
-            }
-            _ => {}
         }
         let height = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -3965,6 +3958,17 @@ impl MakerTrait for MakerServer {
     #[cfg(feature = "lightning")]
     fn shutdown_requested(&self) -> bool {
         self.is_shutdown()
+    }
+
+    #[cfg(feature = "lightning")]
+    fn pause_before_height_reread(&self, duration: Duration) {
+        std::thread::sleep(duration);
+        // Inside the pause, after the handler's check before it.
+        #[cfg(feature = "integration-test")]
+        if self.behavior == MakerBehavior::ShutdownDuringFundingHeightPause {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

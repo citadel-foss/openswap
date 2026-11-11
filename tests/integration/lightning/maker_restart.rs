@@ -3001,7 +3001,7 @@ fn handler_records_confirmation_height(
             behavior = MakerBehavior::FailFundingHeightLookup,
             expected_error = "funding height lookup failed",
             preimage = Preimage([0xd2; 32]),
-            lookups = 0,
+            lookups = 1,
             min_confirmations = 1,
         ),
         /// The handler waits for the funding to confirm, but the block can be
@@ -3011,7 +3011,7 @@ fn handler_records_confirmation_height(
             behavior = MakerBehavior::NoFundingHeight,
             expected_error = "swap-in funding has no confirmation height",
             preimage = Preimage([0xd3; 32]),
-            lookups = 0,
+            lookups = 4,
             min_confirmations = 1,
         ),
         /// A reorg can drop the funding's block after the confirmation wait,
