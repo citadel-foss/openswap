@@ -91,10 +91,14 @@ openswap maker::legacy_verification::tests::normal_locktime_is_accepted
 openswap maker::lightning_handlers::tests::compat_lightning_pins_require_exact_direction_and_requirements
 openswap maker::lightning_handlers::tests::directions_are_bounded_by_opposite_channel_sides
 openswap maker::lightning_handlers::tests::only_a_rejection_leaves_the_connection_unpromoted
+openswap maker::lightning_handlers::tests::only_the_recorded_refund_is_ours
 openswap maker::lightning_handlers::tests::persisted_record_survives_serialization_and_still_spends
+openswap maker::lightning_handlers::tests::recorded_spend_stays_spent
+openswap maker::lightning_handlers::tests::refund_waits_for_the_chain_to_say_unspent
 openswap maker::lightning_handlers::tests::unfunded_record_round_trips_without_funding
 openswap maker::lightning_handlers::tests::unusable_channels_and_dust_capacity_disable_a_direction
 openswap maker::lightning_handlers::tests::wallet_caps_only_the_swap_out_direction
+openswap maker::lightning_handlers::tests::watched_htlc_without_a_spend_is_unspent
 openswap maker::nostr::tests::compat_nostr_kinds_are_frozen_and_separate_from_v023
 openswap maker::rpc::messages::tests::no_rpc_variant_carries_the_seed
 openswap maker::rpc::server::tests::compat_rpc_old_requests_and_future_envelope_fields_keep_working
@@ -202,9 +206,9 @@ openswap taker::config::tests::test_incorrect_data_type
 openswap taker::config::tests::test_missing_fields
 openswap taker::config::tests::test_missing_file
 openswap taker::config::tests::test_valid_config
+openswap taker::config::tests::unreadable_values_are_refused
 openswap taker::lightning_swap::tests::cltv_delta_above_u16_is_rejected_not_truncated
 openswap taker::lightning_swap::tests::oversized_amounts_are_rejected_not_wrapped
-openswap taker::config::tests::unreadable_values_are_refused
 openswap taker::offers::tests::a_ban_is_never_pruned_or_polled
 openswap taker::offers::tests::a_ban_is_terminal_and_persists
 openswap taker::offers::tests::a_ban_is_visible_by_address_wherever_it_sits
@@ -685,6 +689,9 @@ openswap::integration lightning::e2e::lightning_swap_in_refuses_blocklisted_fund
 openswap::integration lightning::e2e::lightning_swap_out_refuses_blocklisted_funding
 openswap::integration lightning::maker_restart::conditional_paid_store_refuses_stale_copy
 openswap::integration lightning::maker_restart::forged_swap_in_funding_keeps_accepted_swap
+openswap::integration lightning::maker_restart::lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen
+openswap::integration lightning::maker_restart::lightning_maker_rebroadcasts_an_evicted_refund
+openswap::integration lightning::maker_restart::lightning_maker_restart_recovers_an_interrupted_refund
 openswap::integration lightning::maker_restart::lightning_maker_restart_recovers_funded_swap
 openswap::integration lightning::maker_restart::lightning_maker_restart_refunds_unclaimed_swap_out
 openswap::integration lightning::maker_restart::restarted_watchdog_follows_payment_of_swap_in_missing_funding_height
@@ -698,6 +705,7 @@ openswap::integration lightning::maker_restart::swap_in_funded_handler_yields_to
 openswap::integration lightning::maker_restart::swap_in_request_checks_terms_and_invoice_before_payment_record_lookup
 openswap::integration lightning::maker_restart::swap_in_request_fails_when_payment_record_lookup_fails
 openswap::integration lightning::maker_restart::swap_in_request_refuses_payment_hash_already_on_record
+openswap::integration lightning::maker_restart::switch_resets_on_panic
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_funding_height_is_unknown
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_payment_is_in_flight
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_without_payment_record_until_refunded
