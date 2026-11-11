@@ -3814,6 +3814,7 @@ impl MakerTrait for MakerServer {
             MakerBehavior::FundingHeightLagsOnce
             | MakerBehavior::FundingReminedAtTip
             | MakerBehavior::ShutdownDuringFundingHeightRetry
+            | MakerBehavior::ShutdownDuringFundingHeightPause
                 if self
                     .funding_height_lookups
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -3822,6 +3823,15 @@ impl MakerTrait for MakerServer {
                 if self.behavior == MakerBehavior::ShutdownDuringFundingHeightRetry {
                     self.shutdown
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if self.behavior == MakerBehavior::ShutdownDuringFundingHeightPause {
+                    let requested = Arc::clone(&self.shutdown.requested);
+                    let backend = self.shutdown.backend_flag();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                        backend.store(true, std::sync::atomic::Ordering::Relaxed);
+                    });
                 }
                 return Ok(None);
             }
