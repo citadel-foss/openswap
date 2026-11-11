@@ -705,6 +705,58 @@ mod tests {
     }
 
     #[test]
+    fn answers_read_without_the_wallet_settle_only_returned_sends() {
+        use crate::wallet::{api::test_support::test_wallet, AddressType, UTXOSpendInfo};
+        use bitcoin::{hashes::Hash, ScriptBuf, Txid};
+        use std::collections::HashSet;
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let outpoint = |n: u8| OutPoint::new(Txid::from_byte_array([n; 32]), 0);
+        let cache = |wallet: &mut Wallet, n: u8| {
+            let entry = ListUnspentResultEntry {
+                txid: outpoint(n).txid,
+                vout: 0,
+                address: None,
+                label: None,
+                redeem_script: None,
+                witness_script: None,
+                script_pub_key: ScriptBuf::new(),
+                amount: sats(100_000),
+                confirmations: 1,
+                spendable: true,
+                solvable: true,
+                descriptor: None,
+                safe: true,
+            };
+            let info = UTXOSpendInfo::SeedCoin {
+                path: "m/84'/1'/0'/0/0".to_string(),
+                input_value: sats(100_000),
+                address_type: AddressType::P2WPKH,
+            };
+            wallet.store.utxo_cache.insert(outpoint(n), (entry, info));
+        };
+        let (returned, in_flight) = (
+            Txid::from_byte_array([8; 32]),
+            Txid::from_byte_array([9; 32]),
+        );
+        cache(&mut wallet, 1);
+        cache(&mut wallet, 2);
+        cache(&mut wallet, 3);
+        wallet.hold_for_send(&[outpoint(1), outpoint(2)], returned);
+        wallet.broadcast_returned(&returned);
+        wallet.hold_for_send(&[outpoint(3)], in_flight);
+
+        // One probe per returned send, none for one still broadcasting.
+        assert_eq!(wallet.sends_to_probe(), vec![returned]);
+
+        // Answers gathered outside the wallet cannot free a send still in
+        // flight, even if the backend called it unknown.
+        wallet.settle_sends(&HashSet::from([returned, in_flight]));
+        assert_eq!(wallet.list_lock_unspent(), vec![outpoint(3)]);
+    }
+
+    #[test]
     fn exact_spend_refuses_outputs_above_the_spend() {
         let result = exact_spend_change(sats(10_000), sats(9_001), sats(9_000));
         assert!(matches!(result, Err(WalletError::General(e)) if e.contains("exceed")));

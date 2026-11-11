@@ -2523,19 +2523,45 @@ impl Wallet {
     /// A send whose broadcast has not returned is only ever released by the
     /// first rule; see [`Wallet::broadcast_returned`].
     pub(crate) fn release_settled_sends(&mut self) {
+        let unknown: HashSet<Txid> = self
+            .sends_to_probe()
+            .into_iter()
+            .filter(|txid| matches!(self.blockchain.is_tx_unknown(txid), Ok(true)))
+            .collect();
+        self.settle_sends(&unknown);
+    }
+
+    /// The held sends whose release needs the backend's answer: broadcast
+    /// returned, and some input still cached. Each once, however many inputs.
+    /// A caller can ask the backend about these without holding the wallet,
+    /// then pass the unknown ones to [`Wallet::settle_sends`].
+    pub(crate) fn sends_to_probe(&self) -> Vec<Txid> {
+        let mut txids: Vec<Txid> = self
+            .pending_sends
+            .iter()
+            .filter(|(outpoint, txid)| {
+                self.store.utxo_cache.contains_key(outpoint)
+                    && !self.sends_in_flight.contains(*txid)
+            })
+            .map(|(_, txid)| *txid)
+            .collect();
+        txids.sort();
+        txids.dedup();
+        txids
+    }
+
+    /// Release held send inputs by the rules of
+    /// [`Wallet::release_settled_sends`], with `unknown` the sends the backend
+    /// reported unknown. Rechecks each hold, so answers read without the
+    /// wallet held cannot free a send whose broadcast has not returned.
+    pub(crate) fn settle_sends(&mut self, unknown: &HashSet<Txid>) {
         let held: Vec<(OutPoint, Txid)> =
             self.pending_sends.iter().map(|(o, t)| (*o, *t)).collect();
-        // One backend query per send, not per input.
-        let mut unknown = HashMap::<Txid, bool>::new();
         for (outpoint, txid) in held {
             let settled = send_input_settled(
                 self.store.utxo_cache.contains_key(&outpoint),
                 self.sends_in_flight.contains(&txid),
-                || {
-                    *unknown
-                        .entry(txid)
-                        .or_insert_with(|| matches!(self.blockchain.is_tx_unknown(&txid), Ok(true)))
-                },
+                || unknown.contains(&txid),
             );
             if settled {
                 self.pending_sends.remove(&outpoint);
