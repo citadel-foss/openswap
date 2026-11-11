@@ -275,10 +275,23 @@ fn handle_request<M: MakerRpc>(
                 // tx unknown may free them, and only once the broadcast returned.
                 let sent = lock_debug!(maker.wallet().read())?.send_tx(&tx);
                 lock_debug!(maker.wallet().write())?.broadcast_returned(&tx.compute_txid());
-                let txid = sent?;
 
+                // Sync after a failed broadcast too: an idle maker may run no
+                // other sync, and only a sync can free the held inputs.
                 log::info!("Sync at:----handle_request----");
-                lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;
+                let synced = lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown());
+                let txid = match (sent, synced) {
+                    (Err(e), synced) => {
+                        if let Err(sync_err) = synced {
+                            log::warn!("Sync after a failed send-to-address failed: {sync_err:?}");
+                        }
+                        return Err(e.into());
+                    }
+                    (Ok(txid), synced) => {
+                        synced?;
+                        txid
+                    }
+                };
 
                 RpcMsgResp::SendToAddressResp(txid.to_string())
             }

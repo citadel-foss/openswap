@@ -691,6 +691,9 @@ mod tests {
         // backend cannot say whether the send is known, as a lagging one can't.
         wallet.store.utxo_cache.insert(outpoint(2), (entry, info));
         wallet.hold_for_send(&[outpoint(1), outpoint(2)], send);
+        // Past the broadcast, so the cached coin reaches the backend query,
+        // whose failure must keep it held.
+        wallet.broadcast_returned(&send);
 
         wallet.release_settled_sends();
         assert!(!wallet.pending_sends.contains_key(&outpoint(1)));
