@@ -1389,6 +1389,11 @@ impl MakerServer {
     pub fn setup_fidelity_bond(&self, maker_address: &str) -> Result<FidelityProof, MakerError> {
         use bitcoin::absolute::LockTime;
 
+        #[cfg(feature = "integration-test")]
+        if self.behavior == super::handlers::MakerBehavior::FailFidelitySetup {
+            return Err(MakerError::General("Test: fidelity bond setup failed"));
+        }
+
         // Adopt any bond that was broadcast but not yet confirmed (e.g. the
         // maker shut down while waiting for confirmation) before deciding
         // whether a new bond is needed.

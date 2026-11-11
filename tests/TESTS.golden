@@ -772,6 +772,7 @@ openswap::integration restart::legacy_reboot::maker_reboot_preserves_funded_swap
 openswap::integration restart::reboot::legacy_electrum_crash_after_contract_exchange
 openswap::integration restart::reboot::legacy_electrum_maker_settles_an_incoming_its_own_sweep_spent
 openswap::integration restart::reboot::legacy_electrum_restart_rebuilds_watches
+openswap::integration restart::reboot::maker_restart_with_failing_bond_setup_still_recovers
 openswap::integration restart::reboot::maker_restart_with_unpriceable_fees_still_recovers
 openswap::integration restart::reboot::orphan_reservation_is_released_on_restart
 openswap::integration restart::reboot::reservations_survive_a_maker_restart
