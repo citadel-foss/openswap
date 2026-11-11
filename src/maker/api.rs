@@ -1628,6 +1628,11 @@ impl MakerServer {
     pub fn check_swap_liquidity(&self) -> Result<(), MakerError> {
         const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
+        #[cfg(feature = "integration-test")]
+        if self.behavior == super::handlers::MakerBehavior::FailSwapLiquidityCheck {
+            return Err(MakerError::General("Test: swap liquidity check failed"));
+        }
+
         let addr = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
             .get_next_external_address(AddressType::P2TR)
