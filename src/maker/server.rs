@@ -1013,12 +1013,31 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             maker.thread_pool.add_thread(handle)?;
         }
 
+        settle_held_sends(&maker);
+
         if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
             break;
         }
     }
 
     Ok(())
+}
+
+/// A direct send whose broadcast failed keeps its inputs held until a pass
+/// finds the send unknown, and an idle maker runs no sync to make that pass.
+/// One here per heartbeat while any send is held, asking the backend once per
+/// send, frees them once the backend answers again.
+fn settle_held_sends(maker: &MakerServer) {
+    let held = match lock_debug!(maker.wallet.read()) {
+        Ok(wallet) => wallet.has_held_sends(),
+        Err(_) => return,
+    };
+    if !held {
+        return;
+    }
+    if let Ok(mut wallet) = lock_debug!(maker.wallet.write()) {
+        wallet.release_settled_sends();
+    }
 }
 
 /// Periodically check for expired fidelity bonds and renew them.

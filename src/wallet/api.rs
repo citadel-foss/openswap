@@ -2498,6 +2498,11 @@ impl Wallet {
         self.sends_in_flight.insert(txid);
     }
 
+    /// Whether any direct send still holds its inputs.
+    pub(crate) fn has_held_sends(&self) -> bool {
+        !self.pending_sends.is_empty()
+    }
+
     /// Mark the broadcast of a held send as returned, whether it succeeded or
     /// failed. From then on a sync that finds the tx unknown may free its
     /// inputs; before, the tx is unknown only because it was not sent yet.
