@@ -2538,8 +2538,10 @@ impl Wallet {
         }
     }
 
-    /// Outpoints currently held in the wallet-side lock set (see
-    /// [`Wallet::locked_utxos`]).
+    /// Outpoints kept out of coin selection: the wallet-side lock set (see
+    /// [`Wallet::locked_utxos`]), which [`Wallet::lock_unspendable_utxos`]
+    /// rebuilds, and the inputs of held direct sends (see
+    /// [`Wallet::pending_sends`]), which only a settling sync releases.
     pub(crate) fn list_lock_unspent(&self) -> Vec<OutPoint> {
         self.locked_utxos
             .iter()
