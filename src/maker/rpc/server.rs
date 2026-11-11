@@ -276,22 +276,21 @@ fn handle_request<M: MakerRpc>(
                 let sent = lock_debug!(maker.wallet().read())?.send_tx(&tx);
                 lock_debug!(maker.wallet().write())?.broadcast_returned(&tx.compute_txid());
 
-                // Sync after a failed broadcast too: an idle maker may run no
-                // other sync, and only a sync can free the held inputs.
-                log::info!("Sync at:----handle_request----");
-                let synced = lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown());
-                let txid = match (sent, synced) {
-                    (Err(e), synced) => {
-                        if let Err(sync_err) = synced {
-                            log::warn!("Sync after a failed send-to-address failed: {sync_err:?}");
-                        }
+                // A failed broadcast gets no full sync: that one retries until
+                // the backend answers, under the write guard, and an outage is
+                // a likely cause of the failure. One settling pass asks the
+                // backend once per send; if the send proves unknown its inputs
+                // are freed now, otherwise a later sync frees them.
+                let txid = match sent {
+                    Ok(txid) => txid,
+                    Err(e) => {
+                        lock_debug!(maker.wallet().write())?.release_settled_sends();
                         return Err(e.into());
                     }
-                    (Ok(txid), synced) => {
-                        synced?;
-                        txid
-                    }
                 };
+
+                log::info!("Sync at:----handle_request----");
+                lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;
 
                 RpcMsgResp::SendToAddressResp(txid.to_string())
             }
