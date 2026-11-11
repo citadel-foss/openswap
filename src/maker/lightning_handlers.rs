@@ -765,10 +765,25 @@ fn handle_swap_in_funded<M: Maker>(
     // same height dates the window checked here and the one stored, so the
     // two cannot disagree.
     let funding_height = read_funding_height(maker, &funded.outpoint.txid)?;
+    // The confirmation wait counted its confirmations before any reread. A
+    // height read again after a reorg can belong to a block that re-mined the
+    // funding since, with fewer confirmations than the swap requires; a
+    // height above the tip means the backend contradicts itself. Either way
+    // stop unpaid, leaving the swap InAccepted.
+    let tip = maker.get_current_height()?;
+    let Some(age) = tip.checked_sub(funding_height) else {
+        return Err(MakerError::General(
+            "swap-in funding height is above the chain tip",
+        ));
+    };
+    if age + 1 < swap.min_confirmations {
+        return Err(MakerError::General(
+            "swap-in funding has fewer confirmations than the swap requires",
+        ));
+    }
     if !maker.htlc_unspent(&funded.outpoint)? {
         return refuse_swap_in(maker, &funded.swap_id, "funding output is already spent");
     }
-    let age = maker.get_current_height()?.saturating_sub(funding_height);
     let remaining = (swap.locktime as u32).saturating_sub(age);
     if remaining < MIN_REMAINING_LOCKTIME {
         return refuse_swap_in(
@@ -861,20 +876,24 @@ fn handle_swap_in_funded<M: Maker>(
 /// have taken the block away. A failed query or a shutdown stops it at once.
 fn read_funding_height<M: Maker>(maker: &Arc<M>, txid: &bitcoin::Txid) -> Result<u32, MakerError> {
     for read in 1..=FUNDING_HEIGHT_READS {
+        if read > 1 {
+            if maker.shutdown_requested() {
+                return Err(MakerError::Shutdown);
+            }
+            log::info!(
+                "[{}] Swap-in funding {txid} has no confirmation height yet; reading again",
+                maker.network_port()
+            );
+            std::thread::sleep(FUNDING_HEIGHT_RETRY);
+            // A shutdown during the pause has stopped the watcher, so a height
+            // read now would let the handler store InPaid with no watch.
+            if maker.shutdown_requested() {
+                return Err(MakerError::Shutdown);
+            }
+        }
         if let Some(height) = maker.tx_confirmation_height(txid)? {
             return Ok(height);
         }
-        if read == FUNDING_HEIGHT_READS {
-            break;
-        }
-        if maker.shutdown_requested() {
-            return Err(MakerError::Shutdown);
-        }
-        log::info!(
-            "[{}] Swap-in funding {txid} has no confirmation height yet; reading again",
-            maker.network_port()
-        );
-        std::thread::sleep(FUNDING_HEIGHT_RETRY);
     }
     Err(MakerError::General(
         "swap-in funding has no confirmation height",

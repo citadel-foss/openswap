@@ -3001,6 +3001,7 @@ fn handler_records_confirmation_height(
             behavior = MakerBehavior::FailFundingHeightLookup,
             expected_error = "funding height lookup failed",
             preimage = Preimage([0xd2; 32]),
+            min_confirmations = 1,
         ),
         /// The handler waits for the funding to confirm, but the block can be
         /// reorged away before it reads the height. A lookup that answers with
@@ -3009,6 +3010,24 @@ fn handler_records_confirmation_height(
             behavior = MakerBehavior::NoFundingHeight,
             expected_error = "swap-in funding has no confirmation height",
             preimage = Preimage([0xd3; 32]),
+            min_confirmations = 1,
+        ),
+        /// A reorg can drop the funding's block after the confirmation wait,
+        /// and the next block mine it again. The height the handler reads then
+        /// has fewer confirmations than the swap requires, so it must not pay.
+        swap_in_funded_handler_stops_on_a_reorged_shallow_funding(
+            behavior = MakerBehavior::FundingReminedAtTip,
+            expected_error = "swap-in funding has fewer confirmations than the swap requires",
+            preimage = Preimage([0xd5; 32]),
+            min_confirmations = 2,
+        ),
+        /// Shutdown stops the watcher. A handler rereading a missing height
+        /// must stop on it rather than read on and store an unwatched InPaid.
+        swap_in_funded_handler_stops_on_shutdown_during_height_retry(
+            behavior = MakerBehavior::ShutdownDuringFundingHeightRetry,
+            expected_error = "Shutdown",
+            preimage = Preimage([0xd6; 32]),
+            min_confirmations = 1,
         ),
     ],
 )]
@@ -3017,6 +3036,7 @@ fn handler_stops_without_funding_height(
     ln: Arc<MockLightningBackend>,
     expected_error: &str,
     preimage: Preimage,
+    min_confirmations: u32,
 ) {
     let taker_ln = MockLightningBackend::new();
     let framework = world.framework().clone();
@@ -3025,11 +3045,18 @@ fn handler_stops_without_funding_height(
     pause_block_generation(&framework);
 
     let swap_id = preimage.payment_hash().to_string();
-    accept_swap_in(&maker, &taker_ln, &preimage);
+    let request = LnSwapInRequest {
+        min_confirmations,
+        ..swap_in_request(&taker_ln, &preimage)
+    };
+    match expect_ln(send_swap_in_request(&maker, request).unwrap()) {
+        LightningMakerMessage::SwapInAccept(_) => {}
+        other => panic!("expected SwapInAccept, got {}", other),
+    }
     let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
     let value = accepted.amount + accepted.fee;
     let funding = fund_htlc(bitcoind, &accepted);
-    generate_blocks(bitcoind, 1);
+    generate_blocks(bitcoind, min_confirmations as u64);
 
     let result = announce_funding(&maker, &swap_id, funding, value);
     assert!(

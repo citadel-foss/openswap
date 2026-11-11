@@ -3785,12 +3785,21 @@ impl MakerTrait for MakerServer {
             }
             MakerBehavior::NoFundingHeight => return Ok(None),
             MakerBehavior::FundingHeightLagsOnce
+            | MakerBehavior::FundingReminedAtTip
+            | MakerBehavior::ShutdownDuringFundingHeightRetry
                 if self
                     .funding_height_lookups
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     == 0 =>
             {
-                return Ok(None)
+                if self.behavior == MakerBehavior::ShutdownDuringFundingHeightRetry {
+                    self.shutdown
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(None);
+            }
+            MakerBehavior::FundingReminedAtTip => {
+                return Ok(Some(self.get_current_height()?));
             }
             _ => {}
         }

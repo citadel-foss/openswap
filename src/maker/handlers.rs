@@ -167,6 +167,14 @@ pub enum MakerBehavior {
     /// height with no height, then the real one, as a backend that is briefly
     /// behind would (an Electrum failover to a lagging server).
     FundingHeightLagsOnce,
+    /// Answer the first lookup of a Lightning HTLC funding's confirmation
+    /// height with no height, then the chain tip, as after a reorg drops the
+    /// funding's block and the next block mines it again.
+    FundingReminedAtTip,
+    /// Request shutdown on the first lookup of a Lightning HTLC funding's
+    /// confirmation height and answer it with no height, so the handler's
+    /// reread meets the shutdown.
+    ShutdownDuringFundingHeightRetry,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).
