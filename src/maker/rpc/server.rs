@@ -276,18 +276,11 @@ fn handle_request<M: MakerRpc>(
                 let sent = lock_debug!(maker.wallet().read())?.send_tx(&tx);
                 lock_debug!(maker.wallet().write())?.broadcast_returned(&tx.compute_txid());
 
-                // A failed broadcast gets no full sync: that one retries until
-                // the backend answers, under the write guard, and an outage is
-                // a likely cause of the failure. One settling pass asks the
-                // backend once per send; if the send proves unknown its inputs
-                // are freed now, otherwise a later sync frees them.
-                let txid = match sent {
-                    Ok(txid) => txid,
-                    Err(e) => {
-                        lock_debug!(maker.wallet().write())?.release_settled_sends();
-                        return Err(e.into());
-                    }
-                };
+                // A failed broadcast gets no sync here: a full one retries
+                // until the backend answers, under the write guard, and an
+                // outage is a likely cause of the failure. The idle heartbeat
+                // settles the held inputs without holding the wallet.
+                let txid = sent?;
 
                 log::info!("Sync at:----handle_request----");
                 lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;
