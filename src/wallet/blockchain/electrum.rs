@@ -3474,6 +3474,8 @@ pub(crate) mod tests {
         refuse.store(false, Ordering::SeqCst);
         let reconnects = backend.reconnect_count();
         server.hang_up();
+        // The first poll meets the hang-up and rebuilds; the second re-arms there.
+        backend.poll_event();
         backend.poll_event();
         assert_eq!(backend.reconnect_count() - reconnects, 1, "no rebuild");
         assert!(backend.notifier.lock().unwrap().refusals.is_empty());
