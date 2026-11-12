@@ -251,7 +251,7 @@ impl std::fmt::Debug for CoreRPC {
 impl CoreRPC {
     /// Connect an RPC client for the configured wallet endpoint. Cheap — the
     /// client connects lazily on first use. A rescan holds its caller until it
-    /// ends; an owner that shuts down uses [`CoreRPC::with_shutdown_flag`].
+    /// ends; an owner that shuts down uses `with_shutdown_flag`.
     pub fn new(config: &CoreRpcConfig) -> Result<Self, WalletError> {
         Self::with_shutdown_flag(config, Arc::new(AtomicBool::new(false)))
     }
@@ -471,8 +471,8 @@ impl CoreRPC {
             ));
         }
 
-        // The node's own list of ZMQ publishers must carry both topics we
-        // subscribe to, on the endpoint we subscribe to.
+        // One SUB socket receives both topics, so Core must publish them on a
+        // shared endpoint. One that differs from --zmq only warns, below.
         #[derive(Deserialize)]
         struct ZmqNotification {
             #[serde(rename = "type")]
