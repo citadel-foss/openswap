@@ -392,6 +392,7 @@ openswap wallet::blockchain::electrum::tests::clearnet_default_has_no_proxy
 openswap wallet::blockchain::electrum::tests::endpoint_credentials_are_omitted_from_connection_logs
 openswap wallet::blockchain::electrum::tests::estimate_feerate_converts_btc_per_kvb_and_rejects_no_estimate
 openswap wallet::blockchain::electrum::tests::history_warnings_reset_after_recovery_and_unsubscription
+openswap wallet::blockchain::electrum::tests::malformed_replies_are_not_retried
 openswap wallet::blockchain::electrum::tests::mined_height_above_the_tip_errors
 openswap wallet::blockchain::electrum::tests::not_subscribed_is_terminal
 openswap wallet::blockchain::electrum::tests::onion_without_proxy_is_rejected_before_connecting

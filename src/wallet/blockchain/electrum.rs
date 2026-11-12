@@ -2768,6 +2768,54 @@ pub(crate) mod tests {
         assert!(backend.may_have_missed(&script));
     }
 
+    #[test]
+    fn malformed_replies_are_not_retried() {
+        let reply = Arc::new(Mutex::new(Value::Null));
+        let server = {
+            let reply = reply.clone();
+            mock_electrum(move |method, _params| match method {
+                "blockchain.transaction.get" => Ok(reply.lock().unwrap().clone()),
+                method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+            })
+        };
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 1,
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        let txid = Txid::from_byte_array([1; 32]);
+        for (answer, expected) in [
+            (json!(5), "InvalidResponse"),
+            (json!("zz"), "Hex"),
+            (json!("00"), "Bitcoin"),
+        ] {
+            *reply.lock().unwrap() = answer;
+            let fetches = |calls: &Vec<String>| {
+                calls
+                    .iter()
+                    .filter(|m| *m == "blockchain.transaction.get")
+                    .count()
+            };
+            let before = fetches(&server.calls.lock().unwrap());
+            let result = backend.call("blockchain.transaction.get", |c| c.transaction_get(&txid));
+            let name = match &result {
+                Err(WalletError::Electrum(Error::InvalidResponse(_))) => "InvalidResponse",
+                Err(WalletError::Electrum(Error::Hex(_))) => "Hex",
+                Err(WalletError::Electrum(Error::Bitcoin(_))) => "Bitcoin",
+                other => panic!("expected {}, got {:?}", expected, other),
+            };
+            assert_eq!(name, expected);
+            assert_eq!(
+                fetches(&server.calls.lock().unwrap()) - before,
+                1,
+                "{}",
+                expected
+            );
+            assert_eq!(backend.reconnect_count(), 0, "{}", expected);
+        }
+    }
+
     /// A script whose last mempool transaction is evicted gets a `null` status,
     /// which the client fails to decode while reading another reply.
     #[test]
@@ -4081,6 +4129,12 @@ pub(crate) mod tests {
         // Answered-but-negative, or local state: reconnecting cannot help.
         assert!(is_terminal(&Error::AlreadySubscribed([0u8; 32].into())));
         assert!(is_terminal(&Error::NotSubscribed([0u8; 32].into())));
+        // A reply that does not decode as hex or a bitcoin type was answered.
+        assert!(is_terminal(&Error::InvalidResponse(json!(5))));
+        let bad_hex = <Vec<u8> as bitcoin::hex::FromHex>::from_hex("zz").unwrap_err();
+        assert!(is_terminal(&Error::Hex(bad_hex)));
+        let bad_tx = bitcoin::consensus::deserialize::<Transaction>(&[0]).unwrap_err();
+        assert!(is_terminal(&Error::Bitcoin(bad_tx)));
         // A transport-shaped error must stay retryable.
         assert!(!is_terminal(&Error::Message("socket closed".into())));
         // A JSON error may come from a notification, so it is retried.
