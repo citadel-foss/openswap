@@ -341,6 +341,7 @@ openswap wallet::backup::tests::backup_v2_keeps_new_fields_and_reads_v1_both_way
 openswap wallet::backup::tests::backup_without_a_phrase_checks_the_file_password
 openswap wallet::backup::tests::compat_backup_refusal_preserves_existing_files_and_missing_parents
 openswap wallet::backup::tests::compat_backups_round_trip_through_the_v023_payload
+openswap wallet::backup::tests::default_backup_path_keeps_a_dotted_wallet_name
 openswap wallet::backup::tests::max_watch_index_overflow_is_the_window_cap
 openswap wallet::backup::tests::mnemonic_normalization_preserves_restore_words
 openswap wallet::backup::tests::open_swaps_summary_counts_each_kind

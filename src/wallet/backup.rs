@@ -732,12 +732,7 @@ impl Wallet {
                 open.incoming, open.outgoing, open.swap_locks, open.lightning
             );
         }
-        let backup_name = format!("{}-backup", wallet.get_name());
-        log::info!(
-            "Backing up wallet: {} to {}",
-            wallet.get_name(),
-            backup_name
-        );
+        log::info!("Backing up wallet: {}", wallet.get_name());
 
         let wallet_password = prompt_password("Enter current wallet passphrase: ".to_string())
             .map_err(|e| WalletError::prompt_failed("failed to read passphrase", e))?;
@@ -754,17 +749,26 @@ impl Wallet {
         })?;
 
         let backup_path = match output {
-            Some(path) => path,
-            None => env::current_dir()
-                .map_err(|e| WalletError::General(format!("failed to get current directory: {e}")))?
-                .join(backup_name),
-        }
-        // `backup` swaps any extension for `.json`; log the file it really writes.
-        .with_extension("json");
+            // `backup` swaps any extension for `.json`; log the file it really writes.
+            Some(path) => path.with_extension("json"),
+            None => default_backup_path(
+                &env::current_dir().map_err(|e| {
+                    WalletError::General(format!("failed to get current directory: {e}"))
+                })?,
+                wallet.get_name(),
+            ),
+        };
         wallet.backup(&backup_path, wallet_password, backup_enc_material)?;
         log::info!("Wallet backup succeeded: {backup_path:?}");
         Ok(())
     }
+}
+
+/// The file [`Wallet::backup_interactive`] writes in `dir` when no output
+/// path is given. The name is built whole, since swapping the extension
+/// would cut a dotted wallet name such as `alice.dat` down to `alice.json`.
+fn default_backup_path(dir: &Path, wallet_name: &str) -> PathBuf {
+    dir.join(format!("{wallet_name}-backup.json"))
 }
 
 #[cfg(test)]
@@ -1205,6 +1209,26 @@ mod tests {
                 (Some(_), err) => panic!("expected the window cap, got {}", err),
             }
         }
+    }
+
+    /// The default backup file keeps the whole wallet name, dots included,
+    /// so `alice.dat` and `alice.v2` no longer both write `alice.json`.
+    #[test]
+    fn default_backup_path_keeps_a_dotted_wallet_name() {
+        let dir = tempdir().unwrap();
+        for name in ["wallet", "alice.dat", "alice.v2"] {
+            assert_eq!(
+                default_backup_path(dir.path(), name),
+                dir.path().join(format!("{name}-backup.json"))
+            );
+        }
+
+        let wallet = test_wallet(&dir.path().join("wallet"));
+        let km = KeyMaterial::new_from_password(Some("backup password".to_string())).unwrap();
+        let path = default_backup_path(dir.path(), "alice.dat");
+        wallet.write_backup(&path, test_password(), km).unwrap();
+        assert!(path.exists());
+        assert!(!dir.path().join("alice.json").exists());
     }
 
     /// A wallet with no stored phrase checks the password against its file
