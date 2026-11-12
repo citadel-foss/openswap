@@ -217,10 +217,15 @@ fn send_rpc_req(
     let response_bytes = read_message(&mut stream)?;
     let response: RpcMsgResp = serde_cbor::from_slice(&response_bytes)?;
 
-    if matches!(response, RpcMsgResp::Pong) {
-        println!("success");
-    } else {
-        println!("{response}");
+    match response {
+        RpcMsgResp::Pong => println!("success"),
+        // A rejected request must fail the process, or scripts take a failed
+        // payment or policy change for a successful one.
+        RpcMsgResp::ServerError(e) => {
+            eprintln!("{e}");
+            return Err(MakerError::General("makerd rejected the request"));
+        }
+        response => println!("{response}"),
     }
 
     Ok(())

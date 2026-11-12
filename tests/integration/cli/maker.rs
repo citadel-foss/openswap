@@ -303,6 +303,31 @@ fn rpc_server(world: &mut World) {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // A request makerd rejects fails the process, so scripts see the failure.
+    let output = Command::new(env!("CARGO_BIN_EXE_maker-cli"))
+        .args([
+            "-p",
+            &format!("127.0.0.1:{}", rpc.port),
+            "-d",
+            data_dir.to_str().unwrap(),
+            "blocklist-add",
+            "not-an-address",
+        ])
+        .output()
+        .expect("failed to run maker-cli");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    info!("maker-cli blocklist-add not-an-address: {}", stderr.trim());
+    assert!(
+        !output.status.success(),
+        "maker-cli must exit nonzero on a rejected request, stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("rejected"),
+        "maker-cli should report the rejection on stderr, got: {}",
+        stderr
+    );
+
     // ---- Stop, last: it shuts the server down ----
     assert_rpc!(rpc, { Req::Stop => Resp::Shutdown });
     wait_until!(

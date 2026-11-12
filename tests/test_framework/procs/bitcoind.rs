@@ -255,6 +255,20 @@ pub(crate) fn init_bitcoind(
 /// Panics if the chain never grows by `n`, so a node that cannot mine fails here
 /// instead of surfacing later as an unrelated timeout.
 pub(crate) fn generate_blocks(bitcoind: &BitcoinD, n: u64) {
+    // One `generatetoaddress` per few blocks: a loaded node can take longer
+    // than jsonrpc's 15 s read timeout to mine a long batch, and the client
+    // then resends it, so the node mines the batch twice and overshoots the
+    // height a test asked for. Short calls stay well inside the timeout.
+    const MAX_BLOCKS_PER_CALL: u64 = 10;
+    let mut remaining = n;
+    while remaining > 0 {
+        let chunk = remaining.min(MAX_BLOCKS_PER_CALL);
+        generate_blocks_once(bitcoind, chunk);
+        remaining -= chunk;
+    }
+}
+
+fn generate_blocks_once(bitcoind: &BitcoinD, n: u64) {
     let before = bitcoind.client.get_block_count();
     let Err(e) = try_generate_blocks(bitcoind, n) else {
         return;
