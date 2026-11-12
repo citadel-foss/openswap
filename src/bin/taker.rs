@@ -390,6 +390,7 @@ impl Commands {
             | Commands::Restore { .. }
             | Commands::ShowSeed
             | Commands::AttachSeed
+            | Commands::ListSwaps { .. }
             | Commands::VerifyDeniability { .. } => false,
         }
     }
@@ -1117,6 +1118,7 @@ mod tests {
             "list-utxo",
             "recover",
             "backup",
+            "list-swaps",
         ] {
             assert!(!needs(&[cmd]), "{} must not need Tor", cmd);
         }
