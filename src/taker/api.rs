@@ -32,7 +32,7 @@ use crate::{
             SwapDetails, SwapPrivkey, TakerToMakerMessage,
         },
         contract::calculate_pubkey_from_nonce,
-        features::{choose_pins, supported, unmet_for_flow, KNOWN},
+        features::{check_names, choose_pins, supported, unmet_for_flow, KNOWN},
     },
     utill::{
         funding_fee_policy_sats, generate_maker_keys, get_taker_dir, read_message, send_message,
@@ -2867,18 +2867,26 @@ pub(crate) fn handshake_with_maker(
             )))
         }
     };
-    // Registry order, each name once: repeats can't grow what we keep.
-    let features: Vec<String> = KNOWN
-        .iter()
-        .filter(|f| features.iter().any(|name| name == f.name))
-        .map(|f| f.name.to_string())
-        .collect();
+    let features = recognized_features(features)?;
     let missing: Vec<&String> = needed.iter().filter(|n| !features.contains(n)).collect();
     if !missing.is_empty() {
         return Err(TakerError::General(format!(
             "Maker does not list {missing:?}"
         )));
     }
+    Ok(features)
+}
+
+/// Validates and normalizes a peer's Hello to the names this build understands.
+fn recognized_features(features: Vec<String>) -> Result<Vec<String>, TakerError> {
+    check_names(&features)
+        .map_err(|reason| TakerError::General(format!("Maker sent an invalid Hello: {reason}")))?;
+    // Registry order, each name once: repeats can't grow what we keep.
+    let features: Vec<String> = KNOWN
+        .iter()
+        .filter(|f| features.iter().any(|name| name == f.name))
+        .map(|f| f.name.to_string())
+        .collect();
     Ok(features)
 }
 
@@ -4082,7 +4090,7 @@ mod tests {
             compat_hello_reply(reply, &["taproot".into()]).unwrap(),
             ["taproot"]
         );
-        let repeated = (0..100)
+        let repeated = (0..20)
             .flat_map(|_| KNOWN.iter().rev().map(|f| f.name.to_string()))
             .chain(["future-v1".into()])
             .collect();
@@ -4090,6 +4098,24 @@ mod tests {
         assert_eq!(
             compat_hello_reply(reply, &[]).unwrap(),
             KNOWN.iter().map(|f| f.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn maker_hello_feature_names_and_bounds_are_checked_before_normalizing() {
+        assert!(recognized_features(vec!["Taproot".into()]).is_err());
+        assert!(recognized_features(vec![
+            "a".repeat(crate::protocol::features::MAX_FEATURE_NAME_LEN + 1)
+        ])
+        .is_err());
+        assert!(recognized_features(vec![
+            "future-v1".into();
+            crate::protocol::features::MAX_FEATURES + 1
+        ])
+        .is_err());
+        assert_eq!(
+            recognized_features(vec!["taproot".into(), "taproot".into()]).unwrap(),
+            ["taproot"]
         );
     }
 

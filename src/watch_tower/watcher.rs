@@ -544,10 +544,50 @@ impl<R: Role> Watcher<R> {
         &mut self,
         watches: &[(OutPoint, ScriptBuf)],
     ) -> Result<(), String> {
-        let mut oldest: Option<u64> = None;
+        let mut every_watch_unspent = true;
+        let mut utxo_lookup_failed = false;
         for (outpoint, _) in watches {
             if self.shutdown.load(Ordering::Relaxed) {
                 log::info!("watch rebuild rescan aborted before funding lookup: shutdown");
+                return Ok(());
+            }
+            // A currently unspent output cannot have a confirmed spender, so
+            // it contributes nothing to the recovery range. This cheap UTXO
+            // lookup avoids replaying the whole chain on the common restart
+            // where every rebuilt contract is still live. On an inconclusive
+            // lookup, fall through to the conservative block scan.
+            match self
+                .blockchain
+                .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+            {
+                Ok(Some(_)) => {
+                    self.queue_reconcile(*outpoint);
+                    continue;
+                }
+                Ok(None) => every_watch_unspent = false,
+                Err(e) => {
+                    every_watch_unspent = false;
+                    utxo_lookup_failed = true;
+                    log::warn!(
+                        "UTXO lookup failed before rebuild scan for {outpoint}: {e}; scanning conservatively"
+                    );
+                }
+            }
+        }
+        if every_watch_unspent {
+            log::info!("Rescanning blocks skipped: every rebuilt watch is still unspent");
+            return Ok(());
+        }
+
+        // Once any output is spent or its UTXO lookup is inconclusive, retain
+        // every rebuilt watch as a possible scan anchor. An older live watch's
+        // funding height is still a safe fallback if a later lookup fails, and
+        // preserves the recovery range used before the all-unspent fast path.
+        let mut oldest: Option<u64> = None;
+        let mut funding_lookup_failed = false;
+        for (outpoint, _) in watches {
+            if self.shutdown.load(Ordering::Relaxed) {
+                log::info!("watch rebuild rescan aborted during funding lookup: shutdown");
                 return Ok(());
             }
             match self.blockchain.tx_block_height(&outpoint.txid) {
@@ -558,10 +598,24 @@ impl<R: Role> Watcher<R> {
                 // spend, and a spend that only ever sat in the mempool and was
                 // evicted means no claim happened, so nothing needs recovering.
                 Ok(None) => {}
-                Err(e) => log::warn!("funding height lookup failed for {outpoint}: {e}"),
+                Err(e) => {
+                    funding_lookup_failed = true;
+                    log::warn!("funding height lookup failed for {outpoint}: {e}");
+                }
             }
         }
-        let Some(from) = oldest else { return Ok(()) };
+        let Some(from) = oldest else {
+            if funding_lookup_failed || utxo_lookup_failed {
+                return Err(
+                    "rebuild recovery is inconclusive: no confirmed funding height was available"
+                        .to_string(),
+                );
+            }
+            log::info!(
+                "Rescanning blocks skipped: no rebuilt watch has a confirmed funding height"
+            );
+            return Ok(());
+        };
         self.scan_blocks(from).map_err(|e| {
             log::error!("block rescan from height {from} failed: {e:?}");
             format!("block rescan from height {from} failed: {e:?}")
@@ -1522,6 +1576,162 @@ mod tests {
             .into_iter()
             .find(|watch| watch.outpoint == outpoint)
             .and_then(|watch| watch.spent_tx)
+    }
+
+    #[test]
+    fn rebuild_skips_block_scan_when_every_watch_is_still_unspent() {
+        let node = Arc::new(Mutex::new(Node::default()));
+        node.lock().unwrap().mine(Vec::new());
+        let (url, calls) = mock_core_rpc({
+            let node = node.clone();
+            move |method, params| {
+                let node = node.lock().unwrap();
+                if method == "gettxout" {
+                    return Ok(unspent_output(&node));
+                }
+                node.answer(method, params)
+            }
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        let watch = (
+            OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            ScriptBuf::new(),
+        );
+        let outpoint = watch.0;
+
+        watcher.rescan_for_missed_spends(&[watch]).unwrap();
+
+        assert_eq!(calls.lock().unwrap().as_slice(), ["gettxout"]);
+        assert_eq!(watcher.pending_reconcile, [outpoint]);
+    }
+
+    #[test]
+    fn rebuild_retries_when_funding_height_lookup_fails() {
+        let (url, calls) = mock_core_rpc(|method, _params| match method {
+            "gettxout" => Ok(Value::Null),
+            "getrawtransaction" => Err(json!({ "code": -28, "message": "txindex warming up" })),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        let watch = (
+            OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            ScriptBuf::new(),
+        );
+
+        assert!(watcher.rescan_for_missed_spends(&[watch]).is_err());
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["gettxout", "getrawtransaction"]
+        );
+    }
+
+    #[test]
+    fn rebuild_retries_when_utxo_lookup_fails_and_funding_is_unknown() {
+        let (url, calls) = mock_core_rpc(|method, _params| match method {
+            "gettxout" => Err(json!({ "code": -28, "message": "chainstate warming up" })),
+            "getrawtransaction" => {
+                Err(json!({ "code": -5, "message": "No such mempool or blockchain transaction" }))
+            }
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        let watch = (
+            OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            ScriptBuf::new(),
+        );
+
+        assert!(watcher.rescan_for_missed_spends(&[watch]).is_err());
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["gettxout", "getrawtransaction"]
+        );
+    }
+
+    #[test]
+    fn rebuild_succeeds_when_funding_transaction_has_no_height() {
+        let funding = spend(OutPoint::new(Txid::from_byte_array([7; 32]), 0));
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let (url, calls) = mock_core_rpc(move |method, _params| match method {
+            "gettxout" => Ok(Value::Null),
+            "getrawtransaction" => Ok(verbose_tx(&funding)),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+
+        watcher
+            .rescan_for_missed_spends(&[(outpoint, ScriptBuf::new())])
+            .unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["gettxout", "getrawtransaction"]
+        );
+    }
+
+    #[test]
+    fn rebuild_uses_unspent_watch_as_scan_anchor_when_later_height_lookup_fails() {
+        let old_funding = spend(OutPoint::new(Txid::from_byte_array([1; 32]), 0));
+        let later_funding = spend(OutPoint::new(Txid::from_byte_array([2; 32]), 0));
+        let old_outpoint = OutPoint::new(old_funding.compute_txid(), 0);
+        let later_outpoint = OutPoint::new(later_funding.compute_txid(), 0);
+        let missed_spend = spend(later_outpoint);
+        let node = Arc::new(Mutex::new(Node::default()));
+        {
+            let mut node = node.lock().unwrap();
+            node.mine(Vec::new());
+            node.mine(vec![old_funding]);
+            node.mine(vec![later_funding]);
+            node.mine(vec![missed_spend.clone()]);
+        }
+        let (url, _calls) = mock_core_rpc({
+            let node = node.clone();
+            move |method, params| {
+                let node = node.lock().unwrap();
+                if method == "gettxout" {
+                    let txid: Txid = serde_json::from_value(params[0].clone()).unwrap();
+                    return if txid == old_outpoint.txid {
+                        Ok(unspent_output(&node))
+                    } else {
+                        Ok(Value::Null)
+                    };
+                }
+                if method == "getrawtransaction" && params[0] == json!(later_outpoint.txid) {
+                    return Err(json!({ "code": -28, "message": "txindex warming up" }));
+                }
+                node.answer(method, params)
+            }
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        for outpoint in [old_outpoint, later_outpoint] {
+            watcher
+                .registry
+                .register_watch(outpoint, ScriptBuf::new())
+                .unwrap();
+        }
+
+        watcher
+            .rescan_for_missed_spends(&[
+                (old_outpoint, ScriptBuf::new()),
+                (later_outpoint, ScriptBuf::new()),
+            ])
+            .unwrap();
+
+        assert_eq!(recorded_spend(&watcher, later_outpoint), Some(missed_spend));
     }
 
     /// Core dropped `rawtx` seq 1, the spend of a watched outpoint. The gap in

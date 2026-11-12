@@ -107,6 +107,7 @@ openswap protocol::features::tests::compat_pins_obey_flow_requirements_and_build
 openswap protocol::features::tests::compat_registry_keeps_names_flows_and_build_support
 openswap protocol::features::tests::compat_requirement_versions_do_not_cross_families
 openswap protocol::features::tests::feature_lists_are_bounded
+openswap protocol::features::tests::flow_resolution_does_not_require_feature_name_to_equal_flow
 openswap protocol::features::tests::hello_defers_known_families_to_pins
 openswap protocol::features::tests::pins_are_checked_for_one_served_flow
 openswap protocol::features::tests::pins_take_only_mutual_names_for_the_flow
@@ -134,6 +135,7 @@ openswap taker::api::tests::compat_taker_cli_merge_skips_unchanged_values
 openswap taker::api::tests::compat_taker_requirements_survive_cli_merge_and_bind_pins
 openswap taker::api::tests::compat_v023_maker_hello_cannot_repin_a_new_taker
 openswap taker::api::tests::init_taker_config_persists_lightning_settings
+openswap taker::api::tests::maker_hello_feature_names_and_bounds_are_checked_before_normalizing
 openswap taker::api::tests::taker_config_debug_hides_wallet_password
 openswap taker::background_services::tests::abort_flag_clears_once_the_watcher_answers
 openswap taker::background_services::tests::compat_handover_save_failure_keeps_the_live_slot
@@ -383,6 +385,7 @@ openswap wallet::blockchain::electrum::tests::a_persistent_refusal_does_not_recy
 openswap wallet::blockchain::electrum::tests::a_refused_re_arm_reports_each_new_tip_once
 openswap wallet::blockchain::electrum::tests::a_refused_script_is_armed_and_replayed_once_its_backoff_is_up
 openswap wallet::blockchain::electrum::tests::a_refused_subscribe_is_sent_again_on_retry
+openswap wallet::blockchain::electrum::tests::a_refused_wallet_subscription_queries_each_script_once
 openswap wallet::blockchain::electrum::tests::a_resubscribed_script_retries_a_failed_fetch
 openswap wallet::blockchain::electrum::tests::a_script_armed_after_a_reconnect_takes_another_watch
 openswap wallet::blockchain::electrum::tests::a_server_error_leaves_the_subscriptions_trusted
@@ -398,6 +401,10 @@ openswap wallet::blockchain::electrum::tests::clearnet_default_has_no_proxy
 openswap wallet::blockchain::electrum::tests::endpoint_credentials_are_omitted_from_connection_logs
 openswap wallet::blockchain::electrum::tests::estimate_feerate_converts_btc_per_kvb_and_rejects_no_estimate
 openswap wallet::blockchain::electrum::tests::history_warnings_reset_after_recovery_and_unsubscription
+openswap wallet::blockchain::electrum::tests::list_unspent_does_not_cache_for_a_script_claimed_during_snapshot
+openswap wallet::blockchain::electrum::tests::list_unspent_releases_notifier_during_snapshot_query
+openswap wallet::blockchain::electrum::tests::list_unspent_retries_snapshot_after_generation_change
+openswap wallet::blockchain::electrum::tests::list_unspent_stops_after_snapshot_retry_limit
 openswap wallet::blockchain::electrum::tests::mined_height_above_the_tip_errors
 openswap wallet::blockchain::electrum::tests::onion_without_proxy_is_rejected_before_connecting
 openswap wallet::blockchain::electrum::tests::only_the_unknown_txid_protocol_error_reads_as_absent
@@ -416,10 +423,13 @@ openswap wallet::blockchain::electrum::tests::spend_check_finds_a_spend_mined_wi
 openswap wallet::blockchain::electrum::tests::spend_check_finds_the_spend_past_an_unfetchable_tx
 openswap wallet::blockchain::electrum::tests::spend_check_ignores_unfetchable_txs_that_cannot_spend
 openswap wallet::blockchain::electrum::tests::terminal_errors_are_not_retried
+openswap wallet::blockchain::electrum::tests::transaction_history_pages_are_ordered_without_sorting_the_discarded_tail
 openswap wallet::blockchain::electrum::tests::unreachable_error_names_the_attempt_count
 openswap wallet::blockchain::electrum::tests::unspent_height_minus_one_deserializes_as_unconfirmed
 openswap wallet::blockchain::electrum::tests::unwatch_avoids_upstream_unsubscribe_and_allows_rewatch
 openswap wallet::blockchain::electrum::tests::url_host_strips_scheme_and_port
+openswap wallet::blockchain::electrum::tests::wallet_utxo_refresh_recovers_a_poisoned_serialization_lock
+openswap wallet::blockchain::electrum::tests::wallet_utxo_refreshes_are_serialized
 openswap wallet::blockchain::tests::watcher_config_fails_fast_only_on_a_direct_link
 openswap wallet::blockchain::tests::watcher_config_keeps_an_explicit_timeout
 openswap wallet::error::tests::prompt_failed_keeps_only_a_cancelled_prompt
@@ -594,6 +604,11 @@ openswap watch_tower::watcher::tests::never_broadcast_outpoint_leaves_the_queue
 openswap watch_tower::watcher::tests::orphaned_spend_is_kept_until_its_replacement_is_found
 openswap watch_tower::watcher::tests::outage_answers_every_request_within_a_bound
 openswap watch_tower::watcher::tests::re_arm_on_a_failing_connection_stops_at_the_first_failure
+openswap watch_tower::watcher::tests::rebuild_retries_when_funding_height_lookup_fails
+openswap watch_tower::watcher::tests::rebuild_retries_when_utxo_lookup_fails_and_funding_is_unknown
+openswap watch_tower::watcher::tests::rebuild_skips_block_scan_when_every_watch_is_still_unspent
+openswap watch_tower::watcher::tests::rebuild_succeeds_when_funding_transaction_has_no_height
+openswap watch_tower::watcher::tests::rebuild_uses_unspent_watch_as_scan_anchor_when_later_height_lookup_fails
 openswap watch_tower::watcher::tests::rebuilt_watch_that_cannot_subscribe_is_recovered
 openswap watch_tower::watcher::tests::refused_re_arm_keeps_watches_blind_without_spinning
 openswap watch_tower::watcher::tests::reorged_out_spend_gives_way_to_the_spend_on_chain

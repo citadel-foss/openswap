@@ -74,6 +74,15 @@ pub fn check_bounds(names: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses a feature list whose size or names are not valid on the wire.
+pub fn check_names(names: &[String]) -> Result<(), String> {
+    check_bounds(names)?;
+    if let Some(bad) = names.iter().find(|name| !is_valid_name(name)) {
+        return Err(format!("invalid feature name {bad:?}"));
+    }
+    Ok(())
+}
+
 /// Splits `x-vN` into family `x` and version N. A name without a canonical
 /// `-vN` suffix (no leading zero) is its own family at version 0.
 pub fn family_and_version(name: &str) -> (&str, u32) {
@@ -168,18 +177,9 @@ pub fn unmet_for_flow(required: &[String], pins: &[String], flow: &str) -> Resul
 /// name we serve that changes that one flow, at most one per family, and our
 /// requirements for the flow must be met.
 pub fn check_pins(pins: &[String], required: &[String]) -> Result<&'static str, String> {
-    check_bounds(pins)?;
+    check_names(pins)?;
     let ours = supported();
-    let flows: Vec<&'static str> = ours
-        .iter()
-        .copied()
-        .filter(|name| {
-            pins.iter().any(|p| p == name) && KNOWN.iter().any(|f| f.flows.contains(name))
-        })
-        .collect();
-    let [flow] = flows[..] else {
-        return Err(format!("pins {pins:?} must name exactly one flow"));
-    };
+    let flow = flow_for_pins(pins, &ours, KNOWN)?;
     if let Some(stray) = pins.iter().find(|p| {
         !KNOWN
             .iter()
@@ -198,19 +198,37 @@ pub fn check_pins(pins: &[String], required: &[String]) -> Result<&'static str, 
     Ok(flow)
 }
 
+/// Resolves the single flow changed by `pins` without assuming that a feature's
+/// wire name and flow name are identical. Later versions such as `taproot-v1`
+/// still belong to the `taproot` flow.
+fn flow_for_pins(
+    pins: &[String],
+    ours: &[&str],
+    known: &[Feature],
+) -> Result<&'static str, String> {
+    let mut flows = Vec::new();
+    for feature in known.iter().filter(|feature| {
+        ours.contains(&feature.name) && pins.iter().any(|pin| pin == feature.name)
+    }) {
+        for flow in feature.flows {
+            if !flows.contains(flow) {
+                flows.push(*flow);
+            }
+        }
+    }
+    let [flow] = flows[..] else {
+        return Err(format!("pins {pins:?} must name exactly one flow"));
+    };
+    Ok(flow)
+}
+
 /// Reads a `require_features` config value. A malformed list or name stops
 /// startup; a name this build can't serve only warns, as requiring it is the user's choice.
 pub(crate) fn parse_require_features(value: Option<&String>) -> io::Result<Vec<String>> {
     let names = parse_list(value)?;
-    check_bounds(&names).map_err(|e| {
+    check_names(&names).map_err(|e| {
         io::Error::new(io::ErrorKind::InvalidData, format!("require_features: {e}"))
     })?;
-    if let Some(bad) = names.iter().find(|n| !is_valid_name(n)) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("require_features: invalid feature name {bad:?}"),
-        ));
-    }
     if let Err(unknown) = check_requires(&names, &supported()) {
         log::warn!("require_features lists names this build does not support: {unknown:?}");
     }
@@ -317,6 +335,29 @@ mod tests {
         assert!(check_bounds(&names(MAX_FEATURES + 1)).is_err());
         assert!(check_bounds(&["a".repeat(MAX_FEATURE_NAME_LEN + 1)]).is_err());
         assert!(check_pins(&names(MAX_FEATURES + 1), &[]).is_err());
+        assert!(check_names(&["Taproot".to_string()]).is_err());
+        assert!(check_names(&[String::new()]).is_err());
+    }
+
+    #[test]
+    fn flow_resolution_does_not_require_feature_name_to_equal_flow() {
+        const FUTURE: &[Feature] = &[
+            Feature {
+                name: "taproot-v1",
+                flows: &["taproot"],
+                lightning: false,
+            },
+            Feature {
+                name: "audit-v1",
+                flows: &["taproot"],
+                lightning: false,
+            },
+        ];
+        let pins = names(&["taproot-v1", "audit-v1"]);
+        assert_eq!(
+            flow_for_pins(&pins, &["taproot-v1", "audit-v1"], FUTURE),
+            Ok("taproot")
+        );
     }
 
     #[test]
