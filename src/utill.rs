@@ -546,11 +546,31 @@ pub(crate) fn parse_toml<P: AsRef<Path>>(path: P) -> io::Result<HashMap<String, 
     Ok(config_map)
 }
 
-/// Parses a value of type T from an Option<&String>, returning the default if parsing fails or is None
-pub(crate) fn parse_field<T: std::str::FromStr>(value: Option<&String>, default: T) -> T {
-    value
-        .and_then(|value| value.parse::<T>().ok())
-        .unwrap_or(default)
+/// Reads `key` from a parsed config as a `T`. A missing key gives `default`.
+/// A value that cannot be read is an error: it must not quietly become the
+/// default, which could turn a safety or fee setting into something else.
+pub(crate) fn parse_field<T: std::str::FromStr>(
+    config: &HashMap<String, String>,
+    key: &str,
+    default: T,
+) -> io::Result<T> {
+    let Some(value) = config.get(key) else {
+        return Ok(default);
+    };
+    value.parse::<T>().map_err(|_| {
+        let hint = if value.contains('#') {
+            " Inline comments are not supported; put the comment on its own line."
+        } else {
+            ""
+        };
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "{key}: cannot read {value:?} as {}.{hint}",
+                std::any::type_name::<T>()
+            ),
+        )
+    })
 }
 
 /// Parses a one-line list of quoted names, `["a", "b"]`. Anything else is an
@@ -725,17 +745,13 @@ pub(crate) fn compute_checksum(descriptor: &str) -> Result<String, WalletError> 
     Ok(checksum_chars)
 }
 
-/// Parse the proxy (Socket:Port) argument from the cli input.
+/// Parse the Bitcoin Core RPC authentication (USER:PASSWORD) argument from the cli input.
+///
+/// Splits on the first `:` only, like Bitcoin Core does, so the password may contain `:`.
 pub fn parse_proxy_auth(s: &str) -> Result<(String, String), NetError> {
-    let parts: Vec<_> = s.split(':').collect();
-    if parts.len() != 2 {
-        return Err(NetError::InvalidNetworkAddress);
-    }
+    let (user, passwd) = s.split_once(':').ok_or(NetError::InvalidNetworkAddress)?;
 
-    let user = parts[0].to_string();
-    let passwd = parts[1].to_string();
-
-    Ok((user, passwd))
+    Ok((user.to_string(), passwd.to_string()))
 }
 
 /// Tor Error grades
@@ -1647,6 +1663,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_field_uses_the_default_only_for_a_missing_key() {
+        let config = HashMap::from([
+            ("port".to_string(), "6102".to_string()),
+            ("flag".to_string(), "true".to_string()),
+        ]);
+        assert_eq!(parse_field(&config, "port", 1u16).unwrap(), 6102);
+        assert!(parse_field(&config, "flag", false).unwrap());
+        assert_eq!(parse_field(&config, "missing", 7u64).unwrap(), 7);
+    }
+
+    #[test]
+    fn parse_field_refuses_a_value_it_cannot_read() {
+        for (key, value) in [
+            ("base_fee", "1000 # sats"),
+            ("base_fee", "1_000"),
+            ("base_fee", "-5"),
+            ("base_fee", ""),
+            ("rpc_port", "70000"),
+            ("required_confirms", "3 # safer"),
+            ("check_blocklist", "True"),
+            ("check_blocklist", "yes"),
+            ("amount_relative_fee_pct", "0,5"),
+        ] {
+            let config = HashMap::from([(key.to_string(), value.to_string())]);
+            let error = match key {
+                "base_fee" => parse_field(&config, key, 500u64).unwrap_err(),
+                "rpc_port" => parse_field(&config, key, 6103u16).unwrap_err(),
+                "required_confirms" => parse_field(&config, key, 1u32).unwrap_err(),
+                "check_blocklist" => parse_field(&config, key, false).unwrap_err(),
+                _ => parse_field(&config, key, 0.0025f64).unwrap_err(),
+            };
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            let message = error.to_string();
+            assert!(message.starts_with(key), "{}", message);
+            assert!(message.contains(&format!("{value:?}")), "{}", message);
+            assert_eq!(
+                message.contains("own line"),
+                value.contains('#'),
+                "{}",
+                message
+            );
+        }
+    }
+
+    #[test]
     fn password_file_drops_one_trailing_newline() {
         let dir = tempfile::tempdir().unwrap();
         let read = |content: &str| {
@@ -2088,6 +2149,20 @@ mod tests {
             .add_exp_tweak(&secp, &scalar_from_nonce)
             .unwrap();
         assert_eq!(returned_pubkey.to_string(), tweaked_pubkey.to_string());
+    }
+
+    #[test]
+    fn test_parse_proxy_auth() {
+        assert_eq!(
+            parse_proxy_auth("user:password").unwrap(),
+            ("user".to_string(), "password".to_string())
+        );
+        // Only the first ':' separates the user from the password.
+        assert_eq!(
+            parse_proxy_auth("user:pass:word").unwrap(),
+            ("user".to_string(), "pass:word".to_string())
+        );
+        assert!(parse_proxy_auth("userpassword").is_err());
     }
 
     // ── parse_checked_address tests ──────────────────────────────────────────

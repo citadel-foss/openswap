@@ -236,7 +236,23 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     if maker.behavior == super::handlers::MakerBehavior::StopWatcherOnStartup {
         maker.watch_service.stop_watcher_for_test();
     }
-    let listener = if maker.watch_service.is_alive() {
+    // Fees no swap can pay leave nothing to serve, but contracts from a
+    // previous run still need recovering, so start recovery-only instead of
+    // failing: an error here would shut down the recovery started below.
+    let fees_priceable = match super::api::check_fees_can_price_a_swap(&maker.config) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!(
+                "[{}] {:?}; recovery-only mode: no fidelity bond and no new swaps until the fee settings are fixed",
+                maker.config.network_port,
+                e
+            );
+            false
+        }
+    };
+    let listener = if !fees_priceable {
+        None
+    } else if maker.watch_service.is_alive() {
         // Tests reserve the port at allocation and hand the socket over, so a
         // parallel test cannot take it between allocation and start.
         #[cfg(feature = "integration-test")]
@@ -2124,19 +2140,24 @@ fn send_message(stream: &TcpStream, message: &MakerToTakerMessage) -> Result<(),
 }
 
 /// Binds `port`, or the first free port above it in steps of 2.
+///
+/// `port` itself is always tried. The search above it stops below 62000.
 pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
     let mut current_port = port;
     const MAX_PORT: u16 = 62000;
 
-    while current_port < MAX_PORT {
+    loop {
         match TcpListener::bind((Ipv4Addr::LOCALHOST, current_port)) {
             Ok(l) => {
                 let bound_port = l.local_addr().map_err(MakerError::IO)?.port();
                 return Ok((l, bound_port));
             }
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
-                log::info!("Port {} in use, trying {}", current_port, current_port + 2);
-                current_port += 2
+                let Some(next_port) = current_port.checked_add(2).filter(|&p| p < MAX_PORT) else {
+                    break;
+                };
+                log::info!("Port {} in use, trying {}", current_port, next_port);
+                current_port = next_port;
             }
             Err(e) => {
                 log::error!("Failed to bind port {}: {}", current_port, e);
@@ -2470,6 +2491,32 @@ mod tests {
         drop(held);
         let (_listener, bound) = bind_port_retry(port).unwrap();
         assert_eq!(bound, port, "a free port is used as is");
+    }
+
+    /// A configured port at or above the search's upper bound is still tried.
+    #[test]
+    fn bind_port_retry_tries_a_given_port_above_the_search_bound() {
+        // The probe listener is dropped before bind_port_retry runs, so
+        // another process can take the port in between. Only then move on to
+        // the next candidate: a port that is still free must have been bound.
+        for port in 62_000..=u16::MAX {
+            if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err() {
+                continue;
+            }
+            match bind_port_retry(port) {
+                Ok((_listener, bound)) => {
+                    assert_eq!(bound, port);
+                    return;
+                }
+                Err(e) => assert!(
+                    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err(),
+                    "bind_port_retry({}) refused a free port: {:?}",
+                    port,
+                    e
+                ),
+            }
+        }
+        panic!("no free port above the search bound");
     }
 
     #[test]

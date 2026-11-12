@@ -4,8 +4,13 @@
 use std::{
     collections::HashMap,
     convert::TryFrom,
-    net::{TcpStream, ToSocketAddrs},
-    sync::Mutex,
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+        Arc, Mutex,
+    },
+    thread,
     time::Duration,
 };
 
@@ -43,6 +48,10 @@ pub struct CoreRpcConfig {
 
 const RPC_HOSTPORT: &str = "localhost:18443";
 
+/// Core answers `importdescriptors` and `rescanblockchain` only once the rescan
+/// ends, which takes hours on mainnet.
+const RESCAN_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Bitcoin Core's conventional ZMQ notification port.
 const ZMQ_DEFAULT_PORT: u16 = 28332;
 
@@ -52,6 +61,17 @@ impl CoreRpcConfig {
     pub fn default_zmq_addr(rpc_url: &str) -> String {
         let host = rpc_url.rsplit_once(':').map(|(h, _)| h).unwrap_or(rpc_url);
         format!("tcp://{host}:{ZMQ_DEFAULT_PORT}")
+    }
+
+    /// ZMQ endpoint for the `--zmq` value, or the default on the RPC host. The
+    /// flag is documented as `address:port`, which libzmq refuses without a
+    /// transport, so a bare value gets `tcp://`.
+    pub fn resolve_zmq_addr(zmq: Option<&str>, rpc_url: &str) -> String {
+        match zmq {
+            Some(addr) if addr.contains("://") => addr.to_string(),
+            Some(addr) => format!("tcp://{addr}"),
+            None => Self::default_zmq_addr(rpc_url),
+        }
     }
 }
 
@@ -205,9 +225,13 @@ impl ZmqSubscriber {
 /// it, so it never opens a socket.
 pub struct CoreRPC {
     rpc: Client,
+    /// Same endpoint as `rpc`, with [`RESCAN_TIMEOUT`] for the calls that rescan.
+    rescan_rpc: Arc<Client>,
     config: CoreRpcConfig,
     /// `rawtx`/`rawblock` subscriber, established lazily by the watchtower.
     zmq: ZmqSubscriber,
+    /// Set by the owner to stop waiting for a pending rescan.
+    shutdown: Arc<AtomicBool>,
 }
 
 #[derive(Deserialize)]
@@ -226,25 +250,93 @@ impl std::fmt::Debug for CoreRPC {
 
 impl CoreRPC {
     /// Connect an RPC client for the configured wallet endpoint. Cheap — the
-    /// client connects lazily on first use. Used by `AnyBlockchain::from_config`.
+    /// client connects lazily on first use. A rescan holds its caller until it
+    /// ends; an owner that shuts down uses `with_shutdown_flag`.
     pub fn new(config: &CoreRpcConfig) -> Result<Self, WalletError> {
-        let rpc = Client::new(
-            &format!("http://{}/wallet/{}", config.url, config.wallet_name),
-            config.auth.clone(),
-        )?;
+        Self::with_shutdown_flag(config, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Like [`CoreRPC::new`], but setting `shutdown` stops waiting for a
+    /// pending rescan, so a rescan cannot hold the owner's shutdown for hours.
+    /// Used by `AnyBlockchain::from_config_with_shutdown`.
+    pub(crate) fn with_shutdown_flag(
+        config: &CoreRpcConfig,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Self, WalletError> {
+        let url = format!("http://{}/wallet/{}", config.url, config.wallet_name);
+        let rpc = Client::new(&url, config.auth.clone())?;
+        let mut builder = jsonrpc::simple_http::Builder::new()
+            .timeout(RESCAN_TIMEOUT)
+            .url(&url)
+            .map_err(|e| CoreRpcError::JsonRpc(e.into()))?;
+        if let (Some(user), pass) = config.auth.clone().get_user_pass()? {
+            builder = builder.auth(user, pass);
+        }
+        let rescan_rpc = Arc::new(Client::from_jsonrpc(jsonrpc::Client::with_transport(
+            builder.build(),
+        )));
         Ok(Self {
             rpc,
+            rescan_rpc,
             config: config.clone(),
             zmq: ZmqSubscriber::new(config.zmq_addr.clone()),
+            shutdown,
         })
     }
 
-    /// Open a fresh, independent Bitcoin Core RPC connection with the same config.
+    /// Open a fresh Bitcoin Core RPC connection with the same config and the
+    /// same shutdown flag, so the owner's shutdown also ends its rescan waits.
     ///
     /// Used to give a separate consumer (e.g. the watchtower discovery thread)
     /// its own connection without threading the config around separately.
     pub fn reconnect(&self) -> Result<Self, WalletError> {
-        Self::new(&self.config)
+        Self::with_shutdown_flag(&self.config, self.shutdown.clone())
+    }
+
+    /// Open a fresh connection whose rescan waits end on the consumer's own
+    /// `shutdown`. Used by `AnyBlockchain::new_connection_with_shutdown`.
+    pub(crate) fn reconnect_with_shutdown(
+        &self,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Self, WalletError> {
+        Self::with_shutdown_flag(&self.config, shutdown)
+    }
+
+    /// Run a call Core answers only when its rescan ends. A shutdown requested
+    /// while it waits stops the wait, not the scan: Core finishes it either way,
+    /// so no imported range is left unscanned, and no RPC has to succeed for the
+    /// shutdown to return. Work started after a shutdown, such as a recovery
+    /// sweep or a final sync, runs to the end.
+    fn rescan_call<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        method: &'static str,
+        params: Vec<Value>,
+    ) -> Result<T, WalletError> {
+        let stopping = self.shutdown.load(Ordering::SeqCst);
+        let client = Arc::clone(&self.rescan_rpc);
+        let (reply, replied) = mpsc::channel();
+        thread::Builder::new()
+            .name(format!("core-{method}"))
+            .spawn(move || {
+                let _ = reply.send(client.call::<T>(method, &params));
+            })
+            .map_err(WalletError::IO)?;
+        loop {
+            match replied.recv_timeout(Duration::from_millis(500)) {
+                Ok(result) => return Ok(result?),
+                Err(RecvTimeoutError::Timeout)
+                    if !stopping && self.shutdown.load(Ordering::SeqCst) =>
+                {
+                    return Err(WalletError::Interrupted("Shutdown requested"));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(WalletError::General(format!(
+                        "Core {method} ended without a reply"
+                    )));
+                }
+            }
+        }
     }
 
     /// Returns the active-chain height for a block received through ZMQ.
@@ -427,19 +519,53 @@ impl CoreRPC {
             ));
         }
 
-        // The node's own list of ZMQ publishers must carry both topics we subscribe to.
+        // One SUB socket receives both topics, so Core must publish them on a
+        // shared endpoint. One that differs from --zmq only warns, below.
         #[derive(Deserialize)]
         struct ZmqNotification {
             #[serde(rename = "type")]
             kind: String,
+            address: String,
         }
         let pubs: Vec<ZmqNotification> = self.rpc.call("getzmqnotifications", &[])?;
-        for topic in ["pubrawtx", "pubrawblock"] {
-            if !pubs.iter().any(|p| p.kind == topic) {
+        let [rawtx, rawblock] = ["pubrawtx", "pubrawblock"].map(|topic| {
+            pubs.iter()
+                .filter(|p| p.kind == topic)
+                .map(|p| p.address.as_str())
+                .collect::<Vec<_>>()
+        });
+        for (topic, addresses) in [("pubrawtx", &rawtx), ("pubrawblock", &rawblock)] {
+            if addresses.is_empty() {
                 return Err(WalletError::Zmq(format!(
                     "Bitcoin Core does not publish {topic}; set -zmq{topic}=<addr>"
                 )));
             }
+        }
+        let shared: Vec<&str> = rawtx
+            .iter()
+            .copied()
+            .filter(|address| rawblock.contains(address))
+            .collect();
+        if shared.is_empty() {
+            return Err(WalletError::Zmq(format!(
+                "Bitcoin Core publishes pubrawtx on {} and pubrawblock on {}, but --zmq {} \
+                 subscribes to both on one endpoint",
+                rawtx.join(", "),
+                rawblock.join(", "),
+                self.config.zmq_addr
+            )));
+        }
+        // A tunnel or port mapping makes a working endpoint differ from Core's bind.
+        if !shared
+            .iter()
+            .any(|published| zmq_endpoint_matches(published, &self.config.zmq_addr))
+        {
+            log::warn!(
+                "Bitcoin Core publishes pubrawtx and pubrawblock on {}, but --zmq is {}; \
+                 this only works through a tunnel or port mapping",
+                shared.join(", "),
+                self.config.zmq_addr
+            );
         }
 
         // A ZMQ SUB connect() to a dead endpoint "succeeds" and then stays
@@ -700,9 +826,8 @@ impl Blockchain for CoreRPC {
     }
 
     fn import_descriptors(&self, requests: &[Value]) -> Result<(), WalletError> {
-        let results: Vec<Value> = self
-            .rpc
-            .call("importdescriptors", &[Value::Array(requests.to_vec())])?;
+        let results: Vec<Value> =
+            self.rescan_call("importdescriptors", vec![Value::Array(requests.to_vec())])?;
         // Core rejects a descriptor in its own result, not as an RPC error.
         let failures: Vec<String> = requests
             .iter()
@@ -721,7 +846,7 @@ impl Blockchain for CoreRPC {
     }
 
     fn rescan_wallet_from(&self, height: u64) -> Result<(), WalletError> {
-        let _: Value = self.rpc.call("rescanblockchain", &[json!(height)])?;
+        let _: Value = self.rescan_call("rescanblockchain", vec![json!(height)])?;
         Ok(())
     }
 
@@ -766,10 +891,36 @@ impl Blockchain for CoreRPC {
     }
 
     fn chain_name(&self) -> Result<String, WalletError> {
-        let name = self.rpc.get_blockchain_info()?.chain.to_string();
+        let name = super::chain_name_for(self.rpc.get_blockchain_info()?.chain).to_string();
         super::validate_chain_name(&name)?;
         Ok(name)
     }
+}
+
+/// Whether a subscriber at `configured` reaches a publisher bound at `published`.
+/// A bind on the unspecified address (`*`, `0.0.0.0`, `[::]`) listens on every host.
+fn zmq_endpoint_matches(published: &str, configured: &str) -> bool {
+    let resolve = |endpoint: &str| -> Vec<SocketAddr> {
+        let Some(hostport) = endpoint.strip_prefix("tcp://") else {
+            return Vec::new();
+        };
+        let hostport = match hostport.strip_prefix("*:") {
+            Some(port) => format!("0.0.0.0:{port}"),
+            None => hostport.to_string(),
+        };
+        hostport
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .unwrap_or_default()
+    };
+    let wanted = resolve(configured);
+    published == configured
+        || resolve(published).iter().any(|bound| {
+            wanted.iter().any(|addr| {
+                bound.port() == addr.port()
+                    && (bound.ip().is_unspecified() || bound.ip() == addr.ip())
+            })
+        })
 }
 
 /// List the wallet names known to the node (`listwalletdir`).
@@ -792,6 +943,10 @@ pub(crate) mod tests {
         collections::HashSet,
         io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         thread,
         time::Instant,
     };
@@ -1024,6 +1179,113 @@ pub(crate) mod tests {
         }
     }
 
+    /// Reads one HTTP JSON-RPC request; `None` once the client hangs up.
+    fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Value> {
+        let mut line = String::new();
+        let mut body_len = 0;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return None;
+            }
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some(n) = line.to_lowercase().strip_prefix("content-length:") {
+                body_len = n.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; body_len];
+        reader.read_exact(&mut body).ok()?;
+        Some(serde_json::from_slice(&body).unwrap())
+    }
+
+    fn write_result(writer: &mut TcpStream, request: &Value, result: Value) {
+        let reply =
+            json!({ "jsonrpc": "2.0", "id": request["id"], "result": result, "error": null })
+                .to_string();
+        let _ = write!(
+            writer,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+            reply.len()
+        )
+        .and_then(|()| writer.flush());
+    }
+
+    /// A node with `-txindex` whose ZMQ topics are published on `rawtx` and
+    /// `rawblock`, checked against `zmq_addr`.
+    fn check_zmq(zmq_addr: &str, rawtx: &str, rawblock: &str) -> Result<(), WalletError> {
+        let (core, server) = mock_core(vec![
+            (
+                "getindexinfo",
+                json!({ "txindex": { "synced": true, "best_block_height": 0 } }),
+            ),
+            (
+                "getzmqnotifications",
+                json!([
+                    { "type": "pubrawtx", "address": rawtx, "hwm": 1000 },
+                    { "type": "pubrawblock", "address": rawblock, "hwm": 1000 },
+                ]),
+            ),
+        ]);
+        let core = CoreRPC::new(&CoreRpcConfig {
+            zmq_addr: zmq_addr.to_string(),
+            ..core.config.clone()
+        })
+        .unwrap();
+        let result = core.check_node_requirements();
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn zmq_address_mismatch_is_reported() {
+        let zmq = TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let configured = format!("tcp://{}", zmq.local_addr().unwrap());
+        let rawblock = format!("tcp://{}", other.local_addr().unwrap());
+        let err = check_zmq(&configured, &configured, &rawblock).unwrap_err();
+        assert!(matches!(err, WalletError::Zmq(_)), "{:?}", err);
+        let message = format!("{err:?}");
+        assert!(message.contains("pubrawblock"), "{}", message);
+        assert!(message.contains(&configured), "{}", message);
+        assert!(message.contains(&rawblock), "{}", message);
+    }
+
+    #[test]
+    fn zmq_forwarded_endpoint_is_accepted() {
+        let zmq = TcpListener::bind("127.0.0.1:0").unwrap();
+        let core_bind = TcpListener::bind("127.0.0.1:0").unwrap();
+        let published = format!("tcp://{}", core_bind.local_addr().unwrap());
+        check_zmq(
+            &format!("tcp://{}", zmq.local_addr().unwrap()),
+            &published,
+            &published,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn zmq_matcher_compares_host_and_port() {
+        let configured = "tcp://127.0.0.1:28332";
+        for published in [
+            configured,
+            "tcp://*:28332",
+            "tcp://0.0.0.0:28332",
+            "tcp://[::]:28332",
+        ] {
+            assert!(zmq_endpoint_matches(published, configured), "{}", published);
+        }
+        assert!(zmq_endpoint_matches(configured, "tcp://localhost:28332"));
+        for published in ["tcp://*:28333", "tcp://127.0.0.2:28332", "ipc:///tmp/zmq"] {
+            assert!(
+                !zmq_endpoint_matches(published, configured),
+                "{}",
+                published
+            );
+        }
+    }
+
     /// Serves one canned reply per JSON-RPC method, failing on any other.
     fn mock_core(
         replies: Vec<(&'static str, Value)>,
@@ -1037,20 +1299,10 @@ pub(crate) mod tests {
                 let (stream, _) = listener.accept().expect("accept core client");
                 let mut writer = stream.try_clone().unwrap();
                 let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-                while seen.len() < expected && reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    let mut body_len = 0;
-                    while line.trim() != "" {
-                        if let Some(n) = line.to_lowercase().strip_prefix("content-length:") {
-                            body_len = n.trim().parse().unwrap();
-                        }
-                        line.clear();
-                        reader.read_line(&mut line).unwrap();
-                    }
-                    line.clear();
-                    let mut body = vec![0; body_len];
-                    reader.read_exact(&mut body).unwrap();
-                    let request: Value = serde_json::from_slice(&body).unwrap();
+                while seen.len() < expected {
+                    let Some(request) = read_request(&mut reader) else {
+                        break;
+                    };
                     let method = request["method"].as_str().unwrap().to_string();
                     let result = replies
                         .iter()
@@ -1059,15 +1311,7 @@ pub(crate) mod tests {
                         .1
                         .clone();
                     seen.push(method);
-                    let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result, "error": null })
-                        .to_string();
-                    write!(
-                        writer,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
-                        reply.len()
-                    )
-                    .unwrap();
-                    writer.flush().unwrap();
+                    write_result(&mut writer, &request, result);
                 }
             }
             seen
@@ -1078,6 +1322,19 @@ pub(crate) mod tests {
         })
         .unwrap();
         (core, server)
+    }
+
+    #[test]
+    fn resolve_zmq_addr_adds_tcp_to_a_bare_address() {
+        let rpc = "10.0.0.5:38332";
+        for (given, expected) in [
+            (Some("127.0.0.1:28332"), "tcp://127.0.0.1:28332"),
+            (Some("tcp://127.0.0.1:28332"), "tcp://127.0.0.1:28332"),
+            (Some("ipc:///tmp/bitcoind.zmq"), "ipc:///tmp/bitcoind.zmq"),
+            (None, "tcp://10.0.0.5:28332"),
+        ] {
+            assert_eq!(CoreRpcConfig::resolve_zmq_addr(given, rpc), expected);
+        }
     }
 
     #[test]
@@ -1121,14 +1378,168 @@ pub(crate) mod tests {
         assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
     }
 
-    /// A Core 0.21 node answering only the backup/restore backend probe.
-    fn mock_core_v21() -> (CoreRPC, thread::JoinHandle<Vec<String>>) {
-        let info = json!({ "chain": "regtest", "blocks": 0, "headers": 0,
+    /// Core answers `rescanblockchain` only when the scan ends, long after
+    /// simple_http's default 15 s timeout.
+    #[test]
+    fn rescan_survives_long_scan_without_resend() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock core");
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.expect("accept core client");
+                let counter = Arc::clone(&counter);
+                thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    while let Some(request) = read_request(&mut reader) {
+                        assert_eq!(request["method"], "rescanblockchain");
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_secs(20));
+                        write_result(
+                            &mut writer,
+                            &request,
+                            json!({ "start_height": 0, "stop_height": 0 }),
+                        );
+                    }
+                });
+            }
+        });
+        let core = CoreRPC::new(&CoreRpcConfig {
+            url: addr.to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        core.rescan_wallet_from(0).unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A mock Core that answers each request after `delay`, as during a long
+    /// rescan or on a dead link, and records the method of each one it receives.
+    fn slow_core(delay: Duration) -> (CoreRpcConfig, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock core");
+        let addr = listener.local_addr().unwrap();
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&methods);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = stream.expect("accept core client");
+                let seen = Arc::clone(&seen);
+                thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    while let Some(request) = read_request(&mut reader) {
+                        let method = request["method"].as_str().unwrap().to_string();
+                        seen.lock().unwrap().push(method);
+                        thread::sleep(delay);
+                        write_result(&mut writer, &request, json!([{ "success": true }]));
+                    }
+                });
+            }
+        });
+        let config = CoreRpcConfig {
+            url: addr.to_string(),
+            ..Default::default()
+        };
+        (config, methods)
+    }
+
+    /// Sets `shutdown` while `backend` waits on an import, which must then
+    /// return `Interrupted` well before the mock's 20 s reply.
+    fn assert_shutdown_stops_the_wait(backend: &impl Blockchain, shutdown: Arc<AtomicBool>) {
+        let stop = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            shutdown.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let result = backend.import_descriptors(&[json!({ "desc": "raw(51)", "timestamp": 0 })]);
+        stop.join().unwrap();
+        assert!(
+            matches!(result, Err(WalletError::Interrupted(_))),
+            "{:?}",
+            result
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The scan is left to finish in Core: aborting it would leave the imported
+    /// range unscanned, and no RPC is needed for the shutdown to return.
+    #[test]
+    fn shutdown_stops_waiting_for_a_rescan() {
+        let (config, methods) = slow_core(Duration::from_secs(20));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let core = CoreRPC::with_shutdown_flag(&config, Arc::clone(&shutdown)).unwrap();
+        assert_shutdown_stops_the_wait(&core, shutdown);
+        assert_eq!(*methods.lock().unwrap(), ["importdescriptors"]);
+    }
+
+    /// Recovery sweeps and final syncs run after their owner's shutdown, so a
+    /// rescan they start must not be cut short.
+    #[test]
+    fn a_rescan_started_after_shutdown_runs_to_the_end() {
+        let (config, _) = slow_core(Duration::from_millis(1500));
+        let core = CoreRPC::with_shutdown_flag(&config, Arc::new(AtomicBool::new(true))).unwrap();
+        core.import_descriptors(&[json!({ "desc": "raw(51)", "timestamp": 0 })])
+            .unwrap();
+        core.rescan_wallet_from(0).unwrap();
+    }
+
+    #[test]
+    fn any_blockchain_gives_core_its_shutdown_flag() {
+        use crate::wallet::blockchain::{AnyBlockchain, BackendConfig};
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let backend = AnyBlockchain::from_config_with_shutdown(
+            &BackendConfig::CoreRpc(slow_core(Duration::from_secs(20)).0),
+            Arc::clone(&shutdown),
+        )
+        .unwrap();
+        assert_shutdown_stops_the_wait(&backend, shutdown);
+
+        let parent_shutdown = Arc::new(AtomicBool::new(false));
+        let parent = AnyBlockchain::from_config_with_shutdown(
+            &BackendConfig::CoreRpc(slow_core(Duration::from_secs(20)).0),
+            Arc::clone(&parent_shutdown),
+        )
+        .unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let consumer = parent
+            .new_connection_with_shutdown(Arc::clone(&shutdown))
+            .unwrap();
+        assert_shutdown_stops_the_wait(&consumer, shutdown);
+        assert!(!parent_shutdown.load(Ordering::SeqCst));
+    }
+
+    fn blockchain_info(chain: &str) -> Value {
+        json!({ "chain": chain, "blocks": 0, "headers": 0,
             "bestblockhash": "0".repeat(64), "difficulty": 0.0,
             "mediantime": 0, "verificationprogress": 1.0, "initialblockdownload": false,
-            "chainwork": "00", "size_on_disk": 0, "pruned": false, "warnings": "" });
+            "chainwork": "00", "size_on_disk": 0, "pruned": false, "warnings": "" })
+    }
+
+    #[test]
+    fn chain_name_maps_every_network() {
+        for (network, chain) in [
+            (Network::Bitcoin, "main"),
+            (Network::Testnet, "test"),
+            (Network::Testnet4, "testnet4"),
+            (Network::Signet, "signet"),
+            (Network::Regtest, "regtest"),
+        ] {
+            let (core, server) = mock_core(vec![
+                ("getblockchaininfo", blockchain_info(chain)),
+                ("getnetworkinfo", json!({ "version": 280100 })),
+            ]);
+            assert_eq!(core.chain_name().unwrap(), chain, "{network:?}");
+            server.join().unwrap();
+        }
+    }
+
+    /// A Core 0.21 node answering only the backup/restore backend probe.
+    fn mock_core_v21() -> (CoreRPC, thread::JoinHandle<Vec<String>>) {
         mock_core(vec![
-            ("getblockchaininfo", info),
+            ("getblockchaininfo", blockchain_info("regtest")),
             // Asked once by `get_blockchain_info` itself, once by the v22 gate.
             ("getnetworkinfo", json!({ "version": 210100 })),
             ("getnetworkinfo", json!({ "version": 210100 })),
