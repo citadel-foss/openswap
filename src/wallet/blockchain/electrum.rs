@@ -306,20 +306,21 @@ fn refusal_backoff(refusals: u8) -> Duration {
 /// True for errors that mean the request was answered, not that the transport
 /// failed. Reconnecting cannot help these. `NotSubscribed` is included because
 /// it is local client state, and after a rebuild it means "re-arm", not "retry".
-/// An answer that does not decode is terminal too, except a JSON error at EOF,
-/// which is how the client reports a connection the server closed.
+/// An answer that does not decode as hex or a bitcoin type is terminal too. A
+/// JSON error never is: the client also raises one for a notification it could
+/// not decode while reading another reply, and only a reconnect re-reads what
+/// that notification carried.
 fn is_terminal(e: &electrum_client::Error) -> bool {
     !is_rate_limited(e)
-        && match e {
+        && matches!(
+            e,
             electrum_client::Error::Protocol(_)
-            | electrum_client::Error::AlreadySubscribed(_)
-            | electrum_client::Error::NotSubscribed(_)
-            | electrum_client::Error::InvalidResponse(_)
-            | electrum_client::Error::Hex(_)
-            | electrum_client::Error::Bitcoin(_) => true,
-            electrum_client::Error::JSON(json) => !json.is_eof() && !json.is_io(),
-            _ => false,
-        }
+                | electrum_client::Error::AlreadySubscribed(_)
+                | electrum_client::Error::NotSubscribed(_)
+                | electrum_client::Error::InvalidResponse(_)
+                | electrum_client::Error::Hex(_)
+                | electrum_client::Error::Bitcoin(_)
+        )
 }
 
 /// True for a protocol error saying we sent too much. ElectrumX-family servers
@@ -2767,6 +2768,40 @@ pub(crate) mod tests {
         assert!(backend.may_have_missed(&script));
     }
 
+    /// A script whose last mempool transaction is evicted gets a `null` status,
+    /// which the client fails to decode while reading another reply.
+    #[test]
+    fn an_unreadable_script_notification_drops_cached_coins() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let coins = Arc::new(Mutex::new(vec![json!({
+            "height": 0, "tx_hash": "11".repeat(32), "tx_pos": 0, "value": 1_000
+        })]));
+        let server = {
+            let coins = coins.clone();
+            mock_electrum(move |method, _params| match method {
+                "blockchain.scripthash.subscribe" => Ok(json!("aa".repeat(32))),
+                "blockchain.scripthash.listunspent" => Ok(json!(coins.lock().unwrap().clone())),
+                method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+            })
+        };
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 1,
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        backend.watch_script(&script, None);
+        assert_eq!(backend.list_unspent(None, None).unwrap().len(), 1);
+        assert_eq!(backend.list_unspent(None, None).unwrap().len(), 1);
+
+        coins.lock().unwrap().clear();
+        server.notify(
+            "blockchain.scripthash.subscribe",
+            json!([scripthash(&script), null]),
+        );
+        assert!(backend.list_unspent(None, None).unwrap().is_empty());
+    }
+
     #[test]
     fn an_unreadable_header_notification_rereads_the_tip() {
         let server = mock_electrum(|method, _params| {
@@ -4048,9 +4083,9 @@ pub(crate) mod tests {
         assert!(is_terminal(&Error::NotSubscribed([0u8; 32].into())));
         // A transport-shaped error must stay retryable.
         assert!(!is_terminal(&Error::Message("socket closed".into())));
-        // An answer that does not decode is terminal; EOF is a closed socket.
+        // A JSON error may come from a notification, so it is retried.
         let bad_shape = serde_json::from_value::<u64>(json!("x")).unwrap_err();
-        assert!(is_terminal(&Error::JSON(bad_shape)));
+        assert!(!is_terminal(&Error::JSON(bad_shape)));
         let eof = serde_json::from_str::<Value>("").unwrap_err();
         assert!(!is_terminal(&Error::JSON(eof)));
     }
