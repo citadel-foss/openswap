@@ -311,10 +311,16 @@ pub(super) struct LnCapacity {
 /// the maker receiving over Lightning and paying from the on-chain wallet,
 /// so it is bounded by *inbound* capacity and by `wallet_max`. Channels that
 /// are not usable contribute nothing either way.
+///
+/// A swap-out's hold invoice asks for the amount *plus* the maker fee, so the
+/// fee has to fit in the inbound capacity too; `base_fee` and
+/// `amount_relative_fee_pct` are the terms that fee is charged at.
 pub(super) fn directional_limits(
     channels: &[ChannelInfo],
     wallet_max: u64,
     min_size: u64,
+    base_fee: u64,
+    amount_relative_fee_pct: f64,
 ) -> LnCapacity {
     let (outbound_msat, inbound_msat) = channels.iter().filter(|channel| channel.is_usable).fold(
         (0u64, 0u64),
@@ -326,13 +332,42 @@ pub(super) fn directional_limits(
         },
     );
     let max_swap_in = outbound_msat / 1000;
-    let max_swap_out = (inbound_msat / 1000).min(wallet_max);
+    let max_swap_out =
+        max_receivable_amount(inbound_msat / 1000, base_fee, amount_relative_fee_pct)
+            .min(wallet_max);
     LnCapacity {
         swap_in: max_swap_in >= min_size,
         max_swap_in,
         swap_out: max_swap_out >= min_size,
         max_swap_out,
     }
+}
+
+/// Largest amount whose invoice, the amount plus [`ln_fee`] on it, still fits
+/// in `inbound_sat`. The fee never decreases as the amount grows, so a binary
+/// search over the amount finds the exact boundary.
+fn max_receivable_amount(inbound_sat: u64, base_fee: u64, amount_relative_fee_pct: f64) -> u64 {
+    let fits = |amount: u64| {
+        let fee = ln_fee(base_fee, amount_relative_fee_pct, Amount::from_sat(amount));
+        amount.saturating_add(fee.to_sat()) <= inbound_sat
+    };
+    // Invariant: `low` is zero or fits, and nothing above `high` fits.
+    let (mut low, mut high) = (0, inbound_sat);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low
+}
+
+/// The maker fee charged on a Lightning swap of `amount`, in either direction.
+fn ln_fee(base_fee: u64, amount_relative_fee_pct: f64, amount: Amount) -> Amount {
+    let fee = base_fee as f64 + amount.to_sat() as f64 * amount_relative_fee_pct / 100.0;
+    Amount::from_sat(fee.ceil() as u64)
 }
 
 /// Everything the Lightning handlers need from the maker; bails with a
@@ -542,9 +577,11 @@ fn validate_terms<M: Maker>(
              after {min_confirmations} confirmation(s)"
         ));
     }
-    let fee =
-        offer.base_fee as f64 + amount.to_sat() as f64 * offer.amount_relative_fee_pct / 100.0;
-    Ok(Amount::from_sat(fee.ceil() as u64))
+    Ok(ln_fee(
+        offer.base_fee,
+        offer.amount_relative_fee_pct,
+        amount,
+    ))
 }
 
 fn store_swap<M: Maker>(
@@ -2037,14 +2074,14 @@ mod tests {
     #[test]
     fn directions_are_bounded_by_opposite_channel_sides() {
         // Freshly opened channel: all outbound, no inbound.
-        let limits = directional_limits(&[channel(500_000, 0, true)], u64::MAX, 10_000);
+        let limits = directional_limits(&[channel(500_000, 0, true)], u64::MAX, 10_000, 0, 0.0);
         assert!(limits.swap_in);
         assert_eq!(limits.max_swap_in, 500_000);
         assert!(!limits.swap_out, "no inbound capacity means no swap-outs");
         assert_eq!(limits.max_swap_out, 0);
 
         // Fully drained the other way: inbound only.
-        let limits = directional_limits(&[channel(0, 500_000, true)], u64::MAX, 10_000);
+        let limits = directional_limits(&[channel(0, 500_000, true)], u64::MAX, 10_000, 0, 0.0);
         assert!(!limits.swap_in);
         assert_eq!(limits.max_swap_in, 0);
         assert!(limits.swap_out);
@@ -2055,13 +2092,23 @@ mod tests {
     /// while a swap-in, which pays over Lightning, is untouched by that.
     #[test]
     fn wallet_caps_only_the_swap_out_direction() {
-        let limits = directional_limits(&[channel(500_000, 500_000, true)], 80_000, 10_000);
+        let limits = directional_limits(&[channel(500_000, 500_000, true)], 80_000, 10_000, 0, 0.0);
         assert_eq!(limits.max_swap_in, 500_000);
+        assert_eq!(limits.max_swap_out, 80_000);
+
+        // With a fee, inbound still covers 98_019 sats, so the wallet stays the bound.
+        let limits = directional_limits(
+            &[channel(500_000, 100_000, true)],
+            80_000,
+            10_000,
+            1_000,
+            1.0,
+        );
         assert_eq!(limits.max_swap_out, 80_000);
 
         // An unreadable wallet is reported as no on-chain capacity, which
         // must disable swap-outs rather than advertise an unbacked one.
-        let limits = directional_limits(&[channel(500_000, 500_000, true)], 0, 10_000);
+        let limits = directional_limits(&[channel(500_000, 500_000, true)], 0, 10_000, 0, 0.0);
         assert!(limits.swap_in);
         assert!(!limits.swap_out);
     }
@@ -2075,7 +2122,7 @@ mod tests {
             channel(999_999, 999_999, false),
             channel(200_000, 4_000, true),
         ];
-        let limits = directional_limits(&channels, u64::MAX, 10_000);
+        let limits = directional_limits(&channels, u64::MAX, 10_000, 0, 0.0);
         assert_eq!(
             limits.max_swap_in, 500_000,
             "unusable channels contribute nothing"
@@ -2084,9 +2131,39 @@ mod tests {
         assert!(limits.swap_in && limits.swap_out);
 
         // Below min_size the direction is withdrawn, not advertised small.
-        let limits = directional_limits(&[channel(300_000, 9_999, true)], u64::MAX, 10_000);
+        let limits = directional_limits(&[channel(300_000, 9_999, true)], u64::MAX, 10_000, 0, 0.0);
         assert!(limits.swap_in);
         assert!(!limits.swap_out);
+    }
+
+    /// The taker pays a swap-out's amount plus the maker fee over Lightning,
+    /// so the advertised maximum must leave room for the fee in the inbound
+    /// capacity, or the largest advertised swap-out could never be paid.
+    #[test]
+    fn swap_out_limit_leaves_inbound_room_for_the_fee() {
+        let (base_fee, pct) = (1_000, 1.0);
+        let limits = directional_limits(
+            &[channel(0, 100_000, true)],
+            u64::MAX,
+            10_000,
+            base_fee,
+            pct,
+        );
+        // 98_019 + ceil(1_000 + 980.19) = 100_000, while one sat more would
+        // need a 100_001 sat invoice.
+        assert_eq!(limits.max_swap_out, 98_019);
+        let invoice =
+            |amount: u64| amount + ln_fee(base_fee, pct, Amount::from_sat(amount)).to_sat();
+        assert_eq!(invoice(limits.max_swap_out), 100_000);
+        assert!(invoice(limits.max_swap_out + 1) > 100_000);
+
+        // Inbound that covers the minimum swap but not its fee serves nothing.
+        let limits = directional_limits(&[channel(0, 10_500, true)], u64::MAX, 10_000, 1_000, 0.0);
+        assert!(!limits.swap_out);
+
+        // A base fee above the whole inbound capacity leaves nothing.
+        let limits = directional_limits(&[channel(0, 500, true)], u64::MAX, 0, 1_000, 0.0);
+        assert_eq!(limits.max_swap_out, 0);
     }
 
     /// Promotion moves a connection from the server's short pending deadline

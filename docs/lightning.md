@@ -175,7 +175,9 @@ offer, so it tracks reality rather than a number you configured:
 - **`max_swap_in`** — bounded by your **outbound** channel capacity, since you
   pay over Lightning.
 - **`max_swap_out`** — bounded by your **inbound** channel capacity *and* your
-  on-chain wallet, since you receive over Lightning and pay out on-chain.
+  on-chain wallet, since you receive over Lightning and pay out on-chain. The
+  taker pays the amount plus your fee over Lightning, so the fee is taken out
+  of the inbound capacity first.
 - **`min_size`** — your usual minimum swap amount.
 - **`base_fee` / `amount_relative_fee_pct`** — reused from your existing fee
   settings (see [the fee policy](./fee-policy.md)); there is no separate
