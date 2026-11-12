@@ -44,7 +44,10 @@ use openswap::{
 
 use crate::test_framework::*;
 
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{
+    AtomicBool,
+    Ordering::{Relaxed, SeqCst},
+};
 
 fn ln_message(msg: LightningTakerMessage) -> TakerToMakerMessage {
     TakerToMakerMessage::Lightning(Box::new(msg))
@@ -259,11 +262,6 @@ fn backdate_past_watchdog_idle(maker: &MakerServer, swap_id: &str) {
     maker_lightning = [ln.clone()],
     setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
 )]
-// The watcher answers a query for a watched, unspent outpoint with
-// `UtxoSpent { spending_tx: None }`, which `watchdog_resolve_swap_out` reads
-// as "spent, tx not known yet" and retries forever, so the refund branch is
-// never reached. Un-ignore once that is fixed.
-#[ignore = "the watchdog never reaches its swap-out refund branch (issue #1127)"]
 fn lightning_maker_restart_refunds_unclaimed_swap_out(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
@@ -373,6 +371,371 @@ fn lightning_maker_restart_refunds_unclaimed_swap_out(
     assert!(
         ln.claim_held_payment(&preimage).is_err(),
         "the refunded swap's held payment must be failed back"
+    );
+}
+
+/// The maker's refund can leave the mempool while the watcher still has it
+/// on record as the HTLC's spend. Waiting for that spend to confirm would
+/// wait forever, so the watchdog sends the recorded refund again, and the
+/// swap closes, failing its held payment, only once the refund confirms.
+///
+/// The eviction is real: unwinding the chain below the refund's CSV height
+/// makes bitcoind drop it as no longer final, and restoring the chain does
+/// not bring it back.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_rebroadcasts_an_evicted_refund(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    use openswap::watch_tower::watcher::WatcherEvent;
+
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    let locktime: u16 = 30;
+
+    let preimage = Preimage([0x79; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    let funded = fund_swap_out(
+        &maker,
+        &ln,
+        preimage.payment_hash(),
+        Amount::from_sat(40_000),
+        locktime,
+    );
+    generate_blocks(bitcoind, 1);
+    let funded_at = bitcoind.client.get_block_count().unwrap()
+        - confirmations(bitcoind, &funded.outpoint.txid) as u64
+        + 1;
+    // Past the CSV with a block to spare, so the refund is final.
+    mine_to(bitcoind, funded_at + locktime as u64 + 1);
+
+    // ---- The watchdog refunds, and the watcher records the refund ----
+    ln_watchdog_tick_now(&maker);
+    let refund_txid = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .and_then(|swap| swap.refund_txid)
+        .expect("the watchdog broadcast a refund");
+    let in_mempool = |txid: &Txid| bitcoind.client.get_mempool_entry(txid).is_ok();
+    assert!(in_mempool(&refund_txid));
+    let recorded_spend = || match maker.watch_service.watch_request(funded.outpoint) {
+        Ok(WatcherEvent::UtxoSpent { spending_tx, .. }) => spending_tx.map(|tx| tx.compute_txid()),
+        other => panic!("unexpected watcher answer: {:?}", other),
+    };
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the watcher to record the refund",
+        recorded_spend() == Some(refund_txid)
+    );
+
+    // ---- Evict it: below the CSV height it is no longer final ----
+    let tip = bitcoind.client.get_block_count().unwrap();
+    let unwound = bitcoind
+        .client
+        .get_block_hash(funded_at + locktime as u64 - 1)
+        .unwrap();
+    bitcoind.client.invalidate_block(&unwound).unwrap();
+    assert!(
+        !in_mempool(&refund_txid),
+        "the unwound chain kept the refund"
+    );
+    bitcoind.client.reconsider_block(&unwound).unwrap();
+    assert_eq!(bitcoind.client.get_block_count().unwrap(), tip);
+    assert!(
+        !in_mempool(&refund_txid),
+        "restoring the chain restored the refund"
+    );
+    // The watcher still names the evicted refund as the spend.
+    assert_eq!(recorded_spend(), Some(refund_txid));
+
+    // ---- The watchdog sends it again, and keeps the swap open ----
+    ln_watchdog_tick_now(&maker);
+    assert!(
+        in_mempool(&refund_txid),
+        "the evicted refund was never sent again"
+    );
+    // Further passes change nothing until it confirms.
+    ln_watchdog_tick_now(&maker);
+    let swap = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .expect("the swap stays open");
+    assert_eq!(swap.phase, LnMakerPhase::OutFunded);
+    assert_eq!(swap.refund_txid, Some(refund_txid));
+    assert!(in_mempool(&refund_txid));
+
+    // ---- Once it confirms, the swap closes and the payment fails back ----
+    generate_blocks(bitcoind, 1);
+    assert!(confirmations(bitcoind, &refund_txid) >= 1);
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the maker to close the refunded swap",
+        {
+            ln_watchdog_tick_now(&maker);
+            maker.get_ln_swap(&swap_id).unwrap().is_none()
+        }
+    );
+    assert!(
+        ln.claim_held_payment(&preimage).is_err(),
+        "the refunded swap's held payment must be failed back"
+    );
+}
+
+/// Holds a watchdog test switch on until dropped, even if the test panics.
+struct Switch(&'static AtomicBool);
+
+impl Switch {
+    fn on(switch: &'static AtomicBool) -> Self {
+        switch.store(true, SeqCst);
+        Self(switch)
+    }
+}
+
+impl Drop for Switch {
+    fn drop(&mut self) {
+        self.0.store(false, SeqCst);
+    }
+}
+
+/// A test that panics while holding a [`Switch`] still leaves it off.
+#[test]
+fn switch_resets_on_panic() {
+    static FLAG: AtomicBool = AtomicBool::new(false);
+    let _ = std::panic::catch_unwind(|| {
+        let _on = Switch::on(&FLAG);
+        panic!("held");
+    });
+    assert!(!FLAG.load(SeqCst));
+}
+
+/// A crash in the middle of the watchdog's refund, between recording it and
+/// broadcasting it, must leave a restarted maker able to finish it: send the
+/// refund, recognise it as its own, and close the swap once it confirms.
+/// Broadcasting first could leave a refund that confirmed while the maker
+/// was down and that the restarted maker did not know was its own, so the
+/// swap never closed.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_restart_recovers_an_interrupted_refund(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    use openswap::maker::lightning_handlers::INTERRUPT_REFUND;
+
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    let locktime: u16 = 30;
+
+    let preimage = Preimage([0x7a; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    let funded = fund_swap_out(
+        &maker,
+        &ln,
+        preimage.payment_hash(),
+        Amount::from_sat(40_000),
+        locktime,
+    );
+    generate_blocks(bitcoind, 1);
+    let funded_at = bitcoind.client.get_block_count().unwrap()
+        - confirmations(bitcoind, &funded.outpoint.txid) as u64
+        + 1;
+    mine_to(bitcoind, funded_at + locktime as u64 + 1);
+
+    // ---- The refund is interrupted, and the maker goes down ----
+    let interrupted = Switch::on(&INTERRUPT_REFUND);
+    ln_watchdog_tick_now(&maker);
+    drop(interrupted);
+    let recorded = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .and_then(|swap| swap.refund_txid);
+    let in_mempool = |txid: &Txid| bitcoind.client.get_mempool_entry(txid).is_ok();
+    let sent_before_recorded = recorded.is_some_and(|txid| in_mempool(&txid));
+    // The maker stays down long enough for anything it sent to confirm.
+    generate_blocks(bitcoind, 1);
+
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(maker);
+    world.drop_makers();
+    let mut restarted = MakerServer::init(config).expect("maker restarts");
+    restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
+    world.adopt_makers([Arc::new(restarted)]);
+    let maker = world.makers()[0].inner().clone();
+
+    // ---- The restarted maker refunds and closes the swap ----
+    ln_watchdog_tick_now(&maker);
+    generate_blocks(bitcoind, 1);
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the restarted maker to close the refunded swap",
+        {
+            ln_watchdog_tick_now(&maker);
+            maker.get_ln_swap(&swap_id).unwrap().is_none()
+        }
+    );
+    assert!(
+        ln.claim_held_payment(&preimage).is_err(),
+        "the refunded swap's held payment must be failed back"
+    );
+
+    // The txid recorded before the crash named the refund that confirmed,
+    // and nothing reached the network before it was recorded.
+    let recorded = recorded.expect("the refund was recorded before the crash");
+    assert!(!sent_before_recorded);
+    assert!(confirmations(bitcoind, &recorded) >= 1);
+    assert_eq!(
+        raw_tx_with_retry(bitcoind, &recorded)
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect::<Vec<_>>(),
+        vec![funded.outpoint]
+    );
+}
+
+/// While a Core re-check after lost notifications is pending, the watcher
+/// answers "no spend" for an HTLC the taker may already have claimed. Past
+/// the CSV that answer must not send the maker's refund, which the chain
+/// would reject anyway; the chain decides, here and after a restart. Once
+/// the watcher has the claim, the maker settles the held payment from its
+/// preimage.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    use openswap::maker::lightning_handlers::HIDE_HTLC_SPENDS;
+
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    let locktime: u16 = 30;
+
+    let preimage = Preimage([0x7b; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    let funded = fund_swap_out(
+        &maker,
+        &ln,
+        preimage.payment_hash(),
+        Amount::from_sat(40_000),
+        locktime,
+    );
+    generate_blocks(bitcoind, 1);
+    let funded_at = bitcoind.client.get_block_count().unwrap()
+        - confirmations(bitcoind, &funded.outpoint.txid) as u64
+        + 1;
+    // Past the CSV, so only the chain stands between the watchdog and a refund.
+    mine_to(bitcoind, funded_at + locktime as u64 + 1);
+
+    // ---- The taker claims, and the watcher does not say so ----
+    let hidden = Switch::on(&HIDE_HTLC_SPENDS);
+    let swap = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .expect("the swap is open");
+    let (_, value) = swap.funding.expect("the swap is funded");
+    let destination = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap()
+        .script_pubkey();
+    let claim = swap
+        .htlc
+        .create_hashlock_spend(
+            funded.outpoint,
+            value,
+            &SecretKey::from_slice(&[0x31; 32]).unwrap(),
+            &preimage,
+            destination,
+        )
+        .unwrap();
+    let claim_txid = bitcoind.client.send_raw_transaction(&claim).unwrap();
+    generate_blocks(bitcoind, 1);
+    assert!(confirmations(bitcoind, &claim_txid) >= 1);
+
+    let no_refund = |maker: &Arc<MakerServer>| {
+        let swap = maker
+            .get_ln_swap(&swap_id)
+            .unwrap()
+            .expect("the swap stays open");
+        assert_eq!(swap.phase, LnMakerPhase::OutFunded);
+        assert_eq!(
+            swap.refund_txid, None,
+            "the maker refunded an HTLC the taker had claimed"
+        );
+    };
+    ln_watchdog_tick_now(&maker);
+    no_refund(&maker);
+
+    // ---- Still unseen after a restart ----
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(maker);
+    world.drop_makers();
+    let mut restarted = MakerServer::init(config).expect("maker restarts");
+    restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
+    world.adopt_makers([Arc::new(restarted)]);
+    let maker = world.makers()[0].inner().clone();
+    ln_watchdog_tick_now(&maker);
+    no_refund(&maker);
+
+    // ---- Once the watcher has the claim, the preimage settles the swap ----
+    drop(hidden);
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the maker to settle from the taker's claim",
+        {
+            ln_watchdog_tick_now(&maker);
+            maker.get_ln_swap(&swap_id).unwrap().is_none()
+        }
+    );
+    let mut released = None;
+    while let Some(event) = ln.poll_event().unwrap() {
+        if let LnEvent::PaymentSuccessful {
+            preimage: Some(preimage),
+            ..
+        } = event
+        {
+            released = Some(preimage);
+        }
+    }
+    assert_eq!(
+        released,
+        Some(preimage),
+        "the held payment must be settled with the claim's preimage"
     );
 }
 

@@ -626,6 +626,8 @@ check_blocklist = false
 - `check_blocklist`: Set to `true` to refuse swaps funded from a listed address. Off by default. See the [blocklist doc](blocklist.md).
 - `ldk_server_url`, `ldk_api_key_path`, `ldk_tls_cert_path`: Optional keys that connect the taker to a Lightning node. They are absent by default. See the [Lightning doc](lightning.md).
 
+Every number and `true`/`false` value must be readable. If one is not, `taker` stops at startup and names the key. It does not fall back to the default. Put comments on their own line, not after a value. Booleans are lowercase.
+
 ### Wallets
 
 The taker uses wallet files to store the wallet data. The wallet files are stored in the `wallets` directory. These wallet files should be safely backed up as they contain the private keys to the wallet.
