@@ -558,7 +558,10 @@ impl<R: Role> Watcher<R> {
                 // spend, and a spend that only ever sat in the mempool and was
                 // evicted means no claim happened, so nothing needs recovering.
                 Ok(None) => {}
-                Err(e) => log::warn!("funding height lookup failed for {outpoint}: {e}"),
+                Err(e) => {
+                    log::warn!("funding height lookup failed for {outpoint}: {e}");
+                    return Err(format!("funding height lookup failed for {outpoint}: {e}"));
+                }
             }
         }
         let Some(from) = oldest else { return Ok(()) };
@@ -1522,6 +1525,138 @@ mod tests {
             .into_iter()
             .find(|watch| watch.outpoint == outpoint)
             .and_then(|watch| watch.spent_tx)
+    }
+
+    /// A newer funding height cannot bound recovery when an older lookup fails.
+    #[test]
+    fn rebuild_retries_when_older_funding_height_lookup_fails() {
+        let old_funding = spend(OutPoint::new(Txid::from_byte_array([1; 32]), 0));
+        let newer_funding = spend(OutPoint::new(Txid::from_byte_array([2; 32]), 0));
+        let old_outpoint = OutPoint::new(old_funding.compute_txid(), 0);
+        let newer_outpoint = OutPoint::new(newer_funding.compute_txid(), 0);
+        let missed_spend = spend(old_outpoint);
+        let node = Arc::new(Mutex::new(Node::default()));
+        {
+            let mut node = node.lock().unwrap();
+            node.mine(Vec::new());
+            node.mine(vec![old_funding]);
+            node.mine(vec![missed_spend.clone()]);
+            node.mine(vec![newer_funding]);
+        }
+        let fail_old_lookup = Arc::new(AtomicBool::new(true));
+        let scanned_heights = Arc::new(Mutex::new(Vec::new()));
+        let (url, _calls) = mock_core_rpc({
+            let node = node.clone();
+            let fail_old_lookup = fail_old_lookup.clone();
+            let scanned_heights = scanned_heights.clone();
+            move |method, params| {
+                if method == "getrawtransaction"
+                    && params[0] == json!(old_outpoint.txid)
+                    && fail_old_lookup.swap(false, Ordering::SeqCst)
+                {
+                    return Err(json!({ "code": -28, "message": "funding lookup unavailable" }));
+                }
+                if method == "getblockhash" {
+                    scanned_heights
+                        .lock()
+                        .unwrap()
+                        .push(params[0].as_u64().unwrap());
+                }
+                node.lock().unwrap().answer(method, params)
+            }
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        let watches = [
+            (old_outpoint, ScriptBuf::new()),
+            (newer_outpoint, ScriptBuf::new()),
+        ];
+        for (outpoint, script) in &watches {
+            watcher
+                .registry
+                .register_watch(*outpoint, script.clone())
+                .unwrap();
+        }
+        assert_eq!(
+            watcher
+                .blockchain
+                .tx_block_height(&newer_outpoint.txid)
+                .unwrap(),
+            Some(3)
+        );
+
+        let result = watcher.rescan_for_missed_spends(&watches);
+        assert_eq!(recorded_spend(&watcher, old_outpoint), None);
+        assert!(
+            result.is_err(),
+            "recovery reported success while missing the earlier spend: {:?}",
+            result
+        );
+
+        assert!(scanned_heights.lock().unwrap().is_empty());
+        // Fail once more inside the command handler, then let its retry recover.
+        fail_old_lookup.store(true, Ordering::SeqCst);
+        let shutdown = watcher.shutdown.clone();
+        let (reply, answer) = crossbeam_channel::bounded(1);
+        let handle = thread::spawn(move || {
+            watcher.handle_command(WatcherCommand::RebuildWatches {
+                watches: watches.to_vec(),
+                reply,
+            });
+            watcher
+        });
+        let result = answer.recv_timeout(Duration::from_secs(15));
+        if result.is_err() {
+            shutdown.store(true, Ordering::SeqCst);
+        }
+        assert_eq!(
+            result.expect("rebuild should finish after the transient error"),
+            Ok(())
+        );
+        let watcher = handle.join().unwrap();
+        assert_eq!(recorded_spend(&watcher, old_outpoint), Some(missed_spend));
+        assert_eq!(*scanned_heights.lock().unwrap(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn rebuild_distinguishes_unmined_funding_from_lookup_failure() {
+        let funding = spend(OutPoint::new(Txid::from_byte_array([7; 32]), 0));
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        for (response, should_retry) in [
+            (Ok(verbose_tx(&funding)), false),
+            (
+                Err(json!({ "code": -5, "message": "unknown transaction" })),
+                false,
+            ),
+            (
+                Err(json!({ "code": -28, "message": "RPC unavailable" })),
+                true,
+            ),
+        ] {
+            let (url, calls) = mock_core_rpc(move |method, _params| {
+                assert_eq!(method, "getrawtransaction");
+                response.clone()
+            });
+            let mut watcher = core_watcher(&CoreRpcConfig {
+                url,
+                ..CoreRpcConfig::default()
+            });
+            let watches = [(outpoint, ScriptBuf::new())];
+
+            assert_eq!(
+                watcher.rescan_for_missed_spends(&watches).is_err(),
+                should_retry
+            );
+            assert_eq!(*calls.lock().unwrap(), ["getrawtransaction"]);
+
+            calls.lock().unwrap().clear();
+            watcher.rescan_for_missed_spends(&[]).unwrap();
+            watcher.shutdown.store(true, Ordering::SeqCst);
+            watcher.rescan_for_missed_spends(&watches).unwrap();
+            assert!(calls.lock().unwrap().is_empty());
+        }
     }
 
     /// Core dropped `rawtx` seq 1, the spend of a watched outpoint. The gap in

@@ -594,6 +594,8 @@ openswap watch_tower::watcher::tests::never_broadcast_outpoint_leaves_the_queue
 openswap watch_tower::watcher::tests::orphaned_spend_is_kept_until_its_replacement_is_found
 openswap watch_tower::watcher::tests::outage_answers_every_request_within_a_bound
 openswap watch_tower::watcher::tests::re_arm_on_a_failing_connection_stops_at_the_first_failure
+openswap watch_tower::watcher::tests::rebuild_distinguishes_unmined_funding_from_lookup_failure
+openswap watch_tower::watcher::tests::rebuild_retries_when_older_funding_height_lookup_fails
 openswap watch_tower::watcher::tests::rebuilt_watch_that_cannot_subscribe_is_recovered
 openswap watch_tower::watcher::tests::refused_re_arm_keeps_watches_blind_without_spinning
 openswap watch_tower::watcher::tests::reorged_out_spend_gives_way_to_the_spend_on_chain
