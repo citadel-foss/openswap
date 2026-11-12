@@ -7,6 +7,7 @@ use std::{
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
         Arc, Mutex,
     },
     thread,
@@ -225,11 +226,11 @@ impl ZmqSubscriber {
 pub struct CoreRPC {
     rpc: Client,
     /// Same endpoint as `rpc`, with [`RESCAN_TIMEOUT`] for the calls that rescan.
-    rescan_rpc: Client,
+    rescan_rpc: Arc<Client>,
     config: CoreRpcConfig,
     /// `rawtx`/`rawblock` subscriber, established lazily by the watchtower.
     zmq: ZmqSubscriber,
-    /// Set by the owner to abort a pending rescan.
+    /// Set by the owner to stop waiting for a pending rescan.
     shutdown: Arc<AtomicBool>,
 }
 
@@ -249,15 +250,15 @@ impl std::fmt::Debug for CoreRPC {
 
 impl CoreRPC {
     /// Connect an RPC client for the configured wallet endpoint. Cheap — the
-    /// client connects lazily on first use. Nothing can abort its rescans; an
-    /// owner that shuts down uses [`CoreRPC::with_shutdown_flag`].
+    /// client connects lazily on first use. A rescan holds its caller until it
+    /// ends; an owner that shuts down uses [`CoreRPC::with_shutdown_flag`].
     pub fn new(config: &CoreRpcConfig) -> Result<Self, WalletError> {
         Self::with_shutdown_flag(config, Arc::new(AtomicBool::new(false)))
     }
 
-    /// Like [`CoreRPC::new`], but setting `shutdown` aborts a pending rescan,
-    /// so a rescan cannot hold the owner's shutdown for hours. Used by
-    /// `AnyBlockchain::from_config_with_shutdown`.
+    /// Like [`CoreRPC::new`], but setting `shutdown` stops waiting for a
+    /// pending rescan, so a rescan cannot hold the owner's shutdown for hours.
+    /// Used by `AnyBlockchain::from_config_with_shutdown`.
     pub(crate) fn with_shutdown_flag(
         config: &CoreRpcConfig,
         shutdown: Arc<AtomicBool>,
@@ -271,7 +272,9 @@ impl CoreRPC {
         if let (Some(user), pass) = config.auth.clone().get_user_pass()? {
             builder = builder.auth(user, pass);
         }
-        let rescan_rpc = Client::from_jsonrpc(jsonrpc::Client::with_transport(builder.build()));
+        let rescan_rpc = Arc::new(Client::from_jsonrpc(jsonrpc::Client::with_transport(
+            builder.build(),
+        )));
         Ok(Self {
             rpc,
             rescan_rpc,
@@ -282,7 +285,7 @@ impl CoreRPC {
     }
 
     /// Open a fresh Bitcoin Core RPC connection with the same config and the
-    /// same shutdown flag, so the owner's shutdown also aborts its rescans.
+    /// same shutdown flag, so the owner's shutdown also ends its rescan waits.
     ///
     /// Used to give a separate consumer (e.g. the watchtower discovery thread)
     /// its own connection without threading the config around separately.
@@ -290,8 +293,8 @@ impl CoreRPC {
         Self::with_shutdown_flag(&self.config, self.shutdown.clone())
     }
 
-    /// Open a fresh connection whose rescans the consumer's own `shutdown`
-    /// aborts. Used by `AnyBlockchain::new_connection_with_shutdown`.
+    /// Open a fresh connection whose rescan waits end on the consumer's own
+    /// `shutdown`. Used by `AnyBlockchain::new_connection_with_shutdown`.
     pub(crate) fn reconnect_with_shutdown(
         &self,
         shutdown: Arc<AtomicBool>,
@@ -299,37 +302,38 @@ impl CoreRPC {
         Self::with_shutdown_flag(&self.config, shutdown)
     }
 
-    /// Run a call Core answers only when its rescan ends. Nothing interrupts
-    /// the pending request, so a shutdown aborts the rescan itself.
-    fn rescan_call<T: serde::de::DeserializeOwned>(
+    /// Run a call Core answers only when its rescan ends. A shutdown stops the
+    /// wait, not the scan: Core finishes it either way, so no imported range is
+    /// left unscanned, and no RPC has to succeed for the shutdown to return.
+    fn rescan_call<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
-        method: &str,
-        params: &[Value],
+        method: &'static str,
+        params: Vec<Value>,
     ) -> Result<T, WalletError> {
         if self.shutdown.load(Ordering::SeqCst) {
             return Err(WalletError::Interrupted("Shutdown requested"));
         }
-        let done = AtomicBool::new(false);
-        let result = thread::scope(|scope| {
-            let watcher = scope.spawn(|| {
-                while !done.load(Ordering::SeqCst) {
-                    // Repeated: an abort sent before Core starts the scan is a no-op.
-                    if self.shutdown.load(Ordering::SeqCst) {
-                        let _: Result<bool, _> = self.rpc.call("abortrescan", &[]);
-                    }
-                    thread::park_timeout(Duration::from_millis(500));
+        let client = Arc::clone(&self.rescan_rpc);
+        let (reply, replied) = mpsc::channel();
+        thread::Builder::new()
+            .name(format!("core-{method}"))
+            .spawn(move || {
+                let _ = reply.send(client.call::<T>(method, &params));
+            })
+            .map_err(WalletError::IO)?;
+        loop {
+            match replied.recv_timeout(Duration::from_millis(500)) {
+                Ok(result) => return Ok(result?),
+                Err(RecvTimeoutError::Timeout) if self.shutdown.load(Ordering::SeqCst) => {
+                    return Err(WalletError::Interrupted("Shutdown requested"));
                 }
-            });
-            let result = self.rescan_rpc.call(method, params);
-            done.store(true, Ordering::SeqCst);
-            watcher.thread().unpark();
-            result
-        });
-        match result {
-            Err(_) if self.shutdown.load(Ordering::SeqCst) => {
-                Err(WalletError::Interrupted("Shutdown requested"))
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(WalletError::General(format!(
+                        "Core {method} ended without a reply"
+                    )));
+                }
             }
-            result => Ok(result?),
         }
     }
 
@@ -767,7 +771,7 @@ impl Blockchain for CoreRPC {
 
     fn import_descriptors(&self, requests: &[Value]) -> Result<(), WalletError> {
         let results: Vec<Value> =
-            self.rescan_call("importdescriptors", &[Value::Array(requests.to_vec())])?;
+            self.rescan_call("importdescriptors", vec![Value::Array(requests.to_vec())])?;
         // Core rejects a descriptor in its own result, not as an RPC error.
         let failures: Vec<String> = requests
             .iter()
@@ -786,7 +790,7 @@ impl Blockchain for CoreRPC {
     }
 
     fn rescan_wallet_from(&self, height: u64) -> Result<(), WalletError> {
-        let _: Value = self.rescan_call("rescanblockchain", &[json!(height)])?;
+        let _: Value = self.rescan_call("rescanblockchain", vec![json!(height)])?;
         Ok(())
     }
 
@@ -1134,64 +1138,39 @@ pub(crate) mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
-    /// A mock Core that holds each rescan until `abortrescan` arrives, then
-    /// fails it as Core does, or answers after 20 s if no abort comes.
-    fn abortable_core() -> CoreRpcConfig {
+    /// A mock Core that answers no request for 20 s, as during a long rescan
+    /// or on a dead link, and records the method of each one it receives.
+    fn unresponsive_core() -> (CoreRpcConfig, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock core");
         let addr = listener.local_addr().unwrap();
-        let aborted = Arc::new(AtomicBool::new(false));
-        let server_aborted = Arc::clone(&aborted);
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&methods);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let stream = stream.expect("accept core client");
-                let aborted = Arc::clone(&server_aborted);
+                let seen = Arc::clone(&seen);
                 thread::spawn(move || {
                     let mut writer = stream.try_clone().unwrap();
                     let mut reader = BufReader::new(stream);
                     while let Some(request) = read_request(&mut reader) {
                         let method = request["method"].as_str().unwrap().to_string();
-                        if method == "abortrescan" {
-                            aborted.store(true, Ordering::SeqCst);
-                            write_result(&mut writer, &request, json!(true));
-                            continue;
-                        }
-                        assert!(
-                            method == "rescanblockchain" || method == "importdescriptors",
-                            "unexpected call {}",
-                            method
-                        );
-                        let started = Instant::now();
-                        while !aborted.load(Ordering::SeqCst)
-                            && started.elapsed() < Duration::from_secs(20)
-                        {
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                        if !aborted.swap(false, Ordering::SeqCst) {
-                            write_result(&mut writer, &request, json!([{ "success": true }]));
-                            continue;
-                        }
-                        let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": null,
-                            "error": { "code": -1, "message": "Rescan aborted by user." } })
-                        .to_string();
-                        let _ = write!(
-                            writer,
-                            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
-                            reply.len()
-                        )
-                        .and_then(|()| writer.flush());
+                        seen.lock().unwrap().push(method);
+                        thread::sleep(Duration::from_secs(20));
+                        write_result(&mut writer, &request, json!([{ "success": true }]));
                     }
                 });
             }
         });
-        CoreRpcConfig {
+        let config = CoreRpcConfig {
             url: addr.to_string(),
             ..Default::default()
-        }
+        };
+        (config, methods)
     }
 
     /// Sets `shutdown` while `backend` waits on an import, which must then
-    /// return `Interrupted` well before the mock's 20 s fallback.
-    fn assert_shutdown_aborts_import(backend: &impl Blockchain, shutdown: Arc<AtomicBool>) {
+    /// return `Interrupted` well before the mock's 20 s reply.
+    fn assert_shutdown_stops_the_wait(backend: &impl Blockchain, shutdown: Arc<AtomicBool>) {
         let stop = thread::spawn(move || {
             thread::sleep(Duration::from_millis(200));
             shutdown.store(true, Ordering::SeqCst);
@@ -1204,14 +1183,18 @@ pub(crate) mod tests {
             "{:?}",
             result
         );
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+    /// The scan is left to finish in Core: aborting it would leave the imported
+    /// range unscanned, and no RPC is needed for the shutdown to return.
     #[test]
-    fn shutdown_aborts_a_pending_rescan() {
+    fn shutdown_stops_waiting_for_a_rescan() {
+        let (config, methods) = unresponsive_core();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let core = CoreRPC::with_shutdown_flag(&abortable_core(), Arc::clone(&shutdown)).unwrap();
-        assert_shutdown_aborts_import(&core, shutdown);
+        let core = CoreRPC::with_shutdown_flag(&config, Arc::clone(&shutdown)).unwrap();
+        assert_shutdown_stops_the_wait(&core, shutdown);
+        assert_eq!(*methods.lock().unwrap(), ["importdescriptors"]);
         assert!(matches!(
             core.rescan_wallet_from(0),
             Err(WalletError::Interrupted(_))
@@ -1224,15 +1207,15 @@ pub(crate) mod tests {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let backend = AnyBlockchain::from_config_with_shutdown(
-            &BackendConfig::CoreRpc(abortable_core()),
+            &BackendConfig::CoreRpc(unresponsive_core().0),
             Arc::clone(&shutdown),
         )
         .unwrap();
-        assert_shutdown_aborts_import(&backend, shutdown);
+        assert_shutdown_stops_the_wait(&backend, shutdown);
 
         let parent_shutdown = Arc::new(AtomicBool::new(false));
         let parent = AnyBlockchain::from_config_with_shutdown(
-            &BackendConfig::CoreRpc(abortable_core()),
+            &BackendConfig::CoreRpc(unresponsive_core().0),
             Arc::clone(&parent_shutdown),
         )
         .unwrap();
@@ -1240,7 +1223,7 @@ pub(crate) mod tests {
         let consumer = parent
             .new_connection_with_shutdown(Arc::clone(&shutdown))
             .unwrap();
-        assert_shutdown_aborts_import(&consumer, shutdown);
+        assert_shutdown_stops_the_wait(&consumer, shutdown);
         assert!(!parent_shutdown.load(Ordering::SeqCst));
     }
 

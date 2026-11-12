@@ -361,7 +361,7 @@ openswap wallet::blockchain::corerpc::tests::prepare_backend_wallet_refuses_core
 openswap wallet::blockchain::corerpc::tests::rescan_survives_long_scan_without_resend
 openswap wallet::blockchain::corerpc::tests::resolve_zmq_addr_adds_tcp_to_a_bare_address
 openswap wallet::blockchain::corerpc::tests::restore_refuses_core_before_v22_without_a_wallet_file
-openswap wallet::blockchain::corerpc::tests::shutdown_aborts_a_pending_rescan
+openswap wallet::blockchain::corerpc::tests::shutdown_stops_waiting_for_a_rescan
 openswap wallet::blockchain::corerpc::tests::zmq_address_mismatch_is_reported
 openswap wallet::blockchain::corerpc::tests::zmq_forwarded_endpoint_is_accepted
 openswap wallet::blockchain::corerpc::tests::zmq_malformed_message_is_reported_as_missed
