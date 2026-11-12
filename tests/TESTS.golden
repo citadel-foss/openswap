@@ -445,11 +445,13 @@ openswap wallet::funding::tests::empty_when_pool_cannot_cover_total_and_fee
 openswap wallet::funding::tests::exact_change_needs_no_fee_margin
 openswap wallet::funding::tests::falls_through_to_swap_pool_when_regular_plan_misses
 openswap wallet::funding::tests::full_split_count_when_pool_allows
+openswap wallet::funding::tests::greedy_fill_closes_the_gap_on_the_last_slot
 openswap wallet::funding::tests::greedy_fill_packs_three_inputs_within_budget
 openswap wallet::funding::tests::guard_rejection_falls_through_to_the_swap_pool
 openswap wallet::funding::tests::guard_rejection_in_both_pools_keeps_the_loss_error
 openswap wallet::funding::tests::infeasible_input_counts_are_skipped_without_changing_the_plan
 openswap wallet::funding::tests::insufficient_when_neither_pool_covers_the_plan
+openswap wallet::funding::tests::last_slot_cover_does_not_cost_a_split
 openswap wallet::funding::tests::manual_selection_caps_the_pool
 openswap wallet::funding::tests::manual_selection_degrades_the_split_count
 openswap wallet::funding::tests::min_change_skips_a_coin_that_leaves_dust
@@ -463,6 +465,7 @@ openswap wallet::funding::tests::regular_pool_plans_first_when_it_covers
 openswap wallet::funding::tests::smallest_covering_combo_keeps_later_splits_feasible
 openswap wallet::funding::tests::split_floor_forces_fewer_splits
 openswap wallet::funding::tests::stays_within_input_budget_when_possible
+openswap wallet::funding::tests::three_inputs_fund_a_split_whenever_the_top_three_cover
 openswap wallet::report::tests::compat_future_reports_and_nested_fields_survive_typed_views_and_saves
 openswap wallet::report::tests::compat_report_writers_save_proofs_and_changes_in_the_wallet
 openswap wallet::report::tests::payswap_omits_taker_incoming_fields_and_round_trips

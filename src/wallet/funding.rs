@@ -35,7 +35,9 @@ pub struct SplitPlan {
 /// Split `total` across up to `max_splits` funding txs from one pool, trying
 /// `max_splits` down to 1 and taking the first that fits. Each split takes the
 /// fewest UTXOs, ties broken toward the smallest total so later splits keep
-/// coins they can combine. Each split's UTXOs cover its value plus the fee, or
+/// coins they can combine. A split count is retried with the plain greedy
+/// fill (see [`smallest_cover`]) before a lower one, as that fill can leave a
+/// later split the coins the last-slot cover took. Each split's UTXOs cover its value plus the fee, or
 /// with `exact_change`, plus that change margin alone: an exact spend already
 /// pays its fee from the value. Empty only when the pool cannot cover the spend.
 pub(crate) fn plan_funding_splits(
@@ -52,21 +54,25 @@ pub(crate) fn plan_funding_splits(
     sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
 
     for k in (1..=max_splits).rev() {
-        if let Some(plan) = plan_with_k(
-            &sorted,
-            total.to_sat(),
-            k,
-            max_input_budget,
-            fee_rate,
-            min_split,
-            exact_change,
-        ) {
-            return plan;
+        for close_last_slot in [true, false] {
+            if let Some(plan) = plan_with_k(
+                &sorted,
+                total.to_sat(),
+                k,
+                max_input_budget,
+                fee_rate,
+                min_split,
+                exact_change,
+                close_last_slot,
+            ) {
+                return plan;
+            }
         }
     }
     Vec::new()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_with_k(
     pool_desc: &[(OutPoint, Amount)],
     total: u64,
@@ -75,6 +81,7 @@ fn plan_with_k(
     fee_rate: f64,
     min_split: u64,
     exact_change: Option<u64>,
+    close_last_slot: bool,
 ) -> Option<Vec<SplitPlan>> {
     // This also floors every split: `(total - assigned) / splits_left` stays at
     // or above `min_split` for the whole loop, so no per-split check runs.
@@ -118,7 +125,7 @@ fn plan_with_k(
                 if top_sum[n - 1] < need {
                     return None;
                 }
-                smallest_cover(&remaining, n, need)
+                smallest_cover(&remaining, n, need, close_last_slot)
             })
         });
 
@@ -159,7 +166,14 @@ fn plan_with_k(
 /// Indices into `pool_desc` of the `n` UTXOs with the smallest total value
 /// that still covers `need`; `pool_desc` is sorted by value, descending.
 /// Exact for 1-2 inputs, greedy above — exact min-sum is exponential.
-fn smallest_cover(pool_desc: &[(OutPoint, Amount)], n: usize, need: u64) -> Option<Vec<usize>> {
+/// `close_last_slot` lets the greedy fill's last pick close the gap with a
+/// larger coin (see below); without it the fill is the plain greedy.
+fn smallest_cover(
+    pool_desc: &[(OutPoint, Amount)],
+    n: usize,
+    need: u64,
+    close_last_slot: bool,
+) -> Option<Vec<usize>> {
     let m = pool_desc.len();
     if m < n {
         return None;
@@ -190,21 +204,31 @@ fn smallest_cover(pool_desc: &[(OutPoint, Amount)], n: usize, need: u64) -> Opti
         return best.map(|(_, lo, hi)| vec![m - 1 - lo, m - 1 - hi]);
     }
     // Greedy fill: the largest coin within the remaining deficit, else the
-    // smallest coin above it.
+    // smallest coin above it. On the last slot a coin below the deficit can
+    // only end the fill short, so it takes the smallest coin above the
+    // deficit instead.
     let mut chosen: Vec<usize> = Vec::with_capacity(n);
     // Membership mask: a linear `chosen.contains` on every candidate makes the
     // fill quadratic in the pool, and the pool is unbounded for the taker.
     let mut taken = vec![false; m];
     let mut covered = 0u64;
-    for _ in 0..n {
-        let pick = (0..m)
+    for slot in 0..n {
+        let deficit = need - covered;
+        let above = || {
+            (0..m)
+                .filter(|i| !taken[*i])
+                .rfind(|i| pool_desc[*i].1.to_sat() > deficit)
+        };
+        let pick = match (0..m)
             .filter(|i| !taken[*i])
-            .find(|i| pool_desc[*i].1.to_sat() <= need - covered)
-            .or_else(|| {
-                (0..m)
-                    .filter(|i| !taken[*i])
-                    .rfind(|i| pool_desc[*i].1.to_sat() > need - covered)
-            })?;
+            .find(|i| pool_desc[*i].1.to_sat() <= deficit)
+        {
+            Some(i) if close_last_slot && slot + 1 == n && pool_desc[i].1.to_sat() < deficit => {
+                above()
+            }
+            Some(i) => Some(i),
+            None => above(),
+        }?;
         covered += pool_desc[pick].1.to_sat();
         taken[pick] = true;
         chosen.push(pick);
@@ -864,12 +888,90 @@ mod tests {
         // the counts smallest_cover already proves infeasible — and n = 3
         // covers need(3) = 6_201.
         let pool = pool(&[(1, 3_000), (2, 3_000), (3, 3_000)]);
-        assert!(smallest_cover(&pool, 1, 6_065).is_none());
-        assert!(smallest_cover(&pool, 2, 6_133).is_none());
+        assert!(smallest_cover(&pool, 1, 6_065, true).is_none());
+        assert!(smallest_cover(&pool, 2, 6_133, true).is_none());
         let plan = plan_funding_splits(&pool, Amount::from_sat(5_900), 1, 3, 1.0, FLOOR, None);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].utxos.len(), 3);
         assert_eq!(plan[0].value.to_sat(), 5_900);
+    }
+
+    #[test]
+    fn greedy_fill_closes_the_gap_on_the_last_slot() {
+        // 60k, then 30k (within the 40k deficit), leaves 10k. The largest
+        // coin within it, 5k, would end three inputs at 95k; the last slot
+        // takes 20k, the smallest coin above the deficit.
+        let pool = pool(&[
+            (1, 60_000),
+            (2, 30_000),
+            (3, 25_000),
+            (4, 20_000),
+            (5, 5_000),
+        ]);
+        assert_eq!(smallest_cover(&pool, 3, 100_000, true), Some(vec![0, 1, 3]));
+    }
+
+    #[test]
+    fn three_inputs_fund_a_split_whenever_the_top_three_cover() {
+        // need(3) = 99_301 sits under the top-3 sum (115k), so n = 3 must
+        // plan; a fill that ran short there would fall to n = 4.
+        let plan = plan_funding_splits(
+            &pool(&[
+                (1, 60_000),
+                (2, 30_000),
+                (3, 25_000),
+                (4, 20_000),
+                (5, 5_000),
+            ]),
+            Amount::from_sat(99_000),
+            1,
+            u32::MAX,
+            1.0,
+            FLOOR,
+            None,
+        );
+        assert_eq!(plan.len(), 1);
+        let mut vouts: Vec<u32> = plan[0].utxos.iter().map(|op| op.vout).collect();
+        vouts.sort_unstable();
+        assert_eq!(vouts, vec![1, 2, 4]);
+        assert_eq!(plan[0].value.to_sat(), 99_000);
+    }
+
+    #[test]
+    fn last_slot_cover_does_not_cost_a_split() {
+        // The last-slot cover funds the first 99k split with 60k+30k+20k and
+        // leaves 96k for the second. The plain fill takes 60k+30k+6k+6k, so
+        // the 28k coins and 20k still fund the second: two splits, not one.
+        let plan = plan_funding_splits(
+            &pool(&[
+                (1, 60_000),
+                (2, 30_000),
+                (3, 28_000),
+                (4, 28_000),
+                (5, 28_000),
+                (6, 20_000),
+                (7, 6_000),
+                (8, 6_000),
+            ]),
+            Amount::from_sat(198_000),
+            2,
+            4,
+            1.0,
+            FLOOR,
+            None,
+        );
+        assert_eq!(plan.len(), 2);
+        let mut vouts: Vec<Vec<u32>> = plan
+            .iter()
+            .map(|split| {
+                let mut v: Vec<u32> = split.utxos.iter().map(|op| op.vout).collect();
+                v.sort_unstable();
+                v
+            })
+            .collect();
+        vouts.sort_unstable();
+        assert_eq!(vouts, vec![vec![1, 2, 7, 8], vec![3, 4, 5, 6]]);
+        assert!(plan.iter().all(|split| split.value.to_sat() == 99_000));
     }
 
     #[test]
