@@ -348,6 +348,7 @@ openswap wallet::backup::tests::restore_options_survive_the_wallet_file_format
 openswap wallet::backup::tests::restore_refuses_unserved_requires_before_touching_anything
 openswap wallet::backup::tests::restore_rejects_bad_options_before_touching_the_backend
 openswap wallet::backup::tests::restore_rejects_traversal_in_backup_file_name
+openswap wallet::blockchain::corerpc::tests::a_rescan_started_after_shutdown_runs_to_the_end
 openswap wallet::blockchain::corerpc::tests::any_blockchain_gives_core_its_shutdown_flag
 openswap wallet::blockchain::corerpc::tests::backup_refuses_core_before_v22_without_a_backup_file
 openswap wallet::blockchain::corerpc::tests::chain_name_maps_every_network

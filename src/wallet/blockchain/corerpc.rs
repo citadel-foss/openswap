@@ -302,17 +302,17 @@ impl CoreRPC {
         Self::with_shutdown_flag(&self.config, shutdown)
     }
 
-    /// Run a call Core answers only when its rescan ends. A shutdown stops the
-    /// wait, not the scan: Core finishes it either way, so no imported range is
-    /// left unscanned, and no RPC has to succeed for the shutdown to return.
+    /// Run a call Core answers only when its rescan ends. A shutdown requested
+    /// while it waits stops the wait, not the scan: Core finishes it either way,
+    /// so no imported range is left unscanned, and no RPC has to succeed for the
+    /// shutdown to return. Work started after a shutdown, such as a recovery
+    /// sweep or a final sync, runs to the end.
     fn rescan_call<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         method: &'static str,
         params: Vec<Value>,
     ) -> Result<T, WalletError> {
-        if self.shutdown.load(Ordering::SeqCst) {
-            return Err(WalletError::Interrupted("Shutdown requested"));
-        }
+        let stopping = self.shutdown.load(Ordering::SeqCst);
         let client = Arc::clone(&self.rescan_rpc);
         let (reply, replied) = mpsc::channel();
         thread::Builder::new()
@@ -324,7 +324,9 @@ impl CoreRPC {
         loop {
             match replied.recv_timeout(Duration::from_millis(500)) {
                 Ok(result) => return Ok(result?),
-                Err(RecvTimeoutError::Timeout) if self.shutdown.load(Ordering::SeqCst) => {
+                Err(RecvTimeoutError::Timeout)
+                    if !stopping && self.shutdown.load(Ordering::SeqCst) =>
+                {
                     return Err(WalletError::Interrupted("Shutdown requested"));
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -1138,9 +1140,9 @@ pub(crate) mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
-    /// A mock Core that answers no request for 20 s, as during a long rescan
-    /// or on a dead link, and records the method of each one it receives.
-    fn unresponsive_core() -> (CoreRpcConfig, Arc<Mutex<Vec<String>>>) {
+    /// A mock Core that answers each request after `delay`, as during a long
+    /// rescan or on a dead link, and records the method of each one it receives.
+    fn slow_core(delay: Duration) -> (CoreRpcConfig, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock core");
         let addr = listener.local_addr().unwrap();
         let methods = Arc::new(Mutex::new(Vec::new()));
@@ -1155,7 +1157,7 @@ pub(crate) mod tests {
                     while let Some(request) = read_request(&mut reader) {
                         let method = request["method"].as_str().unwrap().to_string();
                         seen.lock().unwrap().push(method);
-                        thread::sleep(Duration::from_secs(20));
+                        thread::sleep(delay);
                         write_result(&mut writer, &request, json!([{ "success": true }]));
                     }
                 });
@@ -1190,15 +1192,22 @@ pub(crate) mod tests {
     /// range unscanned, and no RPC is needed for the shutdown to return.
     #[test]
     fn shutdown_stops_waiting_for_a_rescan() {
-        let (config, methods) = unresponsive_core();
+        let (config, methods) = slow_core(Duration::from_secs(20));
         let shutdown = Arc::new(AtomicBool::new(false));
         let core = CoreRPC::with_shutdown_flag(&config, Arc::clone(&shutdown)).unwrap();
         assert_shutdown_stops_the_wait(&core, shutdown);
         assert_eq!(*methods.lock().unwrap(), ["importdescriptors"]);
-        assert!(matches!(
-            core.rescan_wallet_from(0),
-            Err(WalletError::Interrupted(_))
-        ));
+    }
+
+    /// Recovery sweeps and final syncs run after their owner's shutdown, so a
+    /// rescan they start must not be cut short.
+    #[test]
+    fn a_rescan_started_after_shutdown_runs_to_the_end() {
+        let (config, _) = slow_core(Duration::from_millis(1500));
+        let core = CoreRPC::with_shutdown_flag(&config, Arc::new(AtomicBool::new(true))).unwrap();
+        core.import_descriptors(&[json!({ "desc": "raw(51)", "timestamp": 0 })])
+            .unwrap();
+        core.rescan_wallet_from(0).unwrap();
     }
 
     #[test]
@@ -1207,7 +1216,7 @@ pub(crate) mod tests {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let backend = AnyBlockchain::from_config_with_shutdown(
-            &BackendConfig::CoreRpc(unresponsive_core().0),
+            &BackendConfig::CoreRpc(slow_core(Duration::from_secs(20)).0),
             Arc::clone(&shutdown),
         )
         .unwrap();
@@ -1215,7 +1224,7 @@ pub(crate) mod tests {
 
         let parent_shutdown = Arc::new(AtomicBool::new(false));
         let parent = AnyBlockchain::from_config_with_shutdown(
-            &BackendConfig::CoreRpc(unresponsive_core().0),
+            &BackendConfig::CoreRpc(slow_core(Duration::from_secs(20)).0),
             Arc::clone(&parent_shutdown),
         )
         .unwrap();
