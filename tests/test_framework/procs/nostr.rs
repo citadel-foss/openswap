@@ -98,8 +98,12 @@ impl Drop for TestNostrRelay {
 /// Spawns a dedicated relay for a single test.
 ///
 /// Each test gets its own port, so concurrently running tests never share
-/// nostr state.
-pub(in crate::test_framework) fn spawn_nostr_relay(temp_dir: &Path, port: u16) -> TestNostrRelay {
+/// nostr state. A Windows bind failure is returned so the caller can retry
+/// another port. A missing Unix relay binary still panics: that is not a race.
+pub(in crate::test_framework) fn spawn_nostr_relay(
+    temp_dir: &Path,
+    port: u16,
+) -> io::Result<TestNostrRelay> {
     #[cfg(windows)]
     {
         let _ = temp_dir;
@@ -132,9 +136,9 @@ pub(in crate::test_framework) fn spawn_nostr_relay(temp_dir: &Path, port: u16) -
                     bin, e
                 )
             });
-        TestNostrRelay {
+        Ok(TestNostrRelay {
             inner: TestNostrRelayInner::Process(child),
-        }
+        })
     }
 }
 
@@ -170,25 +174,22 @@ pub(in crate::test_framework) fn wait_for_relay_healthy(
 }
 
 #[cfg(windows)]
-fn spawn_embedded_nostr_relay(port: u16) -> TestNostrRelay {
-    let listener =
-        std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind embedded nostr relay");
-    listener
-        .set_nonblocking(true)
-        .expect("embedded nostr relay accept should not block shutdown");
+fn spawn_embedded_nostr_relay(port: u16) -> io::Result<TestNostrRelay> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+    listener.set_nonblocking(true)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_thread = Arc::clone(&shutdown);
     let workers = Arc::new(Mutex::new(Vec::new()));
     let workers_thread = Arc::clone(&workers);
     let thread =
         thread::spawn(move || embedded_nostr_relay_loop(listener, shutdown_thread, workers_thread));
-    TestNostrRelay {
+    Ok(TestNostrRelay {
         inner: TestNostrRelayInner::Embedded(EmbeddedRelay {
             shutdown,
             thread: Some(thread),
             workers,
         }),
-    }
+    })
 }
 
 #[cfg(windows)]
@@ -253,7 +254,10 @@ fn embedded_nostr_relay_loop(
         conn: u64,
         shutdown: Arc<AtomicBool>,
     ) {
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        // The handshake can arrive after the TCP accept on a loaded runner.
+        // The short timeout is only for the read loop, so shutdown can still
+        // join the worker.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let mut socket = match tungstenite::accept(stream) {
             Ok(socket) => socket,
             Err(error) => {
@@ -261,6 +265,9 @@ fn embedded_nostr_relay_loop(
                 return;
             }
         };
+        let _ = socket
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(100)));
         let (tx, rx) = mpsc::channel::<String>();
 
         loop {

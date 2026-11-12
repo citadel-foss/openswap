@@ -147,7 +147,13 @@ impl TestFramework {
         let (nostr_port, nostr_relay) = (0..3)
             .find_map(|_| {
                 let port = free_ports(1)[0];
-                let mut relay = spawn_nostr_relay(&temp_dir, port);
+                let mut relay = match spawn_nostr_relay(&temp_dir, port) {
+                    Ok(relay) => relay,
+                    Err(error) => {
+                        log::warn!("Nostr relay failed to bind port {port}: {error}");
+                        return None;
+                    }
+                };
                 if wait_for_relay_healthy(port, &mut relay) {
                     Some((port, relay))
                 } else {
