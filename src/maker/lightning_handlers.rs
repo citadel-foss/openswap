@@ -518,6 +518,11 @@ fn reject_if_swap_exists<M: Maker>(maker: &Arc<M>, swap_id: &str) -> Result<(), 
         Ok(None) => {}
         Err(e) => return Err(format!("cannot check for an existing swap: {e:?}")),
     }
+    // A maker that `maker-cli stop` is draining would break the new swap when
+    // it shuts down, so the taker should pick another maker now.
+    if maker.is_draining() {
+        return Err("the maker is stopping and takes no new swaps".to_string());
+    }
     if maker.ln_swap_count() >= MAX_CONCURRENT_LN_SWAPS {
         return Err(format!(
             "maker is already serving {MAX_CONCURRENT_LN_SWAPS} lightning swaps"
@@ -1910,6 +1915,20 @@ mod tests {
         maker.watch_service.shutdown();
         let maker = compat_test_maker(&dir.path().join("required"), vec!["future-v1".into()]);
         assert!(check_flow_pins(&maker, &["ln-swap-out".into()], "ln-swap-out").is_err());
+        maker.watch_service.shutdown();
+    }
+
+    /// A drain refuses new Lightning swaps too, in both directions, since both
+    /// request handlers go through this gate.
+    #[test]
+    fn a_draining_maker_refuses_new_lightning_swaps() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), vec![]);
+        assert!(reject_if_swap_exists(&maker, "new-swap").is_ok());
+
+        maker.start_drain();
+        let reason = reject_if_swap_exists(&maker, "new-swap").unwrap_err();
+        assert!(reason.contains("stopping"), "{}", reason);
         maker.watch_service.shutdown();
     }
 

@@ -445,6 +445,8 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
 
     let connection_limiter = ConnectionLimiter::new();
     while !maker.is_shutdown() {
+        // `maker-cli stop` drains: stop once the swaps in progress are done.
+        maker.stop_if_drained()?;
         let Some(listener) = listener.as_ref() else {
             sleep(Duration::from_millis(100));
             continue;
@@ -857,10 +859,13 @@ fn handle_connection(
         if state.phase == super::handlers::SwapPhase::Completed {
             // Remove the completed in-memory state before slow wallet sweeping/syncing.
             // Otherwise the idle checker can race the sweep and launch recovery for
-            // a swap that has already completed successfully.
-            if let Some(ref swap_id) = state.swap_id {
-                maker.remove_connection_state(swap_id)?;
-            }
+            // a swap that has already completed successfully. The swap counts as
+            // settling until this block ends, so a drain waits for the sweep, the
+            // finalization and a failed sweep's re-insert.
+            let _settling = match state.swap_id {
+                Some(ref swap_id) => Some(maker.begin_settling(swap_id)?),
+                None => None,
+            };
 
             log::info!(
                 "[{}] Swap completed, sweeping incoming swapcoins",

@@ -99,6 +99,10 @@ pub enum MakerBehavior {
     /// Refuse every SwapDetails with a reject-ack. Arms a test to prove the
     /// taker never reaches negotiation: any contact fails the swap differently.
     RefuseSwapDetails,
+    /// Start a drain, as `maker-cli stop` does, after a new swap is planned and
+    /// before it is stored. Arms a test of the admission re-check under the
+    /// swaps lock: the swap must be rejected and leave no state behind.
+    DrainDuringAdmission,
     /// Close connection at private key handover phase (taproot maker abort).
     CloseAtPrivateKeyHandover,
     /// Process a handover but drop its first response.
@@ -743,6 +747,14 @@ pub trait Maker: Send + Sync {
     #[cfg(feature = "lightning")]
     fn ln_swap_count(&self) -> usize {
         0
+    }
+
+    /// Whether `maker-cli stop` is draining the maker, so no new swap may start.
+    /// Lightning requests skip `store_connection_state`, so they check this
+    /// themselves.
+    #[cfg(feature = "lightning")]
+    fn is_draining(&self) -> bool {
+        false
     }
 
     /// Whether this specific transaction is confirmed.

@@ -9,8 +9,8 @@ use std::{
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock, RwLock, Weak,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -863,6 +863,13 @@ pub struct MakerServer {
     pub highest_fidelity_proof: RwLock<Option<FidelityProof>>,
     /// Ongoing swap states by swap_id.
     ongoing_swaps: Mutex<HashMap<String, SwapState>>,
+    /// Set by `maker-cli stop`: when the drain gives up on the swaps still
+    /// running. Its presence is the draining flag. The first request sets it,
+    /// so asking again does not extend the wait.
+    drain_deadline: OnceLock<Instant>,
+    /// Completed swaps that have left `ongoing_swaps` but are still sweeping
+    /// or finalizing. A drain waits for them too.
+    settling_swaps: AtomicUsize,
     /// Serializes funding claims, so two passes for one swap cannot both claim.
     funding_claims: Mutex<()>,
     /// Swaps whose funding step a handler is running.
@@ -907,6 +914,22 @@ pub struct MakerServer {
     /// Same handoff for the RPC port.
     #[cfg(feature = "integration-test")]
     pub reserved_rpc_listener: Mutex<Option<TcpListener>>,
+}
+
+/// How long `maker-cli stop` waits for the swaps in progress before the maker
+/// stops anyway. A peer can keep a swap that holds no funds alive with
+/// keepalives, and a later hop cannot tell that apart from one waiting on its
+/// upstream maker, so without a limit one peer could hold the stop for ever.
+pub const DRAIN_LIMIT: Duration = Duration::from_secs(60 * 60);
+
+/// A completed swap that is still sweeping or finalizing; see
+/// [`MakerServer::begin_settling`].
+pub(crate) struct SettlingSwap<'a>(&'a AtomicUsize);
+
+impl Drop for SettlingSwap<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// How long a derived Lightning offer is served before it is recomputed.
@@ -1130,6 +1153,8 @@ impl MakerServer {
             is_setup_complete: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
+            drain_deadline: OnceLock::new(),
+            settling_swaps: AtomicUsize::new(0),
             funding_claims: Mutex::new(()),
             funding_in_progress: Mutex::new(HashSet::new()),
             watch_service,
@@ -1795,13 +1820,112 @@ impl MakerServer {
         lock_debug!(self.ongoing_swaps.lock())
             .map_err(|_| MakerError::MutexPossion)?
             .remove(swap_id);
-        // The swap is over; any reservation it still holds ends with it.
+        self.release_swap_reservation(swap_id)
+    }
+
+    /// Removes a completed swap's entry and counts the swap as settling until
+    /// the guard drops, so a drain waits for its sweep and finalization.
+    ///
+    /// The count goes up under the same lock as the removal. A drain decides
+    /// under that lock too, so it never sees the swap in neither place.
+    pub(crate) fn begin_settling(&self, swap_id: &str) -> Result<SettlingSwap<'_>, MakerError> {
+        let settling = {
+            let mut swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            swaps.remove(swap_id);
+            self.settling_swaps.fetch_add(1, Ordering::SeqCst);
+            SettlingSwap(&self.settling_swaps)
+        };
+        self.release_swap_reservation(swap_id)?;
+        Ok(settling)
+    }
+
+    /// The swap is over; any reservation it still holds ends with it.
+    fn release_swap_reservation(&self, swap_id: &str) -> Result<(), MakerError> {
         let mut wallet = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
         if wallet.release_swap_locks(swap_id, None) {
             wallet.save_to_disk().map_err(MakerError::Wallet)?;
         }
         Ok(())
+    }
+
+    /// Starts a drain, as `maker-cli stop` does: new swaps are refused and the
+    /// serve loop stops the server once the swaps in progress are done, or
+    /// after [`DRAIN_LIMIT`]. The first request sets the deadline; later ones
+    /// do not move it.
+    pub fn start_drain(&self) {
+        self.start_drain_within(DRAIN_LIMIT);
+    }
+
+    /// [`start_drain`](Self::start_drain) with a chosen limit.
+    pub fn start_drain_within(&self, limit: Duration) {
+        if self.drain_deadline.set(Instant::now() + limit).is_ok() {
+            log::info!(
+                "[{}] Stop requested: refusing new swaps, stopping once the swaps in progress finish or in {}s at the latest",
+                self.config.network_port,
+                limit.as_secs()
+            );
+        }
+    }
+
+    /// Whether a drain has started.
+    pub fn is_draining(&self) -> bool {
+        self.drain_deadline.get().is_some()
+    }
+
+    /// Stops the server if a drain is running and no swap is left, or its
+    /// deadline has passed. Called by the serve loop.
+    ///
+    /// Swaps in recovery and Lightning swaps are not counted: they are saved in
+    /// the wallet, may wait on a timelock for hours, and the next start picks
+    /// them up.
+    ///
+    /// Decides under the `ongoing_swaps` lock, which admission also holds when
+    /// it checks for a drain, so a new swap cannot slip in after the decision.
+    pub(crate) fn stop_if_drained(&self) -> Result<(), MakerError> {
+        self.stop_if_drained_at(Instant::now())
+    }
+
+    /// [`stop_if_drained`](Self::stop_if_drained) as of `now`.
+    fn stop_if_drained_at(&self, now: Instant) -> Result<(), MakerError> {
+        let Some(deadline) = self.drain_deadline.get() else {
+            return Ok(());
+        };
+        let swaps = lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        let left = swaps.len() + self.settling_swaps.load(Ordering::SeqCst);
+        if left == 0 {
+            log::info!(
+                "[{}] No swaps left in progress, shutting down",
+                self.config.network_port
+            );
+            self.shutdown.store(true, Ordering::SeqCst);
+        } else if now >= *deadline {
+            log::warn!(
+                "[{}] Drain limit reached with {} swap(s) still in progress ({} running, {} settling), shutting down; recovery finishes them after the restart",
+                self.config.network_port,
+                left,
+                swaps.len(),
+                left - swaps.len()
+            );
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Refuses a new swap while a drain is running.
+    fn refuse_if_draining(&self, swap_id: &str) -> Result<(), MakerError> {
+        if !self.is_draining() {
+            return Ok(());
+        }
+        log::info!(
+            "[{}] Rejecting swap {}: the maker is stopping",
+            self.config.network_port,
+            swap_id
+        );
+        Err(MakerError::General(
+            "Maker is stopping and takes no new swaps",
+        ))
     }
 
     /// Check if any swaps are currently in progress.
@@ -2886,6 +3010,7 @@ impl MakerTrait for MakerServer {
             if known {
                 None
             } else {
+                self.refuse_if_draining(swap_id)?;
                 // After a restart `ongoing_swaps` is empty, so a replayed
                 // SwapDetails for a swap still open on disk would re-admit and
                 // double-fund it. The open swap is recovered, never re-admitted.
@@ -2950,6 +3075,18 @@ impl MakerTrait for MakerServer {
             return Err(MakerError::General(
                 "Swap expired while admitting; resend SwapDetails",
             ));
+        }
+
+        // A drain may have started while we planned. Checked under the lock the
+        // drain decides under, so the swap is either rejected here and leaves
+        // no state, or inserted before the drain looks and waited for.
+        #[cfg(feature = "integration-test")]
+        if planned.is_some() && self.behavior == MakerBehavior::DrainDuringAdmission {
+            self.start_drain();
+        }
+        if planned.is_some() && self.is_draining() {
+            drop(swaps);
+            return self.refuse_if_draining(swap_id);
         }
 
         // The cap read before planning is only a cheap early reject: planning
@@ -3939,6 +4076,11 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn is_draining(&self) -> bool {
+        MakerServer::is_draining(self)
+    }
+
+    #[cfg(feature = "lightning")]
     fn get_receive_address(&self) -> Result<bitcoin::Address, MakerError> {
         let mut wallet = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -3968,6 +4110,10 @@ impl MakerRpc for MakerServer {
 
     fn shutdown(&self) -> &ShutdownSignal {
         &self.shutdown
+    }
+
+    fn start_drain(&self) {
+        MakerServer::start_drain(self);
     }
 
     fn rpc_client(&self) -> Option<&Mutex<Option<TcpStream>>> {
@@ -4021,8 +4167,9 @@ pub(crate) mod tests {
     use super::MakerBehavior;
     use super::{
         check_fees_can_price_a_swap, min_swap_amount, swap_cost_floor, BackendConnector,
-        ConnectionState, MakerError, MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal,
-        ThreadPool, WatchService, MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE, UNPRICEABLE_FEES,
+        ConnectionState, MakerError, MakerServer, MakerServerConfig, MakerTrait, NegotiatedTerms,
+        ShutdownSignal, SwapPhase, SwapState, ThreadPool, WatchService, MIN_SWAP_STEP_SATS,
+        REFUND_LOCKTIME_BASE, UNPRICEABLE_FEES,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
@@ -4044,8 +4191,8 @@ pub(crate) mod tests {
         collections::{HashMap, HashSet},
         path::Path,
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
-            mpsc, Arc, Mutex, RwLock, TryLockError,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+            mpsc, Arc, Mutex, OnceLock, RwLock, TryLockError,
         },
         thread,
         time::{Duration, Instant},
@@ -4120,6 +4267,8 @@ pub(crate) mod tests {
             is_setup_complete: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
+            drain_deadline: OnceLock::new(),
+            settling_swaps: AtomicUsize::new(0),
             funding_claims: Mutex::new(()),
             funding_in_progress: Mutex::new(HashSet::new()),
             completed_handovers: Mutex::new(HashMap::new()),
@@ -4192,6 +4341,118 @@ pub(crate) mod tests {
             error,
             MakerError::General("Swap id belongs to an unfinished swap")
         ));
+    }
+
+    /// A maker holding one admitted swap, as the serve loop sees it.
+    fn maker_with_a_live_swap(dir: &Path) -> (Arc<MakerServer>, ConnectionState) {
+        let maker = compat_test_maker(dir, Vec::new());
+        let state = ConnectionState::new(ProtocolVersion::Legacy);
+        maker.ongoing_swaps.lock().unwrap().insert(
+            "live".to_string(),
+            SwapState {
+                negotiated: NegotiatedTerms::from(&state),
+                ..Default::default()
+            },
+        );
+        (maker, state)
+    }
+
+    /// Without a drain the serve loop's check does nothing. With one and no
+    /// swap in progress, the maker stops at once.
+    #[test]
+    fn drain_with_no_swaps_stops_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        maker.stop_if_drained().unwrap();
+        assert!(!maker.shutdown.load(Ordering::SeqCst));
+
+        maker.start_drain();
+        assert!(maker.is_draining());
+        maker.stop_if_drained().unwrap();
+        assert!(maker.shutdown.load(Ordering::SeqCst));
+    }
+
+    /// A drain refuses a new swap id and lets a known one resume, as a taker
+    /// reconnecting after a dropped connection does.
+    #[test]
+    fn drain_refuses_new_swaps_and_lets_known_ones_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (maker, state) = maker_with_a_live_swap(dir.path());
+        maker.start_drain();
+
+        let error = maker
+            .store_connection_state("new", &state, true)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MakerError::General("Maker is stopping and takes no new swaps")
+        ));
+        assert!(!maker.ongoing_swaps.lock().unwrap().contains_key("new"));
+
+        maker.store_connection_state("live", &state, true).unwrap();
+        assert!(!maker.shutdown.load(Ordering::SeqCst));
+    }
+
+    /// The drain waits for the swap, and for the sweep after the swap has left
+    /// `ongoing_swaps`: shutdown must not fire in between. A failed sweep puts
+    /// the swap back before the guard drops, and the drain keeps waiting.
+    #[test]
+    fn drain_waits_through_settling_and_a_failed_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let (maker, state) = maker_with_a_live_swap(dir.path());
+        maker.start_drain();
+        maker.stop_if_drained().unwrap();
+        assert!(!maker.shutdown.load(Ordering::SeqCst), "a swap is live");
+
+        // The swap completes: out of the map, into settling, in one step.
+        let settling = maker.begin_settling("live").unwrap();
+        assert!(maker.ongoing_swaps.lock().unwrap().is_empty());
+        maker.stop_if_drained().unwrap();
+        assert!(
+            !maker.shutdown.load(Ordering::SeqCst),
+            "settling holds the drain"
+        );
+
+        // The sweep fails: the swap goes back while the guard is alive.
+        let mut completed = state.clone();
+        completed.phase = SwapPhase::Completed;
+        maker
+            .store_connection_state("live", &completed, false)
+            .unwrap();
+        drop(settling);
+        maker.stop_if_drained().unwrap();
+        assert!(
+            !maker.shutdown.load(Ordering::SeqCst),
+            "the reinserted swap holds the drain"
+        );
+
+        // Recovery or a later completion ends it; now nothing is left.
+        maker.remove_swap_state("live").unwrap();
+        maker.stop_if_drained().unwrap();
+        assert!(maker.shutdown.load(Ordering::SeqCst));
+    }
+
+    /// A swap that never ends cannot hold the drain for ever. Asking again does
+    /// not move the deadline.
+    #[test]
+    fn drain_gives_up_at_the_deadline_and_asking_again_does_not_extend_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (maker, _) = maker_with_a_live_swap(dir.path());
+        let limit = Duration::from_secs(600);
+        maker.start_drain_within(limit);
+        let deadline = *maker.drain_deadline.get().unwrap();
+        maker.start_drain_within(Duration::from_secs(86_400));
+        maker.start_drain();
+        assert_eq!(*maker.drain_deadline.get().unwrap(), deadline);
+
+        maker
+            .stop_if_drained_at(deadline - Duration::from_secs(5))
+            .unwrap();
+        assert!(!maker.shutdown.load(Ordering::SeqCst), "inside the limit");
+        maker
+            .stop_if_drained_at(deadline + Duration::from_secs(5))
+            .unwrap();
+        assert!(maker.shutdown.load(Ordering::SeqCst), "past the limit");
     }
 
     /// Non-finite or below-minimum fidelity feerates clamp to the relay

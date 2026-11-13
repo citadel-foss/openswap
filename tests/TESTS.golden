@@ -66,6 +66,10 @@ openswap maker::api::lightning_config_tests::lightning_settings_round_trip_throu
 openswap maker::api::tests::advertised_min_swap_is_the_smallest_passing_round_amount
 openswap maker::api::tests::breach_query_without_an_answer_is_an_error
 openswap maker::api::tests::compat_maker_reservations_and_readmission_use_saved_coins
+openswap maker::api::tests::drain_gives_up_at_the_deadline_and_asking_again_does_not_extend_it
+openswap maker::api::tests::drain_refuses_new_swaps_and_lets_known_ones_resume
+openswap maker::api::tests::drain_waits_through_settling_and_a_failed_sweep
+openswap maker::api::tests::drain_with_no_swaps_stops_at_once
 openswap maker::api::tests::init_rejects_zero_required_confirms
 openswap maker::api::tests::maker_config_checks_file_values
 openswap maker::api::tests::maker_config_debug_hides_wallet_password
@@ -88,6 +92,7 @@ openswap maker::handlers::tests::swap_id_must_be_16_hex_characters
 openswap maker::handlers::tests::taproot_refund_deadline_is_exact_at_the_boundary
 openswap maker::legacy_verification::tests::locktime_that_overflows_the_refund_step_is_rejected
 openswap maker::legacy_verification::tests::normal_locktime_is_accepted
+openswap maker::lightning_handlers::tests::a_draining_maker_refuses_new_lightning_swaps
 openswap maker::lightning_handlers::tests::compat_lightning_pins_require_exact_direction_and_requirements
 openswap maker::lightning_handlers::tests::directions_are_bounded_by_opposite_channel_sides
 openswap maker::lightning_handlers::tests::only_a_rejection_leaves_the_connection_unpromoted
@@ -95,6 +100,7 @@ openswap maker::lightning_handlers::tests::only_the_recorded_refund_is_ours
 openswap maker::lightning_handlers::tests::persisted_record_survives_serialization_and_still_spends
 openswap maker::lightning_handlers::tests::recorded_spend_stays_spent
 openswap maker::lightning_handlers::tests::refund_waits_for_the_chain_to_say_unspent
+openswap maker::lightning_handlers::tests::swap_out_limit_leaves_inbound_room_for_the_fee
 openswap maker::lightning_handlers::tests::unfunded_record_round_trips_without_funding
 openswap maker::lightning_handlers::tests::unusable_channels_and_dust_capacity_disable_a_direction
 openswap maker::lightning_handlers::tests::wallet_caps_only_the_swap_out_direction
@@ -107,6 +113,7 @@ openswap maker::rpc::server::tests::rpc_checks_the_token_before_the_request
 openswap maker::rpc::server::tests::rpc_cookie_is_random_and_authenticated
 openswap maker::rpc::server::tests::send_to_address_clears_the_relay_floor_over_rpc
 openswap maker::rpc::server::tests::send_to_address_rejects_unusable_rates_over_rpc
+openswap maker::rpc::server::tests::stop_after_swaps_starts_a_drain_and_stop_does_not
 openswap maker::server::tests::bind_port_retry_tries_a_given_port_above_the_search_bound
 openswap maker::server::tests::bind_port_retry_tries_the_given_port_first
 openswap maker::server::tests::compat_maker_decode_failure_names_future_variants_without_reply_loops
@@ -676,6 +683,7 @@ openswap watch_tower::watcher::tests::watch_asks_the_server_until_a_reconnect_is
 openswap watch_tower::watcher::tests::watch_requests_do_not_recycle_a_refusing_connection
 openswap watch_tower::watcher::tests::watch_stays_queued_while_core_cannot_find_the_funding_tx
 openswap watch_tower::watcher::tests::watches_recover_after_an_outage
+openswap::bin/maker-cli tests::stop_drains_unless_now_is_given
 openswap::bin/makerd tests::password_file_excludes_the_argv_password
 openswap::bin/makerd tests::plain_makerd_has_no_subcommand
 openswap::bin/makerd tests::restore_and_backup_read_their_options
@@ -701,6 +709,8 @@ openswap::integration fidelity::restart::unconfirmed_bond_not_duplicated_electru
 openswap::integration fidelity::spending::bond_spending
 openswap::integration fidelity::spending::mempool_only_spend_reads_as_spent
 openswap::integration fidelity::timelock_violation::fidelity_limit_violation
+openswap::integration lightning::draining_maker::a_draining_maker_refuses_new_lightning_swaps
+openswap::integration lightning::draining_maker::a_lightning_swap_in_progress_does_not_hold_the_drain
 openswap::integration lightning::e2e::lightning_submarine_swaps_e2e
 openswap::integration lightning::e2e::lightning_swap_in_refuses_announced_value_mismatch
 openswap::integration lightning::e2e::lightning_swap_in_refuses_blocklisted_funding
@@ -708,10 +718,14 @@ openswap::integration lightning::e2e::lightning_swap_out_refuses_blocklisted_fun
 openswap::integration lightning::maker_restart::conditional_paid_store_refuses_stale_copy
 openswap::integration lightning::maker_restart::forged_swap_in_funding_keeps_accepted_swap
 openswap::integration lightning::maker_restart::lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen
+openswap::integration lightning::maker_restart::lightning_maker_does_not_refund_a_claimed_swap_out_without_funding_height
+openswap::integration lightning::maker_restart::lightning_maker_keeps_a_swap_out_while_its_funding_height_is_unknown
 openswap::integration lightning::maker_restart::lightning_maker_rebroadcasts_an_evicted_refund
+openswap::integration lightning::maker_restart::lightning_maker_refunds_a_swap_out_stored_without_funding_height
 openswap::integration lightning::maker_restart::lightning_maker_restart_recovers_an_interrupted_refund
 openswap::integration lightning::maker_restart::lightning_maker_restart_recovers_funded_swap
 openswap::integration lightning::maker_restart::lightning_maker_restart_refunds_unclaimed_swap_out
+openswap::integration lightning::maker_restart::lightning_maker_stale_snapshot_keeps_newer_swap_out_state
 openswap::integration lightning::maker_restart::restarted_watchdog_follows_payment_of_swap_in_missing_funding_height
 openswap::integration lightning::maker_restart::stale_swap_in_refusal_keeps_paid_swap
 openswap::integration lightning::maker_restart::stale_watchdog_expiry_keeps_paid_swap
@@ -873,6 +887,12 @@ openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract
 openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract_data_electrum
 openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract_data_in_flight
 openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract_data_in_flight_electrum
+openswap::integration restart::drain_on_stop::drain_does_not_wait_for_a_swap_that_went_into_recovery
+openswap::integration restart::drain_on_stop::drain_during_admission_rejects_the_swap_and_leaves_no_state
+openswap::integration restart::drain_on_stop::drain_gives_up_on_a_swap_held_open_without_funding
+openswap::integration restart::drain_on_stop::legacy_swap_finishes_and_a_new_taker_uses_the_spare
+openswap::integration restart::drain_on_stop::maker_cli_stop_drains_and_stop_now_does_not
+openswap::integration restart::drain_on_stop::taproot_swap_finishes_and_a_new_taker_uses_the_spare
 openswap::integration restart::legacy_reboot::maker_reboot_preserves_funded_swapcoins
 openswap::integration restart::reboot::legacy_electrum_crash_after_contract_exchange
 openswap::integration restart::reboot::legacy_electrum_maker_settles_an_incoming_its_own_sweep_spent

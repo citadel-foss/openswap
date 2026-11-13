@@ -107,7 +107,7 @@ A randomly generated authentication token written by `makerd` on startup and rem
 
 ## Backing Up and Restoring the Wallet
 
-Both commands run on their own and then exit. They do not start the maker. Both need the chain backend (Bitcoin Core or Electrum) running and reachable, and stop with an error if it is not. Stop `makerd` before you use them. Pass the same `-d`, `-w` and blockchain flags you use to run the maker.
+Both commands run on their own and then exit. They do not start the maker. Both need the chain backend (Bitcoin Core or Electrum) running and reachable, and stop with an error if it is not. Stop `makerd` before you use them: run `maker-cli stop`, which lets swaps in progress finish, and wait for the `makerd` process to exit. Pass the same `-d`, `-w` and blockchain flags you use to run the maker.
 
 ### Backup
 
@@ -117,7 +117,7 @@ $ makerd --password-file <path> backup -o maker-backup.json
 
 `--password-file` (or `-p`) is the wallet's own passphrase. It only unlocks the wallet file at startup; it does not authorize the seed export. The command then asks for two more passphrases at hidden prompts. First it asks for the current wallet passphrase again, which opens the seed phrase to put it into the backup. Then it asks for a backup password, which is separate: it encrypts only the backup file. It writes an encrypted file. Without `-o`, the file is `<wallet>-backup.json` in the current directory. The file always ends in `.json`: `-o maker.bak` writes `maker.json`. The log shows the path written. The command needs an existing wallet. It never creates one.
 
-The backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. Finish open swaps first. Copy `<wallet>_swap_report.json` by hand. There is no backup command in `maker-cli`.
+The backup holds your keys, your fidelity bond records and your swept-coin tags. It does not hold swaps in progress or the swap report file. Finish open swaps first: `maker-cli stop` waits for them, for an hour at most, and you must wait for `makerd` to exit. Copy `<wallet>_swap_report.json` by hand. There is no backup command in `maker-cli`.
 
 ### Restore
 
