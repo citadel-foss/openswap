@@ -1035,7 +1035,7 @@ fn settle_held_sends(maker: &MakerServer) {
         Ok(wallet) if wallet.has_held_sends() => wallet.sends_to_probe(),
         _ => return,
     };
-    let unknown: HashSet<bitcoin::Txid> = if probes.is_empty() {
+    let unknown: HashSet<_> = if probes.is_empty() {
         HashSet::new()
     } else {
         let Ok(chain) = maker.backend.connect() else {
@@ -1043,7 +1043,7 @@ fn settle_held_sends(maker: &MakerServer) {
         };
         probes
             .into_iter()
-            .filter(|txid| matches!(chain.is_tx_unknown(txid), Ok(true)))
+            .filter(|hold| matches!(chain.is_tx_unknown(&hold.txid), Ok(true)))
             .collect()
     };
     if let Ok(mut wallet) = lock_debug!(maker.wallet.write()) {
