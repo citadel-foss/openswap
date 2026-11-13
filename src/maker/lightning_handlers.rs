@@ -139,6 +139,8 @@ pub struct LnMakerSwap {
     /// maker broadcast its funding, or, if that read failed, the block that
     /// confirmed it.
     pub funding_height: Option<u32>,
+    /// Backend deadline for claiming the held payment (swap-out only).
+    pub claim_deadline: Option<u32>,
     /// Last phase-change time; the watchdog only touches idle states.
     pub updated_at: Instant,
 }
@@ -173,6 +175,7 @@ impl LnMakerSwap {
             funding_outpoint,
             funding_value,
             funding_height: self.funding_height,
+            claim_deadline: self.claim_deadline,
         }
     }
 
@@ -197,6 +200,7 @@ impl LnMakerSwap {
             payout_script: record.payout_script,
             funding: record.funding_outpoint.zip(record.funding_value),
             funding_height: record.funding_height,
+            claim_deadline: record.claim_deadline,
             updated_at: Instant::now(),
         }
     }
@@ -683,6 +687,7 @@ fn handle_swap_in_request<M: Maker>(
             payout_script: None,
             funding: None,
             funding_height: None,
+            claim_deadline: None,
             updated_at: Instant::now(),
         },
     )?;
@@ -1088,6 +1093,7 @@ fn handle_swap_out_request<M: Maker>(
             payout_script: None,
             funding: None,
             funding_height: None,
+            claim_deadline: None,
             updated_at: Instant::now(),
         },
     )?;
@@ -1219,6 +1225,7 @@ fn handle_swap_out_paid<M: Maker>(
     let value = output.value;
     swap.funding = Some((outpoint, value));
     swap.funding_height = maker.get_current_height().ok();
+    swap.claim_deadline = claim_deadline;
     swap.phase = LnMakerPhase::OutFunded;
     swap.touch();
     store_swap(maker, swap_id, swap.clone())?;
@@ -1611,22 +1618,99 @@ fn watchdog_resolve_swap_out(
         .funding
         .ok_or(MakerError::General("OutFunded without funding"))?;
 
-    let answer = maker.watch_service.watch_request(outpoint).map_err(|e| {
-        // Logged rather than formatted into the error: MakerError::General
-        // holds a &'static str, and the watchdog reaches this on every
-        // tick for a persistently failing watch.
-        log::warn!("swap-out {swap_id}: watch request failed: {e:?}");
-        MakerError::General("watch request failed")
-    })?;
+    let answer = maker.watch_service.watch_request(outpoint);
     #[cfg(feature = "integration-test")]
     let answer = if HIDE_HTLC_SPENDS.load(std::sync::atomic::Ordering::SeqCst) {
-        WatcherEvent::UtxoSpent {
+        Ok(WatcherEvent::UtxoSpent {
             outpoint,
             spending_tx: None,
-        }
+        })
     } else {
         answer
     };
+    // A watch can miss a claim without noticing the notification loss, or
+    // stay stuck reconciling it. Re-arming does not force a chain read.
+    // Recover before the CSV gate, even with no saved funding height: the
+    // held Lightning payment has its own deadline and cannot wait for CSV.
+    let answer = match &answer {
+        Ok(WatcherEvent::UtxoSpent {
+            spending_tx: Some(tx),
+            ..
+        }) if swap.htlc.extract_preimage(tx).is_some() => answer,
+        // The watcher holds our recorded refund, and it is mined: no claim can
+        // confirm against it, so the lookup could only return this refund,
+        // and on Core it reads every block since funding to do so. Unmined,
+        // or if the check fails, the lookup still runs to find a rival claim.
+        Ok(WatcherEvent::UtxoSpent {
+            spending_tx: Some(tx),
+            ..
+        }) if is_our_refund(swap, tx)
+            && matches!(maker.is_tx_confirmed(&tx.compute_txid()), Ok(true)) =>
+        {
+            answer
+        }
+        _ => {
+            warn_swap_out_claim_deadline(maker, swap_id, swap);
+            let spk = swap
+                .htlc
+                .script_pubkey()
+                .map_err(|_| MakerError::General("htlc script build failed"))?;
+            let spend = maker
+                .backend
+                .connect()
+                .and_then(|chain| chain.spending_transaction(&outpoint, &spk, None))
+                .map_err(|e| {
+                    log::warn!(
+                        "Swap-out {swap_id}: direct preimage recovery failed: {e:?}; \
+                        retrying before the held Lightning payment expires"
+                    );
+                    MakerError::Wallet(e)
+                });
+            match spend {
+                Ok(Some(tx)) => {
+                    if !tx
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output == outpoint)
+                    {
+                        return Err(MakerError::General(
+                            "lookup returned a different HTLC spend",
+                        ));
+                    }
+                    Ok(WatcherEvent::UtxoSpent {
+                        outpoint,
+                        spending_tx: Some(tx),
+                    })
+                }
+                Ok(None) => answer,
+                // The lookup's failure does not invalidate our recorded
+                // refund. Its confirmation checks below still distinguish
+                // our refund from a rival claim before failing Lightning.
+                Err(_)
+                    if matches!(&answer, Ok(WatcherEvent::UtxoSpent {
+                    spending_tx: Some(tx), ..
+                }) if is_our_refund(swap, tx)) =>
+                {
+                    answer
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    // Chain I/O may have outlived the swap. Never act on a removed record,
+    // a different funding outpoint, or a phase another handler advanced.
+    if !maker.get_ln_swap(swap_id)?.is_some_and(|current| {
+        current.direction == LnDirection::SwapOut
+            && current.phase == LnMakerPhase::OutFunded
+            && current.funding == swap.funding
+            && current.payment_hash == swap.payment_hash
+    }) {
+        return Ok(());
+    }
+    let answer = answer.map_err(|e| {
+        log::warn!("swap-out {swap_id}: watch request failed: {e:?}");
+        MakerError::General("watch request failed")
+    })?;
     match HtlcWatch::from_answer(answer)? {
         HtlcWatch::Spent(spending_tx) => {
             let spk = swap.htlc.script_pubkey().map_err(|e| {
@@ -1724,7 +1808,8 @@ fn watchdog_resolve_swap_out(
                 UnspentHtlc::SpentUnseen => {
                     log::warn!(
                         "Swap-out {swap_id}: HTLC is spent on chain but the watcher has no \
-                         spend on record; waiting for it instead of refunding"
+                         spend on record and direct lookup has no transaction; preimage \
+                         recovery is urgent before the held Lightning payment expires"
                     );
                     return Ok(());
                 }
@@ -1784,6 +1869,35 @@ fn watchdog_resolve_swap_out(
             }
             Ok(())
         }
+    }
+}
+
+/// Warn before a potentially slow lookup. This is observational only: neither
+/// an approaching deadline nor a failed height read authorizes a refund.
+fn warn_swap_out_claim_deadline(maker: &Arc<MakerServer>, swap_id: &str, swap: &LnMakerSwap) {
+    let Some(deadline) = swap.claim_deadline else {
+        // Runs on every pass, healthy or not. A failed lookup or an unseen
+        // spend warns on its own path; without a deadline there is nothing
+        // more to warn about here.
+        log::debug!(
+            "Swap-out {swap_id}: held Lightning claim deadline is unknown in this legacy \
+            record; checking the chain for the claim without a deadline estimate"
+        );
+        return;
+    };
+    match maker.get_current_height() {
+        Ok(current) if current.saturating_add(SETTLE_MARGIN) >= deadline => {
+            log::warn!(
+                "Swap-out {swap_id}: preimage unrecovered; hold-invoice claim deadline \
+                is height {deadline}, current height {current}, {} blocks remaining",
+                deadline.saturating_sub(current)
+            );
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!(
+            "Swap-out {swap_id}: preimage unrecovered; hold-invoice claim \
+            deadline is height {deadline}, current height unavailable: {e:?}"
+        ),
     }
 }
 
@@ -1890,6 +2004,144 @@ mod tests {
     use super::*;
     use crate::maker::api::tests::compat_test_maker;
     use bitcoin::ScriptBuf;
+
+    /// Exercise the real watchdog and Core lookup with a watcher that never
+    /// learns the spend. A missing transaction or RPC error must keep the
+    /// held invoice and durable swap available for the next pass.
+    #[test]
+    fn unseen_swap_out_claim_retries_and_settles_before_csv() {
+        use crate::{
+            lightning::{InvoiceParams, MockLightningBackend},
+            wallet::{blockchain::BackendConnector, BackendConfig, CoreRpcConfig},
+            watch_tower::{service::answering, watcher::tests::mock_core_rpc},
+        };
+        use bitcoin::consensus::encode::serialize_hex;
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for answer in [
+            WatcherEvent::UtxoSpent {
+                outpoint: OutPoint::default(),
+                spending_tx: None,
+            },
+            WatcherEvent::Error("reconciliation pending".into()),
+            WatcherEvent::NoOutpoint,
+        ] {
+            let dir = bitcoind::tempfile::tempdir().unwrap();
+            let mut maker = compat_test_maker(dir.path(), vec![]);
+            let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+            let preimage = swap.preimage.unwrap();
+            let (outpoint, value) = swap.funding.unwrap();
+            let claim = swap
+                .htlc
+                .create_hashlock_spend(outpoint, value, &swap.privkey, &preimage, ScriptBuf::new())
+                .unwrap();
+            swap.preimage = None;
+            if matches!(answer, WatcherEvent::Error(_)) {
+                swap.funding_height = None;
+            }
+            let mode = Arc::new(AtomicUsize::new(0));
+            let (url, _) = mock_core_rpc({
+                let mode = mode.clone();
+                move |method, _| match method {
+                    "gettxspendingprevout" => match mode.load(Ordering::SeqCst) {
+                        0 => Ok(json!([])),
+                        1 => Err(json!({"code": -28, "message": "backend unavailable"})),
+                        _ => Ok(json!([{"txid": outpoint.txid, "vout": outpoint.vout,
+                            "spendingtxid": claim.compute_txid()}])),
+                    },
+                    "getrawtransaction" if mode.load(Ordering::SeqCst) == 0 => {
+                        Err(json!({"code": -5, "message": "transaction unavailable"}))
+                    }
+                    "getrawtransaction" => {
+                        let mut tx = claim.clone();
+                        match mode.load(Ordering::SeqCst) {
+                            2 => tx.input[0].previous_output.vout += 1,
+                            3 => {
+                                let witness: Vec<_> = tx.input[0].witness.iter().collect();
+                                tx.input[0].witness = bitcoin::Witness::from_slice(&[
+                                    witness[0],
+                                    &[0x55; 32],
+                                    witness[2],
+                                ]);
+                            }
+                            _ => {}
+                        }
+                        Ok(json!(serialize_hex(&tx)))
+                    }
+                    "gettxout" => Ok(json!(null)),
+                    "getblockcount" => Ok(json!(1)),
+                    other => panic!("unexpected RPC {}", other),
+                }
+            });
+            let inner = Arc::get_mut(&mut maker).unwrap();
+            inner.watch_service.shutdown();
+            inner.watch_service = answering(answer);
+            let config = CoreRpcConfig {
+                url,
+                ..Default::default()
+            };
+            inner.wallet.write().unwrap().blockchain = crate::wallet::AnyBlockchain::CoreRPC(
+                crate::wallet::CoreRPC::new(&config).unwrap(),
+            );
+            inner.backend = BackendConnector::new(
+                BackendConfig::CoreRpc(config),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            let ln = Arc::new(MockLightningBackend::new());
+            ln.create_hold_invoice(swap.payment_hash, InvoiceParams::default())
+                .unwrap();
+            ln.simulate_htlc_arrival(swap.payment_hash, 40_000_000);
+            let ctx = LnContext {
+                ln: ln.clone(),
+                router: LnEventRouter::new(ln.clone()),
+            };
+            let id = swap.payment_hash.to_string();
+            maker.store_ln_swap(&id, swap.clone()).unwrap();
+            // Drain the arrival: only settlement should release a preimage.
+            while ln.poll_event().unwrap().is_some() {}
+            for state in [0, 1, 2, 3] {
+                mode.store(state, Ordering::SeqCst);
+                let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
+                if state != 0 {
+                    assert!(result.is_err());
+                }
+                assert!(maker.get_ln_swap(&id).unwrap().is_some());
+                assert!(ln.poll_event().unwrap().is_none());
+                assert!(maker
+                    .get_ln_swap(&id)
+                    .unwrap()
+                    .unwrap()
+                    .refund_txid
+                    .is_none());
+            }
+            mode.store(4, Ordering::SeqCst);
+            let mut changed = swap.clone();
+            changed.phase = LnMakerPhase::OutAccepted;
+            maker.store_ln_swap(&id, changed).unwrap();
+            watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
+            assert!(ln.poll_event().unwrap().is_none());
+            assert_eq!(
+                maker.get_ln_swap(&id).unwrap().unwrap().phase,
+                LnMakerPhase::OutAccepted
+            );
+            maker.store_ln_swap(&id, swap.clone()).unwrap();
+            watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
+            assert!(
+                maker.get_ln_swap(&id).unwrap().is_none(),
+                "unseen claim was never recovered"
+            );
+            assert!(
+                matches!(ln.poll_event().unwrap(), Some(LnEvent::PaymentSuccessful {
+                preimage: Some(p), .. }) if p == preimage)
+            );
+            while ln.poll_event().unwrap().is_some() {}
+            // The old snapshot cannot re-settle a removed swap.
+            watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
+            assert!(ln.poll_event().unwrap().is_none());
+            maker.watch_service.shutdown();
+        }
+    }
 
     #[test]
     fn compat_lightning_pins_require_exact_direction_and_requirements() {
@@ -2013,6 +2265,7 @@ mod tests {
             payout_script: None,
             funding: Some((OutPoint::default(), Amount::from_sat(40_000))),
             funding_height: Some(812_345),
+            claim_deadline: None,
             updated_at: Instant::now(),
         }
     }
@@ -2022,7 +2275,8 @@ mod tests {
     /// byte-identical spend — that spend is the only way back to the money.
     #[test]
     fn persisted_record_survives_serialization_and_still_spends() {
-        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        swap.claim_deadline = Some(812_435);
         let bytes = serde_cbor::to_vec(&swap.to_record()).unwrap();
         let restored = LnMakerSwap::from_record(serde_cbor::from_slice(&bytes).unwrap());
 
@@ -2038,6 +2292,15 @@ mod tests {
         assert_eq!(restored.invoice, swap.invoice);
         assert_eq!(restored.funding, swap.funding);
         assert_eq!(restored.funding_height, swap.funding_height);
+        assert_eq!(restored.claim_deadline, swap.claim_deadline);
+
+        let mut legacy = swap.to_record();
+        legacy.claim_deadline = None;
+        let legacy = serde_cbor::value::to_value(legacy).unwrap();
+        assert!(!matches!(&legacy, serde_cbor::Value::Map(fields)
+            if fields.contains_key(&serde_cbor::Value::Text("claim_deadline".into()))));
+        let legacy: LnMakerSwapRecord = serde_cbor::value::from_value(legacy).unwrap();
+        assert_eq!(LnMakerSwap::from_record(legacy).claim_deadline, None);
 
         // The point of persisting at all: the refund still signs identically.
         let (outpoint, value) = swap.funding.unwrap();
@@ -2196,5 +2459,248 @@ mod tests {
         assert!(restored.funding.is_none());
         assert!(restored.funding_height.is_none());
         assert_eq!(restored.htlc, swap.htlc);
+    }
+    fn refund_after_lookup(close_during_height: bool, old_core: bool) {
+        use crate::{
+            lightning::MockLightningBackend,
+            wallet::{blockchain::BackendConnector, BackendConfig, CoreRpcConfig},
+            watch_tower::{service::answering, watcher::tests::mock_core_rpc},
+        };
+        use serde_json::json;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Weak,
+        };
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let mut maker = compat_test_maker(dir.path(), vec![]);
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        swap.funding_height = Some(1);
+        swap.payout_script = Some(ScriptBuf::new());
+        let id = swap.payment_hash.to_string();
+        let holder = Arc::new(Mutex::new(None::<Weak<MakerServer>>));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (url, _) = mock_core_rpc({
+            let holder = holder.clone();
+            let closed = closed.clone();
+            let id = id.clone();
+            move |method, _| match method {
+                "gettxspendingprevout" if old_core => {
+                    Err(json!({"code": -32601, "message": "Method not found"}))
+                }
+                "gettxspendingprevout" => Ok(json!([])),
+                "gettxout" => Ok(json!({"bestblock": "00".repeat(32), "confirmations": 100,
+                    "value": 0.0004, "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"},
+                    "coinbase": false})),
+                "getrawtransaction" => Err(json!({"code": -5, "message": "not indexed"})),
+                "getblockcount" => {
+                    // After the new guard, another handler can close the map
+                    // record while get_current_height holds the wallet read lock.
+                    // remove_ln_swap itself removes from this map first.
+                    if close_during_height && !closed.swap(true, Ordering::SeqCst) {
+                        let maker = holder.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
+                        assert!(maker.ln_swaps.lock().unwrap().remove(&id).is_some());
+                    }
+                    Ok(json!(100))
+                }
+                "sendrawtransaction" => Err(json!({"code": -26, "message": "test rejection"})),
+                other => panic!("unexpected RPC {}", other),
+            }
+        });
+        let inner = Arc::get_mut(&mut maker).unwrap();
+        inner.watch_service.shutdown();
+        inner.watch_service = answering(WatcherEvent::UtxoSpent {
+            outpoint: swap.funding.unwrap().0,
+            spending_tx: None,
+        });
+        let config = CoreRpcConfig {
+            url,
+            ..Default::default()
+        };
+        inner.wallet.write().unwrap().blockchain =
+            crate::wallet::AnyBlockchain::CoreRPC(crate::wallet::CoreRPC::new(&config).unwrap());
+        inner.backend = BackendConnector::new(
+            BackendConfig::CoreRpc(config),
+            Arc::new(AtomicBool::new(false)),
+        );
+        *holder.lock().unwrap() = Some(Arc::downgrade(&maker));
+        let ln = Arc::new(MockLightningBackend::new());
+        let ctx = LnContext {
+            ln: ln.clone(),
+            router: LnEventRouter::new(ln),
+        };
+        maker.store_ln_swap(&id, swap.clone()).unwrap();
+        let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
+        let resurrected = maker.get_ln_swap(&id).unwrap();
+        maker.watch_service.shutdown();
+        result.unwrap();
+        if close_during_height {
+            assert!(closed.load(Ordering::SeqCst));
+            assert!(resurrected.is_none(), "closed swap was recreated");
+        } else {
+            assert!(
+                resurrected.unwrap().refund_txid.is_some(),
+                "old Core could not refund"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_swap_out_is_not_recreated_after_the_lookup_guard() {
+        refund_after_lookup(true, false);
+    }
+
+    #[test]
+    fn old_core_can_refund_an_unspent_swap_out() {
+        refund_after_lookup(false, true);
+    }
+    #[test]
+    fn recorded_refund_recovery_survives_direct_lookup_failure() {
+        use crate::{
+            lightning::{InvoiceParams, MockLightningBackend},
+            wallet::{blockchain::BackendConnector, BackendConfig, CoreRpcConfig},
+            watch_tower::{
+                service::answering,
+                watcher::tests::{mock_core_rpc, Node},
+            },
+        };
+        use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn, TxOut, Txid};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Evicted refund, confirmed refund, rival claim, failed proof, and
+        // an unrelated watcher transaction. Only our confirmed refund closes.
+        for case in 0..5 {
+            let dir = bitcoind::tempfile::tempdir().unwrap();
+            let mut maker = compat_test_maker(dir.path(), vec![]);
+            let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+            let preimage = swap.preimage.take().unwrap();
+            let value = swap.funding.unwrap().1;
+            let funding = bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([55; 32]), 1),
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value,
+                    script_pubkey: swap.htlc.script_pubkey().unwrap(),
+                }],
+            };
+            let outpoint = OutPoint::new(funding.compute_txid(), 0);
+            swap.funding = Some((outpoint, value));
+            let refund = swap
+                .htlc
+                .create_timelock_spend(outpoint, value, &swap.privkey, ScriptBuf::new())
+                .unwrap();
+            let refund_id = refund.compute_txid();
+            swap.refund_txid = Some(refund_id);
+            let mut node = Node::default();
+            node.mine(vec![]);
+            node.mine(vec![funding]);
+            if case == 2 {
+                let claim = swap
+                    .htlc
+                    .create_hashlock_spend(
+                        outpoint,
+                        value,
+                        &swap.privkey,
+                        &preimage,
+                        ScriptBuf::new(),
+                    )
+                    .unwrap();
+                node.mine(vec![claim]);
+            } else if case != 0 {
+                node.mine(vec![refund.clone()]);
+            }
+            let broadcast = Arc::new(AtomicBool::new(false));
+            let (url, _) = mock_core_rpc({
+                let broadcast = broadcast.clone();
+                let refund_hex = serialize_hex(&refund);
+                move |method, params| match method {
+                    "gettxspendingprevout" => {
+                        Err(json!({"code": -28, "message": "spend lookup unavailable"}))
+                    }
+                    "gettxout" if case == 0 && params[2] == json!(false) => Ok(json!({
+                        "bestblock": "00".repeat(32), "confirmations": 1, "value": 0.0004,
+                        "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"}, "coinbase": false
+                    })),
+                    "getrawtransaction" if case == 3 && params[0] == json!(refund_id) => {
+                        Err(json!({"code": -28, "message": "confirmation unavailable"}))
+                    }
+                    "sendrawtransaction" => {
+                        assert_eq!(params[0], json!(refund_hex));
+                        broadcast.store(true, Ordering::SeqCst);
+                        Err(json!({"code": -26, "message": "test rejection"}))
+                    }
+                    _ => node.answer(method, params),
+                }
+            });
+            let mut watched = refund;
+            if case == 4 {
+                watched.lock_time = bitcoin::absolute::LockTime::from_height(1).unwrap();
+            }
+            let inner = Arc::get_mut(&mut maker).unwrap();
+            inner.watch_service.shutdown();
+            inner.watch_service = answering(WatcherEvent::UtxoSpent {
+                outpoint,
+                spending_tx: Some(watched),
+            });
+            let config = CoreRpcConfig {
+                url,
+                ..Default::default()
+            };
+            inner.wallet.write().unwrap().blockchain = crate::wallet::AnyBlockchain::CoreRPC(
+                crate::wallet::CoreRPC::new(&config).unwrap(),
+            );
+            inner.backend = BackendConnector::new(
+                BackendConfig::CoreRpc(config),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let ln = Arc::new(MockLightningBackend::new());
+            ln.create_hold_invoice(swap.payment_hash, InvoiceParams::default())
+                .unwrap();
+            ln.simulate_htlc_arrival(swap.payment_hash, 40_000_000);
+            while ln.poll_event().unwrap().is_some() {}
+            let ctx = LnContext {
+                ln: ln.clone(),
+                router: LnEventRouter::new(ln.clone()),
+            };
+            let id = swap.payment_hash.to_string();
+            maker.store_ln_swap(&id, swap.clone()).unwrap();
+            if case == 1 {
+                // Closing also attempts a wallet sync; cancel those unrelated
+                // retries rather than requiring a full wallet RPC fixture.
+                maker.shutdown.store(true, Ordering::SeqCst);
+            }
+            let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
+            assert_eq!(
+                result.is_err(),
+                case == 3 || case == 4,
+                "case {}: {:?}",
+                case,
+                result
+            );
+            assert_eq!(broadcast.load(Ordering::SeqCst), case == 0, "case {}", case);
+            assert_eq!(
+                maker.get_ln_swap(&id).unwrap().is_none(),
+                case == 1,
+                "case {}",
+                case
+            );
+            if case != 1 {
+                assert!(
+                    ln.poll_event().unwrap().is_none(),
+                    "case {} changed Lightning state",
+                    case
+                );
+            }
+            assert_eq!(
+                ln.claim_held_payment(&preimage).is_err(),
+                case == 1,
+                "case {}",
+                case
+            );
+            maker.watch_service.shutdown();
+        }
     }
 }

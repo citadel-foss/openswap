@@ -845,6 +845,7 @@ mod tests {
                 funding_outpoint: None,
                 funding_value: None,
                 funding_height: None,
+                claim_deadline: None,
             },
         );
         let wallet = RwLock::new(wallet);
