@@ -67,6 +67,7 @@ openswap maker::api::tests::advertised_min_swap_is_the_smallest_passing_round_am
 openswap maker::api::tests::breach_query_without_an_answer_is_an_error
 openswap maker::api::tests::compat_maker_reservations_and_readmission_use_saved_coins
 openswap maker::api::tests::drain_gives_up_at_the_deadline_and_asking_again_does_not_extend_it
+openswap maker::api::tests::drain_keeps_a_replay_window_after_the_last_swap_settles
 openswap maker::api::tests::drain_refuses_new_swaps_and_lets_known_ones_resume
 openswap maker::api::tests::drain_waits_through_settling_and_a_failed_sweep
 openswap maker::api::tests::drain_with_no_swaps_stops_at_once
@@ -890,6 +891,7 @@ openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract
 openswap::integration restart::drain_on_stop::drain_does_not_wait_for_a_swap_that_went_into_recovery
 openswap::integration restart::drain_on_stop::drain_during_admission_rejects_the_swap_and_leaves_no_state
 openswap::integration restart::drain_on_stop::drain_gives_up_on_a_swap_held_open_without_funding
+openswap::integration restart::drain_on_stop::drain_stays_up_for_a_taker_retrying_a_lost_handover_reply
 openswap::integration restart::drain_on_stop::legacy_swap_finishes_and_a_new_taker_uses_the_spare
 openswap::integration restart::drain_on_stop::maker_cli_stop_drains_and_stop_now_does_not
 openswap::integration restart::drain_on_stop::taproot_swap_finishes_and_a_new_taker_uses_the_spare

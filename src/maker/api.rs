@@ -870,6 +870,8 @@ pub struct MakerServer {
     /// Completed swaps that have left `ongoing_swaps` but are still sweeping
     /// or finalizing. A drain waits for them too.
     settling_swaps: AtomicUsize,
+    /// When the last swap finished settling, for the drain's replay grace.
+    last_settled: Mutex<Option<Instant>>,
     /// Serializes funding claims, so two passes for one swap cannot both claim.
     funding_claims: Mutex<()>,
     /// Swaps whose funding step a handler is running.
@@ -916,6 +918,13 @@ pub struct MakerServer {
     pub reserved_rpc_listener: Mutex<Option<TcpListener>>,
 }
 
+/// How long a drain outlives the last settled swap, so a taker that lost its
+/// handover reply can retry. A little over the taker's retry delay.
+#[cfg(not(feature = "integration-test"))]
+const HANDOVER_REPLAY_GRACE: Duration = Duration::from_secs(20);
+#[cfg(feature = "integration-test")]
+const HANDOVER_REPLAY_GRACE: Duration = Duration::from_secs(8);
+
 /// How long `maker-cli stop` waits for the swaps in progress before the maker
 /// stops anyway. A peer can keep a swap that holds no funds alive with
 /// keepalives, and a later hop cannot tell that apart from one waiting on its
@@ -924,11 +933,17 @@ pub const DRAIN_LIMIT: Duration = Duration::from_secs(60 * 60);
 
 /// A completed swap that is still sweeping or finalizing; see
 /// [`MakerServer::begin_settling`].
-pub(crate) struct SettlingSwap<'a>(&'a AtomicUsize);
+pub(crate) struct SettlingSwap<'a> {
+    count: &'a AtomicUsize,
+    last_settled: &'a Mutex<Option<Instant>>,
+}
 
 impl Drop for SettlingSwap<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        if let Ok(mut last) = self.last_settled.lock() {
+            *last = Some(Instant::now());
+        }
+        self.count.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1155,6 +1170,7 @@ impl MakerServer {
             ongoing_swaps: Mutex::new(HashMap::new()),
             drain_deadline: OnceLock::new(),
             settling_swaps: AtomicUsize::new(0),
+            last_settled: Mutex::new(None),
             funding_claims: Mutex::new(()),
             funding_in_progress: Mutex::new(HashSet::new()),
             watch_service,
@@ -1834,7 +1850,10 @@ impl MakerServer {
                 lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
             swaps.remove(swap_id);
             self.settling_swaps.fetch_add(1, Ordering::SeqCst);
-            SettlingSwap(&self.settling_swaps)
+            SettlingSwap {
+                count: &self.settling_swaps,
+                last_settled: &self.last_settled,
+            }
         };
         self.release_swap_reservation(swap_id)?;
         Ok(settling)
@@ -1894,6 +1913,14 @@ impl MakerServer {
         };
         let swaps = lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
         let left = swaps.len() + self.settling_swaps.load(Ordering::SeqCst);
+        // A taker whose handover reply was lost retries and is answered from
+        // the in-memory replay cache. Keep it alive for that retry.
+        let replay_open = lock_debug!(self.last_settled.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .is_some_and(|at| now.saturating_duration_since(at) < HANDOVER_REPLAY_GRACE);
+        if left == 0 && replay_open {
+            return Ok(());
+        }
         if left == 0 {
             log::info!(
                 "[{}] No swaps left in progress, shutting down",
@@ -4269,6 +4296,7 @@ pub(crate) mod tests {
             ongoing_swaps: Mutex::new(HashMap::new()),
             drain_deadline: OnceLock::new(),
             settling_swaps: AtomicUsize::new(0),
+            last_settled: Mutex::new(None),
             funding_claims: Mutex::new(()),
             funding_in_progress: Mutex::new(HashSet::new()),
             completed_handovers: Mutex::new(HashMap::new()),
@@ -4426,9 +4454,29 @@ pub(crate) mod tests {
             "the reinserted swap holds the drain"
         );
 
-        // Recovery or a later completion ends it; now nothing is left.
+        // Recovery or a later completion ends it; now nothing is left. The
+        // guard dropped just now, so the replay grace still holds the drain.
         maker.remove_swap_state("live").unwrap();
         maker.stop_if_drained().unwrap();
+        assert!(!maker.shutdown.load(Ordering::SeqCst), "replay grace");
+        maker
+            .stop_if_drained_at(Instant::now() + super::HANDOVER_REPLAY_GRACE)
+            .unwrap();
+        assert!(maker.shutdown.load(Ordering::SeqCst));
+    }
+
+    /// A taker that lost its handover reply retries after a settled swap. The
+    /// drain stays up for that retry, and the deadline still ends it.
+    #[test]
+    fn drain_keeps_a_replay_window_after_the_last_swap_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (maker, _state) = maker_with_a_live_swap(dir.path());
+        maker.start_drain();
+        drop(maker.begin_settling("live").unwrap());
+        maker.stop_if_drained().unwrap();
+        assert!(!maker.shutdown.load(Ordering::SeqCst));
+        let later = Instant::now() + super::HANDOVER_REPLAY_GRACE;
+        maker.stop_if_drained_at(later).unwrap();
         assert!(maker.shutdown.load(Ordering::SeqCst));
     }
 

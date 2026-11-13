@@ -191,6 +191,7 @@ fn handle_request<M: MakerRpc>(
     };
     log::info!("RPC request received: {rpc_request:?}");
 
+    let mut drain_after_reply = false;
     let resp = match rpc_request {
         RpcMsgReq::Ping => RpcMsgResp::Pong,
         RpcMsgReq::ContractUtxo => {
@@ -297,9 +298,11 @@ fn handle_request<M: MakerRpc>(
             RpcMsgResp::Shutdown
         }
         // Only latches the drain: the serve loop does the waiting, so this
-        // sequential RPC server stays free for a following `stop --now`.
+        // sequential RPC server stays free for a following `stop --now`. The
+        // latch comes after the reply is written, so an idle maker cannot shut
+        // the socket before the caller has its answer.
         RpcMsgReq::StopAfterSwaps => {
-            maker.start_drain();
+            drain_after_reply = true;
             RpcMsgResp::Shutdown
         }
 
@@ -343,6 +346,9 @@ fn handle_request<M: MakerRpc>(
 
     if let Err(e) = send_message(socket, &resp) {
         log::error!("Error sending RPC response {e:?}");
+    }
+    if drain_after_reply {
+        maker.start_drain();
     }
 
     Ok(())

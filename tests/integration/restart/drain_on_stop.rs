@@ -70,6 +70,19 @@ fn drain_lets_a_swap_finish_and_turns_new_swaps_away(world: &mut World, protocol
     draining.start_drain();
     assert!(draining.is_draining());
 
+    // The first taker stays in touch while the second swap runs, which can
+    // take longer than the idle timeout on a slow machine.
+    let active = Arc::new(AtomicBool::new(true));
+    let keepalives = {
+        let (maker, active, swap_id) = (draining.clone(), active.clone(), first.swap_id.clone());
+        thread::spawn(move || {
+            while active.load(Relaxed) {
+                maker.touch_connection_state(&swap_id).unwrap();
+                thread::sleep(Duration::from_secs(1));
+            }
+        })
+    };
+
     // A new swap is turned away and goes to the spare. The turned-away maker
     // is not banned or marked unavailable: it did nothing wrong.
     world.takers_mut()[1]
@@ -87,6 +100,8 @@ fn drain_lets_a_swap_finish_and_turns_new_swaps_away(world: &mut World, protocol
         .find(|maker| maker.address.to_string() == draining_address)
         .expect("the draining maker is still in the offerbook")
         .state;
+    active.store(false, Relaxed);
+    keepalives.join().unwrap();
     assert_eq!(standing, MakerState::Good);
     assert!(
         !draining.shutdown.load(Relaxed),
@@ -323,5 +338,39 @@ fn drain_does_not_wait_for_a_swap_that_went_into_recovery(world: &mut World) {
         "a drain after the restart not to wait for startup recovery",
         restarted.shutdown.load(Relaxed)
     );
+    world.shutdown_makers();
+}
+
+/// The last handover reply is lost, so the taker asks again after its retry
+/// delay. The swap settles on the maker in the meantime, and the drain must
+/// stay up long enough to answer the retry from the replay cache. Without that
+/// grace the maker stops first and the swap falls into on-chain recovery.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [DropHandoverResponse],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+)]
+fn drain_stays_up_for_a_taker_retrying_a_lost_handover_reply(world: &mut World) {
+    let maker = world.makers()[0].inner().clone();
+    let maker_address = world.makers()[0].address();
+    let summary = world
+        .taker_mut()
+        .prepare(route(ProtocolVersion::Taproot, vec![maker_address]))
+        .expect("the maker admits the swap");
+    maker.start_drain();
+
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
+        .expect("the retry is answered although the maker is draining");
+    wait_until!(
+        Duration::from_secs(60),
+        "the maker to stop once the retry is served",
+        maker.shutdown.load(Relaxed)
+    );
+    assert!(!maker
+        .has_unfinished_outgoing_swapcoin(&summary.swap_id)
+        .unwrap());
     world.shutdown_makers();
 }
