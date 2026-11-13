@@ -273,6 +273,24 @@ fn read_pubkey_from_fidelity_script(redeemscript: &ScriptBuf) -> Result<PublicKe
     }
 }
 
+/// Adds a live bond's valuation to its `show-fidelity` entry. A bond whose
+/// lock has ended but that is not redeemed yet is listed as expired with no
+/// value, instead of failing the whole listing.
+fn list_bond_valuation(
+    bond_info: &mut serde_json::Value,
+    valuation: Result<Amount, WalletError>,
+) -> Result<(), WalletError> {
+    match valuation {
+        Ok(bond_value) => bond_info["bond_value"] = serde_json::json!(bond_value),
+        Err(WalletError::Fidelity(FidelityError::BondLocktimeExpired)) => {
+            bond_info["status"] = serde_json::json!("Expired");
+            bond_info["bond_value"] = serde_json::json!(Amount::ZERO);
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 /// When a bond matures, as a timestamp.
 ///
 /// A fidelity locktime is height-based everywhere else it is handled, so a
@@ -474,8 +492,9 @@ impl Wallet {
 
     /// Display the fidelity bonds
     pub fn display_fidelity_bonds(&self) -> Result<String, WalletError> {
-        // Only a live bond needs a valuation, so the tip is fetched on the
-        // first one that does. An empty or all-spent list makes no chain call.
+        // Only a confirmed live bond needs a valuation, so the tip is fetched
+        // on the first one that does. An empty, all-spent or all-unconfirmed
+        // list makes no chain call.
         let mut tip = None;
         let serialized = self
             .store
@@ -490,6 +509,12 @@ impl Wallet {
                 });
 
                 if !bond.is_spent {
+                    // A bond still waiting to confirm has no confirmation time
+                    // to value it from.
+                    if bond.conf_height.is_none() {
+                        bond_info["status"] = serde_json::json!("Unconfirmed");
+                        return Ok(bond_info);
+                    }
                     let (tip_height, tip_time) = match tip {
                         Some(t) => t,
                         None => {
@@ -498,8 +523,8 @@ impl Wallet {
                             t
                         }
                     };
-                    let bond_value = self.calculate_bond_value(bond, tip_height, tip_time)?;
-                    bond_info["bond_value"] = serde_json::json!(bond_value);
+                    let valuation = self.calculate_bond_value(bond, tip_height, tip_time);
+                    list_bond_valuation(&mut bond_info, valuation)?;
                 }
 
                 Ok(bond_info)
@@ -1423,6 +1448,98 @@ mod test {
         assert!(wallet.fidelity_bond(0).is_err());
         let (next, _, _) = wallet.get_next_fidelity_address(lock_time(1000)).unwrap();
         assert_eq!(next, 13, "a new bond must not reuse a recovered key");
+    }
+
+    /// An expired bond the maker has not redeemed yet is listed as expired,
+    /// not as an error that hides every other bond.
+    #[test]
+    fn listing_marks_an_expired_bond_instead_of_failing() {
+        let entry = || serde_json::json!({ "status": "Live" });
+
+        let mut live = entry();
+        list_bond_valuation(&mut live, Ok(Amount::from_sat(42))).unwrap();
+        assert_eq!(live["status"], "Live");
+        assert_eq!(live["bond_value"], serde_json::json!(Amount::from_sat(42)));
+
+        let mut expired = entry();
+        list_bond_valuation(
+            &mut expired,
+            Err(WalletError::Fidelity(FidelityError::BondLocktimeExpired)),
+        )
+        .unwrap();
+        assert_eq!(expired["status"], "Expired");
+        assert_eq!(expired["bond_value"], serde_json::json!(Amount::ZERO));
+
+        // Anything else, such as a backend failure, still fails the listing.
+        assert!(list_bond_valuation(
+            &mut entry(),
+            Err(WalletError::Fidelity(FidelityError::BondDoesNotExist)),
+        )
+        .is_err());
+    }
+
+    /// A confirmed bond whose lock has ended but that is not redeemed yet is
+    /// listed as expired through the whole listing path, not just the helper.
+    #[test]
+    fn listing_shows_an_expired_bond() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        // Every header is the regtest genesis header, which is all
+        // `chain_tip` needs.
+        let server = crate::wallet::blockchain::mock_electrum(|_, _| Ok(serde_json::Value::Null));
+        server.set_tip(
+            2_000,
+            &bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
+        );
+        wallet.blockchain = crate::wallet::AnyBlockchain::Electrum(
+            crate::wallet::Electrum::new(&crate::wallet::ElectrumConfig {
+                url: server.url.clone(),
+                ..Default::default()
+            })
+            .expect("connect to mock electrum"),
+        );
+        let secret = SecretKey::from_slice(&[6; 32]).unwrap();
+        wallet.store.fidelity_bond.push(FidelityBond {
+            outpoint: OutPoint::null(),
+            amount: Amount::from_sat(50_000),
+            lock_time: LockTime::from_height(1_000).unwrap(),
+            pubkey: PublicKey::new(secret.public_key(&Secp256k1::new())),
+            conf_height: Some(100),
+            is_spent: false,
+            bond_index: 0,
+            tx: None,
+            extra: BTreeMap::new(),
+        });
+
+        let listing: serde_json::Value =
+            serde_json::from_str(&wallet.display_fidelity_bonds().unwrap()).unwrap();
+        assert_eq!(listing[0]["status"], "Expired");
+        assert_eq!(listing[0]["bond_value"], serde_json::json!(Amount::ZERO));
+    }
+
+    /// A bond still in the mempool is listed as unconfirmed, without a chain
+    /// call: there is no confirmation time to value it from yet.
+    #[test]
+    fn listing_shows_an_unconfirmed_bond() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let secret = SecretKey::from_slice(&[5; 32]).unwrap();
+        wallet.store.fidelity_bond.push(FidelityBond {
+            outpoint: OutPoint::null(),
+            amount: Amount::from_sat(50_000),
+            lock_time: LockTime::from_height(1_000).unwrap(),
+            pubkey: PublicKey::new(secret.public_key(&Secp256k1::new())),
+            conf_height: None,
+            is_spent: false,
+            bond_index: 0,
+            tx: None,
+            extra: BTreeMap::new(),
+        });
+
+        let listing: serde_json::Value =
+            serde_json::from_str(&wallet.display_fidelity_bonds().unwrap()).unwrap();
+        assert_eq!(listing[0]["status"], "Unconfirmed");
+        assert!(listing[0].get("bond_value").is_none());
     }
 }
 
