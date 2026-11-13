@@ -286,6 +286,13 @@ fn embedded_nostr_relay_loop(
         conn: u64,
         shutdown: Arc<AtomicBool>,
     ) {
+        // The listener is nonblocking so accept can poll shutdown. Windows
+        // inherited sockets stay that way, which makes the handshake fail with
+        // Interrupted and the read loop spin on WouldBlock.
+        if let Err(error) = stream.set_nonblocking(false) {
+            log::warn!("Embedded nostr connection could not be made blocking: {error}");
+            return;
+        }
         // The handshake can arrive after the TCP accept on a loaded runner.
         // The short timeout is only for the read loop, so shutdown can still
         // join the worker.
