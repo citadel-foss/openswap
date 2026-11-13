@@ -86,6 +86,15 @@ impl TestNostrRelay {
             }
         }
     }
+
+    /// Live connection workers. Finished ones are joined by the accept loop,
+    /// so this is zero again after a client disconnects.
+    #[cfg(windows)]
+    fn worker_count(&self) -> usize {
+        match &self.inner {
+            TestNostrRelayInner::Embedded(embedded) => embedded.workers.lock().unwrap().len(),
+        }
+    }
 }
 
 impl Drop for TestNostrRelay {
@@ -437,4 +446,58 @@ fn embedded_nostr_relay_loop(
 
         hub.lock().unwrap().subs.retain(|sub| sub.conn != conn);
     }
+}
+
+/// A disconnect must not leave a finished worker until teardown, and the
+/// relay must still accept the next connection.
+#[cfg(windows)]
+#[test]
+fn embedded_relay_reaps_a_finished_connection() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut relay = spawn_embedded_nostr_relay(port).unwrap();
+    let url = format!("ws://127.0.0.1:{port}");
+
+    let connect = || {
+        let start = Instant::now();
+        loop {
+            if let Ok((socket, _)) = tungstenite::connect(&url) {
+                return socket;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "embedded relay did not accept a connection"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let wait_for_workers = |relay: &TestNostrRelay, expected: usize| {
+        let start = Instant::now();
+        while relay.worker_count() != expected {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "worker count stayed at {}, expected {expected}",
+                relay.worker_count()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    assert_eq!(relay.worker_count(), 0);
+    let mut socket = connect();
+    wait_for_workers(&relay, 1);
+    let _ = socket.close(None);
+    drop(socket);
+    wait_for_workers(&relay, 0);
+    assert!(
+        !relay.try_wait().unwrap(),
+        "relay exited while reaping a finished connection"
+    );
+
+    let mut socket = connect();
+    wait_for_workers(&relay, 1);
+    let _ = socket.close(None);
+    drop(socket);
+    wait_for_workers(&relay, 0);
 }
