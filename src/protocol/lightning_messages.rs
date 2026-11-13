@@ -33,10 +33,10 @@ pub struct LightningOffer {
     /// Largest swap-in in satoshis. The maker pays this over Lightning, so
     /// it is bounded by its outbound channel capacity.
     pub max_swap_in: u64,
-    /// Largest swap-out in satoshis. The maker receives this over Lightning
-    /// and pays it out on-chain, so it is bounded by its inbound channel
-    /// capacity *and* its on-chain wallet — a different resource entirely
-    /// from the swap-in limit.
+    /// Largest swap-out in satoshis. The maker receives this plus its fee
+    /// over Lightning and pays the amount out on-chain, so it is bounded by
+    /// its inbound channel capacity less the fee *and* by its on-chain
+    /// wallet — a different resource entirely from the swap-in limit.
     pub max_swap_out: u64,
 }
 

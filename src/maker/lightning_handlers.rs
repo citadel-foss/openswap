@@ -136,7 +136,8 @@ pub struct LnMakerSwap {
     pub funding: Option<(OutPoint, Amount)>,
     /// Refund timing. Swap-in: the block that confirmed the funding, where the
     /// taker's CSV refund window starts. Swap-out: the chain tip when the
-    /// maker broadcast its funding.
+    /// maker broadcast its funding, or, if that read failed, the block that
+    /// confirmed it.
     pub funding_height: Option<u32>,
     /// Backend deadline for claiming the held payment (swap-out only).
     pub claim_deadline: Option<u32>,
@@ -314,10 +315,16 @@ pub(super) struct LnCapacity {
 /// the maker receiving over Lightning and paying from the on-chain wallet,
 /// so it is bounded by *inbound* capacity and by `wallet_max`. Channels that
 /// are not usable contribute nothing either way.
+///
+/// A swap-out's hold invoice asks for the amount *plus* the maker fee, so the
+/// fee has to fit in the inbound capacity too; `base_fee` and
+/// `amount_relative_fee_pct` are the terms that fee is charged at.
 pub(super) fn directional_limits(
     channels: &[ChannelInfo],
     wallet_max: u64,
     min_size: u64,
+    base_fee: u64,
+    amount_relative_fee_pct: f64,
 ) -> LnCapacity {
     let (outbound_msat, inbound_msat) = channels.iter().filter(|channel| channel.is_usable).fold(
         (0u64, 0u64),
@@ -329,13 +336,42 @@ pub(super) fn directional_limits(
         },
     );
     let max_swap_in = outbound_msat / 1000;
-    let max_swap_out = (inbound_msat / 1000).min(wallet_max);
+    let max_swap_out =
+        max_receivable_amount(inbound_msat / 1000, base_fee, amount_relative_fee_pct)
+            .min(wallet_max);
     LnCapacity {
         swap_in: max_swap_in >= min_size,
         max_swap_in,
         swap_out: max_swap_out >= min_size,
         max_swap_out,
     }
+}
+
+/// Largest amount whose invoice, the amount plus [`ln_fee`] on it, still fits
+/// in `inbound_sat`. The fee never decreases as the amount grows, so a binary
+/// search over the amount finds the exact boundary.
+fn max_receivable_amount(inbound_sat: u64, base_fee: u64, amount_relative_fee_pct: f64) -> u64 {
+    let fits = |amount: u64| {
+        let fee = ln_fee(base_fee, amount_relative_fee_pct, Amount::from_sat(amount));
+        amount.saturating_add(fee.to_sat()) <= inbound_sat
+    };
+    // Invariant: `low` is zero or fits, and nothing above `high` fits.
+    let (mut low, mut high) = (0, inbound_sat);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low
+}
+
+/// The maker fee charged on a Lightning swap of `amount`, in either direction.
+fn ln_fee(base_fee: u64, amount_relative_fee_pct: f64, amount: Amount) -> Amount {
+    let fee = base_fee as f64 + amount.to_sat() as f64 * amount_relative_fee_pct / 100.0;
+    Amount::from_sat(fee.ceil() as u64)
 }
 
 /// Everything the Lightning handlers need from the maker; bails with a
@@ -545,9 +581,11 @@ fn validate_terms<M: Maker>(
              after {min_confirmations} confirmation(s)"
         ));
     }
-    let fee =
-        offer.base_fee as f64 + amount.to_sat() as f64 * offer.amount_relative_fee_pct / 100.0;
-    Ok(Amount::from_sat(fee.ceil() as u64))
+    Ok(ln_fee(
+        offer.base_fee,
+        offer.amount_relative_fee_pct,
+        amount,
+    ))
 }
 
 fn store_swap<M: Maker>(
@@ -1412,6 +1450,8 @@ pub fn watchdog_expire_swap_in_snapshot(
     watchdog_expire_swap_in(maker, swap_id, swap)
 }
 
+/// Recovers a swap-in preimage, or releases its state after the refund window
+/// only when payment failure or a confirmed refund leaves nothing to sweep.
 fn watchdog_finish_swap_in(
     maker: &Arc<MakerServer>,
     ctx: &LnContext,
@@ -1449,7 +1489,7 @@ fn watchdog_finish_swap_in(
     // this an `InPaid` swap whose payment failed would be polled forever.
     let funded_at = match swap.funding_height {
         Some(height) => height,
-        None => match recover_swap_in_funding_height(maker, swap_id, swap)? {
+        None => match recover_funding_height(maker, swap_id, swap, LnMakerPhase::InPaid)? {
             Some(height) => height,
             None => return Ok(()),
         },
@@ -1523,31 +1563,32 @@ fn swap_in_htlc_refunded(maker: &Arc<MakerServer>, swap: &LnMakerSwap) -> Result
     maker.is_htlc_spend_confirmed(&outpoint, &spk)
 }
 
-/// Recovers the funding height of an InPaid swap-in stored without one, as a
-/// handler whose height lookup failed used to store it. The watchdog cannot
-/// time the taker's refund window without it. Returns the height once it is
-/// stored; `None` leaves the swap for a later pass, because the funding has
-/// no confirmation height yet or the swap has changed since `swap` was read.
+/// Recovers the funding height of a swap stored in `phase` without one, as a
+/// handler whose height lookup failed stores it. The watchdog cannot time
+/// the refund window without it. Returns the height once it is stored;
+/// `None` leaves the swap for a later pass, because the funding has no
+/// confirmation height yet or the swap has changed since `swap` was read.
 /// A failed lookup is an error, and the swap is kept.
-fn recover_swap_in_funding_height(
+fn recover_funding_height(
     maker: &Arc<MakerServer>,
     swap_id: &str,
     swap: &LnMakerSwap,
+    phase: LnMakerPhase,
 ) -> Result<Option<u32>, MakerError> {
     let Some((outpoint, _)) = swap.funding else {
         return Ok(None);
     };
     let Some(height) = maker.tx_confirmation_height(&outpoint.txid)? else {
         log::warn!(
-            "Swap-in {swap_id}: funding {outpoint} has no confirmation height; keeping the swap \
+            "Swap {swap_id}: funding {outpoint} has no confirmation height; keeping the swap \
              until it does"
         );
         return Ok(None);
     };
-    if !maker.fill_ln_funding_height(swap_id, LnMakerPhase::InPaid, outpoint, height)? {
+    if !maker.fill_ln_funding_height(swap_id, phase, outpoint, height)? {
         return Ok(None);
     }
-    log::info!("Swap-in {swap_id}: recovered funding height {height} from the chain");
+    log::info!("Swap {swap_id}: recovered funding height {height} from the chain");
     Ok(Some(height))
 }
 
@@ -1565,6 +1606,8 @@ pub fn watchdog_finish_swap_in_snapshot(
     watchdog_finish_swap_in(maker, &LnContext { ln, router }, swap_id, swap)
 }
 
+/// Settles a funded swap-out from its claim, or refunds an unclaimed HTLC
+/// after its CSV window, keeping the record until the refund confirms.
 fn watchdog_resolve_swap_out(
     maker: &Arc<MakerServer>,
     ctx: &LnContext,
@@ -1742,12 +1785,19 @@ fn watchdog_resolve_swap_out(
         }
         HtlcWatch::Unspent => {
             // Unspent: refund once the CSV window has passed. An early
-            // attempt fails non-BIP68-final harmlessly and is retried.
+            // attempt fails non-BIP68-final harmlessly and is retried. A
+            // swap stored without its height gets the funding's.
+            let funded_at = match swap.funding_height {
+                Some(height) => height,
+                None => {
+                    match recover_funding_height(maker, swap_id, swap, LnMakerPhase::OutFunded)? {
+                        Some(height) => height,
+                        None => return Ok(()),
+                    }
+                }
+            };
             let current = maker.get_current_height()?;
-            let refundable = swap
-                .funding_height
-                .map(|h| current >= h.saturating_add(swap.locktime as u32))
-                .unwrap_or(false);
+            let refundable = current >= funded_at.saturating_add(swap.locktime as u32);
             let unspent_on_chain = || {
                 maker
                     .htlc_unspent_and_age(&outpoint)
@@ -1766,8 +1816,11 @@ fn watchdog_resolve_swap_out(
                 UnspentHtlc::Refund => {}
             }
             let mut swap = swap.clone();
-            // Persist the destination together with the refund under the
-            // phase guard below; payout_script() writes unconditionally.
+            // Stored below with the refund, so it must not carry the
+            // snapshot's missing height over the one just recovered.
+            swap.funding_height = Some(funded_at);
+            // Not payout_script(), whose store is unconditional: a new script
+            // changes the refund txid, so the guarded store below writes both.
             let destination = match &swap.payout_script {
                 Some(script) => script.clone(),
                 None => {
@@ -1791,6 +1844,7 @@ fn watchdog_resolve_swap_out(
             let refund_txid = refund_tx.compute_txid();
             if swap.refund_txid != Some(refund_txid) {
                 swap.refund_txid = Some(refund_txid);
+                // A claim may have closed the swap since the snapshot.
                 if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::OutFunded, swap.clone())? {
                     return Ok(());
                 }
@@ -1845,6 +1899,20 @@ fn warn_swap_out_claim_deadline(maker: &Arc<MakerServer>, swap_id: &str, swap: &
             deadline is height {deadline}, current height unavailable: {e:?}"
         ),
     }
+}
+
+/// Runs the watchdog's pass over an OutFunded swap-out on a snapshot the test
+/// supplies, whatever state the stored swap has reached since.
+#[cfg(feature = "integration-test")]
+pub fn watchdog_resolve_swap_out_snapshot(
+    maker: &Arc<MakerServer>,
+    swap_id: &str,
+    swap: &LnMakerSwap,
+) -> Result<(), MakerError> {
+    let (Some(ln), Some(router)) = (maker.lightning.clone(), maker.ln_router.clone()) else {
+        return Err(MakerError::General("lightning is not configured"));
+    };
+    watchdog_resolve_swap_out(maker, &LnContext { ln, router }, swap_id, swap)
 }
 
 /// Stops the watchdog's swap-out refund between its two steps, recording it
@@ -2269,14 +2337,14 @@ mod tests {
     #[test]
     fn directions_are_bounded_by_opposite_channel_sides() {
         // Freshly opened channel: all outbound, no inbound.
-        let limits = directional_limits(&[channel(500_000, 0, true)], u64::MAX, 10_000);
+        let limits = directional_limits(&[channel(500_000, 0, true)], u64::MAX, 10_000, 0, 0.0);
         assert!(limits.swap_in);
         assert_eq!(limits.max_swap_in, 500_000);
         assert!(!limits.swap_out, "no inbound capacity means no swap-outs");
         assert_eq!(limits.max_swap_out, 0);
 
         // Fully drained the other way: inbound only.
-        let limits = directional_limits(&[channel(0, 500_000, true)], u64::MAX, 10_000);
+        let limits = directional_limits(&[channel(0, 500_000, true)], u64::MAX, 10_000, 0, 0.0);
         assert!(!limits.swap_in);
         assert_eq!(limits.max_swap_in, 0);
         assert!(limits.swap_out);
@@ -2287,13 +2355,23 @@ mod tests {
     /// while a swap-in, which pays over Lightning, is untouched by that.
     #[test]
     fn wallet_caps_only_the_swap_out_direction() {
-        let limits = directional_limits(&[channel(500_000, 500_000, true)], 80_000, 10_000);
+        let limits = directional_limits(&[channel(500_000, 500_000, true)], 80_000, 10_000, 0, 0.0);
         assert_eq!(limits.max_swap_in, 500_000);
+        assert_eq!(limits.max_swap_out, 80_000);
+
+        // With a fee, inbound still covers 98_019 sats, so the wallet stays the bound.
+        let limits = directional_limits(
+            &[channel(500_000, 100_000, true)],
+            80_000,
+            10_000,
+            1_000,
+            1.0,
+        );
         assert_eq!(limits.max_swap_out, 80_000);
 
         // An unreadable wallet is reported as no on-chain capacity, which
         // must disable swap-outs rather than advertise an unbacked one.
-        let limits = directional_limits(&[channel(500_000, 500_000, true)], 0, 10_000);
+        let limits = directional_limits(&[channel(500_000, 500_000, true)], 0, 10_000, 0, 0.0);
         assert!(limits.swap_in);
         assert!(!limits.swap_out);
     }
@@ -2307,7 +2385,7 @@ mod tests {
             channel(999_999, 999_999, false),
             channel(200_000, 4_000, true),
         ];
-        let limits = directional_limits(&channels, u64::MAX, 10_000);
+        let limits = directional_limits(&channels, u64::MAX, 10_000, 0, 0.0);
         assert_eq!(
             limits.max_swap_in, 500_000,
             "unusable channels contribute nothing"
@@ -2316,9 +2394,39 @@ mod tests {
         assert!(limits.swap_in && limits.swap_out);
 
         // Below min_size the direction is withdrawn, not advertised small.
-        let limits = directional_limits(&[channel(300_000, 9_999, true)], u64::MAX, 10_000);
+        let limits = directional_limits(&[channel(300_000, 9_999, true)], u64::MAX, 10_000, 0, 0.0);
         assert!(limits.swap_in);
         assert!(!limits.swap_out);
+    }
+
+    /// The taker pays a swap-out's amount plus the maker fee over Lightning,
+    /// so the advertised maximum must leave room for the fee in the inbound
+    /// capacity, or the largest advertised swap-out could never be paid.
+    #[test]
+    fn swap_out_limit_leaves_inbound_room_for_the_fee() {
+        let (base_fee, pct) = (1_000, 1.0);
+        let limits = directional_limits(
+            &[channel(0, 100_000, true)],
+            u64::MAX,
+            10_000,
+            base_fee,
+            pct,
+        );
+        // 98_019 + ceil(1_000 + 980.19) = 100_000, while one sat more would
+        // need a 100_001 sat invoice.
+        assert_eq!(limits.max_swap_out, 98_019);
+        let invoice =
+            |amount: u64| amount + ln_fee(base_fee, pct, Amount::from_sat(amount)).to_sat();
+        assert_eq!(invoice(limits.max_swap_out), 100_000);
+        assert!(invoice(limits.max_swap_out + 1) > 100_000);
+
+        // Inbound that covers the minimum swap but not its fee serves nothing.
+        let limits = directional_limits(&[channel(0, 10_500, true)], u64::MAX, 10_000, 1_000, 0.0);
+        assert!(!limits.swap_out);
+
+        // A base fee above the whole inbound capacity leaves nothing.
+        let limits = directional_limits(&[channel(0, 500, true)], u64::MAX, 0, 1_000, 0.0);
+        assert_eq!(limits.max_swap_out, 0);
     }
 
     /// Promotion moves a connection from the server's short pending deadline

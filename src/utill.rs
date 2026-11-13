@@ -1767,7 +1767,7 @@ mod tests {
             features: vec!["legacy".to_string(), "taproot".to_string()],
         });
 
-        thread::spawn(move || {
+        let receiver = thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             let msg_bytes = read_message(&mut socket).unwrap();
             let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes).unwrap();
@@ -1784,6 +1784,8 @@ mod tests {
 
         let mut stream = TcpStream::connect(address).unwrap();
         send_message(&mut stream, &message).unwrap();
+        // Join so a failed assertion in the receiver fails this test.
+        receiver.join().unwrap();
     }
 
     #[test]

@@ -185,8 +185,8 @@ This shows our maker's fidelity bond in a clean JSON format:
 - **index**: The bond index (0 for the first/current bond)
 - **outpoint**: The transaction output point (txid:vout) where the bond is locked
 - **amount**: The amount locked in the fidelity bond (10,000 sats by default)
-- **status**: Current status of the bond ("Live" means active and unspent, "Redeemed" means it has been spent after expiry)
-- **bond_value**: The calculated bond value (only shown for live bonds)
+- **status**: Current status of the bond ("Live" means active and unspent, "Unconfirmed" means broadcast but not yet mined, "Expired" means its timelock has passed but it is not redeemed yet, "Redeemed" means it has been spent after expiry)
+- **bond_value**: The calculated bond value (shown for live bonds, and 0 for expired ones)
 
 > **Note:** Currently, a maker can have only one active (unexpired) fidelity bond at a time. `makerd` automatically creates a new bond once the previous one expires and is redeemed.
 
