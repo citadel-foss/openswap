@@ -221,6 +221,9 @@ fn embedded_nostr_relay_loop(
     let next_conn = Arc::new(AtomicU64::new(1));
 
     while !shutdown.load(Relaxed) {
+        // A reconnecting test would otherwise keep every finished handle until
+        // teardown. Join them here so the list stays the live connections.
+        reap_finished_workers(&workers);
         match listener.accept() {
             Ok((stream, _)) => {
                 let hub = Arc::clone(&hub);
@@ -238,6 +241,26 @@ fn embedded_nostr_relay_loop(
                 log::warn!("Embedded nostr relay stopped accepting: {error}");
                 break;
             }
+        }
+    }
+
+    fn reap_finished_workers(workers: &Mutex<Vec<JoinHandle<()>>>) {
+        let finished = {
+            let mut guard = workers.lock().unwrap();
+            let mut still_running = Vec::with_capacity(guard.len());
+            let mut finished = Vec::new();
+            for worker in guard.drain(..) {
+                if worker.is_finished() {
+                    finished.push(worker);
+                } else {
+                    still_running.push(worker);
+                }
+            }
+            *guard = still_running;
+            finished
+        };
+        for worker in finished {
+            let _ = worker.join();
         }
     }
 

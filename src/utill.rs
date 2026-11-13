@@ -2442,7 +2442,11 @@ mod tests {
         let mut perms = fs::metadata(dir.path()).unwrap().permissions();
         perms.set_mode(0o555);
         fs::set_permissions(dir.path(), perms).unwrap();
-        assert!(set_config_key(&path, "port", "2").is_err());
+        // Root, or CAP_DAC_OVERRIDE, can still create the staging file.
+        // Skip the failure assert then; the bytes check below still runs.
+        if fs::File::create(dir.path().join(".write-probe")).is_err() {
+            assert!(set_config_key(&path, "port", "2").is_err());
+        }
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
