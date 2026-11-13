@@ -503,6 +503,7 @@ impl Wallet {
             store_enc_material: restored_enc_material,
             locked_utxos: std::collections::HashSet::new(),
             pending_sends: std::collections::HashMap::new(),
+            send_holds_made: 0,
             sends_in_flight: std::collections::HashSet::new(),
             _in_use: Some(in_use),
         })

@@ -748,12 +748,30 @@ mod tests {
         wallet.hold_for_send(&[outpoint(3)], in_flight);
 
         // One probe per returned send, none for one still broadcasting.
-        assert_eq!(wallet.sends_to_probe(), vec![returned]);
+        let probes = wallet.sends_to_probe();
+        assert_eq!(
+            probes.iter().map(|hold| hold.txid).collect::<Vec<_>>(),
+            vec![returned]
+        );
 
         // Answers gathered outside the wallet cannot free a send still in
         // flight, even if the backend called it unknown.
-        wallet.settle_sends(&HashSet::from([returned, in_flight]));
+        let in_flight_hold = *wallet.pending_sends.get(&outpoint(3)).unwrap();
+        let mut unknown: HashSet<_> = probes.iter().copied().collect();
+        unknown.insert(in_flight_hold);
+        wallet.settle_sends(&unknown);
         assert_eq!(wallet.list_lock_unspent(), vec![outpoint(3)]);
+
+        // A retry that signs the same tx is a new hold: the answer about the
+        // first one, arriving late, must not free it.
+        wallet.hold_for_send(&[outpoint(1), outpoint(2)], returned);
+        wallet.broadcast_returned(&returned);
+        wallet.settle_sends(&probes.into_iter().collect());
+        let mut held = wallet.list_lock_unspent();
+        held.sort();
+        let mut expected = vec![outpoint(1), outpoint(2), outpoint(3)];
+        expected.sort();
+        assert_eq!(held, expected);
     }
 
     #[test]

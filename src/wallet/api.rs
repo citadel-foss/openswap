@@ -103,11 +103,14 @@ pub struct Wallet {
     pub(crate) store_enc_material: KeyMaterial,
     /// Wallet-side set of outpoints excluded from coin selection.
     pub(crate) locked_utxos: HashSet<OutPoint>,
-    /// Inputs of our own direct sends, keyed to the spending txid, held out of
-    /// coin selection until a sync settles them (see
+    /// Inputs of our own direct sends, keyed to the hold that spends them,
+    /// held out of coin selection until a sync settles them (see
     /// [`Wallet::release_settled_sends`]). Kept apart from `locked_utxos`,
     /// which [`Wallet::lock_unspendable_utxos`] rebuilds from scratch.
-    pub(crate) pending_sends: HashMap<OutPoint, Txid>,
+    pub(crate) pending_sends: HashMap<OutPoint, SendHold>,
+    /// Numbers each hold, so a backend answer about one hold cannot settle a
+    /// later hold of the same txid (a retried send can sign the same tx).
+    pub(crate) send_holds_made: u64,
     /// Held sends whose broadcast has not returned yet. Until it does, the
     /// backend not knowing the tx says nothing, so no sync may free its inputs.
     pub(crate) sends_in_flight: HashSet<Txid>,
@@ -531,6 +534,7 @@ impl Wallet {
             store_enc_material,
             locked_utxos: HashSet::new(),
             pending_sends: HashMap::new(),
+            send_holds_made: 0,
             sends_in_flight: HashSet::new(),
             _in_use: Some(in_use),
         })
@@ -660,6 +664,7 @@ impl Wallet {
             store_enc_material,
             locked_utxos: HashSet::new(),
             pending_sends: HashMap::new(),
+            send_holds_made: 0,
             sends_in_flight: HashSet::new(),
             _in_use: Some(in_use),
         };
@@ -2493,8 +2498,13 @@ impl Wallet {
     /// a sync settles them. Call before the broadcast, so no other thread can
     /// select them while it runs.
     pub(crate) fn hold_for_send(&mut self, outpoints: &[OutPoint], txid: Txid) {
+        self.send_holds_made += 1;
+        let hold = SendHold {
+            txid,
+            number: self.send_holds_made,
+        };
         self.pending_sends
-            .extend(outpoints.iter().map(|outpoint| (*outpoint, txid)));
+            .extend(outpoints.iter().map(|outpoint| (*outpoint, hold)));
         self.sends_in_flight.insert(txid);
     }
 
@@ -2523,10 +2533,10 @@ impl Wallet {
     /// A send whose broadcast has not returned is only ever released by the
     /// first rule; see [`Wallet::broadcast_returned`].
     pub(crate) fn release_settled_sends(&mut self) {
-        let unknown: HashSet<Txid> = self
+        let unknown: HashSet<SendHold> = self
             .sends_to_probe()
             .into_iter()
-            .filter(|txid| matches!(self.blockchain.is_tx_unknown(txid), Ok(true)))
+            .filter(|hold| matches!(self.blockchain.is_tx_unknown(&hold.txid), Ok(true)))
             .collect();
         self.settle_sends(&unknown);
     }
@@ -2535,33 +2545,34 @@ impl Wallet {
     /// returned, and some input still cached. Each once, however many inputs.
     /// A caller can ask the backend about these without holding the wallet,
     /// then pass the unknown ones to [`Wallet::settle_sends`].
-    pub(crate) fn sends_to_probe(&self) -> Vec<Txid> {
-        let mut txids: Vec<Txid> = self
+    pub(crate) fn sends_to_probe(&self) -> Vec<SendHold> {
+        let mut holds: Vec<SendHold> = self
             .pending_sends
             .iter()
-            .filter(|(outpoint, txid)| {
+            .filter(|(outpoint, hold)| {
                 self.store.utxo_cache.contains_key(outpoint)
-                    && !self.sends_in_flight.contains(*txid)
+                    && !self.sends_in_flight.contains(&hold.txid)
             })
-            .map(|(_, txid)| *txid)
+            .map(|(_, hold)| *hold)
             .collect();
-        txids.sort();
-        txids.dedup();
-        txids
+        holds.sort_by_key(|hold| hold.number);
+        holds.dedup();
+        holds
     }
 
     /// Release held send inputs by the rules of
     /// [`Wallet::release_settled_sends`], with `unknown` the sends the backend
     /// reported unknown. Rechecks each hold, so answers read without the
-    /// wallet held cannot free a send whose broadcast has not returned.
-    pub(crate) fn settle_sends(&mut self, unknown: &HashSet<Txid>) {
-        let held: Vec<(OutPoint, Txid)> =
-            self.pending_sends.iter().map(|(o, t)| (*o, *t)).collect();
-        for (outpoint, txid) in held {
+    /// wallet held cannot free a send whose broadcast has not returned, nor a
+    /// later hold of the same txid than the one asked about.
+    pub(crate) fn settle_sends(&mut self, unknown: &HashSet<SendHold>) {
+        let held: Vec<(OutPoint, SendHold)> =
+            self.pending_sends.iter().map(|(o, h)| (*o, *h)).collect();
+        for (outpoint, hold) in held {
             let settled = send_input_settled(
                 self.store.utxo_cache.contains_key(&outpoint),
-                self.sends_in_flight.contains(&txid),
-                || unknown.contains(&txid),
+                self.sends_in_flight.contains(&hold.txid),
+                || unknown.contains(&hold),
             );
             if settled {
                 self.pending_sends.remove(&outpoint);
@@ -4540,6 +4551,14 @@ impl Wallet {
     }
 }
 
+/// One hold of a direct send's inputs: the send's txid and the hold's number,
+/// unique within the wallet's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SendHold {
+    pub(crate) txid: Txid,
+    pub(crate) number: u64,
+}
+
 /// Whether a sync may free a held send input; see
 /// [`Wallet::release_settled_sends`]. `send_unknown` asks the backend, and is
 /// not called while the send's broadcast is still in flight.
@@ -5354,6 +5373,7 @@ pub(crate) mod test_support {
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
             pending_sends: HashMap::new(),
+            send_holds_made: 0,
             sends_in_flight: HashSet::new(),
             _in_use: None,
         }
@@ -5750,6 +5770,7 @@ mod restore_history_probe_tests {
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
             pending_sends: HashMap::new(),
+            send_holds_made: 0,
             sends_in_flight: HashSet::new(),
             _in_use: None,
         }
@@ -6947,6 +6968,7 @@ mod timelock_reconcile_tests {
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
             pending_sends: HashMap::new(),
+            send_holds_made: 0,
             sends_in_flight: HashSet::new(),
             _in_use: None,
         }
