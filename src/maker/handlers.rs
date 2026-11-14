@@ -163,6 +163,22 @@ pub enum MakerBehavior {
     /// Answer every lookup of a Lightning HTLC funding's confirmation height
     /// with no height, as after a reorg takes the funding's block away.
     NoFundingHeight,
+    /// Answer the first lookup of a Lightning HTLC funding's confirmation
+    /// height with no height, then the real one, as a backend that is briefly
+    /// behind would (an Electrum failover to a lagging server).
+    FundingHeightLagsOnce,
+    /// Answer the first lookup of a Lightning HTLC funding's confirmation
+    /// height with no height, then the chain tip, as after a reorg drops the
+    /// funding's block and the next block mines it again.
+    FundingReminedAtTip,
+    /// Request shutdown on the first lookup of a Lightning HTLC funding's
+    /// confirmation height and answer it with no height, so the handler's
+    /// reread meets the shutdown.
+    ShutdownDuringFundingHeightRetry,
+    /// Answer the first lookup of a Lightning HTLC funding's confirmation
+    /// height with no height, and request shutdown inside the handler's pause
+    /// before it reads again.
+    ShutdownDuringFundingHeightPause,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).
@@ -777,17 +793,12 @@ pub trait Maker: Send + Sync {
         Err(MakerError::General("lightning swaps not supported"))
     }
 
-    /// Whether `outpoint` is still unspent (mempool included), and how many
-    /// blocks have passed since its transaction confirmed.
+    /// Whether `outpoint` is still unspent, mempool included.
     ///
-    /// A swap-in maker must know both before it pays: an already-spent
-    /// output, or one whose CSV window has largely elapsed, means the taker
-    /// can refund the HTLC the maker is about to pay for.
+    /// A swap-in maker must know before it pays: an already-spent output
+    /// means the taker took back the HTLC the maker is about to pay for.
     #[cfg(feature = "lightning")]
-    fn htlc_unspent_and_age(
-        &self,
-        _outpoint: &bitcoin::OutPoint,
-    ) -> Result<(bool, u32), MakerError> {
+    fn htlc_unspent(&self, _outpoint: &bitcoin::OutPoint) -> Result<bool, MakerError> {
         Err(MakerError::General("lightning swaps not supported"))
     }
 
@@ -833,6 +844,13 @@ pub trait Maker: Send + Sync {
     #[cfg(feature = "lightning")]
     fn shutdown_requested(&self) -> bool {
         false
+    }
+
+    /// Pauses `duration` before a swap-in handler reads a missing funding
+    /// height again.
+    #[cfg(feature = "lightning")]
+    fn pause_before_height_reread(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
     }
 }
 

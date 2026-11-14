@@ -2911,19 +2911,37 @@ fn announce_funding(
     format!("{result:?}")
 }
 
-/// The taker's CSV refund window starts at the block that confirmed its
-/// funding, so that block, not the tip when the handler runs, is what
-/// handle_swap_in_funded must record as the funding height.
+/// Announces a confirmed funding to a maker whose height lookup behaves as
+/// `behavior` says, and checks that handle_swap_in_funded paid and recorded
+/// the block that confirmed the funding.
 #[world_test(
     backend = BitcoindBackend,
     bind = [ln = maker_node()],
-    maker_behaviors = [Normal],
+    maker_behaviors = [behavior],
     takers = [Normal],
     maker_lightning = [ln.clone()],
+    cases = [
+        /// The taker's CSV refund window starts at the block that confirmed
+        /// its funding, so that block, not the tip when the handler runs, is
+        /// what handle_swap_in_funded must record as the funding height.
+        swap_in_funded_handler_records_confirmation_height(
+            behavior = MakerBehavior::Normal,
+            preimage = Preimage([0xd1; 32]),
+        ),
+        /// A backend that is briefly behind, such as an Electrum server the
+        /// maker failed over to, can answer the first lookup with no height
+        /// although the wait just saw the block. The handler must read again
+        /// and pay rather than fail a sound swap.
+        swap_in_funded_handler_rereads_a_lagging_funding_height(
+            behavior = MakerBehavior::FundingHeightLagsOnce,
+            preimage = Preimage([0xd4; 32]),
+        ),
+    ],
 )]
-fn swap_in_funded_handler_records_confirmation_height(
+fn handler_records_confirmation_height(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
+    preimage: Preimage,
 ) {
     let taker_ln = MockLightningBackend::new();
     let framework = world.framework().clone();
@@ -2931,7 +2949,6 @@ fn swap_in_funded_handler_records_confirmation_height(
     let maker = world.makers()[0].inner().clone();
     pause_block_generation(&framework);
 
-    let preimage = Preimage([0xd1; 32]);
     let swap_id = preimage.payment_hash().to_string();
     accept_swap_in(&maker, &taker_ln, &preimage);
     let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
@@ -2984,6 +3001,8 @@ fn swap_in_funded_handler_records_confirmation_height(
             behavior = MakerBehavior::FailFundingHeightLookup,
             expected_error = "funding height lookup failed",
             preimage = Preimage([0xd2; 32]),
+            lookups = 1,
+            min_confirmations = 1,
         ),
         /// The handler waits for the funding to confirm, but the block can be
         /// reorged away before it reads the height. A lookup that answers with
@@ -2992,6 +3011,36 @@ fn swap_in_funded_handler_records_confirmation_height(
             behavior = MakerBehavior::NoFundingHeight,
             expected_error = "swap-in funding has no confirmation height",
             preimage = Preimage([0xd3; 32]),
+            lookups = 4,
+            min_confirmations = 1,
+        ),
+        /// A reorg can drop the funding's block after the confirmation wait,
+        /// and the next block mine it again. The height the handler reads then
+        /// has fewer confirmations than the swap requires, so it must not pay.
+        swap_in_funded_handler_stops_on_a_reorged_shallow_funding(
+            behavior = MakerBehavior::FundingReminedAtTip,
+            expected_error = "swap-in funding has fewer confirmations than the swap requires",
+            preimage = Preimage([0xd5; 32]),
+            lookups = 2,
+            min_confirmations = 2,
+        ),
+        /// Shutdown stops the watcher. A handler rereading a missing height
+        /// must stop on it rather than read on and store an unwatched InPaid.
+        swap_in_funded_handler_stops_on_shutdown_during_height_retry(
+            behavior = MakerBehavior::ShutdownDuringFundingHeightRetry,
+            expected_error = "Shutdown",
+            preimage = Preimage([0xd6; 32]),
+            lookups = 1,
+            min_confirmations = 1,
+        ),
+        /// Shutdown can also arrive during the pause before a reread. The
+        /// handler must check again after the pause and stop without reading.
+        swap_in_funded_handler_stops_on_shutdown_during_height_pause(
+            behavior = MakerBehavior::ShutdownDuringFundingHeightPause,
+            expected_error = "Shutdown",
+            preimage = Preimage([0xd7; 32]),
+            lookups = 1,
+            min_confirmations = 1,
         ),
     ],
 )]
@@ -3000,6 +3049,8 @@ fn handler_stops_without_funding_height(
     ln: Arc<MockLightningBackend>,
     expected_error: &str,
     preimage: Preimage,
+    lookups: u32,
+    min_confirmations: u32,
 ) {
     let taker_ln = MockLightningBackend::new();
     let framework = world.framework().clone();
@@ -3008,11 +3059,18 @@ fn handler_stops_without_funding_height(
     pause_block_generation(&framework);
 
     let swap_id = preimage.payment_hash().to_string();
-    accept_swap_in(&maker, &taker_ln, &preimage);
+    let request = LnSwapInRequest {
+        min_confirmations,
+        ..swap_in_request(&taker_ln, &preimage)
+    };
+    match expect_ln(send_swap_in_request(&maker, request).unwrap()) {
+        LightningMakerMessage::SwapInAccept(_) => {}
+        other => panic!("expected SwapInAccept, got {}", other),
+    }
     let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
     let value = accepted.amount + accepted.fee;
     let funding = fund_htlc(bitcoind, &accepted);
-    generate_blocks(bitcoind, 1);
+    generate_blocks(bitcoind, min_confirmations as u64);
 
     let result = announce_funding(&maker, &swap_id, funding, value);
     assert!(
@@ -3024,6 +3082,11 @@ fn handler_stops_without_funding_height(
         ln.last_pay_cltv_bound(),
         None,
         "the handler paid without a funding height"
+    );
+    assert_eq!(
+        maker.funding_height_lookups.load(Relaxed),
+        lookups,
+        "the handler made an unexpected number of funding height lookups"
     );
     let kept = maker
         .get_ln_swap(&swap_id)
