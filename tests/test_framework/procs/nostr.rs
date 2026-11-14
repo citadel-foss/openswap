@@ -294,9 +294,15 @@ fn embedded_nostr_relay_loop(
             return;
         }
         // The handshake can arrive after the TCP accept on a loaded runner.
-        // The short timeout is only for the read loop, so shutdown can still
-        // join the worker.
+        // A read timeout does not bound writes: tungstenite flushes each
+        // send, so a subscriber that stops reading would pin this worker and
+        // block shutdown's join. The write bound also covers the handshake
+        // reply.
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        if let Err(error) = stream.set_write_timeout(Some(Duration::from_secs(5))) {
+            log::warn!("Embedded nostr connection could not bound writes: {error}");
+            return;
+        }
         let mut socket = match tungstenite::accept(stream) {
             Ok(socket) => socket,
             Err(error) => {
@@ -507,4 +513,127 @@ fn embedded_relay_reaps_a_finished_connection() {
     let _ = socket.close(None);
     drop(socket);
     wait_for_workers(&relay, 0);
+}
+
+/// A bad signature must be refused and must not be stored or broadcast.
+/// Removing `event.verify()` would otherwise leave this suite green.
+#[cfg(windows)]
+#[test]
+fn embedded_relay_rejects_a_bad_signature() {
+    use nostr::{
+        event::{EventBuilder, Kind},
+        key::Keys,
+        ClientMessage, Event, Filter, JsonUtil, RelayMessage, SubscriptionId,
+    };
+    use tungstenite::{stream::MaybeTlsStream, Message, WebSocket};
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let relay = spawn_embedded_nostr_relay(port).unwrap();
+    let url = format!("ws://127.0.0.1:{port}");
+
+    let connect = || {
+        let start = Instant::now();
+        loop {
+            if let Ok((socket, _)) = tungstenite::connect(&url) {
+                return socket;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "embedded relay did not accept a connection"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let set_read_timeout = |socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+                            timeout: Duration| {
+        match socket.get_mut() {
+            MaybeTlsStream::Plain(tcp) => tcp.set_read_timeout(Some(timeout)).unwrap(),
+            _ => panic!("embedded relay is plaintext"),
+        }
+    };
+    let read_relay =
+        |socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>| match socket.read() {
+            Ok(Message::Text(text)) => RelayMessage::from_json(text.as_str()).unwrap(),
+            other => panic!("expected a relay text frame, got {:?}", other),
+        };
+    let send = |socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>,
+                message: &ClientMessage| {
+        socket.send(Message::text(message.as_json())).unwrap();
+    };
+
+    let keys = Keys::generate();
+    let signed = |content: &str| {
+        EventBuilder::new(Kind::Custom(1), content)
+            .build(keys.public_key())
+            .sign_with_keys(&keys)
+            .unwrap()
+    };
+    let good = signed("good");
+    let mut bad = signed("bad");
+    bad.content = "tampered".to_string();
+    assert!(good.verify().is_ok());
+    assert!(bad.verify().is_err());
+
+    let mut subscriber = connect();
+    set_read_timeout(&mut subscriber, Duration::from_secs(2));
+    send(
+        &mut subscriber,
+        &ClientMessage::req(SubscriptionId::new("live"), Filter::new()),
+    );
+    assert!(
+        matches!(
+            read_relay(&mut subscriber),
+            RelayMessage::EndOfStoredEvents(_)
+        ),
+        "subscription was not registered"
+    );
+
+    let mut publisher = connect();
+    set_read_timeout(&mut publisher, Duration::from_secs(2));
+    let publish = |socket: &mut WebSocket<MaybeTlsStream<std::net::TcpStream>>, event: &Event| {
+        send(socket, &ClientMessage::event(event.clone()));
+        match read_relay(socket) {
+            RelayMessage::Ok {
+                event_id, status, ..
+            } => {
+                assert_eq!(event_id, event.id);
+                status
+            }
+            other => panic!("expected OK, got {:?}", other),
+        }
+    };
+    assert!(publish(&mut publisher, &good));
+    match read_relay(&mut subscriber) {
+        RelayMessage::Event { event, .. } => assert_eq!(event.id, good.id),
+        other => panic!("subscriber missed the valid event: {:?}", other),
+    }
+
+    assert!(!publish(&mut publisher, &bad));
+    set_read_timeout(&mut subscriber, Duration::from_millis(400));
+    match subscriber.read() {
+        Err(tungstenite::Error::Io(error))
+            if error.kind() == io::ErrorKind::TimedOut
+                || error.kind() == io::ErrorKind::WouldBlock => {}
+        Ok(Message::Text(text)) => panic!("rejected event was broadcast: {}", text),
+        other => panic!("unexpected frame after a rejected event: {:?}", other),
+    }
+
+    let mut later = connect();
+    set_read_timeout(&mut later, Duration::from_secs(2));
+    send(
+        &mut later,
+        &ClientMessage::req(SubscriptionId::new("later"), Filter::new()),
+    );
+    let mut stored = Vec::new();
+    loop {
+        match read_relay(&mut later) {
+            RelayMessage::Event { event, .. } => stored.push(event.id),
+            RelayMessage::EndOfStoredEvents(_) => break,
+            other => panic!("expected stored events, got {:?}", other),
+        }
+    }
+    assert_eq!(stored, vec![good.id]);
+    drop(relay);
 }
