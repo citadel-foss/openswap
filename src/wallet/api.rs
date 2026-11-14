@@ -7346,6 +7346,7 @@ mod mempool_deferral_tests {
     use bitcoind::tempfile::tempdir;
     use std::{
         collections::BTreeMap,
+        fs,
         io::{BufRead, BufReader, Write as IoWrite},
         net::TcpListener,
         sync::{Arc, Mutex, RwLock},
@@ -7371,6 +7372,11 @@ mod mempool_deferral_tests {
         fail_lookups_after_broadcast: bool,
         /// Every fee estimate, in sat/vB.
         feerate: f64,
+        /// The wallet file to read at each broadcast request.
+        wallet_file: Option<PathBuf>,
+        /// Per broadcast request, whether `wallet_file` already held the
+        /// broadcast tx as a bond with its signed transaction.
+        saved_at_send: Vec<bool>,
     }
 
     impl StubChain {
@@ -7386,6 +7392,8 @@ mod mempool_deferral_tests {
                 fail_lookups: HashSet::new(),
                 fail_lookups_after_broadcast: false,
                 feerate: 1.0,
+                wallet_file: None,
+                saved_at_send: Vec::new(),
             }))
         }
 
@@ -7493,6 +7501,25 @@ mod mempool_deferral_tests {
                                 }
                             }
                             "blockchain.transaction.broadcast" => {
+                                if let Some(path) = chain.wallet_file.clone() {
+                                    let sent = deserialize_hex::<Transaction>(param)
+                                        .unwrap()
+                                        .compute_txid();
+                                    let saved = WalletStore::read_from_disk(
+                                        &path,
+                                        Some(PASSWORD.to_string()),
+                                    )
+                                    .is_ok_and(|(store, _)| {
+                                        store.fidelity_bond.iter().any(|bond| {
+                                            bond.outpoint.txid == sent
+                                                && bond
+                                                    .tx
+                                                    .as_ref()
+                                                    .is_some_and(|tx| tx.compute_txid() == sent)
+                                        })
+                                    });
+                                    chain.saved_at_send.push(saved);
+                                }
                                 if chain.reject_broadcast {
                                     return json!({"jsonrpc": "2.0", "id": req["id"], "error": {
                                         "code": -26, "message": "transaction temporarily rejected",
@@ -8602,6 +8629,43 @@ mod mempool_deferral_tests {
         (result, txid, in_memory, saved_bonds(&path))
     }
 
+    /// The bond and its signed transaction are on disk before the backend
+    /// sees the broadcast, so a crash mid-send never leaves a funded bond
+    /// without a record. A bond that cannot be saved is never sent.
+    #[test]
+    fn a_bond_is_saved_before_it_is_broadcast() {
+        let funding = tx(OutPoint::null(), 50_000, ScriptBuf::new());
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("wallet.cbor");
+        let chain = StubChain::with(&[(&funding, 50)]);
+        chain.lock().unwrap().wallet_file = Some(path.clone());
+        let mut wallet = stub_wallet(&path, electrum(&start_electrum_stub(chain.clone())));
+
+        let bond = unsent_bond(&funding);
+        let txid = bond.outpoint.txid;
+        assert_eq!(wallet.register_and_broadcast_bond(bond).unwrap(), txid);
+        assert_eq!(chain.lock().unwrap().saved_at_send, vec![true]);
+
+        // The wallet file can no longer be written.
+        let bond = FidelityBond {
+            bond_index: 1,
+            ..unsent_bond(&tx(OutPoint::null(), 60_000, ScriptBuf::new()))
+        };
+        let readonly = |on: bool| {
+            for target in [path.as_path(), temp_dir.path()] {
+                let mut perms = fs::metadata(target).unwrap().permissions();
+                perms.set_readonly(on);
+                fs::set_permissions(target, perms).unwrap();
+            }
+        };
+        readonly(true);
+        let result = wallet.register_and_broadcast_bond(bond);
+        readonly(false);
+        assert!(result.is_err());
+        assert_eq!(chain.lock().unwrap().saved_at_send, vec![true]);
+        assert_eq!(saved_bonds(&path), vec![txid]);
+    }
+
     #[test]
     fn a_broadcast_bond_is_saved_with_its_transaction() {
         let (result, txid, in_memory, on_disk) = broadcast_bond(|_, _| {});
@@ -8811,11 +8875,12 @@ mod mempool_deferral_tests {
         assert!(is_refused(&bond.ensure_broadcast(&chain)));
     }
 
-    /// A replacement for refused bonds spends one coin of each one that can
-    /// still confirm, the largest, from whichever pool holds them, and adopts
-    /// one the backend knows. A bond with a free coin is conflicted through
-    /// it; one without is dead only once a spend of its coin is buried. It
-    /// waits while some bond's coins cannot be spent.
+    /// A replacement for refused bonds spends every free coin of each one that
+    /// can still confirm, from whichever pool holds them, and adopts one the
+    /// backend knows. A bond with a free coin is conflicted through it; one
+    /// without waits unless the backend proves a spend of its coin buried,
+    /// which an Electrum server's word never does. It waits while some bond's
+    /// coins cannot be spent.
     #[test]
     fn a_replacement_bond_conflicts_with_every_viable_refused_bond() {
         let coin = |seed: u8| OutPoint::new(Txid::from_byte_array([seed; 32]), 0);
@@ -8872,7 +8937,7 @@ mod mempool_deferral_tests {
             bond(7, &[OutPoint::new(pooled_parent.compute_txid(), 0)]),
             // The backend does not know where coin 9 came from.
             bond(8, &[coin(9)]),
-            // No free coin, and a buried spend: this bond can never confirm.
+            // No free coin, and a deep spend only the Electrum server reports.
             bond(9, &[mined]),
             // No free coin, and a spend in the tip block only.
             bond(10, &[shallow]),
@@ -8906,8 +8971,7 @@ mod mempool_deferral_tests {
                 redeem_script: None,
                 witness_script: None,
                 script_pub_key: ScriptBuf::new(),
-                // Coin 2 is bond 0's largest.
-                amount: Amount::from_sat(if seed == 2 { 80_000 } else { 50_000 }),
+                amount: Amount::from_sat(50_000),
                 confirmations: 1,
                 spendable: true,
                 solvable: true,
@@ -8939,24 +9003,96 @@ mod mempool_deferral_tests {
         let plan = |refused: &[u32]| wallet.plan_bond_replacement(refused).unwrap();
         let spend = |coins: &[OutPoint]| BondReplacement::Spend(coins.to_vec());
         assert_eq!(plan(&[]), spend(&[]));
-        assert_eq!(plan(&[9]), spend(&[]));
         assert_eq!(plan(&[1]), spend(&[coin(3)]));
-        assert_eq!(plan(&[0]), spend(&[coin(2)]));
-        assert_eq!(plan(&[0, 1, 9]), spend(&[coin(2), coin(3)]));
-        assert_eq!(plan(&[0, 12]), spend(&[coin(2)]));
+        assert_eq!(plan(&[0]), spend(&[coin(1), coin(2)]));
+        assert_eq!(plan(&[0, 1]), spend(&[coin(1), coin(2), coin(3)]));
+        assert_eq!(plan(&[0, 12]), spend(&[coin(1), coin(2)]));
         assert_eq!(plan(&[11]), spend(&[coin(10)]));
         assert_eq!(plan(&[3]), spend(&[coin(5)]));
         assert_eq!(plan(&[0, 5]), BondReplacement::Adopt(5));
         // Locked, reserved, needing both pools in one transaction, not listed
-        // by the wallet yet, spent only in the mempool, of unknown origin, or
-        // spent in a block a reorg can undo.
-        for refused in [&[2][..], &[4], &[0, 3], &[0, 6], &[0, 7], &[0, 8], &[0, 10]] {
+        // by the wallet yet, spent only in the mempool, of unknown origin,
+        // spent in a block a reorg can undo, or spent by the server's word.
+        for refused in [
+            &[9][..],
+            &[0, 9],
+            &[2],
+            &[4],
+            &[0, 3],
+            &[0, 6],
+            &[0, 7],
+            &[0, 8],
+            &[0, 10],
+        ] {
             assert!(
                 matches!(plan(refused), BondReplacement::Wait(_)),
                 "{:?}",
                 refused
             );
         }
+    }
+
+    /// A replacement pinned to swept coins that cannot fund it is topped up
+    /// from seed coins, where a deposit lands, instead of waiting forever.
+    #[test]
+    fn a_replacement_tops_up_swept_conflicts_from_seed_coins() {
+        let temp_dir = tempdir().unwrap();
+        let url = start_electrum_stub(StubChain::with(&[]));
+        let mut wallet = stub_wallet(&temp_dir.path().join("wallet.cbor"), electrum(&url));
+        let coin = |seed: u8| OutPoint::new(Txid::from_byte_array([seed; 32]), 0);
+        for (seed, sats, swept) in [(1, 30_000, true), (2, 200_000, false)] {
+            let entry = ListUnspentResultEntry {
+                txid: coin(seed).txid,
+                vout: 0,
+                address: None,
+                label: None,
+                redeem_script: None,
+                witness_script: None,
+                script_pub_key: ScriptBuf::new(),
+                amount: Amount::from_sat(sats),
+                confirmations: 1,
+                spendable: true,
+                solvable: true,
+                descriptor: None,
+                safe: true,
+            };
+            let (path, input_value, address_type) =
+                (format!("m/0/{seed}"), entry.amount, AddressType::P2TR);
+            let spend = if swept {
+                UTXOSpendInfo::SweptCoin {
+                    path,
+                    input_value,
+                    address_type,
+                }
+            } else {
+                UTXOSpendInfo::SeedCoin {
+                    path,
+                    input_value,
+                    address_type,
+                }
+            };
+            wallet.store.utxo_cache.insert(coin(seed), (entry, spend));
+        }
+        let select = |sats| {
+            let mut coins: Vec<OutPoint> = wallet
+                .select_replacement_coins(
+                    Amount::from_sat(sats),
+                    2.0,
+                    AddressType::P2TR,
+                    &[coin(1)],
+                )
+                .unwrap()
+                .iter()
+                .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                .collect();
+            coins.sort();
+            coins
+        };
+        // The swept coin alone covers a small bond.
+        assert_eq!(select(10_000), vec![coin(1)]);
+        let mut both = vec![coin(1), coin(2)];
+        both.sort();
+        assert_eq!(select(100_000), both);
     }
 
     /// When the backend cannot say whether the bond went out, the record stays

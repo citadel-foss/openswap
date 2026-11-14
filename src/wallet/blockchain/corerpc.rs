@@ -541,6 +541,47 @@ impl CoreRPC {
     }
 }
 
+impl CoreRPC {
+    /// [`Blockchain::is_spend_buried`] against the chain whose tip is `best`.
+    /// The caller checks the tip did not move while this answered.
+    fn spend_buried_at(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+        depth: u64,
+        best: BlockHash,
+    ) -> Result<bool, WalletError> {
+        // The funding tx must be `depth` deep on the active chain, or no spend
+        // of it can be. A tx whose block was reorged out keeps that block's
+        // hash in the txindex, but has no confirmations.
+        let confirmations = match self.rpc.get_raw_transaction_info(&outpoint.txid, None) {
+            Ok(info) => info.confirmations.unwrap_or(0),
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -5 => {
+                return Ok(false)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if u64::from(confirmations) < depth || !self.is_confirmed_spend(outpoint, script)? {
+            return Ok(false);
+        }
+        // Core keeps no spend index: the spend is buried unless one of the
+        // `depth - 1` blocks from `best` down holds it.
+        let mut hash = best;
+        for _ in 1..depth {
+            let block = self.rpc.get_block(&hash)?;
+            if block
+                .txdata
+                .iter()
+                .any(|tx| tx.input.iter().any(|i| i.previous_output == *outpoint))
+            {
+                return Ok(false);
+            }
+            hash = block.header.prev_blockhash;
+        }
+        Ok(true)
+    }
+}
+
 impl Blockchain for CoreRPC {
     fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResult, WalletError> {
         Ok(self.rpc.get_blockchain_info()?)
@@ -598,24 +639,17 @@ impl Blockchain for CoreRPC {
         script: &Script,
         depth: u64,
     ) -> Result<bool, WalletError> {
-        if !self.is_confirmed_spend(outpoint, script)? {
-            return Ok(false);
-        }
-        // Core keeps no spend index: the spend is buried unless one of the
-        // newest `depth - 1` blocks holds it. The tip is read after the spend
-        // was seen, so the spending block is at or below it.
-        let tip = self.get_block_count()?;
-        for height in (tip + 2).saturating_sub(depth)..=tip {
-            let block = self.block_at_height(height)?;
-            if block
-                .txdata
-                .iter()
-                .any(|tx| tx.input.iter().any(|i| i.previous_output == *outpoint))
-            {
-                return Ok(false);
+        // Every answer must come from one chain: a block connected or
+        // disconnected between the queries could move the spend. Retried a
+        // few times, then reported unproven.
+        for _ in 0..3 {
+            let best = self.rpc.get_best_block_hash()?;
+            let buried = self.spend_buried_at(outpoint, script, depth, best)?;
+            if self.rpc.get_best_block_hash()? == best {
+                return Ok(buried);
             }
         }
-        Ok(true)
+        Ok(false)
     }
 
     fn get_raw_transaction(

@@ -201,16 +201,23 @@ pub trait Blockchain: Send + Sync + 'static {
     /// mempool-blind UTXO set.
     fn is_confirmed_spend(&self, outpoint: &OutPoint, script: &Script)
         -> Result<bool, WalletError>;
-    /// True only when a block at least `depth` deep (the tip is 1 deep) spends
-    /// `outpoint`, so a reorg that short will not undo the spend. `script` is
-    /// the outpoint's scriptPubKey, as for
-    /// [`is_confirmed_spend`](Self::is_confirmed_spend).
+    /// True only when the backend can prove a block at least `depth` deep (the
+    /// tip is 1 deep) on its active chain spends `outpoint`, so a reorg that
+    /// short will not undo the spend. `script` is the outpoint's
+    /// scriptPubKey, as for [`is_confirmed_spend`](Self::is_confirmed_spend).
+    ///
+    /// A false answer only means "not proven". Bitcoin Core answers from its
+    /// own validated chain. An Electrum server's history is its word alone:
+    /// nothing checks that a listed spend is in a block, so Electrum always
+    /// answers false, the default.
     fn is_spend_buried(
         &self,
-        outpoint: &OutPoint,
-        script: &Script,
-        depth: u64,
-    ) -> Result<bool, WalletError>;
+        _outpoint: &OutPoint,
+        _script: &Script,
+        _depth: u64,
+    ) -> Result<bool, WalletError> {
+        Ok(false)
+    }
     /// Fetch a raw transaction by txid.
     fn get_raw_transaction(
         &self,

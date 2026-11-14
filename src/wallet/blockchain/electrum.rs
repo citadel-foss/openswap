@@ -1374,30 +1374,6 @@ impl Blockchain for Electrum {
         Ok(false)
     }
 
-    fn is_spend_buried(
-        &self,
-        outpoint: &OutPoint,
-        script: &Script,
-        depth: u64,
-    ) -> Result<bool, WalletError> {
-        let history = self.history(script)?;
-        let tip = self.get_block_count()?;
-        for entry in &history {
-            // Unconfirmed entries have a height of 0 or below.
-            if entry.tx_hash == outpoint.txid || entry.height <= 0 {
-                continue;
-            }
-            if (tip + 1).saturating_sub(entry.height as u64) < depth {
-                continue;
-            }
-            let tx = self.get_raw_transaction(&entry.tx_hash, None)?;
-            if tx.input.iter().any(|i| i.previous_output == *outpoint) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     fn script_has_history(&self, script: &Script, _network: Network) -> Result<bool, WalletError> {
         // History keeps spent outputs, so an emptied address still answers here
         // while `listunspent` reports nothing.

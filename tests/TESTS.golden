@@ -326,6 +326,7 @@ openswap wallet::api::legacy_recovery_tests::test_ensure_contract_unsigned_legac
 openswap wallet::api::legacy_recovery_tests::test_ensure_contract_unsigned_legacy_with_unspent_wallet_inputs_and_shared_funding_is_not_yet
 openswap wallet::api::mempool_deferral_tests::a_bond_accepted_despite_an_error_reply_is_kept
 openswap wallet::api::mempool_deferral_tests::a_bond_answered_with_a_server_fault_is_kept
+openswap wallet::api::mempool_deferral_tests::a_bond_is_saved_before_it_is_broadcast
 openswap wallet::api::mempool_deferral_tests::a_bond_refused_as_already_known_is_kept
 openswap wallet::api::mempool_deferral_tests::a_bond_with_an_unknown_outcome_is_kept_and_reported
 openswap wallet::api::mempool_deferral_tests::a_broadcast_bond_is_saved_with_its_transaction
@@ -333,6 +334,7 @@ openswap wallet::api::mempool_deferral_tests::a_kept_refused_bond_is_reported_un
 openswap wallet::api::mempool_deferral_tests::a_rebroadcast_taken_despite_an_error_reply_is_not_refused
 openswap wallet::api::mempool_deferral_tests::a_refused_unknown_bond_is_dropped
 openswap wallet::api::mempool_deferral_tests::a_replacement_bond_conflicts_with_every_viable_refused_bond
+openswap wallet::api::mempool_deferral_tests::a_replacement_tops_up_swept_conflicts_from_seed_coins
 openswap wallet::api::mempool_deferral_tests::an_unclear_rebroadcast_failure_stays_retryable
 openswap wallet::api::mempool_deferral_tests::committed_legacy_resends_unknown_funding_before_its_contract
 openswap wallet::api::mempool_deferral_tests::compat_committed_taproot_survives_absence_until_confirmation
@@ -715,6 +717,7 @@ openswap::integration fidelity::restart::unconfirmed_bond_not_duplicated
 openswap::integration fidelity::restart::unconfirmed_bond_not_duplicated_electrum
 openswap::integration fidelity::spending::bond_spending
 openswap::integration fidelity::spending::mempool_only_spend_reads_as_spent
+openswap::integration fidelity::spending::spend_reads_buried_only_deep_on_the_active_chain
 openswap::integration fidelity::timelock_violation::fidelity_limit_violation
 openswap::integration lightning::e2e::lightning_submarine_swaps_e2e
 openswap::integration lightning::e2e::lightning_swap_in_refuses_announced_value_mismatch
