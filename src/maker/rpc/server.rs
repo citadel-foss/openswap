@@ -256,20 +256,31 @@ fn handle_request<M: MakerRpc>(
                     change_address_type: AddressType::P2TR,
                 };
 
-                let coins_to_send = lock_debug!(maker.wallet().read())?.coin_select(
-                    amount,
-                    feerate,
-                    address_type,
-                    None,
-                    None,
-                )?;
-                let tx = lock_debug!(maker.wallet().write())?.spend_from_wallet(
-                    feerate,
-                    destination,
-                    &coins_to_send,
-                )?;
+                // Select and sign under one guard, then hold the inputs so no
+                // swap thread claims them while the broadcast runs unguarded.
+                let tx = {
+                    let mut wallet = lock_debug!(maker.wallet().write())?;
+                    let coins_to_send =
+                        wallet.coin_select(amount, feerate, address_type, None, None)?;
+                    let tx = wallet.spend_from_wallet(feerate, destination, &coins_to_send)?;
+                    let spent: Vec<_> =
+                        tx.input.iter().map(|input| input.previous_output).collect();
+                    wallet.hold_for_send(&spent, tx.compute_txid());
+                    tx
+                };
 
-                let txid = lock_debug!(maker.wallet().read())?.send_tx(&tx)?;
+                // Syncs release the inputs once the backend settles the spend.
+                // A broadcast error keeps them held too: the backend may have
+                // taken the tx and lost the reply, so only a sync that finds the
+                // tx unknown may free them, and only once the broadcast returned.
+                let sent = lock_debug!(maker.wallet().read())?.send_tx(&tx);
+                lock_debug!(maker.wallet().write())?.broadcast_returned(&tx.compute_txid());
+
+                // A failed broadcast gets no sync here: a full one retries
+                // until the backend answers, under the write guard, and an
+                // outage is a likely cause of the failure. The idle heartbeat
+                // settles the held inputs without holding the wallet.
+                let txid = sent?;
 
                 log::info!("Sync at:----handle_request----");
                 lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;

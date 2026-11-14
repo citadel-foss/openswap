@@ -103,6 +103,17 @@ pub struct Wallet {
     pub(crate) store_enc_material: KeyMaterial,
     /// Wallet-side set of outpoints excluded from coin selection.
     pub(crate) locked_utxos: HashSet<OutPoint>,
+    /// Inputs of our own direct sends, keyed to the hold that spends them,
+    /// held out of coin selection until a sync settles them (see
+    /// [`Wallet::release_settled_sends`]). Kept apart from `locked_utxos`,
+    /// which [`Wallet::lock_unspendable_utxos`] rebuilds from scratch.
+    pub(crate) pending_sends: HashMap<OutPoint, SendHold>,
+    /// Numbers each hold, so a backend answer about one hold cannot settle a
+    /// later hold of the same txid (a retried send can sign the same tx).
+    pub(crate) send_holds_made: u64,
+    /// Held sends whose broadcast has not returned yet. Until it does, the
+    /// backend not knowing the tx says nothing, so no sync may free its inputs.
+    pub(crate) sends_in_flight: HashSet<Txid>,
     /// Shared for library wallets, exclusive for daemons, held for the
     /// wallet's lifetime. `None` only offline.
     pub(crate) _in_use: Option<WalletInUse>,
@@ -522,6 +533,9 @@ impl Wallet {
             store,
             store_enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
+            send_holds_made: 0,
+            sends_in_flight: HashSet::new(),
             _in_use: Some(in_use),
         })
     }
@@ -649,6 +663,9 @@ impl Wallet {
             store,
             store_enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
+            send_holds_made: 0,
+            sends_in_flight: HashSet::new(),
             _in_use: Some(in_use),
         };
         wallet.warn_if_seed_not_backed_up();
@@ -2477,10 +2494,102 @@ impl Wallet {
         self.locked_utxos.extend(outpoints.iter().copied());
     }
 
-    /// Outpoints currently held in the wallet-side lock set (see
-    /// [`Wallet::locked_utxos`]).
+    /// Hold `outpoints`, spent by our own `txid`, out of coin selection until
+    /// a sync settles them. Call before the broadcast, so no other thread can
+    /// select them while it runs.
+    pub(crate) fn hold_for_send(&mut self, outpoints: &[OutPoint], txid: Txid) {
+        self.send_holds_made += 1;
+        let hold = SendHold {
+            txid,
+            number: self.send_holds_made,
+        };
+        self.pending_sends
+            .extend(outpoints.iter().map(|outpoint| (*outpoint, hold)));
+        self.sends_in_flight.insert(txid);
+    }
+
+    /// Whether any direct send still holds its inputs.
+    pub(crate) fn has_held_sends(&self) -> bool {
+        !self.pending_sends.is_empty()
+    }
+
+    /// Mark the broadcast of a held send as returned, whether it succeeded or
+    /// failed. From then on a sync that finds the tx unknown may free its
+    /// inputs; before, the tx is unknown only because it was not sent yet.
+    pub(crate) fn broadcast_returned(&mut self, txid: &Txid) {
+        self.sends_in_flight.remove(txid);
+    }
+
+    /// Release held send inputs a sync has settled. Runs after every
+    /// successful sync, so a failed one only delays the release.
+    ///
+    /// * Gone from the synced cache: the backend saw the spend, so selection
+    ///   can no longer pick the coin.
+    /// * Still cached and the backend positively reports the send unknown:
+    ///   it was evicted or reorged out, so the coin is ours to spend again.
+    /// * Anything else, a failed query included: the backend has not caught up
+    ///   (Electrum may still answer from a stale script entry), so keep holding.
+    ///
+    /// A send whose broadcast has not returned is only ever released by the
+    /// first rule; see [`Wallet::broadcast_returned`].
+    pub(crate) fn release_settled_sends(&mut self) {
+        let unknown: HashSet<SendHold> = self
+            .sends_to_probe()
+            .into_iter()
+            .filter(|hold| matches!(self.blockchain.is_tx_unknown(&hold.txid), Ok(true)))
+            .collect();
+        self.settle_sends(&unknown);
+    }
+
+    /// The held sends whose release needs the backend's answer: broadcast
+    /// returned, and some input still cached. Each once, however many inputs.
+    /// A caller can ask the backend about these without holding the wallet,
+    /// then pass the unknown ones to [`Wallet::settle_sends`].
+    pub(crate) fn sends_to_probe(&self) -> Vec<SendHold> {
+        let mut holds: Vec<SendHold> = self
+            .pending_sends
+            .iter()
+            .filter(|(outpoint, hold)| {
+                self.store.utxo_cache.contains_key(outpoint)
+                    && !self.sends_in_flight.contains(&hold.txid)
+            })
+            .map(|(_, hold)| *hold)
+            .collect();
+        holds.sort_by_key(|hold| hold.number);
+        holds.dedup();
+        holds
+    }
+
+    /// Release held send inputs by the rules of
+    /// [`Wallet::release_settled_sends`], with `unknown` the sends the backend
+    /// reported unknown. Rechecks each hold, so answers read without the
+    /// wallet held cannot free a send whose broadcast has not returned, nor a
+    /// later hold of the same txid than the one asked about.
+    pub(crate) fn settle_sends(&mut self, unknown: &HashSet<SendHold>) {
+        let held: Vec<(OutPoint, SendHold)> =
+            self.pending_sends.iter().map(|(o, h)| (*o, *h)).collect();
+        for (outpoint, hold) in held {
+            let settled = send_input_settled(
+                self.store.utxo_cache.contains_key(&outpoint),
+                self.sends_in_flight.contains(&hold.txid),
+                || unknown.contains(&hold),
+            );
+            if settled {
+                self.pending_sends.remove(&outpoint);
+            }
+        }
+    }
+
+    /// Outpoints kept out of coin selection: the wallet-side lock set (see
+    /// [`Wallet::locked_utxos`]), which [`Wallet::lock_unspendable_utxos`]
+    /// rebuilds, and the inputs of held direct sends (see
+    /// [`Wallet::pending_sends`]), which only a settling sync releases.
     pub(crate) fn list_lock_unspent(&self) -> Vec<OutPoint> {
-        self.locked_utxos.iter().copied().collect()
+        self.locked_utxos
+            .iter()
+            .chain(self.pending_sends.keys())
+            .copied()
+            .collect()
     }
 
     /// Reserve `outpoints` for the swap `swap_key`; they stay out of coin
@@ -4442,6 +4551,21 @@ impl Wallet {
     }
 }
 
+/// One hold of a direct send's inputs: the send's txid and the hold's number,
+/// unique within the wallet's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SendHold {
+    pub(crate) txid: Txid,
+    pub(crate) number: u64,
+}
+
+/// Whether a sync may free a held send input; see
+/// [`Wallet::release_settled_sends`]. `send_unknown` asks the backend, and is
+/// not called while the send's broadcast is still in flight.
+fn send_input_settled(cached: bool, in_flight: bool, send_unknown: impl FnOnce() -> bool) -> bool {
+    !cached || (!in_flight && send_unknown())
+}
+
 /// Wait for the given txs to reach `required_confirms`, returning the highest block
 /// height any of them was mined at. Returns 0 if `required_confirms` is 0 or `txids`
 /// is empty.
@@ -5013,7 +5137,10 @@ impl Wallet {
         loop {
             Self::check_shutdown(shutdown)?;
             match self.sync(shutdown) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.release_settled_sends();
+                    return Ok(());
+                }
                 Err(e) if Self::sync_error_is_final(&e) => return Err(e),
                 Err(e) => log::error!("Blockchain sync failed. Retrying. | {e:?}"),
             }
@@ -5245,8 +5372,29 @@ pub(crate) mod test_support {
             store,
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
+            send_holds_made: 0,
+            sends_in_flight: HashSet::new(),
             _in_use: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod send_hold_tests {
+    use super::send_input_settled;
+
+    #[test]
+    fn an_in_flight_send_is_never_released_as_unknown() {
+        // Spent: the coin left the synced cache. Released whatever else holds.
+        assert!(send_input_settled(false, true, || unreachable!()));
+        // A sync between signing and broadcast finds the send unknown only
+        // because it is not sent yet; the backend must not even be asked.
+        assert!(!send_input_settled(true, true, || unreachable!()));
+        // Once the broadcast returned, an unknown send was evicted or never
+        // taken, so the coin is free again; a known one stays held.
+        assert!(send_input_settled(true, false, || true));
+        assert!(!send_input_settled(true, false, || false));
     }
 }
 
@@ -5621,6 +5769,9 @@ mod restore_history_probe_tests {
             store,
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
+            send_holds_made: 0,
+            sends_in_flight: HashSet::new(),
             _in_use: None,
         }
     }
@@ -6816,6 +6967,9 @@ mod timelock_reconcile_tests {
             store,
             store_enc_material: enc_material,
             locked_utxos: HashSet::new(),
+            pending_sends: HashMap::new(),
+            send_holds_made: 0,
+            sends_in_flight: HashSet::new(),
             _in_use: None,
         }
     }
