@@ -55,7 +55,7 @@ Commands:
   send-to-address     Send Bitcoin to an external address and return the txid
   show-tor-address    Show the server tor address
   show-data-dir       Show the data directory path
-  stop                Shutdown the makerd server
+  stop                Stop makerd after the swaps in progress finish, within an hour at most. New swaps are refused meanwhile. Returns before makerd has exited
   show-fidelity       Show all the fidelity bonds, current and previous, with an (index, {bond_proof, is_spent}) tuple
   sync-wallet         Sync the Maker wallet with the current blockchain state
   verify-deniability  Verify the deniability proof for a specific swap
@@ -567,9 +567,31 @@ After performing all functionalities, we can stop the maker server using the `st
 $ ./maker-cli stop
 
 Shutdown Initiated
+makerd takes no new swaps and exits once the swaps in progress finish, within an hour at most.
+This command returns before makerd has exited: wait for the process to end.
+Run `maker-cli stop --now` to stop at once. Swaps in progress then settle on-chain.
 ```
 
-This shuts down the makerd server. Once you run this command, the maker server initiates a shutdown, and we'll see the following logs indicating the shutdown process:
+`stop` drains the maker. It does not wait for the swap to finish inside the command: it asks makerd to drain and returns at once, and makerd stops itself later. A script that goes on to back up or upgrade must wait for the `makerd` process to exit first.
+
+While it drains, makerd:
+
+- refuses new swaps with the normal reject message, so a taker picks another maker before any funds move. The taker does not ban the maker for it. This covers Lightning swap requests too.
+- lets every on-chain swap it has already admitted finish, including the sweep and the final bookkeeping after the swap completes. A taker that dropped its connection can reconnect for a swap makerd already knows.
+- keeps recovery and the watchtower running.
+- exits once no swap is left. With no swap in progress, that is right away.
+
+The wait ends after one hour at most. Then makerd stops anyway, logs how many swaps were left, and recovers them after the restart as it does today. The limit keeps a peer that holds a swap open without funding it from blocking the stop. Running `stop` again does not start the hour over.
+
+makerd does not wait for work that is already saved and picked up again after a restart, because that can take hours (timelocks, HTLCs):
+
+- a swap whose taker went away and that moved into recovery,
+- recovery that runs at startup,
+- Lightning swaps already in progress.
+
+To stop at once, run `maker-cli stop --now`. This also works while makerd is draining, and it is how to cut a drain short. `SIGINT` and `SIGTERM` stop makerd at once too. In Docker, `SIGTERM` is followed by `SIGKILL` after about ten seconds, so a graceful stop there is `maker-cli stop`, then waiting for the container to exit. A `makerd` from before this release answers `stop` with "unknown request" and does not stop; use `stop --now` with it.
+
+Once the maker server shuts down, we'll see the following logs indicating the shutdown process:
 
 ```bash
  INFO openswap::maker::server - [6102] Server shutting down...

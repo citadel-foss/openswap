@@ -134,6 +134,9 @@ pub trait MakerRpc {
     fn data_dir(&self) -> &Path;
     fn config(&self) -> &MakerServerConfig;
     fn shutdown(&self) -> &ShutdownSignal;
+    /// Starts a drain: refuse new swaps and let the serve loop stop the server
+    /// once the swaps in progress are done. Returns at once.
+    fn start_drain(&self);
     /// Where the client being served is parked, so shutdown can close it
     /// under a blocked read.
     fn rpc_client(&self) -> Option<&Mutex<Option<TcpStream>>> {
@@ -188,6 +191,7 @@ fn handle_request<M: MakerRpc>(
     };
     log::info!("RPC request received: {rpc_request:?}");
 
+    let mut drain_after_reply = false;
     let resp = match rpc_request {
         RpcMsgReq::Ping => RpcMsgResp::Pong,
         RpcMsgReq::ContractUtxo => {
@@ -293,6 +297,14 @@ fn handle_request<M: MakerRpc>(
             maker.shutdown().store(true, Relaxed);
             RpcMsgResp::Shutdown
         }
+        // Only latches the drain: the serve loop does the waiting, so this
+        // sequential RPC server stays free for a following `stop --now`. The
+        // latch comes after the reply is written, so an idle maker cannot shut
+        // the socket before the caller has its answer.
+        RpcMsgReq::StopAfterSwaps => {
+            drain_after_reply = true;
+            RpcMsgResp::Shutdown
+        }
 
         RpcMsgReq::ListFidelity => {
             let list = lock_debug!(maker.wallet().read())?.display_fidelity_bonds()?;
@@ -334,6 +346,9 @@ fn handle_request<M: MakerRpc>(
 
     if let Err(e) = send_message(socket, &resp) {
         log::error!("Error sending RPC response {e:?}");
+    }
+    if drain_after_reply {
+        maker.start_drain();
     }
 
     Ok(())
@@ -409,6 +424,9 @@ mod tests {
         config: MakerServerConfig,
         data_dir: std::path::PathBuf,
         shutdown: ShutdownSignal,
+        /// Set when a drain was asked for, so a test can tell the request
+        /// reached `start_drain` and not `shutdown`.
+        draining: AtomicBool,
     }
 
     impl MakerRpc for GuardDouble {
@@ -424,6 +442,9 @@ mod tests {
         fn shutdown(&self) -> &ShutdownSignal {
             &self.shutdown
         }
+        fn start_drain(&self) {
+            self.draining.store(true, Relaxed);
+        }
         #[cfg(not(feature = "integration-test"))]
         fn get_tor_hostname(&self) -> Result<String, TorError> {
             unreachable!("no request in these tests asks for the hostname")
@@ -434,6 +455,13 @@ mod tests {
     fn rpc_round_trip<T: Serialize>(
         envelope: impl FnOnce(&str) -> T,
     ) -> Result<RpcMsgResp, MakerError> {
+        rpc_round_trip_with_double(envelope).0
+    }
+
+    /// [`rpc_round_trip`], also returning the double so a test can check it.
+    fn rpc_round_trip_with_double<T: Serialize>(
+        envelope: impl FnOnce(&str) -> T,
+    ) -> (Result<RpcMsgResp, MakerError>, Arc<GuardDouble>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut server, _) = listener.accept().unwrap();
@@ -444,11 +472,13 @@ mod tests {
             config: MakerServerConfig::default(),
             data_dir: dir.path().to_path_buf(),
             shutdown: ShutdownSignal::new(),
+            draining: AtomicBool::new(false),
         });
 
         send_message(&mut client, &envelope(&cookie)).unwrap();
-        handle_request(&double, &mut server, &cookie)?;
-        Ok(serde_cbor::from_slice(&read_message(&mut client).unwrap()).unwrap())
+        let reply = handle_request(&double, &mut server, &cookie)
+            .map(|()| serde_cbor::from_slice(&read_message(&mut client).unwrap()).unwrap());
+        (reply, double)
     }
 
     fn rpc_send_to_address(address: &str, feerate: f64) -> Result<RpcMsgResp, MakerError> {
@@ -567,6 +597,27 @@ mod tests {
             "the floor rate must clear the rate check: {:?}",
             e
         );
+    }
+
+    /// `StopAfterSwaps` only starts a drain and answers at once; `Stop` still
+    /// shuts the server down on the spot.
+    #[test]
+    fn stop_after_swaps_starts_a_drain_and_stop_does_not() {
+        let request = |request| {
+            move |cookie: &str| AuthenticatedRpcRequest {
+                token: cookie.to_string(),
+                request,
+            }
+        };
+        let (reply, double) = rpc_round_trip_with_double(request(RpcMsgReq::StopAfterSwaps));
+        assert!(matches!(reply.unwrap(), RpcMsgResp::Shutdown));
+        assert!(double.draining.load(Relaxed));
+        assert!(!double.shutdown.load(Relaxed), "the serve loop stops it");
+
+        let (reply, double) = rpc_round_trip_with_double(request(RpcMsgReq::Stop));
+        assert!(matches!(reply.unwrap(), RpcMsgResp::Shutdown));
+        assert!(double.shutdown.load(Relaxed));
+        assert!(!double.draining.load(Relaxed));
     }
 
     #[test]
