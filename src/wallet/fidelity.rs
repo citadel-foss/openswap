@@ -917,7 +917,7 @@ impl Wallet {
     /// A bond with a free coin is always conflicted through it, whatever its
     /// other coins show. Only a bond with no free coin is looked up on chain:
     /// it is dead, and needs no conflict, once a spend of one of its coins is
-    /// [`REFUSED_BOND_SPEND_DEPTH`] blocks deep; a shallower or mempool spend,
+    /// `REFUSED_BOND_SPEND_DEPTH` (6) blocks deep; a shallower or mempool spend,
     /// or an unknown funding tx, waits. So does an unspent coin the wallet
     /// does not list: the node wallet is told to abandon the refused tx, and
     /// the next sync lists the coin. When some bond's coins are all locked,
