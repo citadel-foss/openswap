@@ -1662,7 +1662,25 @@ impl MakerServer {
                             self.config.network_port,
                             txid
                         );
-                        let conf_height = self.wait_for_bond_confirmation(index)?;
+                        let conf_height = match self.wait_for_bond_confirmation(index) {
+                            Ok(height) => height,
+                            // The new bond left the mempool and the backend
+                            // refuses it again: evicted, or a refused bond it
+                            // conflicts with confirmed first. Start over:
+                            // setup adopts that bond, or replaces both.
+                            Err(MakerError::Wallet(WalletError::Fidelity(
+                                e @ FidelityError::BondBroadcastRefused { .. },
+                            ))) => {
+                                log::warn!(
+                                    "[{}] New fidelity bond {} was refused while awaiting confirmation: {}. Checking the refused bonds again",
+                                    self.config.network_port,
+                                    txid,
+                                    e
+                                );
+                                return Ok(None);
+                            }
+                            Err(e) => return Err(e),
+                        };
 
                         // Re-acquire write lock briefly to finalize
                         lock_debug!(self.wallet.write())

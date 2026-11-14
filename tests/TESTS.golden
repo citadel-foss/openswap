@@ -95,6 +95,7 @@ openswap maker::lightning_handlers::tests::only_the_recorded_refund_is_ours
 openswap maker::lightning_handlers::tests::persisted_record_survives_serialization_and_still_spends
 openswap maker::lightning_handlers::tests::recorded_spend_stays_spent
 openswap maker::lightning_handlers::tests::refund_waits_for_the_chain_to_say_unspent
+openswap maker::lightning_handlers::tests::swap_out_limit_leaves_inbound_room_for_the_fee
 openswap maker::lightning_handlers::tests::unfunded_record_round_trips_without_funding
 openswap maker::lightning_handlers::tests::unusable_channels_and_dust_capacity_disable_a_direction
 openswap maker::lightning_handlers::tests::wallet_caps_only_the_swap_out_direction
@@ -706,6 +707,7 @@ openswap::integration fidelity::renewal::bond_auto_renewal
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart
 openswap::integration fidelity::restart::evicted_bond_rebroadcast_on_restart_electrum
 openswap::integration fidelity::restart::live_bond_is_advertised_while_another_is_pending
+openswap::integration fidelity::restart::refused_bond_confirming_after_its_replacement_is_adopted
 openswap::integration fidelity::restart::refused_bond_confirming_before_its_replacement_is_adopted
 openswap::integration fidelity::restart::refused_bond_is_replaced_by_a_conflicting_bond
 openswap::integration fidelity::restart::refused_replacement_restarts_setup_instead_of_stopping
@@ -721,10 +723,14 @@ openswap::integration lightning::e2e::lightning_swap_out_refuses_blocklisted_fun
 openswap::integration lightning::maker_restart::conditional_paid_store_refuses_stale_copy
 openswap::integration lightning::maker_restart::forged_swap_in_funding_keeps_accepted_swap
 openswap::integration lightning::maker_restart::lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen
+openswap::integration lightning::maker_restart::lightning_maker_does_not_refund_a_claimed_swap_out_without_funding_height
+openswap::integration lightning::maker_restart::lightning_maker_keeps_a_swap_out_while_its_funding_height_is_unknown
 openswap::integration lightning::maker_restart::lightning_maker_rebroadcasts_an_evicted_refund
+openswap::integration lightning::maker_restart::lightning_maker_refunds_a_swap_out_stored_without_funding_height
 openswap::integration lightning::maker_restart::lightning_maker_restart_recovers_an_interrupted_refund
 openswap::integration lightning::maker_restart::lightning_maker_restart_recovers_funded_swap
 openswap::integration lightning::maker_restart::lightning_maker_restart_refunds_unclaimed_swap_out
+openswap::integration lightning::maker_restart::lightning_maker_stale_snapshot_keeps_newer_swap_out_state
 openswap::integration lightning::maker_restart::restarted_watchdog_follows_payment_of_swap_in_missing_funding_height
 openswap::integration lightning::maker_restart::stale_swap_in_refusal_keeps_paid_swap
 openswap::integration lightning::maker_restart::stale_watchdog_expiry_keeps_paid_swap

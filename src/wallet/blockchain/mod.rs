@@ -201,6 +201,16 @@ pub trait Blockchain: Send + Sync + 'static {
     /// mempool-blind UTXO set.
     fn is_confirmed_spend(&self, outpoint: &OutPoint, script: &Script)
         -> Result<bool, WalletError>;
+    /// True only when a block at least `depth` deep (the tip is 1 deep) spends
+    /// `outpoint`, so a reorg that short will not undo the spend. `script` is
+    /// the outpoint's scriptPubKey, as for
+    /// [`is_confirmed_spend`](Self::is_confirmed_spend).
+    fn is_spend_buried(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+        depth: u64,
+    ) -> Result<bool, WalletError>;
     /// Fetch a raw transaction by txid.
     fn get_raw_transaction(
         &self,
@@ -614,6 +624,17 @@ impl Blockchain for AnyBlockchain {
         match self {
             AnyBlockchain::CoreRPC(b) => b.is_confirmed_spend(outpoint, script),
             AnyBlockchain::Electrum(b) => b.is_confirmed_spend(outpoint, script),
+        }
+    }
+    fn is_spend_buried(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+        depth: u64,
+    ) -> Result<bool, WalletError> {
+        match self {
+            AnyBlockchain::CoreRPC(b) => b.is_spend_buried(outpoint, script, depth),
+            AnyBlockchain::Electrum(b) => b.is_spend_buried(outpoint, script, depth),
         }
     }
     fn get_raw_transaction(

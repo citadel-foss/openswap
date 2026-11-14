@@ -519,6 +519,21 @@ fn wait_for_log_count(log_path: &str, expected: &str, times: usize, timeout: Dur
     }
 }
 
+/// The first tx to reach `node`'s mempool.
+fn wait_for_mempool_tx(node: &bitcoind::BitcoinD) -> Txid {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(txid) = node.client.get_raw_mempool().unwrap().first() {
+            return *txid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no replacement bond was broadcast"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// A bond the node refuses on restart is skipped, and the bond funded in its
 /// place spends one of its coins: the refused tx may still confirm from a
 /// peer's mempool, and the two must never both lock funds.
@@ -530,17 +545,7 @@ fn refused_bond_is_replaced_by_a_conflicting_bond(world: &mut World) {
     let run = restart_with_refused_bond(world, 10.0);
     let bond_txid = run.bond.compute_txid();
 
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let replacement_txid = loop {
-        if let Some(txid) = run.node.client.get_raw_mempool().unwrap().first() {
-            break *txid;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no replacement bond was broadcast"
-        );
-        thread::sleep(Duration::from_millis(500));
-    };
+    let replacement_txid = wait_for_mempool_tx(&run.node);
     assert_ne!(replacement_txid, bond_txid);
     let replacement = run
         .node
@@ -608,6 +613,63 @@ fn refused_bond_confirming_before_its_replacement_is_adopted(world: &mut World) 
         lacks "held by refused bonds",
         // Run 1's bond only; the trailing ": " skips the test's own wait line.
         count("Fidelity bond broadcast, waiting for confirmation: ") == 1,
+    });
+}
+
+/// A refused bond that confirms after its replacement went out evicts the
+/// replacement. Setup starts over instead of stopping, adopts the refused
+/// bond, and still lists its bonds with the dead replacement's record kept.
+#[world_test(
+    backend = BitcoindBackend,
+    makers = 1,
+)]
+fn refused_bond_confirming_after_its_replacement_is_adopted(world: &mut World) {
+    let run = restart_with_refused_bond(world, 10.0);
+    let bond_txid = run.bond.compute_txid();
+
+    let replacement_txid = wait_for_mempool_tx(&run.node);
+    assert_ne!(replacement_txid, bond_txid);
+    // A peer mines the refused bond: the conflicting replacement leaves the
+    // mempool, and its rebroadcast is refused.
+    mine_tx(&run.node, &run.bond);
+    assert!(run.node.client.get_raw_mempool().unwrap().is_empty());
+
+    wait_for_makers_setup(std::slice::from_ref(&run.maker), 180);
+    assert!(!run.thread.is_finished(), "setup must not stop");
+    {
+        let wallet = run.maker.wallet.read().unwrap();
+        let index = wallet.get_highest_fidelity_index().unwrap().unwrap();
+        let bond = wallet
+            .get_fidelity_bonds()
+            .iter()
+            .find(|bond| bond.bond_index == index)
+            .unwrap();
+        assert_eq!(bond.outpoint().txid, bond_txid, "the mined bond is adopted");
+
+        let listing: serde_json::Value =
+            serde_json::from_str(&wallet.display_fidelity_bonds().unwrap()).unwrap();
+        let status = |txid: Txid| {
+            listing
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|bond| {
+                    bond["outpoint"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(&txid.to_string())
+                })
+                .map(|bond| bond["status"].clone())
+        };
+        assert_eq!(status(bond_txid), Some("Live".into()));
+        assert_eq!(status(replacement_txid), Some("Unconfirmed".into()));
+    }
+    run.stop();
+
+    assert_log!(world; {
+        has "held by refused bonds",
+        has "was refused while awaiting confirmation",
+        lacks "Fidelity Bond Creation failed",
     });
 }
 
