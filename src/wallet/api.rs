@@ -8811,9 +8811,11 @@ mod mempool_deferral_tests {
         assert!(is_refused(&bond.ensure_broadcast(&chain)));
     }
 
-    /// A replacement for refused bonds spends a coin of each one that can
-    /// still confirm, from whichever pool holds them, and adopts one the
-    /// backend knows. It waits while some bond's coins cannot be spent.
+    /// A replacement for refused bonds spends one coin of each one that can
+    /// still confirm, the largest, from whichever pool holds them, and adopts
+    /// one the backend knows. A bond with a free coin is conflicted through
+    /// it; one without is dead only once a spend of its coin is buried. It
+    /// waits while some bond's coins cannot be spent.
     #[test]
     fn a_replacement_bond_conflicts_with_every_viable_refused_bond() {
         let coin = |seed: u8| OutPoint::new(Txid::from_byte_array([seed; 32]), 0);
@@ -8845,10 +8847,21 @@ mod mempool_deferral_tests {
             49_000,
             ScriptBuf::new(),
         );
+        // A coin spent in the tip block, which a reorg can undo.
+        let shallow_parent = tx(coin(23), 50_000, ScriptBuf::new());
+        let shallow_spend = tx(
+            OutPoint::new(shallow_parent.compute_txid(), 0),
+            49_000,
+            ScriptBuf::new(),
+        );
+        let mined = OutPoint::new(mined_parent.compute_txid(), 0);
+        let pooled = OutPoint::new(pooled_parent.compute_txid(), 0);
+        let shallow = OutPoint::new(shallow_parent.compute_txid(), 0);
         let bonds = vec![
             bond(0, &[coin(1), coin(2)]),
-            // A confirmed tx spent its coin: this bond can never confirm.
-            bond(1, &[coin(3), OutPoint::new(mined_parent.compute_txid(), 0)]),
+            // A buried spend of one coin, but coin 3 is free: conflicting
+            // through it holds even if the spend is reorged out.
+            bond(1, &[coin(3), mined]),
             bond(2, &[coin(4)]),
             bond(3, &[coin(5)]),
             bond(4, &[coin(6)]),
@@ -8859,6 +8872,14 @@ mod mempool_deferral_tests {
             bond(7, &[OutPoint::new(pooled_parent.compute_txid(), 0)]),
             // The backend does not know where coin 9 came from.
             bond(8, &[coin(9)]),
+            // No free coin, and a buried spend: this bond can never confirm.
+            bond(9, &[mined]),
+            // No free coin, and a spend in the tip block only.
+            bond(10, &[shallow]),
+            // Its free coin conflicts it, whatever its other coins show.
+            bond(11, &[coin(10), pooled, shallow]),
+            // Shares coin 2 with bond 0.
+            bond(12, &[coin(2)]),
         ];
         // Bond 5 reached the backend after all.
         let known = bonds[5].tx.clone().unwrap();
@@ -8869,11 +8890,13 @@ mod mempool_deferral_tests {
             (&mined_spend, 60),
             (&pooled_parent, 50),
             (&pooled_spend, 0),
+            (&shallow_parent, 50),
+            (&shallow_spend, TIP),
         ]));
         let temp_dir = tempdir().unwrap();
         let mut wallet = stub_wallet(&temp_dir.path().join("wallet.cbor"), electrum(&url));
 
-        for seed in 1..=7 {
+        for seed in (1..=7).chain([10]) {
             let outpoint = coin(seed);
             let entry = ListUnspentResultEntry {
                 txid: outpoint.txid,
@@ -8883,7 +8906,8 @@ mod mempool_deferral_tests {
                 redeem_script: None,
                 witness_script: None,
                 script_pub_key: ScriptBuf::new(),
-                amount: Amount::from_sat(50_000),
+                // Coin 2 is bond 0's largest.
+                amount: Amount::from_sat(if seed == 2 { 80_000 } else { 50_000 }),
                 confirmations: 1,
                 spendable: true,
                 solvable: true,
@@ -8915,13 +8939,18 @@ mod mempool_deferral_tests {
         let plan = |refused: &[u32]| wallet.plan_bond_replacement(refused).unwrap();
         let spend = |coins: &[OutPoint]| BondReplacement::Spend(coins.to_vec());
         assert_eq!(plan(&[]), spend(&[]));
-        assert_eq!(plan(&[1]), spend(&[]));
-        assert_eq!(plan(&[0, 1]), spend(&[coin(1), coin(2)]));
+        assert_eq!(plan(&[9]), spend(&[]));
+        assert_eq!(plan(&[1]), spend(&[coin(3)]));
+        assert_eq!(plan(&[0]), spend(&[coin(2)]));
+        assert_eq!(plan(&[0, 1, 9]), spend(&[coin(2), coin(3)]));
+        assert_eq!(plan(&[0, 12]), spend(&[coin(2)]));
+        assert_eq!(plan(&[11]), spend(&[coin(10)]));
         assert_eq!(plan(&[3]), spend(&[coin(5)]));
         assert_eq!(plan(&[0, 5]), BondReplacement::Adopt(5));
         // Locked, reserved, needing both pools in one transaction, not listed
-        // by the wallet yet, spent only in the mempool, or of unknown origin.
-        for refused in [&[2][..], &[4], &[0, 3], &[0, 6], &[0, 7], &[0, 8]] {
+        // by the wallet yet, spent only in the mempool, of unknown origin, or
+        // spent in a block a reorg can undo.
+        for refused in [&[2][..], &[4], &[0, 3], &[0, 6], &[0, 7], &[0, 8], &[0, 10]] {
             assert!(
                 matches!(plan(refused), BondReplacement::Wait(_)),
                 "{:?}",

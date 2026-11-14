@@ -24,7 +24,7 @@ use bitcoind::bitcoincore_rpc::{
 use serde::{Deserialize, Serialize};
 use serde_cbor::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::TryFrom,
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
@@ -524,13 +524,21 @@ impl FidelityBond {
     }
 }
 
+/// How many blocks must bury the spend of a refused bond's coin before the
+/// bond counts as dead and a replacement may use unrelated coins. A shallower
+/// spend can be reorged out, letting the refused bond confirm beside its
+/// replacement.
+pub const REFUSED_BOND_SPEND_DEPTH: u64 = 6;
+
 /// A coin of a refused bond, as the chain reports it.
 enum CoinState {
     /// In the UTXO set or the mempool, unspent.
     Unspent,
-    /// Spent by a confirmed transaction: the refused bond can never confirm.
-    SpentConfirmed,
-    /// Spent only in the mempool, or its funding tx is unknown.
+    /// Spent by a transaction [`REFUSED_BOND_SPEND_DEPTH`] blocks deep: the
+    /// refused bond can never confirm.
+    SpentBuried,
+    /// Spent only in the mempool or in a shallow block, or its funding tx is
+    /// unknown.
     Unclear,
 }
 
@@ -901,23 +909,31 @@ impl Wallet {
     /// once the node's minimum fee falls.
     ///
     /// The new bond must spend a coin of every refused bond that can still
-    /// confirm, so at most one of them ever locks funds. A refused bond the
-    /// backend now knows is adopted instead. One whose coin a confirmed
-    /// transaction spent can never confirm and needs no conflict. When some
-    /// bond's coins are all locked, reserved for a swap, or in the other coin
-    /// pool (one transaction spends from one pool), funding must wait. It also
-    /// waits while an unspent coin of a refused bond is missing from the
-    /// wallet: the node wallet is told to abandon the refused tx, and the next
-    /// sync lists the coin. A bond counts as dead only once a confirmed tx
-    /// spends one of its coins; a mempool spend or an unknown funding tx waits.
+    /// confirm, so at most one of them ever locks funds. One free coin per
+    /// bond is enough, so only one is taken: the largest, which pays for its
+    /// own input best. A refused bond the backend now knows is adopted
+    /// instead.
+    ///
+    /// A bond with a free coin is always conflicted through it, whatever its
+    /// other coins show. Only a bond with no free coin is looked up on chain:
+    /// it is dead, and needs no conflict, once a spend of one of its coins is
+    /// [`REFUSED_BOND_SPEND_DEPTH`] blocks deep; a shallower or mempool spend,
+    /// or an unknown funding tx, waits. So does an unspent coin the wallet
+    /// does not list: the node wallet is told to abandon the refused tx, and
+    /// the next sync lists the coin. When some bond's coins are all locked,
+    /// reserved for a swap, or in the other coin pool (one transaction spends
+    /// from one pool), funding waits too.
     pub fn plan_bond_replacement(&self, refused: &[u32]) -> Result<BondReplacement, WalletError> {
         let locked = self.list_lock_unspent();
-        let free = |pool: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>| -> HashSet<OutPoint> {
-            pool.iter()
-                .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
-                .filter(|outpoint| !locked.contains(outpoint) && !self.is_swap_reserved(outpoint))
-                .collect()
-        };
+        let free =
+            |pool: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>| -> HashMap<OutPoint, Amount> {
+                pool.iter()
+                    .map(|(utxo, _)| (OutPoint::new(utxo.txid, utxo.vout), utxo.amount))
+                    .filter(|(outpoint, _)| {
+                        !locked.contains(outpoint) && !self.is_swap_reserved(outpoint)
+                    })
+                    .collect()
+            };
         let regular = free(self.list_descriptor_utxo_spend_info());
         let swept = free(self.list_swept_incoming_swap_utxos());
 
@@ -933,10 +949,16 @@ impl Wallet {
                 return Ok(BondReplacement::Adopt(bond.bond_index));
             }
             let inputs: Vec<OutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
-            // A coin the wallet does not list is spent, or still held by the
-            // node wallet for the refused tx. Only the chain can tell, and
-            // only a confirmed spend proves the bond can never confirm: a
-            // mempool spender can still be evicted.
+            if inputs
+                .iter()
+                .any(|i| regular.contains_key(i) || swept.contains_key(i))
+            {
+                viable.push((bond.bond_index, inputs));
+                continue;
+            }
+            // No free coin. One the wallet does not list is spent, or still
+            // held by the node wallet for the refused tx: only the chain can
+            // tell, and only a buried spend proves the bond can never confirm.
             let mut unlisted = false;
             let mut undecided = false;
             let mut dead = false;
@@ -946,7 +968,7 @@ impl Wallet {
             {
                 match self.coin_state(input)? {
                     CoinState::Unspent => unlisted = true,
-                    CoinState::SpentConfirmed => {
+                    CoinState::SpentBuried => {
                         dead = true;
                         break;
                     }
@@ -956,10 +978,6 @@ impl Wallet {
             if dead {
                 continue;
             }
-            if undecided {
-                unclear.push(bond.bond_index);
-                continue;
-            }
             if unlisted {
                 // Core's wallet counts these coins spent by the refused tx
                 // until it is abandoned. The next sync then lists them.
@@ -967,12 +985,18 @@ impl Wallet {
                 hidden.push(bond.bond_index);
                 continue;
             }
+            if undecided {
+                unclear.push(bond.bond_index);
+                continue;
+            }
+            // Its coins are listed, but locked or reserved for a swap.
             viable.push((bond.bond_index, inputs));
         }
         if !unclear.is_empty() {
             return Ok(BondReplacement::Wait(format!(
-                "refused bonds {unclear:?} spend coins whose spend is not confirmed, or whose \
-                 funding tx the backend does not know"
+                "refused bonds {unclear:?} have no free coin, and spend coins whose spend is not \
+                 {REFUSED_BOND_SPEND_DEPTH} blocks deep, or whose funding tx the backend does \
+                 not know"
             )));
         }
         if !hidden.is_empty() {
@@ -981,20 +1005,24 @@ impl Wallet {
             )));
         }
 
-        for pool in [&regular, &swept] {
-            let coins: Vec<Vec<OutPoint>> = viable
-                .iter()
-                .map(|(_, inputs)| {
-                    inputs
-                        .iter()
-                        .copied()
-                        .filter(|i| pool.contains(i))
-                        .collect()
-                })
-                .collect();
-            if coins.iter().all(|coins: &Vec<OutPoint>| !coins.is_empty()) {
-                return Ok(BondReplacement::Spend(coins.concat()));
+        'pool: for pool in [&regular, &swept] {
+            let mut picked: Vec<OutPoint> = Vec::new();
+            for (_, inputs) in &viable {
+                // A coin already picked for another bond conflicts this one too.
+                if inputs.iter().any(|i| picked.contains(i)) {
+                    continue;
+                }
+                let Some(coin) = inputs
+                    .iter()
+                    .filter_map(|i| pool.get(i).map(|amount| (i, amount)))
+                    .max_by_key(|(_, amount)| **amount)
+                    .map(|(i, _)| *i)
+                else {
+                    continue 'pool;
+                };
+                picked.push(coin);
             }
+            return Ok(BondReplacement::Spend(picked));
         }
         let stuck: Vec<u32> = viable.iter().map(|(index, _)| *index).collect();
         Ok(BondReplacement::Wait(format!(
@@ -1012,8 +1040,8 @@ impl Wallet {
         {
             return Ok(CoinState::Unspent);
         }
-        // Not unspent: spent, or its funding tx is unknown. The spend's
-        // confirmation is read from the coin's script, so fetch its parent.
+        // Not unspent: spent, or its funding tx is unknown. The spend's depth
+        // is read from the coin's script, so fetch its parent.
         if self.blockchain.is_tx_unknown(&coin.txid)? {
             return Ok(CoinState::Unclear);
         }
@@ -1022,11 +1050,12 @@ impl Wallet {
             return Ok(CoinState::Unclear);
         };
         Ok(
-            if self
-                .blockchain
-                .is_confirmed_spend(coin, &output.script_pubkey)?
-            {
-                CoinState::SpentConfirmed
+            if self.blockchain.is_spend_buried(
+                coin,
+                &output.script_pubkey,
+                REFUSED_BOND_SPEND_DEPTH,
+            )? {
+                CoinState::SpentBuried
             } else {
                 CoinState::Unclear
             },

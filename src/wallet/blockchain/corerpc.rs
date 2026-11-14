@@ -592,6 +592,32 @@ impl Blockchain for CoreRPC {
                 .is_none())
     }
 
+    fn is_spend_buried(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+        depth: u64,
+    ) -> Result<bool, WalletError> {
+        if !self.is_confirmed_spend(outpoint, script)? {
+            return Ok(false);
+        }
+        // Core keeps no spend index: the spend is buried unless one of the
+        // newest `depth - 1` blocks holds it. The tip is read after the spend
+        // was seen, so the spending block is at or below it.
+        let tip = self.get_block_count()?;
+        for height in (tip + 2).saturating_sub(depth)..=tip {
+            let block = self.block_at_height(height)?;
+            if block
+                .txdata
+                .iter()
+                .any(|tx| tx.input.iter().any(|i| i.previous_output == *outpoint))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn get_raw_transaction(
         &self,
         txid: &Txid,
