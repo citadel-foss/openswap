@@ -637,3 +637,173 @@ fn embedded_relay_rejects_a_bad_signature() {
     assert_eq!(stored, vec![good.id]);
     drop(relay);
 }
+
+/// A subscriber that stops reading must not pin shutdown in `socket.send`.
+/// Removing the write timeout would leave this join blocked.
+#[cfg(windows)]
+#[test]
+fn embedded_relay_shutdown_survives_a_blocked_write() {
+    use std::{
+        net::SocketAddr,
+        os::windows::io::{FromRawSocket, RawSocket},
+        sync::mpsc,
+    };
+
+    use nostr::{
+        event::{EventBuilder, Kind},
+        key::Keys,
+        ClientMessage, Filter, JsonUtil, RelayMessage, SubscriptionId,
+    };
+    use tungstenite::{Message, WebSocket};
+
+    /// Connect with a tiny receive window, set before the handshake, so a
+    /// client that stops reading fills the relay's send buffer.
+    fn connect_small_window(addr: SocketAddr) -> io::Result<std::net::TcpStream> {
+        #[link(name = "ws2_32")]
+        extern "system" {
+            fn socket(af: i32, ty: i32, protocol: i32) -> usize;
+            fn setsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *const i32,
+                optlen: i32,
+            ) -> i32;
+            fn connect(s: usize, name: *const u8, namelen: i32) -> i32;
+            fn closesocket(s: usize) -> i32;
+        }
+        #[repr(C)]
+        struct SockAddrV4 {
+            family: u16,
+            port: u16,
+            addr: [u8; 4],
+            zero: [u8; 8],
+        }
+
+        let std::net::SocketAddr::V4(addr) = addr else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "embedded relay is ipv4",
+            ));
+        };
+        unsafe {
+            // AF_INET, SOCK_STREAM, IPPROTO_TCP. Winsock is already started
+            // by the relay's listener.
+            let sock = socket(2, 1, 6);
+            if sock == usize::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            // Windows `SOL_SOCKET` / `SO_RCVBUF`.
+            let size = 4096i32;
+            if setsockopt(sock, 0xffff, 0x1002, &size, 4) != 0 {
+                let error = io::Error::last_os_error();
+                closesocket(sock);
+                return Err(error);
+            }
+            let sa = SockAddrV4 {
+                family: 2,
+                port: addr.port().to_be(),
+                addr: addr.ip().octets(),
+                zero: [0; 8],
+            };
+            if connect(sock, &sa as *const SockAddrV4 as *const u8, 16) != 0 {
+                let error = io::Error::last_os_error();
+                closesocket(sock);
+                return Err(error);
+            }
+            Ok(std::net::TcpStream::from_raw_socket(sock as RawSocket))
+        }
+    }
+
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let relay = spawn_embedded_nostr_relay(port).unwrap();
+    let url = format!("ws://127.0.0.1:{port}");
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let connect = || {
+        let start = Instant::now();
+        loop {
+            if let Ok(stream) = connect_small_window(addr) {
+                match tungstenite::client(url.as_str(), stream) {
+                    Ok((socket, _)) => return socket,
+                    Err(tungstenite::HandshakeError::Failure(error)) => {
+                        panic!("embedded relay handshake failed: {:?}", error)
+                    }
+                    Err(tungstenite::HandshakeError::Interrupted(_)) => {}
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "embedded relay did not accept a connection"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let set_read_timeout = |socket: &mut WebSocket<std::net::TcpStream>, timeout: Duration| {
+        socket.get_mut().set_read_timeout(Some(timeout)).unwrap();
+    };
+    let read_relay = |socket: &mut WebSocket<std::net::TcpStream>| match socket.read() {
+        Ok(Message::Text(text)) => RelayMessage::from_json(text.as_str()).unwrap(),
+        other => panic!("expected a relay text frame, got {:?}", other),
+    };
+
+    let mut subscriber = connect();
+    set_read_timeout(&mut subscriber, Duration::from_secs(2));
+    subscriber
+        .send(Message::text(
+            ClientMessage::req(SubscriptionId::new("stuck"), Filter::new()).as_json(),
+        ))
+        .unwrap();
+    assert!(
+        matches!(
+            read_relay(&mut subscriber),
+            RelayMessage::EndOfStoredEvents(_)
+        ),
+        "subscription was not registered"
+    );
+    // Leave the socket open and unread. Dropping it would reset the
+    // connection and unblock the relay without the write timeout.
+
+    let mut publisher = connect();
+    set_read_timeout(&mut publisher, Duration::from_secs(2));
+    let keys = Keys::generate();
+    let payload = "x".repeat(8_000);
+    for i in 0..40 {
+        let event = EventBuilder::new(Kind::Custom(1), format!("{i:04}-{payload}"))
+            .build(keys.public_key())
+            .sign_with_keys(&keys)
+            .unwrap();
+        publisher
+            .send(Message::text(ClientMessage::event(event).as_json()))
+            .unwrap();
+        match read_relay(&mut publisher) {
+            RelayMessage::Ok { status: true, .. } => {}
+            other => panic!("expected an accepted event, got {:?}", other),
+        }
+    }
+    // The subscriber worker polls every 100ms, then blocks in send.
+    thread::sleep(Duration::from_millis(300));
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let started = Instant::now();
+    thread::spawn(move || {
+        drop(relay);
+        let _ = done_tx.send(started.elapsed());
+    });
+    let elapsed = done_rx
+        .recv_timeout(Duration::from_secs(12))
+        .unwrap_or_else(|_| panic!("shutdown stayed blocked on a subscriber that stopped reading"));
+    assert!(
+        elapsed > Duration::from_secs(1),
+        "shutdown did not block on the full subscriber socket: {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_secs(12),
+        "shutdown took {:?}",
+        elapsed
+    );
+    drop(subscriber);
+}
