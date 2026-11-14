@@ -41,9 +41,9 @@ use crate::{
         min_contract_value_sats,
         seed_cli::WalletInUse,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
-        AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FeePriority,
-        FidelityError, MakerReport, RecoveryOutcome, RestoreOptions, SwapRole, Wallet, WalletError,
-        MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
+        AddressType, AnyBlockchain, BackendConfig, Blockchain, BondReplacement, CoreRpcConfig,
+        FeePriority, FidelityError, MakerReport, RecoveryOutcome, RestoreOptions, SwapRole, Wallet,
+        WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::{service::WatchService, watcher::WatcherEvent, watcher_error::WatcherError},
 };
@@ -1299,15 +1299,18 @@ impl MakerServer {
     /// Waits for live but unconfirmed fidelity bonds to confirm and records
     /// their confirmation height. No-op if no such bond exists.
     ///
-    /// A bond is registered with `conf_height: None` as soon as it is
-    /// broadcast, so a maker that shut down while waiting for confirmation
-    /// restarts with a pending bond in the wallet. Such a bond fails
+    /// A bond is registered with `conf_height: None` just before it is
+    /// broadcast, so a maker that shut down while broadcasting or waiting for
+    /// confirmation restarts with a pending bond in the wallet. Such a bond fails
     /// valuation (`calculate_bond_value` needs the confirmation height) and
     /// would be silently discarded by `get_highest_fidelity_index`, making
     /// the maker create a second bond and doubly lock funds. Finalizing it
     /// here prevents that. Pending bonds are checked together, and once any
     /// bond is live the rest get one check each; the renewal loop checks again.
-    fn finalize_pending_fidelity_bonds(&self, mut live_bond: bool) -> Result<(), MakerError> {
+    ///
+    /// Returns the indices of the bonds the backend refused, which a new bond
+    /// must replace.
+    fn finalize_pending_fidelity_bonds(&self, mut live_bond: bool) -> Result<Vec<u32>, MakerError> {
         // Snapshot the pending bonds once: an unrecoverable bond stays
         // pending in the wallet, so re-finding inside the loop would spin
         // on it forever.
@@ -1329,8 +1332,9 @@ impl MakerServer {
             }
         }
 
+        let mut refused = Vec::new();
         if pending.is_empty() {
-            return Ok(());
+            return Ok(refused);
         }
         let chain = self.bond_chain()?;
         while !pending.is_empty() {
@@ -1351,17 +1355,25 @@ impl MakerServer {
                         live_bond = true;
                     }
                     Ok(None) => unconfirmed.push((index, txid)),
-                    // The bond was evicted and there is no stored transaction to
-                    // rebroadcast: it can never confirm. Losing the bond must not
-                    // take the maker down — log it and start up anyway.
+                    // The bond was evicted with no stored transaction to
+                    // rebroadcast, or the backend refuses the stored one: this
+                    // maker cannot get it confirmed. Waiting on it would hold
+                    // startup forever — log it, skip it, and fund a new bond.
+                    // A refused bond can still confirm elsewhere, so the new
+                    // bond spends its coins.
                     Err(MakerError::Wallet(WalletError::Fidelity(
-                        FidelityError::BondTransactionMissing { .. },
+                        e @ (FidelityError::BondTransactionMissing { .. }
+                        | FidelityError::BondBroadcastRefused { .. }),
                     ))) => {
+                        if matches!(e, FidelityError::BondBroadcastRefused { .. }) {
+                            refused.push(index);
+                        }
                         log::error!(
-                            "[{}] Pending fidelity bond {} was evicted and has no stored transaction; \
-                             it is unrecoverable. Skipping it and continuing startup.",
+                            "[{}] Pending fidelity bond {} cannot be broadcast: {}. \
+                             Skipping it and continuing startup.",
                             self.config.network_port,
-                            txid
+                            txid,
+                            e
                         );
                     }
                     Err(e) => return Err(e),
@@ -1382,11 +1394,30 @@ impl MakerServer {
                 return Err(MakerError::Shutdown);
             }
         }
-        Ok(())
+        Ok(refused)
     }
 
     /// Setup fidelity bond for this maker.
     pub fn setup_fidelity_bond(&self, maker_address: &str) -> Result<FidelityProof, MakerError> {
+        // One deposit address for the whole setup, across every pass, so a
+        // pass that starts over doesn't burn and watch a new one.
+        let mut deposit = None;
+        loop {
+            if let Some(proof) = self.try_setup_fidelity_bond(maker_address, &mut deposit)? {
+                return Ok(proof);
+            }
+        }
+    }
+
+    /// One pass of [`Self::setup_fidelity_bond`]. `None` means a bond the
+    /// backend refused needs another look, so setup starts over.
+    /// `deposit` is the address the funds wait asks for, allocated by the
+    /// first pass that needs one.
+    fn try_setup_fidelity_bond(
+        &self,
+        maker_address: &str,
+        deposit: &mut Option<bitcoin::Address>,
+    ) -> Result<Option<FidelityProof>, MakerError> {
         use bitcoin::absolute::LockTime;
 
         // Adopt any bond that was broadcast but not yet confirmed (e.g. the
@@ -1401,7 +1432,7 @@ impl MakerServer {
             *lock_debug!(self.highest_fidelity_proof.write())
                 .map_err(|_| MakerError::General("Failed to lock fidelity proof"))? = None;
         }
-        self.finalize_pending_fidelity_bonds(live_bond)?;
+        let refused_bonds = self.finalize_pending_fidelity_bonds(live_bond)?;
 
         let highest_index = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -1490,10 +1521,16 @@ impl MakerServer {
             // Wait for funds and create fidelity bond
             const SYNC_INTERVAL: Duration = Duration::from_secs(10);
             // One address for the whole wait, so each retry doesn't burn a new one.
-            let addr = lock_debug!(self.wallet.write())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .get_next_external_address(AddressType::P2TR)
-                .map_err(MakerError::Wallet)?;
+            let addr = match deposit {
+                Some(addr) => addr.clone(),
+                None => {
+                    let addr = lock_debug!(self.wallet.write())
+                        .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                        .get_next_external_address(AddressType::P2TR)
+                        .map_err(MakerError::Wallet)?;
+                    deposit.insert(addr).clone()
+                }
+            };
 
             while !self.shutdown.load(Ordering::Relaxed) {
                 log::info!("Sync at:----setup_fidelity_bond----");
@@ -1502,14 +1539,44 @@ impl MakerServer {
                     .sync_and_save(&self.shutdown)
                     .map_err(MakerError::Wallet)?;
 
+                // Re-planned after every sync: a refused bond may have reached
+                // the backend, or its coins been freed, while funds were awaited.
+                let plan = lock_debug!(self.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                    .plan_bond_replacement(&refused_bonds);
+                let conflicts = match plan {
+                    Ok(BondReplacement::Spend(coins)) => coins,
+                    Ok(BondReplacement::Adopt(index)) => {
+                        log::info!(
+                            "[{}] Refused fidelity bond {} reached the backend; adopting it instead of creating one",
+                            self.config.network_port,
+                            index
+                        );
+                        return Ok(None);
+                    }
+                    other => {
+                        log::warn!(
+                            "[{}] Not creating a fidelity bond yet: {:?}. Next check in {} secs",
+                            self.config.network_port,
+                            other,
+                            SYNC_INTERVAL.as_secs()
+                        );
+                        if !self.wait_for_shutdown(SYNC_INTERVAL) {
+                            return Err(MakerError::Shutdown);
+                        }
+                        continue;
+                    }
+                };
+
                 let fidelity_result = lock_debug!(self.wallet.write())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                    .create_fidelity(
+                    .create_fidelity_replacing(
                         amount,
                         locktime,
                         Some(maker_address),
                         self.config.fidelity_feerate,
                         AddressType::P2TR,
+                        &conflicts,
                     );
 
                 match fidelity_result {
@@ -1565,6 +1632,21 @@ impl MakerServer {
                             if !self.wait_for_shutdown(SYNC_INTERVAL) {
                                 return Err(MakerError::Shutdown);
                             }
+                        } else if !refused_bonds.is_empty() {
+                            // A refused bond may have confirmed after the coins
+                            // were picked, so the replacement conflicts with
+                            // it. Start over: setup adopts the bond, or waits on
+                            // or replaces the new one if its record was kept.
+                            log::warn!(
+                                "[{}] Fidelity bond creation failed: {:?}. Checking the refused bonds again in {} secs",
+                                self.config.network_port,
+                                e,
+                                SYNC_INTERVAL.as_secs()
+                            );
+                            if !self.wait_for_shutdown(SYNC_INTERVAL) {
+                                return Err(MakerError::Shutdown);
+                            }
+                            return Ok(None);
                         } else {
                             log::error!(
                                 "[{}] Fidelity Bond Creation failed: {:?}",
@@ -1580,7 +1662,25 @@ impl MakerServer {
                             self.config.network_port,
                             txid
                         );
-                        let conf_height = self.wait_for_bond_confirmation(index)?;
+                        let conf_height = match self.wait_for_bond_confirmation(index) {
+                            Ok(height) => height,
+                            // The new bond left the mempool and the backend
+                            // refuses it again: evicted, or a refused bond it
+                            // conflicts with confirmed first. Start over:
+                            // setup adopts that bond, or replaces both.
+                            Err(MakerError::Wallet(WalletError::Fidelity(
+                                e @ FidelityError::BondBroadcastRefused { .. },
+                            ))) => {
+                                log::warn!(
+                                    "[{}] New fidelity bond {} was refused while awaiting confirmation: {}. Checking the refused bonds again",
+                                    self.config.network_port,
+                                    txid,
+                                    e
+                                );
+                                return Ok(None);
+                            }
+                            Err(e) => return Err(e),
+                        };
 
                         // Re-acquire write lock briefly to finalize
                         lock_debug!(self.wallet.write())
@@ -1617,6 +1717,7 @@ impl MakerServer {
             .map_err(|_| MakerError::General("Failed to lock fidelity proof"))?
             .clone()
             .ok_or(MakerError::General("No fidelity proof after setup"))
+            .map(Some)
     }
 
     /// Check if maker has enough liquidity for swaps.

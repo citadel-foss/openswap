@@ -1477,6 +1477,10 @@ impl Blockchain for Electrum {
         Ok(serde_json::from_value(stub)?)
     }
 
+    fn abandon_transaction(&self, _txid: &Txid) -> Result<(), WalletError> {
+        Ok(())
+    }
+
     fn is_tx_unknown(&self, txid: &Txid) -> Result<bool, WalletError> {
         match self.transaction_get_live(txid) {
             Ok(_) => Ok(false),

@@ -59,6 +59,103 @@ fn mempool_only_spend_reads_as_spent(node: &mut Node) {
     info!("Mempool-only spend reads as spent on the Core backend");
 }
 
+/// Pins the Core answer a refused bond's planner trusts to skip the bond: a
+/// spend reads as buried only `depth` blocks deep on the active chain. A
+/// spend whose block is reorged out, or a coin whose funding tx's block is
+/// reorged out while the txindex still names that block, is not buried.
+#[world_test(backend = BitcoindBackend)]
+fn spend_reads_buried_only_deep_on_the_active_chain(node: &mut Node) {
+    let bitcoind = node.bitcoind();
+    let backend = CoreRPC::new(&node.rpc_config()).expect("connect Core backend");
+    let address = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+    let script_of = |outpoint: OutPoint| {
+        bitcoind
+            .client
+            .get_raw_transaction(&outpoint.txid, None)
+            .unwrap()
+            .output[outpoint.vout as usize]
+            .script_pubkey
+            .clone()
+    };
+    // Polls past the txindex catching up with a new block.
+    let buried_becomes = |outpoint: OutPoint, depth: u64, expected: bool| {
+        let script = script_of(outpoint);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while backend.is_spend_buried(&outpoint, &script, depth).unwrap() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} at depth {} never read buried = {}",
+                outpoint,
+                depth,
+                expected
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    };
+
+    let spend_txid = send_to_address(bitcoind, &address, Amount::ONE_BTC);
+    let coin = bitcoind
+        .client
+        .get_raw_transaction(&spend_txid, None)
+        .unwrap()
+        .input[0]
+        .previous_output;
+    buried_becomes(coin, 1, false);
+
+    generate_blocks(bitcoind, 1);
+    buried_becomes(coin, 1, true);
+    buried_becomes(coin, 2, false);
+    generate_blocks(bitcoind, 5);
+    buried_becomes(coin, 6, true);
+
+    // The spend's block is reorged out: the spend is back in the mempool.
+    let spend_block = bitcoind
+        .client
+        .get_raw_transaction_info(&spend_txid, None)
+        .unwrap()
+        .blockhash
+        .unwrap();
+    bitcoind.client.invalidate_block(&spend_block).unwrap();
+    buried_becomes(coin, 1, false);
+    bitcoind.client.reconsider_block(&spend_block).unwrap();
+    buried_becomes(coin, 6, true);
+
+    // A funding tx mined, reorged out, and replaced by a mined conflict: the
+    // txindex still names its stale block, but its coin is in no chain.
+    let funding_txid = send_to_address(bitcoind, &address, Amount::ONE_BTC);
+    generate_blocks(bitcoind, 1);
+    let funding_block = bitcoind
+        .client
+        .get_raw_transaction_info(&funding_txid, None)
+        .unwrap()
+        .blockhash
+        .unwrap();
+    bitcoind.client.invalidate_block(&funding_block).unwrap();
+    let _: serde_json::Value = bitcoind
+        .client
+        .call("bumpfee", &[serde_json::json!(funding_txid.to_string())])
+        .unwrap();
+    generate_blocks(bitcoind, 6);
+    assert_eq!(
+        bitcoind
+            .client
+            .get_raw_transaction_info(&funding_txid, None)
+            .unwrap()
+            .blockhash,
+        Some(funding_block),
+        "the txindex must still name the stale block for this case to mean anything"
+    );
+    for vout in 0..2 {
+        let stale = OutPoint::new(funding_txid, vout);
+        buried_becomes(stale, 1, false);
+        buried_becomes(stale, 6, false);
+    }
+}
+
 /// This test verifies that expired fidelity bond UTXOs are properly isolated from regular transactions:
 ///
 /// - Creates a fidelity bond and lets it expire by advancing blockchain height
