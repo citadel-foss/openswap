@@ -3755,18 +3755,42 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
-    fn is_tx_confirmed(&self, txid: &bitcoin::Txid) -> Result<bool, MakerError> {
+    fn tx_confirmations(&self, txid: &bitcoin::Txid) -> Result<Option<u32>, MakerError> {
         use crate::wallet::Blockchain;
-        // `tx_block_height` already distinguishes "not in a block" from a
-        // query failure, across both backends. Matching on an error string
-        // would not: Core reports an unknown transaction as -5 while
-        // Electrum reports it as a message under -32603.
-        let height = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // Core's txindex still serves a reorged-out transaction under the
+        // block that was replaced, so that block's height would keep counting
+        // a refund the chain no longer has. Its confirmation count is read
+        // from the active chain, and is 0 for such a transaction. An unknown
+        // txid (-5) is `None`; any other failure is an error.
+        if let AnyBlockchain::CoreRPC(core) = &wallet.blockchain {
+            return Ok(core
+                .tx_confirmations(txid)
+                .map_err(MakerError::Wallet)?
+                .filter(|&confirmations| confirmations > 0));
+        }
+        // Electrum answers from the server's active chain. `tx_block_height`
+        // distinguishes "not in a block" from a query failure, which matching
+        // on an error string would not: Electrum reports an unknown
+        // transaction as a message under -32603.
+        let Some(height) = wallet
             .blockchain
             .tx_block_height(txid)
+            .map_err(MakerError::Wallet)?
+        else {
+            return Ok(None);
+        };
+        // The tip is read after the block height, so it is not below it. A
+        // backend that answers otherwise counts as one confirmation, which
+        // only makes a caller wait longer.
+        let tip = wallet
+            .blockchain
+            .get_block_count()
             .map_err(MakerError::Wallet)?;
-        Ok(height.is_some())
+        Ok(Some(
+            u32::try_from(tip.saturating_sub(height) + 1).unwrap_or(u32::MAX),
+        ))
     }
 
     #[cfg(feature = "lightning")]

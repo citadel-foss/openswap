@@ -745,12 +745,13 @@ pub trait Maker: Send + Sync {
         0
     }
 
-    /// Whether this specific transaction is confirmed.
+    /// How many confirmations this specific transaction has, or `None` while
+    /// it is unconfirmed or unknown. A failed query is an error, never `None`.
     ///
     /// Distinguishing *which* transaction spent an HTLC needs this: knowing
     /// the outpoint has some confirmed spend does not say whose it was.
     #[cfg(feature = "lightning")]
-    fn is_tx_confirmed(&self, _txid: &bitcoin::Txid) -> Result<bool, MakerError> {
+    fn tx_confirmations(&self, _txid: &bitcoin::Txid) -> Result<Option<u32>, MakerError> {
         Err(MakerError::General("lightning swaps not supported"))
     }
 
