@@ -3770,10 +3770,20 @@ impl MakerTrait for MakerServer {
                 .map_err(MakerError::Wallet)?
                 .filter(|&confirmations| confirmations > 0));
         }
-        // Electrum answers from the server's active chain. `tx_block_height`
-        // distinguishes "not in a block" from a query failure, which matching
-        // on an error string would not: Electrum reports an unknown
-        // transaction as a message under -32603.
+        // Electrum answers from the server's active chain. The tip is read
+        // first: a new tip drops the cached script histories, so the height
+        // below is never older than the tip it is counted against. In the
+        // other order a reorg between the reads could pair a replaced
+        // refund's old height with the new tip. A block mined between the
+        // reads puts the height above the tip, which counts as one
+        // confirmation and only makes a caller wait longer.
+        let tip = wallet
+            .blockchain
+            .get_block_count()
+            .map_err(MakerError::Wallet)?;
+        // `tx_block_height` distinguishes "not in a block" from a query
+        // failure, which matching on an error string would not: Electrum
+        // reports an unknown transaction as a message under -32603.
         let Some(height) = wallet
             .blockchain
             .tx_block_height(txid)
@@ -3781,13 +3791,6 @@ impl MakerTrait for MakerServer {
         else {
             return Ok(None);
         };
-        // The tip is read after the block height, so it is not below it. A
-        // backend that answers otherwise counts as one confirmation, which
-        // only makes a caller wait longer.
-        let tip = wallet
-            .blockchain
-            .get_block_count()
-            .map_err(MakerError::Wallet)?;
         Ok(Some(
             u32::try_from(tip.saturating_sub(height) + 1).unwrap_or(u32::MAX),
         ))
@@ -4112,6 +4115,70 @@ pub(crate) mod tests {
             ..MakerServerConfig::default()
         };
         assert!(!format!("{config:?}").contains("wallet-secret"));
+    }
+
+    /// On Electrum a refund's height comes from a script history that is
+    /// cached for a few seconds. A reorg that drops the refund and moves the
+    /// tip to five blocks above it must not pair that cached height with the
+    /// new tip, which would count a refund the chain no longer has as six
+    /// blocks deep.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn electrum_refund_depth_ignores_a_height_from_before_a_reorg() {
+        use crate::wallet::{blockchain::mock_electrum, AnyBlockchain, Electrum, ElectrumConfig};
+        use bitcoin::{consensus::encode::serialize_hex, TxIn, TxOut};
+        use serde_json::{json, Value};
+
+        let refund = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let refund_txid = refund.compute_txid();
+        let reorged = Arc::new(AtomicBool::new(false));
+        let server = mock_electrum({
+            let reorged = reorged.clone();
+            let refund_hex = serialize_hex(&refund);
+            move |method, _| match method {
+                "blockchain.transaction.get" => Ok(json!(refund_hex)),
+                // Mined at 100, then gone from the chain that replaced it.
+                "blockchain.scripthash.get_history" if reorged.load(Ordering::SeqCst) => {
+                    Ok(json!([]))
+                }
+                "blockchain.scripthash.get_history" => Ok(json!([
+                    { "tx_hash": refund_txid.to_string(), "height": 100 }
+                ])),
+                _ => Ok(Value::Null),
+            }
+        });
+        let header = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        server.set_tip(100, &header);
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        maker.wallet.write().unwrap().blockchain = AnyBlockchain::Electrum(
+            Electrum::new(&ElectrumConfig {
+                url: server.url.clone(),
+                ..Default::default()
+            })
+            .expect("connect to mock electrum"),
+        );
+        assert_eq!(maker.tx_confirmations(&refund_txid).unwrap(), Some(1));
+
+        // Within the history cache's lifetime, a reorg replaces block 100
+        // and the new chain reaches 105.
+        let mut replacement = header;
+        replacement.nonce += 1;
+        server.set_tip(105, &replacement);
+        reorged.store(true, Ordering::SeqCst);
+        assert_eq!(
+            maker.tx_confirmations(&refund_txid).unwrap(),
+            None,
+            "a refund height read before the reorg was counted against the new tip"
+        );
     }
 
     pub(crate) fn compat_test_maker(

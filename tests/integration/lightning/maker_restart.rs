@@ -792,14 +792,19 @@ fn lightning_maker_keeps_a_shallow_refund_through_a_reorg(
 /// A swap-out refund that has reached `REFUND_FINALITY_DEPTH` closes the
 /// swap and fails the held payment back; one block short of it does not.
 #[world_test(
-    backend = BitcoindBackend,
     bind = [ln = maker_node()],
     maker_behaviors = [Normal],
     takers = [Normal],
     maker_lightning = [ln.clone()],
     setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+    cases = [
+        lightning_maker_closes_a_refund_at_finality_depth(backend = BitcoindBackend),
+        /// Same on Electrum, where the maker counts the refund's depth from
+        /// its block height and the server's tip.
+        lightning_maker_closes_a_refund_at_finality_depth_on_electrum(backend = ElectrumBackend),
+    ],
 )]
-fn lightning_maker_closes_a_refund_at_finality_depth(
+fn run_lightning_maker_closes_a_refund_at_finality_depth(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
 ) {
@@ -825,6 +830,8 @@ fn lightning_maker_closes_a_refund_at_finality_depth(
         - confirmations(bitcoind, &funded.outpoint.txid) as u64
         + 1;
     mine_to(bitcoind, funded_at + locktime as u64 + 1);
+    // On Electrum the maker reads the chain through electrs. No-op on Core.
+    framework.wait_for_electrs_tip();
 
     ln_watchdog_tick_now(&maker);
     let refund_txid = maker
@@ -838,6 +845,12 @@ fn lightning_maker_closes_a_refund_at_finality_depth(
     assert_eq!(
         confirmations(bitcoind, &refund_txid) as u64,
         REFUND_FINALITY_DEPTH - 1
+    );
+    framework.wait_for_electrs_tip();
+    assert_eq!(
+        maker.tx_confirmations(&refund_txid).unwrap(),
+        Some(REFUND_FINALITY_DEPTH as u32 - 1),
+        "the maker's backend must see the refund one block short of final"
     );
     // Only once the watcher holds the refund does a pass reach the depth
     // check; before that it waits on the unseen spend instead.
@@ -859,6 +872,11 @@ fn lightning_maker_closes_a_refund_at_finality_depth(
 
     // ---- At the finality depth the swap closes ----
     generate_blocks(bitcoind, 1);
+    framework.wait_for_electrs_tip();
+    assert_eq!(
+        maker.tx_confirmations(&refund_txid).unwrap(),
+        Some(REFUND_FINALITY_DEPTH as u32)
+    );
     wait_until!(
         Duration::from_secs(30),
         every Duration::from_millis(200),
