@@ -24,7 +24,7 @@ use bitcoind::bitcoincore_rpc::{
 use serde::{Deserialize, Serialize};
 use serde_cbor::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     convert::TryFrom,
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
@@ -865,12 +865,11 @@ impl Wallet {
         if !conflicts.is_empty() {
             log::info!("New fidelity bond spends {conflicts:?}, held by refused bonds");
         }
-        let coins = self.coin_select(
+        let coins = self.select_replacement_coins(
             amount,
             feerate,
             infer_address_type(&fidelity_addr.script_pubkey()),
-            Some(conflicts.to_vec()),
-            None,
+            conflicts,
         )?;
         let outputs = vec![(fidelity_addr, amount)];
 
@@ -904,36 +903,87 @@ impl Wallet {
         Ok((index, txid))
     }
 
+    /// Coins for a new bond that spends every coin in `conflicts`.
+    ///
+    /// Coin selection keeps a transaction to one pool, seed coins or swept
+    /// swap coins. When the conflicts are in a pool that cannot fund the bond,
+    /// such as swept coins while new deposits land as seed coins, the rest is
+    /// selected from all other coins instead, so a deposit can still fund it.
+    pub(super) fn select_replacement_coins(
+        &self,
+        amount: Amount,
+        feerate: f64,
+        bond_type: AddressType,
+        conflicts: &[OutPoint],
+    ) -> Result<Vec<(ListUnspentResultEntry, UTXOSpendInfo)>, WalletError> {
+        let pinned = self.coin_select(amount, feerate, bond_type, Some(conflicts.to_vec()), None);
+        if conflicts.is_empty() || !matches!(pinned, Err(WalletError::InsufficientFund { .. })) {
+            return pinned;
+        }
+        let forced: Vec<_> = self
+            .list_descriptor_utxo_spend_info()
+            .into_iter()
+            .chain(self.list_swept_incoming_swap_utxos())
+            .filter(|(utxo, _)| conflicts.contains(&OutPoint::new(utxo.txid, utxo.vout)))
+            .collect();
+        // The conflicts pay for their own inputs; the rest covers what they
+        // leave of the bond. (txid + vout + script length + sequence) * 4.
+        const INPUT_BASE_WEIGHT: u64 = (32 + 4 + 1 + 4) * 4;
+        let forced_value: u64 = forced.iter().map(|(utxo, _)| utxo.amount.to_sat()).sum();
+        let forced_weight: u64 = forced
+            .iter()
+            .map(|(_, spend)| INPUT_BASE_WEIGHT + spend.estimate_witness_size() as u64)
+            .sum();
+        let forced_fee = (forced_weight as f64 / 4.0 * feerate).ceil() as u64;
+        let rest = (amount.to_sat() + forced_fee).saturating_sub(forced_value);
+        if rest == 0 {
+            return pinned;
+        }
+        let mut coins = self.coin_select(
+            Amount::from_sat(rest),
+            feerate,
+            bond_type,
+            None,
+            Some(conflicts.to_vec()),
+        )?;
+        log::info!(
+            "Topping up the coins held by refused bonds with {} other coins",
+            coins.len()
+        );
+        coins.extend(forced);
+        Ok(coins)
+    }
+
     /// Decides how a new bond can be funded while the bonds at `refused`,
     /// which the backend refused, may still confirm: from a peer's mempool, or
     /// once the node's minimum fee falls.
     ///
     /// The new bond must spend a coin of every refused bond that can still
-    /// confirm, so at most one of them ever locks funds. One free coin per
-    /// bond is enough, so only one is taken: the largest, which pays for its
-    /// own input best. A refused bond the backend now knows is adopted
-    /// instead.
+    /// confirm, so at most one of them ever locks funds. It spends every free
+    /// coin of each such bond, not just one: a peer that still holds a refused
+    /// bond only takes a replacement paying more in absolute fee, and spending
+    /// the same coins at a higher fee rate keeps it from paying less. A refused
+    /// bond the backend now knows is adopted instead.
     ///
     /// A bond with a free coin is always conflicted through it, whatever its
     /// other coins show. Only a bond with no free coin is looked up on chain:
-    /// it is dead, and needs no conflict, once a spend of one of its coins is
-    /// `REFUSED_BOND_SPEND_DEPTH` (6) blocks deep; a shallower or mempool spend,
-    /// or an unknown funding tx, waits. So does an unspent coin the wallet
+    /// it is dead, and needs no conflict, once the backend proves a spend of
+    /// one of its coins is `REFUSED_BOND_SPEND_DEPTH` (6) blocks deep on the
+    /// active chain (see [`Blockchain::is_spend_buried`]). A shallower or
+    /// mempool spend, an unknown funding tx, or a spend the backend cannot
+    /// prove, waits. So does an unspent coin the wallet
     /// does not list: the node wallet is told to abandon the refused tx, and
     /// the next sync lists the coin. When some bond's coins are all locked,
     /// reserved for a swap, or in the other coin pool (one transaction spends
     /// from one pool), funding waits too.
     pub fn plan_bond_replacement(&self, refused: &[u32]) -> Result<BondReplacement, WalletError> {
         let locked = self.list_lock_unspent();
-        let free =
-            |pool: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>| -> HashMap<OutPoint, Amount> {
-                pool.iter()
-                    .map(|(utxo, _)| (OutPoint::new(utxo.txid, utxo.vout), utxo.amount))
-                    .filter(|(outpoint, _)| {
-                        !locked.contains(outpoint) && !self.is_swap_reserved(outpoint)
-                    })
-                    .collect()
-            };
+        let free = |pool: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>| -> HashSet<OutPoint> {
+            pool.iter()
+                .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+                .filter(|outpoint| !locked.contains(outpoint) && !self.is_swap_reserved(outpoint))
+                .collect()
+        };
         let regular = free(self.list_descriptor_utxo_spend_info());
         let swept = free(self.list_swept_incoming_swap_utxos());
 
@@ -951,7 +1001,7 @@ impl Wallet {
             let inputs: Vec<OutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
             if inputs
                 .iter()
-                .any(|i| regular.contains_key(i) || swept.contains_key(i))
+                .any(|i| regular.contains(i) || swept.contains(i))
             {
                 viable.push((bond.bond_index, inputs));
                 continue;
@@ -1005,24 +1055,22 @@ impl Wallet {
             )));
         }
 
-        'pool: for pool in [&regular, &swept] {
-            let mut picked: Vec<OutPoint> = Vec::new();
+        for pool in [&regular, &swept] {
+            let mut coins: Vec<OutPoint> = Vec::new();
+            let mut covered = true;
             for (_, inputs) in &viable {
-                // A coin already picked for another bond conflicts this one too.
-                if inputs.iter().any(|i| picked.contains(i)) {
-                    continue;
+                let mut in_pool = inputs.iter().filter(|i| pool.contains(i)).peekable();
+                covered &= in_pool.peek().is_some();
+                for coin in in_pool {
+                    // Bonds can share a coin.
+                    if !coins.contains(coin) {
+                        coins.push(*coin);
+                    }
                 }
-                let Some(coin) = inputs
-                    .iter()
-                    .filter_map(|i| pool.get(i).map(|amount| (i, amount)))
-                    .max_by_key(|(_, amount)| **amount)
-                    .map(|(i, _)| *i)
-                else {
-                    continue 'pool;
-                };
-                picked.push(coin);
             }
-            return Ok(BondReplacement::Spend(picked));
+            if covered {
+                return Ok(BondReplacement::Spend(coins));
+            }
         }
         let stuck: Vec<u32> = viable.iter().map(|(index, _)| *index).collect();
         Ok(BondReplacement::Wait(format!(
