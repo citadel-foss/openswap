@@ -22,7 +22,7 @@ use crate::{
             RespContractSigsForRecvrAndSender, SenderContractTxInfo,
         },
     },
-    utill::{generate_keypair, generate_maker_keys, read_message, send_message},
+    utill::{generate_keypair, generate_maker_keys},
     wallet::{
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin, WatchOnlySwapCoin},
         Wallet,
@@ -983,12 +983,9 @@ impl Taker {
             locktime,
         };
 
-        send_message(
-            &mut stream,
-            &TakerToMakerMessage::ReqContractSigsForSender(req),
-        )?;
+        stream.send_message(&TakerToMakerMessage::ReqContractSigsForSender(req))?;
 
-        let msg_bytes = read_message(&mut stream)?;
+        let msg_bytes = stream.read_frame(None)?;
         let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
 
         match msg {
@@ -1260,11 +1257,11 @@ impl Taker {
         let msg = TakerToMakerMessage::ProofOfFunding(pof);
         #[cfg(feature = "integration-test")]
         let entered = crate::maker::handlers::funding_steps_entered(swap_id);
-        send_message(&mut stream, &msg)?;
+        stream.send_message(&msg)?;
         #[cfg(feature = "integration-test")]
         self.race_legacy_funding_step(maker_address, swap_id, entered, &msg)?;
 
-        let msg_bytes = read_message(&mut stream)?;
+        let msg_bytes = stream.read_frame(None)?;
         let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
 
         match msg {
@@ -1332,7 +1329,7 @@ impl Taker {
         let msg = TakerToMakerMessage::RespContractSigsForRecvrAndSender(resp);
         #[cfg(feature = "integration-test")]
         let entered = crate::maker::handlers::funding_steps_entered(swap_id);
-        send_message(&mut stream, &msg)?;
+        stream.send_message(&msg)?;
         #[cfg(feature = "integration-test")]
         self.race_legacy_funding_step(maker_address, swap_id, entered, &msg)?;
 
@@ -1373,12 +1370,9 @@ impl Taker {
             locktime,
         };
 
-        send_message(
-            &mut stream,
-            &TakerToMakerMessage::ReqContractSigsForSender(req),
-        )?;
+        stream.send_message(&TakerToMakerMessage::ReqContractSigsForSender(req))?;
 
-        let msg_bytes = read_message(&mut stream)?;
+        let msg_bytes = stream.read_frame(None)?;
         let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
 
         match msg {
@@ -1419,12 +1413,9 @@ impl Taker {
             txs,
         };
 
-        send_message(
-            &mut stream,
-            &TakerToMakerMessage::ReqContractSigsForRecvr(req),
-        )?;
+        stream.send_message(&TakerToMakerMessage::ReqContractSigsForRecvr(req))?;
 
-        let msg_bytes = read_message(&mut stream)?;
+        let msg_bytes = stream.read_frame(None)?;
         let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
 
         match msg {

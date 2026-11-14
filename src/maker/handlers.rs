@@ -6,12 +6,14 @@ use std::{
     time::Instant,
 };
 
+use bip324::SessionId;
 use bitcoin::{bip32::ChainCode, Amount, OutPoint, PublicKey, Transaction, Txid};
 
 use bitcoind::bitcoincore_rpc::{jsonrpc::error::Error as JsonRpcError, Error as BitcoinRpcError};
 
 use super::error::MakerError;
 use crate::{
+    bip324_stream::sign_session_id,
     protocol::{
         common_messages::{
             AckSwapDetails, FidelityProof, GetOffer, Hello, MakerToTakerMessage, Offer,
@@ -230,6 +232,8 @@ pub(crate) fn past_refund_deadline(
 pub struct ConnectionState {
     /// Protocol version being used for this connection.
     pub protocol: ProtocolVersion,
+    /// BIP324 session id of this connection; `None` until the handshake is done.
+    pub session_id: Option<SessionId>,
     /// Current phase of the swap.
     pub phase: SwapPhase,
     /// Unique swap identifier.
@@ -290,10 +294,23 @@ pub enum SwapPhase {
     Completed,
 }
 
+impl ConnectionState {
+    /// A fresh state carrying a real BIP324 session id, for tests that call
+    /// the handlers directly instead of through the encrypted TCP server.
+    #[cfg(feature = "integration-test")]
+    pub fn with_test_session() -> Self {
+        ConnectionState {
+            session_id: Some(crate::bip324_stream::loopback_session_id()),
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ConnectionState {
     fn default() -> Self {
         ConnectionState {
             protocol: ProtocolVersion::Legacy,
+            session_id: None,
             phase: SwapPhase::AwaitingHello,
             swap_id: None,
             swap_amount: Amount::ZERO,
@@ -1119,9 +1136,18 @@ fn handle_hello<M: Maker>(
         })));
     }
 
+    // Sign the BIP324 session id with our tweakable key so the taker can bind
+    // this encrypted channel to the tweakable point our offer advertises.
+    let session_id = state
+        .session_id
+        .ok_or(MakerError::General("Hello before the BIP324 handshake"))?;
+    let (tweakable_privkey, _, _) = maker.get_tweakable_keypair()?;
+    let session_id_sig = sign_session_id(&session_id, &tweakable_privkey);
+
     state.phase = SwapPhase::AwaitingOfferRequest;
     Ok(Some(MakerToTakerMessage::Hello(Hello {
         features: supported().into_iter().map(String::from).collect(),
+        session_id_sig: Some(session_id_sig),
     })))
 }
 

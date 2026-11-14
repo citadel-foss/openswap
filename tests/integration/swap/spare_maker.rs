@@ -170,3 +170,46 @@ fn rebuild_after_replan_uses_the_claimed_coins(world: &mut World, params: SwapPa
     });
     assert_eq!(world.makers()[0].inner().reserved_inputs().unwrap(), 0);
 }
+
+/// A spare whose own offer and session signature agree with each other, but
+/// not with the key its verified offerbook entry advertises, is an impostor
+/// as far as the taker can tell: it must be refused before `SwapDetails`.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtReqContractSigsForSender, Normal],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+)]
+fn spare_with_a_different_offerbook_key_is_refused(world: &mut World) {
+    let params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
+        .with_tx_count(1)
+        .with_required_confirms(1);
+    let summary = world
+        .taker_mut()
+        .prepare(params)
+        .expect("Failed to prepare openswap");
+    let spare = world
+        .makers()
+        .iter()
+        .map(|maker| maker.address())
+        .find(|address| summary.makers.iter().all(|m| &m.address != address))
+        .expect("one maker is left over as the spare");
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let other_key = bitcoin::secp256k1::SecretKey::from_slice(&[9; 32]).unwrap();
+    let impostor_point = bitcoin::PublicKey::new(other_key.public_key(&secp));
+    assert!(world
+        .taker_mut()
+        .inner_mut()
+        .test_set_offerbook_tweakable_point(&spare, impostor_point)
+        .unwrap());
+
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
+        .expect_err("the spare must be refused, leaving no maker to substitute");
+
+    assert_log!(world; {
+        has "Substituting maker 1 with spare",
+        has "changed offer tweakable point",
+    });
+}

@@ -1,5 +1,11 @@
 openswap atomic_file::tests::compat_wallet_lock_is_exclusive_until_its_process_exits
 openswap atomic_file::tests::compat_wallet_lock_survives_atomic_wallet_replacement
+openswap bip324_stream::tests::clean_close_is_connection_closed
+openswap bip324_stream::tests::decoys_do_not_extend_the_idle_wait
+openswap bip324_stream::tests::idle_timeout_leaves_stream_usable
+openswap bip324_stream::tests::oversized_packet_is_refused_before_allocating
+openswap bip324_stream::tests::roundtrip_and_session_binding
+openswap bip324_stream::tests::stalled_handshake_hits_deadline
 openswap blocklist::tests::add_rejects_all_entries_when_any_address_is_invalid
 openswap blocklist::tests::add_update_remove_round_trip
 openswap blocklist::tests::compat_blocklist_header_and_entries_use_one_snapshot
@@ -191,6 +197,7 @@ openswap taker::background_services::tests::compat_recovery_scope_excludes_live_
 openswap taker::background_services::tests::compat_recovery_scope_includes_watchonly_and_claim_ready_coins_but_excludes_lightning
 openswap taker::background_services::tests::compat_unfunded_abort_preserves_scope_until_its_coin_removal_is_saved
 openswap taker::background_services::tests::dead_keepalive_socket_is_dropped_and_retried_immediately
+openswap taker::background_services::tests::heartbeat_authenticates_before_sending_the_swap_id
 openswap taker::background_services::tests::stalled_handshake_is_bounded_by_the_dial_timeout
 openswap taker::background_services::tests::unknown_watcher_answer_requires_abort
 openswap taker::background_services::tests::unreachable_peer_backs_off_instead_of_being_dropped
@@ -928,6 +935,7 @@ openswap::integration swap::payswap::taproot_exact_payment
 openswap::integration swap::spare_maker::legacy_first_maker_drops_before_sender_sigs
 openswap::integration swap::spare_maker::legacy_middle_maker_drops_before_sender_sigs
 openswap::integration swap::spare_maker::rebuild_after_replan_uses_the_claimed_coins
+openswap::integration swap::spare_maker::spare_with_a_different_offerbook_key_is_refused
 openswap::integration swap::spare_maker::taproot_middle_maker_drops_after_ack
 openswap::integration swap::spare_pricing::heterogeneous_substitution_aborts_without_cascade
 openswap::integration swap::spare_pricing::last_hop_equal_priced_spare_completes
