@@ -919,11 +919,18 @@ pub struct MakerServer {
 }
 
 /// How long a drain outlives the last settled swap, so a taker that lost its
-/// handover reply can retry. A little over the taker's retry delay.
+/// handover reply can retry. A taker waits its retry delay, then connects
+/// (over Tor, with a connect budget of its own), so the window covers both
+/// with a margin. Integration tests connect directly.
 #[cfg(not(feature = "integration-test"))]
-const HANDOVER_REPLAY_GRACE: Duration = Duration::from_secs(20);
+const HANDOVER_REPLAY_GRACE: Duration = Duration::from_secs(
+    crate::taker::api::FINALIZE_RETRY_DELAY.as_secs()
+        + crate::taker::api::CONNECT_TIMEOUT_SECS
+        + 15,
+);
 #[cfg(feature = "integration-test")]
-const HANDOVER_REPLAY_GRACE: Duration = Duration::from_secs(8);
+const HANDOVER_REPLAY_GRACE: Duration =
+    Duration::from_secs(crate::taker::api::FINALIZE_RETRY_DELAY.as_secs() + 5);
 
 /// How long `maker-cli stop` waits for the swaps in progress before the maker
 /// stops anyway. A peer can keep a swap that holds no funds alive with
@@ -1202,10 +1209,16 @@ impl MakerServer {
     ) -> Result<Option<MakerToTakerMessage>, MakerError> {
         let mut completed = lock_debug!(self.completed_handovers.lock())?;
         completed.retain(|_, handover| handover.completed_at.elapsed() < COMPLETED_HANDOVER_TTL);
-        Ok(completed
+        let replay = completed
             .get(&request.id)
             .filter(|handover| handover.protocol == protocol && handover.request == *request)
-            .map(|handover| handover.response.clone()))
+            .map(|handover| handover.response.clone());
+        if replay.is_some() {
+            // A draining maker keeps serving a taker that is retrying.
+            *lock_debug!(self.last_settled.lock()).map_err(|_| MakerError::MutexPossion)? =
+                Some(Instant::now());
+        }
+        Ok(replay)
     }
 
     pub(super) fn cache_completed_handover(
@@ -4463,6 +4476,47 @@ pub(crate) mod tests {
             .stop_if_drained_at(Instant::now() + super::HANDOVER_REPLAY_GRACE)
             .unwrap();
         assert!(maker.shutdown.load(Ordering::SeqCst));
+    }
+
+    /// The replay window covers a taker's retry delay plus its connect budget.
+    #[test]
+    fn replay_grace_covers_the_takers_retry_path() {
+        use crate::taker::api::FINALIZE_RETRY_DELAY;
+        #[cfg(not(feature = "integration-test"))]
+        assert!(
+            super::HANDOVER_REPLAY_GRACE
+                >= FINALIZE_RETRY_DELAY
+                    + Duration::from_secs(crate::taker::api::CONNECT_TIMEOUT_SECS)
+        );
+        #[cfg(feature = "integration-test")]
+        assert!(super::HANDOVER_REPLAY_GRACE > FINALIZE_RETRY_DELAY);
+    }
+
+    /// Serving a replay keeps the drain up for a further retry.
+    #[test]
+    fn serving_a_replay_restarts_the_grace_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (maker, _state) = maker_with_a_live_swap(dir.path());
+        *maker.last_settled.lock().unwrap() = Some(Instant::now() - super::HANDOVER_REPLAY_GRACE);
+        let request = crate::protocol::common_messages::PrivateKeyHandover {
+            id: "replayed".into(),
+            privkeys: vec![],
+        };
+        let protocol = crate::protocol::common_messages::ProtocolVersion::Taproot;
+        let response =
+            crate::protocol::common_messages::MakerToTakerMessage::TaprootPrivateKeyHandover(
+                request.clone(),
+            );
+        maker
+            .cache_completed_handover(protocol, request.clone(), &response)
+            .unwrap();
+        assert!(maker
+            .replay_completed_handover(protocol, &request)
+            .unwrap()
+            .is_some());
+        maker.start_drain();
+        maker.stop_if_drained().unwrap();
+        assert!(!maker.shutdown.load(Ordering::SeqCst));
     }
 
     /// A taker that lost its handover reply retries after a settled swap. The
