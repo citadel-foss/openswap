@@ -255,7 +255,9 @@ openswap taker::offers::tests::suppression_state_round_trips_and_missing_map_def
 openswap taker::offers::tests::sync_removes_cached_fidelity_without_exact_registry_match
 openswap taker::offers::tests::timed_sync_uses_current_book_when_ack_is_missing
 openswap taker::payment::tests::confiscatory_fee_schedule_is_rejected
+openswap taker::payment::tests::downstream_max_size_is_checked_on_the_hop_amount
 openswap taker::payment::tests::dust_floor_scales_with_the_declared_tx_count
+openswap taker::payment::tests::floor_replay_bounds_downstream_hop_amounts
 openswap taker::payment::tests::hop_solve_round_trips_exactly
 openswap taker::payment::tests::route_solve_matches_forward_replay
 openswap taker::payment::tests::settlement_outputs_refuse_what_dust_cannot_absorb
