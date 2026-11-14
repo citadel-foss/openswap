@@ -859,6 +859,9 @@ pub struct MakerServer {
     pub shutdown: ShutdownSignal,
     /// Is setup complete flag.
     pub is_setup_complete: AtomicBool,
+    /// A test boolean flag to check the established happens-before relationship.
+    #[cfg(feature = "integration-test")]
+    pub is_maker_setup_actually_complete: AtomicBool,
     /// Highest fidelity proof.
     pub highest_fidelity_proof: RwLock<Option<FidelityProof>>,
     /// Ongoing swap states by swap_id.
@@ -1128,6 +1131,8 @@ impl MakerServer {
             backend,
             shutdown,
             is_setup_complete: AtomicBool::new(false),
+            #[cfg(feature = "integration-test")]
+            is_maker_setup_actually_complete: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
             funding_claims: Mutex::new(()),
@@ -4118,6 +4123,8 @@ pub(crate) mod tests {
             wallet: Arc::new(RwLock::new(wallet)),
             shutdown,
             is_setup_complete: AtomicBool::new(false),
+            #[cfg(feature = "integration-test")]
+            is_maker_setup_actually_complete: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
             funding_claims: Mutex::new(()),
