@@ -443,6 +443,8 @@ openswap wallet::blockchain::electrum::tests::a_transport_failure_leaves_every_s
 openswap wallet::blockchain::electrum::tests::accumulated_total_above_max_money_errors
 openswap wallet::blockchain::electrum::tests::an_unanswered_subscribe_recycles_at_once_during_a_refusal_backoff
 openswap wallet::blockchain::electrum::tests::an_unreachable_history_read_stops_the_script_walk
+openswap wallet::blockchain::electrum::tests::an_unreadable_header_notification_rereads_the_tip
+openswap wallet::blockchain::electrum::tests::an_unreadable_script_notification_drops_cached_coins
 openswap wallet::blockchain::electrum::tests::an_unsubscribe_recycles_the_connection_during_a_refusal_backoff
 openswap wallet::blockchain::electrum::tests::blind_watch_logs_count_shared_outpoints_and_global_rearm
 openswap wallet::blockchain::electrum::tests::cached_transaction_does_not_hide_server_eviction
@@ -452,6 +454,7 @@ openswap wallet::blockchain::electrum::tests::endpoint_credentials_are_omitted_f
 openswap wallet::blockchain::electrum::tests::estimate_feerate_converts_btc_per_kvb_and_rejects_no_estimate
 openswap wallet::blockchain::electrum::tests::history_warnings_reset_after_recovery_and_unsubscription
 openswap wallet::blockchain::electrum::tests::mined_height_above_the_tip_errors
+openswap wallet::blockchain::electrum::tests::not_subscribed_is_terminal
 openswap wallet::blockchain::electrum::tests::onion_without_proxy_is_rejected_before_connecting
 openswap wallet::blockchain::electrum::tests::only_the_unknown_txid_protocol_error_reads_as_absent
 openswap wallet::blockchain::electrum::tests::other_scripts_subscribe_while_one_is_refused
@@ -470,6 +473,7 @@ openswap wallet::blockchain::electrum::tests::spend_check_finds_the_spend_past_a
 openswap wallet::blockchain::electrum::tests::spend_check_ignores_unfetchable_txs_that_cannot_spend
 openswap wallet::blockchain::electrum::tests::terminal_errors_are_not_retried
 openswap wallet::blockchain::electrum::tests::unreachable_error_names_the_attempt_count
+openswap wallet::blockchain::electrum::tests::unreachable_keeps_root_cause
 openswap wallet::blockchain::electrum::tests::unspent_height_minus_one_deserializes_as_unconfirmed
 openswap wallet::blockchain::electrum::tests::unwatch_avoids_upstream_unsubscribe_and_allows_rewatch
 openswap wallet::blockchain::electrum::tests::url_host_strips_scheme_and_port

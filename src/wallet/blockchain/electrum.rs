@@ -8,6 +8,7 @@
 //! locking is handled wallet-side, not here.
 
 use std::{
+    borrow::Borrow,
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -32,8 +33,8 @@ use bitcoind::bitcoincore_rpc::json::{
     ListTransactionResult, ListUnspentResultEntry, WalletTxInfo,
 };
 use electrum_client::{
-    Batch, Client as ElectrumClient, Config as ClientConfig, ConfigBuilder, ElectrumApi,
-    GetHistoryRes, Param, Socks5Config, ToElectrumScriptHash,
+    Batch, ClientType, Config as ClientConfig, ConfigBuilder, ElectrumApi, GetHistoryRes,
+    HeaderNotification, Param, ScriptStatus, ServerFeaturesRes, Socks5Config, ToElectrumScriptHash,
 };
 use serde_json::{json, Value};
 
@@ -155,20 +156,135 @@ fn derive_timeout_secs(cfg: &ElectrumConfig) -> u8 {
 }
 
 /// Build the `electrum_client` config from ours.
-///
-/// `retry(0)` is deliberate. The client's own retry rebuilds the connection and
-/// then returns `Ok`, hiding the fact that every server-side script
-/// subscription was dropped — which leaves the watchtower deaf. Reconnection is
-/// handled by [`Electrum::call`] instead, which knows what to re-arm.
 fn client_config(cfg: &ElectrumConfig) -> ClientConfig {
     let is_onion = url_host(&cfg.url).ends_with(".onion");
     ConfigBuilder::new()
         .socks5(cfg.socks5.as_deref().map(Socks5Config::new))
         .timeout(Some(derive_timeout_secs(cfg)))
-        .retry(0)
         // A hidden-service name has no certificate to validate against.
         .validate_domain(!is_onion)
         .build()
+}
+
+/// One Electrum connection, used without `electrum_client::Client`'s retry
+/// wrapper.
+///
+/// That wrapper's retry rebuilds the connection and then returns `Ok`, hiding
+/// that every server-side script subscription was dropped. With `retry(0)` it
+/// instead replaces every error except `Protocol` and `AlreadySubscribed` with
+/// an empty `AllAttemptsErrored`, so the root cause is lost. Reconnection is
+/// handled by [`Electrum::call`], which knows what to re-arm.
+struct ElectrumClient(ClientType);
+
+macro_rules! raw {
+    ($client:expr, $method:ident($($arg:expr),*)) => {
+        match &$client.0 {
+            ClientType::TCP(c) => c.$method($($arg),*),
+            ClientType::SSL(c) => c.$method($($arg),*),
+            ClientType::Socks5(c) => c.$method($($arg),*),
+        }
+    };
+}
+
+impl ElectrumClient {
+    fn from_config(url: &str, config: ClientConfig) -> Result<Self, electrum_client::Error> {
+        ClientType::from_config(url, &config).map(Self)
+    }
+
+    fn raw_call(
+        &self,
+        method: &str,
+        params: impl IntoIterator<Item = Param>,
+    ) -> Result<Value, electrum_client::Error> {
+        raw!(self, raw_call(method, params))
+    }
+
+    fn batch_call(&self, batch: &Batch) -> Result<Vec<Value>, electrum_client::Error> {
+        raw!(self, batch_call(batch))
+    }
+
+    fn server_features(&self) -> Result<ServerFeaturesRes, electrum_client::Error> {
+        raw!(self, server_features())
+    }
+
+    fn ping(&self) -> Result<(), electrum_client::Error> {
+        raw!(self, ping())
+    }
+
+    fn block_header(&self, height: usize) -> Result<Header, electrum_client::Error> {
+        raw!(self, block_header(height))
+    }
+
+    fn block_headers_subscribe(&self) -> Result<HeaderNotification, electrum_client::Error> {
+        raw!(self, block_headers_subscribe())
+    }
+
+    fn block_headers_pop(&self) -> Result<Option<HeaderNotification>, electrum_client::Error> {
+        raw!(self, block_headers_pop())
+    }
+
+    fn estimate_fee(&self, blocks: usize) -> Result<f64, electrum_client::Error> {
+        raw!(self, estimate_fee(blocks))
+    }
+
+    fn script_subscribe(
+        &self,
+        script: &Script,
+    ) -> Result<Option<ScriptStatus>, electrum_client::Error> {
+        raw!(self, script_subscribe(script))
+    }
+
+    fn batch_script_subscribe<'s, I>(
+        &self,
+        scripts: I,
+    ) -> Result<Vec<Option<ScriptStatus>>, electrum_client::Error>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'s Script>,
+    {
+        raw!(self, batch_script_subscribe(scripts))
+    }
+
+    fn script_pop(&self, script: &Script) -> Result<Option<ScriptStatus>, electrum_client::Error> {
+        raw!(self, script_pop(script))
+    }
+
+    fn script_get_history(
+        &self,
+        script: &Script,
+    ) -> Result<Vec<GetHistoryRes>, electrum_client::Error> {
+        raw!(self, script_get_history(script))
+    }
+
+    fn batch_script_get_history<'s, I>(
+        &self,
+        scripts: I,
+    ) -> Result<Vec<Vec<GetHistoryRes>>, electrum_client::Error>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'s Script>,
+    {
+        raw!(self, batch_script_get_history(scripts))
+    }
+
+    fn transaction_get(&self, txid: &Txid) -> Result<Transaction, electrum_client::Error> {
+        raw!(self, transaction_get(txid))
+    }
+
+    fn batch_transaction_get<'t, I>(
+        &self,
+        txids: I,
+    ) -> Result<Vec<Transaction>, electrum_client::Error>
+    where
+        I: IntoIterator + Clone,
+        I::Item: Borrow<&'t Txid>,
+    {
+        raw!(self, batch_transaction_get(txids))
+    }
+
+    fn transaction_broadcast(&self, tx: &Transaction) -> Result<Txid, electrum_client::Error> {
+        raw!(self, transaction_broadcast(tx))
+    }
 }
 
 /// How long to wait before retry `attempt` (1-based): 1s, 2s, 4s, then capped.
@@ -190,6 +306,10 @@ fn refusal_backoff(refusals: u8) -> Duration {
 /// True for errors that mean the request was answered, not that the transport
 /// failed. Reconnecting cannot help these. `NotSubscribed` is included because
 /// it is local client state, and after a rebuild it means "re-arm", not "retry".
+/// An answer that does not decode as hex or a bitcoin type is terminal too. A
+/// JSON error never is: the client also raises one for a notification it could
+/// not decode while reading another reply, and only a reconnect re-reads what
+/// that notification carried.
 fn is_terminal(e: &electrum_client::Error) -> bool {
     !is_rate_limited(e)
         && matches!(
@@ -197,6 +317,9 @@ fn is_terminal(e: &electrum_client::Error) -> bool {
             electrum_client::Error::Protocol(_)
                 | electrum_client::Error::AlreadySubscribed(_)
                 | electrum_client::Error::NotSubscribed(_)
+                | electrum_client::Error::InvalidResponse(_)
+                | electrum_client::Error::Hex(_)
+                | electrum_client::Error::Bitcoin(_)
         )
 }
 
@@ -951,7 +1074,7 @@ impl Electrum {
 
     /// Run a backend call, reconnecting and retrying on transport failure.
     ///
-    /// The client is configured with `retry(0)`, so a dropped connection
+    /// [`ElectrumClient`] has no retry of its own, so a dropped connection
     /// surfaces here instead of being papered over. A rebuilt Tor circuit or a
     /// restarted server must not abort a swap, so we reconnect and retry up to
     /// `max_retries` times with a widening backoff before failing loudly.
@@ -2201,7 +2324,16 @@ impl Blockchain for Electrum {
         }
 
         // Header tip update.
-        let n = self.call(LOCAL, |c| c.block_headers_pop()).ok().flatten()?;
+        let n = match self.call(LOCAL, |c| c.block_headers_pop()) {
+            Ok(n) => n?,
+            // The client pops a header before decoding it, so one that fails is
+            // gone; the re-arm path re-subscribes and reads the tip again.
+            Err(e) => {
+                log::warn!("electrum header notification unreadable: {e:?}");
+                self.needs_rearm.store(true, Ordering::SeqCst);
+                return None;
+            }
+        };
         let height = n.height as i64;
         let hash = n.header.block_hash();
         if height == state.last_height && state.last_hash == Some(hash) {
@@ -2302,9 +2434,18 @@ pub(crate) mod tests {
         down: Arc<AtomicBool>,
         dropped: Arc<Mutex<Option<String>>>,
         tip: Arc<Mutex<(u64, String)>>,
+        notifications: Arc<Mutex<Vec<Value>>>,
     }
 
     impl MockElectrum {
+        /// Send a `method` notification with `params` ahead of the next reply.
+        pub(crate) fn notify(&self, method: &str, params: Value) {
+            self.notifications
+                .lock()
+                .unwrap()
+                .push(json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+        }
+
         /// The tip `blockchain.headers.subscribe` reports from now on.
         pub(crate) fn set_tip(&self, height: u64, header: &bitcoin::block::Header) {
             *self.tip.lock().unwrap() = (height, serialize_hex(header));
@@ -2345,10 +2486,12 @@ pub(crate) mod tests {
         let down = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(Mutex::new(None::<String>));
         let tip = Arc::new(Mutex::new((1, header_hex.clone())));
+        let notifications = Arc::new(Mutex::new(Vec::new()));
         let answer = Arc::new(answer);
         let (server_calls, server_hang_up, server_down) =
             (calls.clone(), hang_up.clone(), down.clone());
         let (server_dropped, server_tip) = (dropped.clone(), tip.clone());
+        let server_notifications = notifications.clone();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
             // Polled rather than blocking in accept, so going down can close
@@ -2382,7 +2525,7 @@ pub(crate) mod tests {
                 let (answer, calls) = (answer.clone(), server_calls.clone());
                 let (header_hex, hang_up) = (header_hex.clone(), server_hang_up.clone());
                 let (down, dropped) = (server_down.clone(), server_dropped.clone());
-                let tip = server_tip.clone();
+                let (tip, notifications) = (server_tip.clone(), server_notifications.clone());
                 thread::spawn(move || {
                     let mut writer = stream.try_clone().expect("clone electrum stream");
                     let mut reader = BufReader::new(stream);
@@ -2416,10 +2559,15 @@ pub(crate) mod tests {
                             Ok(result) => response["result"] = result,
                             Err(error) => response["error"] = error,
                         }
-                        if serde_json::to_writer(&mut writer, &response).is_err()
-                            || writer.write_all(b"\n").is_err()
-                            || writer.flush().is_err()
-                        {
+                        let queued = std::mem::take(&mut *notifications.lock().unwrap());
+                        for message in queued.iter().chain([&response]) {
+                            if serde_json::to_writer(&mut writer, message).is_err()
+                                || writer.write_all(b"\n").is_err()
+                            {
+                                return;
+                            }
+                        }
+                        if writer.flush().is_err() {
                             return;
                         }
                     }
@@ -2433,6 +2581,7 @@ pub(crate) mod tests {
             down,
             dropped,
             tip,
+            notifications,
         }
     }
 
@@ -2617,6 +2766,69 @@ pub(crate) mod tests {
         server.set_tip(2, &replacement);
         assert_eq!(tips(), [(2, serialize(&replacement.block_hash()))]);
         assert!(backend.may_have_missed(&script));
+    }
+
+    /// A script whose last mempool transaction is evicted gets a `null` status,
+    /// which the client fails to decode while reading another reply.
+    #[test]
+    fn an_unreadable_script_notification_drops_cached_coins() {
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let coins = Arc::new(Mutex::new(vec![json!({
+            "height": 0, "tx_hash": "11".repeat(32), "tx_pos": 0, "value": 1_000
+        })]));
+        let server = {
+            let coins = coins.clone();
+            mock_electrum(move |method, _params| match method {
+                "blockchain.scripthash.subscribe" => Ok(json!("aa".repeat(32))),
+                "blockchain.scripthash.listunspent" => Ok(json!(coins.lock().unwrap().clone())),
+                method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+            })
+        };
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 1,
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        backend.watch_script(&script, None);
+        assert_eq!(backend.list_unspent(None, None).unwrap().len(), 1);
+        assert_eq!(backend.list_unspent(None, None).unwrap().len(), 1);
+
+        coins.lock().unwrap().clear();
+        server.notify(
+            "blockchain.scripthash.subscribe",
+            json!([scripthash(&script), null]),
+        );
+        assert!(backend.list_unspent(None, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_header_notification_rereads_the_tip() {
+        let server = mock_electrum(|method, _params| {
+            Err(json!({ "code": -32601, "message": format!("unexpected {method}") }))
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 1,
+            poll_interval_secs: Some(0),
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        let mined = block_header(2);
+        server.set_tip(2, &mined);
+        server.notify(
+            "blockchain.headers.subscribe",
+            json!([{ "height": 2, "hex": "00" }]),
+        );
+        backend.call(PING, |c| c.ping()).expect("ping");
+
+        assert!(backend.poll_event().is_none(), "the bad header is dropped");
+        match backend.poll_event() {
+            Some(WatchEvent::BlockConnected(b)) => {
+                assert_eq!((b.height, b.hash), (2, serialize(&mined.block_hash())))
+            }
+            other => panic!("expected the tip, got {:?}", other),
+        }
     }
 
     /// Retries spent on a script's earlier subscription must not leave its
@@ -3297,6 +3509,8 @@ pub(crate) mod tests {
         refuse.store(false, Ordering::SeqCst);
         let reconnects = backend.reconnect_count();
         server.hang_up();
+        // The first poll meets the hang-up and rebuilds; the second re-arms there.
+        backend.poll_event();
         backend.poll_event();
         assert_eq!(backend.reconnect_count() - reconnects, 1, "no rebuild");
         assert!(backend.notifier.lock().unwrap().refusals.is_empty());
@@ -3869,6 +4083,11 @@ pub(crate) mod tests {
         assert!(is_terminal(&Error::NotSubscribed([0u8; 32].into())));
         // A transport-shaped error must stay retryable.
         assert!(!is_terminal(&Error::Message("socket closed".into())));
+        // A JSON error may come from a notification, so it is retried.
+        let bad_shape = serde_json::from_value::<u64>(json!("x")).unwrap_err();
+        assert!(!is_terminal(&Error::JSON(bad_shape)));
+        let eof = serde_json::from_str::<Value>("").unwrap_err();
+        assert!(!is_terminal(&Error::JSON(eof)));
     }
 
     #[test]
@@ -4158,5 +4377,90 @@ pub(crate) mod tests {
         assert!(msg.contains("unreachable"), "got: {}", msg);
         assert!(msg.contains('4'), "got: {}", msg);
         assert!(msg.contains("no route"), "got: {}", msg);
+    }
+
+    /// Mock server that runs the opening handshake on its first connection and
+    /// closes every connection after the next request. Returns its address and
+    /// the number of connections it accepted.
+    fn hang_up_after_handshake() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock electrum");
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = connections.clone();
+        let header_hex =
+            serialize_hex(&bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let first = accepted.fetch_add(1, Ordering::SeqCst) == 0;
+                let header_hex = header_hex.clone();
+                thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    if first {
+                        let features = read_request(&mut reader);
+                        serde_json::to_writer(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": features["id"],
+                                "error": { "code": -32601, "message": "method not found" }
+                            }),
+                        )
+                        .unwrap();
+                        writer.write_all(b"\n").unwrap();
+                        let genesis = read_request(&mut reader);
+                        write_result(&mut writer, &genesis, json!(header_hex));
+                        let subscribe = read_request(&mut reader);
+                        write_result(
+                            &mut writer,
+                            &subscribe,
+                            json!({ "height": 0, "hex": header_hex }),
+                        );
+                    }
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                });
+            }
+        });
+        (addr, connections)
+    }
+
+    #[test]
+    fn unreachable_keeps_root_cause() {
+        let (addr, connections) = hang_up_after_handshake();
+        let mut config = cfg(&format!("tcp://{addr}"), None);
+        config.max_retries = 1;
+        let backend = Electrum::new(&config).expect("connect to mock electrum");
+
+        match backend.get_block_count() {
+            Err(WalletError::ElectrumUnreachable { attempts, last }) => {
+                assert_eq!(attempts, 2);
+                assert!(
+                    matches!(&last, Error::JSON(e) if e.is_eof()),
+                    "expected the closed connection's EOF, got {:?}",
+                    last
+                );
+            }
+            other => panic!("expected ElectrumUnreachable, got {:?}", other),
+        }
+        assert_eq!(backend.reconnect_count(), 1);
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn not_subscribed_is_terminal() {
+        let (addr, connections) = hang_up_after_handshake();
+        let mut config = cfg(&format!("tcp://{addr}"), None);
+        config.max_retries = 1;
+        let backend = Electrum::new(&config).expect("connect to mock electrum");
+
+        let spk = ScriptBuf::new();
+        match backend.call(LOCAL, |c| c.script_pop(&spk)) {
+            Err(WalletError::Electrum(Error::NotSubscribed(_))) => {}
+            other => panic!("expected NotSubscribed, got {:?}", other),
+        }
+        assert_eq!(backend.reconnect_count(), 0);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 }
