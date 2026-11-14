@@ -1389,6 +1389,11 @@ impl MakerServer {
     pub fn setup_fidelity_bond(&self, maker_address: &str) -> Result<FidelityProof, MakerError> {
         use bitcoin::absolute::LockTime;
 
+        #[cfg(feature = "integration-test")]
+        if self.behavior == super::handlers::MakerBehavior::FailFidelitySetup {
+            return Err(MakerError::General("Test: fidelity bond setup failed"));
+        }
+
         // Adopt any bond that was broadcast but not yet confirmed (e.g. the
         // maker shut down while waiting for confirmation) before deciding
         // whether a new bond is needed.
@@ -1622,6 +1627,11 @@ impl MakerServer {
     /// Check if maker has enough liquidity for swaps.
     pub fn check_swap_liquidity(&self) -> Result<(), MakerError> {
         const SYNC_INTERVAL: Duration = Duration::from_secs(10);
+
+        #[cfg(feature = "integration-test")]
+        if self.behavior == super::handlers::MakerBehavior::FailSwapLiquidityCheck {
+            return Err(MakerError::General("Test: swap liquidity check failed"));
+        }
 
         let addr = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?

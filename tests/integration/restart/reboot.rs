@@ -38,6 +38,11 @@ pub(crate) enum Restart {
     WatcherDown,
     /// With fee settings no swap can pay, so it starts recovery-only.
     UnpriceableFees,
+    /// With fidelity bond setup failing, so it starts recovery-only.
+    BondSetupFails,
+    /// With its bond set up but the liquidity check failing, so it starts
+    /// recovery-only without announcing the bond.
+    LiquidityCheckFails,
 }
 
 /// Test: maker reboot recovery preserves funded Taproot swapcoins. Maker2 funds
@@ -111,6 +116,14 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart
     if restart == Restart::WatcherDown {
         restarted_server.behavior = MakerBehavior::StopWatcherOnStartup;
     }
+    if restart == Restart::BondSetupFails {
+        restarted_server.behavior = MakerBehavior::FailFidelitySetup;
+    }
+    if restart == Restart::LiquidityCheckFails {
+        restarted_server.behavior = MakerBehavior::FailSwapLiquidityCheck;
+    }
+    // Where the restarted maker's log lines begin.
+    let restart_mark = std::fs::metadata(world.taker_log_path()).map_or(0, |m| m.len()) as usize;
     world.adopt_makers([Arc::new(restarted_server)]);
     world.spawn_makers();
 
@@ -169,6 +182,16 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart
                 Duration::from_secs(120)
             );
         }
+        if matches!(
+            restart,
+            Restart::BondSetupFails | Restart::LiquidityCheckFails
+        ) {
+            wait_logged!(
+                world,
+                "recovery-only mode: not ready for new swaps",
+                Duration::from_secs(120)
+            );
+        }
         assert!(
             TcpStream::connect(("127.0.0.1", restarted.config.network_port)).is_err(),
             "recovery-only maker must not accept swap connections"
@@ -182,8 +205,21 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart
             Duration::from_secs(120)
         );
         assert!(!restarted.is_setup_complete.load(Relaxed));
+        let port = restarted.config.network_port;
         // The recovery-only maker exits on its own once recovery is done.
         world.join_makers();
+        if matches!(
+            restart,
+            Restart::BondSetupFails | Restart::LiquidityCheckFails
+        ) {
+            let log = std::fs::read_to_string(world.taker_log_path()).unwrap();
+            let since_restart = log.get(restart_mark..).unwrap_or_default();
+            let announcing = format!("[{}] Spawning nostr background task", port);
+            assert!(
+                !since_restart.contains(&announcing),
+                "a recovery-only maker must not announce its bond"
+            );
+        }
 
         let wallet = world.makers()[0].inner().wallet.read().unwrap();
         assert_eq!(
@@ -222,6 +258,37 @@ fn taproot_maker_reboot_preserves_funded_swapcoins(world: &mut World, params: Sw
 )]
 fn maker_restart_with_unpriceable_fees_still_recovers(world: &mut World, params: SwapParams) {
     run_reboot_recovery(world, params, Restart::UnpriceableFees);
+}
+
+/// Test: a maker whose fidelity bond setup fails on restart still recovers the
+/// funded swap it left behind. The failure comes after recovery has started,
+/// so failing startup would shut that recovery down; it serves recovery-only.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtPrivateKeyHandover],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn maker_restart_with_failing_bond_setup_still_recovers(world: &mut World, params: SwapParams) {
+    run_reboot_recovery(world, params, Restart::BondSetupFails);
+}
+
+/// Test: a maker whose bond is set up on restart but whose liquidity check
+/// fails still recovers its funded swap, and never announces the bond it
+/// cannot serve swaps for.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtPrivateKeyHandover],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), start_makers(120)],
+    swap(protocol = Taproot, sats = 500_000, makers = 2, tx_count = 3),
+)]
+fn maker_restart_with_failing_liquidity_check_still_recovers(
+    world: &mut World,
+    params: SwapParams,
+) {
+    run_reboot_recovery(world, params, Restart::LiquidityCheckFails);
 }
 
 /// Test: everyone in the route crashes with funding on chain, then each restarts

@@ -370,16 +370,27 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     let listener = listener.filter(|_| maker_address.is_some());
 
     // Only after recovery has started: the bond wait has no deadline, and
-    // contracts left from a previous run must not wait on it.
-    if let Some(maker_address) = maker_address.as_ref() {
-        log::info!(
-            "[{}] Setting up fidelity bond...",
-            maker.config.network_port
+    // contracts left from a previous run must not wait on it. Never fatal
+    // either, for the same reason as Tor above: a bond setting the wallet
+    // cannot use, or a backend error that outlasts its retries, would shut
+    // down the recovery already running. The maker runs recovery-only.
+    let (maker_address, setup_error) = match maker_address {
+        Some(maker_address) => match prepare_for_swaps(&maker, &maker_address) {
+            Ok(()) => (Some(maker_address), None),
+            Err(e) if e.is_shutdown() => return Err(e),
+            Err(e) => (None, Some(e)),
+        },
+        None => (None, None),
+    };
+    // Close the port before saying so: once this line is out, the maker must
+    // already refuse connections.
+    let listener = listener.filter(|_| maker_address.is_some());
+    if let Some(e) = setup_error {
+        log::error!(
+            "[{}] {:?}; recovery-only mode: not ready for new swaps, fix the cause and restart makerd to take swaps again",
+            maker.config.network_port,
+            e
         );
-        maker.setup_fidelity_bond(maker_address)?;
-        spawn_nostr_broadcast_thread(&maker)?;
-        log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
-        maker.check_swap_liquidity()?;
     }
 
     {
@@ -492,6 +503,21 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     }
 
     Ok(())
+}
+
+/// Sets up the fidelity bond and waits for swap liquidity, then announces the
+/// bond. Announced only once both are done: until then `serve` has not reached
+/// its accept loop, and a maker that fails here runs recovery-only and must
+/// not be advertised.
+fn prepare_for_swaps(maker: &Arc<MakerServer>, maker_address: &str) -> Result<(), MakerError> {
+    log::info!(
+        "[{}] Setting up fidelity bond...",
+        maker.config.network_port
+    );
+    maker.setup_fidelity_bond(maker_address)?;
+    log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
+    maker.check_swap_liquidity()?;
+    spawn_nostr_broadcast_thread(maker)
 }
 
 /// Stops the watcher, joins every thread that can touch the wallet, then saves it.
