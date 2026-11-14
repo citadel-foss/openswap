@@ -129,6 +129,14 @@ needs and how to write one.
 If you add, rename or remove a test, run `tests/check_test_names.sh --update`
 and commit the updated `tests/TESTS.golden`. CI fails when the two disagree.
 
+On Windows, CI keeps the Windows build check and runs the standard Legacy and
+Taproot swap scenarios with both Bitcoind and Electrum. The full integration
+suite remains covered by Linux CI. To run the same focused Windows tests
+locally, use `./scripts/test-integration-windows.ps1`; it keeps Cargo offline
+and needs local Bitcoin Core files plus `ELECTRS_EXEC` pointing to a local
+electrs executable. Pass `-Filter '<test-name>'` for a filtered run, or
+`-FullSuite` to opt into all tests.
+
 We also strongly recommend manually testing affected flows on **regtest** (e.g. standard_swap, multi-hop, failure cases).
 
 ## Pull Requests

@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, nightly]
         features: [default, integration-test]
 
@@ -31,14 +31,11 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.rust }}-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Set default toolchain
-        run: rustup default ${{ matrix.rust }}
-
-      - name: Set profile
-        run: rustup set profile minimal
-
-      - name: Update toolchain
-        run: rustup update
+      # Windows runners do not ship rustup. This action installs it on every OS.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
 
       - name: Build for OS
         run: cargo build --features=${{ matrix.features }}

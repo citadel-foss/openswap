@@ -236,7 +236,7 @@ fn a_sync_asks_only_about_changed_scripts(node: &mut Node) {
     let wait_for = |done: &dyn Fn(&[ListUnspentResultEntry]) -> bool| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let _ = node.electrsd().trigger();
+            node.electrsd().trigger();
             let (requests, utxos) = sync();
             if done(&utxos) {
                 return requests;
@@ -356,7 +356,7 @@ fn wait_for_tip(node: &Node, electrum: &Electrum) {
         every std::time::Duration::from_millis(200),
         format!("electrs to reach tip {}", expected),
         {
-            let _ = node.electrsd().trigger();
+            node.electrsd().trigger();
             electrum
                 .get_block_count()
                 .map(|tip| tip >= expected)

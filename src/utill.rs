@@ -1646,11 +1646,9 @@ pub fn interactive_select(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::TcpListener,
-        os::unix::fs::{symlink, PermissionsExt},
-        thread,
-    };
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::{net::TcpListener, thread};
 
     use bitcoin::{
         blockdata::{opcodes::all, script::Builder},
@@ -2383,13 +2381,19 @@ mod tests {
         let original = "# keep\r\n  port  =  1  \r\nfuture_key = [\"x\"]";
         fs::write(&path, original).unwrap();
         // An in-place write would change the bytes seen through this handle.
+        // Windows rejects `MoveFileExW` while any handle is open, even with
+        // delete sharing, so that proof stays off Windows.
+        #[cfg(not(windows))]
         let mut handle = fs::File::open(&path).unwrap();
         set_config_key(&path, "port", "1").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         set_config_key(&path, "port", "2").unwrap();
-        let mut previous = String::new();
-        handle.read_to_string(&mut previous).unwrap();
-        assert_eq!(previous, original);
+        #[cfg(not(windows))]
+        {
+            let mut previous = String::new();
+            handle.read_to_string(&mut previous).unwrap();
+            assert_eq!(previous, original);
+        }
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "# keep\r\nport = 2\r\nfuture_key = [\"x\"]"
@@ -2411,17 +2415,64 @@ mod tests {
         }
     }
 
+    /// Puts directory write permission back so the temp dir can be removed.
+    #[cfg(unix)]
+    struct RestoreDirectoryMode<'a>(&'a std::path::Path);
+
+    #[cfg(unix)]
+    impl Drop for RestoreDirectoryMode<'_> {
+        fn drop(&mut self) {
+            if let Ok(metadata) = fs::metadata(self.0) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = fs::set_permissions(self.0, perms);
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn compat_set_config_key_failed_write_keeps_original() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let original = "port = 1\nfuture_key = keep\n";
         fs::write(&path, original).unwrap();
-        fs::create_dir(path.with_extension("partial")).unwrap();
+        // Staging names are unique, so a leftover `*.partial` directory no
+        // longer blocks the write. A directory this process cannot create
+        // files in still does.
+        let _restore = RestoreDirectoryMode(dir.path());
+        let mut perms = fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(dir.path(), perms).unwrap();
+        // Root, or CAP_DAC_OVERRIDE, can still create the staging file.
+        // Skip the failure assert then; the bytes check below still runs.
+        if fs::File::create(dir.path().join(".write-probe")).is_err() {
+            assert!(set_config_key(&path, "port", "2").is_err());
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// Share read and write, but not delete, so `MoveFileExW` cannot replace
+    /// the destination. Unix covers the same failure with a non-writable parent.
+    #[cfg(windows)]
+    #[test]
+    fn compat_set_config_key_failed_replace_keeps_original() {
+        use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "port = 1\nfuture_key = keep\n";
+        fs::write(&path, original).unwrap();
+        let _guard = OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&path)
+            .unwrap();
         assert!(set_config_key(&path, "port", "2").is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
+    #[cfg(unix)]
     #[test]
     fn compat_set_config_key_preserves_permissions() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
@@ -2440,14 +2491,17 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn compat_atomic_write_creates_private_files() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let partial = path.with_extension("partial");
         for stale in [false, true] {
-            if stale {
+            if path.exists() {
                 fs::remove_file(&path).unwrap();
+            }
+            if stale {
                 fs::write(&partial, "stale").unwrap();
                 fs::set_permissions(&partial, fs::Permissions::from_mode(0o666)).unwrap();
             }
@@ -2457,10 +2511,20 @@ mod tests {
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
-            assert!(!partial.exists());
+            if stale {
+                // A predictable staging name is no longer opened, replaced, or removed.
+                assert_eq!(fs::read(&partial).unwrap(), b"stale");
+                assert_eq!(
+                    fs::metadata(&partial).unwrap().permissions().mode() & 0o777,
+                    0o666
+                );
+            } else {
+                assert!(!partial.exists());
+            }
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn compat_set_config_key_replaces_stale_files_and_symlinks() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
@@ -2468,6 +2532,9 @@ mod tests {
         let partial = path.with_extension("partial");
         let other = dir.path().join("other.toml");
         for linked in [false, true] {
+            // The writer no longer consumes `*.partial`, so the previous case
+            // would still be sitting there when this one creates a symlink.
+            let _ = fs::remove_file(&partial);
             fs::write(&path, "port = 1\nfuture_key = keep\n").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
             if linked {
@@ -2483,6 +2550,9 @@ mod tests {
             assert_eq!(previous, if linked { "unrelated" } else { "stale" });
             if linked {
                 assert_eq!(fs::read_to_string(&other).unwrap(), "unrelated");
+                assert!(partial.symlink_metadata().unwrap().file_type().is_symlink());
+            } else {
+                assert_eq!(fs::read(&partial).unwrap(), b"stale");
             }
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
@@ -2492,7 +2562,6 @@ mod tests {
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
-            assert!(!partial.exists());
         }
     }
 

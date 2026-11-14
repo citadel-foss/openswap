@@ -231,6 +231,7 @@ openswap taker::offers::tests::expired_bond_removes_its_suppression_record
 openswap taker::offers::tests::failed_offerbook_write_preserves_existing_file
 openswap taker::offers::tests::fidelity_candidate_transitions_enforce_one_live_bond
 openswap taker::offers::tests::groups_every_live_bond_claiming_an_address
+openswap taker::offers::tests::later_offerbook_write_replaces_existing_file
 openswap taker::offers::tests::legacy_candidate_fields_deserialize_and_backfill
 openswap taker::offers::tests::legacy_states_migrate_without_inventing_evidence
 openswap taker::offers::tests::maker_address_try_from_uses_strict_validation

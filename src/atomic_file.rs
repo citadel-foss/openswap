@@ -23,9 +23,7 @@ impl FileLock {
     /// would let another process lock a fresh inode under the same path while
     /// this one still holds the old one.
     pub(crate) fn acquire(lock_path: &Path) -> io::Result<Self> {
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        std::fs::create_dir_all(parent_dir(lock_path))?;
 
         let file = OpenOptions::new()
             .write(true)
@@ -46,6 +44,17 @@ impl FileLock {
     }
 }
 
+/// Directory that should contain `path`.
+///
+/// A relative file name such as `wallet.cbor` has an empty parent. Creating
+/// that empty path fails, so callers use `.` (the current directory) instead.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 pub(crate) fn read_json<T: DeserializeOwned + Default>(path: &Path) -> io::Result<T> {
     if !path.exists() {
         return Ok(T::default());
@@ -61,23 +70,31 @@ pub(crate) fn write_json_atomically<T: Serialize>(path: &Path, value: &T) -> io:
 }
 
 /// Replace `path` with `bytes` so a crash leaves either the old or the new file.
+///
+/// The bytes go to a uniquely named staging file in the same directory, then
+/// that file replaces `path`. A fixed `*.partial` name collides when two
+/// writers stage the same path. On Unix the containing directory is synced
+/// after the rename. On Windows the move uses `MOVEFILE_WRITE_THROUGH`, which
+/// does not return until the filesystem has flushed the replacement.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temporary_path = path.with_extension("partial");
+    let parent = parent_dir(path);
+    std::fs::create_dir_all(parent)?;
 
+    // `.tmp*` would also hide a real wallet named `.tmp-savings`. This prefix
+    // is reserved for the writer.
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".openswap-staging-")
+        .tempfile_in(parent)?;
     {
+        let temporary_file = temporary.as_file_mut();
         // Private from the first byte, and never a stale temp that keeps its old mode.
-        match std::fs::remove_file(&temporary_path) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = temporary_file.metadata()?.permissions();
+            permissions.set_mode(0o600);
+            temporary_file.set_permissions(permissions)?;
         }
-        let mut temporary_file = options.open(&temporary_path)?;
         // The rename would otherwise change the mode the user gave the file.
         if let Ok(existing) = std::fs::metadata(path) {
             temporary_file.set_permissions(existing.permissions())?;
@@ -85,29 +102,71 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
         temporary_file.write_all(bytes)?;
         temporary_file.sync_all()?;
     }
-
-    std::fs::rename(&temporary_path, path)?;
+    // Close the handle before the replace. Windows rejects a move of a file
+    // that this process still has open.
+    let temporary = temporary.into_temp_path();
+    replace_durable(&temporary, path)?;
 
     // Without a directory sync, a power loss can undo the rename after `Ok` returned.
     // A sync failure only leaves durability unconfirmed; the rename already happened.
+    // Windows cannot open a directory to sync it; `MOVEFILE_WRITE_THROUGH` covers that.
     #[cfg(unix)]
     {
-        let parent = path.parent().unwrap_or_else(|| Path::new(""));
-        let directory = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
-        if let Err(error) = File::open(directory).and_then(|dir| dir.sync_all()) {
+        if let Err(error) = File::open(parent).and_then(|dir| dir.sync_all()) {
             log::warn!(
                 "Could not sync {} after writing {}: {error}",
-                directory.display(),
+                parent.display(),
                 path.display()
             );
         }
     }
 
     Ok(())
+}
+
+/// Move `from` onto `to`, replacing `to` when it already exists.
+fn replace_durable(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::rename(from, to)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MoveFileExW(existing_name: *const u16, new_name: *const u16, flags: u32) -> i32;
+        }
+
+        fn wide(path: &Path) -> Vec<u16> {
+            path.as_os_str().encode_wide().chain(Some(0)).collect()
+        }
+
+        let from_wide = wide(from);
+        let to_wide = wide(to);
+        // SAFETY: both pointers address null-terminated buffers that live
+        // until this call returns.
+        let replaced = unsafe {
+            MoveFileExW(
+                from_wide.as_ptr(),
+                to_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if replaced == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::rename(from, to)
+    }
 }
 
 #[cfg(test)]
