@@ -340,6 +340,20 @@ enum Commands {
     /// and the phrase at hidden prompts, and accepts only the phrase that
     /// derives this wallet's key.
     AttachSeed,
+    /// List the swaps in this wallet, with the fees paid.
+    /// With --swap-id, show the full report of that swap.
+    ///
+    /// Works offline: it only reads the wallet file, so no backend or Tor is
+    /// needed. It asks for the wallet passphrase unless one is given.
+    ListSwaps {
+        /// Show only this swap, in full.
+        #[clap(long, short = 's')]
+        swap_id: Option<String>,
+        /// Most rows to list, newest first. The default is 100, the most 10000.
+        /// A swap can take two rows. The totals always cover every row.
+        #[clap(long, short = 'n')]
+        limit: Option<u32>,
+    },
     /// Verify the deniability proof for a specific swap.
     VerifyDeniability {
         /// The swap ID to verify.
@@ -376,6 +390,7 @@ impl Commands {
             | Commands::Restore { .. }
             | Commands::ShowSeed
             | Commands::AttachSeed
+            | Commands::ListSwaps { .. }
             | Commands::VerifyDeniability { .. } => false,
         }
     }
@@ -494,6 +509,7 @@ fn display_offer(
     ))
 }
 
+/// Runs the taker, and exits like SIGINT when a passphrase prompt is cancelled.
 fn main() -> Result<(), TakerError> {
     match run() {
         // Ctrl-C at a passphrase prompt: exit as SIGINT would.
@@ -505,6 +521,8 @@ fn main() -> Result<(), TakerError> {
     }
 }
 
+/// Parses the arguments and runs one command. Commands that only read the
+/// wallet file run before the backend and Tor are set up.
 fn run() -> Result<(), TakerError> {
     let mut args = Cli::parse();
     let mut wallet_password = args.password.take().map(Zeroizing::new);
@@ -548,6 +566,27 @@ fn run() -> Result<(), TakerError> {
     }
     if let Some(file) = &args.password_file {
         wallet_password = Some(openswap::utill::read_password_file(file)?);
+    }
+    // Offline too: the reports are in the wallet file.
+    if let Commands::ListSwaps { swap_id, limit } = &args.command {
+        let path = data_dir.join("wallets").join(&wallet_name);
+        if !path.exists() {
+            return Err(TakerError::General(format!("no wallet file at {path:?}")));
+        }
+        let password = match wallet_password {
+            Some(password) => password,
+            None => openswap::utill::prompt_password("Enter wallet passphrase: ".to_string())?,
+        };
+        println!(
+            "{}",
+            Wallet::swap_list_json_from_file(
+                &path,
+                password,
+                swap_id.as_deref(),
+                limit.map(|n| n as usize)
+            )?
+        );
+        return Ok(());
     }
     // Static settings live in the file (auto-created with defaults if missing).
     // Read it here, before the backend bakes the proxy address in, so a
@@ -1022,6 +1061,10 @@ fn run() -> Result<(), TakerError> {
             // Handled above before taker init
             unreachable!()
         }
+        Commands::ListSwaps { .. } => {
+            // Handled above before taker init
+            unreachable!()
+        }
         Commands::VerifyDeniability { swap_id } => match taker.verify_deniability(swap_id) {
             Ok(true) => println!("Proof valid: swap participated in a completed openswap"),
             Ok(false) => println!("Proof invalid or not found for this swap ID"),
@@ -1075,6 +1118,7 @@ mod tests {
             "list-utxo",
             "recover",
             "backup",
+            "list-swaps",
         ] {
             assert!(!needs(&[cmd]), "{} must not need Tor", cmd);
         }

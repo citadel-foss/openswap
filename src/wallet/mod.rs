@@ -37,8 +37,8 @@ pub(crate) use fidelity::{
     MIN_FIDELITY_TIMELOCK,
 };
 pub use report::{
-    MakerFeeInfo, MakerReport, PaymentResult, RecoveryReport, ReportUtxo, SwapRole, SwapStatus,
-    TakerReport,
+    MakerFeeInfo, MakerReport, PaymentResult, RecoveryReport, ReportUtxo, SwapHistory, SwapRole,
+    SwapStatus, SwapSummary, SwapTotals, TakerReport, DEFAULT_LISTED_SWAPS, MAX_LISTED_SWAPS,
 };
 pub use seed::SecretMnemonic;
 pub use spend::Destination;

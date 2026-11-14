@@ -73,6 +73,17 @@ enum Commands {
     ShowFidelity,
     /// Sync the Maker wallet with the current blockchain state.
     SyncWallet,
+    /// List the swaps this maker has done, with the fees earned.
+    /// With --swap-id, show the full report of that swap.
+    ListSwaps {
+        /// Show only this swap, in full.
+        #[arg(long, short = 's')]
+        swap_id: Option<String>,
+        /// Most rows to list, newest first. The default is 100, the most 10000.
+        /// A swap can take two rows. The totals always cover every row.
+        #[arg(long, short = 'n')]
+        limit: Option<u32>,
+    },
     /// Verify the deniability proof for a specific swap.
     VerifyDeniability {
         /// The swap ID to verify.
@@ -94,6 +105,7 @@ enum Commands {
     },
 }
 
+/// Reads the RPC cookie, connects to makerd and runs the chosen command.
 fn main() -> Result<(), MakerError> {
     let cli = App::parse();
     let data_dir = match cli.data_directory {
@@ -168,6 +180,9 @@ fn main() -> Result<(), MakerError> {
         Commands::SyncWallet => {
             send_rpc_req(stream, &rpc_cookie, RpcMsgReq::SyncWallet)?;
         }
+        Commands::ListSwaps { swap_id, limit } => {
+            send_rpc_req(stream, &rpc_cookie, RpcMsgReq::ListSwaps { swap_id, limit })?;
+        }
         Commands::VerifyDeniability { swap_id } => {
             send_rpc_req(
                 stream,
@@ -198,6 +213,8 @@ fn main() -> Result<(), MakerError> {
     Ok(())
 }
 
+/// Sends one request and prints the reply. An error reply goes to stderr and
+/// fails the command.
 fn send_rpc_req(
     mut stream: TcpStream,
     rpc_cookie: &str,

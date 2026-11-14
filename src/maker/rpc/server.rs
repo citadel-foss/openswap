@@ -155,6 +155,7 @@ struct RawRpcRequest {
     request: Value,
 }
 
+/// Checks the cookie, runs one RPC request against the maker and sends the reply.
 fn handle_request<M: MakerRpc>(
     maker: &Arc<M>,
     socket: &mut TcpStream,
@@ -311,6 +312,14 @@ fn handle_request<M: MakerRpc>(
         RpcMsgReq::VerifyDeniability { swap_id } => {
             match lock_debug!(maker.wallet().read())?.verify_deniability(&swap_id) {
                 Ok(valid) => RpcMsgResp::VerifyDeniabilityResp(valid),
+                Err(e) => RpcMsgResp::ServerError(e.to_string()),
+            }
+        }
+        RpcMsgReq::ListSwaps { swap_id, limit } => {
+            match lock_debug!(maker.wallet().read())?
+                .swap_list_json(swap_id.as_deref(), limit.map(|n| n as usize))
+            {
+                Ok(json) => RpcMsgResp::SwapList(json),
                 Err(e) => RpcMsgResp::ServerError(e.to_string()),
             }
         }
