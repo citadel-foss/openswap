@@ -2427,7 +2427,7 @@ pub(crate) mod tests {
         MakerAddress(format!("{label}.onion"))
     }
 
-    fn addr(_id: &str) -> MakerAddress {
+    pub(crate) fn addr(_id: &str) -> MakerAddress {
         #[cfg(not(feature = "integration-test"))]
         return onion_addr(_id);
         #[cfg(feature = "integration-test")]
@@ -2502,7 +2502,7 @@ pub(crate) mod tests {
         assert_eq!(addresses, ["c", "d", "a", "b"]);
     }
 
-    fn dummy_offer(maker_addr: &str) -> Offer {
+    pub(crate) fn dummy_offer(maker_addr: &str) -> Offer {
         let secp = Secp256k1::new();
         let secret_key = SecretKey::from_slice(&[1; 32]).expect("valid secret key");
         let secp_pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
