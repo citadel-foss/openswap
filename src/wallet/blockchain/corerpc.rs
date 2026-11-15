@@ -639,17 +639,10 @@ impl Blockchain for CoreRPC {
         script: &Script,
         depth: u64,
     ) -> Result<bool, WalletError> {
-        // Every answer must come from one chain: a block connected or
-        // disconnected between the queries could move the spend. Retried a
-        // few times, then reported unproven.
-        for _ in 0..3 {
-            let best = self.rpc.get_best_block_hash()?;
-            let buried = self.spend_buried_at(outpoint, script, depth, best)?;
-            if self.rpc.get_best_block_hash()? == best {
-                return Ok(buried);
-            }
-        }
-        Ok(false)
+        on_one_tip(
+            || Ok(self.rpc.get_best_block_hash()?),
+            |best| self.spend_buried_at(outpoint, script, depth, best),
+        )
     }
 
     fn get_raw_transaction(
@@ -953,6 +946,24 @@ fn list_wallet_dir(client: &Client) -> Result<Vec<String>, WalletError> {
     }
     let result: CallResult = client.call("listwalletdir", &[])?;
     Ok(result.wallets.into_iter().map(|n| n.name).collect())
+}
+
+/// Runs `check` against the tip `best` reports, and keeps its answer only if
+/// the tip is unchanged afterwards: a block connected or disconnected between
+/// the queries could move a spend. Retried a few times, then reported
+/// unproven (false).
+fn on_one_tip(
+    mut best: impl FnMut() -> Result<BlockHash, WalletError>,
+    mut check: impl FnMut(BlockHash) -> Result<bool, WalletError>,
+) -> Result<bool, WalletError> {
+    for _ in 0..3 {
+        let tip = best()?;
+        let answer = check(tip)?;
+        if best()? == tip {
+            return Ok(answer);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1713,5 +1724,33 @@ pub(crate) mod tests {
         );
         assert!(err.contains("Insufficient data"), "{}", err);
         server.join().unwrap();
+    }
+
+    /// A tip that moves during the check discards its answer: the check is
+    /// retried on the new tip, and a tip that keeps moving reads unproven.
+    #[test]
+    fn a_spend_is_proven_buried_only_on_one_tip() {
+        use bitcoin::hashes::Hash;
+        let hash = |n: u8| BlockHash::from_byte_array([n; 32]);
+        let run = |tips: &[u8]| {
+            let mut tips = tips.iter().map(|n| hash(*n));
+            let mut checked = Vec::new();
+            let answer = on_one_tip(
+                || Ok(tips.next().unwrap()),
+                |tip| {
+                    checked.push(tip);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            (answer, checked)
+        };
+        assert_eq!(run(&[1, 1]), (true, vec![hash(1)]));
+        // A reorg during the first check: the answer comes from the new tip.
+        assert_eq!(run(&[1, 2, 2, 2]), (true, vec![hash(1), hash(2)]));
+        assert_eq!(
+            run(&[1, 2, 3, 4, 5, 6]),
+            (false, vec![hash(1), hash(3), hash(5)])
+        );
     }
 }

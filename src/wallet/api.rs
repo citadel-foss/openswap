@@ -3564,6 +3564,8 @@ impl Wallet {
         };
 
         // 3. Validate manual selection: all outpoints must exist and stay within one pool.
+        //    `Wallet::select_replacement_coins` is the one caller that adds coins from the
+        //    other pool afterwards, so a replacement bond can still conflict a refused one.
         let manually_selected_outpoints =
             manually_selected_outpoints.filter(|outpoints| !outpoints.is_empty());
 
@@ -8651,16 +8653,14 @@ mod mempool_deferral_tests {
             bond_index: 1,
             ..unsent_bond(&tx(OutPoint::null(), 60_000, ScriptBuf::new()))
         };
-        let readonly = |on: bool| {
-            for target in [path.as_path(), temp_dir.path()] {
-                let mut perms = fs::metadata(target).unwrap().permissions();
-                perms.set_readonly(on);
-                fs::set_permissions(target, perms).unwrap();
-            }
-        };
-        readonly(true);
+        // A directory at the destination forces the atomic replacement to
+        // fail, even as root.
+        let saved = temp_dir.path().join("saved.cbor");
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
         let result = wallet.register_and_broadcast_bond(bond);
-        readonly(false);
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&saved, &path).unwrap();
         assert!(result.is_err());
         assert_eq!(chain.lock().unwrap().saved_at_send, vec![true]);
         assert_eq!(saved_bonds(&path), vec![txid]);
@@ -8945,6 +8945,18 @@ mod mempool_deferral_tests {
             bond(11, &[coin(10), pooled, shallow]),
             // Shares coin 2 with bond 0.
             bond(12, &[coin(2)]),
+            // No free coin, but our own bond 14 spends it, buried 6 deep.
+            bond(13, &[coin(30)]),
+            FidelityBond {
+                conf_height: Some(TIP as u32 - 5),
+                ..bond(14, &[coin(30)])
+            },
+            // As 13, but our bond 16 is only 5 deep.
+            bond(15, &[coin(31)]),
+            FidelityBond {
+                conf_height: Some(TIP as u32 - 4),
+                ..bond(16, &[coin(31)])
+            },
         ];
         // Bond 5 reached the backend after all.
         let known = bonds[5].tx.clone().unwrap();
@@ -9010,6 +9022,7 @@ mod mempool_deferral_tests {
         assert_eq!(plan(&[11]), spend(&[coin(10)]));
         assert_eq!(plan(&[3]), spend(&[coin(5)]));
         assert_eq!(plan(&[0, 5]), BondReplacement::Adopt(5));
+        assert_eq!(plan(&[0, 13]), spend(&[coin(1), coin(2)]));
         // Locked, reserved, needing both pools in one transaction, not listed
         // by the wallet yet, spent only in the mempool, of unknown origin,
         // spent in a block a reorg can undo, or spent by the server's word.
@@ -9023,6 +9036,7 @@ mod mempool_deferral_tests {
             &[0, 7],
             &[0, 8],
             &[0, 10],
+            &[0, 15],
         ] {
             assert!(
                 matches!(plan(refused), BondReplacement::Wait(_)),
@@ -9040,7 +9054,7 @@ mod mempool_deferral_tests {
         let url = start_electrum_stub(StubChain::with(&[]));
         let mut wallet = stub_wallet(&temp_dir.path().join("wallet.cbor"), electrum(&url));
         let coin = |seed: u8| OutPoint::new(Txid::from_byte_array([seed; 32]), 0);
-        for (seed, sats, swept) in [(1, 30_000, true), (2, 200_000, false)] {
+        for (seed, sats, swept) in [(1, 30_000, true), (2, 200_000, false), (3, 100_600, true)] {
             let entry = ListUnspentResultEntry {
                 txid: coin(seed).txid,
                 vout: 0,
@@ -9073,13 +9087,13 @@ mod mempool_deferral_tests {
             };
             wallet.store.utxo_cache.insert(coin(seed), (entry, spend));
         }
-        let select = |sats| {
+        let select = |wallet: &Wallet, sats, feerate, conflict| {
             let mut coins: Vec<OutPoint> = wallet
                 .select_replacement_coins(
                     Amount::from_sat(sats),
-                    2.0,
+                    feerate,
                     AddressType::P2TR,
-                    &[coin(1)],
+                    &[coin(conflict)],
                 )
                 .unwrap()
                 .iter()
@@ -9089,10 +9103,18 @@ mod mempool_deferral_tests {
             coins
         };
         // The swept coin alone covers a small bond.
-        assert_eq!(select(10_000), vec![coin(1)]);
+        let boundary = wallet.store.utxo_cache.remove(&coin(3)).unwrap();
+        assert_eq!(select(&wallet, 10_000, 2.0, 1), vec![coin(1)]);
         let mut both = vec![coin(1), coin(2)];
         both.sort();
-        assert_eq!(select(100_000), both);
+        assert_eq!(select(&wallet, 100_000, 2.0, 1), both);
+        // The conflict covers the bond and its own input's fee, but not the
+        // rest of the transaction.
+        wallet.store.utxo_cache.remove(&coin(1));
+        wallet.store.utxo_cache.insert(coin(3), boundary);
+        let mut both = vec![coin(3), coin(2)];
+        both.sort();
+        assert_eq!(select(&wallet, 100_000, 10.0, 3), both);
     }
 
     /// When the backend cannot say whether the bond went out, the record stays

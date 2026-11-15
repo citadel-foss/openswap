@@ -38,7 +38,7 @@ use crate::{
     wallet::{
         blockchain::BackendConnector,
         funding::{fit_declared_shape, net_policy_fees, SplitPlan},
-        min_contract_value_sats,
+        is_broadcast_refusal, min_contract_value_sats,
         seed_cli::WalletInUse,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, BondReplacement, CoreRpcConfig,
@@ -1632,11 +1632,12 @@ impl MakerServer {
                             if !self.wait_for_shutdown(SYNC_INTERVAL) {
                                 return Err(MakerError::Shutdown);
                             }
-                        } else if !refused_bonds.is_empty() {
+                        } else if !refused_bonds.is_empty() && is_broadcast_refusal(&e) {
                             // A refused bond may have confirmed after the coins
-                            // were picked, so the replacement conflicts with
-                            // it. Start over: setup adopts the bond, or waits on
-                            // or replaces the new one if its record was kept.
+                            // were picked, so the backend refused the
+                            // replacement as a conflict. Start over: setup
+                            // adopts the bond, or replaces the new one. Other
+                            // errors stop setup, as without refused bonds.
                             log::warn!(
                                 "[{}] Fidelity bond creation failed: {:?}. Checking the refused bonds again in {} secs",
                                 self.config.network_port,

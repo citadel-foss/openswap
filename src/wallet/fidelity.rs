@@ -587,6 +587,11 @@ fn is_server_fault(code: Option<i64>) -> bool {
     matches!(code, Some(-32603 | -32099..=-32000))
 }
 
+/// Whether `error` is the backend refusing a broadcast, not a fault.
+pub(crate) fn is_broadcast_refusal(error: &WalletError) -> bool {
+    broadcast_refusal(error).is_some()
+}
+
 fn broadcast_refusal(error: &WalletError) -> Option<BroadcastRefusal> {
     let refusal = match error {
         WalletError::Rpc(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(e))) => {
@@ -909,6 +914,11 @@ impl Wallet {
     /// swap coins. When the conflicts are in a pool that cannot fund the bond,
     /// such as swept coins while new deposits land as seed coins, the rest is
     /// selected from all other coins instead, so a deposit can still fund it.
+    ///
+    /// That top-up deliberately breaks the one-pool rule, linking swept swap
+    /// coins to seed coins on chain: the new bond must conflict with the
+    /// refused one, or both can confirm, and a deposit only ever lands as a
+    /// seed coin. It is the only such exception and is logged at warn.
     pub(super) fn select_replacement_coins(
         &self,
         amount: Amount,
@@ -935,10 +945,12 @@ impl Wallet {
             .map(|(_, spend)| INPUT_BASE_WEIGHT + spend.estimate_witness_size() as u64)
             .sum();
         let forced_fee = (forced_weight as f64 / 4.0 * feerate).ceil() as u64;
-        let rest = (amount.to_sat() + forced_fee).saturating_sub(forced_value);
-        if rest == 0 {
-            return pinned;
-        }
+        // When the conflicts cover the bond, the transaction and output
+        // overhead is still missing: select for at least one sat so the top-up
+        // pays it.
+        let rest = (amount.to_sat() + forced_fee)
+            .saturating_sub(forced_value)
+            .max(1);
         let mut coins = self.coin_select(
             Amount::from_sat(rest),
             feerate,
@@ -946,8 +958,9 @@ impl Wallet {
             None,
             Some(conflicts.to_vec()),
         )?;
-        log::info!(
-            "Topping up the coins held by refused bonds with {} other coins",
+        log::warn!(
+            "Topping up the coins held by refused bonds with {} other coins; \
+             this transaction may mix swept swap coins with seed coins",
             coins.len()
         );
         coins.extend(forced);
@@ -967,15 +980,19 @@ impl Wallet {
     ///
     /// A bond with a free coin is always conflicted through it, whatever its
     /// other coins show. Only a bond with no free coin is looked up on chain:
-    /// it is dead, and needs no conflict, once the backend proves a spend of
-    /// one of its coins is `REFUSED_BOND_SPEND_DEPTH` (6) blocks deep on the
-    /// active chain (see [`Blockchain::is_spend_buried`]). A shallower or
+    /// it is dead, and needs no conflict, once one of the wallet's own bonds
+    /// spending one of its coins (such as its replacement) is confirmed
+    /// `REFUSED_BOND_SPEND_DEPTH` (6) blocks deep, or the backend proves a
+    /// spend of one of its coins is that deep on the active chain (see
+    /// [`Blockchain::is_spend_buried`]). A shallower or
     /// mempool spend, an unknown funding tx, or a spend the backend cannot
     /// prove, waits. So does an unspent coin the wallet
     /// does not list: the node wallet is told to abandon the refused tx, and
     /// the next sync lists the coin. When some bond's coins are all locked,
     /// reserved for a swap, or in the other coin pool (one transaction spends
-    /// from one pool), funding waits too.
+    /// from one pool), funding waits too. The conflicts of a funded plan are
+    /// from one pool, but [`Self::create_fidelity_replacing`] may top them up
+    /// from the other one when that pool cannot fund the bond.
     pub fn plan_bond_replacement(&self, refused: &[u32]) -> Result<BondReplacement, WalletError> {
         let locked = self.list_lock_unspent();
         let free = |pool: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>| -> HashSet<OutPoint> {
@@ -1006,7 +1023,25 @@ impl Wallet {
                 viable.push((bond.bond_index, inputs));
                 continue;
             }
-            // No free coin. One the wallet does not list is spent, or still
+            // No free coin. A bond of ours buried deep enough that spends one
+            // of its coins, such as its own replacement, proves it dead. The
+            // wallet already trusts its bonds' confirmation heights.
+            let tip = self.blockchain.get_block_count()?;
+            let replaced = self.store.fidelity_bond.iter().any(|other| {
+                other
+                    .conf_height
+                    .is_some_and(|height| tip + 1 >= u64::from(height) + REFUSED_BOND_SPEND_DEPTH)
+                    && other.tx.as_ref().is_some_and(|other_tx| {
+                        other_tx
+                            .input
+                            .iter()
+                            .any(|i| inputs.contains(&i.previous_output))
+                    })
+            });
+            if replaced {
+                continue;
+            }
+            // Otherwise a coin the wallet does not list is spent, or still
             // held by the node wallet for the refused tx: only the chain can
             // tell, and only a buried spend proves the bond can never confirm.
             let mut unlisted = false;
