@@ -755,6 +755,15 @@ pub trait Maker: Send + Sync {
         Err(MakerError::General("lightning swaps not supported"))
     }
 
+    /// Whether this specific transaction is confirmed. Kept for callers from
+    /// v0.2.3; the crate itself only calls [`Self::tx_confirmations`], so
+    /// overriding this method alone changes nothing the maker does.
+    #[cfg(feature = "lightning")]
+    #[deprecated(note = "use `tx_confirmations`, which also returns the depth")]
+    fn is_tx_confirmed(&self, txid: &bitcoin::Txid) -> Result<bool, MakerError> {
+        Ok(self.tx_confirmations(txid)?.is_some())
+    }
+
     /// Height of the block that confirmed this transaction, or `None` while
     /// it is unconfirmed or unknown. A failed query is an error, never `None`.
     ///

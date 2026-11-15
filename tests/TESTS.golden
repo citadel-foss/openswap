@@ -68,6 +68,7 @@ openswap maker::api::tests::breach_query_without_an_answer_is_an_error
 openswap maker::api::tests::compat_maker_reservations_and_readmission_use_saved_coins
 openswap maker::api::tests::electrum_refund_depth_ignores_a_height_from_before_a_reorg
 openswap maker::api::tests::init_rejects_zero_required_confirms
+openswap maker::api::tests::is_tx_confirmed_keeps_its_v0_2_3_answers
 openswap maker::api::tests::maker_config_checks_file_values
 openswap maker::api::tests::maker_config_debug_hides_wallet_password
 openswap maker::api::tests::maker_config_network_round_trips_only_once_confirmed

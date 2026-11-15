@@ -4181,6 +4181,79 @@ pub(crate) mod tests {
         );
     }
 
+    /// `is_tx_confirmed` shipped in v0.2.3 and is kept as a wrapper over
+    /// `tx_confirmations`. It must keep its old answers: true once mined,
+    /// false for a mempool or unknown transaction, and an error, not false,
+    /// when the backend fails.
+    #[cfg(feature = "lightning")]
+    #[test]
+    #[allow(deprecated)]
+    fn is_tx_confirmed_keeps_its_v0_2_3_answers() {
+        use crate::wallet::{blockchain::mock_electrum, AnyBlockchain, Electrum, ElectrumConfig};
+        use bitcoin::{consensus::encode::serialize_hex, TxIn, TxOut};
+        use serde_json::{json, Value};
+
+        let tx = |sats| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(sats),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let (mined, pending) = (tx(40_000), tx(41_000));
+        let (unknown, failing) = (tx(42_000).compute_txid(), tx(43_000).compute_txid());
+        let server = mock_electrum({
+            let (mined, pending) = (mined.clone(), pending.clone());
+            move |method, params| {
+                let txid = params[0].as_str().unwrap_or_default();
+                match method {
+                    "blockchain.transaction.get" if txid == mined.compute_txid().to_string() => {
+                        Ok(json!(serialize_hex(&mined)))
+                    }
+                    "blockchain.transaction.get" if txid == pending.compute_txid().to_string() => {
+                        Ok(json!(serialize_hex(&pending)))
+                    }
+                    "blockchain.transaction.get" if txid == unknown.to_string() => Err(
+                        json!({ "code": -32603, "message": "No such mempool or blockchain transaction" }),
+                    ),
+                    "blockchain.transaction.get" => {
+                        Err(json!({ "code": 1, "message": "daemon error" }))
+                    }
+                    "blockchain.scripthash.get_history" => Ok(json!([
+                        { "tx_hash": mined.compute_txid().to_string(), "height": 100 },
+                        { "tx_hash": pending.compute_txid().to_string(), "height": 0 }
+                    ])),
+                    _ => Ok(Value::Null),
+                }
+            }
+        });
+        let header = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        server.set_tip(105, &header);
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        maker.wallet.write().unwrap().blockchain = AnyBlockchain::Electrum(
+            Electrum::new(&ElectrumConfig {
+                url: server.url.clone(),
+                ..Default::default()
+            })
+            .expect("connect to mock electrum"),
+        );
+
+        assert_eq!(
+            maker.tx_confirmations(&mined.compute_txid()).unwrap(),
+            Some(6)
+        );
+        assert!(maker.is_tx_confirmed(&mined.compute_txid()).unwrap());
+        assert!(!maker.is_tx_confirmed(&pending.compute_txid()).unwrap());
+        assert!(!maker.is_tx_confirmed(&unknown).unwrap());
+        assert!(
+            maker.is_tx_confirmed(&failing).is_err(),
+            "a failed backend query read as unconfirmed"
+        );
+    }
+
     pub(crate) fn compat_test_maker(
         path: &Path,
         require_features: Vec<String>,
