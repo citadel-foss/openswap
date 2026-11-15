@@ -385,6 +385,7 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     }
 
     if listener.is_some() {
+        #[cfg(not(feature = "integration-test"))]
         maker.is_setup_complete.store(true, Relaxed);
         #[cfg(feature = "integration-test")]
         maker.is_setup_complete.store(true, Ordering::Release);
