@@ -2063,6 +2063,9 @@ impl Taker {
                 // The maker we picked from the offerbook must still own the
                 // same tweakable key, and must prove it for this channel. A
                 // spare carries no route offer, so its offerbook entry counts.
+                // A preferred maker never seen in the offerbook has no known
+                // key: it is trusted on first use, bound to the key in its own
+                // offer (as before BIP324).
                 let address = self.swap_state()?.makers[maker_idx].address.to_string();
                 if let Some(expected) = self.maker_identity(&address)? {
                     if offer.tweakable_point != expected {
@@ -2905,14 +2908,17 @@ impl Taker {
         address: &str,
         needed: &[String],
     ) -> Result<(Bip324Stream, Vec<String>), TakerError> {
+        let read_timeout = Duration::from_secs(MAKER_RESPONSE_TIMEOUT_SECS);
+        let deadline = Instant::now() + read_timeout;
         let mut stream = connect_to_maker(
             address,
             self.config.connection_type,
             self.config.socks_port,
-            Duration::from_secs(MAKER_RESPONSE_TIMEOUT_SECS),
+            read_timeout,
+            deadline,
             self.network,
         )?;
-        let features = handshake_with_maker(&mut stream, needed)?;
+        let features = handshake_with_maker(&mut stream, needed, Some(deadline))?;
         Ok((stream, features))
     }
 }
@@ -2920,9 +2926,12 @@ impl Taker {
 /// Exchange Hellos over a connected stream. The maker must list every name in
 /// `needed`. Returns the names it listed that this build recognizes; the rest
 /// mean nothing here. Free of `Taker` so background threads can reconnect.
+/// With a `deadline`, the maker's whole Hello must arrive before it; pass the
+/// one the BIP324 handshake used, so the two share a single budget.
 pub(crate) fn handshake_with_maker(
     stream: &mut Bip324Stream,
     needed: &[String],
+    deadline: Option<Instant>,
 ) -> Result<Vec<String>, TakerError> {
     let hello = Hello {
         features: supported().into_iter().map(String::from).collect(),
@@ -2930,7 +2939,7 @@ pub(crate) fn handshake_with_maker(
     };
     stream.send_message(&TakerToMakerMessage::Hello(hello))?;
 
-    let msg: MakerToTakerMessage = serde_cbor::from_slice(&stream.read_frame(None)?)?;
+    let msg: MakerToTakerMessage = serde_cbor::from_slice(&stream.read_frame(deadline)?)?;
     let features = match msg {
         MakerToTakerMessage::Hello(hello) => {
             stream.set_maker_session_sig(hello.session_id_sig);
@@ -2963,7 +2972,8 @@ pub(crate) fn handshake_with_maker(
     Ok(features)
 }
 
-/// Connect to a maker directly or through Tor and run the BIP324 handshake.
+/// Connect to a maker directly or through Tor and run the BIP324 handshake,
+/// which must finish before `deadline`. Later reads wait up to `read_timeout`.
 /// Free of `Taker` so background threads can reconnect on their own.
 // The integration-test build connects directly and reads neither knob.
 #[cfg_attr(feature = "integration-test", allow(unused_variables))]
@@ -2972,6 +2982,7 @@ pub(crate) fn connect_to_maker(
     connection_type: ConnectionType,
     socks_port: u16,
     read_timeout: Duration,
+    deadline: Instant,
     network: bitcoin::Network,
 ) -> Result<Bip324Stream, TakerError> {
     {
@@ -3004,12 +3015,12 @@ pub(crate) fn connect_to_maker(
             .map_err(|e| TakerError::General(format!("Failed to set socket timeout: {}", e)))?;
 
         // One absolute budget for the whole handshake, so a maker trickling
-        // bytes cannot keep it open past the read timeout.
+        // bytes cannot keep it open past the caller's deadline.
         Ok(Bip324Stream::new(
             socket,
             network,
             bip324::Role::Initiator,
-            Some(Instant::now() + read_timeout),
+            Some(deadline),
         )?)
     }
 }
@@ -3759,11 +3770,11 @@ impl Taker {
     /// offer sync first, so a refresh cannot restore the real key.
     #[cfg(feature = "integration-test")]
     pub fn test_set_offerbook_tweakable_point(
-        &mut self,
+        &self,
         address: &str,
         point: PublicKey,
     ) -> Result<bool, TakerError> {
-        self.offer_sync_handle.shutdown();
+        self.offer_sync_handle.stop_sync_for_test()?;
         self.offerbook.set_tweakable_point(address, point)
     }
 
@@ -4169,7 +4180,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let result = handshake_with_maker(&mut client, needed);
+        let result = handshake_with_maker(&mut client, needed, None);
         peer.join().unwrap();
         result
     }

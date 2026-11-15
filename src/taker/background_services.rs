@@ -562,15 +562,19 @@ impl HeartbeatPeer {
                 self.retry_in -= 1;
                 return;
             }
+            // One budget for connect, BIP324 and Hello: this thread serves
+            // every route maker, so one stalled peer must not hold it longer.
+            let deadline = std::time::Instant::now() + dial_timeout;
             match connect_to_maker(
                 &self.address,
                 dial.connection_type,
                 dial.socks_port,
                 dial_timeout,
+                deadline,
                 dial.network,
             )
             .and_then(|mut stream| {
-                handshake_with_maker(&mut stream, &self.needed)?;
+                handshake_with_maker(&mut stream, &self.needed, Some(deadline))?;
                 if let Some(identity) = &self.identity {
                     stream.authenticate(identity)?;
                 }
@@ -1065,6 +1069,46 @@ mod tests {
             elapsed
         );
         // The handshake read timed out, so no stream is kept and we back off.
+        assert!(peer.stream.is_none());
+        assert_eq!(peer.retry_in, RECONNECT_BACKOFF_MIN_TICKS);
+    }
+
+    /// A maker that completes BIP324 but sends only the first byte of its
+    /// Hello must not hold the heartbeat for a fresh packet-assembly window
+    /// (60s): the Hello shares the dial deadline with the BIP324 handshake.
+    #[test]
+    fn stall_mid_hello_is_bounded_by_the_dial_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let maker = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut stream = Bip324Stream::new(
+                socket,
+                bitcoin::Network::Regtest,
+                bip324::Role::Responder,
+                None,
+            )
+            .unwrap();
+            let _: TakerToMakerMessage = stream.read_message().unwrap();
+            stream.send_partial_for_test(1);
+            // Hold the connection open, mid-packet, until the taker gives up.
+            let _ = released.recv();
+        });
+
+        let dial_timeout = Duration::from_millis(500);
+        let mut peer = peer_on(&address);
+        let started = std::time::Instant::now();
+        peer.tick(&keepalive(), test_dial(), dial_timeout);
+        let elapsed = started.elapsed();
+        drop(release);
+        maker.join().unwrap();
+
+        assert!(
+            elapsed < dial_timeout * 4,
+            "a maker stalled mid-Hello held the heartbeat for {:?}",
+            elapsed
+        );
         assert!(peer.stream.is_none());
         assert_eq!(peer.retry_in, RECONNECT_BACKOFF_MIN_TICKS);
     }
