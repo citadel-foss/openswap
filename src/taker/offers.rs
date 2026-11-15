@@ -69,6 +69,10 @@ enum SyncCommand {
         address: MakerAddress,
         done: mpsc::Sender<Result<bool, TakerError>>,
     },
+    /// Test only: end the sync thread alone, without touching the shutdown
+    /// flag it shares with the rest of the taker. Acked once no sync runs.
+    #[cfg(feature = "integration-test")]
+    Stop(mpsc::Sender<()>),
 }
 
 #[cfg(not(feature = "integration-test"))]
@@ -709,6 +713,17 @@ impl OfferSyncClient {
 }
 
 impl OfferSyncHandle {
+    /// Test hook: stop offer synchronization only, leaving the taker's shared
+    /// shutdown flag (and so the watcher and backends) running. Returns once
+    /// no sync is in progress or will start.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn stop_sync_for_test(&self) -> Result<(), TakerError> {
+        let (done_tx, done_rx) = mpsc::channel();
+        self.cmd_tx.send(SyncCommand::Stop(done_tx))?;
+        done_rx.recv()?;
+        Ok(())
+    }
+
     /// Shutdown handler
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -1212,6 +1227,12 @@ impl OfferSyncService {
                                 let result = self.offerbook.remove(&address);
                                 let _ = done.send(result);
                             }
+                            #[cfg(feature = "integration-test")]
+                            Ok(SyncCommand::Stop(done)) => {
+                                log::info!("Offer sync stopped for a test");
+                                let _ = done.send(());
+                                return;
+                            }
                             Err(mpsc::TryRecvError::Empty) => {}
                             Err(mpsc::TryRecvError::Disconnected) => return,
                         }
@@ -1265,6 +1286,12 @@ impl OfferSyncService {
                 }
                 SyncCommand::RemoveMaker { address, done } => {
                     let _ = done.send(self.offerbook.remove(&address));
+                }
+                // Only the sleep loop can end the thread; ack so no caller
+                // hangs, the stop itself is lost (tests never queue one here).
+                #[cfg(feature = "integration-test")]
+                SyncCommand::Stop(done) => {
+                    let _ = done.send(());
                 }
             }
         }
@@ -2063,7 +2090,7 @@ impl MakerAddress {
             bip324::Role::Initiator,
             Some(handshake_deadline),
         )?;
-        let features = handshake_with_maker(&mut socket, &[])?;
+        let features = handshake_with_maker(&mut socket, &[], Some(handshake_deadline))?;
 
         // Send GetOffer
         let get_offer = RouterTakerToMakerMessage::GetOffer(RouterGetOffer);

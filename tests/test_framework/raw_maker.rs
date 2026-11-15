@@ -1,4 +1,4 @@
-//! A bare maker protocol client: one TCP connection, messages sent by hand.
+//! A bare maker protocol client: one BIP324 connection, messages sent by hand.
 //!
 //! The `Taker` API drives a whole swap and never keeps a connection past its
 //! turn. Tests that need an old connection held open, or a message the taker
@@ -6,7 +6,9 @@
 
 use std::{io::ErrorKind, net::TcpStream, time::Duration};
 
+use bitcoin::Network;
 use openswap::{
+    bip324_stream::{Bip324Error, Bip324Stream},
     error::NetError,
     protocol::{
         common_messages::{
@@ -15,7 +17,6 @@ use openswap::{
         },
         features::{choose_pins, supported},
     },
-    utill::{read_message, send_message},
 };
 
 /// Longer than any maker reply in a test, shorter than a hung test.
@@ -23,16 +24,18 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One raw connection to a maker.
 pub struct RawMakerConnection {
-    stream: TcpStream,
+    stream: Bip324Stream,
 }
 
 impl RawMakerConnection {
-    /// Opens a connection; nothing is sent yet.
+    /// Opens a connection and runs the BIP324 handshake; no message is sent yet.
     pub fn connect(address: &str) -> Self {
-        let stream = TcpStream::connect(address).expect("connect to maker");
-        stream
+        let socket = TcpStream::connect(address).expect("connect to maker");
+        socket
             .set_read_timeout(Some(REPLY_TIMEOUT))
             .expect("set read timeout");
+        let stream = Bip324Stream::new(socket, Network::Regtest, bip324::Role::Initiator, None)
+            .expect("BIP324 handshake with maker");
         Self { stream }
     }
 
@@ -47,6 +50,7 @@ impl RawMakerConnection {
         let mut conn = Self::connect(address);
         conn.send(&TakerToMakerMessage::Hello(Hello {
             features: supported().into_iter().map(String::from).collect(),
+            session_id_sig: None,
         }));
         let maker_features = match conn.recv() {
             Ok(MakerToTakerMessage::Hello(hello)) => hello.features,
@@ -69,14 +73,14 @@ impl RawMakerConnection {
 
     /// Sends one message.
     pub fn send(&mut self, message: &TakerToMakerMessage) {
-        send_message(&mut self.stream, message).expect("send to maker");
+        self.stream.send_message(message).expect("send to maker");
     }
 
     /// Panics unless the maker closed the connection: a reply, a decode
     /// error or a read timeout all mean it is still open.
     pub fn expect_closed(&mut self) {
         match self.recv() {
-            Err(NetError::ReachedEOF) => {}
+            Err(NetError::ReachedEOF | NetError::Bip324Error(Bip324Error::ConnectionClosed)) => {}
             Err(NetError::IO(e))
                 if matches!(
                     e.kind(),
@@ -94,7 +98,6 @@ impl RawMakerConnection {
     /// Reads one reply. An error means the maker closed the connection or
     /// did not answer in time.
     pub fn recv(&mut self) -> Result<MakerToTakerMessage, NetError> {
-        let bytes = read_message(&mut self.stream)?;
-        Ok(serde_cbor::from_slice(&bytes)?)
+        self.stream.read_message()
     }
 }

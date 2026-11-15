@@ -1,6 +1,6 @@
 //! BIP324 transport layer for OpenSwap's peer-to-peer communication.
 //!
-//! `Bip324Stream` runs the BIP324 handshake over a connected `TcpStream` and
+//! [`Bip324Stream`] runs the BIP324 handshake over a connected `TcpStream` and
 //! then carries one CBOR message per genuine BIP324 packet.
 //!
 //! Both the Taker (as BIP324 *initiator*) and the Maker (as BIP324 *responder*)
@@ -135,7 +135,7 @@ impl Read for DeadlineReader {
 /// An encrypted transport channel to a peer.
 ///
 /// Carries one CBOR-encoded message per genuine BIP324 packet.
-pub(crate) struct Bip324Stream {
+pub struct Bip324Stream {
     reader: ProtocolSessionReader<BufReader<DeadlineReader>>,
     writer: TcpStream,
     inbound: InboundCipher,
@@ -204,7 +204,7 @@ impl Bip324Stream {
     }
 
     /// Read the next genuine message and decode it as `T`.
-    pub(crate) fn read_message<T: DeserializeOwned>(&mut self) -> Result<T, NetError> {
+    pub fn read_message<T: DeserializeOwned>(&mut self) -> Result<T, NetError> {
         Ok(serde_cbor::from_slice(&self.read_frame(None)?)?)
     }
 
@@ -214,9 +214,9 @@ impl Bip324Stream {
     /// within the socket's idle read timeout; that timeout is returned as a
     /// plain `WouldBlock`/`TimedOut` IO error and leaves the stream usable.
     /// Once a packet has started, the rest of it must arrive within
-    /// [`MESSAGE_ASSEMBLY_TIMEOUT`] (and before `deadline`), or the read fails
+    /// `MESSAGE_ASSEMBLY_TIMEOUT` (60s, and before `deadline`), or the read fails
     /// with [`Bip324Error::ReadDeadlineExpired`].
-    pub(crate) fn read_frame(&mut self, deadline: Option<Instant>) -> Result<Vec<u8>, NetError> {
+    pub fn read_frame(&mut self, deadline: Option<Instant>) -> Result<Vec<u8>, NetError> {
         let result = self.read_frame_inner(deadline);
         self.set_deadline(None);
         result
@@ -224,10 +224,22 @@ impl Bip324Stream {
 
     fn read_frame_inner(&mut self, deadline: Option<Instant>) -> Result<Vec<u8>, NetError> {
         let started = Instant::now();
+        // Without a caller deadline, the idle wait is one absolute window, so
+        // a decoy resumes it rather than restarting it.
+        let idle_end = self.idle_timeout.map(|t| started + t);
         loop {
             let mut len_bytes = [0u8; NUM_LENGTH_BYTES];
-            self.set_deadline(deadline);
-            self.read_exact(&mut len_bytes[..1], true)?;
+            self.set_deadline(deadline.or(idle_end));
+            match self.read_exact(&mut len_bytes[..1], true) {
+                // The idle window ran out: the same retryable timeout a plain
+                // idle socket gives, not a fatal deadline.
+                Err(NetError::Bip324Error(Bip324Error::ReadDeadlineExpired))
+                    if deadline.is_none() =>
+                {
+                    return Err(NetError::IO(ErrorKind::TimedOut.into()));
+                }
+                result => result?,
+            }
 
             let assembly = Instant::now() + MESSAGE_ASSEMBLY_TIMEOUT;
             self.set_deadline(Some(deadline.map_or(assembly, |d| d.min(assembly))));
@@ -278,7 +290,7 @@ impl Bip324Stream {
     }
 
     /// Serialize a message to CBOR and send it as a genuine BIP324 packet.
-    pub(crate) fn send_message(&mut self, message: &impl Serialize) -> Result<(), NetError> {
+    pub fn send_message(&mut self, message: &impl Serialize) -> Result<(), NetError> {
         self.send_frame(&serde_cbor::ser::to_vec(message)?)
     }
 
@@ -361,8 +373,16 @@ pub(crate) fn loopback_session_id() -> SessionId {
     let socket = TcpStream::connect(addr).expect("connect loopback");
     let initiator = Bip324Stream::new(socket, Network::Regtest, bip324::Role::Initiator, None)
         .expect("loopback handshake");
-    let _ = responder.join();
-    *initiator.session_id()
+    let responder_id = responder
+        .join()
+        .expect("loopback responder panicked")
+        .expect("loopback responder handshake");
+    assert_eq!(
+        *initiator.session_id(),
+        responder_id,
+        "loopback session ids differ"
+    );
+    responder_id
 }
 
 #[cfg(test)]
@@ -485,6 +505,31 @@ mod tests {
         );
         assert!(started.elapsed() < idle * 3, "{:?}", started.elapsed());
         drop(maker);
+        writer.join().unwrap();
+    }
+
+    /// One decoy late in the idle window, then silence: the read must give up
+    /// when the window ends (300ms), not one full window after the decoy.
+    #[test]
+    fn a_late_decoy_does_not_restart_the_idle_window() {
+        let idle = Duration::from_millis(300);
+        let (mut taker, mut maker) = pair_with_maker_idle(Network::Regtest, Some(idle));
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            let packet = taker.outbound.encrypt_to_vec(&[], PacketType::Decoy, None);
+            taker.writer.write_all(&packet).unwrap();
+            // Keep the socket open past the window.
+            thread::sleep(Duration::from_millis(600));
+        });
+        let started = Instant::now();
+        let err = maker.read_frame(None).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&err, NetError::IO(e) if e.kind() == ErrorKind::TimedOut),
+            "{:?}",
+            err
+        );
+        assert!(elapsed < Duration::from_millis(450), "{:?}", elapsed);
         writer.join().unwrap();
     }
 

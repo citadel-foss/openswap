@@ -383,7 +383,9 @@ impl Taker {
             other => return Err(general(format!("expected Offer, got {other:?}"))),
         };
         // A maker from the verified offerbook must still present that offer's
-        // key; otherwise whoever answered could substitute its own.
+        // key; otherwise whoever answered could substitute its own. An
+        // explicit address not in the offerbook has no known key and is
+        // trusted on first use, bound to the key in its own offer.
         let known = self
             .offerbook
             .good_makers()?

@@ -198,8 +198,8 @@ fn spare_with_a_different_offerbook_key_is_refused(world: &mut World) {
     let other_key = bitcoin::secp256k1::SecretKey::from_slice(&[9; 32]).unwrap();
     let impostor_point = bitcoin::PublicKey::new(other_key.public_key(&secp));
     assert!(world
-        .taker_mut()
-        .inner_mut()
+        .taker()
+        .inner()
         .test_set_offerbook_tweakable_point(&spare, impostor_point)
         .unwrap());
 
