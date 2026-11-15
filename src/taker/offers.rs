@@ -1214,7 +1214,13 @@ impl OfferSyncService {
                                     log::warn!("Manual offer sync failed: {e:?}");
                                 }
                                 let _ = done_tx.send(());
-                                self.drain_and_ack(&cmd_rx);
+                                // A Stop queued behind this sync ends the
+                                // thread here, before any further sync runs.
+                                if let Some(stop) = self.drain_and_ack(&cmd_rx) {
+                                    log::info!("Offer sync stopped for a test");
+                                    let _ = stop.send(());
+                                    return;
+                                }
                                 break;
                             }
                             Ok(SyncCommand::PollMaker { address, done }) => {
@@ -1275,7 +1281,9 @@ impl OfferSyncService {
     }
 
     /// Coalesce queued sync requests, but execute polls and removals in order.
-    fn drain_and_ack(&self, rx: &mpsc::Receiver<SyncCommand>) {
+    /// A test `Stop` ends the drain unacked and is returned, so the caller can
+    /// end the service before acking it; commands behind it are not run.
+    fn drain_and_ack(&self, rx: &mpsc::Receiver<SyncCommand>) -> Option<mpsc::Sender<()>> {
         while let Ok(command) = rx.try_recv() {
             match command {
                 SyncCommand::SyncNow(done) => {
@@ -1287,14 +1295,11 @@ impl OfferSyncService {
                 SyncCommand::RemoveMaker { address, done } => {
                     let _ = done.send(self.offerbook.remove(&address));
                 }
-                // Only the sleep loop can end the thread; ack so no caller
-                // hangs, the stop itself is lost (tests never queue one here).
                 #[cfg(feature = "integration-test")]
-                SyncCommand::Stop(done) => {
-                    let _ = done.send(());
-                }
+                SyncCommand::Stop(done) => return Some(done),
             }
         }
+        None
     }
 }
 
@@ -3949,7 +3954,7 @@ pub(crate) mod tests {
             .unwrap();
         cmd_tx.send(SyncCommand::SyncNow(last_tx)).unwrap();
 
-        service.drain_and_ack(&cmd_rx);
+        assert!(service.drain_and_ack(&cmd_rx).is_none());
 
         sync_rx.try_recv().unwrap();
         assert_eq!(poll_rx.try_recv().unwrap().unwrap().address, address);
@@ -3960,6 +3965,49 @@ pub(crate) mod tests {
             .unwrap()
             .makers
             .is_empty());
+    }
+
+    /// A test `Stop` that arrives while a manual sync runs must not be acked
+    /// and dropped by the drain: the service would sync again afterwards and
+    /// could restore an offerbook entry the test has just changed.
+    #[cfg(feature = "integration-test")]
+    #[test]
+    fn stop_queued_behind_a_sync_is_handed_back_unacked() {
+        let dir = tempdir().unwrap();
+        let offerbook = OfferBookHandle::load_or_create(dir.path()).unwrap();
+        let config = CoreRpcConfig {
+            url: "127.0.0.1:0".into(),
+            ..CoreRpcConfig::default()
+        };
+        let service = OfferSyncService::new(
+            offerbook,
+            FileRegistry::new(),
+            0,
+            Network::Regtest,
+            Arc::new(AnyBlockchain::CoreRPC(CoreRPC::new(&config).unwrap())),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (before_tx, before_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (after_tx, after_rx) = mpsc::channel();
+        cmd_tx.send(SyncCommand::SyncNow(before_tx)).unwrap();
+        cmd_tx.send(SyncCommand::Stop(stop_tx)).unwrap();
+        cmd_tx.send(SyncCommand::SyncNow(after_tx)).unwrap();
+
+        let stop = service
+            .drain_and_ack(&cmd_rx)
+            .expect("the Stop is handed back to end the service");
+
+        before_rx.try_recv().unwrap();
+        // Not acked yet: the caller acks only once the loop is ending.
+        assert!(stop_rx.try_recv().is_err());
+        // Nothing behind the Stop runs, so no further sync is started.
+        assert!(after_rx.try_recv().is_err());
+        assert!(matches!(cmd_rx.try_recv(), Ok(SyncCommand::SyncNow(_))));
+        stop.send(()).unwrap();
+        stop_rx.try_recv().unwrap();
     }
 
     #[test]

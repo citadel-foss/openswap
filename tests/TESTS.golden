@@ -259,6 +259,7 @@ openswap taker::offers::tests::removal_reports_an_entry_removed_during_the_reque
 openswap taker::offers::tests::same_bond_discovery_cannot_bypass_cooldown
 openswap taker::offers::tests::spent_fidelity_removal_persists_and_can_be_restored_after_reorg
 openswap taker::offers::tests::stale_pruning_is_inclusive_and_uses_the_right_age_anchor
+openswap taker::offers::tests::stop_queued_behind_a_sync_is_handed_back_unacked
 openswap taker::offers::tests::suppression_carries_the_failure_run_back
 openswap taker::offers::tests::suppression_state_round_trips_and_missing_map_defaults
 openswap taker::offers::tests::sync_removes_cached_fidelity_without_exact_registry_match
