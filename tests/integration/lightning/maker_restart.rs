@@ -3239,9 +3239,11 @@ fn handler_records_confirmation_height(
         "the handler did not reach the payment: {}",
         result
     );
-    assert!(
-        ln.last_pay_cltv_bound().is_some(),
-        "the handler never tried to pay"
+    // Two blocks of the window are gone, and the route keeps its margin.
+    assert_eq!(
+        ln.last_pay_cltv_bound(),
+        Some(accepted.locktime as u32 - 2 - LN_CLTV_SAFETY_MARGIN),
+        "the route budget is not what the funding's age leaves of the window"
     );
     let paid = maker.get_ln_swap(&swap_id).unwrap().unwrap();
     assert_eq!(paid.phase, LnMakerPhase::InPaid);
@@ -3251,6 +3253,113 @@ fn handler_records_confirmation_height(
         Some(confirmed_at as u32),
         "the handler did not record the funding's confirmation height"
     );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
+/// The maker's route margin, `CLTV_SAFETY_MARGIN` in its handler.
+const LN_CLTV_SAFETY_MARGIN: u32 = 12;
+/// The least locktime a swap-in must have left to be paid,
+/// `MIN_REMAINING_LOCKTIME` in the maker's handler.
+const LN_MIN_REMAINING_LOCKTIME: u32 = 24;
+
+/// The chain moves on while the handler pauses to reread a missing funding
+/// height. The window it checks and the route budget it pays with must come
+/// from the tip after the pause, not from before it.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [FundingHeightLagsWhileChainMoves],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    cases = [
+        /// A few blocks pass: the payment's budget shrinks by exactly them.
+        swap_in_funded_handler_budgets_from_the_tip_after_a_reread(
+            preimage = Preimage([0xd8; 32]),
+            leave_too_little = false,
+        ),
+        /// Enough blocks pass to leave less than the minimum window: the
+        /// handler must refuse rather than pay against the earlier tip.
+        swap_in_funded_handler_refuses_when_the_window_closes_during_a_reread(
+            preimage = Preimage([0xd9; 32]),
+            leave_too_little = true,
+        ),
+    ],
+)]
+fn handler_rechecks_the_window_after_a_reread(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+    preimage: Preimage,
+    leave_too_little: bool,
+) {
+    let taker_ln = MockLightningBackend::new();
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+
+    let swap_id = preimage.payment_hash().to_string();
+    accept_swap_in(&maker, &taker_ln, &preimage);
+    let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    let value = accepted.amount + accepted.fee;
+    let funding = fund_htlc(bitcoind, &accepted);
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &funding.txid);
+    let locktime = accepted.locktime as u32;
+
+    let (result_tx, result_rx) = mpsc::channel();
+    let handler_maker = maker.clone();
+    let funded_id = swap_id.clone();
+    thread::spawn(move || {
+        let _ = result_tx.send(announce_funding(&handler_maker, &funded_id, funding, value));
+    });
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_millis(100),
+        "the handler to find the funding height missing",
+        maker.funding_height_lookups.load(Relaxed) >= 1
+    );
+    // One block short of the minimum window, or just a couple of blocks.
+    let age = if leave_too_little {
+        locktime - LN_MIN_REMAINING_LOCKTIME + 1
+    } else {
+        2
+    };
+    mine_to(bitcoind, confirmed_at + age as u64);
+    maker.funding_height_pause_released.store(true, Relaxed);
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the handler did not return after its pause");
+
+    if leave_too_little {
+        assert!(
+            result.contains("locktime blocks remain"),
+            "the handler did not refuse a window that closed during its pause: {}",
+            result
+        );
+        assert_eq!(
+            ln.last_pay_cltv_bound(),
+            None,
+            "the handler paid against the tip from before its pause"
+        );
+        assert!(
+            maker.get_ln_swap(&swap_id).unwrap().is_none(),
+            "a refused swap-in must be forgotten"
+        );
+    } else {
+        assert!(
+            result.contains("pay_invoice failed"),
+            "the handler did not reach the payment: {}",
+            result
+        );
+        assert_eq!(
+            ln.last_pay_cltv_bound(),
+            Some(locktime - age - LN_CLTV_SAFETY_MARGIN),
+            "the route budget ignores the blocks mined during the pause"
+        );
+    }
 
     framework.set_block_gen_paused(false);
     maker.shutdown.store(true, Relaxed);

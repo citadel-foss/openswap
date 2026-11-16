@@ -179,6 +179,11 @@ pub enum MakerBehavior {
     /// height with no height, and request shutdown inside the handler's pause
     /// before it reads again.
     ShutdownDuringFundingHeightPause,
+    /// Answer the first lookup of a Lightning HTLC funding's confirmation
+    /// height with no height, then hold the handler in its pause before the
+    /// reread until the test sets `funding_height_pause_released`, so the
+    /// test can move the chain on meanwhile.
+    FundingHeightLagsWhileChainMoves,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).

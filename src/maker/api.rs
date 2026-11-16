@@ -904,6 +904,9 @@ pub struct MakerServer {
     /// [`MakerBehavior::FundingHeightLagsOnce`].
     #[cfg(feature = "integration-test")]
     pub funding_height_lookups: std::sync::atomic::AtomicU32,
+    /// Ends the pause [`MakerBehavior::FundingHeightLagsWhileChainMoves`] holds.
+    #[cfg(feature = "integration-test")]
+    pub funding_height_pause_released: AtomicBool,
     /// Reserved by the framework at allocation; taken at server start so no
     /// parallel test can snipe the port in between.
     #[cfg(feature = "integration-test")]
@@ -1153,6 +1156,8 @@ impl MakerServer {
             behavior: MakerBehavior::default(),
             #[cfg(feature = "integration-test")]
             funding_height_lookups: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "integration-test")]
+            funding_height_pause_released: AtomicBool::new(false),
             #[cfg(feature = "integration-test")]
             reserved_network_listener: Mutex::new(None),
             #[cfg(feature = "integration-test")]
@@ -3823,6 +3828,7 @@ impl MakerTrait for MakerServer {
                 MakerBehavior::FundingHeightLagsOnce
                 | MakerBehavior::FundingReminedAtTip
                 | MakerBehavior::ShutdownDuringFundingHeightPause
+                | MakerBehavior::FundingHeightLagsWhileChainMoves
                     if earlier == 0 =>
                 {
                     return Ok(None)
@@ -3995,6 +4001,16 @@ impl MakerTrait for MakerServer {
         if self.behavior == MakerBehavior::ShutdownDuringFundingHeightPause {
             self.shutdown
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(feature = "integration-test")]
+        if self.behavior == MakerBehavior::FundingHeightLagsWhileChainMoves {
+            while !self
+                .funding_height_pause_released
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && !self.is_shutdown()
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
 }
@@ -4323,6 +4339,8 @@ pub(crate) mod tests {
             behavior: MakerBehavior::default(),
             #[cfg(feature = "integration-test")]
             funding_height_lookups: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "integration-test")]
+            funding_height_pause_released: AtomicBool::new(false),
             #[cfg(feature = "integration-test")]
             reserved_network_listener: Mutex::new(None),
             #[cfg(feature = "integration-test")]
