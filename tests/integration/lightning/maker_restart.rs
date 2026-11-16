@@ -378,7 +378,7 @@ fn lightning_maker_restart_refunds_unclaimed_swap_out(
 /// The maker's refund can leave the mempool while the watcher still has it
 /// on record as the HTLC's spend. Waiting for that spend to confirm would
 /// wait forever, so the watchdog sends the recorded refund again, and the
-/// swap closes, failing its held payment, only once the refund confirms.
+/// swap closes, failing its held payment, only once the refund is final.
 ///
 /// The eviction is real: unwinding the chain below the refund's CSV height
 /// makes bitcoind drop it as no longer final, and restoring the chain does
@@ -477,9 +477,9 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
     assert_eq!(swap.refund_txid, Some(refund_txid));
     assert!(in_mempool(&refund_txid));
 
-    // ---- Once it confirms, the swap closes and the payment fails back ----
-    generate_blocks(bitcoind, 1);
-    assert!(confirmations(bitcoind, &refund_txid) >= 1);
+    // ---- Once it is final, the swap closes and the payment fails back ----
+    generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
+    assert!(confirmations(bitcoind, &refund_txid) as u64 >= REFUND_FINALITY_DEPTH);
     wait_until!(
         Duration::from_secs(30),
         every Duration::from_millis(200),
@@ -525,7 +525,7 @@ fn switch_resets_on_panic() {
 
 /// A crash in the middle of the watchdog's refund, between recording it and
 /// broadcasting it, must leave a restarted maker able to finish it: send the
-/// refund, recognise it as its own, and close the swap once it confirms.
+/// refund, recognise it as its own, and close the swap once it is final.
 /// Broadcasting first could leave a refund that confirmed while the maker
 /// was down and that the restarted maker did not know was its own, so the
 /// swap never closed.
@@ -589,7 +589,7 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
 
     // ---- The restarted maker refunds and closes the swap ----
     ln_watchdog_tick_now(&maker);
-    generate_blocks(bitcoind, 1);
+    generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
     wait_until!(
         Duration::from_secs(30),
         every Duration::from_millis(200),
@@ -617,6 +617,280 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
             .collect::<Vec<_>>(),
         vec![funded.outpoint]
     );
+}
+
+/// Confirmations the maker's swap-out refund needs before the swap closes.
+/// Mirrors the maker's `REFUND_FINALITY_DEPTH`.
+const REFUND_FINALITY_DEPTH: u64 = 6;
+
+/// A refund with one confirmation can still be reorged out, and the taker's
+/// hashlock claim, which never expires, can confirm in its place. Failing the
+/// held payment then would leave the maker with neither side, and dropping
+/// the record would lose the only copy of the refund key. So the swap stays
+/// open, across a restart, while the refund is shallow, and when a reorg
+/// replaces it with the taker's claim the maker settles from its preimage.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_keeps_a_shallow_refund_through_a_reorg(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    use openswap::watch_tower::watcher::WatcherEvent;
+
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    let locktime: u16 = 30;
+    // The test mines every block itself, so it controls the refund's depth.
+    pause_block_generation(&framework);
+
+    let preimage = Preimage([0x90; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    let funded = fund_swap_out(
+        &maker,
+        &ln,
+        preimage.payment_hash(),
+        Amount::from_sat(40_000),
+        locktime,
+    );
+    generate_blocks(bitcoind, 1);
+    let funded_at = bitcoind.client.get_block_count().unwrap()
+        - confirmations(bitcoind, &funded.outpoint.txid) as u64
+        + 1;
+    mine_to(bitcoind, funded_at + locktime as u64 + 1);
+
+    // ---- The refund confirms once, and the watcher records it ----
+    ln_watchdog_tick_now(&maker);
+    let refund_txid = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .and_then(|swap| swap.refund_txid)
+        .expect("the watchdog broadcast a refund");
+    generate_blocks(bitcoind, 1);
+    assert_eq!(confirmations(bitcoind, &refund_txid), 1);
+    let refund_block = bitcoind.client.get_best_block_hash().unwrap();
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the watcher to record the refund",
+        matches!(
+            maker.watch_service.watch_request(funded.outpoint),
+            Ok(WatcherEvent::UtxoSpent { spending_tx: Some(tx), .. })
+                if tx.compute_txid() == refund_txid
+        )
+    );
+
+    // ---- One confirmation is not final: the swap stays open ----
+    let still_open = |maker: &Arc<MakerServer>, when: &str| {
+        let swap = maker
+            .get_ln_swap(&swap_id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("the maker closed the swap {}", when));
+        assert_eq!(swap.phase, LnMakerPhase::OutFunded);
+        assert_eq!(swap.refund_txid, Some(refund_txid));
+    };
+    ln_watchdog_tick_now(&maker);
+    still_open(&maker, "on a refund with one confirmation");
+
+    // ---- A restart keeps the shallow refund's record ----
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(maker);
+    world.drop_makers();
+    let mut restarted = MakerServer::init(config).expect("maker restarts");
+    restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
+    world.adopt_makers([Arc::new(restarted)]);
+    let maker = world.makers()[0].inner().clone();
+    ln_watchdog_tick_now(&maker);
+    still_open(&maker, "after a restart on a refund with one confirmation");
+
+    // ---- A reorg replaces the refund with the taker's claim ----
+    let swap = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    let (_, value) = swap.funding.expect("the swap is funded");
+    let destination = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap();
+    let claim = swap
+        .htlc
+        .create_hashlock_spend(
+            funded.outpoint,
+            value,
+            &SecretKey::from_slice(&[0x31; 32]).unwrap(),
+            &preimage,
+            destination.script_pubkey(),
+        )
+        .unwrap();
+    bitcoind.client.invalidate_block(&refund_block).unwrap();
+    // Mined directly: the disconnected refund is back in the mempool, and
+    // the block that confirms the claim evicts it.
+    bitcoind
+        .client
+        .call::<serde_json::Value>(
+            "generateblock",
+            &[
+                serde_json::json!(destination.to_string()),
+                serde_json::json!([bitcoin::consensus::encode::serialize_hex(&claim)]),
+            ],
+        )
+        .unwrap();
+    // Deep enough that the replaced block would count as final.
+    generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
+    assert!(confirmations(bitcoind, &claim.compute_txid()) >= 1);
+    // Core's txindex still names the replaced block for the refund, so its
+    // depth must come from the active chain, where it has none.
+    let refund_info = bitcoind
+        .client
+        .get_raw_transaction_info(&refund_txid, None)
+        .unwrap();
+    assert_eq!(refund_info.blockhash, Some(refund_block));
+    assert_eq!(refund_info.confirmations.unwrap_or(0), 0);
+    assert_eq!(
+        maker.tx_confirmations(&refund_txid).unwrap(),
+        None,
+        "the maker counted a reorged-out refund as confirmed"
+    );
+
+    // ---- The held payment was kept, so the claim's preimage settles it ----
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_millis(200),
+        "the maker to settle from the taker's claim",
+        {
+            ln_watchdog_tick_now(&maker);
+            maker.get_ln_swap(&swap_id).unwrap().is_none()
+        }
+    );
+    let mut released = None;
+    while let Some(event) = ln.poll_event().unwrap() {
+        if let LnEvent::PaymentSuccessful {
+            preimage: Some(preimage),
+            ..
+        } = event
+        {
+            released = Some(preimage);
+        }
+    }
+    assert_eq!(
+        released,
+        Some(preimage),
+        "the held payment must be settled with the claim's preimage"
+    );
+    framework.set_block_gen_paused(false);
+}
+
+/// A swap-out refund that has reached `REFUND_FINALITY_DEPTH` closes the
+/// swap and fails the held payment back; one block short of it does not.
+#[world_test(
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+    cases = [
+        lightning_maker_closes_a_refund_at_finality_depth(backend = BitcoindBackend),
+        /// Same on Electrum, where the maker counts the refund's depth from
+        /// its block height and the server's tip.
+        lightning_maker_closes_a_refund_at_finality_depth_on_electrum(backend = ElectrumBackend),
+    ],
+)]
+fn run_lightning_maker_closes_a_refund_at_finality_depth(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    use openswap::watch_tower::watcher::WatcherEvent;
+
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    let locktime: u16 = 30;
+    pause_block_generation(&framework);
+
+    let preimage = Preimage([0x91; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    let funded = fund_swap_out(
+        &maker,
+        &ln,
+        preimage.payment_hash(),
+        Amount::from_sat(40_000),
+        locktime,
+    );
+    generate_blocks(bitcoind, 1);
+    let funded_at = bitcoind.client.get_block_count().unwrap()
+        - confirmations(bitcoind, &funded.outpoint.txid) as u64
+        + 1;
+    mine_to(bitcoind, funded_at + locktime as u64 + 1);
+    // On Electrum the maker reads the chain through electrs. No-op on Core.
+    framework.wait_for_electrs_tip();
+
+    ln_watchdog_tick_now(&maker);
+    let refund_txid = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .and_then(|swap| swap.refund_txid)
+        .expect("the watchdog broadcast a refund");
+
+    // ---- One block short of final: still open, payment still held ----
+    generate_blocks(bitcoind, REFUND_FINALITY_DEPTH - 1);
+    assert_eq!(
+        confirmations(bitcoind, &refund_txid) as u64,
+        REFUND_FINALITY_DEPTH - 1
+    );
+    framework.wait_for_electrs_tip();
+    assert_eq!(
+        maker.tx_confirmations(&refund_txid).unwrap(),
+        Some(REFUND_FINALITY_DEPTH as u32 - 1),
+        "the maker's backend must see the refund one block short of final"
+    );
+    // Only once the watcher holds the refund does a pass reach the depth
+    // check; before that it waits on the unseen spend instead.
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the watcher to record the refund",
+        matches!(
+            maker.watch_service.watch_request(funded.outpoint),
+            Ok(WatcherEvent::UtxoSpent { spending_tx: Some(tx), .. })
+                if tx.compute_txid() == refund_txid
+        )
+    );
+    ln_watchdog_tick_now(&maker);
+    assert!(
+        maker.get_ln_swap(&swap_id).unwrap().is_some(),
+        "the maker closed the swap before its refund was final"
+    );
+
+    // ---- At the finality depth the swap closes ----
+    generate_blocks(bitcoind, 1);
+    framework.wait_for_electrs_tip();
+    assert_eq!(
+        maker.tx_confirmations(&refund_txid).unwrap(),
+        Some(REFUND_FINALITY_DEPTH as u32)
+    );
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the maker to close the refunded swap",
+        {
+            ln_watchdog_tick_now(&maker);
+            maker.get_ln_swap(&swap_id).unwrap().is_none()
+        }
+    );
+    assert!(
+        ln.claim_held_payment(&preimage).is_err(),
+        "the refunded swap's held payment must be failed back"
+    );
+    framework.set_block_gen_paused(false);
 }
 
 /// While a Core re-check after lost notifications is pending, the watcher
@@ -868,8 +1142,8 @@ fn lightning_maker_refunds_a_swap_out_stored_without_funding_height(
         vec![funded.outpoint]
     );
 
-    // ---- Once it confirms, the swap closes and the payment fails back ----
-    generate_blocks(bitcoind, 1);
+    // ---- Once it is final, the swap closes and the payment fails back ----
+    generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
     wait_until!(
         Duration::from_secs(30),
         every Duration::from_millis(200),

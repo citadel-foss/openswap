@@ -3755,18 +3755,45 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
-    fn is_tx_confirmed(&self, txid: &bitcoin::Txid) -> Result<bool, MakerError> {
+    fn tx_confirmations(&self, txid: &bitcoin::Txid) -> Result<Option<u32>, MakerError> {
         use crate::wallet::Blockchain;
-        // `tx_block_height` already distinguishes "not in a block" from a
-        // query failure, across both backends. Matching on an error string
-        // would not: Core reports an unknown transaction as -5 while
-        // Electrum reports it as a message under -32603.
-        let height = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // Core's txindex still serves a reorged-out transaction under the
+        // block that was replaced, so that block's height would keep counting
+        // a refund the chain no longer has. Its confirmation count is read
+        // from the active chain, and is 0 for such a transaction. An unknown
+        // txid (-5) is `None`; any other failure is an error.
+        if let AnyBlockchain::CoreRPC(core) = &wallet.blockchain {
+            return Ok(core
+                .tx_confirmations(txid)
+                .map_err(MakerError::Wallet)?
+                .filter(|&confirmations| confirmations > 0));
+        }
+        // Electrum answers from the server's active chain. The tip is read
+        // first: a new tip drops the cached script histories, so the height
+        // below is never older than the tip it is counted against. In the
+        // other order a reorg between the reads could pair a replaced
+        // refund's old height with the new tip. A block mined between the
+        // reads puts the height above the tip, which counts as one
+        // confirmation and only makes a caller wait longer.
+        let tip = wallet
+            .blockchain
+            .get_block_count()
+            .map_err(MakerError::Wallet)?;
+        // `tx_block_height` distinguishes "not in a block" from a query
+        // failure, which matching on an error string would not: Electrum
+        // reports an unknown transaction as a message under -32603.
+        let Some(height) = wallet
             .blockchain
             .tx_block_height(txid)
-            .map_err(MakerError::Wallet)?;
-        Ok(height.is_some())
+            .map_err(MakerError::Wallet)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            u32::try_from(tip.saturating_sub(height) + 1).unwrap_or(u32::MAX),
+        ))
     }
 
     #[cfg(feature = "lightning")]
@@ -4088,6 +4115,143 @@ pub(crate) mod tests {
             ..MakerServerConfig::default()
         };
         assert!(!format!("{config:?}").contains("wallet-secret"));
+    }
+
+    /// On Electrum a refund's height comes from a script history that is
+    /// cached for a few seconds. A reorg that drops the refund and moves the
+    /// tip to five blocks above it must not pair that cached height with the
+    /// new tip, which would count a refund the chain no longer has as six
+    /// blocks deep.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn electrum_refund_depth_ignores_a_height_from_before_a_reorg() {
+        use crate::wallet::{blockchain::mock_electrum, AnyBlockchain, Electrum, ElectrumConfig};
+        use bitcoin::{consensus::encode::serialize_hex, TxIn, TxOut};
+        use serde_json::{json, Value};
+
+        let refund = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let refund_txid = refund.compute_txid();
+        let reorged = Arc::new(AtomicBool::new(false));
+        let server = mock_electrum({
+            let reorged = reorged.clone();
+            let refund_hex = serialize_hex(&refund);
+            move |method, _| match method {
+                "blockchain.transaction.get" => Ok(json!(refund_hex)),
+                // Mined at 100, then gone from the chain that replaced it.
+                "blockchain.scripthash.get_history" if reorged.load(Ordering::SeqCst) => {
+                    Ok(json!([]))
+                }
+                "blockchain.scripthash.get_history" => Ok(json!([
+                    { "tx_hash": refund_txid.to_string(), "height": 100 }
+                ])),
+                _ => Ok(Value::Null),
+            }
+        });
+        let header = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        server.set_tip(100, &header);
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        maker.wallet.write().unwrap().blockchain = AnyBlockchain::Electrum(
+            Electrum::new(&ElectrumConfig {
+                url: server.url.clone(),
+                ..Default::default()
+            })
+            .expect("connect to mock electrum"),
+        );
+        assert_eq!(maker.tx_confirmations(&refund_txid).unwrap(), Some(1));
+
+        // Within the history cache's lifetime, a reorg replaces block 100
+        // and the new chain reaches 105.
+        let mut replacement = header;
+        replacement.nonce += 1;
+        server.set_tip(105, &replacement);
+        reorged.store(true, Ordering::SeqCst);
+        assert_eq!(
+            maker.tx_confirmations(&refund_txid).unwrap(),
+            None,
+            "a refund height read before the reorg was counted against the new tip"
+        );
+    }
+
+    /// `is_tx_confirmed` shipped in v0.2.3 and is kept as a wrapper over
+    /// `tx_confirmations`. It must keep its old answers: true once mined,
+    /// false for a mempool or unknown transaction, and an error, not false,
+    /// when the backend fails.
+    #[cfg(feature = "lightning")]
+    #[test]
+    #[allow(deprecated)]
+    fn is_tx_confirmed_keeps_its_v0_2_3_answers() {
+        use crate::wallet::{blockchain::mock_electrum, AnyBlockchain, Electrum, ElectrumConfig};
+        use bitcoin::{consensus::encode::serialize_hex, TxIn, TxOut};
+        use serde_json::{json, Value};
+
+        let tx = |sats| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                value: Amount::from_sat(sats),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let (mined, pending) = (tx(40_000), tx(41_000));
+        let (unknown, failing) = (tx(42_000).compute_txid(), tx(43_000).compute_txid());
+        let server = mock_electrum({
+            let (mined, pending) = (mined.clone(), pending.clone());
+            move |method, params| {
+                let txid = params[0].as_str().unwrap_or_default();
+                match method {
+                    "blockchain.transaction.get" if txid == mined.compute_txid().to_string() => {
+                        Ok(json!(serialize_hex(&mined)))
+                    }
+                    "blockchain.transaction.get" if txid == pending.compute_txid().to_string() => {
+                        Ok(json!(serialize_hex(&pending)))
+                    }
+                    "blockchain.transaction.get" if txid == unknown.to_string() => Err(
+                        json!({ "code": -32603, "message": "No such mempool or blockchain transaction" }),
+                    ),
+                    "blockchain.transaction.get" => {
+                        Err(json!({ "code": 1, "message": "daemon error" }))
+                    }
+                    "blockchain.scripthash.get_history" => Ok(json!([
+                        { "tx_hash": mined.compute_txid().to_string(), "height": 100 },
+                        { "tx_hash": pending.compute_txid().to_string(), "height": 0 }
+                    ])),
+                    _ => Ok(Value::Null),
+                }
+            }
+        });
+        let header = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        server.set_tip(105, &header);
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        maker.wallet.write().unwrap().blockchain = AnyBlockchain::Electrum(
+            Electrum::new(&ElectrumConfig {
+                url: server.url.clone(),
+                ..Default::default()
+            })
+            .expect("connect to mock electrum"),
+        );
+
+        assert_eq!(
+            maker.tx_confirmations(&mined.compute_txid()).unwrap(),
+            Some(6)
+        );
+        assert!(maker.is_tx_confirmed(&mined.compute_txid()).unwrap());
+        assert!(!maker.is_tx_confirmed(&pending.compute_txid()).unwrap());
+        assert!(!maker.is_tx_confirmed(&unknown).unwrap());
+        assert!(
+            maker.is_tx_confirmed(&failing).is_err(),
+            "a failed backend query read as unconfirmed"
+        );
     }
 
     pub(crate) fn compat_test_maker(
