@@ -2,7 +2,8 @@
 //! This test exercises the taker CLI commands: get-new-address, get-balances, list-utxo,
 //! and send-to-address, verifying correct wallet behavior through the command-line interface.
 
-use bitcoin::{address::NetworkChecked, Address, Amount};
+use bitcoin::{address::NetworkChecked, Address, Amount, Txid};
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::wallet::Wallet;
 use zeroize::Zeroizing;
 
@@ -10,7 +11,7 @@ use serde_json::{json, Value};
 use std::{
     fs,
     path::PathBuf,
-    process::Command,
+    process::{Command, Output},
     str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -33,8 +34,8 @@ impl<'n> TakerCli<'n> {
         }
     }
 
-    // Execute a cli-command
-    fn execute(&self, cmd: &[&str]) -> String {
+    /// Runs a cli-command and returns its raw result, failure included.
+    fn run(&self, cmd: &[&str]) -> Output {
         let mut args = vec!["--data-directory", self.data_dir.to_str().unwrap()];
 
         // RPC authentication (user:password) from the cookie file
@@ -62,10 +63,15 @@ impl<'n> TakerCli<'n> {
             args.push(arg);
         }
 
-        let output = Command::new(env!("CARGO_BIN_EXE_taker"))
+        Command::new(env!("CARGO_BIN_EXE_taker"))
             .args(args)
             .output()
-            .expect("Failed to execute taker");
+            .expect("Failed to execute taker")
+    }
+
+    // Execute a cli-command
+    fn execute(&self, cmd: &[&str]) -> String {
+        let output = self.run(cmd);
 
         // Capture the standard output and error from the command execution
         let mut value = output.stdout;
@@ -181,6 +187,88 @@ fn wallet_commands(node: &mut Node) {
     info!("Transfer verification successful");
 
     info!("Taker CLI test completed successfully!");
+}
+
+/// `send-to-address --max` empties the wallet in one output: the fee comes out
+/// of the total at the asked rate, and nothing is left or wasted on a change
+/// output that is never made.
+#[world_test(backend = BitcoindBackend)]
+fn send_to_address_max_sends_the_whole_balance(node: &mut Node) {
+    let taker_cli = TakerCli::new(node);
+    let bitcoind = node.bitcoind();
+
+    let funded = [
+        Amount::from_sat(50_000_000),
+        Amount::from_sat(30_000_000),
+        Amount::from_sat(7_654_321),
+    ];
+    for amount in funded.iter().copied() {
+        let address = taker_cli.execute(&["get-new-address"]);
+        let address: Address<NetworkChecked> =
+            Address::from_str(&address).unwrap().assume_checked();
+        send_to_address(bitcoind, &address, amount);
+    }
+    generate_blocks(bitcoind, 10);
+    let total: Amount = funded.iter().copied().sum();
+
+    let destination = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked();
+    let destination_str = destination.to_string();
+
+    // `--max` and `--amount` exclude each other, and one of them is needed.
+    for args in [vec!["-a", "1000", "--max"], Vec::new()] {
+        let mut cmd = vec!["send-to-address", "-t", destination_str.as_str()];
+        cmd.extend(args);
+        assert!(!taker_cli.run(&cmd).status.success(), "{:?}", cmd);
+    }
+    let balances = taker_cli.execute(&["get-balances"]);
+    let balances = serde_json::from_str::<Value>(&balances).unwrap();
+    assert_eq!(balances["spendable"], json!(total.to_sat()));
+
+    let output = taker_cli.run(&[
+        "send-to-address",
+        "-t",
+        &destination_str,
+        "--max",
+        "-f",
+        "2",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let txid = Txid::from_str(stdout.lines().last().unwrap().trim()).unwrap();
+    generate_blocks(bitcoind, 1);
+
+    let tx = bitcoind.client.get_raw_transaction(&txid, None).unwrap();
+    assert_eq!(tx.input.len(), 3, "every coin is spent");
+    assert_eq!(tx.output.len(), 1, "no change output");
+    assert_eq!(tx.output[0].script_pubkey, destination.script_pubkey());
+    let fee = total - tx.output[0].value;
+    let rate = fee.to_sat() as f64 / tx.vsize() as f64;
+    assert!(
+        (2.0..2.1).contains(&rate),
+        "the fee must be the asked 2 sat/vB on the real size, got {} ({} sats, {} vB)",
+        rate,
+        fee.to_sat(),
+        tx.vsize()
+    );
+
+    let balances = taker_cli.execute(&["get-balances"]);
+    let balances = serde_json::from_str::<Value>(&balances).unwrap();
+    assert_eq!(balances["spendable"], json!(0));
+    assert_eq!(balances["regular"], json!(0));
+
+    // Nothing is left to send.
+    let output = taker_cli.run(&["send-to-address", "-t", &destination_str, "--max"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("No spendable coins"), "{}", stderr);
 }
 
 /// `show-seed` is the only way to read the seed, so it must refuse a piped

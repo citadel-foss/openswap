@@ -374,6 +374,8 @@ openswap wallet::api::restore_history_probe_tests::seed_is_readable_after_taker_
 openswap wallet::api::restore_history_probe_tests::sync_does_not_enter_the_backend_after_shutdown
 openswap wallet::api::restore_history_probe_tests::v023_and_pre_port_backups_restore_to_marked_v2
 openswap wallet::api::restore_history_probe_tests::window_cap_and_old_core_are_not_retried
+openswap wallet::api::spendable_pool_tests::pools_keep_seed_and_swept_coins_apart
+openswap wallet::api::spendable_pool_tests::pools_leave_out_locked_reserved_and_excluded_coins
 openswap wallet::api::swap_reservation_tests::a_reservation_survives_a_wallet_reload
 openswap wallet::api::swap_reservation_tests::only_a_spendable_coin_no_swap_holds_can_be_claimed
 openswap wallet::api::timelock_reconcile_tests::cleanup_save_failure_preserves_coins_and_monotonic_flags
@@ -478,6 +480,8 @@ openswap wallet::blockchain::electrum::tests::url_host_strips_scheme_and_port
 openswap wallet::blockchain::tests::watcher_config_fails_fast_only_on_a_direct_link
 openswap wallet::blockchain::tests::watcher_config_keeps_an_explicit_timeout
 openswap wallet::error::tests::prompt_failed_keeps_only_a_cancelled_prompt
+openswap wallet::ffi::tests::a_sweep_of_an_empty_wallet_is_refused
+openswap wallet::ffi::tests::a_sweep_refuses_a_bad_address_and_unusable_fee_rates
 openswap wallet::ffi::tests::an_unset_rate_pays_exactly_the_relay_floor
 openswap wallet::ffi::tests::gui_seed_calls_need_the_password_every_time
 openswap wallet::ffi::tests::the_floor_and_the_default_clear_the_rate_check
@@ -699,8 +703,10 @@ openswap::bin/taker tests::only_market_commands_need_tor
 openswap::bin/taker tests::password_file_excludes_the_argv_password
 openswap::bin/taker tests::restore_needs_exactly_one_source
 openswap::bin/taker tests::restore_reads_options_and_keeps_wallet_name_unset
+openswap::bin/taker tests::send_to_address_takes_an_amount_or_max_not_both
 openswap::integration cli::maker::rpc_server
 openswap::integration cli::makerd::makerd_stops_cleanly_on_sigterm_and_sigint
+openswap::integration cli::taker::send_to_address_max_sends_the_whole_balance
 openswap::integration cli::taker::show_seed_refuses_pipes_and_argv_passwords
 openswap::integration cli::taker::taker_cli_shows_maker_states
 openswap::integration cli::taker::wallet_commands
