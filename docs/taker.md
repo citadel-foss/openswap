@@ -289,6 +289,26 @@ $ taker list-utxo-contract
 
 This lists all UTXOs that we need to claim via timelock. If you see entries in this list, you should run the `recover` command to claim them.
 
+### Send to an Address
+
+To pay an external address, give an amount in sats:
+
+```bash
+$ taker send-to-address --address <ADDRESS> --amount 100000 --feerate 2
+```
+
+The command opens a picker to choose the coins to spend. The fee is paid on top of the amount, and what is left comes back to the wallet as change.
+
+To send everything instead, use `--max` in place of `--amount`:
+
+```bash
+$ taker send-to-address --address <ADDRESS> --max --feerate 2
+```
+
+`--max` spends every regular coin in one transaction with one output. The fee comes out of the total, at exactly the feerate you gave, and nothing is left behind. It prints the txid on standard output, and what it sent on standard error. It refuses if nothing is spendable or if the result would be dust.
+
+Coins that a swap holds are never sent. Swap coins are never sent together with regular coins either, because that would link them on-chain. If the wallet has no regular coins, `--max` sends the swap coins. If it has both, it sends the regular ones and tells you how many swap coins are left. Run it again to send those.
+
 ### Fetch Available Offers
 
 Now we are ready to initiate a openswap. We are first going to sync the offer book to get a list of available makers:
@@ -554,7 +574,7 @@ $ taker -w <wallet_name> show-seed
 
 The command works offline and asks for the passphrase at a hidden prompt, never from `-p` or `--password-file`. It prints only to a terminal, not a pipe. Write the words down, then re-type the words it asks for. The command records the confirmation only when no other `taker` command is running on this wallet, and says so if it cannot. Wait for the other command to finish, then run `show-seed` again.
 
-A wallet made before phrases were stored has none, and `show-seed` says so. It never invents one. If you still have the original phrase, store it with `taker -w <wallet_name> attach-seed`. It accepts only the phrase that derives this wallet's key. Otherwise keep an encrypted backup, or sweep the coins to a new wallet.
+A wallet made before phrases were stored has none, and `show-seed` says so. It never invents one. If you still have the original phrase, store it with `taker -w <wallet_name> attach-seed`. It accepts only the phrase that derives this wallet's key. Otherwise keep an encrypted backup, or move the coins to a new wallet with `taker send-to-address --max` (see [Send to an Address](#send-to-an-address)).
 
 ### Restoring a Wallet
 
