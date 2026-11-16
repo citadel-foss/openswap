@@ -272,7 +272,7 @@ fn run() -> Result<(), MakerError> {
     config.password = wallet_password.as_mut().map(|p| std::mem::take(&mut **p));
 
     // SIGTERM (`docker stop`; PID 1 ignores it by default) and SIGINT stop
-    // the server like `maker-cli stop`. Installed only now, so Ctrl-C still
+    // the server at once, like `maker-cli stop --now`. Installed only now, so Ctrl-C still
     // aborts the prompts above.
     let shutdown = ShutdownSignal::new();
     #[cfg(unix)]
