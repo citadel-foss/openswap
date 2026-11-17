@@ -247,6 +247,7 @@ openswap taker::offers::tests::maker_states_read_as_plain_words
 openswap taker::offers::tests::makers_to_poll_requires_current_fidelity_and_respects_backoff
 openswap taker::offers::tests::manual_offer_does_not_gain_a_registry_outpoint
 openswap taker::offers::tests::manual_poll_preserves_suppression_evidence
+openswap taker::offers::tests::manual_sync_waits_only_for_the_first_relay_snapshot
 openswap taker::offers::tests::mark_failure_keeps_one_unbroken_run
 openswap taker::offers::tests::mark_success_clears_an_unavailable_state
 openswap taker::offers::tests::offerbook_load_removes_invalid_persisted_addresses
@@ -626,6 +627,7 @@ openswap watch_tower::nostr::tests::duplicate_event_across_relays_skips_blockcha
 openswap watch_tower::nostr::tests::eose_message_returns_true
 openswap watch_tower::nostr::tests::future_dated_event_never_moves_the_cursor
 openswap watch_tower::nostr::tests::garbage_frame_is_skipped_not_fatal
+openswap watch_tower::nostr::tests::op_return_only_announcement_resolves_without_a_height_lookup
 openswap watch_tower::nostr::tests::output_lookup_failure_blocks_market_sync_until_retry_succeeds
 openswap watch_tower::nostr::tests::shutdown_stops_discovery_without_waiting_for_a_silent_relay
 openswap watch_tower::nostr::tests::tampered_event_is_rejected_before_claiming_txid

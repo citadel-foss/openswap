@@ -671,6 +671,17 @@ fn handle_relay_message(
                     return Ok(false);
                 }
             };
+            if tx
+                .output
+                .get(vout as usize)
+                .is_none_or(|output| output.script_pubkey.is_op_return())
+            {
+                log::debug!("Ignoring unspendable fidelity output {txid}:{vout} via {relay_url}");
+                lookups.seen.insert(txid);
+                lookups.resolve(&txid, &registry)?;
+                registry.save_nostr_cursor(relay_url, cursor)?;
+                return Ok(false);
+            }
             let confirmation_height = match blockchain.tx_block_height(&txid) {
                 Ok(Some(height)) => height,
                 Ok(None) => {
@@ -1050,6 +1061,56 @@ mod tests {
 
         assert!(!result);
         assert!(registry.load_nostr_cursor(relay_url).unwrap().is_some());
+    }
+
+    #[test]
+    fn op_return_only_announcement_resolves_without_a_height_lookup() {
+        use bitcoin::{consensus::encode::serialize_hex, Amount, ScriptBuf, TxOut};
+        use serde_json::json;
+
+        let mut transaction = bitcoin::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        transaction.output = vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return([1u8; 4]),
+        }];
+        let txid = transaction.compute_txid();
+        let server = mock_electrum(move |method, _| match method {
+            "blockchain.transaction.get" => Ok(json!(serialize_hex(&transaction))),
+            _ => panic!("unexpected method: {}", method),
+        });
+        let blockchain = AnyBlockchain::from_config(&BackendConfig::Electrum(ElectrumConfig {
+            url: server.url,
+            max_retries: 0,
+            ..Default::default()
+        }))
+        .unwrap();
+        let keys = Keys::generate();
+        let kind = Kind::Custom(37778);
+        let event = EventBuilder::new(kind, format!("{txid}:0"))
+            .tag(Tag::from_standardized(TagStandard::Expiration(
+                Timestamp::from_secs(Timestamp::now().as_secs() + 60),
+            )))
+            .build(keys.public_key)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let registry = Arc::new(FileRegistry::new());
+        let mut lookups = DiscoveryLookups::new();
+
+        assert!(!handle_relay_message(
+            registry.clone(),
+            RelayMessage::Event {
+                subscription_id: Cow::Owned(SubscriptionId::new("sub")),
+                event: Cow::Owned(event),
+            },
+            &blockchain,
+            "wss://relay.example",
+            kind,
+            &mut lookups,
+        )
+        .unwrap());
+        assert!(lookups.pending.is_empty());
+        assert!(registry.pending_discovery_txids().unwrap().is_empty());
+        assert!(!lookups.seen.claim(txid));
     }
 
     #[test]

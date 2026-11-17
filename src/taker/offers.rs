@@ -1187,7 +1187,7 @@ impl OfferSyncService {
                         )
                         .is_none()
                         {
-                            return polled;
+                            continue;
                         }
                         polled.insert(addr);
                     }
@@ -1300,17 +1300,15 @@ impl OfferSyncService {
         })
     }
 
-    /// Waits up to DISCOVERY_WAIT_MAX for relay snapshots and discovery lookups
-    /// before running a manual sync.
+    /// Waits up to DISCOVERY_WAIT_MAX for the first relay snapshot before running
+    /// a manual sync. Cleanup still waits for full discovery or its grace period.
     fn wait_for_discovery(&self, shutdown_flag: &AtomicBool) {
-        if self.initial_sync_complete.load(Ordering::SeqCst) {
-            return;
-        }
-
+        let discovery_ready = || {
+            self.initial_sync_complete.load(Ordering::SeqCst)
+                || self.registry.has_discovery_snapshot().unwrap_or(false)
+        };
         let wait_start = std::time::Instant::now();
-        while !self.initial_sync_complete.load(Ordering::SeqCst)
-            && !shutdown_flag.load(Ordering::Relaxed)
-        {
+        while !discovery_ready() && !shutdown_flag.load(Ordering::Relaxed) {
             if wait_start.elapsed() >= DISCOVERY_WAIT_MAX {
                 log::warn!(
                     "Initial Nostr discovery did not complete in {:?}; proceeding with manual sync",
@@ -3323,6 +3321,24 @@ pub(crate) mod tests {
         registry.resolve_discovery_lookup(&outpoint.txid).unwrap();
         service.run_once().unwrap();
         assert!(handle.snapshot().unwrap().makers.is_empty());
+    }
+
+    #[test]
+    fn manual_sync_waits_only_for_the_first_relay_snapshot() {
+        let dir = tempdir().unwrap();
+        let registry = FileRegistry::new();
+        registry.record_discovery_snapshot().unwrap();
+        let service = OfferSyncService::new(
+            OfferBookHandle::load_or_create(dir.path()).unwrap(),
+            registry,
+            0,
+            Arc::new(chain_at_height(1)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let started = Instant::now();
+        service.wait_for_discovery(&AtomicBool::new(false));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
