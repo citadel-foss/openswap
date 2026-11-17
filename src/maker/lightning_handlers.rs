@@ -2606,9 +2606,10 @@ mod tests {
         use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn, TxOut, Txid};
         use serde_json::json;
         use std::sync::atomic::{AtomicBool, Ordering};
-        // Evicted refund, confirmed refund, rival claim, failed proof, and
-        // an unrelated watcher transaction. Only our confirmed refund closes.
-        for case in 0..5 {
+        // Evicted refund, final refund, rival claim, failed proof, an
+        // unrelated watcher transaction, and our refund one block short of
+        // final. Only our final refund closes.
+        for case in 0..6 {
             let dir = bitcoind::tempfile::tempdir().unwrap();
             let mut maker = compat_test_maker(dir.path(), vec![]);
             let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
@@ -2651,6 +2652,14 @@ mod tests {
                 node.mine(vec![claim]);
             } else if case != 0 {
                 node.mine(vec![refund.clone()]);
+            }
+            if case == 1 || case == 5 {
+                // Bury the refund to the depth at which the swap may close,
+                // or one block short of it.
+                let depth = REFUND_FINALITY_DEPTH - u32::from(case == 5);
+                for _ in 1..depth {
+                    node.mine(vec![]);
+                }
             }
             let broadcast = Arc::new(AtomicBool::new(false));
             let (url, _) = mock_core_rpc({
@@ -2707,10 +2716,19 @@ mod tests {
             };
             let id = swap.payment_hash.to_string();
             maker.store_ln_swap(&id, swap.clone()).unwrap();
-            if case == 1 {
+            if case == 1 || case == 5 {
                 // Closing also attempts a wallet sync; cancel those unrelated
                 // retries rather than requiring a full wallet RPC fixture.
+                // Case 5 must not close, but if it did it should fail, not hang.
                 maker.shutdown.store(true, Ordering::SeqCst);
+            }
+            if case == 1 || case == 5 {
+                assert_eq!(
+                    maker.tx_confirmations(&refund_id).unwrap(),
+                    Some(REFUND_FINALITY_DEPTH - u32::from(case == 5)),
+                    "case {}",
+                    case
+                );
             }
             let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
             assert_eq!(
