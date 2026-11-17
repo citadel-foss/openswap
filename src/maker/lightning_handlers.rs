@@ -104,10 +104,18 @@ const FUNDING_CONF_BUDGET: u32 = 24;
 /// the only copy of the refund key, and neither can be undone. A shallower
 /// refund can still be reorged out, and the taker's hashlock claim, which
 /// never expires, can confirm in its place; with the payment already failed
-/// the maker would lose both sides. Six matches LDK's `ANTI_REORG_DELAY`. If
-/// the payment's claim deadline comes first, the node fails it back itself,
-/// as closing at one confirmation would have.
+/// the maker would lose both sides. Six matches LDK's `ANTI_REORG_DELAY`.
+/// Swap-out admission leaves room for this depth before the payment's claim
+/// deadline, at which the node would fail the payment back itself.
 const REFUND_FINALITY_DEPTH: u32 = 6;
+
+/// Blocks allowed for the swap-out refund to be mined once its CSV opens.
+///
+/// The refund can be mined no earlier than `locktime` blocks after the
+/// funding confirms, and a busy mempool can hold it back further. Admission
+/// budgets this delay so the refund can still reach [`REFUND_FINALITY_DEPTH`]
+/// before the held payment's claim deadline.
+const REFUND_MINING_BUDGET: u32 = 6;
 
 /// Direction of a swap and how far it has progressed. Defined alongside the
 /// wallet's persisted record so the live state and the on-disk state cannot
@@ -1244,16 +1252,32 @@ fn handle_swap_out_paid<M: Maker>(
     let claim_window_ends = tip
         .saturating_add(FUNDING_CONF_BUDGET)
         .saturating_add(swap.locktime as u32);
+    // If the taker never claims, our refund opens when its claim window
+    // closes. The payment must outlive the refund reaching finality: once the
+    // node fails it back, a reorg that swaps the refund for the taker's claim
+    // leaves us with neither side. A refund mined at height R is
+    // REFUND_FINALITY_DEPTH deep at R + REFUND_FINALITY_DEPTH - 1, and the
+    // node fails the payment when the tip reaches the deadline, so the
+    // deadline must be past that.
+    let refund_final_by = claim_window_ends
+        .saturating_add(REFUND_MINING_BUDGET)
+        .saturating_add(REFUND_FINALITY_DEPTH);
+    let required = claim_window_ends
+        .saturating_add(SETTLE_MARGIN)
+        .max(refund_final_by);
     match claim_deadline {
-        Some(deadline) if deadline >= claim_window_ends.saturating_add(SETTLE_MARGIN) => {}
+        Some(deadline) if deadline >= required => {}
         Some(deadline) => {
             return Ok(reject(
                 swap_id,
                 format!(
-                    "lightning claim deadline {deadline} is before the on-chain claim \
-                     window closes at {claim_window_ends} (tip {tip} + {FUNDING_CONF_BUDGET} \
-                     confirmation budget + {} locktime + {SETTLE_MARGIN} margin); the node's \
-                     hold window is too narrow for this locktime",
+                    "lightning claim deadline {deadline} is before {required}: the on-chain \
+                     claim window closes at {claim_window_ends} (tip {tip} + \
+                     {FUNDING_CONF_BUDGET} confirmation budget + {} locktime), and the hold \
+                     must outlast both a {SETTLE_MARGIN}-block settle margin and our refund \
+                     being mined within {REFUND_MINING_BUDGET} blocks and reaching \
+                     {REFUND_FINALITY_DEPTH} confirmations; the node's hold window is too \
+                     narrow for this locktime",
                     swap.locktime
                 ),
             ));
