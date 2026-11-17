@@ -74,6 +74,14 @@ pub enum RpcMsgReq {
         /// Addresses to remove.
         addresses: Vec<String>,
     },
+    /// List the swap history, or show the reports of one swap.
+    ListSwaps {
+        /// Show only this swap, in full.
+        swap_id: Option<String>,
+        /// Most rows to list, newest first. The default is 100; more than
+        /// 10,000 is cut to 10,000.
+        limit: Option<u32>,
+    },
 }
 
 /// Enum representing RPC message responses.
@@ -128,8 +136,11 @@ pub enum RpcMsgResp {
     BlocklistAddResp(AddOutcome),
     /// Response containing the number of removed blocklist entries.
     BlocklistRemoveResp(usize),
+    /// Response with the swap history, or the reports of one swap, as JSON.
+    SwapList(String),
 }
 
+/// How `maker-cli` prints each reply.
 impl Display for RpcMsgResp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -177,6 +188,7 @@ impl Display for RpcMsgResp {
                 write!(f, "Added: {}, updated: {}", outcome.added, outcome.updated)
             }
             Self::BlocklistRemoveResp(removed) => write!(f, "Removed: {removed}"),
+            Self::SwapList(json) => write!(f, "{json}"),
         }
     }
 }

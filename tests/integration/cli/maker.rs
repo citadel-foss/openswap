@@ -87,6 +87,33 @@ fn bond_rows(list: &str) -> Vec<Value> {
     bonds
 }
 
+/// Whether a `ListSwaps` reply is a history whose one swap is `swap_id`, a
+/// success that earned `fee`.
+fn history_has_swap(json: &str, swap_id: &str, fee: u64) -> bool {
+    let history: Value = serde_json::from_str(json).expect("ListSwaps must be JSON");
+    let swaps = history["swaps"].as_array().expect("a swaps list");
+    swaps.len() == 1
+        && swaps[0]["swap_id"] == swap_id
+        && swaps[0]["role"] == "Maker"
+        && swaps[0]["status"] == "Success"
+        && swaps[0]["fee_earned"] == fee
+        && history["totals"]["succeeded"] == 1
+        && history["totals"]["fees_earned"] == fee
+        && history["totals"]["unreadable_reports"] == 0
+        && history["omitted"] == 0
+}
+
+/// Whether a one-swap `ListSwaps` reply holds the maker report of `swap_id`
+/// and no deniability proof.
+fn detail_has_swap(json: &str, swap_id: &str, fee: u64) -> bool {
+    let detail: Value = serde_json::from_str(json).expect("ListSwaps must be JSON");
+    let reports = detail["maker"].as_array().expect("a maker report");
+    reports.len() == 1
+        && reports[0]["swap_id"] == swap_id
+        && reports[0]["fee_earned"] == fee
+        && reports[0].get("deniability_proof").is_none()
+}
+
 /// `assert_rpc!(rpc, { request => reply pattern [if guard], .. })`: sends every
 /// request in order, then fails once, listing every reply that did not match.
 macro_rules! assert_rpc {
@@ -213,6 +240,20 @@ fn rpc_server(world: &mut World) {
         "the maker must hold exactly its bond"
     );
 
+    // The fee the maker's own stored report says it earned.
+    let fee_earned = target
+        .wallet
+        .read()
+        .unwrap()
+        .swap_reports()
+        .maker
+        .values()
+        .flatten()
+        .find(|report| report.swap_id == swap_id)
+        .expect("the maker must hold a report for the swap")
+        .fee_earned;
+    assert!(fee_earned > 0, "the maker must have earned a fee");
+
     // ---- Queries ----
     assert_rpc!(rpc, {
         Req::Ping => Resp::Pong,
@@ -235,6 +276,17 @@ fn rpc_server(world: &mut World) {
         Req::VerifyDeniability { swap_id: swap_id.clone() } => Resp::VerifyDeniabilityResp(true),
         // An unknown swap id is an error, not `false`.
         Req::VerifyDeniability { swap_id: "no-such-swap".to_string() } => Resp::ServerError(_),
+        Req::ListSwaps { swap_id: None, limit: None } => Resp::SwapList(json)
+            if history_has_swap(&json, &swap_id, fee_earned),
+        Req::ListSwaps { swap_id: Some(swap_id.clone()), limit: None } => Resp::SwapList(json)
+            if detail_has_swap(&json, &swap_id, fee_earned),
+        Req::ListSwaps { swap_id: Some("no-such-swap".to_string()), limit: None }
+            => Resp::ServerError(_),
+        // A limit of 0 lists no rows, but the totals still count the swap.
+        Req::ListSwaps { swap_id: None, limit: Some(0) } => Resp::SwapList(json)
+            if serde_json::from_str::<Value>(&json).is_ok_and(|h| {
+                h["swaps"] == json!([]) && h["omitted"] == 1 && h["totals"]["succeeded"] == 1
+            }),
     });
 
     // ---- Mutating ----
@@ -327,6 +379,102 @@ fn rpc_server(world: &mut World) {
         "maker-cli should report the rejection on stderr, got: {}",
         stderr
     );
+
+    // The same history through both binaries, so argument parsing is covered.
+    let output = Command::new(env!("CARGO_BIN_EXE_maker-cli"))
+        .args([
+            "-p",
+            &format!("127.0.0.1:{}", rpc.port),
+            "-d",
+            data_dir.to_str().unwrap(),
+            "list-swaps",
+        ])
+        .output()
+        .expect("failed to run maker-cli");
+    assert!(
+        output.status.success(),
+        "maker-cli list-swaps failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        history_has_swap(&stdout, &swap_id, fee_earned),
+        "maker-cli list-swaps printed: {}",
+        stdout
+    );
+
+    // An id that does not exist is an error: stderr, and a failing exit code.
+    let output = Command::new(env!("CARGO_BIN_EXE_maker-cli"))
+        .args([
+            "-p",
+            &format!("127.0.0.1:{}", rpc.port),
+            "-d",
+            data_dir.to_str().unwrap(),
+            "list-swaps",
+            "--swap-id",
+            "no-such-swap",
+        ])
+        .output()
+        .expect("failed to run maker-cli");
+    assert!(!output.status.success(), "an unknown swap id must fail");
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no swap with id no-such-swap"));
+
+    // The taker lists its swap from the wallet file alone: its bitcoind
+    // address is left out, and nothing connects to Tor.
+    let output = Command::new(env!("CARGO_BIN_EXE_taker"))
+        .args([
+            "--data-directory",
+            world.temp_dir().join("taker1").to_str().unwrap(),
+            "--WALLET",
+            "taker1",
+            "--PASSWORD",
+            "integration-test",
+            "list-swaps",
+        ])
+        .output()
+        .expect("failed to run taker");
+    assert!(
+        output.status.success(),
+        "taker list-swaps failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let history: Value = serde_json::from_slice(&output.stdout).expect("taker prints JSON");
+    let swaps = history["swaps"].as_array().unwrap();
+    assert_eq!(swaps.len(), 1, "{history}");
+    assert_eq!(swaps[0]["swap_id"], swap_id.as_str());
+    assert_eq!(swaps[0]["role"], "Taker");
+    assert_eq!(swaps[0]["status"], "Success");
+    assert!(swaps[0]["fee_paid"].as_u64().unwrap() > 0, "{}", history);
+    assert_eq!(history["totals"]["fees_paid"], swaps[0]["fee_paid"]);
+    assert_eq!(history["omitted"], 0);
+
+    // The file is only read: a limit of 0 lists no rows, and the wallet stays as it was.
+    let wallet_file = world
+        .temp_dir()
+        .join("taker1")
+        .join("wallets")
+        .join("taker1");
+    let before = fs::read(&wallet_file).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_taker"))
+        .args([
+            "--data-directory",
+            world.temp_dir().join("taker1").to_str().unwrap(),
+            "--WALLET",
+            "taker1",
+            "--PASSWORD",
+            "integration-test",
+            "list-swaps",
+            "--limit",
+            "0",
+        ])
+        .output()
+        .expect("failed to run taker");
+    assert!(output.status.success());
+    let limited: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(limited["swaps"], json!([]));
+    assert_eq!(limited["omitted"], 1);
+    assert_eq!(fs::read(&wallet_file).unwrap(), before);
 
     // ---- Stop, last: it shuts the server down ----
     assert_rpc!(rpc, { Req::Stop => Resp::Shutdown });

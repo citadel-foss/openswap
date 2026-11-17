@@ -95,6 +95,17 @@ const SETTLE_MARGIN: u32 = 6;
 /// the taker's claim stays valid for that whole time.
 const FUNDING_CONF_BUDGET: u32 = 24;
 
+/// Confirmations the swap-out refund needs before the maker closes the swap.
+///
+/// Closing fails the held Lightning payment and deletes the record holding
+/// the only copy of the refund key, and neither can be undone. A shallower
+/// refund can still be reorged out, and the taker's hashlock claim, which
+/// never expires, can confirm in its place; with the payment already failed
+/// the maker would lose both sides. Six matches LDK's `ANTI_REORG_DELAY`. If
+/// the payment's claim deadline comes first, the node fails it back itself,
+/// as closing at one confirmation would have.
+const REFUND_FINALITY_DEPTH: u32 = 6;
+
 /// Direction of a swap and how far it has progressed. Defined alongside the
 /// wallet's persisted record so the live state and the on-disk state cannot
 /// drift apart.
@@ -1607,7 +1618,8 @@ pub fn watchdog_finish_swap_in_snapshot(
 }
 
 /// Settles a funded swap-out from its claim, or refunds an unclaimed HTLC
-/// after its CSV window, keeping the record until the refund confirms.
+/// after its CSV window, keeping the record until the refund is
+/// [`REFUND_FINALITY_DEPTH`] blocks deep.
 fn watchdog_resolve_swap_out(
     maker: &Arc<MakerServer>,
     ctx: &LnContext,
@@ -1645,7 +1657,7 @@ fn watchdog_resolve_swap_out(
             spending_tx: Some(tx),
             ..
         }) if is_our_refund(swap, tx)
-            && matches!(maker.is_tx_confirmed(&tx.compute_txid()), Ok(true)) =>
+            && matches!(maker.tx_confirmations(&tx.compute_txid()), Ok(Some(_))) =>
         {
             answer
         }
@@ -1748,11 +1760,11 @@ fn watchdog_resolve_swap_out(
                 }
                 return Ok(());
             }
-            let ours_confirmed = match swap.refund_txid {
-                Some(txid) => maker.is_tx_confirmed(&txid)?,
-                None => false,
+            let refund_depth = match swap.refund_txid {
+                Some(txid) => maker.tx_confirmations(&txid)?,
+                None => None,
             };
-            if !ours_confirmed {
+            let Some(depth) = refund_depth else {
                 // Someone else won the outpoint, which can only be the
                 // taker's claim. Keep the swap and retry until we hold the
                 // confirmed spender and can take its preimage.
@@ -1761,8 +1773,17 @@ fn watchdog_resolve_swap_out(
                      retrying for the preimage"
                 );
                 return Ok(());
+            };
+            if depth < REFUND_FINALITY_DEPTH {
+                // Ours, but a reorg can still put the taker's claim in its
+                // place. Keep the held payment and the record until then.
+                log::info!(
+                    "Swap-out {swap_id}: our refund has {depth} of {REFUND_FINALITY_DEPTH} \
+                     confirmations; keeping the swap until it is final"
+                );
+                return Ok(());
             }
-            log::info!("Swap-out {swap_id}: our refund confirmed; closing");
+            log::info!("Swap-out {swap_id}: our refund is {depth} blocks deep; closing");
             let _ = ctx.ln.fail_held_payment(swap.payment_hash);
             maker.unwatch_outpoint(outpoint, spk);
             ctx.router.unsubscribe(&swap.payment_hash);
@@ -1854,7 +1875,7 @@ fn watchdog_resolve_swap_out(
                 return Err(MakerError::General("Test: refund interrupted"));
             }
             // Broadcast but keep the record: the refund is only ours once it
-            // confirms, and until then this record holds the only key that
+            // is final, and until then this record holds the only key that
             // can rebuild it. The confirmed-spend branch above closes the
             // swap and fails the held payment on a later tick.
             match maker.broadcast_transaction(&refund_tx) {
