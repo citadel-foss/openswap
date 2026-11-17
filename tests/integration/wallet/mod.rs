@@ -6,4 +6,6 @@ mod backup;
 mod broadcast_idempotency;
 mod electrum_transport;
 mod list_transactions;
+#[cfg(unix)]
+mod send_max;
 mod utxo_behavior;
