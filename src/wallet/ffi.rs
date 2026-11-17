@@ -291,7 +291,8 @@ impl Wallet {
     /// Regular coins go first. Swap coins go only when the wallet has no
     /// regular ones, because a spend never mixes the two pools. Coins that are
     /// locked or reserved by a swap stay put. [`Sweep::left_behind`] counts
-    /// the coins of the other pool, so the caller can say a second send is due.
+    /// the coins of the other pool. The caller should send those to a fresh
+    /// address: the same one would link the two pools on-chain.
     pub fn sweep_to_address(
         &mut self,
         address: String,
@@ -324,8 +325,14 @@ impl Wallet {
         let amount = tx.output[0].value;
         let inputs = tx.input.len();
 
-        let txid = self.send_tx(&tx)?;
-        self.sync_and_save(&crate::utill::NO_SHUTDOWN)?;
+        // The id of the transaction we built, not whatever the backend echoes.
+        self.send_tx(&tx)?;
+        let txid = tx.compute_txid();
+        // The coins are gone from the network's view once the broadcast is
+        // accepted, so a failed refresh must not hide the txid from the caller.
+        if let Err(e) = self.sync_and_save(&crate::utill::NO_SHUTDOWN) {
+            log::error!("Wallet refresh failed after broadcasting {txid}: {e:?}");
+        }
 
         Ok(Sweep {
             txid,

@@ -137,7 +137,7 @@ enum Commands {
         /// Send everything instead of an amount, with the fee taken from it.
         /// Spends all regular coins; if the wallet has none, all swap coins.
         /// The two kinds are never sent together, so run it again for the
-        /// other. Coins held by a swap stay.
+        /// other, to a fresh address. Coins held by a swap stay.
         #[clap(long, conflicts_with = "amount")]
         max: bool,
         /// Feerate in sats/vByte. Defaults to 1 sat/vByte; values below the
@@ -752,7 +752,7 @@ fn run() -> Result<(), TakerError> {
                 );
                 if sweep.left_behind > 0 {
                     eprintln!(
-                        "{} swap coin(s) were not sent, as they are never mixed with regular coins. Run the command again to send them.",
+                        "{} swap coin(s) were not sent, as they are never mixed with regular coins. Run the command again to send them, to a fresh address: reusing this one would link them to the coins just sent.",
                         sweep.left_behind
                     );
                 }
