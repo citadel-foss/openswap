@@ -1030,6 +1030,8 @@ openswap::integration wallet::electrum_transport::reconnects_after_the_connectio
 openswap::integration wallet::electrum_transport::shutdown_interrupts_an_active_retry_and_allows_join
 openswap::integration wallet::electrum_transport::unreachable_server_reports_exhausted_attempts
 openswap::integration wallet::list_transactions::lists_funding_transactions
+openswap::integration wallet::send_max::sweep_survives_a_failed_refresh_bitcoind
+openswap::integration wallet::send_max::sweep_survives_a_failed_refresh_electrum
 openswap::integration wallet::utxo_behavior::address_grouping_behavior
 openswap::integration wallet::utxo_behavior::legacy_swap_completes_with_degraded_splits
 openswap::integration wallet::utxo_behavior::manual_coinselection
