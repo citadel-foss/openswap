@@ -1265,9 +1265,13 @@ fn handle_swap_out_paid<M: Maker>(
     let required = claim_window_ends
         .saturating_add(SETTLE_MARGIN)
         .max(refund_final_by);
+    // A refused swap-out must not keep the taker's payment held until the
+    // watchdog's timer runs out. The record stays, so the watchdog retries
+    // the cancellation if this one fails.
     match claim_deadline {
         Some(deadline) if deadline >= required => {}
         Some(deadline) => {
+            let _ = ctx.ln.fail_held_payment(swap.payment_hash);
             return Ok(reject(
                 swap_id,
                 format!(
@@ -1283,6 +1287,7 @@ fn handle_swap_out_paid<M: Maker>(
             ));
         }
         None => {
+            let _ = ctx.ln.fail_held_payment(swap.payment_hash);
             return Ok(reject(
                 swap_id,
                 "backend reported no claim deadline, so the hold window cannot be checked",
