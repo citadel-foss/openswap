@@ -224,7 +224,8 @@ fn swap_out_admission_budgets_for_refund_finality(
     let claim_window_ends = tip + LN_FUNDING_CONF_BUDGET + locktime as u32;
     ln.set_claim_deadline(Some(claim_window_ends + extra));
 
-    let payment_hash = Preimage([hash_byte; 32]).payment_hash();
+    let preimage = Preimage([hash_byte; 32]);
+    let payment_hash = preimage.payment_hash();
     let reply = pay_swap_out(
         &maker,
         &ln,
@@ -245,6 +246,13 @@ fn swap_out_admission_budgets_for_refund_finality(
             other
         ),
     }
+    // A refusal cancels the taker's payment at once; an admission keeps it
+    // held for the maker to settle.
+    let still_held = ln.claim_held_payment(&preimage).is_ok();
+    assert_eq!(
+        still_held, admitted,
+        "the held payment must be cancelled exactly when the swap-out is refused"
+    );
 
     framework.set_block_gen_paused(false);
     maker.shutdown.store(true, Relaxed);
