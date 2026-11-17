@@ -2,16 +2,18 @@
 //! Nothing goes wrong and the openswap completes successfully.
 //! Also asserts a 3-hop request is rejected up front when only 2 makers exist.
 
-use bitcoin::Amount;
+use bitcoin::{Amount, OutPoint, Txid};
+use bitcoind::bitcoincore_rpc::{json::ListUnspentResultEntry, RpcApi};
 use openswap::{
     protocol::common_messages::ProtocolVersion,
     taker::{error::TakerError, SwapParams},
+    wallet::UTXOSpendInfo,
 };
 
 use crate::test_framework::*;
 
 use log::info;
-use std::{thread, time::Duration};
+use std::{collections::HashSet, thread, time::Duration};
 
 /// This test demonstrates a standard openswap round between a Taker and 2 Makers. Nothing goes wrong
 /// and the openswap completes successfully.
@@ -180,6 +182,96 @@ fn run_swap_with_custom_feerate(
             sweep_vsize_model
         );
     }
+}
+
+/// After a swap the taker holds regular coins (its change) and swept swap
+/// coins. `send-to-address --max` sends one pool per transaction: the regular
+/// coins first, reporting the swap coins it left, then the swap coins.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    setup = [
+        fund_taker_default(3),
+        fund_makers_default(),
+        spawn_ready_makers_and_mine(),
+    ],
+)]
+fn send_max_never_mixes_regular_and_swap_coins(world: &mut World) {
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
+        .with_tx_count(2)
+        .with_required_confirms(1);
+    world
+        .taker_mut()
+        .swap(swap_params)
+        .expect("swap must complete");
+    world.mine(1);
+    world.taker().sync();
+
+    let wallet = world.taker().inner().get_wallet();
+    let outpoints = |coins: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>| -> HashSet<OutPoint> {
+        coins
+            .iter()
+            .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+            .collect()
+    };
+    let (regular, swept) = {
+        let wallet = wallet.read().unwrap();
+        (
+            outpoints(wallet.list_descriptor_utxo_spend_info()),
+            outpoints(wallet.list_swept_incoming_swap_utxos()),
+        )
+    };
+    assert!(!regular.is_empty(), "the taker keeps regular change");
+    assert!(!swept.is_empty(), "the swap leaves swept coins");
+
+    let bitcoind = world.bitcoind();
+    let fresh = || {
+        bitcoind
+            .client
+            .get_new_address(None, None)
+            .unwrap()
+            .assume_checked()
+    };
+    let spent_by = |txid: &Txid| -> HashSet<OutPoint> {
+        bitcoind
+            .client
+            .get_raw_transaction(txid, None)
+            .unwrap()
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect()
+    };
+
+    // First send: the regular pool only, and it says what it left.
+    let first = wallet
+        .write()
+        .unwrap()
+        .sweep_to_address(fresh().to_string(), Some(2.0))
+        .expect("send the regular coins");
+    assert_eq!(first.inputs, regular.len());
+    assert_eq!(first.left_behind, swept.len());
+    assert_eq!(spent_by(&first.txid), regular, "no swap coin in the send");
+    world.mine(1);
+    world.taker().sync();
+    let balances = wallet.read().unwrap().get_balances().unwrap();
+    assert_eq!(balances.regular, Amount::ZERO);
+    assert!(balances.swap > Amount::ZERO, "the swap coins are untouched");
+
+    // Second send: nothing but the swap coins remain, and they go.
+    let second = wallet
+        .write()
+        .unwrap()
+        .sweep_to_address(fresh().to_string(), Some(2.0))
+        .expect("send the swap coins");
+    assert_eq!(second.inputs, swept.len());
+    assert_eq!(second.left_behind, 0);
+    assert_eq!(spent_by(&second.txid), swept);
+    world.mine(1);
+    world.taker().sync();
+    let balances = wallet.read().unwrap().get_balances().unwrap();
+    assert_eq!(balances.spendable, Amount::ZERO);
 }
 
 /// A maker blocked in its contract-confirmation wait refreshes the swap's

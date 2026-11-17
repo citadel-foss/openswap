@@ -956,6 +956,7 @@ openswap::integration swap::spare_pricing::last_hop_expensive_spare_aborts_inste
 openswap::integration swap::standard::legacy_payment_cannot_take_planned_funding_coins
 openswap::integration swap::standard::legacy_swap_at_custom_feerate
 openswap::integration swap::standard::legacy_two_maker_swap_completes
+openswap::integration swap::standard::send_max_never_mixes_regular_and_swap_coins
 openswap::integration swap::standard::taproot_payment_cannot_take_planned_funding_coins
 openswap::integration swap::standard::taproot_swap_at_custom_feerate
 openswap::integration swap::standard::taproot_swap_survives_unconfirmed_confirmation_wait

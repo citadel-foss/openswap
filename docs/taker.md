@@ -307,7 +307,7 @@ $ taker send-to-address --address <ADDRESS> --max --feerate 2
 
 `--max` spends every regular coin in one transaction with one output. The fee comes out of the total, at exactly the feerate you gave, and nothing is left behind. It prints the txid on standard output, and what it sent on standard error. It refuses if nothing is spendable or if the result would be dust.
 
-Coins that a swap holds are never sent. Swap coins are never sent together with regular coins either, because that would link them on-chain. If the wallet has no regular coins, `--max` sends the swap coins. If it has both, it sends the regular ones and tells you how many swap coins are left. Run it again to send those.
+Coins that a swap holds are never sent. Swap coins are never sent together with regular coins either, because that would link them on-chain. If the wallet has no regular coins, `--max` sends the swap coins. If it has both, it sends the regular ones and tells you how many swap coins are left. Run it again to send those, and give it a fresh address from the receiving wallet. Sending both to the same address would link them on-chain.
 
 ### Fetch Available Offers
 
