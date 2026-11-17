@@ -297,7 +297,7 @@ Now we are ready to initiate a openswap. We are first going to sync the offer bo
 $ taker fetch-offers
 ```
 
-This blocks until the offerbook sync cycle completes (including Nostr-based maker discovery), then prints each discovered maker with its state, offer terms, and fidelity bond details, followed by a summary line. On each taker start, it refreshes offers from all makers found on the configured relays, including addresses already in the local offerbook. If a relay or blockchain backend does not respond, the command warns that the displayed offerbook may be incomplete.
+This blocks until the offerbook sync cycle completes (including Nostr-based maker discovery), or for at most ten minutes, then prints each discovered maker with its state, offer terms, and fidelity bond details, followed by a summary line. On each taker start, it refreshes offers from all makers found on the configured relays, including addresses already in the local offerbook. If a relay or blockchain backend does not respond, or the cycle has not finished after ten minutes, the command warns that the displayed offerbook may be incomplete.
 
 Each discovered maker receives one initial poll before its normal freshness and retry delays apply. A failed bond lookup or unavailable relay does not keep overriding delays for other makers. Known expired bonds are removed even if discovery is incomplete. If at least one relay supplies its snapshot, cleanup of absent and stale makers can proceed after the startup grace period; the incomplete-discovery warning remains until every configured relay responds.
 

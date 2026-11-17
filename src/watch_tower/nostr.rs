@@ -119,7 +119,8 @@ impl DiscoveryLookups {
         Ok(self
             .pending
             .values()
-            .find(|lookup| lookup.retry_at <= Instant::now())
+            .filter(|lookup| lookup.retry_at <= Instant::now())
+            .min_by_key(|lookup| lookup.retry_at)
             .map(|lookup| {
                 (
                     lookup.relay_url.clone(),
@@ -645,11 +646,15 @@ fn handle_relay_message(
 
             // Claim the txid before any RPC work, so duplicate events across
             // relays don't repeat the fetch and validation.
-            if lookups
+            if let Some(lookup) = lookups
                 .pending
-                .get(&txid)
-                .is_some_and(|lookup| lookup.retry_at > Instant::now())
+                .get_mut(&txid)
+                .filter(|lookup| lookup.retry_at > Instant::now())
             {
+                if event.created_at > lookup.event.created_at {
+                    lookup.relay_url = Arc::from(relay_url);
+                    lookup.event = event.into_owned();
+                }
                 return Ok(false);
             }
             if !lookups.seen.claim(txid) {
@@ -1111,6 +1116,82 @@ mod tests {
         assert!(lookups.pending.is_empty());
         assert!(registry.pending_discovery_txids().unwrap().is_empty());
         assert!(!lookups.seen.claim(txid));
+    }
+
+    fn announcement(txid: Txid, created_at: u64) -> nostr::Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::Custom(37778), format!("{txid}:0"))
+            .custom_created_at(Timestamp::from_secs(created_at))
+            .tag(Tag::from_standardized(TagStandard::Expiration(
+                Timestamp::from_secs(created_at + 7200),
+            )))
+            .build(keys.public_key)
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn deferred_lookup_keeps_the_newer_announcement_and_its_retry_deadline() {
+        let txid = Txid::from_byte_array([7; 32]);
+        let now = Timestamp::now().as_secs();
+        let retry_at = Instant::now() + Duration::from_secs(60);
+        let mut lookups = DiscoveryLookups::new();
+        lookups.pending.insert(
+            txid,
+            PendingDiscoveryLookup {
+                relay_url: Arc::from("wss://old.example"),
+                event: announcement(txid, now - 3600),
+                retry_at,
+            },
+        );
+        let newer = announcement(txid, now);
+        let blockchain =
+            AnyBlockchain::from_config(&BackendConfig::CoreRpc(CoreRpcConfig::default())).unwrap();
+
+        assert!(!handle_relay_message(
+            Arc::new(FileRegistry::new()),
+            RelayMessage::Event {
+                subscription_id: Cow::Owned(SubscriptionId::new("sub")),
+                event: Cow::Owned(newer.clone()),
+            },
+            &blockchain,
+            "wss://new.example",
+            Kind::Custom(37778),
+            &mut lookups,
+        )
+        .unwrap());
+        let lookup = &lookups.pending[&txid];
+        assert_eq!(lookup.event.id, newer.id);
+        assert_eq!(&*lookup.relay_url, "wss://new.example");
+        assert_eq!(lookup.retry_at, retry_at);
+    }
+
+    #[test]
+    fn due_lookups_retry_oldest_deadline_first() {
+        let now = Timestamp::now().as_secs();
+        let mut lookups = DiscoveryLookups::new();
+        let mut oldest = None;
+        for i in 1..=16u8 {
+            let txid = Txid::from_byte_array([i; 32]);
+            let event = announcement(txid, now);
+            if i == 16 {
+                oldest = Some(event.id);
+            }
+            lookups.pending.insert(
+                txid,
+                PendingDiscoveryLookup {
+                    relay_url: Arc::from("wss://relay.example"),
+                    event,
+                    retry_at: Instant::now() - Duration::from_secs(u64::from(i)),
+                },
+            );
+        }
+
+        let (_, message) = lookups.retry_due(&FileRegistry::new()).unwrap().unwrap();
+        let RelayMessage::Event { event, .. } = message else {
+            panic!("retry must replay an event");
+        };
+        assert_eq!(Some(event.id), oldest);
     }
 
     #[test]

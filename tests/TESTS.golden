@@ -623,6 +623,8 @@ openswap wallet::swapcoin::timelock_spend_tests::taproot_timelock_recovery_is_ou
 openswap wallet::swapcoin::timelock_spend_tests::timelock_witness_on_another_outpoint_is_not_ours
 openswap watch_tower::nostr::tests::closing_the_relay_socket_stops_a_parked_read
 openswap watch_tower::nostr::tests::confirmation_lookup_failure_blocks_market_sync_until_retry_succeeds
+openswap watch_tower::nostr::tests::deferred_lookup_keeps_the_newer_announcement_and_its_retry_deadline
+openswap watch_tower::nostr::tests::due_lookups_retry_oldest_deadline_first
 openswap watch_tower::nostr::tests::duplicate_event_across_relays_skips_blockchain_and_advances_cursor
 openswap watch_tower::nostr::tests::eose_message_returns_true
 openswap watch_tower::nostr::tests::future_dated_event_never_moves_the_cursor
