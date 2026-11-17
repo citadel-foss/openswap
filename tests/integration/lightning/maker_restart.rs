@@ -3265,6 +3265,18 @@ const LN_CLTV_SAFETY_MARGIN: u32 = 12;
 /// `MIN_REMAINING_LOCKTIME` in the maker's handler.
 const LN_MIN_REMAINING_LOCKTIME: u32 = 24;
 
+/// How much of the swap-in window the chain leaves after the handler's pause.
+#[derive(Debug, Clone, Copy)]
+enum RereadWindow {
+    /// A few blocks pass, leaving a usable window.
+    Usable,
+    /// At least the minimum window, but less than the invoice's final delta
+    /// plus the route margin.
+    BelowInvoiceDelta,
+    /// Less than the minimum window.
+    BelowMinimum,
+}
+
 /// The chain moves on while the handler pauses to reread a missing funding
 /// height. The window it checks and the route budget it pays with must come
 /// from the tip after the pause, not from before it.
@@ -3278,13 +3290,20 @@ const LN_MIN_REMAINING_LOCKTIME: u32 = 24;
         /// A few blocks pass: the payment's budget shrinks by exactly them.
         swap_in_funded_handler_budgets_from_the_tip_after_a_reread(
             preimage = Preimage([0xd8; 32]),
-            leave_too_little = false,
+            window = RereadWindow::Usable,
+        ),
+        /// Enough blocks pass to leave the minimum window but not the
+        /// invoice's final delta plus the margin: no route could meet the
+        /// budget, so the handler must refuse rather than pay.
+        swap_in_funded_handler_refuses_a_window_below_the_invoice_delta_after_a_reread(
+            preimage = Preimage([0xda; 32]),
+            window = RereadWindow::BelowInvoiceDelta,
         ),
         /// Enough blocks pass to leave less than the minimum window: the
         /// handler must refuse rather than pay against the earlier tip.
         swap_in_funded_handler_refuses_when_the_window_closes_during_a_reread(
             preimage = Preimage([0xd9; 32]),
-            leave_too_little = true,
+            window = RereadWindow::BelowMinimum,
         ),
     ],
 )]
@@ -3292,7 +3311,7 @@ fn handler_rechecks_the_window_after_a_reread(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
     preimage: Preimage,
-    leave_too_little: bool,
+    window: RereadWindow,
 ) {
     let taker_ln = MockLightningBackend::new();
     let framework = world.framework().clone();
@@ -3321,11 +3340,27 @@ fn handler_rechecks_the_window_after_a_reread(
         "the handler to find the funding height missing",
         maker.funding_height_lookups.load(Relaxed) >= 1
     );
-    // One block short of the minimum window, or just a couple of blocks.
-    let age = if leave_too_little {
-        locktime - LN_MIN_REMAINING_LOCKTIME + 1
-    } else {
-        2
+    let invoice_delta = verify_invoice(
+        &accepted.invoice,
+        &accepted.payment_hash,
+        accepted.amount.to_sat() * 1000,
+    )
+    .unwrap()
+    .min_final_cltv_expiry_delta as u32;
+    let age = match window {
+        RereadWindow::Usable => 2,
+        // One block short of the invoice's delta plus the margin, which
+        // still leaves more than the minimum window.
+        RereadWindow::BelowInvoiceDelta => {
+            let age = locktime - (invoice_delta + LN_CLTV_SAFETY_MARGIN) + 1;
+            assert!(
+                locktime - age >= LN_MIN_REMAINING_LOCKTIME,
+                "the window must pass the minimum check to reach the invoice check"
+            );
+            age
+        }
+        // One block short of the minimum window.
+        RereadWindow::BelowMinimum => locktime - LN_MIN_REMAINING_LOCKTIME + 1,
     };
     mine_to(bitcoind, confirmed_at + age as u64);
     maker.funding_height_pause_released.store(true, Relaxed);
@@ -3333,10 +3368,15 @@ fn handler_rechecks_the_window_after_a_reread(
         .recv_timeout(Duration::from_secs(120))
         .expect("the handler did not return after its pause");
 
-    if leave_too_little {
+    let refusal = match window {
+        RereadWindow::Usable => None,
+        RereadWindow::BelowInvoiceDelta => Some("cannot cover the invoice's"),
+        RereadWindow::BelowMinimum => Some("locktime blocks remain"),
+    };
+    if let Some(refusal) = refusal {
         assert!(
-            result.contains("locktime blocks remain"),
-            "the handler did not refuse a window that closed during its pause: {}",
+            result.contains(refusal),
+            "the handler did not refuse a window that shrank during its pause: {}",
             result
         );
         assert_eq!(
