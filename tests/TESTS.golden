@@ -93,6 +93,7 @@ openswap maker::legacy_verification::tests::normal_locktime_is_accepted
 openswap maker::lightning_handlers::tests::closed_swap_out_is_not_recreated_after_the_lookup_guard
 openswap maker::lightning_handlers::tests::compat_lightning_pins_require_exact_direction_and_requirements
 openswap maker::lightning_handlers::tests::directions_are_bounded_by_opposite_channel_sides
+openswap maker::lightning_handlers::tests::electrum_lookup_failure_leaves_the_refund_to_the_utxo_check
 openswap maker::lightning_handlers::tests::old_core_can_refund_an_unspent_swap_out
 openswap maker::lightning_handlers::tests::only_a_rejection_leaves_the_connection_unpromoted
 openswap maker::lightning_handlers::tests::only_the_recorded_refund_is_ours
