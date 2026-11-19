@@ -218,9 +218,15 @@ node running — or re-run `recover` later — until it reports the swap as
 resolved. A maker restarting mid-swap recovers the same way: its records are
 restored into the live swap map on startup so it can still sweep or refund.
 
+After a swap-out, the taker keeps the swap's record until its on-chain claim
+confirms. `recover` sends the same claim again if it dropped out of the
+mempool, and removes the record once the claim is confirmed. If the maker's
+funding reply was lost after you paid, `recover` asks the maker for it again
+before claiming.
+
 ## Upgrading and downgrading
 
-Lightning swap state lives in your wallet file. A build without the `lightning` feature refuses a wallet that holds Lightning swaps and names the missing feature. Build with `--features lightning` to open it. The upgrade steps for the wallet itself are in the [maker doc](makerd.md#upgrading-and-downgrading) and the [taker doc](taker.md#upgrading-and-downgrading).
+Lightning swap state lives in your wallet file. A build without the `lightning` feature refuses a wallet that holds Lightning swaps and names the missing feature. Build with `--features lightning` to open it. A taker wallet holding a paid swap-out whose funding reply was lost needs `ln-funding-resume`, so an older build refuses it rather than deleting the record. The upgrade steps for the wallet itself are in the [maker doc](makerd.md#upgrading-and-downgrading) and the [taker doc](taker.md#upgrading-and-downgrading).
 
 ## Current limitations
 

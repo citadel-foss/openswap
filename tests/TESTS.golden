@@ -165,6 +165,7 @@ openswap protocol::features::tests::pins_take_only_mutual_names_for_the_flow
 openswap protocol::features::tests::registry_names_are_valid_and_lightning_needs_the_cargo_feature
 openswap protocol::features::tests::require_features_fails_closed_on_bad_names
 openswap protocol::features::tests::requirements_bind_only_their_own_flows_but_unknown_ones_bind_all
+openswap protocol::features::tests::storage_only_names_change_no_flow
 openswap protocol::features::tests::versions_split_only_on_a_canonical_suffix
 openswap protocol::lightning_messages::tests::compat_lightning_requests_keep_pins_and_bitcoin_fields
 openswap protocol::lightning_messages::tests::lightning_offer_field_is_forward_and_backward_compatible
@@ -211,7 +212,17 @@ openswap taker::config::tests::test_missing_file
 openswap taker::config::tests::test_valid_config
 openswap taker::config::tests::unreadable_values_are_refused
 openswap taker::lightning_swap::tests::cltv_delta_above_u16_is_rejected_not_truncated
+openswap taker::lightning_swap::tests::kept_claim_is_dropped_only_once_confirmed
+openswap taker::lightning_swap::tests::kept_claim_is_rebuilt_unchanged_after_eviction
+openswap taker::lightning_swap::tests::legacy_paid_swap_out_is_kept_until_its_payment_fails
+openswap taker::lightning_swap::tests::lost_funding_reply_is_resumed_and_claimed
 openswap taker::lightning_swap::tests::oversized_amounts_are_rejected_not_wrapped
+openswap taker::lightning_swap::tests::resolved_first_hop_drops_second_hop_without_asking_the_maker
+openswap taker::lightning_swap::tests::resumed_funding_is_checked_before_it_is_recorded
+openswap taker::lightning_swap::tests::screened_out_resent_funding_is_dropped_unclaimed
+openswap taker::lightning_swap::tests::swap_in_records_keep_their_recovery_behaviour
+openswap taker::lightning_swap::tests::unfunded_records_are_dropped_only_when_nothing_was_funded
+openswap taker::lightning_swap::tests::unsaved_payout_script_broadcasts_nothing
 openswap taker::offers::tests::a_ban_is_never_pruned_or_polled
 openswap taker::offers::tests::a_ban_is_terminal_and_persists
 openswap taker::offers::tests::a_ban_is_visible_by_address_wherever_it_sits
@@ -583,6 +594,7 @@ openswap wallet::storage::tests::compat_wallet_headers_authenticate_and_bare_fil
 openswap wallet::storage::tests::compat_wallet_requirements_precede_password_and_decryption
 openswap wallet::storage::tests::encrypted_wallet_without_password_says_password_required
 openswap wallet::storage::tests::failed_first_write_leaves_no_wallet_file
+openswap wallet::storage::tests::funding_resume_record_refuses_older_readers_until_funded
 openswap wallet::storage::tests::legacy_tracker_predicates_match_v023
 openswap wallet::storage::tests::legacy_upgrade_archives_exact_inputs_and_seals_the_master_key
 openswap wallet::storage::tests::legacy_upgrade_refuses_before_creating_archives
@@ -718,6 +730,7 @@ openswap::integration lightning::e2e::lightning_submarine_swaps_e2e
 openswap::integration lightning::e2e::lightning_swap_in_refuses_announced_value_mismatch
 openswap::integration lightning::e2e::lightning_swap_in_refuses_blocklisted_funding
 openswap::integration lightning::e2e::lightning_swap_out_refuses_blocklisted_funding
+openswap::integration lightning::e2e::lightning_swap_out_resumes_after_a_lost_funding_reply
 openswap::integration lightning::maker_restart::conditional_paid_store_refuses_stale_copy
 openswap::integration lightning::maker_restart::forged_swap_in_funding_keeps_accepted_swap
 openswap::integration lightning::maker_restart::lightning_maker_closes_a_refund_at_finality_depth

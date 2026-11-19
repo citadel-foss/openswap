@@ -689,6 +689,18 @@ impl OfferSyncClient {
 }
 
 impl OfferSyncHandle {
+    /// A handle with no sync thread behind it, for tests that build a taker
+    /// without discovery.
+    #[cfg(all(test, feature = "lightning"))]
+    pub(crate) fn idle(offerbook: OfferBookHandle) -> Self {
+        Self {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            join: None,
+            cmd_tx: mpsc::channel().0,
+            offerbook,
+        }
+    }
+
     /// Shutdown handler
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);

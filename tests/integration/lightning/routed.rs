@@ -133,13 +133,17 @@ fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) 
         max_bound
     );
 
-    // Both hops resolved: no recovery records left behind.
+    // Hop 1's record went with the swap. Hop 2's stays until its claim
+    // confirms, so recovery finds that spend now and drops it.
     let outcomes = taker.recover_lightning_swaps().unwrap();
+    assert_eq!(outcomes.len(), 1, "{:?}", outcomes);
     assert!(
-        outcomes.is_empty(),
-        "no pending lightning swaps should remain, got: {:?}",
+        outcomes[0].starts_with(&format!("{}-out: ", report.swap_id))
+            && (outcomes[0].contains("already resolved") || outcomes[0].contains("recovered via")),
+        "the kept hop-2 record must resolve on its confirmed claim, got: {:?}",
         outcomes
     );
+    assert!(taker.recover_lightning_swaps().unwrap().is_empty());
 }
 
 /// With screening on, the taker must refuse to claim hop 2 when the second
@@ -192,13 +196,14 @@ fn lightning_routed_swap_refuses_blocklisted_second_hop(world: &mut World) {
         ),
     }
 
-    // Hop 2 was refused before its outpoint was recorded, so recovery drops
-    // it unclaimed. Hop 1 refunds once its timelock matures.
+    // Hop 2 was refused before its outpoint was recorded. Recovery asks the
+    // second maker again, screens the funding the same way, and drops hop 2
+    // unclaimed. Hop 1 refunds once its timelock matures.
     let history = recover_all_lightning_swaps(taker, Duration::from_secs(300));
     assert!(
         history
             .iter()
-            .any(|line| line.ends_with("-out: no on-chain commitment; forgotten")),
+            .any(|line| line.ends_with("-out: funding refused by screening; forgotten")),
         "hop 2 must be dropped unclaimed, got: {:?}",
         history
     );

@@ -124,13 +124,17 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
             >= 1
     );
 
-    // Both swaps fully resolved: no taker-side recovery records remain.
+    // The swap-in record went with the swap. The swap-out record stays until
+    // its claim confirms, so recovery finds that spend now and drops it.
     let outcomes = taker.recover_lightning_swaps().unwrap();
+    assert_eq!(outcomes.len(), 1, "{:?}", outcomes);
     assert!(
-        outcomes.is_empty(),
-        "no pending lightning swaps should remain, got: {:?}",
+        outcomes[0].starts_with(&format!("{}: ", swap_out.swap_id))
+            && (outcomes[0].contains("already resolved") || outcomes[0].contains("recovered via")),
+        "the kept swap-out record must resolve on its confirmed claim, got: {:?}",
         outcomes
     );
+    assert!(taker.recover_lightning_swaps().unwrap().is_empty());
 
     // The maker read the preimage from the taker's claim and settled the held
     // payment: the taker's node reports it settled with the swap's preimage.
@@ -456,13 +460,92 @@ fn lightning_swap_out_refuses_blocklisted_funding(world: &mut World) {
         ),
     }
 
-    // Refused before the outpoint was recorded, so recovery holds nothing
-    // that could claim the listed coins later.
+    // Refused before the outpoint was recorded. Recovery asks the maker for
+    // the funding again, screens it the same way, and drops the record, so
+    // nothing is left that could claim the listed coins later.
     let outcomes = taker.recover_lightning_swaps().unwrap();
     assert_eq!(outcomes.len(), 1, "{:?}", outcomes);
     assert!(
-        outcomes[0].contains("no on-chain commitment"),
+        outcomes[0].contains("funding refused by screening; forgotten"),
         "{:?}",
         outcomes
+    );
+    assert!(taker.recover_lightning_swaps().unwrap().is_empty());
+}
+
+/// A taker that loses the funding reply after paying keeps its record. On
+/// recovery it repeats `SwapOutPaid` on a new connection, gets the same
+/// funding back from the maker, claims it, and drops the record once the
+/// claim confirms. The maker then settles the held payment.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [(maker_ln, taker_ln) = maker_and_taker_nodes()],
+    maker_behaviors = [Normal],
+    takers = [DropSwapOutFundingReply],
+    maker_lightning = [maker_ln],
+    taker_lightning = [taker_ln.clone()],
+    setup = [
+        fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        start_makers(120),
+    ],
+)]
+fn lightning_swap_out_resumes_after_a_lost_funding_reply(
+    world: &mut World,
+    taker_ln: Arc<MockLightningBackend>,
+) {
+    let maker = world.makers()[0].inner().clone();
+    let maker_address = world.makers()[0].address();
+    let taker = world.taker_mut().inner_mut();
+    let error = taker
+        .lightning_swap_out(LnSwapParams {
+            amount: Amount::from_sat(40_000),
+            maker_address: Some(maker_address),
+            locktime: Some(30),
+            min_confirmations: 1,
+        })
+        .expect_err("the taker drops the connection before the funding reply");
+    log::info!("swap-out stopped before its funding reply: {error:?}");
+
+    let history = recover_all_lightning_swaps(taker, Duration::from_secs(300));
+    let swap_id = history
+        .first()
+        .and_then(|line| line.split_once(": "))
+        .map(|(id, _)| id.to_string())
+        .expect("recovery reports the swap");
+    let reported = |text: &str| {
+        history
+            .iter()
+            .any(|line| line.starts_with(&swap_id) && line.contains(text))
+    };
+    assert!(
+        !reported("forgotten"),
+        "the paid swap-out must not be dropped, got: {:?}",
+        history
+    );
+    assert!(
+        reported("awaiting confirmation"),
+        "recovery must claim the resent funding, got: {:?}",
+        history
+    );
+    assert!(
+        reported("already resolved") || reported("recovered via"),
+        "the record must go once the claim confirms, got: {:?}",
+        history
+    );
+
+    // Recovery sends no `SwapOutClaimed`, so the maker finds the claim on its
+    // watchdog pass, reads the preimage from it, and settles the payment.
+    let hash: sha256::Hash = swap_id.parse().unwrap();
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_secs(1),
+        "the maker to settle the held payment",
+        {
+            ln_watchdog_tick_now(&maker);
+            matches!(
+                taker_ln.payment_outcome(hash),
+                Ok(PaymentOutcome::Settled(_))
+            )
+        }
     );
 }
