@@ -481,7 +481,8 @@ pub struct LnMakerSwapRecord {
     pub funding_value: Option<bitcoin::Amount>,
     /// Refund timing. Swap-in: the block that confirmed the funding, where the
     /// taker's CSV refund window starts. Swap-out: the chain tip when the
-    /// maker broadcast its funding.
+    /// maker broadcast its funding, which the watchdog replaces with the block
+    /// that confirmed the funding on the active chain.
     pub funding_height: Option<u32>,
     /// Hold-invoice claim deadline, retained for recovery warnings after restart.
     /// Older records lack it. This field does not authorize financial actions.

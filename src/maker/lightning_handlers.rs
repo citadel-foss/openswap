@@ -2979,9 +2979,9 @@ mod tests {
         }
     }
 
-    /// A reorg that moves the funding to a later block moves the CSV window
-    /// with it, also for a swap restored from its saved record, whose height
-    /// an earlier pass has already corrected.
+    /// A corrected height is saved to the wallet file and survives a restart.
+    /// A reorg that later moves the funding to another block moves the CSV
+    /// window with it, also for the restored swap.
     #[test]
     fn swap_out_refund_follows_a_reorg_after_restart() {
         let dir = bitcoind::tempfile::tempdir().unwrap();
@@ -2991,6 +2991,17 @@ mod tests {
         let node = Arc::new(Mutex::new(chain_with(Some((&funding, 10)), 50)));
         let (maker, ctx, broadcast) =
             csv_gate_maker(dir.path(), &swap, node.clone(), Default::default());
+        let read_wallet_file = || {
+            crate::wallet::WalletStore::read_from_disk(
+                &dir.path().join("wallet"),
+                Some("test-password".to_string()),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            read_wallet_file().0.ln_maker_swaps[&id].funding_height,
+            Some(9)
+        );
 
         watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
         assert_eq!(
@@ -2998,10 +3009,25 @@ mod tests {
             (Some(10), None, Some(10), None)
         );
 
-        // A restart rebuilds the swap from the saved record.
-        let record = maker.wallet.read().unwrap().store.ln_maker_swaps[&id].clone();
-        let restored = LnMakerSwap::from_record(record);
-        assert_eq!(restored.funding_height, Some(10));
+        // A restart reads the wallet file and rebuilds the swap map from it.
+        // Both replace what this maker holds in memory.
+        let (store, material) = read_wallet_file();
+        let restored = LnMakerSwap::from_record(store.ln_maker_swaps[&id].clone());
+        assert_eq!(
+            restored.funding_height,
+            Some(10),
+            "the corrected height was not saved"
+        );
+        {
+            let mut wallet = maker.wallet.write().unwrap();
+            wallet.store = store;
+            wallet.store_enc_material = material;
+        }
+        maker
+            .ln_swaps
+            .lock()
+            .unwrap()
+            .insert(id.clone(), restored.clone());
 
         // A reorg drops the funding's block, and the funding confirms again
         // at 13. At 70 the CSV counted from 10 has passed, not from 13.
