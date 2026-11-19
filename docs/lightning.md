@@ -218,9 +218,11 @@ node running — or re-run `recover` later — until it reports the swap as
 resolved. A maker restarting mid-swap recovers the same way: its records are
 restored into the live swap map on startup so it can still sweep or refund.
 
-After a swap-out, the taker keeps the swap's record until its on-chain claim
-confirms. `recover` sends the same claim again if it dropped out of the
-mempool, and removes the record once the claim is confirmed. If the maker's
+After a swap-out, the taker keeps the swap's record until a spend of the
+HTLC confirms. `recover` sends the same claim again if it dropped out of the
+mempool, and removes the record once a spend is confirmed. That spend is
+usually your claim, but a maker's refund also ends the record, so its removal
+alone does not prove you were paid. If the maker's
 funding reply was lost after you paid, `recover` asks the maker for it again
 before claiming.
 

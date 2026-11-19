@@ -522,8 +522,10 @@ fn lightning_swap_out_resumes_after_a_lost_funding_reply(
         "the paid swap-out must not be dropped, got: {:?}",
         history
     );
+    // A block can land between the broadcast and the spend check, so the
+    // pass that claims reports either outcome; both follow its broadcast.
     assert!(
-        reported("awaiting confirmation"),
+        reported("awaiting confirmation") || reported("recovered via"),
         "recovery must claim the resent funding, got: {:?}",
         history
     );
