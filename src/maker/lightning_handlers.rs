@@ -386,8 +386,9 @@ fn ln_fee(base_fee: u64, amount_relative_fee_pct: f64, amount: Amount) -> Amount
 
 /// Why a new swap-out is refused (#1239).
 ///
-/// The taker can claim a swap-out HTLC through its hashlock until the
-/// maker's CSV refund opens, `locktime` blocks after the funding confirms.
+/// The taker can claim a swap-out HTLC through its hashlock until the output
+/// is spent. The maker's competing CSV refund becomes valid `locktime` blocks
+/// after the funding confirms.
 /// The maker gets paid only if the held Lightning payment is still held when
 /// that claim reveals the preimage. Admission can only estimate when the
 /// funding will confirm, and nothing afterwards enforces the estimate, so a
