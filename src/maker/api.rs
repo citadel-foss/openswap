@@ -3711,6 +3711,7 @@ impl MakerTrait for MakerServer {
         swap_id: &str,
         expected: super::lightning_handlers::LnMakerPhase,
         outpoint: OutPoint,
+        previous: Option<u32>,
         height: u32,
     ) -> Result<bool, MakerError> {
         // Same lock order as store_ln_swap_if_phase, so the check and the
@@ -3721,7 +3722,7 @@ impl MakerTrait for MakerServer {
         let in_memory = swaps.get(swap_id).is_some_and(|swap| {
             swap.phase == expected
                 && swap.funding.map(|(funded, _)| funded) == Some(outpoint)
-                && swap.funding_height.is_none()
+                && swap.funding_height == previous
         });
         let on_disk = wallet
             .store
@@ -3730,7 +3731,7 @@ impl MakerTrait for MakerServer {
             .is_some_and(|record| {
                 record.phase == expected
                     && record.funding_outpoint == Some(outpoint)
-                    && record.funding_height.is_none()
+                    && record.funding_height == previous
             });
         if !(in_memory && on_disk) {
             return Ok(false);
@@ -3744,7 +3745,7 @@ impl MakerTrait for MakerServer {
             // Put the record back, so the wallet store still matches the map
             // and the disk.
             if let Some(record) = wallet.store.ln_maker_swaps.get_mut(swap_id) {
-                record.funding_height = None;
+                record.funding_height = previous;
             }
             return Err(MakerError::Wallet(e));
         }

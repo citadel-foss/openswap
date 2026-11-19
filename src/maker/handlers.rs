@@ -725,15 +725,17 @@ pub trait Maker: Send + Sync {
     }
 
     /// Set a Lightning swap's `funding_height`, but only while the stored swap
-    /// is still in `expected`, still funded at `outpoint` and still has no
-    /// height. Only that field changes, so whatever else another writer has
-    /// stored is kept. Returns whether the height was stored.
+    /// is still in `expected`, still funded at `outpoint` and still has the
+    /// height `previous` the caller read. Only that field changes, so whatever
+    /// else another writer has stored is kept. Returns whether the height was
+    /// stored.
     #[cfg(feature = "lightning")]
     fn fill_ln_funding_height(
         &self,
         _swap_id: &str,
         _expected: super::lightning_handlers::LnMakerPhase,
         _outpoint: bitcoin::OutPoint,
+        _previous: Option<u32>,
         _height: u32,
     ) -> Result<bool, MakerError> {
         Err(MakerError::General("lightning swaps not supported"))
