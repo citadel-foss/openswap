@@ -2336,6 +2336,14 @@ mod tests {
         assert!(offer.swap_in && offer.max_swap_in > offer.min_size);
         assert!(!offer.swap_out, "swap-out must not be advertised");
         assert_eq!(offer.max_swap_out, 0);
+        // A second read within LN_OFFER_TTL comes from the cache, which holds
+        // the offer as computed, swap-out included. It must be withheld there
+        // too.
+        assert_eq!(
+            Maker::lightning_offer(maker.as_ref()),
+            Some(offer),
+            "a cached offer must not advertise swap-out"
+        );
 
         let swap_out_only = LightningOffer {
             swap_in: false,
