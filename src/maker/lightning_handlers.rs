@@ -1700,17 +1700,11 @@ fn watchdog_resolve_swap_out(
                     })
                 }
                 Ok(None) => answer,
-                // The lookup's failure does not invalidate our recorded
-                // refund. Its confirmation checks below still distinguish
-                // our refund from a rival claim before failing Lightning.
-                Err(_)
-                    if matches!(&answer, Ok(WatcherEvent::UtxoSpent {
-                    spending_tx: Some(tx), ..
-                }) if is_our_refund(swap, tx)) =>
-                {
-                    answer
-                }
-                Err(e) => return Err(e),
+                // A failed lookup says nothing about the HTLC, so fall back
+                // to the watcher's answer and look again next pass. A refund
+                // still needs the chain to show the exact outpoint unspent,
+                // and closing still needs our refund final on the chain.
+                Err(_) => answer,
             }
         }
     };
@@ -2082,7 +2076,7 @@ mod tests {
                     "getrawtransaction" => {
                         let mut tx = claim.clone();
                         match mode.load(Ordering::SeqCst) {
-                            2 => tx.input[0].previous_output.vout += 1,
+                            2 => tx.input[0].previous_output.vout ^= 1,
                             3 => {
                                 let witness: Vec<_> = tx.input[0].witness.iter().collect();
                                 tx.input[0].witness = bitcoin::Witness::from_slice(&[
@@ -2100,6 +2094,7 @@ mod tests {
                     other => panic!("unexpected RPC {}", other),
                 }
             });
+            let watcher_fails = matches!(answer, WatcherEvent::Error(_));
             let inner = Arc::get_mut(&mut maker).unwrap();
             inner.watch_service.shutdown();
             inner.watch_service = answering(answer);
@@ -2129,8 +2124,18 @@ mod tests {
             for state in [0, 1, 2, 3] {
                 mode.store(state, Ordering::SeqCst);
                 let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
-                if state != 0 {
-                    assert!(result.is_err());
+                match state {
+                    // A failed lookup falls back to the watcher's answer,
+                    // which is an error only when the watcher failed.
+                    1 => assert_eq!(result.is_err(), watcher_fails, "state 1: {:?}", result),
+                    2 => assert!(
+                        matches!(&result, Err(MakerError::General(msg))
+                            if *msg == "lookup returned a different HTLC spend"),
+                        "state 2: {:?}",
+                        result
+                    ),
+                    3 => assert!(result.is_err(), "state 3: {:?}", result),
+                    _ => {}
                 }
                 assert!(maker.get_ln_swap(&id).unwrap().is_some());
                 assert!(ln.poll_event().unwrap().is_none());
@@ -2593,6 +2598,172 @@ mod tests {
     fn old_core_can_refund_an_unspent_swap_out() {
         refund_after_lookup(false, true);
     }
+
+    /// On Electrum the direct spend lookup fails while the HTLC script's
+    /// history lists a transaction the server cannot serve, as anyone can pay
+    /// to that script. The failure says nothing about the HTLC, so the refund
+    /// decision falls to the live UTXO check of the exact outpoint: refund
+    /// only when it shows the outpoint unspent, no refund when it shows it
+    /// spent, and no decision when it fails. The held payment is untouched.
+    #[test]
+    fn electrum_lookup_failure_leaves_the_refund_to_the_utxo_check() {
+        use crate::{
+            lightning::{InvoiceParams, MockLightningBackend},
+            wallet::{
+                blockchain::{mock_electrum, BackendConnector},
+                AnyBlockchain, BackendConfig, Electrum, ElectrumConfig,
+            },
+            watch_tower::service::answering,
+        };
+        use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn, TxOut, Txid};
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Utxo {
+            Unspent,
+            Spent,
+            Fails,
+        }
+        for utxo in [Utxo::Unspent, Utxo::Spent, Utxo::Fails] {
+            let dir = bitcoind::tempfile::tempdir().unwrap();
+            let mut maker = compat_test_maker(dir.path(), vec![]);
+            let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+            let preimage = swap.preimage.take().unwrap();
+            swap.payout_script = Some(ScriptBuf::new());
+            let value = swap.funding.unwrap().1;
+            let htlc_spk = swap.htlc.script_pubkey().unwrap();
+            let funding = bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![TxIn::default()],
+                output: vec![TxOut {
+                    value,
+                    script_pubkey: htlc_spk.clone(),
+                }],
+            };
+            let outpoint = OutPoint::new(funding.compute_txid(), 0);
+            // Past the CSV: funded at 10, locktime 60, tip 100.
+            swap.funding = Some((outpoint, value));
+            swap.funding_height = Some(10);
+            let deposit = bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: htlc_spk,
+                }],
+            };
+            let (funding_id, deposit_id) = (
+                funding.compute_txid().to_string(),
+                deposit.compute_txid().to_string(),
+            );
+            let broadcasts = Arc::new(AtomicUsize::new(0));
+            let server = mock_electrum({
+                let broadcasts = broadcasts.clone();
+                let funding_hex = serialize_hex(&funding);
+                move |method, params| match method {
+                    "blockchain.scripthash.get_history" => Ok(json!([
+                        { "tx_hash": funding_id, "height": 10 },
+                        { "tx_hash": deposit_id, "height": 0 },
+                    ])),
+                    "blockchain.scripthash.listunspent" => match utxo {
+                        Utxo::Unspent => Ok(json!([{
+                            "tx_hash": funding_id, "tx_pos": 0, "height": 10,
+                            "value": value.to_sat(),
+                        }])),
+                        Utxo::Spent => Ok(json!([])),
+                        Utxo::Fails => Err(json!({ "code": 1, "message": "daemon error" })),
+                    },
+                    "blockchain.transaction.get" if params[0] == json!(funding_id) => {
+                        Ok(json!(funding_hex))
+                    }
+                    // The deposit is listed but cannot be served.
+                    "blockchain.transaction.get" => {
+                        Err(json!({ "code": 1, "message": "daemon error" }))
+                    }
+                    "blockchain.transaction.broadcast" => {
+                        broadcasts.fetch_add(1, Ordering::SeqCst);
+                        Err(json!({ "code": 1, "message": "test rejection" }))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            });
+            server.set_tip(
+                100,
+                &bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
+            );
+            let config = ElectrumConfig {
+                url: server.url.clone(),
+                max_retries: 0,
+                ..Default::default()
+            };
+            let inner = Arc::get_mut(&mut maker).unwrap();
+            inner.watch_service.shutdown();
+            inner.watch_service = answering(WatcherEvent::UtxoSpent {
+                outpoint,
+                spending_tx: None,
+            });
+            inner.wallet.write().unwrap().blockchain =
+                AnyBlockchain::Electrum(Electrum::new(&config).unwrap());
+            inner.backend = BackendConnector::new(
+                BackendConfig::Electrum(config),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let ln = Arc::new(MockLightningBackend::new());
+            ln.create_hold_invoice(swap.payment_hash, InvoiceParams::default())
+                .unwrap();
+            ln.simulate_htlc_arrival(swap.payment_hash, 40_000_000);
+            while ln.poll_event().unwrap().is_some() {}
+            let ctx = LnContext {
+                ln: ln.clone(),
+                router: LnEventRouter::new(ln.clone()),
+            };
+            let id = swap.payment_hash.to_string();
+            maker.store_ln_swap(&id, swap.clone()).unwrap();
+
+            let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
+
+            assert_eq!(
+                result.is_err(),
+                utxo == Utxo::Fails,
+                "{:?}: {:?}",
+                utxo,
+                result
+            );
+            let stored = maker
+                .get_ln_swap(&id)
+                .unwrap()
+                .expect("the swap was removed");
+            assert_eq!(
+                stored.refund_txid.is_some(),
+                utxo == Utxo::Unspent,
+                "{:?}: refund recorded",
+                utxo
+            );
+            assert_eq!(
+                broadcasts.load(Ordering::SeqCst) > 0,
+                utxo == Utxo::Unspent,
+                "{:?}: refund broadcast",
+                utxo
+            );
+            assert!(
+                ln.poll_event().unwrap().is_none(),
+                "{:?}: Lightning changed",
+                utxo
+            );
+            assert!(
+                ln.claim_held_payment(&preimage).is_ok(),
+                "{:?}: the held payment was not kept",
+                utxo
+            );
+            maker.watch_service.shutdown();
+        }
+    }
     #[test]
     fn recorded_refund_recovery_survives_direct_lookup_failure() {
         use crate::{
@@ -2731,13 +2902,7 @@ mod tests {
                 );
             }
             let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
-            assert_eq!(
-                result.is_err(),
-                case == 3 || case == 4,
-                "case {}: {:?}",
-                case,
-                result
-            );
+            assert_eq!(result.is_err(), case == 3, "case {}: {:?}", case, result);
             assert_eq!(broadcast.load(Ordering::SeqCst), case == 0, "case {}", case);
             assert_eq!(
                 maker.get_ln_swap(&id).unwrap().is_none(),
