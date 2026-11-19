@@ -92,12 +92,14 @@ openswap maker::legacy_verification::tests::locktime_that_overflows_the_refund_s
 openswap maker::legacy_verification::tests::normal_locktime_is_accepted
 openswap maker::lightning_handlers::tests::compat_lightning_pins_require_exact_direction_and_requirements
 openswap maker::lightning_handlers::tests::directions_are_bounded_by_opposite_channel_sides
+openswap maker::lightning_handlers::tests::offer_withholds_swap_out_while_admission_is_closed
 openswap maker::lightning_handlers::tests::only_a_rejection_leaves_the_connection_unpromoted
 openswap maker::lightning_handlers::tests::only_the_recorded_refund_is_ours
 openswap maker::lightning_handlers::tests::persisted_record_survives_serialization_and_still_spends
 openswap maker::lightning_handlers::tests::recorded_spend_stays_spent
 openswap maker::lightning_handlers::tests::refund_waits_for_the_chain_to_say_unspent
 openswap maker::lightning_handlers::tests::swap_out_limit_leaves_inbound_room_for_the_fee
+openswap maker::lightning_handlers::tests::swap_out_request_is_refused_before_any_side_effect
 openswap maker::lightning_handlers::tests::unfunded_record_round_trips_without_funding
 openswap maker::lightning_handlers::tests::unusable_channels_and_dust_capacity_disable_a_direction
 openswap maker::lightning_handlers::tests::wallet_caps_only_the_swap_out_direction
@@ -750,6 +752,7 @@ openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_without_p
 openswap::integration lightning::maker_restart::watchdog_releases_swap_in_missing_funding_height
 openswap::integration lightning::offer_limits::maker_serves_only_the_direction_it_has_capacity_for
 openswap::integration lightning::routed::lightning_routed_swap_e2e
+openswap::integration lightning::routed::lightning_routed_swap_is_refused_before_hop_one_funding
 openswap::integration lightning::routed::lightning_routed_swap_refuses_blocklisted_second_hop
 openswap::integration lightning::swap_in::swap_in_happy_path
 openswap::integration lightning::swap_in::swap_in_refund_path
