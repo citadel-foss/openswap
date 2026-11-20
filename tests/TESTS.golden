@@ -213,9 +213,13 @@ openswap taker::config::tests::test_valid_config
 openswap taker::config::tests::unreadable_values_are_refused
 openswap taker::lightning_swap::tests::cltv_delta_above_u16_is_rejected_not_truncated
 openswap taker::lightning_swap::tests::failed_payout_script_save_is_not_kept_in_memory
+openswap taker::lightning_swap::tests::first_claim_needs_the_agreed_confirmations
 openswap taker::lightning_swap::tests::first_claim_of_a_funded_record_waits_for_the_refund_window
+openswap taker::lightning_swap::tests::first_hop_check_is_refused_when_the_chain_moves_during_it
 openswap taker::lightning_swap::tests::first_recovery_pass_reads_the_tip_before_any_history
 openswap taker::lightning_swap::tests::funded_records_are_claimed_before_any_maker_is_asked
+openswap taker::lightning_swap::tests::funding_count_is_refused_when_the_chain_moves_during_it
+openswap taker::lightning_swap::tests::funding_count_is_refused_when_the_tip_cannot_be_read
 openswap taker::lightning_swap::tests::kept_claim_is_dropped_only_once_confirmed
 openswap taker::lightning_swap::tests::kept_claim_is_rebuilt_unchanged_after_eviction
 openswap taker::lightning_swap::tests::legacy_paid_swap_out_is_kept_until_its_payment_fails

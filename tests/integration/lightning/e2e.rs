@@ -442,6 +442,43 @@ fn lightning_swap_out_refuses_blocklisted_funding(world: &mut World) {
         )
         .unwrap();
 
+    // Hold the chain and confirm the funding with one block. The framework
+    // mines 5 blocks every 3 s while the swap rechecks an unconfirmed funding
+    // every 10 s, which can carry it past the refund window that recovery
+    // checks before it screens (30 blocks after it confirms, less the
+    // 12-block margin).
+    let framework = world.framework().clone();
+    let maker = world.makers()[0].inner().clone();
+    framework.set_block_gen_paused(true);
+    let confirm_funding = {
+        let (framework, maker) = (framework.clone(), maker.clone());
+        thread::spawn(move || {
+            let mut funding = None;
+            wait_until!(
+                Duration::from_secs(60),
+                every Duration::from_millis(200),
+                "the maker to broadcast the swap-out funding",
+                {
+                    funding = maker
+                        .ln_swaps
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .find_map(|swap| swap.funding);
+                    funding.is_some_and(|(outpoint, _)| {
+                        framework
+                            .bitcoind
+                            .client
+                            .get_raw_transaction(&outpoint.txid, None)
+                            .is_ok()
+                    })
+                }
+            );
+            generate_blocks(&framework.bitcoind, 1);
+            funding.unwrap().0
+        })
+    };
+
     let maker_address = world.makers()[0].address();
     let taker = world.taker_mut().inner_mut();
     match taker.lightning_swap_out(LnSwapParams {
@@ -460,6 +497,20 @@ fn lightning_swap_out_refuses_blocklisted_funding(world: &mut World) {
         ),
     }
 
+    let funding = confirm_funding.join().unwrap();
+    let confirmations = framework
+        .bitcoind
+        .client
+        .get_raw_transaction_info(&funding.txid, None)
+        .unwrap()
+        .confirmations
+        .unwrap_or(0);
+    assert!(
+        (1..=18).contains(&confirmations),
+        "funding has {} confirmations",
+        confirmations
+    );
+
     // Refused before the outpoint was recorded. Recovery asks the maker for
     // the funding again, screens it the same way, and drops the record, so
     // nothing is left that could claim the listed coins later.
@@ -471,6 +522,18 @@ fn lightning_swap_out_refuses_blocklisted_funding(world: &mut World) {
         outcomes
     );
     assert!(taker.recover_lightning_swaps().unwrap().is_empty());
+    // Nothing claimed the listed coins, not even in the mempool.
+    assert!(
+        framework
+            .bitcoind
+            .client
+            .get_tx_out(&funding.txid, funding.vout, Some(true))
+            .unwrap()
+            .is_some(),
+        "the refused funding was spent"
+    );
+
+    framework.set_block_gen_paused(false);
 }
 
 /// A taker that loses the funding reply after paying keeps its record. On

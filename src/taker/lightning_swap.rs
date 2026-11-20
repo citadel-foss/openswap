@@ -1173,27 +1173,44 @@ impl Taker {
             // A claim reveals the preimage. This build saves the payout
             // script just before a record's first claim, so a funded
             // swap-out record with resume data and no script has never sent
-            // one: like resumed funding, its first claim waits for the refund
-            // window. A claim already sent is always sent again, and a record
-            // from an older build, without resume data, is claimed as before.
-            let unsent = !record.is_swap_in
-                && record.outpoint.is_some()
-                && record.resume.is_some()
-                && record.payout_script.is_none();
-            let withheld = if unsent {
-                match funding_confirmations(&self.read_wallet()?.blockchain, &outpoint.txid) {
-                    Ok(confirmations) if claim_window_open(confirmations, record.locktime) => None,
-                    Ok(confirmations) => Some(format!(
-                        "claim withheld: funding has {confirmations} of the {} confirmations \
-                         before the maker can refund",
-                        record.locktime
-                    )),
-                    Err(e) => Some(format!(
-                        "claim withheld: funding confirmations unknown: {e:?}"
-                    )),
+            // one: like resumed funding, its first claim needs the agreed
+            // confirmations and waits for the refund window. A claim already
+            // sent is always sent again, and a record from an older build,
+            // without resume data, is claimed as before.
+            let unsent = match &record.resume {
+                Some(resume)
+                    if !record.is_swap_in
+                        && record.outpoint.is_some()
+                        && record.payout_script.is_none() =>
+                {
+                    Some(resume)
                 }
-            } else {
-                None
+                _ => None,
+            };
+            let withheld = match unsent {
+                Some(resume) => {
+                    match funding_confirmations(&self.read_wallet()?.blockchain, &outpoint.txid) {
+                        Ok(confirmations) if confirmations < resume.min_confirmations => {
+                            Some(format!(
+                                "claim withheld: funding has {confirmations} of the {} \
+                                 confirmations agreed",
+                                resume.min_confirmations
+                            ))
+                        }
+                        Ok(confirmations) if claim_window_open(confirmations, record.locktime) => {
+                            None
+                        }
+                        Ok(confirmations) => Some(format!(
+                            "claim withheld: funding has {confirmations} of the {} confirmations \
+                             before the maker can refund",
+                            record.locktime
+                        )),
+                        Err(e) => Some(format!(
+                            "claim withheld: funding confirmations unknown: {e:?}"
+                        )),
+                    }
+                }
+                None => None,
             };
 
             // A record is the only copy of the key that reaches this HTLC, so
@@ -1291,24 +1308,24 @@ impl Taker {
                 .ok()?;
             let wallet = self.read_wallet().ok()?;
             let chain = &wallet.blockchain;
-            // Read the tip first. On Electrum a changed tip drops cached
-            // script answers, and a refund confirms only in a new block.
-            chain.get_block_count().ok()?;
-            if chain.is_confirmed_spend(&outpoint, &script).ok()? {
-                return Some(FirstHop::Spent);
-            }
-            // Our refund can be mined in the next block once the funding has
-            // `locktime` confirmations (BIP68), and recovery broadcasts it.
-            let confirmations = chain
-                .get_raw_transaction_info(&outpoint.txid, None)
-                .ok()?
-                .confirmations
-                .unwrap_or(0);
-            Some(if confirmations >= hop.locktime as u32 {
-                FirstHop::RefundMature
-            } else {
-                FirstHop::Unspent
+            on_one_chain(chain, || {
+                if chain.is_confirmed_spend(&outpoint, &script)? {
+                    return Ok(FirstHop::Spent);
+                }
+                // Our refund can be mined in the next block once the funding
+                // has `locktime` confirmations (BIP68), and recovery
+                // broadcasts it.
+                let confirmations = chain
+                    .get_raw_transaction_info(&outpoint.txid, None)?
+                    .confirmations
+                    .unwrap_or(0);
+                Ok(if confirmations >= hop.locktime as u32 {
+                    FirstHop::RefundMature
+                } else {
+                    FirstHop::Unspent
+                })
             })
+            .ok()
         };
         let decide = || unfunded_action(key, record, records, payment, first_hop);
         let Some(resume) = self.settle_unfunded(key, decide(), outcomes)? else {
@@ -1566,16 +1583,37 @@ fn check_resumed_funding(
     Ok(Some(funding_tx))
 }
 
-/// The funding's confirmations as the chain stands now. The tip is read
-/// first: on Electrum a changed tip drops cached script history, so the
-/// count never pairs history from before a reorg with a newer tip.
+/// Runs `read` between two reads of the best block and refuses its answer
+/// if the best block changed meanwhile, including a replacement at the same
+/// height: the answer could then mix history from before a reorg with a
+/// tip from after it. The first read also lets Electrum drop script history
+/// cached under an older tip.
+fn on_one_chain<T>(
+    chain: &AnyBlockchain,
+    read: impl FnOnce() -> Result<T, TakerError>,
+) -> Result<T, TakerError> {
+    use crate::wallet::blockchain::Blockchain;
+    let best = || -> Result<_, TakerError> {
+        let info = chain.get_blockchain_info()?;
+        Ok((info.blocks, info.best_block_hash))
+    };
+    let before = best()?;
+    let answer = read()?;
+    if best()? != before {
+        return Err(general("the chain changed during the lookup"));
+    }
+    Ok(answer)
+}
+
+/// The funding's confirmations, read on one chain (see [`on_one_chain`]).
 fn funding_confirmations(chain: &AnyBlockchain, txid: &Txid) -> Result<u32, TakerError> {
     use crate::wallet::blockchain::Blockchain;
-    chain.get_block_count()?;
-    Ok(chain
-        .get_raw_transaction_info(txid, None)?
-        .confirmations
-        .unwrap_or(0))
+    on_one_chain(chain, || {
+        Ok(chain
+            .get_raw_transaction_info(txid, None)?
+            .confirmations
+            .unwrap_or(0))
+    })
 }
 
 /// Whether a first claim still has `CLTV_SAFETY_MARGIN` blocks to itself
@@ -2866,6 +2904,249 @@ mod tests {
             "{:?}",
             result.as_ref().map(Option::is_some)
         );
+    }
+
+    /// A reorg lands during the confirmation lookup itself, right after the
+    /// backend read the funding's history: the funding goes back to the
+    /// mempool and the tip moves, to a new height in one case and to a
+    /// replacement at the same height in the other. The count would pair the
+    /// old history with the old tip, so it is refused rather than used.
+    #[test]
+    fn funding_count_is_refused_when_the_chain_moves_during_it() {
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let mut replacement = genesis;
+        replacement.nonce += 1;
+        for (height, header) in [(102, genesis), (101, replacement)] {
+            let dir = tempfile::tempdir().unwrap();
+            let chain = Arc::new(Mutex::new(Chain::default()));
+            let swap = swap_out("unused:1");
+            chain.lock().unwrap().set(&swap.funding, Some(100));
+            let (taker, server) = taker_with(dir.path(), &chain);
+            let server = Arc::new(server);
+            let reorg = {
+                let (server, funding) = (server.clone(), swap.funding.clone());
+                move |chain: &mut Chain| {
+                    chain.set(&funding, Some(0));
+                    server.set_tip(height, &header);
+                }
+            };
+            chain.lock().unwrap().after_history = Some((
+                scripthash(&swap.funding.output[0].script_pubkey),
+                Box::new(reorg),
+            ));
+            let resume = swap.record.resume.clone().unwrap();
+            let funded = LnHtlcFunded {
+                swap_id: swap.id.clone(),
+                outpoint: swap.outpoint,
+                value: AMOUNT,
+            };
+            let result = check_resumed_funding(
+                &taker.read_wallet().unwrap().blockchain,
+                &swap.id,
+                &swap.record,
+                &resume,
+                &funded,
+            );
+            assert!(chain.lock().unwrap().after_history.is_none());
+            assert!(
+                result.is_err(),
+                "tip {}: {:?}",
+                height,
+                result.as_ref().map(Option::is_some)
+            );
+        }
+    }
+
+    /// The count is used only when the best block was read both before and
+    /// after the funding's history. A tip that cannot be read at all, or only
+    /// after the history was read, refuses the count; a stable chain keeps
+    /// the funding.
+    #[test]
+    fn funding_count_is_refused_when_the_tip_cannot_be_read() {
+        const TIP: &str = "blockchain.headers.subscribe";
+        for case in ["stable", "no tip", "tip lost after history"] {
+            let dir = tempfile::tempdir().unwrap();
+            let chain = Arc::new(Mutex::new(Chain::default()));
+            let swap = swap_out("unused:1");
+            chain.lock().unwrap().set(&swap.funding, Some(100));
+            let (taker, server) = taker_with(dir.path(), &chain);
+            let server = Arc::new(server);
+            match case {
+                "no tip" => server.drop_requests_for(Some(TIP)),
+                "tip lost after history" => {
+                    let server = server.clone();
+                    chain.lock().unwrap().after_history = Some((
+                        scripthash(&swap.funding.output[0].script_pubkey),
+                        Box::new(move |_: &mut Chain| server.drop_requests_for(Some(TIP))),
+                    ));
+                }
+                _ => {}
+            }
+            let resume = swap.record.resume.clone().unwrap();
+            let funded = LnHtlcFunded {
+                swap_id: swap.id.clone(),
+                outpoint: swap.outpoint,
+                value: AMOUNT,
+            };
+            let result = check_resumed_funding(
+                &taker.read_wallet().unwrap().blockchain,
+                &swap.id,
+                &swap.record,
+                &resume,
+                &funded,
+            );
+            server.drop_requests_for(None);
+            let accepted = matches!(result, Ok(Some(_)));
+            assert_eq!(
+                accepted,
+                case == "stable",
+                "{}: {:?}",
+                case,
+                result.map(|_| ())
+            );
+            if case == "tip lost after history" {
+                assert!(chain.lock().unwrap().after_history.is_none());
+            }
+        }
+    }
+
+    /// A block confirming a spend of hop 1 lands during the hop-1 check,
+    /// right after the backend read hop 1's history. The check would see hop
+    /// 1 unspent under the old tip, so it reports the status as unknown: hop
+    /// 2 is kept and maker 2 is not asked.
+    #[test]
+    fn first_hop_check_is_refused_when_the_chain_moves_during_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let first = swap_out("unused:1");
+        let mut second = swap_out("unused:1");
+        let unknown = LightningMakerMessage::Reject(LnReject {
+            swap_id: second.id.clone(),
+            reason: "unknown swap".into(),
+        });
+        let (maker, asked) = counting_maker(&second.id, unknown);
+        second.record.resume.as_mut().unwrap().maker = maker;
+        let (in_key, out_key) = (format!("{}-in", first.id), format!("{}-out", first.id));
+        chain.lock().unwrap().set(&first.funding, Some(100));
+        let (taker, server) = taker_with(dir.path(), &chain);
+        let server = Arc::new(server);
+        let spend = Transaction {
+            input: vec![TxIn {
+                previous_output: first.outpoint,
+                ..Default::default()
+            }],
+            ..funding_paying(ScriptBuf::from_bytes(vec![0x51]), AMOUNT)
+        };
+        let new_block = {
+            let server = server.clone();
+            move |chain: &mut Chain| {
+                chain.set(&spend, Some(102));
+                server.set_tip(
+                    102,
+                    &bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
+                );
+            }
+        };
+        chain.lock().unwrap().after_history = Some((
+            scripthash(&first.funding.output[0].script_pubkey),
+            Box::new(new_block),
+        ));
+        let hop1 = LnPendingSwap {
+            is_swap_in: true,
+            resume: None,
+            ..funded(&first)
+        };
+        taker.save_pending_swap(&in_key, hop1.clone()).unwrap();
+        taker
+            .save_pending_swap(&out_key, second.record.clone())
+            .unwrap();
+        let records = vec![(in_key, hop1), (out_key.clone(), second.record.clone())];
+
+        let mut outcomes = Vec::new();
+        let funding = taker
+            .recover_funding(&out_key, &second.record, &records, &mut outcomes)
+            .unwrap();
+        assert!(chain.lock().unwrap().after_history.is_none());
+        assert_eq!(funding, None);
+        assert_eq!(
+            outcomes,
+            [format!("{out_key}: first hop status unknown; kept")]
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+        assert_eq!(record(&taker, &out_key), Some(second.record.clone()));
+    }
+
+    /// A record funded at the agreed confirmations, whose payout-script save
+    /// then failed, has never sent a claim. A reorg puts the funding back in
+    /// the mempool before recovery runs: the first claim needs the agreed
+    /// confirmations again, as when the swap first claimed, and the record
+    /// is kept until they are back. A count that cannot be read withholds
+    /// the claim too.
+    #[test]
+    fn first_claim_needs_the_agreed_confirmations() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let (mut taker, server) = taker_with(dir.path(), &chain);
+        let mut swap = swap_out("unused:1");
+        swap.record.resume.as_mut().unwrap().min_confirmations = 3;
+        let claims = || {
+            chain
+                .lock()
+                .unwrap()
+                .broadcasts
+                .iter()
+                .filter(|tx| tx.input[0].previous_output == swap.outpoint)
+                .count()
+        };
+
+        // Funded with the agreed 3 confirmations, then the payout-script
+        // save fails, so no claim was built.
+        chain.lock().unwrap().set(&swap.funding, Some(100));
+        connect(&taker, &server, 102);
+        taker.save_pending_swap(&swap.id, funded(&swap)).unwrap();
+        let failed = payout_script_with(&mut taker.write_wallet().unwrap(), &swap.id, |_| {
+            Err(WalletError::General("disk full".into()))
+        });
+        assert!(failed.is_err());
+
+        // A reorg returns the funding to the mempool (0 confirmations), then
+        // it is mined again one block short (2 of 3), then its count cannot
+        // be read: no claim, and the record stays as it was.
+        let cases: [(&str, Option<u64>, u64, bool); 3] = [
+            ("mempool", Some(0), 103, false),
+            ("one short", Some(104), 105, false),
+            ("unknown", Some(104), 106, true),
+        ];
+        for (case, height, tip, failing) in cases {
+            chain.lock().unwrap().set(&swap.funding, height);
+            chain.lock().unwrap().failing = if failing {
+                vec![swap.outpoint.txid.to_string()]
+            } else {
+                Vec::new()
+            };
+            connect(&taker, &server, tip);
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            assert!(
+                outcomes[0].contains("claim withheld"),
+                "{}: {:?}",
+                case,
+                outcomes
+            );
+            assert_eq!(claims(), 0, "{}", case);
+            assert_eq!(record(&taker, &swap.id), Some(funded(&swap)), "{}", case);
+        }
+
+        // Exactly the agreed 3 confirmations again: claimed.
+        chain.lock().unwrap().failing.clear();
+        connect(&taker, &server, 106);
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert!(
+            outcomes[0].contains("awaiting confirmation"),
+            "{:?}",
+            outcomes
+        );
+        assert_eq!(claims(), 1);
+        assert!(record(&taker, &swap.id).unwrap().payout_script.is_some());
     }
 
     /// A funded swap-out record whose claim was never sent has not released
