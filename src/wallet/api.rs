@@ -4786,6 +4786,14 @@ impl Wallet {
         Ok(())
     }
 
+    /// One sync attempt, then persist to disk. For a caller that already holds
+    /// a result it must not delay: a backend that is down fails this at once,
+    /// where [`Wallet::sync_and_save`] would retry until it came back.
+    pub(crate) fn sync_once_and_save(&mut self) -> Result<(), WalletError> {
+        self.sync(&crate::utill::NO_SHUTDOWN)?;
+        self.save_to_disk()
+    }
+
     /// Sync the wallet, then persist to disk. The shutdown flag stops scans,
     /// backend retries, and the outer retry loop.
     pub fn sync_and_save(

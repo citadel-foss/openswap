@@ -2,7 +2,6 @@
 //! when the wallet cannot refresh itself.
 
 use bitcoind::bitcoincore_rpc::RpcApi;
-use log::info;
 use std::{fs, os::unix::fs::PermissionsExt};
 
 use crate::test_framework::*;
@@ -27,13 +26,11 @@ fn run_sweep_survives_a_failed_refresh(world: &mut World) {
     let mut read_only = writable.clone();
     read_only.set_mode(0o555);
     fs::set_permissions(&wallets, read_only).unwrap();
-    let blocked = fs::File::create(wallets.join("probe")).is_err();
-    if !blocked {
-        // Root ignores directory modes, so the failure cannot be injected.
+    if fs::File::create(wallets.join("probe")).is_ok() {
         fs::set_permissions(&wallets, writable).unwrap();
         let _ = fs::remove_file(wallets.join("probe"));
-        info!("directory modes are not enforced here; skipping");
-        return;
+        // Root ignores directory modes. Passing here would hide a regression.
+        panic!("directory modes are not enforced; run this test as an unprivileged user");
     }
 
     let destination = world
