@@ -37,8 +37,8 @@ use bitcoin::{
 use crate::{
     blocklist::BlocklistError,
     lightning::{
-        invoice::verify_invoice, swap::SwapHtlc, InvoiceParams, LightningBackend, LnEvent,
-        PaymentOutcome, Preimage,
+        invoice::verify_invoice, swap::SwapHtlc, InvoiceParams, LightningBackend, LightningError,
+        LnEvent, PaymentOutcome, Preimage,
     },
     protocol::{
         common_messages::{GetOffer, MakerToTakerMessage, Offer, TakerToMakerMessage},
@@ -49,7 +49,7 @@ use crate::{
         },
     },
     utill::{generate_keypair, read_message, send_message, MIN_RELAY_FEE_RATE},
-    wallet::{AddressType, AnyBlockchain, LnFundingResume, LnPendingSwap, Wallet},
+    wallet::{AddressType, AnyBlockchain, LnFundingResume, LnPendingSwap, Wallet, WalletError},
 };
 
 use super::{
@@ -781,8 +781,10 @@ impl Taker {
         // window we are about to claim within, so a swap cannot straddle the
         // HTLC's timelock.
         let cltv_bound = (locktime as u32).saturating_sub(CLTV_SAFETY_MARGIN as u32);
-        ln.pay_invoice(&accept.invoice, None, Some(cltv_bound))
-            .map_err(|e| general(format!("pay invoice: {e:?}")))?;
+        if let Err(e) = ln.pay_invoice(&accept.invoice, None, Some(cltv_bound)) {
+            self.drop_unsent_payment(&swap_id, &e)?;
+            return Err(general(format!("pay invoice: {e:?}")));
+        }
         conn.send(LightningTakerMessage::SwapOutPaid(LnSwapOutPaid {
             swap_id: swap_id.clone(),
         }))?;
@@ -1246,20 +1248,18 @@ impl Taker {
                 .is_confirmed_spend(&outpoint, &script)
                 .ok()
         };
-        let resume = match unfunded_action(key, record, records, payment, first_hop_spent) {
-            Unfunded::Forget(why) => {
-                self.remove_pending_swap(key)?;
-                outcomes.push(format!("{key}: {why}; forgotten"));
-                return Ok(None);
-            }
-            Unfunded::Keep(why) => {
-                outcomes.push(format!("{key}: {why}; kept"));
-                return Ok(None);
-            }
-            Unfunded::Resume(resume) => resume,
+        let decide = || unfunded_action(key, record, records, payment, first_hop_spent);
+        let Some(resume) = self.settle_unfunded(key, decide(), outcomes)? else {
+            return Ok(None);
         };
         match self.resume_funding(key, record, resume) {
             Ok(Some((outpoint, value))) => {
+                // The reply can take minutes. Decide again before the claim
+                // reveals the preimage: hop 1's refund may have confirmed, or
+                // our payment failed, in the meantime.
+                if self.settle_unfunded(key, decide(), outcomes)?.is_none() {
+                    return Ok(None);
+                }
                 record_funding(&mut *self.write_wallet()?, key, outpoint, value)?;
                 log::info!("{key}: funding {outpoint} recovered from the maker");
                 Ok(Some((outpoint, value)))
@@ -1283,6 +1283,39 @@ impl Taker {
                 Ok(None)
             }
         }
+    }
+
+    /// Carries out an [`Unfunded`] decision: drops or keeps the record and
+    /// reports it, or returns the resume data when the maker is to be asked.
+    fn settle_unfunded<'a>(
+        &self,
+        key: &str,
+        action: Unfunded<'a>,
+        outcomes: &mut Vec<String>,
+    ) -> Result<Option<&'a LnFundingResume>, TakerError> {
+        match action {
+            Unfunded::Forget(why) => {
+                self.remove_pending_swap(key)?;
+                outcomes.push(format!("{key}: {why}; forgotten"));
+                Ok(None)
+            }
+            Unfunded::Keep(why) => {
+                outcomes.push(format!("{key}: {why}; kept"));
+                Ok(None)
+            }
+            Unfunded::Resume(resume) => Ok(Some(resume)),
+        }
+    }
+
+    /// Drops a swap-out's record when `pay_invoice` failed before the node
+    /// took the payment on: nothing was paid, so the maker has nothing to
+    /// fund. Any other failure may follow a payment in flight, and the
+    /// record stays for recovery.
+    fn drop_unsent_payment(&self, swap_id: &str, error: &LightningError) -> Result<(), TakerError> {
+        if payment_never_sent(error) {
+            self.remove_pending_swap(swap_id)?;
+        }
+        Ok(())
     }
 
     /// Asks the maker for a swap-out's funding again. `SwapOutPaid` is
@@ -1335,6 +1368,20 @@ impl Taker {
         // As in the swap itself: never record funding we refuse to claim.
         self.screen_funding_tx(&funding_tx)?;
         Ok(Some((funded.outpoint, funded.value)))
+    }
+}
+
+/// Whether a failed `pay_invoice` proves no payment was started. ldk-server
+/// answers an invalid or unauthenticated request with `InvalidRequestError`
+/// or `AuthError` before ldk-node takes the payment on. Other codes are
+/// shared with failures after a payment was accepted (`InternalServerError`
+/// also covers failing to store an in-flight payment), and a timeout or a
+/// lost connection says nothing either way.
+fn payment_never_sent(error: &LightningError) -> bool {
+    match error {
+        LightningError::InvalidInvoice(_) => true,
+        LightningError::Api { code, .. } => code == "InvalidRequestError" || code == "AuthError",
+        _ => false,
     }
 }
 
@@ -1461,6 +1508,16 @@ fn record_funding(
 /// transaction as the one it replaces and recovery passes do not walk the
 /// wallet's receive addresses.
 fn payout_script(wallet: &mut Wallet, key: &str) -> Result<ScriptBuf, TakerError> {
+    payout_script_with(wallet, key, Wallet::save_to_disk)
+}
+
+/// [`payout_script`], with the save that records a new script passed in so
+/// a test can make that save alone fail.
+fn payout_script_with(
+    wallet: &mut Wallet,
+    key: &str,
+    save: impl FnOnce(&Wallet) -> Result<(), WalletError>,
+) -> Result<ScriptBuf, TakerError> {
     let missing = || general(format!("{key}: recovery record missing"));
     let saved = wallet.store.ln_pending_swaps.get(key).ok_or_else(missing)?;
     if let Some(script) = &saved.payout_script {
@@ -1475,7 +1532,7 @@ fn payout_script(wallet: &mut Wallet, key: &str) -> Result<ScriptBuf, TakerError
         .get_mut(key)
         .ok_or_else(missing)?
         .payout_script = Some(script.clone());
-    if let Err(e) = wallet.save_to_disk() {
+    if let Err(e) = save(wallet) {
         // Not on disk, so no spend may use it: the next try picks and saves
         // a script before anything is broadcast.
         if let Some(record) = wallet.store.ln_pending_swaps.get_mut(key) {
@@ -1489,6 +1546,7 @@ fn payout_script(wallet: &mut Wallet, key: &str) -> Result<ScriptBuf, TakerError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::blockchain::SCRIPT_CACHE_TTL;
     use crate::{
         lightning::MockLightningBackend,
         protocol::{common_messages::Hello, lightning_messages::LnReject},
@@ -2443,6 +2501,165 @@ mod tests {
         assert!(outcomes.contains(&format!("{in_key}: already resolved on-chain")));
         assert!(record(&taker, &out_key).is_none() && record(&taker, &in_key).is_none());
         assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// A maker that answers one `SwapOutPaid` for `swap_id` with `reply`,
+    /// after running `meanwhile`.
+    fn slow_maker(
+        swap_id: &str,
+        meanwhile: impl FnOnce() + Send + 'static,
+        reply: LightningMakerMessage,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let swap_id = swap_id.to_string();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let read = |socket: &mut TcpStream| -> TakerToMakerMessage {
+                serde_cbor::from_slice(&read_message(socket).unwrap()).unwrap()
+            };
+            read(&mut socket);
+            let hello = Hello {
+                features: vec!["ln-swap-out".to_string()],
+            };
+            send_message(&mut socket, &MakerToTakerMessage::Hello(hello)).unwrap();
+            match read(&mut socket) {
+                TakerToMakerMessage::Lightning(msg) => match *msg {
+                    LightningTakerMessage::SwapOutPaid(paid) => assert_eq!(paid.swap_id, swap_id),
+                    other => panic!("expected SwapOutPaid, got {}", other),
+                },
+                other => panic!("expected a Lightning message, got {:?}", other),
+            }
+            meanwhile();
+            let reply = MakerToTakerMessage::Lightning(Box::new(reply));
+            send_message(&mut socket, &reply).unwrap();
+        });
+        address
+    }
+
+    /// Hop 1's refund confirms while recovery waits for maker 2's reply.
+    /// Recovery decides again once the reply arrives, so hop 2's funding is
+    /// neither recorded nor claimed, and the preimage stays private.
+    #[test]
+    fn second_hop_funding_is_rechecked_after_the_maker_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let first = swap_out("unused:1");
+        let mut second = swap_out("unused:1");
+        let refund = Transaction {
+            input: vec![TxIn {
+                previous_output: first.outpoint,
+                ..Default::default()
+            }],
+            ..funding_paying(ScriptBuf::from_bytes(vec![0x51]), AMOUNT)
+        };
+        let reply = LightningMakerMessage::SwapOutFunded(LnHtlcFunded {
+            swap_id: second.id.clone(),
+            outpoint: second.outpoint,
+            value: AMOUNT,
+        });
+        let confirm_refund = {
+            let chain = chain.clone();
+            move || {
+                chain.lock().unwrap().set(&refund, Some(102));
+                // Outlive the backend's script cache, as a real wait would.
+                thread::sleep(SCRIPT_CACHE_TTL + Duration::from_millis(500));
+            }
+        };
+        second.record.resume.as_mut().unwrap().maker =
+            slow_maker(&second.id, confirm_refund, reply);
+        let (in_key, out_key) = (format!("{}-in", first.id), format!("{}-out", first.id));
+        chain.lock().unwrap().set(&first.funding, Some(100));
+        chain.lock().unwrap().set(&second.funding, Some(101));
+        let (taker, _server) = taker_with(dir.path(), &chain);
+        let hop1 = LnPendingSwap {
+            is_swap_in: true,
+            resume: None,
+            ..funded(&first)
+        };
+        taker.save_pending_swap(&in_key, hop1.clone()).unwrap();
+        taker
+            .save_pending_swap(&out_key, second.record.clone())
+            .unwrap();
+        let records = vec![(in_key, hop1), (out_key.clone(), second.record.clone())];
+
+        let mut outcomes = Vec::new();
+        let funding = taker
+            .recover_funding(&out_key, &second.record, &records, &mut outcomes)
+            .unwrap();
+        assert_eq!(funding, None);
+        assert_eq!(
+            outcomes,
+            [format!("{out_key}: first hop already resolved; forgotten")]
+        );
+        assert!(record(&taker, &out_key).is_none());
+        assert!(chain.lock().unwrap().broadcasts.is_empty());
+    }
+
+    /// The save that records a new payout script fails after the address
+    /// was taken. The script is not kept in memory, so nothing can claim to
+    /// it; the next pass saves a script first and claims to that one.
+    #[test]
+    fn failed_payout_script_save_is_not_kept_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let swap = swap_out("unused:1");
+        chain.lock().unwrap().set(&swap.funding, Some(100));
+        let (mut taker, _server) = taker_with(dir.path(), &chain);
+        taker.save_pending_swap(&swap.id, funded(&swap)).unwrap();
+
+        let failed = payout_script_with(&mut taker.write_wallet().unwrap(), &swap.id, |_| {
+            Err(WalletError::General("disk full".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(record(&taker, &swap.id).unwrap().payout_script, None);
+        assert!(chain.lock().unwrap().broadcasts.is_empty());
+
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert!(
+            outcomes[0].contains("awaiting confirmation"),
+            "{:?}",
+            outcomes
+        );
+        let path = dir.path().join("wallet");
+        let (stored, _) =
+            crate::wallet::WalletStore::read_from_disk(&path, Some("test-password".into()))
+                .unwrap();
+        let claim = chain.lock().unwrap().broadcasts[0].clone();
+        assert_eq!(
+            stored.ln_pending_swaps[&swap.id].payout_script,
+            Some(claim.output[0].script_pubkey.clone())
+        );
+    }
+
+    /// A payment the node refused before taking it on leaves nothing for
+    /// the maker to fund, so the record goes. Any failure that may follow an
+    /// accepted payment keeps it for recovery.
+    #[test]
+    fn refused_payment_drops_the_swap_record_only_when_nothing_was_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let swap = swap_out("unused:1");
+        let (taker, _server) = taker_with(dir.path(), &chain);
+        let api = |code: &str| LightningError::Api {
+            code: code.into(),
+            message: String::new(),
+        };
+        for (error, dropped) in [
+            (LightningError::InvalidInvoice("no amount".into()), true),
+            (api("InvalidRequestError"), true),
+            (api("AuthError"), true),
+            (api("InternalServerError"), false),
+            (api("LightningError"), false),
+            (LightningError::Timeout, false),
+            (LightningError::Connection("reset".into()), false),
+        ] {
+            taker
+                .save_pending_swap(&swap.id, swap.record.clone())
+                .unwrap();
+            taker.drop_unsent_payment(&swap.id, &error).unwrap();
+            assert_eq!(record(&taker, &swap.id).is_none(), dropped, "{:?}", error);
+        }
     }
 
     /// A swap-out record from before resume data existed is kept while our

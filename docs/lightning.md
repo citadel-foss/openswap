@@ -222,9 +222,12 @@ After a swap-out, the taker keeps the swap's record until a spend of the
 HTLC confirms. `recover` sends the same claim again if it dropped out of the
 mempool, and removes the record once a spend is confirmed. That spend is
 usually your claim, but a maker's refund also ends the record, so its removal
-alone does not prove you were paid. If the maker's
-funding reply was lost after you paid, `recover` asks the maker for it again
-before claiming.
+alone does not prove you were paid.
+
+If the maker's funding reply was lost after you paid, `recover` asks the maker
+for it again before claiming. That needs the resume data this release saves
+with each swap-out. A swap-out recorded by an older release without it is kept
+until your node reports the payment failed.
 
 ## Upgrading and downgrading
 
