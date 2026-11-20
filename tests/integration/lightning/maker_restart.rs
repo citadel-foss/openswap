@@ -3406,6 +3406,73 @@ fn handler_rechecks_the_window_after_a_reread(
     maker.watch_service.shutdown();
 }
 
+/// A block can arrive while the handler reads the funding height. The tip
+/// the handler counts against must be the one read before the height: on
+/// Electrum only that order keeps a reorg from pairing the funding's replaced
+/// height with the new tip. Here the funding stays put, so the block mined
+/// during the read must not shrink the route budget.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [ChainMovesDuringHeightRead],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+)]
+fn swap_in_funded_handler_counts_from_the_tip_read_before_the_height(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    let taker_ln = MockLightningBackend::new();
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+
+    let preimage = Preimage([0xdb; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    accept_swap_in(&maker, &taker_ln, &preimage);
+    let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    let value = accepted.amount + accepted.fee;
+    let funding = fund_htlc(bitcoind, &accepted);
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &funding.txid);
+    let age = 2;
+    mine_to(bitcoind, confirmed_at + age);
+
+    let (result_tx, result_rx) = mpsc::channel();
+    let handler_maker = maker.clone();
+    let funded_id = swap_id.clone();
+    thread::spawn(move || {
+        let _ = result_tx.send(announce_funding(&handler_maker, &funded_id, funding, value));
+    });
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_millis(100),
+        "the handler to start reading the funding height",
+        maker.funding_height_lookups.load(Relaxed) >= 1
+    );
+    generate_blocks(bitcoind, 1);
+    maker.funding_height_pause_released.store(true, Relaxed);
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the handler did not return after the height read");
+
+    assert!(
+        result.contains("pay_invoice failed"),
+        "the handler did not reach the payment: {}",
+        result
+    );
+    assert_eq!(
+        ln.last_pay_cltv_bound(),
+        Some(accepted.locktime as u32 - age as u32 - LN_CLTV_SAFETY_MARGIN),
+        "the handler counted against a tip read after the funding height"
+    );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
 /// Announces a confirmed funding to a maker whose height lookup `behavior`
 /// breaks, and checks that the handler stopped with `expected_error` before
 /// paying, leaving the swap as it was.

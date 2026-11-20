@@ -775,13 +775,14 @@ fn handle_swap_in_funded<M: Maker>(
     // InAccepted, where the unfunded expiry frees it, rather than pay. The
     // same height dates the window checked here and the one stored, so the
     // two cannot disagree.
-    let funding_height = read_funding_height(maker, &funded.outpoint.txid)?;
+    let (funding_height, tip) = read_funding_height(maker, &funded.outpoint.txid)?;
     // The confirmation wait counted its confirmations before any reread. A
     // height read again after a reorg can belong to a block that re-mined the
-    // funding since, with fewer confirmations than the swap requires; a
-    // height above the tip means the backend contradicts itself. Either way
-    // stop unpaid, leaving the swap InAccepted.
-    let tip = maker.get_current_height()?;
+    // funding since, with fewer confirmations than the swap requires. A
+    // height above the tip read before it means a block arrived between the
+    // reads, or the backend contradicts itself, so its age is unknown. Either
+    // way stop unpaid, leaving the swap InAccepted for the taker to announce
+    // again.
     let Some(age) = tip.checked_sub(funding_height) else {
         return Err(MakerError::General(
             "swap-in funding height is above the chain tip",
@@ -885,7 +886,17 @@ fn handle_swap_in_funded<M: Maker>(
 /// read again a few times, so a backend that is briefly behind does not fail
 /// the swap; one still missing after that stops the handler, as a reorg may
 /// have taken the block away. A failed query or a shutdown stops it at once.
-fn read_funding_height<M: Maker>(maker: &Arc<M>, txid: &bitcoin::Txid) -> Result<u32, MakerError> {
+///
+/// Returns the height with the tip read just before it. On Electrum a new tip
+/// drops the cached script histories, so the height is never older than that
+/// tip. In the other order, a reorg between the reads could pair the funding's
+/// replaced, lower height with the new tip and count confirmations the
+/// funding does not have. A block mined between the reads instead puts the
+/// height above the tip, which the caller refuses without paying.
+fn read_funding_height<M: Maker>(
+    maker: &Arc<M>,
+    txid: &bitcoin::Txid,
+) -> Result<(u32, u32), MakerError> {
     for read in 1..=FUNDING_HEIGHT_READS {
         if read > 1 {
             if maker.shutdown_requested() {
@@ -902,8 +913,9 @@ fn read_funding_height<M: Maker>(maker: &Arc<M>, txid: &bitcoin::Txid) -> Result
                 return Err(MakerError::Shutdown);
             }
         }
+        let tip = maker.get_current_height()?;
         if let Some(height) = maker.tx_confirmation_height(txid)? {
-            return Ok(height);
+            return Ok((height, tip));
         }
     }
     Err(MakerError::General(

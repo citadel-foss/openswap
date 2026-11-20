@@ -184,6 +184,10 @@ pub enum MakerBehavior {
     /// reread until the test sets `funding_height_pause_released`, so the
     /// test can move the chain on meanwhile.
     FundingHeightLagsWhileChainMoves,
+    /// Hold the first lookup of a Lightning HTLC funding's confirmation
+    /// height until the test sets `funding_height_pause_released`, then
+    /// answer it, so the test can mine a block while the height is read.
+    ChainMovesDuringHeightRead,
 }
 
 /// Minimum time required to react to contract broadcasts (in blocks).

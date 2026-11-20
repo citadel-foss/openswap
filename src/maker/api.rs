@@ -3836,6 +3836,15 @@ impl MakerTrait for MakerServer {
                 MakerBehavior::FundingReminedAtTip => {
                     return Ok(Some(self.get_current_height()?));
                 }
+                MakerBehavior::ChainMovesDuringHeightRead if earlier == 0 => {
+                    while !self
+                        .funding_height_pause_released
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        && !self.is_shutdown()
+                    {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
                 _ => {}
             }
         }
