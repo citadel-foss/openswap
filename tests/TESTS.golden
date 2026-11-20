@@ -746,6 +746,7 @@ openswap::integration lightning::maker_restart::swap_in_request_refuses_payment_
 openswap::integration lightning::maker_restart::swap_out_admits_a_hold_that_outlasts_refund_finality
 openswap::integration lightning::maker_restart::swap_out_refuses_a_hold_covering_only_the_settle_margin
 openswap::integration lightning::maker_restart::swap_out_refuses_a_hold_one_block_short_of_refund_finality
+openswap::integration lightning::maker_restart::swap_out_refuses_a_hold_without_a_claim_deadline
 openswap::integration lightning::maker_restart::switch_resets_on_panic
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_funding_height_is_unknown
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_payment_is_in_flight
