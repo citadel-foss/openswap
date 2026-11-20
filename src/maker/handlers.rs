@@ -120,6 +120,11 @@ pub enum MakerBehavior {
     CrashBeforeRecovery,
     /// Use an invalid fidelity bond timelock (fidelity timelock violation test).
     InvalidFidelityTimelock,
+    /// Fail fidelity bond setup at startup, as a bond setting the wallet
+    /// cannot use or a backend error that outlasts its retries would.
+    FailFidelitySetup,
+    /// Fail the swap liquidity check at startup, after the bond is set up.
+    FailSwapLiquidityCheck,
     /// Point a Legacy sender contract at a funding output that is not the advertised multisig.
     MalformedLegacyFundingOutput,
     /// Underfund the Taproot contract while claiming the expected amount.

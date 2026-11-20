@@ -5,7 +5,10 @@ use std::{
     io::{ErrorKind, Read},
     net::{Ipv4Addr, TcpListener, TcpStream},
     sync::{
-        atomic::Ordering::{self, Relaxed},
+        atomic::{
+            AtomicUsize,
+            Ordering::{self, Relaxed},
+        },
         Arc, Mutex, MutexGuard,
     },
     thread::{self, sleep},
@@ -289,6 +292,9 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     #[cfg(feature = "lightning")]
     spawn_lightning_threads(&maker)?;
 
+    // Reboot recoveries still running. A maker that runs recovery-only
+    // because its setup failed stops once they are done; see the accept loop.
+    let reboot_recoveries_left = Arc::new(AtomicUsize::new(0));
     // Check for unfinished swapcoins from a previous run and start recovery.
     {
         let (inc, out) = lock_debug!(maker.wallet.read())
@@ -332,12 +338,17 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
 
             for (swap_id, (inc, out)) in groups {
                 let maker_clone = Arc::clone(&maker);
+                let left = Arc::clone(&reboot_recoveries_left);
+                left.fetch_add(1, Relaxed);
                 let handle = thread::Builder::new()
                     .name(format!("reboot-recovery-{}", maker.config.network_port))
                     .spawn(move || {
                         if let Err(e) = recover_from_swap(maker_clone, swap_id.clone(), inc, out) {
                             log::error!("Reboot recovery failed for {}: {:?}", swap_id, e);
                         }
+                        // Not on a panic: a recovery that never finished
+                        // keeps the maker up rather than ending it early.
+                        left.fetch_sub(1, Relaxed);
                     })
                     .map_err(MakerError::IO)?;
                 maker.thread_pool.add_thread(handle)?;
@@ -370,16 +381,27 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     let listener = listener.filter(|_| maker_address.is_some());
 
     // Only after recovery has started: the bond wait has no deadline, and
-    // contracts left from a previous run must not wait on it.
-    if let Some(maker_address) = maker_address.as_ref() {
-        log::info!(
-            "[{}] Setting up fidelity bond...",
-            maker.config.network_port
+    // contracts left from a previous run must not wait on it. Never fatal
+    // either, for the same reason as Tor above: a bond setting the wallet
+    // cannot use, or a backend error that outlasts its retries, would shut
+    // down the recovery already running. The maker runs recovery-only.
+    let (maker_address, setup_error) = match maker_address {
+        Some(maker_address) => match prepare_for_swaps(&maker, &maker_address) {
+            Ok(()) => (Some(maker_address), None),
+            Err(e) if e.is_shutdown() => return Err(e),
+            Err(e) => (None, Some(e)),
+        },
+        None => (None, None),
+    };
+    // Close the port before saying so: once this line is out, the maker must
+    // already refuse connections.
+    let listener = listener.filter(|_| maker_address.is_some());
+    if let Some(e) = &setup_error {
+        log::error!(
+            "[{}] {:?}; recovery-only mode: not ready for new swaps, fix the cause and restart makerd to take swaps again",
+            maker.config.network_port,
+            e
         );
-        maker.setup_fidelity_bond(maker_address)?;
-        spawn_nostr_broadcast_thread(&maker)?;
-        log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
-        maker.check_swap_liquidity()?;
     }
 
     {
@@ -446,6 +468,15 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     let connection_limiter = ConnectionLimiter::new();
     while !maker.is_shutdown() {
         let Some(listener) = listener.as_ref() else {
+            // A setup error needs the operator, so once nothing is left to
+            // recover, stop and report it rather than idle unnoticed.
+            if setup_error.is_some() && recovery_finished(&maker, &reboot_recoveries_left) {
+                log::info!(
+                    "[{}] Recovery finished; stopping on the setup error",
+                    maker.config.network_port
+                );
+                break;
+            }
             sleep(Duration::from_millis(100));
             continue;
         };
@@ -491,7 +522,46 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         }
     }
 
-    Ok(())
+    // Whatever ended the loop, a maker that could not set up for swaps
+    // reports why, after `start_server` has joined its threads and saved.
+    match setup_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Whether a recovery-only maker has nothing left to recover: no reboot
+/// recovery is running and, with Lightning, no swap is left for the watchdog.
+fn recovery_finished(maker: &MakerServer, reboot_recoveries_left: &AtomicUsize) -> bool {
+    if reboot_recoveries_left.load(Relaxed) > 0 {
+        return false;
+    }
+    #[cfg(feature = "lightning")]
+    if maker
+        .ln_swaps
+        .lock()
+        .map_or(true, |swaps| !swaps.is_empty())
+    {
+        return false;
+    }
+    #[cfg(not(feature = "lightning"))]
+    let _ = maker;
+    true
+}
+
+/// Sets up the fidelity bond and waits for swap liquidity, then announces the
+/// bond. Announced only once both are done: until then `serve` has not reached
+/// its accept loop, and a maker that fails here runs recovery-only and must
+/// not be advertised.
+fn prepare_for_swaps(maker: &Arc<MakerServer>, maker_address: &str) -> Result<(), MakerError> {
+    log::info!(
+        "[{}] Setting up fidelity bond...",
+        maker.config.network_port
+    );
+    maker.setup_fidelity_bond(maker_address)?;
+    log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
+    maker.check_swap_liquidity()?;
+    spawn_nostr_broadcast_thread(maker)
 }
 
 /// Stops the watcher, joins every thread that can touch the wallet, then saves it.
@@ -1040,6 +1110,11 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
 /// Periodically check for expired fidelity bonds and renew them.
 fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result<(), MakerError> {
     use crate::wallet::AddressType;
+
+    log::info!(
+        "[{}] Fidelity bond renewal loop started",
+        maker.config.network_port
+    );
 
     let tick = Duration::from_secs(2);
     let mut elapsed = Duration::ZERO;
