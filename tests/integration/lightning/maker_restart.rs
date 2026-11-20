@@ -195,23 +195,30 @@ const LN_SETTLE_MARGIN: u32 = 6;
         /// within its budget and reach finality: the maker funds.
         swap_out_admits_a_hold_that_outlasts_refund_finality(
             hash_byte = 0xe1,
-            extra = LN_REFUND_MINING_BUDGET + LN_REFUND_FINALITY_DEPTH,
-            admitted = true,
+            extra = Some(LN_REFUND_MINING_BUDGET + LN_REFUND_FINALITY_DEPTH),
+            refusal = None,
         ),
         /// One block less: a refund mined at the end of its budget would be
         /// one block short of finality when the node fails the payment.
         swap_out_refuses_a_hold_one_block_short_of_refund_finality(
             hash_byte = 0xe2,
-            extra = LN_REFUND_MINING_BUDGET + LN_REFUND_FINALITY_DEPTH - 1,
-            admitted = false,
+            extra = Some(LN_REFUND_MINING_BUDGET + LN_REFUND_FINALITY_DEPTH - 1),
+            refusal = Some("hold window is too narrow"),
         ),
         /// The deadline the settle margin alone accepted. A refund mined a
         /// couple of blocks after its CSV opens is still shallow when the
         /// node fails the payment, so the maker must not fund.
         swap_out_refuses_a_hold_covering_only_the_settle_margin(
             hash_byte = 0xe3,
-            extra = LN_SETTLE_MARGIN,
-            admitted = false,
+            extra = Some(LN_SETTLE_MARGIN),
+            refusal = Some("hold window is too narrow"),
+        ),
+        /// A backend that reports no claim deadline leaves the hold window
+        /// unknown: the maker must refuse and release the payment.
+        swap_out_refuses_a_hold_without_a_claim_deadline(
+            hash_byte = 0xe4,
+            extra = None,
+            refusal = Some("backend reported no claim deadline"),
         ),
     ],
 )]
@@ -219,9 +226,10 @@ fn swap_out_admission_budgets_for_refund_finality(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
     hash_byte: u8,
-    extra: u32,
-    admitted: bool,
+    extra: Option<u32>,
+    refusal: Option<&str>,
 ) {
+    let admitted = refusal.is_none();
     let framework = world.framework().clone();
     let maker = world.makers()[0].inner().clone();
     pause_block_generation(&framework);
@@ -229,7 +237,7 @@ fn swap_out_admission_budgets_for_refund_finality(
     let locktime: u16 = 30;
     let tip = framework.bitcoind.client.get_block_count().unwrap() as u32;
     let claim_window_ends = tip + LN_FUNDING_CONF_BUDGET + locktime as u32;
-    ln.set_claim_deadline(Some(claim_window_ends + extra));
+    ln.set_claim_deadline(extra.map(|extra| claim_window_ends + extra));
 
     let preimage = Preimage([hash_byte; 32]);
     let payment_hash = preimage.payment_hash();
@@ -243,7 +251,7 @@ fn swap_out_admission_budgets_for_refund_finality(
     match (admitted, reply) {
         (true, LightningMakerMessage::SwapOutFunded(_)) => {}
         (false, LightningMakerMessage::Reject(reject)) => assert!(
-            reject.reason.contains("hold window is too narrow"),
+            reject.reason.contains(refusal.unwrap()),
             "the maker refused for another reason: {}",
             reject.reason
         ),
