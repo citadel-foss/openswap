@@ -213,6 +213,7 @@ openswap taker::config::tests::test_valid_config
 openswap taker::config::tests::unreadable_values_are_refused
 openswap taker::lightning_swap::tests::cltv_delta_above_u16_is_rejected_not_truncated
 openswap taker::lightning_swap::tests::failed_payout_script_save_is_not_kept_in_memory
+openswap taker::lightning_swap::tests::first_claim_of_a_funded_record_waits_for_the_refund_window
 openswap taker::lightning_swap::tests::first_recovery_pass_reads_the_tip_before_any_history
 openswap taker::lightning_swap::tests::funded_records_are_claimed_before_any_maker_is_asked
 openswap taker::lightning_swap::tests::kept_claim_is_dropped_only_once_confirmed
@@ -224,6 +225,7 @@ openswap taker::lightning_swap::tests::oversized_amounts_are_rejected_not_wrappe
 openswap taker::lightning_swap::tests::recovery_pass_without_a_tip_does_nothing
 openswap taker::lightning_swap::tests::refused_payment_drops_the_swap_record_only_when_nothing_was_sent
 openswap taker::lightning_swap::tests::resolved_first_hop_drops_second_hop_without_asking_the_maker
+openswap taker::lightning_swap::tests::resumed_funding_count_reads_the_chain_after_a_reorg
 openswap taker::lightning_swap::tests::resumed_funding_is_checked_before_it_is_recorded
 openswap taker::lightning_swap::tests::resumed_funding_near_the_maker_refund_is_refused
 openswap taker::lightning_swap::tests::screened_out_resent_funding_is_dropped_unclaimed

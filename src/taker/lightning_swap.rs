@@ -1170,20 +1170,31 @@ impl Taker {
                 },
             };
             let htlc = SwapHtlc::from_redeemscript(record.redeemscript.clone(), record.locktime);
-            let destination = payout_script(&mut *self.write_wallet()?, swap_id)?;
-            let spend = if record.is_swap_in {
-                // Our money, refund branch (CSV-gated).
-                htlc.create_timelock_spend(outpoint, value, &record.privkey, destination)
+            // A claim reveals the preimage. This build saves the payout
+            // script just before a record's first claim, so a funded
+            // swap-out record with resume data and no script has never sent
+            // one: like resumed funding, its first claim waits for the refund
+            // window. A claim already sent is always sent again, and a record
+            // from an older build, without resume data, is claimed as before.
+            let unsent = !record.is_swap_in
+                && record.outpoint.is_some()
+                && record.resume.is_some()
+                && record.payout_script.is_none();
+            let withheld = if unsent {
+                match funding_confirmations(&self.read_wallet()?.blockchain, &outpoint.txid) {
+                    Ok(confirmations) if claim_window_open(confirmations, record.locktime) => None,
+                    Ok(confirmations) => Some(format!(
+                        "claim withheld: funding has {confirmations} of the {} confirmations \
+                         before the maker can refund",
+                        record.locktime
+                    )),
+                    Err(e) => Some(format!(
+                        "claim withheld: funding confirmations unknown: {e:?}"
+                    )),
+                }
             } else {
-                // Claim with our own preimage.
-                let preimage = Preimage(
-                    record
-                        .preimage
-                        .ok_or_else(|| general("swap-out record without preimage"))?,
-                );
-                htlc.create_hashlock_spend(outpoint, value, &record.privkey, &preimage, destination)
-            }
-            .map_err(|e| general(format!("recovery spend build: {e}")))?;
+                None
+            };
 
             // A record is the only copy of the key that reaches this HTLC, so
             // it is dropped on one condition alone: the outpoint has a
@@ -1191,7 +1202,34 @@ impl Taker {
             // ambiguous backend error qualifies — a mempool spend can still
             // be evicted or reorged out, and deleting on one strands the
             // HTLC for good.
-            let broadcast = self.read_wallet()?.send_tx(&spend);
+            let broadcast = match withheld {
+                Some(why) => Err(general(why)),
+                None => {
+                    let destination = payout_script(&mut *self.write_wallet()?, swap_id)?;
+                    let spend = if record.is_swap_in {
+                        // Our money, refund branch (CSV-gated).
+                        htlc.create_timelock_spend(outpoint, value, &record.privkey, destination)
+                    } else {
+                        // Claim with our own preimage.
+                        let preimage = Preimage(
+                            record
+                                .preimage
+                                .ok_or_else(|| general("swap-out record without preimage"))?,
+                        );
+                        htlc.create_hashlock_spend(
+                            outpoint,
+                            value,
+                            &record.privkey,
+                            &preimage,
+                            destination,
+                        )
+                    }
+                    .map_err(|e| general(format!("recovery spend build: {e}")))?;
+                    self.read_wallet()?
+                        .send_tx(&spend)
+                        .map_err(TakerError::from)
+                }
+            };
             match &broadcast {
                 Ok(txid) => log::info!("{swap_id}: recovery spend broadcast in {txid}"),
                 Err(e) => log::debug!("{swap_id}: recovery spend not accepted: {e:?}"),
@@ -1515,15 +1553,8 @@ fn check_resumed_funding(
     SwapHtlc::from_redeemscript(record.redeemscript.clone(), record.locktime)
         .validate_funding_output(output, resume.amount)
         .map_err(|e| general(format!("bad funding output: {e}")))?;
-    let confirmations = chain
-        .get_raw_transaction_info(&funded.outpoint.txid, None)?
-        .confirmations
-        .unwrap_or(0);
-    // The maker's refund can be mined once the funding has `locktime`
-    // confirmations (BIP68). Claim only while at least `CLTV_SAFETY_MARGIN`
-    // blocks remain for our claim alone: a claim that loses to the refund
-    // hands the maker the preimage, and with it our payment.
-    if confirmations.saturating_add(CLTV_SAFETY_MARGIN as u32) > record.locktime as u32 {
+    let confirmations = funding_confirmations(chain, &funded.outpoint.txid)?;
+    if !claim_window_open(confirmations, record.locktime) {
         return Err(general(format!(
             "funding has {confirmations} of the {} confirmations before the maker can refund",
             record.locktime
@@ -1533,6 +1564,26 @@ fn check_resumed_funding(
         return Ok(None);
     }
     Ok(Some(funding_tx))
+}
+
+/// The funding's confirmations as the chain stands now. The tip is read
+/// first: on Electrum a changed tip drops cached script history, so the
+/// count never pairs history from before a reorg with a newer tip.
+fn funding_confirmations(chain: &AnyBlockchain, txid: &Txid) -> Result<u32, TakerError> {
+    use crate::wallet::blockchain::Blockchain;
+    chain.get_block_count()?;
+    Ok(chain
+        .get_raw_transaction_info(txid, None)?
+        .confirmations
+        .unwrap_or(0))
+}
+
+/// Whether a first claim still has `CLTV_SAFETY_MARGIN` blocks to itself
+/// before the maker's refund can be mined, which BIP68 allows once the
+/// funding has `locktime` confirmations. A claim that loses to the refund
+/// hands the maker the preimage, and with it our payment.
+fn claim_window_open(confirmations: u32, locktime: u16) -> bool {
+    confirmations.saturating_add(CLTV_SAFETY_MARGIN as u32) <= locktime as u32
 }
 
 /// Saves a verified funding outpoint, then the payout script, before the
@@ -2769,6 +2820,144 @@ mod tests {
         server.set_down(false);
     }
 
+    /// A reorg returns the resumed funding to the mempool while the backend
+    /// still holds the history that placed it in a block. The confirmation
+    /// count reads the tip first, so it sees the new chain and the funding is
+    /// not accepted for a claim.
+    #[test]
+    fn resumed_funding_count_reads_the_chain_after_a_reorg() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let swap = swap_out("unused:1");
+        chain.lock().unwrap().set(&swap.funding, Some(100));
+        let (taker, server) = taker_with(dir.path(), &chain);
+        let resume = swap.record.resume.clone().unwrap();
+        let funded = LnHtlcFunded {
+            swap_id: swap.id.clone(),
+            outpoint: swap.outpoint,
+            value: AMOUNT,
+        };
+        let check = |taker: &Taker| {
+            check_resumed_funding(
+                &taker.read_wallet().unwrap().blockchain,
+                &swap.id,
+                &swap.record,
+                &resume,
+                &funded,
+            )
+        };
+        {
+            use crate::wallet::blockchain::Blockchain;
+            // A recovery pass reads the tip before anything else.
+            let wallet = taker.read_wallet().unwrap();
+            wallet.blockchain.get_block_count().unwrap();
+        }
+        assert!(matches!(check(&taker), Ok(Some(_))));
+
+        // Within the cache's lifetime, a block replacing the tip drops the
+        // funding back into the mempool.
+        let mut replacement = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        replacement.nonce += 1;
+        chain.lock().unwrap().set(&swap.funding, Some(0));
+        server.set_tip(101, &replacement);
+        let result = check(&taker);
+        assert!(
+            matches!(result, Ok(None)),
+            "{:?}",
+            result.as_ref().map(Option::is_some)
+        );
+    }
+
+    /// A funded swap-out record whose claim was never sent has not released
+    /// its preimage: here the payout-script save failed after the funding was
+    /// recorded. Its first claim waits for the refund window like resumed
+    /// funding: past the guard it is withheld and the record kept, and once
+    /// the maker refunds the record goes, unclaimed. Inside the window it is
+    /// claimed. A claim already sent, and a record from an older build, are
+    /// claimed as before.
+    #[test]
+    fn first_claim_of_a_funded_record_waits_for_the_refund_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let (mut taker, server) = taker_with(dir.path(), &chain);
+        let claims = |outpoint: OutPoint| {
+            chain
+                .lock()
+                .unwrap()
+                .broadcasts
+                .iter()
+                .filter(|tx| tx.input[0].previous_output == outpoint)
+                .count()
+        };
+
+        // Unsent: the payout-script save fails after the funding is recorded.
+        let unsent = swap_out("unused:1");
+        chain.lock().unwrap().set(&unsent.funding, Some(100));
+        taker.save_pending_swap("unsent", funded(&unsent)).unwrap();
+        let failed = payout_script_with(&mut taker.write_wallet().unwrap(), "unsent", |_| {
+            Err(WalletError::General("disk full".into()))
+        });
+        assert!(failed.is_err());
+        // 20 confirmations: 10 blocks before the maker can refund.
+        connect(&taker, &server, 119);
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert!(outcomes[0].contains("claim withheld"), "{:?}", outcomes);
+        assert_eq!(claims(unsent.outpoint), 0);
+        assert_eq!(record(&taker, "unsent").unwrap().payout_script, None);
+        // The maker refunds; the record goes without a claim.
+        let refund = Transaction {
+            input: vec![TxIn {
+                previous_output: unsent.outpoint,
+                ..Default::default()
+            }],
+            ..funding_paying(ScriptBuf::from_bytes(vec![0x51]), AMOUNT)
+        };
+        chain.lock().unwrap().set(&refund, Some(130));
+        connect(&taker, &server, 130);
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert!(outcomes[0].contains("already resolved"), "{:?}", outcomes);
+        assert!(record(&taker, "unsent").is_none());
+        assert_eq!(claims(unsent.outpoint), 0);
+
+        // Unsent, inside the window: 18 confirmations, 12 blocks left.
+        let early = swap_out("unused:1");
+        chain.lock().unwrap().set(&early.funding, Some(100));
+        taker.save_pending_swap("early", funded(&early)).unwrap();
+        connect(&taker, &server, 117);
+        taker.recover_lightning_swaps().unwrap();
+        assert_eq!(claims(early.outpoint), 1);
+        taker.remove_pending_swap("early").unwrap();
+
+        // Sent before, and from an older build: claimed past the guard.
+        let sent = swap_out("unused:1");
+        let older = swap_out("unused:1");
+        for (key, swap, pending) in [
+            (
+                "sent",
+                &sent,
+                LnPendingSwap {
+                    payout_script: Some(ScriptBuf::from_bytes(vec![0x51])),
+                    ..funded(&sent)
+                },
+            ),
+            (
+                "older",
+                &older,
+                LnPendingSwap {
+                    resume: None,
+                    ..funded(&older)
+                },
+            ),
+        ] {
+            chain.lock().unwrap().set(&swap.funding, Some(100));
+            taker.save_pending_swap(key, pending).unwrap();
+            connect(&taker, &server, 119);
+            taker.recover_lightning_swaps().unwrap();
+            assert_eq!(claims(swap.outpoint), 1, "{}", key);
+            taker.remove_pending_swap(key).unwrap();
+        }
+    }
+
     /// The maker's refund can be mined once the funding has `locktime`
     /// confirmations. Resumed funding is accepted for a claim only while at
     /// least `CLTV_SAFETY_MARGIN` blocks remain before then; closer, at
@@ -2824,8 +3013,7 @@ mod tests {
     /// pass, and it may sit unconfirmed in the mempool. An unfunded hop 2 is
     /// then kept without asking maker 2, so no claim reveals the preimage
     /// while that refund can still confirm. One block earlier hop 2 is still
-    /// resumed, and a hop 2 whose funding is already recorded is still
-    /// claimed.
+    /// resumed, and a hop 2 whose claim was already sent is still claimed.
     #[test]
     fn mature_first_hop_refund_stops_second_hop_resume() {
         let dir = tempfile::tempdir().unwrap();
@@ -2888,8 +3076,12 @@ mod tests {
             .any(|(tx, height)| *height == 0 && tx.input[0].previous_output == first.outpoint));
         assert_eq!(spends(second.outpoint), 0);
 
-        // A hop 2 with its funding recorded is still claimed.
-        taker.save_pending_swap(&out_key, funded(&second)).unwrap();
+        // A hop 2 whose claim was already sent is still claimed.
+        let sent = LnPendingSwap {
+            payout_script: Some(ScriptBuf::from_bytes(vec![0x51])),
+            ..funded(&second)
+        };
+        taker.save_pending_swap(&out_key, sent).unwrap();
         connect(&taker, &server, 129);
         taker.recover_lightning_swaps().unwrap();
         assert_eq!(spends(second.outpoint), 1);
