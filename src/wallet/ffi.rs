@@ -325,12 +325,12 @@ impl Wallet {
         let amount = tx.output[0].value;
         let inputs = tx.input.len();
 
-        // The id of the transaction we built, not whatever the backend echoes.
-        self.send_tx(&tx)?;
-        let txid = tx.compute_txid();
-        // The coins are gone from the network's view once the broadcast is
-        // accepted, so a failed refresh must not hide the txid from the caller.
-        if let Err(e) = self.sync_and_save(&crate::utill::NO_SHUTDOWN) {
+        let txid = self.send_tx(&tx)?;
+        // The broadcast is accepted, so the caller must get the txid whatever
+        // the backend does next: one refresh attempt, and a failure is logged.
+        // `sync_and_save` would retry an unreachable backend for as long as it
+        // stays down, and hold the wallet lock while it does.
+        if let Err(e) = self.sync_once_and_save() {
             log::error!("Wallet refresh failed after broadcasting {txid}: {e:?}");
         }
 
