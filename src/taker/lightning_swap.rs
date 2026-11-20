@@ -1546,12 +1546,11 @@ fn payout_script_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::blockchain::SCRIPT_CACHE_TTL;
     use crate::{
         lightning::MockLightningBackend,
         protocol::{common_messages::Hello, lightning_messages::LnReject},
         wallet::{
-            blockchain::{mock_electrum, scripthash, MockElectrum},
+            blockchain::{mock_electrum, scripthash, MockElectrum, SCRIPT_CACHE_TTL},
             test_wallet, Electrum, ElectrumConfig,
         },
     };
