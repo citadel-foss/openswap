@@ -3185,19 +3185,37 @@ fn announce_funding(
     format!("{result:?}")
 }
 
-/// The taker's CSV refund window starts at the block that confirmed its
-/// funding, so that block, not the tip when the handler runs, is what
-/// handle_swap_in_funded must record as the funding height.
+/// Announces a confirmed funding to a maker whose height lookup behaves as
+/// `behavior` says, and checks that handle_swap_in_funded paid and recorded
+/// the block that confirmed the funding.
 #[world_test(
     backend = BitcoindBackend,
     bind = [ln = maker_node()],
-    maker_behaviors = [Normal],
+    maker_behaviors = [behavior],
     takers = [Normal],
     maker_lightning = [ln.clone()],
+    cases = [
+        /// The taker's CSV refund window starts at the block that confirmed
+        /// its funding, so that block, not the tip when the handler runs, is
+        /// what handle_swap_in_funded must record as the funding height.
+        swap_in_funded_handler_records_confirmation_height(
+            behavior = MakerBehavior::Normal,
+            preimage = Preimage([0xd1; 32]),
+        ),
+        /// A backend that is briefly behind, such as an Electrum server the
+        /// maker failed over to, can answer the first lookup with no height
+        /// although the wait just saw the block. The handler must read again
+        /// and pay rather than fail a sound swap.
+        swap_in_funded_handler_rereads_a_lagging_funding_height(
+            behavior = MakerBehavior::FundingHeightLagsOnce,
+            preimage = Preimage([0xd4; 32]),
+        ),
+    ],
 )]
-fn swap_in_funded_handler_records_confirmation_height(
+fn handler_records_confirmation_height(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
+    preimage: Preimage,
 ) {
     let taker_ln = MockLightningBackend::new();
     let framework = world.framework().clone();
@@ -3205,7 +3223,6 @@ fn swap_in_funded_handler_records_confirmation_height(
     let maker = world.makers()[0].inner().clone();
     pause_block_generation(&framework);
 
-    let preimage = Preimage([0xd1; 32]);
     let swap_id = preimage.payment_hash().to_string();
     accept_swap_in(&maker, &taker_ln, &preimage);
     let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
@@ -3222,9 +3239,11 @@ fn swap_in_funded_handler_records_confirmation_height(
         "the handler did not reach the payment: {}",
         result
     );
-    assert!(
-        ln.last_pay_cltv_bound().is_some(),
-        "the handler never tried to pay"
+    // Two blocks of the window are gone, and the route keeps its margin.
+    assert_eq!(
+        ln.last_pay_cltv_bound(),
+        Some(accepted.locktime as u32 - 2 - LN_CLTV_SAFETY_MARGIN),
+        "the route budget is not what the funding's age leaves of the window"
     );
     let paid = maker.get_ln_swap(&swap_id).unwrap().unwrap();
     assert_eq!(paid.phase, LnMakerPhase::InPaid);
@@ -3233,6 +3252,220 @@ fn swap_in_funded_handler_records_confirmation_height(
         paid.funding_height,
         Some(confirmed_at as u32),
         "the handler did not record the funding's confirmation height"
+    );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
+/// The maker's route margin, `CLTV_SAFETY_MARGIN` in its handler.
+const LN_CLTV_SAFETY_MARGIN: u32 = 12;
+/// The least locktime a swap-in must have left to be paid,
+/// `MIN_REMAINING_LOCKTIME` in the maker's handler.
+const LN_MIN_REMAINING_LOCKTIME: u32 = 24;
+
+/// How much of the swap-in window the chain leaves after the handler's pause.
+#[derive(Debug, Clone, Copy)]
+enum RereadWindow {
+    /// A few blocks pass, leaving a usable window.
+    Usable,
+    /// At least the minimum window, but less than the invoice's final delta
+    /// plus the route margin.
+    BelowInvoiceDelta,
+    /// Less than the minimum window.
+    BelowMinimum,
+}
+
+/// The chain moves on while the handler pauses to reread a missing funding
+/// height. The window it checks and the route budget it pays with must come
+/// from the tip after the pause, not from before it.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [FundingHeightLagsWhileChainMoves],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    cases = [
+        /// A few blocks pass: the payment's budget shrinks by exactly them.
+        swap_in_funded_handler_budgets_from_the_tip_after_a_reread(
+            preimage = Preimage([0xd8; 32]),
+            window = RereadWindow::Usable,
+        ),
+        /// Enough blocks pass to leave the minimum window but not the
+        /// invoice's final delta plus the margin: no route could meet the
+        /// budget, so the handler must refuse rather than pay.
+        swap_in_funded_handler_refuses_a_window_below_the_invoice_delta_after_a_reread(
+            preimage = Preimage([0xda; 32]),
+            window = RereadWindow::BelowInvoiceDelta,
+        ),
+        /// Enough blocks pass to leave less than the minimum window: the
+        /// handler must refuse rather than pay against the earlier tip.
+        swap_in_funded_handler_refuses_when_the_window_closes_during_a_reread(
+            preimage = Preimage([0xd9; 32]),
+            window = RereadWindow::BelowMinimum,
+        ),
+    ],
+)]
+fn handler_rechecks_the_window_after_a_reread(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+    preimage: Preimage,
+    window: RereadWindow,
+) {
+    let taker_ln = MockLightningBackend::new();
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+
+    let swap_id = preimage.payment_hash().to_string();
+    accept_swap_in(&maker, &taker_ln, &preimage);
+    let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    let value = accepted.amount + accepted.fee;
+    let funding = fund_htlc(bitcoind, &accepted);
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &funding.txid);
+    let locktime = accepted.locktime as u32;
+
+    let (result_tx, result_rx) = mpsc::channel();
+    let handler_maker = maker.clone();
+    let funded_id = swap_id.clone();
+    thread::spawn(move || {
+        let _ = result_tx.send(announce_funding(&handler_maker, &funded_id, funding, value));
+    });
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_millis(100),
+        "the handler to find the funding height missing",
+        maker.funding_height_lookups.load(Relaxed) >= 1
+    );
+    let invoice_delta = verify_invoice(
+        &accepted.invoice,
+        &accepted.payment_hash,
+        accepted.amount.to_sat() * 1000,
+    )
+    .unwrap()
+    .min_final_cltv_expiry_delta as u32;
+    let age = match window {
+        RereadWindow::Usable => 2,
+        // One block short of the invoice's delta plus the margin, which
+        // still leaves more than the minimum window.
+        RereadWindow::BelowInvoiceDelta => {
+            let age = locktime - (invoice_delta + LN_CLTV_SAFETY_MARGIN) + 1;
+            assert!(
+                locktime - age >= LN_MIN_REMAINING_LOCKTIME,
+                "the window must pass the minimum check to reach the invoice check"
+            );
+            age
+        }
+        // One block short of the minimum window.
+        RereadWindow::BelowMinimum => locktime - LN_MIN_REMAINING_LOCKTIME + 1,
+    };
+    mine_to(bitcoind, confirmed_at + age as u64);
+    maker.funding_height_pause_released.store(true, Relaxed);
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the handler did not return after its pause");
+
+    let refusal = match window {
+        RereadWindow::Usable => None,
+        RereadWindow::BelowInvoiceDelta => Some("cannot cover the invoice's"),
+        RereadWindow::BelowMinimum => Some("locktime blocks remain"),
+    };
+    if let Some(refusal) = refusal {
+        assert!(
+            result.contains(refusal),
+            "the handler did not refuse a window that shrank during its pause: {}",
+            result
+        );
+        assert_eq!(
+            ln.last_pay_cltv_bound(),
+            None,
+            "the handler paid against the tip from before its pause"
+        );
+        assert!(
+            maker.get_ln_swap(&swap_id).unwrap().is_none(),
+            "a refused swap-in must be forgotten"
+        );
+    } else {
+        assert!(
+            result.contains("pay_invoice failed"),
+            "the handler did not reach the payment: {}",
+            result
+        );
+        assert_eq!(
+            ln.last_pay_cltv_bound(),
+            Some(locktime - age - LN_CLTV_SAFETY_MARGIN),
+            "the route budget ignores the blocks mined during the pause"
+        );
+    }
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
+/// A block can arrive while the handler reads the funding height. The tip
+/// the handler counts against must be the one read before the height: on
+/// Electrum only that order keeps a reorg from pairing the funding's replaced
+/// height with the new tip. Here the funding stays put, so the block mined
+/// during the read must not shrink the route budget.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [ChainMovesDuringHeightRead],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+)]
+fn swap_in_funded_handler_counts_from_the_tip_read_before_the_height(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    let taker_ln = MockLightningBackend::new();
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+
+    let preimage = Preimage([0xdb; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    accept_swap_in(&maker, &taker_ln, &preimage);
+    let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    let value = accepted.amount + accepted.fee;
+    let funding = fund_htlc(bitcoind, &accepted);
+    generate_blocks(bitcoind, 1);
+    let confirmed_at = confirmation_height(bitcoind, &funding.txid);
+    let age = 2;
+    mine_to(bitcoind, confirmed_at + age);
+
+    let (result_tx, result_rx) = mpsc::channel();
+    let handler_maker = maker.clone();
+    let funded_id = swap_id.clone();
+    thread::spawn(move || {
+        let _ = result_tx.send(announce_funding(&handler_maker, &funded_id, funding, value));
+    });
+    wait_until!(
+        Duration::from_secs(60),
+        every Duration::from_millis(100),
+        "the handler to start reading the funding height",
+        maker.funding_height_lookups.load(Relaxed) >= 1
+    );
+    generate_blocks(bitcoind, 1);
+    maker.funding_height_pause_released.store(true, Relaxed);
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the handler did not return after the height read");
+
+    assert!(
+        result.contains("pay_invoice failed"),
+        "the handler did not reach the payment: {}",
+        result
+    );
+    assert_eq!(
+        ln.last_pay_cltv_bound(),
+        Some(accepted.locktime as u32 - age as u32 - LN_CLTV_SAFETY_MARGIN),
+        "the handler counted against a tip read after the funding height"
     );
 
     framework.set_block_gen_paused(false);
@@ -3258,6 +3491,8 @@ fn swap_in_funded_handler_records_confirmation_height(
             behavior = MakerBehavior::FailFundingHeightLookup,
             expected_error = "funding height lookup failed",
             preimage = Preimage([0xd2; 32]),
+            lookups = 1,
+            min_confirmations = 1,
         ),
         /// The handler waits for the funding to confirm, but the block can be
         /// reorged away before it reads the height. A lookup that answers with
@@ -3266,6 +3501,36 @@ fn swap_in_funded_handler_records_confirmation_height(
             behavior = MakerBehavior::NoFundingHeight,
             expected_error = "swap-in funding has no confirmation height",
             preimage = Preimage([0xd3; 32]),
+            lookups = 4,
+            min_confirmations = 1,
+        ),
+        /// A reorg can drop the funding's block after the confirmation wait,
+        /// and the next block mine it again. The height the handler reads then
+        /// has fewer confirmations than the swap requires, so it must not pay.
+        swap_in_funded_handler_stops_on_a_reorged_shallow_funding(
+            behavior = MakerBehavior::FundingReminedAtTip,
+            expected_error = "swap-in funding has fewer confirmations than the swap requires",
+            preimage = Preimage([0xd5; 32]),
+            lookups = 2,
+            min_confirmations = 2,
+        ),
+        /// Shutdown stops the watcher. A handler rereading a missing height
+        /// must stop on it rather than read on and store an unwatched InPaid.
+        swap_in_funded_handler_stops_on_shutdown_during_height_retry(
+            behavior = MakerBehavior::ShutdownDuringFundingHeightRetry,
+            expected_error = "Shutdown",
+            preimage = Preimage([0xd6; 32]),
+            lookups = 1,
+            min_confirmations = 1,
+        ),
+        /// Shutdown can also arrive during the pause before a reread. The
+        /// handler must check again after the pause and stop without reading.
+        swap_in_funded_handler_stops_on_shutdown_during_height_pause(
+            behavior = MakerBehavior::ShutdownDuringFundingHeightPause,
+            expected_error = "Shutdown",
+            preimage = Preimage([0xd7; 32]),
+            lookups = 1,
+            min_confirmations = 1,
         ),
     ],
 )]
@@ -3274,6 +3539,8 @@ fn handler_stops_without_funding_height(
     ln: Arc<MockLightningBackend>,
     expected_error: &str,
     preimage: Preimage,
+    lookups: u32,
+    min_confirmations: u32,
 ) {
     let taker_ln = MockLightningBackend::new();
     let framework = world.framework().clone();
@@ -3282,11 +3549,18 @@ fn handler_stops_without_funding_height(
     pause_block_generation(&framework);
 
     let swap_id = preimage.payment_hash().to_string();
-    accept_swap_in(&maker, &taker_ln, &preimage);
+    let request = LnSwapInRequest {
+        min_confirmations,
+        ..swap_in_request(&taker_ln, &preimage)
+    };
+    match expect_ln(send_swap_in_request(&maker, request).unwrap()) {
+        LightningMakerMessage::SwapInAccept(_) => {}
+        other => panic!("expected SwapInAccept, got {}", other),
+    }
     let accepted = maker.get_ln_swap(&swap_id).unwrap().unwrap();
     let value = accepted.amount + accepted.fee;
     let funding = fund_htlc(bitcoind, &accepted);
-    generate_blocks(bitcoind, 1);
+    generate_blocks(bitcoind, min_confirmations as u64);
 
     let result = announce_funding(&maker, &swap_id, funding, value);
     assert!(
@@ -3298,6 +3572,11 @@ fn handler_stops_without_funding_height(
         ln.last_pay_cltv_bound(),
         None,
         "the handler paid without a funding height"
+    );
+    assert_eq!(
+        maker.funding_height_lookups.load(Relaxed),
+        lookups,
+        "the handler made an unexpected number of funding height lookups"
     );
     let kept = maker
         .get_ln_swap(&swap_id)
