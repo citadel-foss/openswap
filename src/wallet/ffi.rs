@@ -325,13 +325,24 @@ impl Wallet {
         let amount = tx.output[0].value;
         let inputs = tx.input.len();
 
-        let txid = self.send_tx(&tx)?;
-        // The broadcast is accepted, so the caller must get the txid whatever
-        // the backend does next: one refresh attempt, and a failure is logged.
-        // `sync_and_save` would retry an unreachable backend for as long as it
-        // stays down, and hold the wallet lock while it does.
-        if let Err(e) = self.sync_once_and_save() {
-            log::error!("Wallet refresh failed after broadcasting {txid}: {e:?}");
+        let echoed = self.send_tx(&tx)?;
+        // The id of the transaction we built: a backend's reply is not trusted
+        // to name it.
+        let txid = tx.compute_txid();
+        if echoed != txid {
+            log::warn!("Backend named the sweep {echoed}, but it built {txid}");
+        }
+        // The broadcast is accepted, so the caller gets the txid whatever
+        // happens next. The wallet is not synced: a sweep has one external
+        // output and no change, so the spent coins are all there is to learn,
+        // and they leave the cache here. No network call can then hold the
+        // wallet lock or delay the result, and a retry cannot pick the coins
+        // again. The next sync of the wallet confirms the spend.
+        for input in &tx.input {
+            self.store.utxo_cache.remove(&input.previous_output);
+        }
+        if let Err(e) = self.save_to_disk() {
+            log::error!("Wallet save failed after broadcasting {txid}: {e:?}");
         }
 
         Ok(Sweep {
