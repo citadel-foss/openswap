@@ -395,8 +395,7 @@ fn lightning_maker_restart_refunds_unclaimed_swap_out(
 ///
 /// The eviction is real: unwinding the chain below the refund's CSV height
 /// makes bitcoind drop it as no longer final, and restoring the chain does
-/// not bring it back. The market rises before the resend, so only the rate
-/// the refund was first built at gives back the recorded txid.
+/// not bring it back.
 #[world_test(
     backend = BitcoindBackend,
     bind = [ln = maker_node()],
@@ -418,7 +417,6 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
     // The test mines every block itself. A background block could confirm
     // the refund between the mempool checks below and close the swap early.
     pause_block_generation(&framework);
-    let market = SpendFeerate::set(10.0);
 
     let preimage = Preimage([0x79; 32]);
     let swap_id = preimage.payment_hash().to_string();
@@ -445,11 +443,6 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
         .expect("the watchdog broadcast a refund");
     let in_mempool = |txid: &Txid| bitcoind.client.get_mempool_entry(txid).is_ok();
     assert!(in_mempool(&refund_txid));
-    assert_eq!(
-        mempool_spend_fee(bitcoind, funded.outpoint, funded.value),
-        Amount::from_sat(1_500),
-        "the refund must pay the market rate, 10 sat/vB for 150 vB"
-    );
     let recorded_spend = || match maker.watch_service.watch_request(funded.outpoint) {
         Ok(WatcherEvent::UtxoSpent { spending_tx, .. }) => spending_tx.map(|tx| tx.compute_txid()),
         other => panic!("unexpected watcher answer: {:?}", other),
@@ -482,17 +475,10 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
     assert_eq!(recorded_spend(), Some(refund_txid));
 
     // ---- The watchdog sends it again, and keeps the swap open ----
-    // Rebuilt at the new market rate it would be another transaction.
-    market.set_rate(40.0);
     ln_watchdog_tick_now(&maker);
     assert!(
         in_mempool(&refund_txid),
         "the evicted refund was never sent again"
-    );
-    assert_eq!(
-        mempool_spend_fee(bitcoind, funded.outpoint, funded.value),
-        Amount::from_sat(1_500),
-        "the resent refund must keep its 10 sat/vB, not the 40 sat/vB market"
     );
     // Further passes change nothing until it confirms.
     ln_watchdog_tick_now(&maker);
@@ -555,7 +541,8 @@ fn switch_resets_on_panic() {
 /// refund, recognise it as its own, and close the swap once it is final.
 /// Broadcasting first could leave a refund that confirmed while the maker
 /// was down and that the restarted maker did not know was its own, so the
-/// swap never closed.
+/// swap never closed. The market rises while it is down, so the refund the
+/// restarted maker rebuilds is the recorded one only at the recorded rate.
 #[world_test(
     backend = BitcoindBackend,
     bind = [ln = maker_node()],
@@ -574,6 +561,7 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
     let bitcoind = &framework.bitcoind;
     let maker = world.makers()[0].inner().clone();
     let locktime: u16 = 30;
+    let market = SpendFeerate::set(10.0);
 
     let preimage = Preimage([0x7a; 32]);
     let swap_id = preimage.payment_hash().to_string();
@@ -615,6 +603,8 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
     let maker = world.makers()[0].inner().clone();
 
     // ---- The restarted maker refunds and closes the swap ----
+    // Nothing was sent, so it rebuilds the refund from its record.
+    market.set_rate(40.0);
     ln_watchdog_tick_now(&maker);
     generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
     wait_until!(
@@ -636,13 +626,24 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
     let recorded = recorded.expect("the refund was recorded before the crash");
     assert!(!sent_before_recorded);
     assert!(confirmations(bitcoind, &recorded) >= 1);
+    let refund = raw_tx_with_retry(bitcoind, &recorded);
     assert_eq!(
-        raw_tx_with_retry(bitcoind, &recorded)
+        refund
             .input
             .iter()
             .map(|input| input.previous_output)
             .collect::<Vec<_>>(),
         vec![funded.outpoint]
+    );
+    assert_eq!(
+        funded.value
+            - refund
+                .output
+                .iter()
+                .map(|output| output.value)
+                .sum::<Amount>(),
+        Amount::from_sat(1_500),
+        "the refund must keep the 10 sat/vB it was recorded at, not the 40 sat/vB market"
     );
 }
 
