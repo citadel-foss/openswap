@@ -15,8 +15,8 @@ use bitcoin::{
 use bitcoind::bitcoincore_rpc::RpcApi;
 
 use openswap::lightning::{
-    HtlcFunded, InvoiceParams, LightningBackend, LightningError, MockLightningBackend, Preimage,
-    SwapHtlc, SwapInMaker, SwapInParams, SwapInTaker,
+    swap::SPEND_FEE_RATE_FLOOR, HtlcFunded, InvoiceParams, LightningBackend, LightningError,
+    MockLightningBackend, Preimage, SwapHtlc, SwapInMaker, SwapInParams, SwapInTaker,
 };
 
 use crate::test_framework::*;
@@ -83,7 +83,12 @@ fn swap_in_happy_path(node: &mut Node) {
 
     // 10. Maker sweeps the on-chain HTLC through the hashlock branch.
     let claim_tx = maker
-        .claim_tx(outpoint, funding_output.value, miner_spk(bitcoind))
+        .claim_tx(
+            outpoint,
+            funding_output.value,
+            miner_spk(bitcoind),
+            SPEND_FEE_RATE_FLOOR,
+        )
         .unwrap();
     let witness: Vec<_> = claim_tx.input[0].witness.iter().collect();
     assert_eq!(
@@ -119,7 +124,12 @@ fn swap_in_refund_path(node: &mut Node) {
     assert!(!taker.try_claim().unwrap());
 
     let refund_tx = taker
-        .refund_tx(outpoint, funding_output.value, miner_spk(bitcoind))
+        .refund_tx(
+            outpoint,
+            funding_output.value,
+            miner_spk(bitcoind),
+            SPEND_FEE_RATE_FLOOR,
+        )
         .unwrap();
 
     // Too early: CSV not yet satisfied.
@@ -182,6 +192,7 @@ fn swap_in_wrong_preimage_fails_both_layers(node: &mut Node) {
             &hashlock_sk,
             &wrong_preimage,
             miner_spk(bitcoind),
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     assert!(
@@ -197,6 +208,7 @@ fn swap_in_wrong_preimage_fails_both_layers(node: &mut Node) {
             &hashlock_sk,
             &preimage,
             miner_spk(bitcoind),
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     bitcoind.client.send_raw_transaction(&good_claim).unwrap();

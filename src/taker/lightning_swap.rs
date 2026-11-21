@@ -31,7 +31,9 @@ use bitcoin::{
 
 use crate::{
     lightning::{
-        invoice::verify_invoice, swap::SwapHtlc, InvoiceParams, LightningBackend, LnEvent, Preimage,
+        invoice::verify_invoice,
+        swap::{htlc_spend_feerate, SwapHtlc},
+        InvoiceParams, LightningBackend, LnEvent, Preimage,
     },
     protocol::{
         common_messages::{GetOffer, MakerToTakerMessage, Offer, TakerToMakerMessage},
@@ -42,7 +44,7 @@ use crate::{
         },
     },
     utill::{generate_keypair, read_message, send_message, MIN_RELAY_FEE_RATE},
-    wallet::{AddressType, LnPendingSwap},
+    wallet::{AddressType, FeePriority, LnPendingSwap},
 };
 
 use super::{
@@ -491,6 +493,22 @@ impl Taker {
         // the only copy of our branch key.
         let (outpoint, actual_value) = {
             let mut wallet = self.write_wallet()?;
+            // Priced to confirm while the maker still waits for it, as the
+            // maker prices its swap-out funding: at the relay floor a busy
+            // chain leaves it unconfirmed and the swap is abandoned.
+            let feerate = {
+                use crate::wallet::blockchain::Blockchain;
+                match wallet.blockchain.estimate_feerate(FeePriority::High) {
+                    Ok(rate) if rate.is_finite() => rate.max(MIN_RELAY_FEE_RATE),
+                    other => {
+                        log::warn!(
+                            "lightning: no feerate estimate for high priority \
+                             ({other:?}); funding the HTLC at the relay floor"
+                        );
+                        MIN_RELAY_FEE_RATE
+                    }
+                }
+            };
             // One split, one destination: an HTLC output is a single exact
             // payment, with no hop to reimburse and nothing to randomize.
             // A Lightning HTLC is a script-path P2WSH contract, priced like
@@ -498,14 +516,14 @@ impl Taker {
             let plan = wallet.plan_funding(
                 value,
                 1,
-                MIN_RELAY_FEE_RATE,
+                feerate,
                 u32::MAX,
                 None,
                 None,
                 None,
                 crate::protocol::ProtocolVersion::Legacy,
             )?;
-            let result = wallet.execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE)?;
+            let result = wallet.execute_funding_plan(&plan, &[address], feerate)?;
             let tx = result
                 .funding_txes
                 .into_iter()
@@ -811,6 +829,7 @@ impl Taker {
             .write_wallet()?
             .get_next_external_address(AddressType::P2WPKH)?
             .script_pubkey();
+        let feerate = htlc_spend_feerate(&self.read_wallet()?.blockchain);
         let claim_tx = htlc
             .create_hashlock_spend(
                 funded.outpoint,
@@ -818,6 +837,7 @@ impl Taker {
                 &hashlock_privkey,
                 &preimage,
                 destination,
+                feerate,
             )
             .map_err(|e| general(format!("claim build: {e}")))?;
         let claim_txid = self.read_wallet()?.send_tx(&claim_tx)?;
@@ -1068,6 +1088,7 @@ impl Taker {
             .write_wallet()?
             .get_next_external_address(AddressType::P2WPKH)?
             .script_pubkey();
+        let feerate = htlc_spend_feerate(&self.read_wallet()?.blockchain);
         let claim_tx = htlc2
             .create_hashlock_spend(
                 funded2.outpoint,
@@ -1075,6 +1096,7 @@ impl Taker {
                 &hashlock_privkey,
                 &preimage,
                 destination,
+                feerate,
             )
             .map_err(|e| general(format!("claim build: {e}")))?;
         let claim_txid = self.read_wallet()?.send_tx(&claim_tx)?;
@@ -1135,9 +1157,10 @@ impl Taker {
                 .write_wallet()?
                 .get_next_external_address(AddressType::P2WPKH)?
                 .script_pubkey();
+            let feerate = htlc_spend_feerate(&self.read_wallet()?.blockchain);
             let spend = if record.is_swap_in {
                 // Our money, refund branch (CSV-gated).
-                htlc.create_timelock_spend(outpoint, value, &record.privkey, destination)
+                htlc.create_timelock_spend(outpoint, value, &record.privkey, destination, feerate)
             } else {
                 // Claim with our own preimage.
                 let preimage = Preimage(
@@ -1145,7 +1168,14 @@ impl Taker {
                         .preimage
                         .ok_or_else(|| general("swap-out record without preimage"))?,
                 );
-                htlc.create_hashlock_spend(outpoint, value, &record.privkey, &preimage, destination)
+                htlc.create_hashlock_spend(
+                    outpoint,
+                    value,
+                    &record.privkey,
+                    &preimage,
+                    destination,
+                    feerate,
+                )
             }
             .map_err(|e| general(format!("recovery spend build: {e}")))?;
 

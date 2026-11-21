@@ -21,8 +21,8 @@ use bitcoin::{
 use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
 use openswap::{
     lightning::{
-        invoice::verify_invoice, InvoiceParams, LightningBackend, LnEvent, MockLightningBackend,
-        PaymentId, PaymentOutcome, Preimage, SwapHtlc,
+        invoice::verify_invoice, swap::SPEND_FEE_RATE_FLOOR, InvoiceParams, LightningBackend,
+        LnEvent, MockLightningBackend, PaymentId, PaymentOutcome, Preimage, SwapHtlc,
     },
     maker::{
         handlers::{handle_message, ConnectionState, Maker},
@@ -43,6 +43,7 @@ use openswap::{
     wallet::AddressType,
 };
 
+use super::SpendFeerate;
 use crate::test_framework::*;
 
 use std::sync::atomic::{
@@ -217,6 +218,7 @@ fn lightning_maker_restart_recovers_funded_swap(world: &mut World, ln: Arc<MockL
             funded.value,
             &restored.privkey,
             destination,
+            SPEND_FEE_RATE_FLOOR,
         )
         .expect("refund builds from restored state");
 
@@ -273,6 +275,7 @@ fn lightning_maker_restart_refunds_unclaimed_swap_out(
     let maker = world.makers()[0].inner().clone();
     let locktime: u16 = 30;
     let amount = Amount::from_sat(40_000);
+    let market = SpendFeerate::set(10.0);
 
     // The taker pays but never claims, so the preimage stays private.
     let preimage = Preimage([0x78; 32]);
@@ -343,6 +346,27 @@ fn lightning_maker_restart_refunds_unclaimed_swap_out(
             .collect::<Vec<_>>(),
         vec![funded.outpoint],
         "the refund must spend exactly the swap's HTLC"
+    );
+    assert_eq!(
+        funded.value
+            - refund
+                .output
+                .iter()
+                .map(|output| output.value)
+                .sum::<Amount>(),
+        Amount::from_sat(1_500),
+        "the refund must pay the market rate, 10 sat/vB for 150 vB"
+    );
+    // A rebuild keeps the rate the recorded txid was built at.
+    market.set_rate(40.0);
+    assert_eq!(
+        maker
+            .ln_swaps
+            .lock()
+            .unwrap()
+            .get(&swap_id)
+            .and_then(|swap| swap.refund_feerate),
+        Some(10.0)
     );
 
     // The refunded coins are back in the maker's wallet.
@@ -729,6 +753,7 @@ fn lightning_maker_keeps_a_shallow_refund_through_a_reorg(
             &SecretKey::from_slice(&[0x31; 32]).unwrap(),
             &preimage,
             destination.script_pubkey(),
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     bitcoind.client.invalidate_block(&refund_block).unwrap();
@@ -954,6 +979,7 @@ fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
             &SecretKey::from_slice(&[0x31; 32]).unwrap(),
             &preimage,
             destination,
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     let claim_txid = bitcoind.client.send_raw_transaction(&claim).unwrap();
@@ -1399,6 +1425,7 @@ fn lightning_maker_does_not_refund_a_claimed_swap_out_without_funding_height(
             &SecretKey::from_slice(&[0x31; 32]).unwrap(),
             &preimage,
             destination,
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     let claim_txid = bitcoind.client.send_raw_transaction(&claim).unwrap();
@@ -1470,6 +1497,7 @@ fn accepted_swap_in_with_locktime(preimage: &Preimage, locktime: u16) -> LnMaker
         invoice: "lnbcrt-test".to_string(),
         preimage: None,
         refund_txid: None,
+        refund_feerate: None,
         accepted_height: None,
         payout_script: None,
         funding: None,
@@ -2139,6 +2167,7 @@ fn broadcast_taker_refund(bitcoind: &BitcoinD, swap: &LnMakerSwap, funding: OutP
             swap.amount + swap.fee,
             &timelock_privkey,
             destination,
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     bitcoind.client.send_raw_transaction(&refund).unwrap()
@@ -2630,6 +2659,97 @@ fn stale_watchdog_snapshot_keeps_newer_swap_in_state(
     framework.set_block_gen_paused(false);
     restarted.shutdown.store(true, Relaxed);
     restarted.watch_service.shutdown();
+}
+
+/// The fee the mempool's spend of `funding` pays out of `value`.
+fn mempool_spend_fee(bitcoind: &BitcoinD, funding: OutPoint, value: Amount) -> Amount {
+    let spend = bitcoind
+        .client
+        .get_raw_mempool()
+        .unwrap()
+        .into_iter()
+        .map(|txid| bitcoind.client.get_raw_transaction(&txid, None).unwrap())
+        .find(|tx| {
+            tx.input
+                .iter()
+                .any(|input| input.previous_output == funding)
+        })
+        .expect("the HTLC has a spend in the mempool");
+    value
+        - spend
+            .output
+            .iter()
+            .map(|output| output.value)
+            .sum::<Amount>()
+}
+
+/// The swap-in sweep pays the market rate. While it waits in the mempool the
+/// watchdog leaves it alone, even after the market rises: replacing it would
+/// also evict anything the wallet has since funded from its output.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone(), payee_ln = pair.1.clone()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+)]
+fn swap_in_sweep_pays_the_market_rate_and_is_not_replaced(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+    payee_ln: Arc<MockLightningBackend>,
+) {
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    let router = maker.ln_router.clone().unwrap();
+    pause_block_generation(&framework);
+    let market = SpendFeerate::set(5.0);
+
+    let preimage = Preimage([0xb1; 32]);
+    let id = preimage.payment_hash().to_string();
+    let mut swap = accepted_swap_in(&preimage);
+    swap.invoice = payee_ln
+        .create_hold_invoice(
+            preimage.payment_hash(),
+            InvoiceParams {
+                amount_msat: Some(swap.amount.to_sat() * 1000),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .invoice;
+    let funding = fund_htlc(bitcoind, &swap);
+    generate_blocks(bitcoind, 1);
+    let mut paid = paid_without_height(&swap, funding);
+    paid.funding_height = Some(confirmation_height(bitcoind, &funding.txid) as u32);
+    router.subscribe(paid.payment_hash);
+    maker.store_ln_swap(&id, paid).unwrap();
+    ln.pay_invoice(&swap.invoice, None, Some(100)).unwrap();
+    payee_ln.claim_held_payment(&preimage).unwrap();
+
+    ln_watchdog_tick_now(&maker);
+    let value = swap.amount + swap.fee;
+    assert_eq!(
+        maker.get_ln_swap(&id).unwrap().unwrap().phase,
+        LnMakerPhase::InSwept
+    );
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(750),
+        "the sweep must pay the market rate, 5 sat/vB for 150 vB"
+    );
+
+    market.set_rate(20.0);
+    ln_watchdog_tick_now(&maker);
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(750),
+        "the watchdog must not replace a sweep that is still in the mempool"
+    );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
 }
 
 /// A swap-in's payment can still be in flight after the taker's refund

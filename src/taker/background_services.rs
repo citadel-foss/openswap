@@ -840,6 +840,7 @@ mod tests {
                 invoice: "pending".into(),
                 preimage: None,
                 refund_txid: None,
+                refund_feerate: None,
                 accepted_height: None,
                 payout_script: None,
                 funding_outpoint: None,

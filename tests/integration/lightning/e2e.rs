@@ -26,6 +26,7 @@ use openswap::{
     wallet::AddressType,
 };
 
+use super::{tx_fee, SpendFeerate};
 use crate::test_framework::*;
 
 /// Two mock Lightning nodes over one shared ledger: the maker's first, the
@@ -65,6 +66,7 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
     let maker = world.makers()[0].inner().clone();
     let maker_address = world.makers()[0].address();
     let taker = world.taker_mut().inner_mut();
+    let _market = SpendFeerate::set(10.0);
 
     // ---- Swap-in: taker pays on-chain, gains Lightning balance ----
     let swap_in = taker
@@ -122,6 +124,11 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
             .and_then(|info| info.confirmations)
             .unwrap_or(0)
             >= 1
+    );
+    assert_eq!(
+        tx_fee(bitcoind, &claim_txid),
+        Amount::from_sat(1_500),
+        "the taker's claim must pay the market rate, 10 sat/vB for 150 vB"
     );
 
     // Both swaps fully resolved: no taker-side recovery records remain.
