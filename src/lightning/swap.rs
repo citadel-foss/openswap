@@ -47,8 +47,7 @@ use bitcoin::{
 use crate::{
     protocol::{contract::create_contract_redeemscript, error::ProtocolError, Hash160},
     utill::{
-        capped_fee, generate_keypair, is_unusable_fee_rate, redeemscript_to_scriptpubkey,
-        LEGACY_CONTRACT_SPEND_VSIZE,
+        capped_fee, generate_keypair, redeemscript_to_scriptpubkey, LEGACY_CONTRACT_SPEND_VSIZE,
     },
     wallet::{Blockchain, FeePriority, WalletError},
 };
@@ -74,8 +73,21 @@ pub const SPEND_FEE_RATE_FLOOR: f64 = 2.0;
 /// so a spend priced under the market can still be unconfirmed when the
 /// other side's branch opens.
 pub fn htlc_spend_feerate<B: Blockchain + ?Sized>(chain: &B) -> f64 {
+    // Regtest has no fee estimates, so a test names the rate the market has
+    // reached.
+    #[cfg(feature = "integration-test")]
+    if let Some(rate) = std::env::var(SPEND_FEERATE_ENV)
+        .ok()
+        .and_then(|rate| rate.parse::<f64>().ok())
+    {
+        return spend_feerate_from(Ok(rate));
+    }
     spend_feerate_from(chain.estimate_feerate(FeePriority::High))
 }
+
+/// Names the feerate [`htlc_spend_feerate`] sees in test builds.
+#[cfg(feature = "integration-test")]
+pub const SPEND_FEERATE_ENV: &str = "OPENSWAP_HTLC_SPEND_FEERATE";
 
 fn spend_feerate_from(estimate: Result<f64, WalletError>) -> f64 {
     match estimate {
@@ -370,7 +382,9 @@ impl SwapHtlc {
         destination: ScriptBuf,
         feerate: f64,
     ) -> Result<Transaction, SwapError> {
-        if is_unusable_fee_rate(feerate) {
+        // Below the floor is a caller bug, not a market rate: it would let a
+        // spend that cannot fit the floor fee pay less than every spend did.
+        if !feerate.is_finite() || feerate < SPEND_FEE_RATE_FLOOR {
             return Err(SwapError::Validation(format!(
                 "no spend fee at {feerate} sat/vB"
             )));
@@ -991,7 +1005,7 @@ mod tests {
     fn spend_refuses_an_unusable_feerate() {
         let (htlc, preimage, ..) = test_htlc();
         let (_, privkey) = generate_keypair();
-        for feerate in [f64::NAN, f64::INFINITY, 0.5] {
+        for feerate in [f64::NAN, f64::INFINITY, 0.5, 1.5] {
             let result = htlc.create_hashlock_spend(
                 OutPoint::default(),
                 Amount::from_sat(100_000),
