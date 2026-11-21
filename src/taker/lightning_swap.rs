@@ -4007,7 +4007,7 @@ mod tests {
             payer.payment_outcome(hash).unwrap(),
             PaymentOutcome::Pending
         );
-        taker.set_lightning_backend(payer.clone());
+        taker.lightning = Some(payer.clone());
         (maker, payer)
     }
 
