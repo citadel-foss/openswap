@@ -141,9 +141,9 @@ const MAX_FINALIZE_RETRIES: u32 = 2;
 
 /// Delay between finalization retry attempts.
 #[cfg(not(feature = "integration-test"))]
-const FINALIZE_RETRY_DELAY: Duration = Duration::from_secs(15);
+pub(crate) const FINALIZE_RETRY_DELAY: Duration = Duration::from_secs(15);
 #[cfg(feature = "integration-test")]
-const FINALIZE_RETRY_DELAY: Duration = Duration::from_secs(5);
+pub(crate) const FINALIZE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Maximum number of blocks between consecutive hop confirmations.
 /// If a maker's funding confirms more than this many blocks after the previous

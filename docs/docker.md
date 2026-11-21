@@ -192,6 +192,8 @@ docker exec -it openswap-makerd maker-cli get-balances
 docker exec -it openswap-makerd maker-cli stop
 ```
 
+`maker-cli stop` drains the maker: it takes no new swaps and exits once the swaps in progress finish, within an hour at most. The command returns before the container has exited, so wait for it to stop. `docker stop` and the `docker-setup` stop, restart and seed commands stop the maker at once, as before.
+
 ### Taker
 
 Run taker operations:
