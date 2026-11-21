@@ -1029,12 +1029,42 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             maker.thread_pool.add_thread(handle)?;
         }
 
+        settle_held_sends(&maker);
+
         if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
             break;
         }
     }
 
     Ok(())
+}
+
+/// A direct send whose broadcast failed keeps its inputs held until a pass
+/// finds the send unknown, and an idle maker runs no sync to make that pass.
+/// One here per heartbeat while any send is held. The backend is asked on a
+/// connection of its own with the wallet released, since a backend in outage
+/// can take minutes to answer; the wallet is held only to apply the answers.
+fn settle_held_sends(maker: &MakerServer) {
+    use crate::wallet::Blockchain;
+
+    let probes = match lock_debug!(maker.wallet.read()) {
+        Ok(wallet) if wallet.has_held_sends() => wallet.sends_to_probe(),
+        _ => return,
+    };
+    let unknown: HashSet<_> = if probes.is_empty() {
+        HashSet::new()
+    } else {
+        let Ok(chain) = maker.backend.connect() else {
+            return;
+        };
+        probes
+            .into_iter()
+            .filter(|hold| matches!(chain.is_tx_unknown(&hold.txid), Ok(true)))
+            .collect()
+    };
+    if let Ok(mut wallet) = lock_debug!(maker.wallet.write()) {
+        wallet.settle_sends(&unknown);
+    }
 }
 
 /// Periodically check for expired fidelity bonds and renew them.
