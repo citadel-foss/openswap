@@ -262,6 +262,32 @@ impl MakerOfferCandidate {
         }
     }
 
+    fn cached_expiry_height(&self) -> Option<u32> {
+        self.fidelity_expiry_height.or_else(|| {
+            self.offer
+                .as_ref()
+                .map(|offer| offer.fidelity.bond.lock_time.to_consensus_u32())
+        })
+    }
+
+    fn forget_expired_offer(&mut self, now_ts: u64) {
+        self.offer = None;
+        self.fidelity_expiry_height = None;
+        self.last_offer_update_ts = None;
+        self.state = MakerState::Unavailable(match &self.state {
+            MakerState::Unavailable(previous) => UnavailableState {
+                reason: UnavailableReason::BondExpired,
+                ..previous.clone()
+            },
+            _ => UnavailableState {
+                reason: UnavailableReason::BondExpired,
+                since_ts: Some(now_ts),
+                last_attempt_ts: None,
+                attempts: 0,
+            },
+        });
+    }
+
     fn as_offer_and_address(&self) -> Option<OfferAndAddress> {
         match (&self.offer, &self.protocol) {
             (Some(offer), Some(protocol)) => Some(OfferAndAddress {
@@ -904,7 +930,7 @@ impl OfferSyncService {
                 .map_err(|_| TakerError::General("offerbook lock poisoned".into()))?;
             let mut changed = false;
             if height_known {
-                changed |= book.prune_expired_makers(height) > 0;
+                changed |= book.prune_expired_makers(height, now) > 0;
                 changed |= book.prune_expired_suppressions(height) > 0;
             }
             // An announced bond awaiting a backend lookup is not absent. Keep
@@ -1823,19 +1849,24 @@ impl OfferBook {
 
     /// Known bond expiry is independent of Nostr snapshot availability. Preserve
     /// bans even when their bond expires so rediscovery cannot lift the ban.
-    fn prune_expired_makers(&mut self, current_height: u32) -> usize {
-        let before = self.makers.len();
-        self.makers.retain(|maker| {
-            let expiry = maker.fidelity_expiry_height.or_else(|| {
-                maker
-                    .offer
-                    .as_ref()
-                    .map(|offer| offer.fidelity.bond.lock_time.to_consensus_u32())
-            });
-            matches!(maker.state, MakerState::Banned(_))
-                || expiry.is_none_or(|expiry| expiry > current_height)
+    fn prune_expired_makers(&mut self, current_height: u32, now_ts: u64) -> usize {
+        let mut expired = 0;
+        self.makers.retain_mut(|maker| {
+            if matches!(maker.state, MakerState::Banned(_))
+                || maker
+                    .cached_expiry_height()
+                    .is_none_or(|expiry| expiry > current_height)
+            {
+                return true;
+            }
+            expired += 1;
+            if maker.fidelity_outpoint.is_some() {
+                return false;
+            }
+            maker.forget_expired_offer(now_ts);
+            true
         });
-        before - self.makers.len()
+        expired
     }
 
     /// Drops suppression records once their fidelity bond can no longer be a
@@ -4283,6 +4314,62 @@ pub(crate) mod tests {
         assert_eq!(suppressed.fidelity_outpoint, outpoint);
         assert_eq!(suppressed.fidelity_expiry_height, Some(500));
         assert!(!book.upsert_discovered(address, outpoint, Some(500), second_prune_ts + 1));
+    }
+
+    #[test]
+    fn expired_manual_maker_is_polled_and_takes_renewed_bond() {
+        let manual = addr("manual-renewed");
+        let discovered = addr("discovered-expired");
+        let offer = dummy_offer(&manual.to_string());
+        let expiry = offer.fidelity.bond.lock_time.to_consensus_u32();
+        let renewed_expiry = expiry + 1_000;
+        let mut renewed = offer.clone();
+        renewed.fidelity.bond.lock_time = LockTime::from_height(renewed_expiry).unwrap();
+        let fetched_ts = 1_000;
+        let now_ts = fetched_ts + 1;
+        let mut book = OfferBook::default();
+
+        book.insert_candidate(manual.clone(), None, None, fetched_ts, None);
+        book.mark_success(
+            &manual,
+            offer,
+            MakerProtocol::Taproot,
+            Vec::new(),
+            fetched_ts,
+        );
+        book.insert_candidate(
+            discovered,
+            Some(OutPoint::new(Txid::from_slice(&[13; 32]).unwrap(), 0)),
+            Some(expiry),
+            fetched_ts,
+            None,
+        );
+
+        assert_eq!(book.prune_expired_makers(expiry - 1, now_ts), 0);
+        assert!(book.makers_to_poll(now_ts, &HashMap::new()).is_empty());
+
+        assert_eq!(book.prune_expired_makers(expiry, now_ts), 2);
+        assert_eq!(book.makers.len(), 1);
+        let maker = &book.makers[0];
+        assert_eq!(maker.address, manual);
+        assert!(maker.offer.is_none());
+        assert!(maker.as_offer_and_address().is_none());
+        assert!(matches!(
+            &maker.state,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::BondExpired,
+                ..
+            })
+        ));
+        assert_eq!(
+            book.makers_to_poll(now_ts, &HashMap::new()),
+            vec![manual.clone()]
+        );
+
+        book.mark_success(&manual, renewed, MakerProtocol::Taproot, Vec::new(), now_ts);
+        assert_eq!(book.prune_expired_makers(expiry, now_ts), 0);
+        assert_eq!(book.makers[0].state, MakerState::Good);
+        assert_eq!(book.makers[0].cached_expiry_height(), Some(renewed_expiry));
     }
 
     #[test]

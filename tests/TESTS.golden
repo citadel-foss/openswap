@@ -234,6 +234,7 @@ openswap taker::offers::tests::compat_offerbook_round_trips_all_states_through_v
 openswap taker::offers::tests::discovery_replaces_spent_bond_metadata
 openswap taker::offers::tests::draining_sync_requests_preserves_polls_and_removals
 openswap taker::offers::tests::expired_bond_removes_its_suppression_record
+openswap taker::offers::tests::expired_manual_maker_is_polled_and_takes_renewed_bond
 openswap taker::offers::tests::failed_bond_checks_do_not_override_other_makers_retry_delays
 openswap taker::offers::tests::failed_offerbook_write_preserves_existing_file
 openswap taker::offers::tests::fidelity_candidate_transitions_enforce_one_live_bond
