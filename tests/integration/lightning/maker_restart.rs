@@ -2683,8 +2683,9 @@ fn mempool_spend_fee(bitcoind: &BitcoinD, funding: OutPoint, value: Amount) -> A
             .sum::<Amount>()
 }
 
-/// The swap-in sweep pays the market rate, and once the market rises past it
-/// the watchdog replaces the unconfirmed sweep instead of resending it.
+/// The swap-in sweep pays the market rate. While it waits in the mempool the
+/// watchdog leaves it alone, even after the market rises: replacing it would
+/// also evict anything the wallet has since funded from its output.
 #[world_test(
     backend = BitcoindBackend,
     bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone(), payee_ln = pair.1.clone()],
@@ -2692,7 +2693,7 @@ fn mempool_spend_fee(bitcoind: &BitcoinD, funding: OutPoint, value: Amount) -> A
     takers = [Normal],
     maker_lightning = [ln.clone()],
 )]
-fn watchdog_reprices_an_unconfirmed_swap_in_sweep(
+fn swap_in_sweep_pays_the_market_rate_and_is_not_replaced(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
     payee_ln: Arc<MockLightningBackend>,
@@ -2742,8 +2743,8 @@ fn watchdog_reprices_an_unconfirmed_swap_in_sweep(
     ln_watchdog_tick_now(&maker);
     assert_eq!(
         mempool_spend_fee(bitcoind, funding, value),
-        Amount::from_sat(3_000),
-        "the watchdog must replace the sweep at the risen rate"
+        Amount::from_sat(750),
+        "the watchdog must not replace a sweep that is still in the mempool"
     );
 
     framework.set_block_gen_paused(false);

@@ -1027,16 +1027,20 @@ fn watchdog_finish_sweep<M: Maker>(
         ctx.router.unsubscribe(&swap.payment_hash);
         return maker.remove_ln_swap(swap_id);
     }
-    // Still unconfirmed: rebuild and rebroadcast. A duplicate is harmless,
-    // and this is what recovers from an eviction.
+    // A sweep still in the mempool is left alone: replacing it would also
+    // evict anything the wallet has since funded from its unconfirmed
+    // output. Once it has left the mempool it is rebuilt, at the current
+    // rate, which is what recovers from an eviction.
+    if !maker.contract_output_unspent(&outpoint)? {
+        return Ok(());
+    }
     let Some(preimage) = swap.preimage else {
         return Err(MakerError::General("swept swap without a preimage"));
     };
     let mut swap = swap.clone();
     let destination = payout_script(maker, swap_id, &mut swap)?;
-    // Repriced on every pass, unlike the refund: confirmation is read from
-    // the outpoint, so any version of the sweep that confirms will do, and a
-    // sweep left under a risen market is replaced instead of resent as is.
+    // Priced afresh, unlike the refund: confirmation is read from the
+    // outpoint, so any version of the sweep that confirms will do.
     let claim_tx = swap
         .htlc
         .create_hashlock_spend(
