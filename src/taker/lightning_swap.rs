@@ -808,6 +808,10 @@ impl Taker {
             }
             wallet.save_to_disk()?;
         }
+        #[cfg(feature = "integration-test")]
+        if self.behavior == super::api::TakerBehavior::StopBeforeSwapOutClaim {
+            return Err(general("Test: stopped before the swap-out claim"));
+        }
 
         let destination = self
             .write_wallet()?

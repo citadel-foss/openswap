@@ -4025,6 +4025,9 @@ pub enum TakerBehavior {
     /// Announce a swap-in HTLC value one sat above the funded output, so the
     /// maker must refuse the funding message (Lightning swap-in mismatch test).
     ForgeSwapInFundedValue,
+    /// Stop a Lightning swap-out once the maker's HTLC funding is recorded,
+    /// before the claim is broadcast, so only recovery can claim it.
+    StopBeforeSwapOutClaim,
     /// Once the hop-0 funding is signed and before it is broadcast, pay from
     /// its planned coins through the public wallet API. The funding claim must
     /// refuse the payment, and the swap must go on.

@@ -730,6 +730,7 @@ openswap::integration fidelity::timelock_violation::fidelity_limit_violation
 openswap::integration lightning::e2e::lightning_submarine_swaps_e2e
 openswap::integration lightning::e2e::lightning_swap_in_refuses_announced_value_mismatch
 openswap::integration lightning::e2e::lightning_swap_in_refuses_blocklisted_funding
+openswap::integration lightning::e2e::lightning_swap_out_recovery_claims_at_the_market_rate
 openswap::integration lightning::e2e::lightning_swap_out_refuses_blocklisted_funding
 openswap::integration lightning::maker_restart::conditional_paid_store_refuses_stale_copy
 openswap::integration lightning::maker_restart::forged_swap_in_funding_keeps_accepted_swap
