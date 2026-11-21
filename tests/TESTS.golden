@@ -211,6 +211,7 @@ openswap taker::config::tests::test_missing_fields
 openswap taker::config::tests::test_missing_file
 openswap taker::config::tests::test_valid_config
 openswap taker::config::tests::unreadable_values_are_refused
+openswap taker::lightning_swap::tests::cleanup_keeps_the_key_when_funding_disappears_during_the_spend_check
 openswap taker::lightning_swap::tests::cltv_delta_above_u16_is_rejected_not_truncated
 openswap taker::lightning_swap::tests::failed_payout_script_save_is_not_kept_in_memory
 openswap taker::lightning_swap::tests::first_claim_needs_the_agreed_confirmations

@@ -1008,7 +1008,7 @@ fn lookup_spend(core: &CoreRPC, outpoint: &OutPoint) -> Result<Spend, WatcherErr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bitcoin::{
         consensus::{encode::serialize_hex, serialize},
@@ -1270,7 +1270,7 @@ mod tests {
     /// Serves Core JSON-RPC from `answer` on every connection and records each
     /// method called; an `Err` is sent as the JSON-RPC error object. Runs
     /// until the test process exits.
-    fn mock_core_rpc(
+    pub(crate) fn mock_core_rpc(
         answer: impl Fn(&str, &Value) -> Result<Value, Value> + Send + Sync + 'static,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Core RPC");
@@ -1363,7 +1363,7 @@ mod tests {
 
     /// The parts of a Core node the watcher's re-check reads.
     #[derive(Default)]
-    struct Node {
+    pub(crate) struct Node {
         mempool: Vec<Transaction>,
         /// The active chain; a block's height is its index.
         chain: Vec<Block>,
@@ -1375,7 +1375,7 @@ mod tests {
     }
 
     impl Node {
-        fn mine(&mut self, txdata: Vec<Transaction>) {
+        pub(crate) fn mine(&mut self, txdata: Vec<Transaction>) {
             let mut block = genesis_block(Network::Regtest);
             // A distinct header per height, so each block has its own hash.
             block.header.time += self.chain.len() as u32;
@@ -1427,7 +1427,7 @@ mod tests {
                 .map(|tx| (tx, Some((BlockHash::from_byte_array([0xee; 32]), 0))))
         }
 
-        fn answer(&self, method: &str, params: &Value) -> Result<Value, Value> {
+        pub(crate) fn answer(&self, method: &str, params: &Value) -> Result<Value, Value> {
             match method {
                 "gettxspendingprevout" => {
                     let prevout = &params[0][0];

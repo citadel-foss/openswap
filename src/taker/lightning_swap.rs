@@ -1257,9 +1257,11 @@ impl Taker {
                 .map_err(|e| general(format!("htlc spk: {e}")))?;
             let settled = {
                 use crate::wallet::blockchain::Blockchain;
-                self.read_wallet()?
-                    .blockchain
-                    .is_confirmed_spend(&outpoint, &script)
+                let wallet = self.read_wallet()?;
+                let chain = &wallet.blockchain;
+                // A reorg between Core's funding-height and UTXO reads can
+                // make orphaned funding look spent. Keep the key on a tip change.
+                on_one_chain(chain, || Ok(chain.is_confirmed_spend(&outpoint, &script)?))
             };
             match settled {
                 Ok(true) => {
@@ -1960,6 +1962,100 @@ mod tests {
 
     fn external_index(taker: &Taker) -> u32 {
         *taker.read_wallet().unwrap().get_external_index()
+    }
+
+    #[test]
+    fn cleanup_keeps_the_key_when_funding_disappears_during_the_spend_check() {
+        use crate::{
+            wallet::blockchain::{CoreRPC, CoreRpcConfig},
+            watch_tower::watcher::tests::{mock_core_rpc, Node},
+        };
+
+        for fail_final_tip in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let swap = swap_out("unused:1");
+            let (mut taker, _server) =
+                taker_with(dir.path(), &Arc::new(Mutex::new(Chain::default())));
+            taker.save_pending_swap(&swap.id, funded(&swap)).unwrap();
+            payout_script(&mut taker.write_wallet().unwrap(), &swap.id).unwrap();
+            let saved = record(&taker, &swap.id).unwrap();
+
+            // Chain A contains the unspent funding. Chain B replaces its tip at
+            // the same height and contains neither the funding nor a spender.
+            let mut node = Node::default();
+            node.mine(vec![]);
+            node.mine(vec![swap.funding]);
+            let tip_a = node.answer("getblockhash", &json!([1])).unwrap();
+            let tip_b = json!(bitcoin::BlockHash::from_byte_array([2; 32]));
+            assert_ne!(tip_a, tip_b);
+            let funding_chain = Mutex::new(Some(node));
+            let outpoint = swap.outpoint;
+            let (url, calls) = mock_core_rpc(move |method, params| {
+                let mut chain = funding_chain.lock().unwrap();
+                match method {
+                    "getblockcount" => Ok(json!(1)),
+                    // The trailing best-effort wallet sync exits at its version
+                    // check. This fixture serves chain reads, not wallet RPCs.
+                    "getnetworkinfo" => Ok(json!({ "version": 210100 })),
+                    "getblockchaininfo" => {
+                        if chain.is_none() && fail_final_tip {
+                            return Err(json!({ "code": -1, "message": "tip unavailable" }));
+                        }
+                        Ok(json!({
+                            "chain": "regtest", "blocks": 1, "headers": 1,
+                            "bestblockhash": if chain.is_some() { &tip_a } else { &tip_b },
+                            "difficulty": 1.0, "mediantime": 0, "verificationprogress": 1.0,
+                            "initialblockdownload": false, "chainwork": "00", "size_on_disk": 0,
+                            "pruned": false, "warnings": ""
+                        }))
+                    }
+                    "getblockheader" => {
+                        let header = chain.take().unwrap().answer(method, params)?;
+                        assert_eq!(header["confirmations"], 1);
+                        Ok(header)
+                    }
+                    "gettxout" => {
+                        assert!(chain.is_none());
+                        assert_eq!(params, &json!([outpoint.txid, outpoint.vout, false]));
+                        Ok(Value::Null)
+                    }
+                    "getrawtransaction" if chain.is_some() => {
+                        chain.as_ref().unwrap().answer(method, params)
+                    }
+                    _ => Err(json!({ "code": -1, "message": "RPC unavailable" })),
+                }
+            });
+            taker.write_wallet().unwrap().blockchain = AnyBlockchain::CoreRPC(
+                CoreRPC::new(&CoreRpcConfig {
+                    url,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            assert!(calls
+                .lock()
+                .unwrap()
+                .windows(3)
+                .any(|calls| { calls == ["getrawtransaction", "getblockheader", "gettxout"] }));
+            let (stored, _) = crate::wallet::WalletStore::read_from_disk(
+                &dir.path().join("wallet"),
+                Some("test-password".into()),
+            )
+            .unwrap();
+            assert_eq!(stored.ln_pending_swaps.get(&swap.id), Some(&saved));
+            let reason = if fail_final_tip {
+                "tip unavailable"
+            } else {
+                "the chain changed"
+            };
+            assert!(
+                outcomes[0].contains("spend status unknown") && outcomes[0].contains(reason),
+                "{:?}",
+                outcomes
+            );
+        }
     }
 
     /// A kept swap-out record rebuilds the same claim on every pass: one
