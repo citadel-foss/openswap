@@ -146,9 +146,8 @@ pub struct LnMakerSwap {
     /// rebuild is the same transaction. `None` with a txid means the refund
     /// predates priced spends and was built at [`SPEND_FEE_RATE_FLOOR`].
     pub refund_feerate: Option<f64>,
-    /// Feerate (sat/vB) our swap-in sweep was last built at, so the watchdog
-    /// can tell that exact sweep apart from any other spend of the HTLC.
-    /// `None` on a swept record means it was built at
+    /// Feerate (sat/vB) our swap-in sweep was built at, so every rebuild is
+    /// the same transaction. `None` on a swept record means it was built at
     /// [`SPEND_FEE_RATE_FLOOR`].
     pub sweep_feerate: Option<f64>,
     /// Chain tip when the swap was accepted.
@@ -1037,42 +1036,29 @@ fn watchdog_finish_sweep<M: Maker>(
         ctx.router.unsubscribe(&swap.payment_hash);
         return maker.remove_ln_swap(swap_id);
     }
+    // Still unconfirmed: rebuild and rebroadcast. A duplicate is harmless,
+    // and this is what recovers from an eviction. Rebuilt at the rate the
+    // sweep was first built at, so the resend is the same transaction and
+    // never replaces it, nor evicts anything funded from its output.
     let Some(preimage) = swap.preimage else {
         return Err(MakerError::General("swept swap without a preimage"));
     };
     let mut swap = swap.clone();
     let destination = payout_script(maker, swap_id, &mut swap)?;
-    let build = |feerate| {
-        swap.htlc
-            .create_hashlock_spend(
-                outpoint,
-                value,
-                &swap.privkey,
-                &preimage,
-                destination.clone(),
-                feerate,
-            )
-            .map_err(|e| {
-                log::warn!("lightning: claim rebuild failed: {e}");
-                MakerError::General("claim rebuild failed")
-            })
-    };
-    // Our last sweep, rebuilt exactly. While it is in the mempool it is left
-    // alone: replacing it would also evict anything the wallet has since
-    // funded from its unconfirmed output.
-    let built_at = swap.sweep_feerate.unwrap_or(SPEND_FEE_RATE_FLOOR);
-    if maker.is_transaction_known(&build(built_at)?.compute_txid())? {
-        return Ok(());
-    }
-    // Evicted, never sent, or out-bid by the taker's refund: priced at the
-    // current rate, never below the last one, so it can still replace a
-    // competing refund. Recorded before it can reach the network.
-    let feerate = maker.htlc_spend_feerate().max(built_at);
-    let claim_tx = build(feerate)?;
-    swap.sweep_feerate = Some(feerate);
-    if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::InSwept, swap.clone())? {
-        return Ok(());
-    }
+    let claim_tx = swap
+        .htlc
+        .create_hashlock_spend(
+            outpoint,
+            value,
+            &swap.privkey,
+            &preimage,
+            destination,
+            swap.sweep_feerate.unwrap_or(SPEND_FEE_RATE_FLOOR),
+        )
+        .map_err(|e| {
+            log::warn!("lightning: claim rebuild failed: {e}");
+            MakerError::General("claim rebuild failed")
+        })?;
     match maker.broadcast_transaction(&claim_tx) {
         Ok(txid) => log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}"),
         Err(e) => log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}"),
@@ -2149,6 +2135,7 @@ mod tests {
     fn persisted_record_survives_serialization_and_still_spends() {
         let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
         swap.refund_feerate = Some(13.0);
+        swap.sweep_feerate = Some(20.0);
         let bytes = serde_cbor::to_vec(&swap.to_record()).unwrap();
         let restored = LnMakerSwap::from_record(serde_cbor::from_slice(&bytes).unwrap());
 
@@ -2165,6 +2152,7 @@ mod tests {
         assert_eq!(restored.funding, swap.funding);
         assert_eq!(restored.funding_height, swap.funding_height);
         assert_eq!(restored.refund_feerate, Some(13.0));
+        assert_eq!(restored.sweep_feerate, Some(20.0));
 
         // The point of persisting at all: the refund still signs identically,
         // at the rate it was first built at.

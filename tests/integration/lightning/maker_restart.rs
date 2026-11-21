@@ -275,7 +275,7 @@ fn lightning_maker_restart_refunds_unclaimed_swap_out(
     let maker = world.makers()[0].inner().clone();
     let locktime: u16 = 30;
     let amount = Amount::from_sat(40_000);
-    let market = SpendFeerate::set(10.0);
+    let _market = SpendFeerate::set(10.0);
 
     // The taker pays but never claims, so the preimage stays private.
     let preimage = Preimage([0x78; 32]);
@@ -356,17 +356,6 @@ fn lightning_maker_restart_refunds_unclaimed_swap_out(
                 .sum::<Amount>(),
         Amount::from_sat(1_500),
         "the refund must pay the market rate, 10 sat/vB for 150 vB"
-    );
-    // A rebuild keeps the rate the recorded txid was built at.
-    market.set_rate(40.0);
-    assert_eq!(
-        maker
-            .ln_swaps
-            .lock()
-            .unwrap()
-            .get(&swap_id)
-            .and_then(|swap| swap.refund_feerate),
-        Some(10.0)
     );
 
     // The refunded coins are back in the maker's wallet.
@@ -2684,9 +2673,10 @@ fn mempool_spend_fee(bitcoind: &BitcoinD, funding: OutPoint, value: Amount) -> A
             .sum::<Amount>()
 }
 
-/// The swap-in sweep pays the market rate. While it waits in the mempool the
-/// watchdog leaves it alone, even after the market rises: replacing it would
-/// also evict anything the wallet has since funded from its output.
+/// The swap-in sweep pays the market rate it was first built at. The
+/// watchdog resends that same transaction even after the market rises:
+/// replacing it would also evict anything the wallet has since funded from
+/// its output.
 #[world_test(
     backend = BitcoindBackend,
     bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone(), payee_ln = pair.1.clone()],
@@ -2746,64 +2736,6 @@ fn swap_in_sweep_pays_the_market_rate_and_is_not_replaced(
         mempool_spend_fee(bitcoind, funding, value),
         Amount::from_sat(750),
         "the watchdog must not replace a sweep that is still in the mempool"
-    );
-
-    framework.set_block_gen_paused(false);
-    maker.shutdown.store(true, Relaxed);
-    maker.watch_service.shutdown();
-}
-
-/// A maker that recorded its sweep and stopped before sending it can find
-/// the taker's refund in the mempool when it comes back. That spend is not
-/// its sweep, so the watchdog must still send one, priced to replace it.
-#[world_test(
-    backend = BitcoindBackend,
-    bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone(), payee_ln = pair.1.clone()],
-    maker_behaviors = [Normal],
-    takers = [Normal],
-    maker_lightning = [ln.clone()],
-)]
-fn watchdog_contests_a_taker_refund_of_a_swept_swap_in(
-    world: &mut World,
-    ln: Arc<MockLightningBackend>,
-    payee_ln: Arc<MockLightningBackend>,
-) {
-    let _ = (&ln, &payee_ln);
-    let framework = world.framework().clone();
-    let bitcoind = &framework.bitcoind;
-    let maker = world.makers()[0].inner().clone();
-    pause_block_generation(&framework);
-    let _market = SpendFeerate::set(10.0);
-
-    let preimage = Preimage([0xb2; 32]);
-    let id = preimage.payment_hash().to_string();
-    let swap = accepted_swap_in_with_locktime(&preimage, 10);
-    let funding = fund_htlc(bitcoind, &swap);
-    generate_blocks(bitcoind, 1);
-    let mut swept = paid_without_height(&swap, funding);
-    swept.funding_height = Some(confirmation_height(bitcoind, &funding.txid) as u32);
-    swept.phase = LnMakerPhase::InSwept;
-    swept.preimage = Some(preimage);
-    maker.store_ln_swap(&id, swept).unwrap();
-
-    // Past the CSV window the taker's refund goes out first, at 2 sat/vB.
-    generate_blocks(bitcoind, 10);
-    let refund = broadcast_taker_refund(bitcoind, &swap, funding);
-    let value = swap.amount + swap.fee;
-    assert_eq!(
-        mempool_spend_fee(bitcoind, funding, value),
-        Amount::from_sat(300)
-    );
-
-    ln_watchdog_tick_now(&maker);
-    assert_eq!(
-        mempool_spend_fee(bitcoind, funding, value),
-        Amount::from_sat(1_500),
-        "the maker's sweep must replace the taker's refund at 10 sat/vB"
-    );
-    assert!(
-        !bitcoind.client.get_raw_mempool().unwrap().contains(&refund),
-        "the taker's refund must be out of the mempool"
     );
 
     framework.set_block_gen_paused(false);

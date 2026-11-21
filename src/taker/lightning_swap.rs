@@ -44,7 +44,7 @@ use crate::{
         },
     },
     utill::{generate_keypair, read_message, send_message, MIN_RELAY_FEE_RATE},
-    wallet::{AddressType, FeePriority, LnPendingSwap},
+    wallet::{AddressType, LnPendingSwap},
 };
 
 use super::{
@@ -493,22 +493,6 @@ impl Taker {
         // the only copy of our branch key.
         let (outpoint, actual_value) = {
             let mut wallet = self.write_wallet()?;
-            // Priced to confirm while the maker still waits for it, as the
-            // maker prices its swap-out funding: at the relay floor a busy
-            // chain leaves it unconfirmed and the swap is abandoned.
-            let feerate = {
-                use crate::wallet::blockchain::Blockchain;
-                match wallet.blockchain.estimate_feerate(FeePriority::High) {
-                    Ok(rate) if rate.is_finite() => rate.max(MIN_RELAY_FEE_RATE),
-                    other => {
-                        log::warn!(
-                            "lightning: no feerate estimate for high priority \
-                             ({other:?}); funding the HTLC at the relay floor"
-                        );
-                        MIN_RELAY_FEE_RATE
-                    }
-                }
-            };
             // One split, one destination: an HTLC output is a single exact
             // payment, with no hop to reimburse and nothing to randomize.
             // A Lightning HTLC is a script-path P2WSH contract, priced like
@@ -516,14 +500,14 @@ impl Taker {
             let plan = wallet.plan_funding(
                 value,
                 1,
-                feerate,
+                MIN_RELAY_FEE_RATE,
                 u32::MAX,
                 None,
                 None,
                 None,
                 crate::protocol::ProtocolVersion::Legacy,
             )?;
-            let result = wallet.execute_funding_plan(&plan, &[address], feerate)?;
+            let result = wallet.execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE)?;
             let tx = result
                 .funding_txes
                 .into_iter()

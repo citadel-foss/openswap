@@ -758,7 +758,6 @@ openswap::integration lightning::maker_restart::swap_in_request_fails_when_payme
 openswap::integration lightning::maker_restart::swap_in_request_refuses_payment_hash_already_on_record
 openswap::integration lightning::maker_restart::swap_in_sweep_pays_the_market_rate_and_is_not_replaced
 openswap::integration lightning::maker_restart::switch_resets_on_panic
-openswap::integration lightning::maker_restart::watchdog_contests_a_taker_refund_of_a_swept_swap_in
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_funding_height_is_unknown
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_payment_is_in_flight
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_without_payment_record_until_refunded

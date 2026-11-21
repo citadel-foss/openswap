@@ -469,8 +469,9 @@ pub struct LnMakerSwapRecord {
     /// written before spends were priced from the market.
     #[serde(default)]
     pub refund_feerate: Option<f64>,
-    /// Feerate (sat/vB) the swap-in sweep was last built at. Absent from
-    /// records written before spends were priced from the market.
+    /// Feerate (sat/vB) the swap-in sweep was built at, so a restarted maker
+    /// rebuilds the same transaction. Absent from records written before
+    /// spends were priced from the market.
     #[serde(default)]
     pub sweep_feerate: Option<f64>,
     /// Chain tip when this swap was accepted. A swap-in's funding deadline
@@ -573,8 +574,8 @@ impl Requires for LnMakerSwapRecord {
             // confirms, which leaves the swap open until the held payment
             // fails back at its deadline. The coins are refunded either way.
             refund_feerate: _,
-            // An older build drops it and rebuilds the sweep at the floor
-            // rate, which it then treats as a fresh sweep to send.
+            // An older build drops it and resends the sweep at the floor
+            // rate, which cannot replace a higher-fee one already sent.
             sweep_feerate: _,
             accepted_height: _,
             payout_script: _,
