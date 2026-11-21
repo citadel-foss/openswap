@@ -51,6 +51,7 @@ openswap lightning::swap::tests::preimage_links_lightning_and_onchain_hashlocks
 openswap lightning::swap::tests::script_parameters_round_trip
 openswap lightning::swap::tests::spend_fails_when_fee_exceeds_input
 openswap lightning::swap::tests::spend_falls_back_to_the_floor_when_the_rate_leaves_dust
+openswap lightning::swap::tests::spend_feerate_asks_for_the_high_priority_estimate
 openswap lightning::swap::tests::spend_feerate_follows_the_estimate_but_not_below_the_floor
 openswap lightning::swap::tests::spend_pays_its_feerate_on_both_branches
 openswap lightning::swap::tests::spend_refuses_an_unusable_feerate

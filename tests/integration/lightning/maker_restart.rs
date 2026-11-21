@@ -21,10 +21,8 @@ use bitcoin::{
 use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
 use openswap::{
     lightning::{
-        invoice::verify_invoice,
-        swap::{SPEND_FEERATE_ENV, SPEND_FEE_RATE_FLOOR},
-        InvoiceParams, LightningBackend, LnEvent, MockLightningBackend, PaymentId, PaymentOutcome,
-        Preimage, SwapHtlc,
+        invoice::verify_invoice, swap::SPEND_FEE_RATE_FLOOR, InvoiceParams, LightningBackend,
+        LnEvent, MockLightningBackend, PaymentId, PaymentOutcome, Preimage, SwapHtlc,
     },
     maker::{
         handlers::{handle_message, ConnectionState, Maker},
@@ -45,6 +43,7 @@ use openswap::{
     wallet::AddressType,
 };
 
+use super::SpendFeerate;
 use crate::test_framework::*;
 
 use std::sync::atomic::{
@@ -2660,28 +2659,6 @@ fn stale_watchdog_snapshot_keeps_newer_swap_in_state(
     framework.set_block_gen_paused(false);
     restarted.shutdown.store(true, Relaxed);
     restarted.watch_service.shutdown();
-}
-
-/// Names the market feerate HTLC spends see, and clears it on drop so it
-/// cannot leak into another test in this process.
-struct SpendFeerate;
-
-impl SpendFeerate {
-    fn set(rate: f64) -> Self {
-        let guard = SpendFeerate;
-        guard.set_rate(rate);
-        guard
-    }
-
-    fn set_rate(&self, rate: f64) {
-        std::env::set_var(SPEND_FEERATE_ENV, rate.to_string());
-    }
-}
-
-impl Drop for SpendFeerate {
-    fn drop(&mut self) {
-        std::env::remove_var(SPEND_FEERATE_ENV);
-    }
 }
 
 /// The fee the mempool's spend of `funding` pays out of `value`.

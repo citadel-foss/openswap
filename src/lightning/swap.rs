@@ -82,7 +82,11 @@ pub fn htlc_spend_feerate<B: Blockchain + ?Sized>(chain: &B) -> f64 {
     {
         return spend_feerate_from(Ok(rate));
     }
-    spend_feerate_from(chain.estimate_feerate(FeePriority::High))
+    spend_feerate_with(|priority| chain.estimate_feerate(priority))
+}
+
+fn spend_feerate_with(estimate: impl FnOnce(FeePriority) -> Result<f64, WalletError>) -> f64 {
+    spend_feerate_from(estimate(FeePriority::High))
 }
 
 /// Names the feerate [`htlc_spend_feerate`] sees in test builds.
@@ -1020,6 +1024,17 @@ mod tests {
                 feerate
             );
         }
+    }
+
+    #[test]
+    fn spend_feerate_asks_for_the_high_priority_estimate() {
+        let mut asked = None;
+        let rate = spend_feerate_with(|priority| {
+            asked = Some(priority as u16);
+            Ok(27.3)
+        });
+        assert_eq!(rate, 27.3);
+        assert_eq!(asked, Some(FeePriority::High as u16));
     }
 
     #[test]

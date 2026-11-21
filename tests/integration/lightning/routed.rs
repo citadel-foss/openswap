@@ -19,6 +19,7 @@ use openswap::{
     wallet::AddressType,
 };
 
+use super::{tx_fee, SpendFeerate};
 use crate::test_framework::*;
 
 /// One node per maker over a shared ledger, each with a ready channel to the
@@ -51,6 +52,7 @@ fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) 
     let first_maker = world.makers()[0].address();
     let second_maker = world.makers()[1].address();
     let taker = world.taker_mut().inner_mut();
+    let _market = SpendFeerate::set(10.0);
 
     let report = taker
         .lightning_swap_routed(LnRoutedSwapParams {
@@ -84,6 +86,11 @@ fn lightning_routed_swap_e2e(world: &mut World, ln1: Arc<MockLightningBackend>) 
             .and_then(|info| info.confirmations)
             .unwrap_or(0)
             >= 1
+    );
+    assert_eq!(
+        tx_fee(bitcoind, &report.claim_txid),
+        Amount::from_sat(1_500),
+        "the hop-2 claim must pay the market rate, 10 sat/vB for 150 vB"
     );
 
     // Maker 1 learned the preimage over Lightning and swept hop 1: its
