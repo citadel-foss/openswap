@@ -8878,9 +8878,10 @@ mod mempool_deferral_tests {
     /// A replacement for refused bonds spends every free coin of each one that
     /// can still confirm, from whichever pool holds them, and adopts one the
     /// backend knows. A bond with a free coin is conflicted through it; one
-    /// without waits unless the backend proves a spend of its coin buried,
-    /// which an Electrum server's word never does. It waits while some bond's
-    /// coins cannot be spent.
+    /// without waits unless one of our bonds confirmed 6 deep spends its coin,
+    /// even after confirmation dropped that bond's stored tx, or the backend
+    /// proves a spend of its coin buried, which an Electrum server's word
+    /// never does. It waits while some bond's coins cannot be spent.
     #[test]
     fn a_replacement_bond_conflicts_with_every_viable_refused_bond() {
         let coin = |seed: u8| OutPoint::new(Txid::from_byte_array([seed; 32]), 0);
@@ -8947,21 +8948,19 @@ mod mempool_deferral_tests {
             bond(12, &[coin(2)]),
             // No free coin, but our own bond 14 spends it, buried 6 deep.
             bond(13, &[coin(30)]),
-            FidelityBond {
-                conf_height: Some(TIP as u32 - 5),
-                ..bond(14, &[coin(30)])
-            },
+            bond(14, &[coin(30), coin(32)]),
             // As 13, but our bond 16 is only 5 deep.
             bond(15, &[coin(31)]),
-            FidelityBond {
-                conf_height: Some(TIP as u32 - 4),
-                ..bond(16, &[coin(31)])
-            },
+            bond(16, &[coin(31), coin(33)]),
         ];
         // Bond 5 reached the backend after all.
         let known = bonds[5].tx.clone().unwrap();
+        let replacement = bonds[14].tx.clone().unwrap();
+        let shallow_replacement = bonds[16].tx.clone().unwrap();
         let url = start_electrum_stub(StubChain::with(&[
             (&known, 0),
+            (&replacement, TIP - 5),
+            (&shallow_replacement, TIP - 4),
             (&unlisted, 50),
             (&mined_parent, 50),
             (&mined_spend, 60),
@@ -9011,6 +9010,14 @@ mod mempool_deferral_tests {
         wallet.store.fidelity_bond = bonds;
         wallet.lock_utxos(&[coin(4)]);
         wallet.reserve_swap_locks(SWAP, &[coin(6)]);
+        // Confirming a bond drops its stored tx, as every confirmation does.
+        wallet
+            .update_fidelity_bond_conf_details(14, TIP as u32 - 5)
+            .unwrap();
+        wallet
+            .update_fidelity_bond_conf_details(16, TIP as u32 - 4)
+            .unwrap();
+        assert!(wallet.store.fidelity_bond[14].tx.is_none());
 
         let plan = |refused: &[u32]| wallet.plan_bond_replacement(refused).unwrap();
         let spend = |coins: &[OutPoint]| BondReplacement::Spend(coins.to_vec());
@@ -9023,6 +9030,7 @@ mod mempool_deferral_tests {
         assert_eq!(plan(&[3]), spend(&[coin(5)]));
         assert_eq!(plan(&[0, 5]), BondReplacement::Adopt(5));
         assert_eq!(plan(&[0, 13]), spend(&[coin(1), coin(2)]));
+        assert_eq!(plan(&[13]), spend(&[]));
         // Locked, reserved, needing both pools in one transaction, not listed
         // by the wallet yet, spent only in the mempool, of unknown origin,
         // spent in a block a reorg can undo, or spent by the server's word.

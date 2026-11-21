@@ -1027,17 +1027,23 @@ impl Wallet {
             // of its coins, such as its own replacement, proves it dead. The
             // wallet already trusts its bonds' confirmation heights.
             let tip = self.blockchain.get_block_count()?;
-            let replaced = self.store.fidelity_bond.iter().any(|other| {
+            let buried = self.store.fidelity_bond.iter().filter_map(|other| {
                 other
                     .conf_height
-                    .is_some_and(|height| tip + 1 >= u64::from(height) + REFUSED_BOND_SPEND_DEPTH)
-                    && other.tx.as_ref().is_some_and(|other_tx| {
-                        other_tx
-                            .input
-                            .iter()
-                            .any(|i| inputs.contains(&i.previous_output))
-                    })
+                    .filter(|height| tip + 1 >= u64::from(*height) + REFUSED_BOND_SPEND_DEPTH)
+                    .map(|height| (other, height))
             });
+            let replaced = buried
+                .filter_map(|(other, height)| match &other.tx {
+                    Some(other_tx) => Some(other_tx.clone()),
+                    None => self.confirmed_bond_tx(other, height),
+                })
+                .any(|other_tx| {
+                    other_tx
+                        .input
+                        .iter()
+                        .any(|i| inputs.contains(&i.previous_output))
+                });
             if replaced {
                 continue;
             }
@@ -1112,6 +1118,35 @@ impl Wallet {
             "no new bond can spend a coin of each refused bond {stuck:?}: \
              their coins are locked, reserved for a swap, or split across coin pools"
         )))
+    }
+
+    /// The transaction of a bond confirmed at `height`, whose stored copy was
+    /// dropped on confirmation, fetched from its block. `None` when the
+    /// backend cannot serve it, which leaves the refused bond to the chain.
+    fn confirmed_bond_tx(&self, bond: &FidelityBond, height: u32) -> Option<Transaction> {
+        let txid = bond.outpoint.txid;
+        let fetched = self
+            .blockchain
+            .get_block_hash(u64::from(height))
+            .and_then(|block| self.blockchain.get_raw_transaction(&txid, Some(&block)));
+        match fetched {
+            Ok(tx) if tx.compute_txid() == txid => Some(tx),
+            Ok(tx) => {
+                log::warn!(
+                    "Backend returned transaction {} for bond {} ({txid})",
+                    tx.compute_txid(),
+                    bond.bond_index
+                );
+                None
+            }
+            Err(e) => {
+                log::warn!(
+                    "Cannot fetch the transaction of bond {} ({txid}): {e:?}",
+                    bond.bond_index
+                );
+                None
+            }
+        }
     }
 
     /// What the chain says about a coin of a refused bond.
