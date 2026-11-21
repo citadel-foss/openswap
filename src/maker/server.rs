@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashSet,
-    io::{ErrorKind, Read},
+    io::ErrorKind,
     net::{Ipv4Addr, TcpListener, TcpStream},
     sync::{
         atomic::Ordering::{self, Relaxed},
@@ -17,15 +17,14 @@ use bitcoin::OutPoint;
 #[cfg(not(feature = "integration-test"))]
 use crate::maker::rpc::server::MakerRpc;
 use crate::{
+    bip324_stream::{Bip324Error, Bip324Stream},
+    error::NetError,
     lock_debug,
     maker::nostr::broadcast_bond_on_nostr,
     protocol::common_messages::{
         message_name, MakerToTakerMessage, ProtocolVersion, TakerToMakerMessage, UnsupportedMessage,
     },
-    utill::{
-        now_secs, HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE,
-        UNBROADCAST_DISCARD_GRACE,
-    },
+    utill::{now_secs, HEART_BEAT_INTERVAL, MIN_RELAY_FEE_RATE, UNBROADCAST_DISCARD_GRACE},
     wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, SwapRole, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
@@ -58,8 +57,6 @@ const _: () = assert!(
 /// Tor has already established the TCP stream, so protocol identification
 /// should finish well inside this deadline.
 const PENDING_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
-/// Maximum time to finish a frame after its first byte arrives.
-const MESSAGE_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(feature = "integration-test"))]
 const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -664,6 +661,15 @@ fn handle_connection(
         maker.config.network_port
     );
 
+    // The handshake counts against the admission deadline like any other read.
+    let mut encrypted_stream = Bip324Stream::new(
+        stream.as_ref().try_clone().map_err(MakerError::IO)?,
+        maker.network(),
+        bip324::Role::Responder,
+        Some(pending_deadline),
+    )?;
+    state.session_id = Some(*encrypted_stream.session_id());
+
     loop {
         // Check for shutdown
         if maker.is_shutdown() {
@@ -679,13 +685,17 @@ fn handle_connection(
             break;
         }
 
-        let frame = match read_message(&stream, permit.pending.then_some(pending_deadline)) {
+        let frame = match encrypted_stream.read_frame(permit.pending.then_some(pending_deadline)) {
             Ok(frame) => frame,
+            Err(NetError::Bip324Error(Bip324Error::ConnectionClosed)) => {
+                log::debug!("[{}] Client disconnected", maker.config.network_port);
+                break;
+            }
             Err(e) => {
                 // A read timeout is only a wakeup: keepalives arrive on separate
                 // connections and refresh the shared swap activity. Break only
                 // when the swap has gone quiet everywhere, not just this socket.
-                if matches!(&e, MakerError::IO(io) if matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
+                if matches!(&e, NetError::IO(io) if matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
                     && !swap_is_quiet(&maker, &state)
                 {
                     continue;
@@ -715,7 +725,7 @@ fn handle_connection(
                         what,
                         reason: "cannot decode".to_string(),
                     });
-                    let _ = send_message(&stream, &refusal);
+                    let _ = encrypted_stream.send_message(&refusal);
                 }
                 break;
             }
@@ -828,7 +838,7 @@ fn handle_connection(
                 response
             );
 
-            if let Err(e) = send_message(&stream, &response) {
+            if let Err(e) = encrypted_stream.send_message(&response) {
                 log::error!(
                     "[{}] Failed to send response: {:?}",
                     maker.config.network_port,
@@ -2055,90 +2065,6 @@ fn recover_from_swap(
     Ok(())
 }
 
-/// Read one message frame, enforcing one absolute deadline until the connection
-/// proves that it belongs to an admitted swap.
-fn read_message(
-    stream: &TcpStream,
-    pending_deadline: Option<Instant>,
-) -> Result<Vec<u8>, MakerError> {
-    let mut len_buf = [0u8; 4];
-    read_exact_until(stream, &mut len_buf[..1], pending_deadline)?;
-    let assembly_deadline = Instant::now() + MESSAGE_ASSEMBLY_TIMEOUT;
-    let deadline =
-        Some(pending_deadline.map_or(assembly_deadline, |pending| pending.min(assembly_deadline)));
-    read_exact_until(stream, &mut len_buf[1..], deadline)?;
-
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    if len > MAX_RPC_MESSAGE_SIZE {
-        return Err(MakerError::General("Message too large"));
-    }
-
-    let mut buf = vec![0u8; len];
-    read_exact_until(stream, &mut buf, deadline)?;
-    Ok(buf)
-}
-
-fn read_exact_until(
-    stream: &TcpStream,
-    mut buf: &mut [u8],
-    deadline: Option<Instant>,
-) -> Result<(), MakerError> {
-    while !buf.is_empty() {
-        let timeout = deadline
-            .map(|deadline| {
-                deadline
-                    .checked_duration_since(Instant::now())
-                    .ok_or(MakerError::General("Message read deadline expired"))
-            })
-            .transpose()?
-            .unwrap_or(CONNECTION_READ_TIMEOUT)
-            .max(Duration::from_millis(1));
-        stream
-            .set_read_timeout(Some(timeout))
-            .map_err(MakerError::IO)?;
-
-        let mut stream_ref = stream;
-        match stream_ref.read(buf) {
-            Ok(0) => {
-                return Err(MakerError::IO(std::io::Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "peer closed during protocol message",
-                )));
-            }
-            Ok(read) => buf = &mut buf[read..],
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e)
-                if deadline.is_some()
-                    && matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-            {
-                return Err(MakerError::General("Message read deadline expired"));
-            }
-            Err(e) => return Err(MakerError::IO(e)),
-        }
-    }
-    Ok(())
-}
-
-/// Send a message to a stream.
-fn send_message(stream: &TcpStream, message: &MakerToTakerMessage) -> Result<(), MakerError> {
-    let buf = serde_cbor::to_vec(message)
-        .map_err(|_| MakerError::General("Failed to serialize message"))?;
-
-    let len = buf.len() as u32;
-    use std::io::Write;
-
-    let mut stream_ref = stream;
-    stream_ref
-        .write_all(&len.to_be_bytes())
-        .map_err(MakerError::IO)?;
-
-    stream_ref.write_all(&buf).map_err(MakerError::IO)?;
-    stream_ref.flush().map_err(MakerError::IO)?;
-
-    Ok(())
-}
-
 /// Binds `port`, or the first free port above it in steps of 2.
 ///
 /// `port` itself is always tried. The search above it stops below 62000.
@@ -2178,14 +2104,10 @@ mod tests {
         protocol::common_messages::{Hello, PrivateKeyHandover},
         watch_tower::service::answering,
     };
-    use bitcoin::{hashes::Hash, Txid};
+    use bitcoin::{hashes::Hash, Network, Txid};
     use serde::{Deserialize, Serialize};
     use serde_cbor::{value::to_value, Value};
-    use std::{
-        collections::BTreeMap,
-        io::{Read, Write},
-        net::Shutdown,
-    };
+    use std::{collections::BTreeMap, net::Shutdown};
 
     // The handshake variants and fields from v0.2.3 stay independent of
     // the new enums so removing the deliberate refusal breaks this test.
@@ -2206,47 +2128,44 @@ mod tests {
         },
     }
 
+    /// Sends `frames` to a maker connection over BIP324, the way any taker
+    /// does, and collects every reply until the maker closes.
     fn compat_connection_replies(
         maker: &Arc<MakerServer>,
         frames: &[Vec<u8>],
         close_input: bool,
     ) -> Vec<MakerToTakerMessage> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        client
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let (server, _) = listener.accept().unwrap();
+        let network = maker.network();
         let maker = maker.clone();
         let permit = ConnectionLimiter::new().try_acquire().unwrap();
         let handler = thread::spawn(move || handle_connection(maker, Arc::new(server), permit));
+        let mut client = Bip324Stream::new(
+            socket.try_clone().unwrap(),
+            network,
+            bip324::Role::Initiator,
+            None,
+        )
+        .unwrap();
         for frame in frames {
-            client
-                .write_all(&(frame.len() as u32).to_be_bytes())
-                .unwrap();
-            client.write_all(frame).unwrap();
+            client.send_frame(frame).unwrap();
         }
         if close_input {
-            client.shutdown(Shutdown::Write).unwrap();
+            socket.shutdown(Shutdown::Write).unwrap();
         }
         let mut replies = Vec::new();
         loop {
-            let mut prefix = [0; 4];
-            match client.read_exact(&mut prefix) {
-                Ok(()) => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    break
-                }
-                Err(e) => panic!("maker did not close after the frames: {}", e),
+            match client.read_frame(None) {
+                Ok(body) => replies.push(serde_cbor::from_slice(&body).unwrap()),
+                Err(NetError::Bip324Error(Bip324Error::ConnectionClosed)) => break,
+                Err(NetError::IO(e)) if e.kind() == ErrorKind::ConnectionReset => break,
+                Err(e) => panic!("maker did not close after the frames: {:?}", e),
             }
-            let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
-            client.read_exact(&mut body).unwrap();
-            replies.push(serde_cbor::from_slice(&body).unwrap());
         }
         handler.join().unwrap().unwrap();
         replies
@@ -2374,6 +2293,7 @@ mod tests {
         ] {
             let hello = TakerToMakerMessage::Hello(Hello {
                 features: features.into_iter().map(String::from).collect(),
+                ..Default::default()
             });
             let replies =
                 compat_connection_replies(&maker, &[serde_cbor::to_vec(&hello).unwrap()], accepted);
@@ -2669,13 +2589,21 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let reader = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            read_message(&stream, Some(Instant::now() + Duration::from_millis(50)))
+            let mut stream =
+                Bip324Stream::new(stream, Network::Regtest, bip324::Role::Responder, None).unwrap();
+            stream.read_frame(Some(Instant::now() + Duration::from_millis(50)))
         });
 
-        let mut client = TcpStream::connect(address).unwrap();
-        client.write_all(&[0]).unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let mut client =
+            Bip324Stream::new(client, Network::Regtest, bip324::Role::Initiator, None).unwrap();
+        // Start a packet, then stall: only its first length byte is sent.
+        client.send_partial_for_test(1);
         thread::sleep(Duration::from_millis(150));
 
-        assert!(reader.join().unwrap().is_err());
+        assert!(matches!(
+            reader.join().unwrap(),
+            Err(NetError::Bip324Error(Bip324Error::ReadDeadlineExpired))
+        ));
     }
 }

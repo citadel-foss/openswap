@@ -58,6 +58,11 @@ impl ProtocolVersion {
 pub struct Hello {
     /// Feature names the sender supports.
     pub features: Vec<String>,
+    /// Maker only: ECDSA signature by the offer's tweakable key over the BIP324
+    /// session id, binding this encrypted channel to the maker's identity.
+    /// Omitted when absent, so a Hello without it encodes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id_sig: Option<bitcoin::secp256k1::ecdsa::Signature>,
 }
 
 /// Request for offer from Taker to Maker.
@@ -428,6 +433,7 @@ mod tests {
         let (mut reader, _) = listener.accept().unwrap();
         let hello = Hello {
             features: vec!["taproot".into(), "future-v1".into()],
+            ..Default::default()
         };
         let taker = TakerToMakerMessage::Hello(hello.clone());
         let maker = MakerToTakerMessage::Hello(hello.clone());
