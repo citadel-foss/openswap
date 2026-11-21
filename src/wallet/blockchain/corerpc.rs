@@ -387,10 +387,58 @@ impl CoreRPC {
         &self,
         outpoint: &OutPoint,
     ) -> Result<Option<Transaction>, WalletError> {
-        let spends: Vec<SpendingPrevout> = self.rpc.call(
+        let spends: Vec<SpendingPrevout> = match self.rpc.call(
             "gettxspendingprevout",
             &[json!([{ "txid": outpoint.txid, "vout": outpoint.vout }])],
-        )?;
+        ) {
+            // Core 22/23 predate this RPC. Preserve their recovery support
+            // using the existing UTXO and mempool queries. Other RPC errors
+            // remain errors, never an assertion that the output is unspent.
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -32601 => {
+                if self
+                    .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))?
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+                // Do not scan unrelated mempool entries for an output spent
+                // on chain. Both callers follow None with the mined lookup.
+                if self.is_confirmed_spend(outpoint, Script::new())? {
+                    return Ok(None);
+                }
+                // Only an output in the mempool or the confirmed UTXO set can
+                // have a mempool spender. Look the funding up first: a block
+                // mining it in between moves it into the UTXO set, where an
+                // index lagging that block cannot hide it.
+                if self.tx_confirmations(&outpoint.txid)?.is_none()
+                    && self
+                        .get_tx_out(&outpoint.txid, outpoint.vout, Some(false))?
+                        .is_none()
+                {
+                    return Ok(None);
+                }
+                for txid in self.rpc.get_raw_mempool()? {
+                    let tx = match self.get_raw_transaction(&txid, None) {
+                        Ok(tx) => tx,
+                        // The mempool snapshot can outlive an entry. Keep
+                        // searching; the caller also checks mined spends.
+                        Err(WalletError::Rpc(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(
+                            ref e,
+                        )))) if e.code == -5 => continue,
+                        Err(e) => return Err(e),
+                    };
+                    if tx
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output == *outpoint)
+                    {
+                        return Ok(Some(tx));
+                    }
+                }
+                return Ok(None);
+            }
+            result => result?,
+        };
         match spends.first().and_then(|spend| spend.spendingtxid) {
             Some(txid) => self.get_raw_transaction(&txid, None).map(Some),
             None => Ok(None),
@@ -574,7 +622,13 @@ impl Blockchain for CoreRPC {
             Err(e) => return Err(e.into()),
         };
         match info.blockhash {
-            Some(hash) => Ok(Some(self.rpc.get_block_header_info(&hash)?.height as u64)),
+            Some(hash) => {
+                // The txindex keeps the entry of a tx whose block a reorg
+                // orphaned, so the hash alone does not make it mined: only a
+                // block in the active chain does (its header has confirmations).
+                let header = self.rpc.get_block_header_info(&hash)?;
+                Ok((header.confirmations > 0).then_some(header.height as u64))
+            }
             None => Ok(None),
         }
     }
@@ -903,6 +957,227 @@ pub(crate) mod tests {
         wallet::{api::test_support::test_wallet, AnyBlockchain, BackendConfig, Wallet},
     };
     use zeroize::Zeroizing;
+
+    #[test]
+    fn legacy_mempool_spend_lookup_preserves_errors_and_finds_claims() {
+        use crate::watch_tower::watcher::tests::mock_core_rpc;
+        use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let outpoint = OutPoint::new(Txid::from_byte_array([9; 32]), 0);
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                ..Default::default()
+            }],
+            output: Vec::new(),
+        };
+        let mut unrelated = tx.clone();
+        unrelated.input[0].previous_output.vout += 1;
+        let missing = Txid::from_byte_array([10; 32]);
+        let state = Arc::new(AtomicUsize::new(0));
+        let (url, _) = mock_core_rpc({
+            let state = state.clone();
+            let tx = tx.clone();
+            let unrelated = unrelated.clone();
+            move |method, params| match method {
+                "gettxspendingprevout" if state.load(Ordering::SeqCst) == 2 => {
+                    Err(json!({"code": -28, "message": "warming up"}))
+                }
+                "gettxspendingprevout" => {
+                    Err(json!({"code": -32601, "message": "Method not found"}))
+                }
+                "gettxout" if state.load(Ordering::SeqCst) == 0 => Ok(json!({
+                    "bestblock": "00".repeat(32), "confirmations": 100, "value": 0.0004,
+                    "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"}, "coinbase": false
+                })),
+                // The funding is unknown to getrawtransaction, as when a block
+                // mines it mid-lookup, yet its output is in the confirmed UTXO
+                // set, so the mempool must still be searched.
+                "gettxout" if params[2] == json!(false) => Ok(json!({
+                    "bestblock": "00".repeat(32), "confirmations": 1, "value": 0.0004,
+                    "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"}, "coinbase": false
+                })),
+                "gettxout" => Ok(Value::Null),
+                "getrawmempool" if state.load(Ordering::SeqCst) == 3 => {
+                    Err(json!({"code": -28, "message": "mempool unavailable"}))
+                }
+                "getrawmempool" if state.load(Ordering::SeqCst) == 4 => Ok(json!([
+                    missing,
+                    unrelated.compute_txid(),
+                    tx.compute_txid()
+                ])),
+                "getrawmempool" if state.load(Ordering::SeqCst) == 5 => {
+                    Ok(json!([unrelated.compute_txid()]))
+                }
+                "getrawmempool" if state.load(Ordering::SeqCst) == 6 => Ok(json!([])),
+                "getrawmempool" => Ok(json!([unrelated.compute_txid(), tx.compute_txid()])),
+                "getrawtransaction"
+                    if params[0] == json!(outpoint.txid) || params[0] == json!(missing) =>
+                {
+                    Err(json!({"code": -5, "message": "transaction disappeared"}))
+                }
+                "getrawtransaction" if state.load(Ordering::SeqCst) == 7 => {
+                    Err(json!({"code": -28, "message": "transaction lookup failed"}))
+                }
+                "getrawtransaction" if params[0] == json!(unrelated.compute_txid()) => {
+                    Ok(json!(serialize_hex(&unrelated)))
+                }
+                "getrawtransaction" if params[0] == json!(tx.compute_txid()) => {
+                    Ok(json!(serialize_hex(&tx)))
+                }
+                other => panic!("unexpected RPC {}", other),
+            }
+        });
+        let core = CoreRPC::new(&CoreRpcConfig {
+            url,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(core
+            .mempool_spending_transaction(&outpoint)
+            .unwrap()
+            .is_none());
+        for mode in [1, 4] {
+            state.store(mode, Ordering::SeqCst);
+            assert_eq!(
+                core.mempool_spending_transaction(&outpoint).unwrap(),
+                Some(tx.clone())
+            );
+        }
+        for mode in [5, 6] {
+            state.store(mode, Ordering::SeqCst);
+            assert_eq!(core.mempool_spending_transaction(&outpoint).unwrap(), None);
+        }
+        for mode in [2, 3, 7] {
+            state.store(mode, Ordering::SeqCst);
+            assert!(core.mempool_spending_transaction(&outpoint).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_spend_lookup_skips_the_mempool_for_an_unknown_funding_tx() {
+        use crate::watch_tower::watcher::tests::mock_core_rpc;
+        use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn};
+        // A contract never broadcast: its output is in neither the mempool
+        // nor the UTXO set, so nothing can spend it and no mempool entry is
+        // fetched.
+        let outpoint = OutPoint::new(Txid::from_byte_array([11; 32]), 0);
+        let unrelated = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([12; 32]), 0),
+                ..Default::default()
+            }],
+            output: Vec::new(),
+        };
+        let (url, calls) = mock_core_rpc({
+            let unrelated = unrelated.clone();
+            move |method, params| match method {
+                "gettxspendingprevout" => {
+                    Err(json!({"code": -32601, "message": "Method not found"}))
+                }
+                "gettxout" => Ok(Value::Null),
+                "getrawtransaction" if params[0] == json!(outpoint.txid) => {
+                    Err(json!({"code": -5, "message": "No such transaction"}))
+                }
+                "getrawmempool" => Ok(json!([unrelated.compute_txid()])),
+                "getrawtransaction" => Ok(json!(serialize_hex(&unrelated))),
+                other => panic!("unexpected RPC {}", other),
+            }
+        });
+        let core = CoreRPC::new(&CoreRpcConfig {
+            url,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(core.spending_transaction(&outpoint).unwrap(), None);
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|call| call == "getrawmempool"),
+            "{:?}",
+            calls
+        );
+    }
+
+    /// Core's txindex keeps the entry of a tx whose block a reorg orphaned, and
+    /// `getrawtransaction` still names that block. Only a block in the active
+    /// chain makes the tx mined, or a spend of its output confirmed.
+    #[test]
+    fn tx_in_an_orphaned_block_is_not_mined() {
+        use crate::watch_tower::watcher::tests::mock_core_rpc;
+        use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn};
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: Vec::new(),
+        };
+        let block = BlockHash::from_byte_array([7; 32]);
+        // (header confirmations, getrawtransaction confirmations, expected)
+        for (in_chain, tx_confirmations, expected) in [(-1, 0, None), (1, 1, Some(102))] {
+            let raw = tx.clone();
+            let (url, _) = mock_core_rpc(move |method, _| match method {
+                "getrawtransaction" => Ok(json!({
+                    "hex": serialize_hex(&raw),
+                    "txid": raw.compute_txid(),
+                    "hash": raw.compute_wtxid(),
+                    "size": raw.total_size(),
+                    "vsize": raw.vsize(),
+                    "version": 2,
+                    "locktime": 0,
+                    "vin": [{ "txid": raw.input[0].previous_output.txid, "vout": 0, "sequence": raw.input[0].sequence.0 }],
+                    "vout": [],
+                    "blockhash": block,
+                    "confirmations": tx_confirmations,
+                })),
+                "getblockheader" => Ok(json!({
+                    "hash": block,
+                    "confirmations": in_chain,
+                    "height": 102,
+                    "version": 0x2000_0000,
+                    "merkleroot": raw.compute_txid(),
+                    "time": 0,
+                    "mediantime": 0,
+                    "nonce": 0,
+                    "bits": "207fffff",
+                    "difficulty": 1.0,
+                    "chainwork": "00",
+                    "nTx": 1,
+                })),
+                // The output is in no UTXO set: spent, or its tx was orphaned.
+                "gettxout" => Ok(Value::Null),
+                other => Err(json!({ "code": -32601, "message": format!("unexpected {other}") })),
+            });
+            let core = CoreRPC::new(&CoreRpcConfig {
+                url,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                core.tx_block_height(&tx.compute_txid()).unwrap(),
+                expected,
+                "header confirmations {in_chain}"
+            );
+            let outpoint = OutPoint::new(tx.compute_txid(), 0);
+            assert_eq!(
+                core.is_confirmed_spend(&outpoint, &bitcoin::ScriptBuf::new())
+                    .unwrap(),
+                expected.is_some(),
+                "header confirmations {in_chain}"
+            );
+            if expected.is_none() {
+                // Any block scan starts with `getblockcount`, which the mock
+                // refuses, so this also proves none is attempted.
+                assert_eq!(core.mined_spending_transaction(&outpoint).unwrap(), None);
+            }
+        }
+    }
 
     /// Reads one HTTP JSON-RPC request; `None` once the client hangs up.
     fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Value> {

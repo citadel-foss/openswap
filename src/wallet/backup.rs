@@ -1017,6 +1017,7 @@ mod tests {
                 funding_outpoint: None,
                 funding_value: None,
                 funding_height: None,
+                claim_deadline: None,
             },
         );
         assert_eq!(

@@ -1008,7 +1008,7 @@ fn lookup_spend(core: &CoreRPC, outpoint: &OutPoint) -> Result<Spend, WatcherErr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bitcoin::{
         consensus::{encode::serialize_hex, serialize},
@@ -1270,7 +1270,7 @@ mod tests {
     /// Serves Core JSON-RPC from `answer` on every connection and records each
     /// method called; an `Err` is sent as the JSON-RPC error object. Runs
     /// until the test process exits.
-    fn mock_core_rpc(
+    pub(crate) fn mock_core_rpc(
         answer: impl Fn(&str, &Value) -> Result<Value, Value> + Send + Sync + 'static,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Core RPC");
@@ -1363,7 +1363,7 @@ mod tests {
 
     /// The parts of a Core node the watcher's re-check reads.
     #[derive(Default)]
-    struct Node {
+    pub(crate) struct Node {
         mempool: Vec<Transaction>,
         /// The active chain; a block's height is its index.
         chain: Vec<Block>,
@@ -1375,7 +1375,7 @@ mod tests {
     }
 
     impl Node {
-        fn mine(&mut self, txdata: Vec<Transaction>) {
+        pub(crate) fn mine(&mut self, txdata: Vec<Transaction>) {
             let mut block = genesis_block(Network::Regtest);
             // A distinct header per height, so each block has its own hash.
             block.header.time += self.chain.len() as u32;
@@ -1427,7 +1427,7 @@ mod tests {
                 .map(|tx| (tx, Some((BlockHash::from_byte_array([0xee; 32]), 0))))
         }
 
-        fn answer(&self, method: &str, params: &Value) -> Result<Value, Value> {
+        pub(crate) fn answer(&self, method: &str, params: &Value) -> Result<Value, Value> {
             match method {
                 "gettxspendingprevout" => {
                     let prevout = &params[0][0];
@@ -3494,5 +3494,73 @@ mod tests {
 
         assert_eq!(recorded_spend(&watcher, outpoint), Some(confirmed));
         assert!(is_recorded_confirmed(&watcher, outpoint));
+    }
+    #[test]
+    fn legacy_spend_lookup_prioritizes_mined_claims_and_keeps_mempool_claims() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let funding = spend(OutPoint::new(Txid::from_byte_array([42; 32]), 0));
+        let target = OutPoint::new(funding.compute_txid(), 0);
+        let claim = spend(target);
+        let unrelated = spend(OutPoint::new(Txid::from_byte_array([43; 32]), 1));
+        let mut initial = Node::default();
+        initial.mine(vec![]);
+        initial.mine(vec![funding]);
+        initial.mempool = vec![unrelated.clone(), claim.clone()];
+        let node = Arc::new(Mutex::new(initial));
+        let fetched_unrelated = Arc::new(AtomicUsize::new(0));
+        let (url, calls) = mock_core_rpc({
+            let node = node.clone();
+            let fetched_unrelated = fetched_unrelated.clone();
+            move |method, params| {
+                let node = node.lock().unwrap();
+                match method {
+                    "gettxspendingprevout" => {
+                        Err(json!({"code": -32601, "message": "Method not found"}))
+                    }
+                    "getrawmempool" => Ok(json!(node
+                        .mempool
+                        .iter()
+                        .map(Transaction::compute_txid)
+                        .collect::<Vec<_>>())),
+                    "gettxout" if params[2] == json!(false) && node.chain.len() == 2 => Ok(json!({
+                        "bestblock": "00".repeat(32), "confirmations": 1, "value": 0.0004,
+                        "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"}, "coinbase": false
+                    })),
+                    _ => {
+                        if method == "getrawtransaction"
+                            && params[0] == json!(unrelated.compute_txid())
+                        {
+                            fetched_unrelated.fetch_add(1, Ordering::SeqCst);
+                        }
+                        node.answer(method, params)
+                    }
+                }
+            }
+        });
+        let core = CoreRPC::new(&CoreRpcConfig {
+            url,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            core.spending_transaction(&target).unwrap(),
+            Some(claim.clone())
+        );
+        assert_eq!(fetched_unrelated.load(Ordering::SeqCst), 1);
+        assert!(!calls.lock().unwrap().iter().any(|call| call == "getblock"));
+        {
+            let mut node = node.lock().unwrap();
+            node.mempool.pop();
+            node.mine(vec![claim.clone()]);
+        }
+        calls.lock().unwrap().clear();
+        fetched_unrelated.store(0, Ordering::SeqCst);
+        assert_eq!(core.spending_transaction(&target).unwrap(), Some(claim));
+        assert_eq!(fetched_unrelated.load(Ordering::SeqCst), 0);
+        assert!(!calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "getrawmempool"));
     }
 }
