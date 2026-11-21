@@ -1498,6 +1498,7 @@ fn accepted_swap_in_with_locktime(preimage: &Preimage, locktime: u16) -> LnMaker
         preimage: None,
         refund_txid: None,
         refund_feerate: None,
+        sweep_feerate: None,
         accepted_height: None,
         payout_script: None,
         funding: None,
@@ -2745,6 +2746,64 @@ fn swap_in_sweep_pays_the_market_rate_and_is_not_replaced(
         mempool_spend_fee(bitcoind, funding, value),
         Amount::from_sat(750),
         "the watchdog must not replace a sweep that is still in the mempool"
+    );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
+/// A maker that recorded its sweep and stopped before sending it can find
+/// the taker's refund in the mempool when it comes back. That spend is not
+/// its sweep, so the watchdog must still send one, priced to replace it.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone(), payee_ln = pair.1.clone()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+)]
+fn watchdog_contests_a_taker_refund_of_a_swept_swap_in(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+    payee_ln: Arc<MockLightningBackend>,
+) {
+    let _ = (&ln, &payee_ln);
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+    let _market = SpendFeerate::set(10.0);
+
+    let preimage = Preimage([0xb2; 32]);
+    let id = preimage.payment_hash().to_string();
+    let swap = accepted_swap_in_with_locktime(&preimage, 10);
+    let funding = fund_htlc(bitcoind, &swap);
+    generate_blocks(bitcoind, 1);
+    let mut swept = paid_without_height(&swap, funding);
+    swept.funding_height = Some(confirmation_height(bitcoind, &funding.txid) as u32);
+    swept.phase = LnMakerPhase::InSwept;
+    swept.preimage = Some(preimage);
+    maker.store_ln_swap(&id, swept).unwrap();
+
+    // Past the CSV window the taker's refund goes out first, at 2 sat/vB.
+    generate_blocks(bitcoind, 10);
+    let refund = broadcast_taker_refund(bitcoind, &swap, funding);
+    let value = swap.amount + swap.fee;
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(300)
+    );
+
+    ln_watchdog_tick_now(&maker);
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(1_500),
+        "the maker's sweep must replace the taker's refund at 10 sat/vB"
+    );
+    assert!(
+        !bitcoind.client.get_raw_mempool().unwrap().contains(&refund),
+        "the taker's refund must be out of the mempool"
     );
 
     framework.set_block_gen_paused(false);

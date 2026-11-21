@@ -1013,6 +1013,7 @@ mod tests {
                 preimage: None,
                 refund_txid: None,
                 refund_feerate: None,
+                sweep_feerate: None,
                 accepted_height: None,
                 payout_script: None,
                 funding_outpoint: None,

@@ -146,6 +146,11 @@ pub struct LnMakerSwap {
     /// rebuild is the same transaction. `None` with a txid means the refund
     /// predates priced spends and was built at [`SPEND_FEE_RATE_FLOOR`].
     pub refund_feerate: Option<f64>,
+    /// Feerate (sat/vB) our swap-in sweep was last built at, so the watchdog
+    /// can tell that exact sweep apart from any other spend of the HTLC.
+    /// `None` on a swept record means it was built at
+    /// [`SPEND_FEE_RATE_FLOOR`].
+    pub sweep_feerate: Option<f64>,
     /// Chain tip when the swap was accepted.
     pub accepted_height: Option<u32>,
     /// Where this swap pays out, fixed on first use.
@@ -187,6 +192,7 @@ impl LnMakerSwap {
             preimage: self.preimage.map(|p| p.0),
             refund_txid: self.refund_txid,
             refund_feerate: self.refund_feerate,
+            sweep_feerate: self.sweep_feerate,
             accepted_height: self.accepted_height,
             payout_script: self.payout_script.clone(),
             funding_outpoint,
@@ -213,6 +219,7 @@ impl LnMakerSwap {
             preimage: record.preimage.map(Preimage),
             refund_txid: record.refund_txid,
             refund_feerate: record.refund_feerate,
+            sweep_feerate: record.sweep_feerate,
             accepted_height: record.accepted_height,
             payout_script: record.payout_script,
             funding: record.funding_outpoint.zip(record.funding_value),
@@ -700,6 +707,7 @@ fn handle_swap_in_request<M: Maker>(
             preimage: None,
             refund_txid: None,
             refund_feerate: None,
+            sweep_feerate: None,
             accepted_height: maker.get_current_height().ok(),
             payout_script: None,
             funding: None,
@@ -971,6 +979,7 @@ fn sweep_swap_in<M: Maker>(
         .ok_or(MakerError::General("swap-in sweep without funding"))?;
     let mut swap = swap.clone();
     let destination = payout_script(maker, swap_id, &mut swap)?;
+    let feerate = maker.htlc_spend_feerate();
     let claim_tx = swap
         .htlc
         .create_hashlock_spend(
@@ -979,12 +988,13 @@ fn sweep_swap_in<M: Maker>(
             &swap.privkey,
             preimage,
             destination,
-            maker.htlc_spend_feerate(),
+            feerate,
         )
         .map_err(|e| {
             log::warn!("lightning: claim build failed: {e}");
             MakerError::General("claim build failed")
         })?;
+    swap.sweep_feerate = Some(feerate);
     // Record the preimage and the swept phase before broadcasting: the
     // record is what lets the watchdog rebuild this sweep if the broadcast
     // is evicted, and it must not be dropped until the sweep confirms.
@@ -1027,34 +1037,42 @@ fn watchdog_finish_sweep<M: Maker>(
         ctx.router.unsubscribe(&swap.payment_hash);
         return maker.remove_ln_swap(swap_id);
     }
-    // A sweep still in the mempool is left alone: replacing it would also
-    // evict anything the wallet has since funded from its unconfirmed
-    // output. Once it has left the mempool it is rebuilt, at the current
-    // rate, which is what recovers from an eviction.
-    if !maker.contract_output_unspent(&outpoint)? {
-        return Ok(());
-    }
     let Some(preimage) = swap.preimage else {
         return Err(MakerError::General("swept swap without a preimage"));
     };
     let mut swap = swap.clone();
     let destination = payout_script(maker, swap_id, &mut swap)?;
-    // Priced afresh, unlike the refund: confirmation is read from the
-    // outpoint, so any version of the sweep that confirms will do.
-    let claim_tx = swap
-        .htlc
-        .create_hashlock_spend(
-            outpoint,
-            value,
-            &swap.privkey,
-            &preimage,
-            destination,
-            maker.htlc_spend_feerate(),
-        )
-        .map_err(|e| {
-            log::warn!("lightning: claim rebuild failed: {e}");
-            MakerError::General("claim rebuild failed")
-        })?;
+    let build = |feerate| {
+        swap.htlc
+            .create_hashlock_spend(
+                outpoint,
+                value,
+                &swap.privkey,
+                &preimage,
+                destination.clone(),
+                feerate,
+            )
+            .map_err(|e| {
+                log::warn!("lightning: claim rebuild failed: {e}");
+                MakerError::General("claim rebuild failed")
+            })
+    };
+    // Our last sweep, rebuilt exactly. While it is in the mempool it is left
+    // alone: replacing it would also evict anything the wallet has since
+    // funded from its unconfirmed output.
+    let built_at = swap.sweep_feerate.unwrap_or(SPEND_FEE_RATE_FLOOR);
+    if maker.is_transaction_known(&build(built_at)?.compute_txid())? {
+        return Ok(());
+    }
+    // Evicted, never sent, or out-bid by the taker's refund: priced at the
+    // current rate, never below the last one, so it can still replace a
+    // competing refund. Recorded before it can reach the network.
+    let feerate = maker.htlc_spend_feerate().max(built_at);
+    let claim_tx = build(feerate)?;
+    swap.sweep_feerate = Some(feerate);
+    if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::InSwept, swap.clone())? {
+        return Ok(());
+    }
     match maker.broadcast_transaction(&claim_tx) {
         Ok(txid) => log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}"),
         Err(e) => log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}"),
@@ -1127,6 +1145,7 @@ fn handle_swap_out_request<M: Maker>(
             preimage: None,
             refund_txid: None,
             refund_feerate: None,
+            sweep_feerate: None,
             accepted_height: maker.get_current_height().ok(),
             payout_script: None,
             funding: None,
@@ -2114,6 +2133,7 @@ mod tests {
             preimage: Some(preimage),
             refund_txid: None,
             refund_feerate: None,
+            sweep_feerate: None,
             accepted_height: Some(812_000),
             payout_script: None,
             funding: Some((OutPoint::default(), Amount::from_sat(40_000))),
