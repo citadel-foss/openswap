@@ -1,6 +1,7 @@
 //! Lightning swaps against mock Lightning nodes, behind the `lightning`
 //! feature.
 
+mod draining_maker;
 mod e2e;
 mod maker_restart;
 mod offer_limits;
