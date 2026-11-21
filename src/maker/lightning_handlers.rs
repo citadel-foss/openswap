@@ -15,6 +15,9 @@
 //! 3. `SwapOutClaimed` -> extract preimage from the claim tx, settle the
 //!    held payment -> `SwapOutComplete`
 //!
+//! New swap-outs are refused for now (see `SWAP_OUT_ADMISSION_CLOSED`); the
+//! steps after the request still run for swap-outs already on record.
+//!
 //! The connection-independent safety net lives in `ln_watchdog_tick`: it
 //! settles swaps whose final message never arrived (crashed taker, dropped
 //! connection) by watching the chain and the Lightning event stream, and
@@ -35,8 +38,8 @@ use crate::{
         common_messages::MakerToTakerMessage,
         features::check_pins,
         lightning_messages::{
-            LightningMakerMessage, LightningTakerMessage, LnHtlcFunded, LnReject, LnSwapInAccept,
-            LnSwapInComplete, LnSwapInRequest, LnSwapOutAccept, LnSwapOutComplete,
+            LightningMakerMessage, LightningOffer, LightningTakerMessage, LnHtlcFunded, LnReject,
+            LnSwapInAccept, LnSwapInComplete, LnSwapInRequest, LnSwapOutAccept, LnSwapOutComplete,
             LnSwapOutRequest,
         },
     },
@@ -379,6 +382,60 @@ fn max_receivable_amount(inbound_sat: u64, base_fee: u64, amount_relative_fee_pc
 fn ln_fee(base_fee: u64, amount_relative_fee_pct: f64, amount: Amount) -> Amount {
     let fee = base_fee as f64 + amount.to_sat() as f64 * amount_relative_fee_pct / 100.0;
     Amount::from_sat(fee.ceil() as u64)
+}
+
+/// Why a new swap-out is refused (#1239).
+///
+/// The taker can claim a swap-out HTLC through its hashlock until the output
+/// is spent. The maker's competing CSV refund becomes valid `locktime` blocks
+/// after the funding confirms.
+/// The maker gets paid only if the held Lightning payment is still held when
+/// that claim reveals the preimage. Admission can only estimate when the
+/// funding will confirm, and nothing afterwards enforces the estimate, so a
+/// late confirmation can leave the claim valid after the payment has failed
+/// back: the taker keeps both sides. A routed swap's second hop is a
+/// swap-out, so routed swaps stop here too.
+///
+/// Only admission closes. Swaps already on record are funded, settled and
+/// refunded as before.
+const SWAP_OUT_ADMISSION_CLOSED: &str = "new swap-outs are disabled: the maker cannot yet keep \
+     the held Lightning payment collectible for the whole on-chain claim window";
+
+/// Opens swap-out admission for tests that need a swap-out on record, as a
+/// maker built before #1239 would have admitted it.
+#[cfg(feature = "integration-test")]
+pub static ADMIT_NEW_SWAP_OUTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether new swap-outs are admitted: never, outside tests. See
+/// [`SWAP_OUT_ADMISSION_CLOSED`].
+#[cfg(not(feature = "integration-test"))]
+fn new_swap_outs_admitted() -> bool {
+    false
+}
+
+/// See the non-test variant.
+#[cfg(feature = "integration-test")]
+fn new_swap_outs_admitted() -> bool {
+    ADMIT_NEW_SWAP_OUTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The offer as advertised: without swap-out while its admission is closed,
+/// and no offer at all if swap-out was all it served.
+pub(super) fn advertised_offer(offer: LightningOffer) -> Option<LightningOffer> {
+    if new_swap_outs_admitted() {
+        return Some(offer);
+    }
+    let offer = LightningOffer {
+        swap_out: false,
+        max_swap_out: 0,
+        ..offer
+    };
+    if offer.swap_in {
+        Some(offer)
+    } else {
+        None
+    }
 }
 
 /// Everything the Lightning handlers need from the maker; bails with a
@@ -1040,6 +1097,10 @@ fn handle_swap_out_request<M: Maker>(
     ctx: &LnContext,
     req: LnSwapOutRequest,
 ) -> Result<Option<MakerToTakerMessage>, MakerError> {
+    // First, so a refused request leaves no invoice, mailbox or record.
+    if !new_swap_outs_admitted() {
+        return Ok(reject(&req.swap_id, SWAP_OUT_ADMISSION_CLOSED));
+    }
     if let Err(reason) = swap_id_matches_hash(&req.swap_id, &req.payment_hash)
         .and_then(|()| check_flow_pins(maker, &req.features, "ln-swap-out"))
         .and_then(|()| reject_if_swap_exists(maker, &req.swap_id))
@@ -2217,5 +2278,145 @@ mod tests {
         assert!(restored.funding.is_none());
         assert!(restored.funding_height.is_none());
         assert_eq!(restored.htlc, swap.htlc);
+    }
+
+    /// A maker on a mock node with a ready channel, half inbound and half
+    /// outbound, and a wallet that may fund up to 1,000,000 sats: on capacity
+    /// alone it could serve either direction.
+    fn maker_with_capacity(
+        path: &std::path::Path,
+    ) -> (
+        Arc<MakerServer>,
+        Arc<crate::lightning::MockLightningBackend>,
+    ) {
+        let ln = Arc::new(crate::lightning::MockLightningBackend::new());
+        ln.set_onchain_balance(Amount::from_btc(0.02).unwrap());
+        let peer = SecretKey::from_slice(&[0x21; 32])
+            .unwrap()
+            .public_key(&bitcoin::secp256k1::Secp256k1::new());
+        let channel = ln
+            .open_channel(crate::lightning::OpenChannelRequest {
+                node_pubkey: peer,
+                address: "127.0.0.1:9735".to_string(),
+                channel_amount: Amount::from_sat(1_000_000),
+                push_to_counterparty_msat: Some(500_000_000),
+                announce_channel: false,
+            })
+            .unwrap();
+        ln.simulate_channel_ready(&channel);
+        let _ = ln.poll_event().unwrap();
+
+        let mut maker = compat_test_maker(path, vec![]);
+        let server = Arc::get_mut(&mut maker).expect("a fresh maker is not shared");
+        server.lightning = Some(ln.clone());
+        server.ln_router = Some(LnEventRouter::new(ln.clone()));
+        server.wallet.write().unwrap().store.offer_maxsize = 1_000_000;
+        (maker, ln)
+    }
+
+    /// Swap-out admission is closed (#1239): a maker whose channels and
+    /// wallet could fund a swap-out still advertises only swap-ins, and an
+    /// offer with nothing but swap-out left is not advertised at all.
+    #[test]
+    fn offer_withholds_swap_out_while_admission_is_closed() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let (maker, ln) = maker_with_capacity(dir.path());
+
+        let offer = Maker::lightning_offer(maker.as_ref()).expect("swap-ins are still offered");
+        // Capacity is not what withholds it: the same channels and wallet
+        // would serve a swap-out.
+        let capacity = directional_limits(
+            &ln.list_channels().unwrap(),
+            1_000_000,
+            offer.min_size,
+            offer.base_fee,
+            offer.amount_relative_fee_pct,
+        );
+        assert!(capacity.swap_out && capacity.max_swap_out > offer.min_size);
+
+        assert!(offer.swap_in && offer.max_swap_in > offer.min_size);
+        assert!(!offer.swap_out, "swap-out must not be advertised");
+        assert_eq!(offer.max_swap_out, 0);
+        // A second read within LN_OFFER_TTL comes from the cache, which holds
+        // the offer as computed, swap-out included. It must be withheld there
+        // too.
+        assert_eq!(
+            Maker::lightning_offer(maker.as_ref()),
+            Some(offer),
+            "a cached offer must not advertise swap-out"
+        );
+
+        let swap_out_only = LightningOffer {
+            swap_in: false,
+            swap_out: true,
+            max_swap_in: 0,
+            max_swap_out: 500_000,
+            ..offer
+        };
+        assert_eq!(advertised_offer(swap_out_only), None);
+        maker.watch_service.shutdown();
+    }
+
+    /// A new swap-out request is refused before anything the maker could
+    /// not take back: no hold invoice on its node, no mailbox, no swap
+    /// record, and the connection stays unbound.
+    #[test]
+    fn swap_out_request_is_refused_before_any_side_effect() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let (maker, ln) = maker_with_capacity(dir.path());
+        let payment_hash = Preimage([0x55; 32]).payment_hash();
+        let swap_id = payment_hash.to_string();
+
+        let mut state = ConnectionState {
+            phase: SwapPhase::AwaitingOfferRequest,
+            ..ConnectionState::default()
+        };
+        let reply = handle_lightning_message(
+            &maker,
+            &mut state,
+            LightningTakerMessage::SwapOutRequest(LnSwapOutRequest {
+                swap_id: swap_id.clone(),
+                payment_hash,
+                amount: Amount::from_sat(40_000),
+                locktime: 60,
+                min_confirmations: 1,
+                taker_hashlock_pubkey: generate_keypair().0,
+                features: vec!["ln-swap-out".to_string()],
+            }),
+        )
+        .unwrap();
+        match reply {
+            Some(MakerToTakerMessage::Lightning(msg)) => match *msg {
+                LightningMakerMessage::Reject(reject) => {
+                    assert_eq!(reject.swap_id, swap_id);
+                    assert_eq!(reject.reason, SWAP_OUT_ADMISSION_CLOSED);
+                }
+                other => panic!("expected a rejection, got {}", other),
+            },
+            other => panic!("expected a Lightning reply, got {:?}", other),
+        }
+
+        assert!(
+            !ln.has_payment_record(payment_hash).unwrap(),
+            "no hold invoice may be created"
+        );
+        assert!(maker.get_ln_swap(&swap_id).unwrap().is_none());
+        assert_eq!(maker.ln_swap_count(), 0);
+        assert_eq!(
+            state.swap_id, None,
+            "a refused peer keeps the pending deadline"
+        );
+
+        // No mailbox was opened: an event for the hash finds no subscriber.
+        ln.push_event(LnEvent::PaymentClaimable {
+            payment_id: crate::lightning::PaymentId(swap_id.clone()),
+            payment_hash: Some(payment_hash),
+            amount_msat: Some(40_000_000),
+            claim_deadline: None,
+        });
+        let router = maker.ln_router.as_ref().unwrap();
+        assert_eq!(router.pump_once(), 0);
+        assert!(router.take_event(&payment_hash).is_none());
+        maker.watch_service.shutdown();
     }
 }

@@ -19,7 +19,7 @@ use openswap::{
     blocklist::BlocklistError,
     lightning::{LightningBackend, MockLightningBackend, PaymentOutcome},
     maker::{
-        lightning_handlers::{ln_watchdog_tick_now, LnMakerPhase},
+        lightning_handlers::{ln_watchdog_tick_now, LnMakerPhase, ADMIT_NEW_SWAP_OUTS},
         MakerServer,
     },
     taker::{error::TakerError, lightning_swap::LnSwapParams},
@@ -99,6 +99,10 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
     );
 
     // ---- Swap-out: taker pays Lightning, gains on-chain BTC ----
+    // The swap-in above ran with swap-out admission closed (#1239), as every
+    // maker now runs. The swap-out needs it open; the settlement and cleanup
+    // checks after it run closed again.
+    let admitted = Switch::on(&ADMIT_NEW_SWAP_OUTS);
     let swap_out = taker
         .lightning_swap_out(LnSwapParams {
             amount: Amount::from_sat(40_000),
@@ -107,6 +111,7 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
             min_confirmations: 1,
         })
         .expect("swap-out must complete");
+    drop(admitted);
     log::info!("swap-out report: {swap_out:?}");
     let claim_txid = swap_out.claim_txid.expect("swap-out produces a claim tx");
 
@@ -428,6 +433,8 @@ fn lightning_swap_in_refuses_announced_value_mismatch(
     ],
 )]
 fn lightning_swap_out_refuses_blocklisted_funding(world: &mut World) {
+    // The taker still screens swap-outs from makers that admit them.
+    let _admitted = Switch::on(&ADMIT_NEW_SWAP_OUTS);
     let blocked_address = world.sole_regular_utxo_address(0);
     world
         .taker()
