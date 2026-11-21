@@ -3816,6 +3816,17 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn htlc_spend_feerate(&self) -> f64 {
+        match lock_debug!(self.wallet.read()) {
+            Ok(wallet) => crate::lightning::swap::htlc_spend_feerate(&wallet.blockchain),
+            Err(_) => {
+                log::warn!("lightning: wallet lock failed; spending the HTLC at the floor rate");
+                crate::lightning::swap::SPEND_FEE_RATE_FLOOR
+            }
+        }
+    }
+
+    #[cfg(feature = "lightning")]
     fn is_htlc_spend_confirmed(
         &self,
         outpoint: &bitcoin::OutPoint,

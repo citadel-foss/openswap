@@ -22,8 +22,8 @@ use bitcoin::{Amount, Network, OutPoint};
 use openswap::{
     bitcoind::bitcoincore_rpc::{Auth, Client, RpcApi},
     lightning::{
-        ChannelState, HtlcFunded, LightningBackend, OpenChannelRequest, SwapInMaker, SwapInParams,
-        SwapInTaker,
+        swap::SPEND_FEE_RATE_FLOOR, ChannelState, HtlcFunded, LightningBackend, OpenChannelRequest,
+        SwapInMaker, SwapInParams, SwapInTaker,
     },
 };
 
@@ -183,7 +183,12 @@ fn main() {
         .assume_checked()
         .script_pubkey();
     let claim_tx = maker
-        .claim_tx(outpoint, funding_output.value, sweep_spk)
+        .claim_tx(
+            outpoint,
+            funding_output.value,
+            sweep_spk,
+            SPEND_FEE_RATE_FLOOR,
+        )
         .expect("claim_tx");
     let claim_txid = rpc
         .send_raw_transaction(&claim_tx)

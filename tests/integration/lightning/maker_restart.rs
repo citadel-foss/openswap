@@ -21,8 +21,8 @@ use bitcoin::{
 use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
 use openswap::{
     lightning::{
-        invoice::verify_invoice, InvoiceParams, LightningBackend, LnEvent, MockLightningBackend,
-        PaymentId, PaymentOutcome, Preimage, SwapHtlc,
+        invoice::verify_invoice, swap::SPEND_FEE_RATE_FLOOR, InvoiceParams, LightningBackend,
+        LnEvent, MockLightningBackend, PaymentId, PaymentOutcome, Preimage, SwapHtlc,
     },
     maker::{
         handlers::{handle_message, ConnectionState, Maker},
@@ -217,6 +217,7 @@ fn lightning_maker_restart_recovers_funded_swap(world: &mut World, ln: Arc<MockL
             funded.value,
             &restored.privkey,
             destination,
+            SPEND_FEE_RATE_FLOOR,
         )
         .expect("refund builds from restored state");
 
@@ -729,6 +730,7 @@ fn lightning_maker_keeps_a_shallow_refund_through_a_reorg(
             &SecretKey::from_slice(&[0x31; 32]).unwrap(),
             &preimage,
             destination.script_pubkey(),
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     bitcoind.client.invalidate_block(&refund_block).unwrap();
@@ -954,6 +956,7 @@ fn lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen(
             &SecretKey::from_slice(&[0x31; 32]).unwrap(),
             &preimage,
             destination,
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     let claim_txid = bitcoind.client.send_raw_transaction(&claim).unwrap();
@@ -1399,6 +1402,7 @@ fn lightning_maker_does_not_refund_a_claimed_swap_out_without_funding_height(
             &SecretKey::from_slice(&[0x31; 32]).unwrap(),
             &preimage,
             destination,
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     let claim_txid = bitcoind.client.send_raw_transaction(&claim).unwrap();
@@ -1470,6 +1474,7 @@ fn accepted_swap_in_with_locktime(preimage: &Preimage, locktime: u16) -> LnMaker
         invoice: "lnbcrt-test".to_string(),
         preimage: None,
         refund_txid: None,
+        refund_feerate: None,
         accepted_height: None,
         payout_script: None,
         funding: None,
@@ -2139,6 +2144,7 @@ fn broadcast_taker_refund(bitcoind: &BitcoinD, swap: &LnMakerSwap, funding: OutP
             swap.amount + swap.fee,
             &timelock_privkey,
             destination,
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     bitcoind.client.send_raw_transaction(&refund).unwrap()

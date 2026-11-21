@@ -30,7 +30,10 @@ use std::{
 use bitcoin::{hashes::sha256, secp256k1::SecretKey, Amount, OutPoint};
 
 use crate::{
-    lightning::{swap::SwapHtlc, ChannelInfo, LightningBackend, LnEvent, PaymentOutcome, Preimage},
+    lightning::{
+        swap::{SwapHtlc, SPEND_FEE_RATE_FLOOR},
+        ChannelInfo, LightningBackend, LnEvent, PaymentOutcome, Preimage,
+    },
     protocol::{
         common_messages::MakerToTakerMessage,
         features::check_pins,
@@ -139,6 +142,10 @@ pub struct LnMakerSwap {
     /// Txid of our refund, recorded before it is broadcast. Names it only:
     /// whether it was sent or confirmed is read from the chain.
     pub refund_txid: Option<bitcoin::Txid>,
+    /// Feerate (sat/vB) our refund was built at, recorded with its txid so a
+    /// rebuild is the same transaction. `None` with a txid means the refund
+    /// predates priced spends and was built at [`SPEND_FEE_RATE_FLOOR`].
+    pub refund_feerate: Option<f64>,
     /// Chain tip when the swap was accepted.
     pub accepted_height: Option<u32>,
     /// Where this swap pays out, fixed on first use.
@@ -179,6 +186,7 @@ impl LnMakerSwap {
             invoice: self.invoice.clone(),
             preimage: self.preimage.map(|p| p.0),
             refund_txid: self.refund_txid,
+            refund_feerate: self.refund_feerate,
             accepted_height: self.accepted_height,
             payout_script: self.payout_script.clone(),
             funding_outpoint,
@@ -204,6 +212,7 @@ impl LnMakerSwap {
             invoice: record.invoice,
             preimage: record.preimage.map(Preimage),
             refund_txid: record.refund_txid,
+            refund_feerate: record.refund_feerate,
             accepted_height: record.accepted_height,
             payout_script: record.payout_script,
             funding: record.funding_outpoint.zip(record.funding_value),
@@ -690,6 +699,7 @@ fn handle_swap_in_request<M: Maker>(
             invoice: req.invoice.clone(),
             preimage: None,
             refund_txid: None,
+            refund_feerate: None,
             accepted_height: maker.get_current_height().ok(),
             payout_script: None,
             funding: None,
@@ -963,7 +973,14 @@ fn sweep_swap_in<M: Maker>(
     let destination = payout_script(maker, swap_id, &mut swap)?;
     let claim_tx = swap
         .htlc
-        .create_hashlock_spend(outpoint, value, &swap.privkey, preimage, destination)
+        .create_hashlock_spend(
+            outpoint,
+            value,
+            &swap.privkey,
+            preimage,
+            destination,
+            maker.htlc_spend_feerate(),
+        )
         .map_err(|e| {
             log::warn!("lightning: claim build failed: {e}");
             MakerError::General("claim build failed")
@@ -1017,9 +1034,19 @@ fn watchdog_finish_sweep<M: Maker>(
     };
     let mut swap = swap.clone();
     let destination = payout_script(maker, swap_id, &mut swap)?;
+    // Repriced on every pass, unlike the refund: confirmation is read from
+    // the outpoint, so any version of the sweep that confirms will do, and a
+    // sweep left under a risen market is replaced instead of resent as is.
     let claim_tx = swap
         .htlc
-        .create_hashlock_spend(outpoint, value, &swap.privkey, &preimage, destination)
+        .create_hashlock_spend(
+            outpoint,
+            value,
+            &swap.privkey,
+            &preimage,
+            destination,
+            maker.htlc_spend_feerate(),
+        )
         .map_err(|e| {
             log::warn!("lightning: claim rebuild failed: {e}");
             MakerError::General("claim rebuild failed")
@@ -1095,6 +1122,7 @@ fn handle_swap_out_request<M: Maker>(
             invoice: invoice.invoice.clone(),
             preimage: None,
             refund_txid: None,
+            refund_feerate: None,
             accepted_height: maker.get_current_height().ok(),
             payout_script: None,
             funding: None,
@@ -1765,9 +1793,11 @@ fn watchdog_resolve_swap_out(
                     script
                 }
             };
+            let feerate = refund_feerate(&swap, || maker.htlc_spend_feerate());
+            swap.refund_feerate = Some(feerate);
             let refund_tx = swap
                 .htlc
-                .create_timelock_spend(outpoint, value, &swap.privkey, destination)
+                .create_timelock_spend(outpoint, value, &swap.privkey, destination, feerate)
                 .map_err(|e| {
                     log::warn!("lightning: refund build failed: {e}");
                     MakerError::General("refund build failed")
@@ -1834,6 +1864,17 @@ pub static INTERRUPT_REFUND: std::sync::atomic::AtomicBool =
 #[cfg(feature = "integration-test")]
 pub static HIDE_HTLC_SPENDS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Feerate (sat/vB) to build this swap's refund at. A refund is recognised
+/// by its recorded txid, so once one is recorded every rebuild reuses the
+/// rate it was built at, and only the first build follows the market.
+fn refund_feerate(swap: &LnMakerSwap, market: impl FnOnce() -> f64) -> f64 {
+    match (swap.refund_txid, swap.refund_feerate) {
+        (_, Some(rate)) => rate,
+        (Some(_), None) => SPEND_FEE_RATE_FLOOR,
+        (None, None) => market(),
+    }
+}
 
 /// Whether `spend` is the refund this swap built. Lacking the preimage
 /// does not make a spend ours; only the persisted refund txid does.
@@ -1910,7 +1951,7 @@ impl HtlcWatch {
 mod tests {
     use super::*;
     use crate::maker::api::tests::compat_test_maker;
-    use bitcoin::ScriptBuf;
+    use bitcoin::{hashes::Hash, ScriptBuf};
 
     #[test]
     fn compat_lightning_pins_require_exact_direction_and_requirements() {
@@ -2013,6 +2054,44 @@ mod tests {
         assert!(!is_our_refund(&swap, &rival));
     }
 
+    #[test]
+    fn refund_keeps_the_rate_its_txid_was_built_at() {
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        assert_eq!(
+            refund_feerate(&swap, || 30.0),
+            30.0,
+            "first build follows the market"
+        );
+        swap.refund_txid = Some(bitcoin::Txid::from_byte_array([0x42; 32]));
+        swap.refund_feerate = Some(30.0);
+        assert_eq!(
+            refund_feerate(&swap, || 80.0),
+            30.0,
+            "a rebuild keeps its rate"
+        );
+    }
+
+    /// A refund recorded before spends were priced was built at the floor
+    /// rate. Its record has no feerate, and must still rebuild that refund.
+    #[test]
+    fn record_without_a_refund_feerate_rebuilds_at_the_floor() {
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        swap.refund_txid = Some(bitcoin::Txid::from_byte_array([0x42; 32]));
+        let serde_cbor::Value::Map(mut fields) =
+            serde_cbor::value::to_value(swap.to_record()).unwrap()
+        else {
+            panic!("a record serializes as a map");
+        };
+        assert!(fields
+            .remove(&serde_cbor::Value::Text("refund_feerate".to_string()))
+            .is_some());
+        let restored = LnMakerSwap::from_record(
+            serde_cbor::value::from_value(serde_cbor::Value::Map(fields)).unwrap(),
+        );
+        assert_eq!(restored.refund_feerate, None);
+        assert_eq!(refund_feerate(&restored, || 80.0), SPEND_FEE_RATE_FLOOR);
+    }
+
     fn sample_swap(direction: LnDirection, phase: LnMakerPhase) -> LnMakerSwap {
         let preimage = Preimage([0x33; 32]);
         let (branch_pubkey, branch_privkey) = generate_keypair();
@@ -2030,6 +2109,7 @@ mod tests {
             invoice: "lnbcrt-test".to_string(),
             preimage: Some(preimage),
             refund_txid: None,
+            refund_feerate: None,
             accepted_height: Some(812_000),
             payout_script: None,
             funding: Some((OutPoint::default(), Amount::from_sat(40_000))),
@@ -2043,7 +2123,8 @@ mod tests {
     /// byte-identical spend — that spend is the only way back to the money.
     #[test]
     fn persisted_record_survives_serialization_and_still_spends() {
-        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        swap.refund_feerate = Some(13.0);
         let bytes = serde_cbor::to_vec(&swap.to_record()).unwrap();
         let restored = LnMakerSwap::from_record(serde_cbor::from_slice(&bytes).unwrap());
 
@@ -2059,16 +2140,30 @@ mod tests {
         assert_eq!(restored.invoice, swap.invoice);
         assert_eq!(restored.funding, swap.funding);
         assert_eq!(restored.funding_height, swap.funding_height);
+        assert_eq!(restored.refund_feerate, Some(13.0));
 
-        // The point of persisting at all: the refund still signs identically.
+        // The point of persisting at all: the refund still signs identically,
+        // at the rate it was first built at.
         let (outpoint, value) = swap.funding.unwrap();
         let original = swap
             .htlc
-            .create_timelock_spend(outpoint, value, &swap.privkey, ScriptBuf::new())
+            .create_timelock_spend(
+                outpoint,
+                value,
+                &swap.privkey,
+                ScriptBuf::new(),
+                swap.refund_feerate.unwrap(),
+            )
             .unwrap();
         let after_restart = restored
             .htlc
-            .create_timelock_spend(outpoint, value, &restored.privkey, ScriptBuf::new())
+            .create_timelock_spend(
+                outpoint,
+                value,
+                &restored.privkey,
+                ScriptBuf::new(),
+                restored.refund_feerate.unwrap(),
+            )
             .unwrap();
         assert_eq!(original, after_restart);
     }

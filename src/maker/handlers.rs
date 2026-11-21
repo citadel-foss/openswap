@@ -774,6 +774,13 @@ pub trait Maker: Send + Sync {
         Err(MakerError::General("lightning swaps not supported"))
     }
 
+    /// Feerate (sat/vB) to build a Lightning HTLC spend at. The default is
+    /// the rate every spend used before spends were priced from the market.
+    #[cfg(feature = "lightning")]
+    fn htlc_spend_feerate(&self) -> f64 {
+        crate::lightning::swap::SPEND_FEE_RATE_FLOOR
+    }
+
     /// Whether `outpoint` has a *confirmed* spend. A mempool-only spend
     /// reports false: it can still be evicted or reorged away, and dropping
     /// a swap's record on one would discard the only key that reaches the
