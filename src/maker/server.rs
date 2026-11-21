@@ -233,6 +233,9 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     log::info!("[{}] Starting maker server", maker.config.network_port);
 
     #[cfg(feature = "integration-test")]
+    maker.is_maker_setup_actually_complete.store(true, Relaxed);
+
+    #[cfg(feature = "integration-test")]
     if maker.behavior == super::handlers::MakerBehavior::StopWatcherOnStartup {
         maker.watch_service.stop_watcher_for_test();
     }
@@ -398,7 +401,10 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     }
 
     if listener.is_some() {
+        #[cfg(not(feature = "integration-test"))]
         maker.is_setup_complete.store(true, Relaxed);
+        #[cfg(feature = "integration-test")]
+        maker.is_setup_complete.store(true, Ordering::Release);
         log::info!(
             "[{}] Server setup complete! Listening on port {}",
             maker.config.network_port,

@@ -2,7 +2,10 @@
 
 use bitcoin::Amount;
 use std::{
-    sync::{atomic::Ordering::Relaxed, Arc},
+    sync::{
+        atomic::Ordering::{Acquire, Relaxed},
+        Arc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -30,7 +33,7 @@ pub fn wait_for_makers_setup(makers: &[Arc<MakerServer>], timeout_secs: u64) {
         if !maker.is_setup_complete.load(Relaxed) {
             log::info!("Waiting for maker {} setup completion", i);
         }
-        while !maker.is_setup_complete.load(Relaxed) {
+        while !maker.is_setup_complete.load(Acquire) {
             if start.elapsed() > timeout {
                 panic!(
                     "Maker {} did not complete setup within {} seconds",

@@ -129,6 +129,7 @@ fn bond_creation_and_redemption(world: &mut World) {
     let restarted_clone = restarted.clone();
     let restarted_thread = thread::spawn(move || start_server(restarted_clone));
     wait_for_makers_setup(std::slice::from_ref(&restarted), 120);
+    assert!(restarted.is_maker_setup_actually_complete.load(Relaxed));
     assert_single_adopted_bond(&restarted, bond_txid);
     restarted.shutdown.store(true, Relaxed);
     let _ = restarted_thread.join().unwrap();
