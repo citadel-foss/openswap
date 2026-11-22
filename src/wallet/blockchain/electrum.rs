@@ -762,18 +762,19 @@ impl Electrum {
     }
 
     /// Fees of mempool transaction `txid` and of every mempool transaction
-    /// spending from it, read from the server's current script histories:
-    /// what a replacement of `txid` has to pay above. A fee the server does
-    /// not report is worked out from the transaction's inputs. `None` when
-    /// `txid` is not in the mempool. A family larger than the node relays is
-    /// an error, so a partial sum is never taken for the whole.
+    /// spending from it: what a replacement of `txid` has to pay above. The
+    /// family is found through the server's current script histories, and
+    /// each fee is worked out from the transaction's inputs and outputs, not
+    /// taken from the server. `None` when `txid` is not in the mempool. A
+    /// family no replacement could evict is an error, so a partial sum is
+    /// never taken for the whole.
     #[cfg(feature = "lightning")]
     pub(crate) fn mempool_package_fee(
         &self,
         txid: &Txid,
     ) -> Result<Option<bitcoin::Amount>, WalletError> {
-        // Bitcoin Core's default limit on a transaction's mempool family.
-        const MAX_FAMILY: usize = 25;
+        // A replacement may evict at most 100 transactions (BIP125 rule 5).
+        const MAX_FAMILY: usize = 100;
         let mut total = bitcoin::Amount::ZERO;
         let mut family = HashSet::from([*txid]);
         let mut checked = HashSet::new();
@@ -787,7 +788,6 @@ impl Electrum {
                 Err(e) => return Err(e),
             };
             let mut pending = false;
-            let mut reported = None;
             for (vout, output) in tx.output.iter().enumerate() {
                 let spent = OutPoint::new(parent, vout as u32);
                 let history =
@@ -795,7 +795,6 @@ impl Electrum {
                 for entry in history {
                     if entry.tx_hash == parent {
                         pending |= entry.height <= 0;
-                        reported = reported.or(entry.fee);
                         continue;
                     }
                     if entry.height > 0 || family.contains(&entry.tx_hash) {
@@ -828,17 +827,13 @@ impl Electrum {
                     "electrum: {parent} spends from {txid} but is not in the mempool"
                 )));
             }
-            let fee = match reported {
-                Some(sats) => bitcoin::Amount::from_sat(sats),
-                None => self.fee_from_inputs(&tx)?,
-            };
-            total += fee;
+            total = checked_add_amount(total, self.fee_from_inputs(&tx)?, "package fee")?;
         }
         Ok(Some(total))
     }
 
     /// What `tx` pays in fees: its inputs' values, read from the transactions
-    /// they spend, less its outputs.
+    /// they spend, each checked against its txid, less its outputs.
     #[cfg(feature = "lightning")]
     fn fee_from_inputs(&self, tx: &Transaction) -> Result<bitcoin::Amount, WalletError> {
         let mut inputs = bitcoin::Amount::ZERO;
@@ -848,9 +843,14 @@ impl Electrum {
                 .output
                 .get(input.previous_output.vout as usize)
                 .ok_or_else(|| electrum_err(format!("electrum: no {}", input.previous_output)))?;
-            inputs += output.value;
+            inputs = checked_add_amount(inputs, output.value, "input value")?;
         }
-        let outputs = tx.output.iter().map(|output| output.value).sum();
+        let outputs = tx
+            .output
+            .iter()
+            .try_fold(bitcoin::Amount::ZERO, |sum, output| {
+                checked_add_amount(sum, output.value, "output value")
+            })?;
         inputs.checked_sub(outputs).ok_or_else(|| {
             electrum_err(format!(
                 "electrum: {} pays out more than it spends",
@@ -3038,8 +3038,8 @@ pub(crate) mod tests {
     }
 
     /// What replacing a mempool transaction has to beat: its fee and the
-    /// fees of everything spending from it. A fee the server reports is
-    /// taken as is; one it leaves out is the inputs' value less the outputs.
+    /// fees of everything spending from it, each worked out from its inputs
+    /// and outputs. A fee the server reports, right or wrong, is not used.
     #[cfg(feature = "lightning")]
     #[test]
     fn package_fee_adds_up_the_mempool_family() {
@@ -3054,7 +3054,7 @@ pub(crate) mod tests {
         let unrelated = deposit(9);
         let entries = json!([
             { "tx_hash": funding.compute_txid(), "height": 101 },
-            { "tx_hash": refund.compute_txid(), "height": 0, "fee": 300 },
+            { "tx_hash": refund.compute_txid(), "height": 0, "fee": 60_000 },
             { "tx_hash": child.compute_txid(), "height": -1 },
             { "tx_hash": unrelated.compute_txid(), "height": 0, "fee": 50 },
         ]);
@@ -3076,7 +3076,8 @@ pub(crate) mod tests {
             ..Default::default()
         })
         .expect("connect to mock electrum");
-        // 300 reported for the refund, and 700 - 200 worked out for its child.
+        // 1000 - 700 for the refund, whatever the server reports, and 700 - 200
+        // for its child.
         assert_eq!(
             backend.mempool_package_fee(&refund.compute_txid()).unwrap(),
             Some(Amount::from_sat(800))
