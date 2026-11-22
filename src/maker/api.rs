@@ -4014,6 +4014,38 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn htlc_pending_spend(
+        &self,
+        outpoint: &bitcoin::OutPoint,
+        script: &bitcoin::ScriptBuf,
+    ) -> Result<Option<Transaction>, MakerError> {
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // Core answers from the mempool alone, with no block scan; callers
+        // ask only once the HTLC has no confirmed spend.
+        match &wallet.blockchain {
+            AnyBlockchain::CoreRPC(core) => core.mempool_spending_transaction(outpoint),
+            AnyBlockchain::Electrum(_) => {
+                wallet
+                    .blockchain
+                    .spending_transaction(outpoint, script.as_script(), None)
+            }
+        }
+        .map_err(MakerError::Wallet)
+    }
+
+    #[cfg(feature = "lightning")]
+    fn is_output_unspent(&self, outpoint: &bitcoin::OutPoint) -> Result<bool, MakerError> {
+        use crate::wallet::Blockchain;
+        Ok(lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+            .map_err(MakerError::Wallet)?
+            .is_some())
+    }
+
+    #[cfg(feature = "lightning")]
     fn is_htlc_spend_confirmed(
         &self,
         outpoint: &bitcoin::OutPoint,

@@ -61,7 +61,7 @@ use super::{
 
 /// Virtual size (vB) an HTLC spend is priced at: the legacy contract spend
 /// model, which upper-bounds both branches of the same script.
-const SPEND_TX_VSIZE: u64 = LEGACY_CONTRACT_SPEND_VSIZE;
+pub(crate) const SPEND_TX_VSIZE: u64 = LEGACY_CONTRACT_SPEND_VSIZE;
 
 /// Lowest feerate (sat/vB) an HTLC spend is built at, and the one every
 /// spend used before spends were priced from the backend's estimate. A
@@ -98,7 +98,8 @@ fn funding_feerate_from(estimate: Result<f64, WalletError>) -> f64 {
         Ok(rate) if rate.is_finite() => rate.max(MIN_RELAY_FEE_RATE),
         other => {
             log::warn!(
-                "lightning: no high-priority feerate estimate ({other:?});                  funding the HTLC at the relay floor"
+                "lightning: no high-priority feerate estimate ({other:?}); \
+                 funding the HTLC at the relay floor"
             );
             MIN_RELAY_FEE_RATE
         }

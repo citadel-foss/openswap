@@ -800,6 +800,25 @@ pub trait Maker: Send + Sync {
         crate::utill::MIN_RELAY_FEE_RATE
     }
 
+    /// The unconfirmed transaction spending `outpoint`, read from the node:
+    /// what a rebuild would replace. `None` when nothing in the mempool
+    /// spends it.
+    #[cfg(feature = "lightning")]
+    fn htlc_pending_spend(
+        &self,
+        _outpoint: &bitcoin::OutPoint,
+        _script: &bitcoin::ScriptBuf,
+    ) -> Result<Option<Transaction>, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Whether `outpoint` is unspent with the mempool included: for a
+    /// pending HTLC spend's output, that nothing builds on it yet.
+    #[cfg(feature = "lightning")]
+    fn is_output_unspent(&self, _outpoint: &bitcoin::OutPoint) -> Result<bool, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
     /// Whether `outpoint` has a *confirmed* spend. A mempool-only spend
     /// reports false: it can still be evicted or reorged away, and dropping
     /// a swap's record on one would discard the only key that reaches the

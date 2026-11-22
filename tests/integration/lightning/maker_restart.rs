@@ -14,7 +14,7 @@ use std::{
 };
 
 use bitcoin::{
-    hashes::sha256,
+    hashes::{sha256, Hash},
     secp256k1::{Secp256k1, SecretKey},
     Amount, Network, OutPoint, PublicKey, Txid,
 };
@@ -395,7 +395,9 @@ fn lightning_maker_restart_refunds_unclaimed_swap_out(
 ///
 /// The eviction is real: unwinding the chain below the refund's CSV height
 /// makes bitcoind drop it as no longer final, and restoring the chain does
-/// not bring it back.
+/// not bring it back. The market has risen meanwhile: with nothing pending,
+/// the refund goes out again at the new rate under a new txid, and the one
+/// it supersedes stays on record.
 #[world_test(
     backend = BitcoindBackend,
     bind = [ln = maker_node()],
@@ -474,11 +476,24 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
     // The watcher still names the evicted refund as the spend.
     assert_eq!(recorded_spend(), Some(refund_txid));
 
-    // ---- The watchdog sends it again, and keeps the swap open ----
+    // ---- The watchdog sends it again, at the risen rate ----
+    let _market = SpendFeerate::set(40.0);
     ln_watchdog_tick_now(&maker);
+    let swap = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .expect("the swap stays open");
+    let resent = swap.refund_txid.expect("the resend is recorded");
+    assert_ne!(resent, refund_txid, "the refund went out at its old rate");
+    assert_eq!(swap.earlier_refund_txids, vec![refund_txid]);
     assert!(
-        in_mempool(&refund_txid),
+        in_mempool(&resent),
         "the evicted refund was never sent again"
+    );
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funded.outpoint, funded.value),
+        Amount::from_sat(6_000),
+        "the resend must pay the new rate, 40 sat/vB for 150 vB"
     );
     // Further passes change nothing until it confirms.
     ln_watchdog_tick_now(&maker);
@@ -487,12 +502,13 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
         .unwrap()
         .expect("the swap stays open");
     assert_eq!(swap.phase, LnMakerPhase::OutFunded);
-    assert_eq!(swap.refund_txid, Some(refund_txid));
-    assert!(in_mempool(&refund_txid));
+    assert_eq!(swap.refund_txid, Some(resent));
+    assert_eq!(swap.earlier_refund_txids, vec![refund_txid]);
+    assert!(in_mempool(&resent));
 
     // ---- Once it is final, the swap closes and the payment fails back ----
     generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
-    assert!(confirmations(bitcoind, &refund_txid) as u64 >= REFUND_FINALITY_DEPTH);
+    assert!(confirmations(bitcoind, &resent) as u64 >= REFUND_FINALITY_DEPTH);
     wait_until!(
         Duration::from_secs(30),
         every Duration::from_millis(200),
@@ -589,6 +605,15 @@ fn lightning_maker_bumps_a_pending_refund(world: &mut World, ln: Arc<MockLightni
         bitcoind.client.get_mempool_entry(&first).is_err(),
         "the bump must replace the first refund"
     );
+    // At that rate, the next pass resends the bump unchanged.
+    ln_watchdog_tick_now(&maker);
+    let swap = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    assert_eq!(swap.refund_txid, Some(bumped));
+    assert_eq!(swap.earlier_refund_txids, vec![first]);
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funded.outpoint, funded.value),
+        Amount::from_sat(6_000)
+    );
 
     // ---- The bumped refund is final, so the swap closes ----
     generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
@@ -607,6 +632,117 @@ fn lightning_maker_bumps_a_pending_refund(world: &mut World, ln: Arc<MockLightni
         "the refunded swap's held payment must be failed back"
     );
     framework.set_block_gen_paused(false);
+}
+
+/// A bump can be the refund on record while an earlier refund is the one
+/// that confirms. That refund is still ours, so the swap closes at finality
+/// and the held payment fails back.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_closes_on_an_earlier_refund(world: &mut World, ln: Arc<MockLightningBackend>) {
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    let locktime: u16 = 30;
+    pause_block_generation(&framework);
+
+    let preimage = Preimage([0x7c; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    let funded = fund_swap_out(
+        &maker,
+        &ln,
+        preimage.payment_hash(),
+        Amount::from_sat(40_000),
+        locktime,
+    );
+    generate_blocks(bitcoind, 1);
+    let funded_at = bitcoind.client.get_block_count().unwrap()
+        - confirmations(bitcoind, &funded.outpoint.txid) as u64
+        + 1;
+    mine_to(bitcoind, funded_at + locktime as u64 + 1);
+
+    ln_watchdog_tick_now(&maker);
+    let mut swap = maker.get_ln_swap(&swap_id).unwrap().unwrap();
+    let first = swap.refund_txid.expect("the watchdog broadcast a refund");
+    // As after a bump the chain never took: a later refund is on record,
+    // and the first one is what confirms.
+    swap.earlier_refund_txids = vec![first];
+    swap.refund_txid = Some(Txid::from_byte_array([0x5b; 32]));
+    maker.store_ln_swap(&swap_id, swap).unwrap();
+    generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
+    assert!(confirmations(bitcoind, &first) as u64 >= REFUND_FINALITY_DEPTH);
+
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the maker to close the swap on its earlier refund",
+        {
+            ln_watchdog_tick_now(&maker);
+            maker.get_ln_swap(&swap_id).unwrap().is_none()
+        }
+    );
+    assert!(
+        ln.claim_held_payment(&preimage).is_err(),
+        "the refunded swap's held payment must be failed back"
+    );
+    framework.set_block_gen_paused(false);
+}
+
+/// A swept swap-in whose sweep never reached the mempool, or was evicted
+/// from it, goes out again at the market rate once that has risen past
+/// the recorded one. Nothing is pending, so nothing is replaced.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+)]
+fn swap_in_sweep_never_sent_goes_out_at_the_market_rate(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    let _ = &ln;
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+    let _market = SpendFeerate::set(20.0);
+
+    let preimage = Preimage([0xb2; 32]);
+    let id = preimage.payment_hash().to_string();
+    let swap = accepted_swap_in(&preimage);
+    let funding = fund_htlc(bitcoind, &swap);
+    generate_blocks(bitcoind, 1);
+    let mut swept = paid_without_height(&swap, funding);
+    swept.funding_height = Some(confirmation_height(bitcoind, &funding.txid) as u32);
+    swept.phase = LnMakerPhase::InSwept;
+    swept.preimage = Some(preimage);
+    swept.sweep_feerate = Some(5.0);
+    maker.store_ln_swap(&id, swept).unwrap();
+
+    ln_watchdog_tick_now(&maker);
+    let value = swap.amount + swap.fee;
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(3_000),
+        "the sweep must go out at the market rate, 20 sat/vB for 150 vB"
+    );
+    assert_eq!(
+        maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate,
+        Some(20.0),
+        "the new rate must be recorded"
+    );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
 }
 
 /// Holds a watchdog test switch on until dropped, even if the test panics.
@@ -641,8 +777,9 @@ fn switch_resets_on_panic() {
 /// refund, recognise it as its own, and close the swap once it is final.
 /// Broadcasting first could leave a refund that confirmed while the maker
 /// was down and that the restarted maker did not know was its own, so the
-/// swap never closed. The market rises while it is down, so the refund the
-/// restarted maker rebuilds is the recorded one only at the recorded rate.
+/// swap never closed. The market falls while it is down, and a refund is
+/// never rebuilt below the rate it was recorded at, so the restarted maker
+/// sends the recorded refund.
 #[world_test(
     backend = BitcoindBackend,
     bind = [ln = maker_node()],
@@ -704,7 +841,7 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
 
     // ---- The restarted maker refunds and closes the swap ----
     // Nothing was sent, so it rebuilds the refund from its record.
-    market.set_rate(40.0);
+    market.set_rate(5.0);
     ln_watchdog_tick_now(&maker);
     generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
     wait_until!(
@@ -743,7 +880,7 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
                 .map(|output| output.value)
                 .sum::<Amount>(),
         Amount::from_sat(1_500),
-        "the refund must keep the 10 sat/vB it was recorded at, not the 40 sat/vB market"
+        "the refund must keep the 10 sat/vB it was recorded at, not the 5 sat/vB market"
     );
 }
 
