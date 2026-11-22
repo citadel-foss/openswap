@@ -94,6 +94,18 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
         swap_in.fee.to_sat() >= 500,
         "fee must include the maker's base fee"
     );
+    // The taker funded the HTLC at the market rate, not the relay floor.
+    let funding_txid = swap_in.funding_outpoint.txid;
+    let funding_vsize = bitcoind
+        .client
+        .get_raw_transaction(&funding_txid, None)
+        .unwrap()
+        .vsize();
+    let funding_rate = tx_fee(bitcoind, &funding_txid).to_sat() as f64 / funding_vsize as f64;
+    assert!(
+        funding_rate >= 9.0,
+        "the taker must fund the HTLC near 10 sat/vB, paid {funding_rate:.2}"
+    );
 
     // The maker learned the preimage and swept the HTLC: its claim spends
     // the funding outpoint. Give the sweep a moment to reach the chain.

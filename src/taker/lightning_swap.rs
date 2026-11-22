@@ -32,7 +32,7 @@ use bitcoin::{
 use crate::{
     lightning::{
         invoice::verify_invoice,
-        swap::{htlc_spend_feerate, SwapHtlc},
+        swap::{htlc_funding_feerate, htlc_spend_feerate, SwapHtlc},
         InvoiceParams, LightningBackend, LnEvent, Preimage,
     },
     protocol::{
@@ -43,7 +43,7 @@ use crate::{
             LnSwapInRequest, LnSwapOutClaimed, LnSwapOutPaid, LnSwapOutRequest,
         },
     },
-    utill::{generate_keypair, read_message, send_message, MIN_RELAY_FEE_RATE},
+    utill::{generate_keypair, read_message, send_message},
     wallet::{AddressType, LnPendingSwap},
 };
 
@@ -493,6 +493,10 @@ impl Taker {
         // the only copy of our branch key.
         let (outpoint, actual_value) = {
             let mut wallet = self.write_wallet()?;
+            // Priced to confirm while the maker still waits for it, as the
+            // maker prices its swap-out funding: at the relay floor a busy
+            // chain leaves it unconfirmed and the swap is abandoned.
+            let feerate = htlc_funding_feerate(&wallet.blockchain);
             // One split, one destination: an HTLC output is a single exact
             // payment, with no hop to reimburse and nothing to randomize.
             // A Lightning HTLC is a script-path P2WSH contract, priced like
@@ -500,14 +504,14 @@ impl Taker {
             let plan = wallet.plan_funding(
                 value,
                 1,
-                MIN_RELAY_FEE_RATE,
+                feerate,
                 u32::MAX,
                 None,
                 None,
                 None,
                 crate::protocol::ProtocolVersion::Legacy,
             )?;
-            let result = wallet.execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE)?;
+            let result = wallet.execute_funding_plan(&plan, &[address], feerate)?;
             let tx = result
                 .funding_txes
                 .into_iter()

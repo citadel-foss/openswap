@@ -48,6 +48,7 @@ use crate::{
     protocol::{contract::create_contract_redeemscript, error::ProtocolError, Hash160},
     utill::{
         capped_fee, generate_keypair, redeemscript_to_scriptpubkey, LEGACY_CONTRACT_SPEND_VSIZE,
+        MIN_RELAY_FEE_RATE,
     },
     wallet::{Blockchain, FeePriority, WalletError},
 };
@@ -73,23 +74,51 @@ pub const SPEND_FEE_RATE_FLOOR: f64 = 2.0;
 /// so a spend priced under the market can still be unconfirmed when the
 /// other side's branch opens.
 pub fn htlc_spend_feerate<B: Blockchain + ?Sized>(chain: &B) -> f64 {
-    // Regtest has no fee estimates, so a test names the rate the market has
-    // reached.
     #[cfg(feature = "integration-test")]
-    if let Some(rate) = std::env::var(SPEND_FEERATE_ENV)
-        .ok()
-        .and_then(|rate| rate.parse::<f64>().ok())
-    {
+    if let Some(rate) = test_market_feerate() {
         return spend_feerate_from(Ok(rate));
     }
     spend_feerate_with(|priority| chain.estimate_feerate(priority))
+}
+
+/// Feerate (sat/vB) to fund an HTLC at: the backend's estimate for about an
+/// hour, never below the relay floor, as the maker prices its own HTLC
+/// funding. Funding left at the floor on a busy chain can still be
+/// unconfirmed when the counterparty gives up on the swap.
+pub fn htlc_funding_feerate<B: Blockchain + ?Sized>(chain: &B) -> f64 {
+    #[cfg(feature = "integration-test")]
+    if let Some(rate) = test_market_feerate() {
+        return funding_feerate_from(Ok(rate));
+    }
+    funding_feerate_from(chain.estimate_feerate(FeePriority::High))
+}
+
+fn funding_feerate_from(estimate: Result<f64, WalletError>) -> f64 {
+    match estimate {
+        Ok(rate) if rate.is_finite() => rate.max(MIN_RELAY_FEE_RATE),
+        other => {
+            log::warn!(
+                "lightning: no high-priority feerate estimate ({other:?});                  funding the HTLC at the relay floor"
+            );
+            MIN_RELAY_FEE_RATE
+        }
+    }
+}
+
+/// The market rate a test names, since regtest has no fee estimates.
+#[cfg(feature = "integration-test")]
+fn test_market_feerate() -> Option<f64> {
+    std::env::var(SPEND_FEERATE_ENV)
+        .ok()
+        .and_then(|rate| rate.parse::<f64>().ok())
 }
 
 fn spend_feerate_with(estimate: impl FnOnce(FeePriority) -> Result<f64, WalletError>) -> f64 {
     spend_feerate_from(estimate(FeePriority::High))
 }
 
-/// Names the feerate [`htlc_spend_feerate`] sees in test builds.
+/// Names the market feerate [`htlc_spend_feerate`] and
+/// [`htlc_funding_feerate`] see in test builds.
 #[cfg(feature = "integration-test")]
 pub const SPEND_FEERATE_ENV: &str = "OPENSWAP_HTLC_SPEND_FEERATE";
 
@@ -1046,6 +1075,18 @@ mod tests {
         assert_eq!(
             spend_feerate_from(Err(WalletError::General("no estimate".to_string()))),
             SPEND_FEE_RATE_FLOOR
+        );
+    }
+
+    #[test]
+    fn funding_feerate_follows_the_estimate_but_not_below_the_relay_floor() {
+        assert_eq!(funding_feerate_from(Ok(27.3)), 27.3);
+        assert_eq!(funding_feerate_from(Ok(1.5)), 1.5);
+        assert_eq!(funding_feerate_from(Ok(0.5)), MIN_RELAY_FEE_RATE);
+        assert_eq!(funding_feerate_from(Ok(f64::NAN)), MIN_RELAY_FEE_RATE);
+        assert_eq!(
+            funding_feerate_from(Err(WalletError::General("no estimate".to_string()))),
+            MIN_RELAY_FEE_RATE
         );
     }
 

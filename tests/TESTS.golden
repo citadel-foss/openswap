@@ -46,6 +46,7 @@ openswap lightning::mock::tests::preimage_payment_hash_is_sha256
 openswap lightning::mock::tests::regular_invoice_round_trip
 openswap lightning::mock::tests::shared_across_threads_as_trait_object
 openswap lightning::swap::tests::extract_preimage_from_hashlock_spend
+openswap lightning::swap::tests::funding_feerate_follows_the_estimate_but_not_below_the_relay_floor
 openswap lightning::swap::tests::hashlock_spend_witness_and_sequence
 openswap lightning::swap::tests::preimage_links_lightning_and_onchain_hashlocks
 openswap lightning::swap::tests::script_parameters_round_trip
