@@ -1175,17 +1175,28 @@ impl Taker {
             // record with resume data and no script when the pass began has
             // never sent one, whether it was funded then or its funding was
             // recovered from the maker above: its first claim needs the
-            // agreed confirmations and waits for the refund window. A claim
-            // already sent is always sent again, and a record from an older
-            // build, without resume data, is claimed as before.
+            // agreed confirmations and waits for the refund window. A routed
+            // second hop's first claim also waits on its first hop, as when
+            // its funding was resumed, and a direct swap-out's on our
+            // payment. A claim already sent is always sent again, and a
+            // record from an older build, without resume data, is claimed as
+            // before.
             let first_claim = match &record.resume {
                 Some(resume) if !record.is_swap_in && record.payout_script.is_none() => {
                     Some(resume)
                 }
                 _ => None,
             };
-            let payment_failed =
-                || direct_payment_failed(swap_id, |hash| self.payment_outcome(hash));
+            let hold = |chain: &AnyBlockchain| {
+                let first_hop = |hop: &LnPendingSwap| first_hop_state(chain, hop).ok();
+                match first_hop_hold(swap_id, &records, first_hop) {
+                    Some((why, _)) => Some(why),
+                    None if direct_payment_failed(swap_id, |hash| self.payment_outcome(hash)) => {
+                        Some("outbound payment failed")
+                    }
+                    None => None,
+                }
+            };
             // Funding recovered above was checked before it was recorded.
             let withheld = match first_claim {
                 Some(resume) if record.outpoint.is_some() => first_claim_withheld(
@@ -1193,7 +1204,7 @@ impl Taker {
                     resume,
                     record.locktime,
                     &outpoint.txid,
-                    payment_failed,
+                    hold,
                 ),
                 _ => None,
             };
@@ -1239,7 +1250,7 @@ impl Taker {
                             resume,
                             record.locktime,
                             &outpoint.txid,
-                            payment_failed,
+                            hold,
                         )
                     });
                     match late {
@@ -1314,31 +1325,9 @@ impl Taker {
     ) -> Result<Option<(OutPoint, Amount)>, TakerError> {
         let payment = |hash| self.payment_outcome(hash);
         let first_hop = |hop: &LnPendingSwap| {
-            use crate::wallet::blockchain::Blockchain;
-            let outpoint = hop.outpoint?;
-            let script = SwapHtlc::from_redeemscript(hop.redeemscript.clone(), hop.locktime)
-                .script_pubkey()
-                .ok()?;
             let wallet = self.read_wallet().ok()?;
             let chain = &wallet.blockchain;
-            on_one_chain(chain, || {
-                if chain.is_confirmed_spend(&outpoint, &script)? {
-                    return Ok(FirstHop::Spent);
-                }
-                // Our refund can be mined in the next block once the funding
-                // has `locktime` confirmations (BIP68), and recovery
-                // broadcasts it.
-                let confirmations = chain
-                    .get_raw_transaction_info(&outpoint.txid, None)?
-                    .confirmations
-                    .unwrap_or(0);
-                Ok(if confirmations >= hop.locktime as u32 {
-                    FirstHop::RefundMature
-                } else {
-                    FirstHop::Unspent
-                })
-            })
-            .ok()
+            on_one_chain(chain, || first_hop_state(chain, hop)).ok()
         };
         let decide = || unfunded_action(key, record, records, payment, first_hop);
         let Some(resume) = self.settle_unfunded(key, decide(), outcomes)? else {
@@ -1516,34 +1505,14 @@ fn unfunded_action<'a>(
     if record.is_swap_in {
         return Unfunded::Forget("no on-chain commitment");
     }
-    if let Some(base) = key.strip_suffix("-out") {
-        // Maker 2 funds only once maker 1 has paid it, and maker 1 pays only
-        // for our first-hop funding, whose outpoint is saved before it is
-        // broadcast.
-        let first_hop_key = format!("{base}-in");
-        match records.iter().find(|(id, _)| *id == first_hop_key) {
-            Some((_, hop)) if hop.outpoint.is_none() => {
-                return Unfunded::Forget("first hop never funded");
-            }
-            // The first hop's record goes once its spend confirms. While
-            // this hop has no outpoint we have not claimed it, so nothing has
-            // revealed the preimage maker 1 needs, and that spend was our
-            // refund. Nothing on this hop is ours to claim, and claiming it
-            // would reveal the preimage after we were refunded.
-            None => return Unfunded::Forget("first hop already resolved"),
-            // The same holds while the record is still here: decided from
-            // the chain, not from which record this pass visits first.
-            Some((_, hop)) => match first_hop(hop) {
-                Some(FirstHop::Spent) => return Unfunded::Forget("first hop already resolved"),
-                // Our refund of hop 1 can confirm at any block now, even
-                // while it waits unconfirmed: claiming hop 2 would reveal the
-                // preimage maker 1 needs too late for it to be repaid.
-                Some(FirstHop::RefundMature) => {
-                    return Unfunded::Keep("first hop refund mature");
-                }
-                Some(FirstHop::Unspent) => {}
-                None => return Unfunded::Keep("first hop status unknown"),
-            },
+    if key.ends_with("-out") {
+        // While this hop has no outpoint we have not claimed it.
+        if let Some((why, resolved)) = first_hop_hold(key, records, first_hop) {
+            return if resolved {
+                Unfunded::Forget(why)
+            } else {
+                Unfunded::Keep(why)
+            };
         }
     } else if direct_payment_failed(key, payment) {
         return Unfunded::Forget("payment failed");
@@ -1552,6 +1521,67 @@ fn unfunded_action<'a>(
         Some(resume) => Unfunded::Resume(resume),
         None => Unfunded::Keep("paid swap-out without a funding outpoint"),
     }
+}
+
+/// Why a routed second hop under `key` must not reveal the preimage with a
+/// first claim, and whether its first hop is resolved for good. `None` while
+/// the first hop is funded and unspent and our refund of it cannot be mined
+/// yet, and for a key that is not a second hop. A claim already sent has
+/// revealed the preimage and goes out again whatever the first hop's state,
+/// so this is only for a claim not yet sent. `records` is the pass's
+/// snapshot; `first_hop` reads a funded first hop, `None` when it cannot.
+fn first_hop_hold(
+    key: &str,
+    records: &[(String, LnPendingSwap)],
+    first_hop: impl FnOnce(&LnPendingSwap) -> Option<FirstHop>,
+) -> Option<(&'static str, bool)> {
+    // Maker 2 funds only once maker 1 has paid it, and maker 1 pays only for
+    // our first-hop funding, whose outpoint is saved before it is broadcast.
+    let first_hop_key = format!("{}-in", key.strip_suffix("-out")?);
+    match records.iter().find(|(id, _)| *id == first_hop_key) {
+        Some((_, hop)) if hop.outpoint.is_none() => Some(("first hop never funded", true)),
+        // The first hop's record goes once its spend confirms. While no
+        // claim of this hop has been sent, nothing has revealed the preimage
+        // maker 1 needs, so that spend was our refund. Nothing on this hop is
+        // ours to claim, and claiming it would reveal the preimage after we
+        // were refunded.
+        None => Some(("first hop already resolved", true)),
+        // The same holds while the record is still here: decided from the
+        // chain, not from which record this pass visits first.
+        Some((_, hop)) => match first_hop(hop) {
+            Some(FirstHop::Spent) => Some(("first hop already resolved", true)),
+            // Our refund of hop 1 can confirm at any block now, even while
+            // it waits unconfirmed: claiming hop 2 would reveal the preimage
+            // maker 1 needs too late for it to be repaid.
+            Some(FirstHop::RefundMature) => Some(("first hop refund mature", false)),
+            Some(FirstHop::Unspent) => None,
+            None => Some(("first hop status unknown", false)),
+        },
+    }
+}
+
+/// Reads a funded first hop's state. Read it inside the caller's
+/// [`on_one_chain`] decision.
+fn first_hop_state(chain: &AnyBlockchain, hop: &LnPendingSwap) -> Result<FirstHop, TakerError> {
+    use crate::wallet::blockchain::Blockchain;
+    let outpoint = hop
+        .outpoint
+        .ok_or_else(|| general("first hop has no funding outpoint"))?;
+    let script = SwapHtlc::from_redeemscript(hop.redeemscript.clone(), hop.locktime)
+        .script_pubkey()
+        .map_err(|e| general(format!("htlc spk: {e}")))?;
+    if chain.is_confirmed_spend(&outpoint, &script)? {
+        return Ok(FirstHop::Spent);
+    }
+    // Our refund can be mined in the next block once the funding has
+    // `locktime` confirmations (BIP68), and recovery broadcasts it.
+    Ok(
+        if funding_confirmations(chain, &outpoint.txid)? >= hop.locktime as u32 {
+            FirstHop::RefundMature
+        } else {
+            FirstHop::Unspent
+        },
+    )
 }
 
 /// Only direct swap-out keys are payment hashes. A missing outbound record
@@ -1635,14 +1665,16 @@ fn funding_confirmations(chain: &AnyBlockchain, txid: &Txid) -> Result<u32, Take
         .unwrap_or(0))
 }
 
-/// Check Bitcoin eligibility and the payer's latest outcome before the final
-/// tip read, so a slow Lightning lookup cannot hide a change of chain.
+/// Check the funding's eligibility, then `hold` (a routed second hop's first
+/// hop, or a direct swap-out's payment), before the final tip read: both
+/// hops are read from one chain, and a slow Lightning lookup cannot hide a
+/// change of chain.
 fn first_claim_withheld(
     chain: &AnyBlockchain,
     resume: &LnFundingResume,
     locktime: u16,
     txid: &Txid,
-    payment_failed: impl FnOnce() -> bool,
+    hold: impl FnOnce(&AnyBlockchain) -> Option<&'static str>,
 ) -> Option<String> {
     let decision = on_one_chain(chain, || {
         let confirmations = funding_confirmations(chain, txid)?;
@@ -1656,10 +1688,8 @@ fn first_claim_withheld(
                 "claim withheld: funding has {confirmations} of the {locktime} confirmations \
              before the maker can refund"
             ))
-        } else if payment_failed() {
-            Some("claim withheld: outbound payment failed".into())
         } else {
-            None
+            hold(chain).map(|why| format!("claim withheld: {why}"))
         })
     });
     decision.unwrap_or_else(|e| {
@@ -1823,6 +1853,10 @@ mod tests {
         refuse: Option<&'static str>,
         /// Scripthashes and txids whose lookups get a server error.
         failing: Vec<String>,
+        /// When set, the tip broadcasts are checked against for BIP68: an
+        /// input with a block-based relative lock is refused until its
+        /// funding has that many confirmations in the next block.
+        csv_tip: Option<u64>,
     }
 
     impl Chain {
@@ -1874,8 +1908,28 @@ mod tests {
                         .any(|j| i.previous_output == j.previous_output)
                 })
             };
+            let immature = |tip: u64| {
+                tx.input.iter().any(|input| {
+                    let Some(bitcoin::relative::LockTime::Blocks(blocks)) =
+                        input.sequence.to_relative_lock_time()
+                    else {
+                        return false;
+                    };
+                    let mined = self
+                        .txs
+                        .iter()
+                        .find(|(k, _)| k.compute_txid() == input.previous_output.txid)
+                        .map(|(_, height)| *height)
+                        .filter(|height| *height > 0);
+                    blocks.value() > 0
+                        && mined.is_none_or(|height| {
+                            (tip + 1).saturating_sub(height) < blocks.value() as u64
+                        })
+                })
+            };
             let refusal = match self.refuse {
                 Some(reason) => Some(reason),
+                None if self.csv_tip.is_some_and(immature) => Some("non-BIP68-final"),
                 None if self.txs.iter().any(|(k, _)| k.compute_txid() == txid) => {
                     Some("txn-already-known")
                 }
@@ -4176,7 +4230,8 @@ mod tests {
     }
 
     /// A routed second hop is not checked against a payment under its hash:
-    /// its funded first claim goes out as before.
+    /// with its first hop funded and unspent, its funded first claim goes
+    /// out as before.
     #[test]
     fn funded_routed_claim_ignores_the_takers_own_payment_status() {
         let dir = tempfile::tempdir().unwrap();
@@ -4189,11 +4244,575 @@ mod tests {
         // nothing about maker 1's payment to maker 2.
         maker.fail_held_payment(hash).unwrap();
         chain.lock().unwrap().set(&swap.funding, Some(100));
+        let first = swap_out("unused:1");
+        chain.lock().unwrap().set(&first.funding, Some(100));
+        taker
+            .save_pending_swap(&format!("{}-in", swap.id), first_hop_record(&first))
+            .unwrap();
         taker
             .save_pending_swap(&format!("{}-out", swap.id), funded(&swap))
             .unwrap();
         taker.recover_lightning_swaps().unwrap();
         assert_eq!(spends(&chain, swap.outpoint), 1);
+    }
+
+    /// Hop 1's record as a routed swap leaves it: funded by us, and refunded
+    /// to us through its timelock.
+    fn first_hop_record(first: &SwapOut) -> LnPendingSwap {
+        LnPendingSwap {
+            is_swap_in: true,
+            resume: None,
+            ..funded(first)
+        }
+    }
+
+    /// A routed swap whose hop-2 funding is recorded and whose first claim
+    /// was never sent, as a withheld claim leaves it: no payout script. Hop
+    /// 1's funding is mined at 100, and its record saved when
+    /// `with_first_hop`; hop 2's funding is mined at `hop2`. Returns hop 1,
+    /// hop 2 and their keys.
+    fn unsent_route(
+        taker: &Taker,
+        chain: &Arc<Mutex<Chain>>,
+        with_first_hop: bool,
+        hop2: u64,
+    ) -> (SwapOut, SwapOut, String, String) {
+        let (first, second) = (swap_out("unused:1"), swap_out("unused:1"));
+        let (in_key, out_key) = (format!("{}-in", first.id), format!("{}-out", first.id));
+        chain.lock().unwrap().set(&first.funding, Some(100));
+        chain.lock().unwrap().set(&second.funding, Some(hop2));
+        if with_first_hop {
+            taker
+                .save_pending_swap(&in_key, first_hop_record(&first))
+                .unwrap();
+        }
+        taker.save_pending_swap(&out_key, funded(&second)).unwrap();
+        (first, second, in_key, out_key)
+    }
+
+    /// A confirmed spend of `outpoint` stands in for our refund of hop 1.
+    fn spending(outpoint: OutPoint) -> Transaction {
+        Transaction {
+            input: vec![TxIn {
+                previous_output: outpoint,
+                ..Default::default()
+            }],
+            ..funding_paying(ScriptBuf::from_bytes(vec![0x51]), AMOUNT)
+        }
+    }
+
+    /// The outcome a recovery pass reported for `key`.
+    fn outcome<'a>(outcomes: &'a [String], key: &str) -> &'a str {
+        let prefix = format!("{key}: ");
+        outcomes
+            .iter()
+            .find(|outcome| outcome.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("no outcome for {}: {:?}", key, outcomes))
+    }
+
+    /// Hop 1 is built as a routed swap builds it: maker 1 holds the hashlock
+    /// branch, we hold the refund branch with a CSV of hop 2's locktime plus
+    /// `ROUTED_HOP_TIMELOCK_MARGIN`, and the record keeps our refund key. The
+    /// mock refuses broadcasts that BIP68 would refuse.
+    ///
+    /// Recovery resumes hop 2's funding from maker 2 and records it; then a
+    /// reorg before the claim leaves it short of the agreed confirmations,
+    /// so the first claim is withheld and the record kept, funded, with no
+    /// payout script. Our refund of hop 1 is refused until its CSV allows the
+    /// next block, then accepted, and is mined in that block, while a deeper
+    /// reorg had put hop 2's funding back in the mempool; it is mined in the
+    /// same block, and two blocks later hop 2 is eligible for its first claim
+    /// again. A claim now would reveal the preimage after we were refunded,
+    /// and take maker 2's coins as well: none is sent, while hop 1's record
+    /// is still in the pass, once it is gone, or after a restart, no address
+    /// is taken, and hop 2's funded record and key are kept. Before, a funded
+    /// hop 2 skipped the first-hop checks.
+    #[test]
+    fn withheld_second_hop_claim_is_not_sent_after_first_hop_refund() {
+        use bitcoin::{
+            secp256k1::{Message, Secp256k1},
+            sighash::{EcdsaSighashType, SighashCache},
+            Sequence,
+        };
+        const FIRST_FUNDED: u64 = 96;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut taker, server, chain, second, parent) = resumed_swap_out(dir.path(), 3, 99, 101);
+        let (in_key, out_key) = (format!("{}-in", second.id), format!("{}-out", second.id));
+        taker.remove_pending_swap(&second.id).unwrap();
+        taker
+            .save_pending_swap(&out_key, second.record.clone())
+            .unwrap();
+
+        // Hop 1, as `routed_swap` records it, funded before maker 2 funded
+        // hop 2 at 99.
+        let (maker1_hashlock, _) = generate_keypair();
+        let (refund_pubkey, refund_key) = generate_keypair();
+        let in_locktime = second.record.locktime + ROUTED_HOP_TIMELOCK_MARGIN;
+        let preimage = Preimage(second.record.preimage.unwrap());
+        let htlc1 = SwapHtlc::new(
+            &maker1_hashlock,
+            &refund_pubkey,
+            &preimage.payment_hash(),
+            in_locktime,
+        );
+        let first_funding = funding_paying(htlc1.script_pubkey().unwrap(), AMOUNT);
+        let first = OutPoint::new(first_funding.compute_txid(), 0);
+        chain
+            .lock()
+            .unwrap()
+            .set(&first_funding, Some(FIRST_FUNDED));
+        taker
+            .save_pending_swap(
+                &in_key,
+                LnPendingSwap {
+                    is_swap_in: true,
+                    preimage: Some(preimage.0),
+                    redeemscript: htlc1.redeemscript().clone(),
+                    locktime: in_locktime,
+                    privkey: refund_key,
+                    outpoint: Some(first),
+                    value: Some(AMOUNT),
+                    payout_script: None,
+                    resume: None,
+                },
+            )
+            .unwrap();
+        // Our refund can be mined from this height on.
+        let refund_valid_from = FIRST_FUNDED + in_locktime as u64;
+        // The taker and the mock's BIP68 check both see `tip`.
+        fn at_tip(taker: &Taker, server: &MockElectrum, chain: &Mutex<Chain>, tip: u64) {
+            connect(taker, server, tip);
+            chain.lock().unwrap().csv_tip = Some(tip);
+        }
+        chain.lock().unwrap().csv_tip = Some(101);
+
+        let mut replacement = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        replacement.nonce += 1;
+        let reorg = {
+            let (server, funding) = (server.clone(), second.funding.clone());
+            move |chain: &mut Chain| {
+                chain.set(&funding, Some(100));
+                server.set_tip(101, &replacement);
+            }
+        };
+        chain
+            .lock()
+            .unwrap()
+            .after_tx_get
+            .push((parent, Box::new(reorg)));
+
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert!(chain.lock().unwrap().after_tx_get.is_empty());
+        assert_eq!(spends(&chain, second.outpoint), 0, "{:?}", outcomes);
+        assert!(
+            outcome(&outcomes, &out_key).contains("claim withheld: funding has 2 of the 3"),
+            "{:?}",
+            outcomes
+        );
+        assert_eq!(on_disk(dir.path(), &out_key), Some(funded(&second)));
+        // Hop 1 has 6 of its 78 blocks: our refund is refused.
+        assert!(
+            outcome(&outcomes, &in_key)
+                .contains(&format!("refund not yet mature (locktime {in_locktime})")),
+            "{:?}",
+            outcomes
+        );
+
+        // A deeper reorg returns hop 2's funding to the mempool. The block
+        // before our refund can be mined arrives: the refund is accepted, and
+        // hop 2's funding has no confirmations, so it is not claimed.
+        chain.lock().unwrap().set(&second.funding, Some(0));
+        at_tip(&taker, &server, &chain, refund_valid_from - 1);
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert_eq!(spends(&chain, second.outpoint), 0, "{:?}", outcomes);
+        assert!(
+            outcome(&outcomes, &out_key).contains("claim withheld: funding has 0 of the 3"),
+            "{:?}",
+            outcomes
+        );
+        assert!(
+            outcome(&outcomes, &in_key).contains("broadcast, awaiting confirmation"),
+            "{:?}",
+            outcomes
+        );
+        let refund = chain
+            .lock()
+            .unwrap()
+            .txs
+            .iter()
+            .find(|(tx, height)| *height == 0 && tx.input[0].previous_output == first)
+            .map(|(tx, _)| tx.clone())
+            .expect("refund accepted");
+
+        // The refund spends hop 1 through our timelock branch: an empty
+        // preimage selects it, its sequence satisfies the script's CSV, and
+        // it is signed by the refund key the script names, not maker 1's.
+        assert_eq!(refund.version, Version::TWO);
+        assert_eq!(refund.input.len(), 1);
+        assert_eq!(refund.input[0].previous_output, first);
+        let script = htlc1.redeemscript();
+        assert_eq!(
+            crate::protocol::contract::read_contract_locktime(script).unwrap(),
+            in_locktime
+        );
+        assert_eq!(refund.input[0].sequence, Sequence::from_height(in_locktime));
+        let witness: Vec<&[u8]> = refund.input[0].witness.iter().collect();
+        assert_eq!(witness.len(), 3);
+        assert!(witness[1].is_empty());
+        assert_eq!(witness[2], script.as_bytes());
+        let signature = bitcoin::ecdsa::Signature::from_slice(witness[0]).unwrap();
+        assert_eq!(signature.sighash_type, EcdsaSighashType::All);
+        let sighash = SighashCache::new(&refund)
+            .p2wsh_signature_hash(0, script, AMOUNT, EcdsaSighashType::All)
+            .unwrap();
+        let message = Message::from_digest(sighash.to_byte_array());
+        let secp = Secp256k1::verification_only();
+        assert!(secp
+            .verify_ecdsa(&message, &signature.signature, &refund_pubkey.inner)
+            .is_ok());
+        assert!(secp
+            .verify_ecdsa(&message, &signature.signature, &maker1_hashlock.inner)
+            .is_err());
+
+        // The next block mines the refund, the first it can be in, and hop
+        // 2's funding again; two blocks later hop 2 has the 3 confirmations
+        // agreed, inside its claim window (3 + 12 of its 30 blocks).
+        let mined = refund_valid_from;
+        assert!(mined >= FIRST_FUNDED + in_locktime as u64);
+        chain.lock().unwrap().set(&refund, Some(mined));
+        chain.lock().unwrap().set(&second.funding, Some(mined));
+        at_tip(&taker, &server, &chain, mined + 2);
+        let index = external_index(&taker);
+        for pass in ["hop 1 recorded at the start", "hop 1 record gone"] {
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            assert_eq!(
+                spends(&chain, second.outpoint),
+                0,
+                "{}: {:?}",
+                pass,
+                outcomes
+            );
+            // Withheld only after hop 2's own checks passed.
+            assert!(
+                outcome(&outcomes, &out_key).contains("claim withheld: first hop already resolved"),
+                "{}: {:?}",
+                pass,
+                outcomes
+            );
+            assert!(record(&taker, &in_key).is_none(), "{}", pass);
+            assert_eq!(record(&taker, &out_key), Some(funded(&second)), "{}", pass);
+            assert_eq!(
+                on_disk(dir.path(), &out_key),
+                Some(funded(&second)),
+                "{}",
+                pass
+            );
+            assert_eq!(external_index(&taker), index, "{}", pass);
+        }
+
+        // Restart from the wallet on disk.
+        drop(taker);
+        let wallet = Wallet::load_or_init(
+            &dir.path().join("wallet"),
+            AnyBlockchain::Electrum(
+                Electrum::new(&ElectrumConfig {
+                    url: server.url.clone(),
+                    max_retries: 0,
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            Some("test-password".into()),
+        )
+        .unwrap();
+        let mut taker = Taker::for_test(wallet, dir.path());
+        assert_eq!(record(&taker, &out_key), Some(funded(&second)));
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert_eq!(spends(&chain, second.outpoint), 0, "{:?}", outcomes);
+        assert!(
+            outcome(&outcomes, &out_key).contains("claim withheld: first hop already resolved"),
+            "{:?}",
+            outcomes
+        );
+        assert_eq!(on_disk(dir.path(), &out_key), Some(funded(&second)));
+        assert_eq!(external_index(&taker), index);
+    }
+
+    /// Hop 2's funding is recorded and its first claim never sent, and hop
+    /// 1's record is gone. That record goes once a spend of hop 1 confirms,
+    /// and while no claim has revealed the preimage, that spend is our
+    /// refund. The claim is withheld on every pass, with no new address,
+    /// and the funded record and its key are kept.
+    #[test]
+    fn unsent_second_hop_claim_without_its_first_hop_record_is_withheld() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let (mut taker, _server) = taker_with(dir.path(), &chain);
+        let (_, second, _, out_key) = unsent_route(&taker, &chain, false, 100);
+        let index = external_index(&taker);
+        for _ in 0..2 {
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            assert_eq!(spends(&chain, second.outpoint), 0, "{:?}", outcomes);
+            assert!(
+                outcome(&outcomes, &out_key).contains("claim withheld: first hop already resolved"),
+                "{:?}",
+                outcomes
+            );
+            assert_eq!(on_disk(dir.path(), &out_key), Some(funded(&second)));
+            assert_eq!(external_index(&taker), index);
+        }
+    }
+
+    /// One block before our refund of hop 1 can be mined, with hop 1 funded
+    /// and unspent, and hop 2's funding at the last block of its safety
+    /// margin: hop 2's first claim goes out.
+    #[test]
+    fn unsent_second_hop_is_claimed_while_first_hop_refund_is_immature() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let (mut taker, server) = taker_with(dir.path(), &chain);
+        let (_, second, _, out_key) = unsent_route(&taker, &chain, true, 111);
+        // Hop 1 has 29 of its 30 confirmations; hop 2 has 18.
+        connect(&taker, &server, 128);
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert_eq!(spends(&chain, second.outpoint), 1, "{:?}", outcomes);
+        assert!(
+            outcome(&outcomes, &out_key).contains("awaiting confirmation"),
+            "{:?}",
+            outcomes
+        );
+    }
+
+    /// Once our refund of hop 1 can be mined, recovery broadcasts it, and it
+    /// can confirm at any block. Hop 2's first claim would reveal the
+    /// preimage maker 1 needs too late for it to be repaid: it is withheld,
+    /// and the funded record kept.
+    #[test]
+    fn unsent_second_hop_claim_is_withheld_once_first_hop_refund_is_mature() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let (mut taker, server) = taker_with(dir.path(), &chain);
+        let (_, second, _, out_key) = unsent_route(&taker, &chain, true, 112);
+        // Hop 1 has its 30 confirmations; hop 2 has 18.
+        connect(&taker, &server, 129);
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert_eq!(spends(&chain, second.outpoint), 0, "{:?}", outcomes);
+        assert!(
+            outcome(&outcomes, &out_key).contains("claim withheld: first hop refund mature"),
+            "{:?}",
+            outcomes
+        );
+        assert_eq!(on_disk(dir.path(), &out_key), Some(funded(&second)));
+    }
+
+    /// A hop-2 claim saved before the pass may already have been sent, and
+    /// the preimage with it. It goes out again whatever hop 1's state, so a
+    /// claim of hop 1 by maker 1 cannot leave us without hop 2.
+    #[test]
+    fn possibly_sent_second_hop_claim_is_rebroadcast_whatever_first_hop_state() {
+        for case in ["no hop 1 record", "hop 1 refunded", "hop 1 refund mature"] {
+            let dir = tempfile::tempdir().unwrap();
+            let chain = Arc::new(Mutex::new(Chain::default()));
+            let (mut taker, server) = taker_with(dir.path(), &chain);
+            let (first, second, _, out_key) =
+                unsent_route(&taker, &chain, case != "no hop 1 record", 100);
+            let sent = LnPendingSwap {
+                payout_script: Some(ScriptBuf::from_bytes(vec![0x51])),
+                ..funded(&second)
+            };
+            taker.save_pending_swap(&out_key, sent).unwrap();
+            match case {
+                "hop 1 refunded" => chain
+                    .lock()
+                    .unwrap()
+                    .set(&spending(first.outpoint), Some(101)),
+                "hop 1 refund mature" => connect(&taker, &server, 129),
+                _ => {}
+            }
+            taker.recover_lightning_swaps().unwrap();
+            assert_eq!(spends(&chain, second.outpoint), 1, "{}", case);
+        }
+    }
+
+    /// Hop 2's first claim is withheld, and its funded record kept, while
+    /// hop 1's state is not settled from one view of the chain: hop 1's
+    /// history cannot be read; a block replaces the tip at the same height
+    /// while hop 1 is read; or hop 1 cannot be read at the final check, after
+    /// the first check passed. Once a stable view shows hop 1 funded, unspent
+    /// and its refund not yet valid, the claim goes out.
+    #[test]
+    fn unsent_second_hop_claim_is_withheld_while_first_hop_is_unknown() {
+        for case in [
+            "history unreadable",
+            "tip replaced",
+            "unreadable at the final check",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let chain = Arc::new(Mutex::new(Chain::default()));
+            let (mut taker, server) = taker_with(dir.path(), &chain);
+            let server = Arc::new(server);
+            let (first, second, _, out_key) = unsent_route(&taker, &chain, true, 100);
+            let first_txid = first.outpoint.txid;
+            let mut replacement =
+                bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+            replacement.nonce += 1;
+            let hook: AfterHistory = {
+                let server = server.clone();
+                match case {
+                    "tip replaced" => {
+                        Box::new(move |_: &mut Chain| server.set_tip(101, &replacement))
+                    }
+                    _ => Box::new(move |chain: &mut Chain| {
+                        chain.failing = vec![first_txid.to_string()]
+                    }),
+                }
+            };
+            {
+                let mut chain = chain.lock().unwrap();
+                match case {
+                    "history unreadable" => {
+                        chain.failing = vec![scripthash(&first.funding.output[0].script_pubkey)]
+                    }
+                    // Each check reads hop 2's funding once: the first
+                    // passes, the hook runs in the final one.
+                    "unreadable at the final check" => chain.after_tx_get.extend([
+                        (
+                            second.outpoint.txid,
+                            Box::new(|_: &mut Chain| {}) as AfterHistory,
+                        ),
+                        (second.outpoint.txid, hook),
+                    ]),
+                    _ => chain.after_tx_get.push((first_txid, hook)),
+                }
+            }
+
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            assert_eq!(
+                spends(&chain, second.outpoint),
+                0,
+                "{}: {:?}",
+                case,
+                outcomes
+            );
+            assert!(chain.lock().unwrap().after_tx_get.is_empty(), "{}", case);
+            assert!(
+                outcome(&outcomes, &out_key).contains("claim withheld"),
+                "{}: {:?}",
+                case,
+                outcomes
+            );
+            assert_eq!(
+                on_disk(dir.path(), &out_key),
+                Some(funded(&second)),
+                "{}",
+                case
+            );
+
+            chain.lock().unwrap().failing.clear();
+            connect(&taker, &server, 101);
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            assert_eq!(
+                spends(&chain, second.outpoint),
+                1,
+                "{}: {:?}",
+                case,
+                outcomes
+            );
+        }
+    }
+
+    /// The tip cannot be read after hop 1 was, so hop 1's state is not known
+    /// to come from one chain: the first-claim check withholds hop 2's claim.
+    /// Checked at the gate: a recovery pass keeps retrying its closing sync
+    /// while the tip stays unreadable.
+    #[test]
+    fn unsent_second_hop_claim_is_withheld_when_the_tip_is_lost_after_first_hop() {
+        const TIP: &str = "blockchain.headers.subscribe";
+        for case in ["stable", "tip lost"] {
+            let dir = tempfile::tempdir().unwrap();
+            let chain = Arc::new(Mutex::new(Chain::default()));
+            let (taker, server) = taker_with(dir.path(), &chain);
+            let server = Arc::new(server);
+            let (first, second, in_key, out_key) = unsent_route(&taker, &chain, true, 100);
+            if case == "tip lost" {
+                let server = server.clone();
+                chain.lock().unwrap().after_tx_get.push((
+                    first.outpoint.txid,
+                    Box::new(move |_: &mut Chain| server.drop_requests_for(Some(TIP))),
+                ));
+            }
+            let records = [
+                (in_key, first_hop_record(&first)),
+                (out_key.clone(), funded(&second)),
+            ];
+            let withheld = first_claim_withheld(
+                &taker.read_wallet().unwrap().blockchain,
+                second.record.resume.as_ref().unwrap(),
+                second.record.locktime,
+                &second.outpoint.txid,
+                |chain| {
+                    let first_hop = |hop: &LnPendingSwap| first_hop_state(chain, hop).ok();
+                    first_hop_hold(&out_key, &records, first_hop).map(|(why, _)| why)
+                },
+            );
+            server.drop_requests_for(None);
+            // Hop 1 was read in both cases.
+            assert!(chain.lock().unwrap().after_tx_get.is_empty(), "{}", case);
+            match case {
+                "stable" => assert_eq!(withheld, None),
+                _ => assert!(
+                    withheld
+                        .as_deref()
+                        .is_some_and(|why| why.starts_with("claim withheld")),
+                    "{:?}",
+                    withheld
+                ),
+            }
+        }
+    }
+
+    /// Records are visited in no fixed order. Our refund of hop 1 has
+    /// confirmed and its record is still here when the pass starts: hop 2's
+    /// first claim is withheld whether hop 1 is visited first, and its
+    /// record dropped, or after hop 2.
+    #[test]
+    fn unsent_second_hop_claim_does_not_depend_on_record_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let (mut taker, _server) = taker_with(dir.path(), &chain);
+        let (first, second, in_key, out_key) = unsent_route(&taker, &chain, true, 100);
+        chain
+            .lock()
+            .unwrap()
+            .set(&spending(first.outpoint), Some(101));
+        let records = [
+            (in_key.clone(), first_hop_record(&first)),
+            (out_key.clone(), funded(&second)),
+        ];
+        let (mut hop1_first, mut hop2_first) = (false, false);
+        for _ in 0..64 {
+            // A new map, with its own iteration order.
+            taker.write_wallet().unwrap().store.ln_pending_swaps =
+                records.iter().cloned().collect();
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            assert_eq!(spends(&chain, second.outpoint), 0, "{:?}", outcomes);
+            assert!(
+                outcome(&outcomes, &out_key).contains("claim withheld: first hop already resolved"),
+                "{:?}",
+                outcomes
+            );
+            assert_eq!(record(&taker, &out_key), Some(funded(&second)));
+            assert!(record(&taker, &in_key).is_none());
+            if outcomes[0].starts_with(&format!("{in_key}: ")) {
+                hop1_first = true;
+            } else {
+                hop2_first = true;
+            }
+            if hop1_first && hop2_first {
+                break;
+            }
+        }
+        assert!(hop1_first && hop2_first);
     }
 
     /// A first claim is withheld after this pass saved its payout script,

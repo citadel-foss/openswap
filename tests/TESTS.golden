@@ -232,6 +232,7 @@ openswap taker::lightning_swap::tests::lost_funding_reply_is_resumed_and_claimed
 openswap taker::lightning_swap::tests::mature_first_hop_refund_stops_second_hop_resume
 openswap taker::lightning_swap::tests::newly_resumed_first_claim_rechecks_payment_after_preparation
 openswap taker::lightning_swap::tests::oversized_amounts_are_rejected_not_wrapped
+openswap taker::lightning_swap::tests::possibly_sent_second_hop_claim_is_rebroadcast_whatever_first_hop_state
 openswap taker::lightning_swap::tests::recovery_pass_without_a_tip_does_nothing
 openswap taker::lightning_swap::tests::refused_payment_drops_the_swap_record_only_when_nothing_was_sent
 openswap taker::lightning_swap::tests::resolved_first_hop_drops_second_hop_without_asking_the_maker
@@ -248,6 +249,13 @@ openswap taker::lightning_swap::tests::swap_in_records_keep_their_recovery_behav
 openswap taker::lightning_swap::tests::unavailable_direct_payment_history_does_not_withhold_a_first_claim
 openswap taker::lightning_swap::tests::unfunded_records_are_dropped_only_when_nothing_was_funded
 openswap taker::lightning_swap::tests::unsaved_payout_script_broadcasts_nothing
+openswap taker::lightning_swap::tests::unsent_second_hop_claim_does_not_depend_on_record_order
+openswap taker::lightning_swap::tests::unsent_second_hop_claim_is_withheld_once_first_hop_refund_is_mature
+openswap taker::lightning_swap::tests::unsent_second_hop_claim_is_withheld_when_the_tip_is_lost_after_first_hop
+openswap taker::lightning_swap::tests::unsent_second_hop_claim_is_withheld_while_first_hop_is_unknown
+openswap taker::lightning_swap::tests::unsent_second_hop_claim_without_its_first_hop_record_is_withheld
+openswap taker::lightning_swap::tests::unsent_second_hop_is_claimed_while_first_hop_refund_is_immature
+openswap taker::lightning_swap::tests::withheld_second_hop_claim_is_not_sent_after_first_hop_refund
 openswap taker::offers::tests::a_ban_is_never_pruned_or_polled
 openswap taker::offers::tests::a_ban_is_terminal_and_persists
 openswap taker::offers::tests::a_ban_is_visible_by_address_wherever_it_sits
