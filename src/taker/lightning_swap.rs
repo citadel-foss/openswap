@@ -871,7 +871,7 @@ impl Taker {
         // have settled with the preimage, so a claim that is evicted or
         // reorged out must still be rebuilt. `recover_lightning_swaps` drops
         // it once the spend is confirmed.
-        let _ = self.write_wallet()?.sync_and_save(&Default::default());
+        self.sync_wallet_once()?;
         Ok(LnSwapReport {
             swap_id,
             maker: conn.address,
@@ -1121,7 +1121,7 @@ impl Taker {
         // Hop 1 needs nothing more from us: maker 1 sweeps it with the
         // preimage our claim publishes.
         self.remove_pending_swap(&in_key)?;
-        let _ = self.write_wallet()?.sync_and_save(&Default::default());
+        self.sync_wallet_once()?;
 
         Ok(LnRoutedSwapReport {
             swap_id,
@@ -1305,7 +1305,7 @@ impl Taker {
                 Err(e) => outcomes.push(format!("{swap_id}: spend status unknown: {e:?}")),
             }
         }
-        let _ = self.write_wallet()?.sync_and_save(&Default::default());
+        self.sync_wallet_once()?;
         Ok(outcomes)
     }
 
@@ -3598,6 +3598,60 @@ mod tests {
         connect(&taker, &server, 129);
         taker.recover_lightning_swaps().unwrap();
         assert_eq!(spends(second.outpoint), 1);
+    }
+
+    /// The backend goes down during a recovery pass, after the record's
+    /// spend check read the HTLC's history. The wallet sync that ends the
+    /// pass is best-effort: the pass returns its outcomes, the record is
+    /// kept, and the wallet is not left locked. Before, the sync retried
+    /// until the backend came back, holding the wallet's write lock.
+    #[test]
+    fn recovery_returns_when_the_backend_is_down_at_the_final_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let swap = swap_out("unused:1");
+        chain.lock().unwrap().set(&swap.funding, Some(100));
+        let (mut taker, server) = taker_with(dir.path(), &chain);
+        let server = Arc::new(server);
+        // A claim that may have been sent is broadcast again without the
+        // first-claim checks; the spend check after it is the pass's last
+        // chain read for the record.
+        let sent = LnPendingSwap {
+            payout_script: Some(ScriptBuf::from_bytes(vec![0x51])),
+            ..funded(&swap)
+        };
+        taker.save_pending_swap(&swap.id, sent.clone()).unwrap();
+        let down = {
+            let server = server.clone();
+            move |_: &mut Chain| server.set_down(true)
+        };
+        chain.lock().unwrap().after_history = Some((
+            scripthash(&swap.funding.output[0].script_pubkey),
+            Box::new(down),
+        ));
+        let wallet = taker.wallet.clone();
+
+        let (done, returned) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcomes = taker.recover_lightning_swaps();
+            let _ = done.send(outcomes.map_err(|e| format!("{e:?}")));
+        });
+        let outcomes = returned
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the recovery pass did not return")
+            .unwrap();
+
+        assert!(chain.lock().unwrap().after_history.is_none());
+        assert_eq!(spends(&chain, swap.outpoint), 1, "{:?}", outcomes);
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| o.starts_with(&format!("{}: spend status unknown", swap.id))),
+            "{:?}",
+            outcomes
+        );
+        assert!(wallet.try_write().is_ok(), "the wallet is still locked");
+        assert_eq!(on_disk(dir.path(), &swap.id), Some(sent));
     }
 
     /// The save that records a new payout script fails after the address

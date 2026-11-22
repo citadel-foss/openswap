@@ -234,6 +234,7 @@ openswap taker::lightning_swap::tests::newly_resumed_first_claim_rechecks_paymen
 openswap taker::lightning_swap::tests::oversized_amounts_are_rejected_not_wrapped
 openswap taker::lightning_swap::tests::possibly_sent_second_hop_claim_is_rebroadcast_whatever_first_hop_state
 openswap taker::lightning_swap::tests::recovery_pass_without_a_tip_does_nothing
+openswap taker::lightning_swap::tests::recovery_returns_when_the_backend_is_down_at_the_final_sync
 openswap taker::lightning_swap::tests::refused_payment_drops_the_swap_record_only_when_nothing_was_sent
 openswap taker::lightning_swap::tests::resolved_first_hop_drops_second_hop_without_asking_the_maker
 openswap taker::lightning_swap::tests::resumed_first_claim_is_withheld_when_the_final_lookup_fails

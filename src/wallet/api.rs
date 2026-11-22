@@ -4780,13 +4780,32 @@ impl Wallet {
         &mut self,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<(), WalletError> {
+        self.sync_and_save_with(shutdown, Self::sync_no_fail)
+    }
+
+    /// [`Self::sync_and_save`] with one sync attempt instead of retrying
+    /// until one succeeds: for callers that treat the sync as best-effort
+    /// and must not wait on a backend that stays down. A failed sync returns
+    /// its error before the save.
+    pub(crate) fn sync_and_save_once(
+        &mut self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), WalletError> {
+        self.sync_and_save_with(shutdown, Self::sync)
+    }
+
+    fn sync_and_save_with(
+        &mut self,
+        shutdown: &std::sync::atomic::AtomicBool,
+        sync: fn(&mut Self, &std::sync::atomic::AtomicBool) -> Result<(), WalletError>,
+    ) -> Result<(), WalletError> {
         log::info!("Sync Started for {:?}", self.store.file_name);
-        self.sync_no_fail(shutdown)?;
+        sync(self, shutdown)?;
         // A seed carries no bond records. Rebuild them, then rescan from the
         // birthday so Core finds their coins.
         if self.store.pending_restore.is_some() && self.recover_fidelity_bonds()? {
             self.store.last_synced_height = None;
-            self.sync_no_fail(shutdown)?;
+            sync(self, shutdown)?;
         }
         self.store.pending_restore = None;
         self.save_to_disk()?;

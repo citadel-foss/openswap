@@ -683,6 +683,18 @@ impl Taker {
             .map_err(|_| TakerError::General("Failed to lock wallet".to_string()))
     }
 
+    /// A best-effort sync and save: one attempt, stopped by this taker's
+    /// shutdown, so a backend that stays down neither keeps the wallet
+    /// write-locked nor blocks shutdown. A failure is logged; the next sync
+    /// catches up.
+    pub(crate) fn sync_wallet_once(&self) -> Result<(), TakerError> {
+        let synced = self.write_wallet()?.sync_and_save_once(&self.shutdown);
+        if let Err(e) = synced {
+            log::warn!("Wallet sync failed; the next sync catches up: {e:?}");
+        }
+        Ok(())
+    }
+
     /// What a hop may forward once the policy funding fee for `input_counts`
     /// comes off. The swap fee and sweep price are already inside
     /// `forwardable`, so this is an exact figure, not a minimum.
