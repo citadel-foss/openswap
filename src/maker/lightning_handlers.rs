@@ -1094,6 +1094,7 @@ fn watchdog_finish_sweep<M: Maker>(
     // preimage is our sweep.
     let pending = match maker.htlc_pending_spend(&outpoint, &spk) {
         Ok(Some(tx)) if swap.htlc.extract_preimage(&tx).is_some() => Some(tx),
+        Ok(None) => None,
         other => {
             // The taker's refund is racing the sweep, or the lookup failed:
             // resend the recorded sweep, as before, and bump nothing.
