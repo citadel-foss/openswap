@@ -885,13 +885,21 @@ fn watchdog_contests_a_taker_refund_of_a_swept_swap_in(
 /// Replacing the refund evicts that child too, so the sweep pays both
 /// their fees plus the replacement step.
 #[world_test(
-    backend = BitcoindBackend,
-    bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone()],
+    bind = [ln = maker_node()],
     maker_behaviors = [Normal],
     takers = [Normal],
     maker_lightning = [ln.clone()],
+    cases = [
+        watchdog_outbids_a_taker_refund_and_its_child(backend = BitcoindBackend),
+        /// Same on Electrum, where the family is read from the server's
+        /// script histories.
+        watchdog_outbids_a_taker_refund_and_its_child_on_electrum(backend = ElectrumBackend),
+    ],
 )]
-fn watchdog_outbids_a_taker_refund_and_its_child(world: &mut World, ln: Arc<MockLightningBackend>) {
+fn run_watchdog_outbids_a_taker_refund_and_its_child(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
     let _ = &ln;
     let framework = world.framework().clone();
     let bitcoind = &framework.bitcoind;
@@ -904,20 +912,23 @@ fn watchdog_outbids_a_taker_refund_and_its_child(world: &mut World, ln: Arc<Mock
     let refund = broadcast_taker_refund(bitcoind, &swap, funding);
     let child = spend_with_fee(bitcoind, refund, Amount::from_sat(1_500));
 
-    ln_watchdog_tick_now(&maker);
+    // An Electrum server sees new mempool transactions shortly after the
+    // node does, so the watchdog may take a few passes.
+    let gone = |txid: &Txid| bitcoind.client.get_mempool_entry(txid).is_err();
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(500),
+        "the sweep to replace the taker's refund and its child",
+        {
+            ln_watchdog_tick_now(&maker);
+            gone(&refund) && gone(&child)
+        }
+    );
     assert_eq!(
         mempool_spend_fee(bitcoind, funding, swap.amount + swap.fee),
         Amount::from_sat(1_950),
-        "the sweep must pay the refund's 300 sats and the child's 1,500 plus the 1 sat/vB step, \
-         13 sat/vB for 150 vB"
+        "the sweep must pay the refund's 300 sats and the child's 1,500 plus the 1 sat/vB step,          13 sat/vB for 150 vB"
     );
-    for (txid, what) in [(refund, "the taker's refund"), (child, "its child")] {
-        assert!(
-            bitcoind.client.get_mempool_entry(&txid).is_err(),
-            "{} must be out of the mempool",
-            what
-        );
-    }
 
     framework.set_block_gen_paused(false);
     maker.shutdown.store(true, Relaxed);

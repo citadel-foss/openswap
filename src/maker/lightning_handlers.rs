@@ -1098,11 +1098,19 @@ fn watchdog_finish_sweep<M: Maker>(
         Ok(Some(refund)) => {
             // The taker's refund is racing the sweep. The invoice is already
             // paid, so the sweep outbids it.
-            let to_beat = maker
-                .mempool_package_fee(&refund.compute_txid())
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| fee_paid(&refund, value));
+            let to_beat = match maker.mempool_package_fee(&refund.compute_txid()) {
+                Ok(Some(fee)) => fee,
+                // Gone since it was read: the next pass sees what replaced it.
+                Ok(None) => return Ok(()),
+                // Without what spends from the refund, a sweep could underpay
+                // and be rejected. The next pass asks again.
+                Err(e) => {
+                    log::warn!(
+                        "Swap-in {swap_id}: cannot read what the taker's refund pays: {e:?}"
+                    );
+                    return Ok(());
+                }
+            };
             let Some((sweep, rate)) = outbid_refund(
                 build,
                 value,

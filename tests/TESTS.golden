@@ -486,6 +486,7 @@ openswap wallet::blockchain::electrum::tests::not_subscribed_is_terminal
 openswap wallet::blockchain::electrum::tests::onion_without_proxy_is_rejected_before_connecting
 openswap wallet::blockchain::electrum::tests::only_the_unknown_txid_protocol_error_reads_as_absent
 openswap wallet::blockchain::electrum::tests::other_scripts_subscribe_while_one_is_refused
+openswap wallet::blockchain::electrum::tests::package_fee_adds_up_the_mempool_family
 openswap wallet::blockchain::electrum::tests::ping_cadence_follows_proxy
 openswap wallet::blockchain::electrum::tests::ping_cadence_override_wins
 openswap wallet::blockchain::electrum::tests::proxy_does_not_require_an_onion_url
@@ -789,6 +790,7 @@ openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_fun
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_payment_is_in_flight
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_without_payment_record_until_refunded
 openswap::integration lightning::maker_restart::watchdog_outbids_a_taker_refund_and_its_child
+openswap::integration lightning::maker_restart::watchdog_outbids_a_taker_refund_and_its_child_on_electrum
 openswap::integration lightning::maker_restart::watchdog_releases_swap_in_missing_funding_height
 openswap::integration lightning::offer_limits::maker_serves_only_the_direction_it_has_capacity_for
 openswap::integration lightning::routed::lightning_routed_swap_e2e

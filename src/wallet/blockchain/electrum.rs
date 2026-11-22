@@ -761,6 +761,104 @@ impl Electrum {
         self.spender_in(history, outpoint)
     }
 
+    /// Fees of mempool transaction `txid` and of every mempool transaction
+    /// spending from it, read from the server's current script histories:
+    /// what a replacement of `txid` has to pay above. A fee the server does
+    /// not report is worked out from the transaction's inputs. `None` when
+    /// `txid` is not in the mempool. A family larger than the node relays is
+    /// an error, so a partial sum is never taken for the whole.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn mempool_package_fee(
+        &self,
+        txid: &Txid,
+    ) -> Result<Option<bitcoin::Amount>, WalletError> {
+        // Bitcoin Core's default limit on a transaction's mempool family.
+        const MAX_FAMILY: usize = 25;
+        let mut total = bitcoin::Amount::ZERO;
+        let mut family = HashSet::from([*txid]);
+        let mut checked = HashSet::new();
+        let mut queue = vec![*txid];
+        while let Some(parent) = queue.pop() {
+            let tx = match self.transaction_get_live(&parent) {
+                Ok(tx) => tx,
+                Err(WalletError::Electrum(ref e)) if is_unknown_txid(e) && parent == *txid => {
+                    return Ok(None)
+                }
+                Err(e) => return Err(e),
+            };
+            let mut pending = false;
+            let mut reported = None;
+            for (vout, output) in tx.output.iter().enumerate() {
+                let spent = OutPoint::new(parent, vout as u32);
+                let history =
+                    self.call(GET_HISTORY, |c| c.script_get_history(&output.script_pubkey))?;
+                for entry in history {
+                    if entry.tx_hash == parent {
+                        pending |= entry.height <= 0;
+                        reported = reported.or(entry.fee);
+                        continue;
+                    }
+                    if entry.height > 0 || family.contains(&entry.tx_hash) {
+                        continue;
+                    }
+                    if !checked.insert((entry.tx_hash, spent)) {
+                        continue;
+                    }
+                    let candidate = self.transaction_get_live(&entry.tx_hash)?;
+                    if candidate
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output == spent)
+                    {
+                        if family.len() >= MAX_FAMILY {
+                            return Err(electrum_err(format!(
+                                "electrum: more than {MAX_FAMILY} transactions spend from {txid}"
+                            )));
+                        }
+                        family.insert(entry.tx_hash);
+                        queue.push(entry.tx_hash);
+                    }
+                }
+            }
+            if !pending {
+                if parent == *txid {
+                    return Ok(None);
+                }
+                return Err(electrum_err(format!(
+                    "electrum: {parent} spends from {txid} but is not in the mempool"
+                )));
+            }
+            let fee = match reported {
+                Some(sats) => bitcoin::Amount::from_sat(sats),
+                None => self.fee_from_inputs(&tx)?,
+            };
+            total += fee;
+        }
+        Ok(Some(total))
+    }
+
+    /// What `tx` pays in fees: its inputs' values, read from the transactions
+    /// they spend, less its outputs.
+    #[cfg(feature = "lightning")]
+    fn fee_from_inputs(&self, tx: &Transaction) -> Result<bitcoin::Amount, WalletError> {
+        let mut inputs = bitcoin::Amount::ZERO;
+        for input in &tx.input {
+            let prev = self.transaction_get_validating(&input.previous_output.txid)?;
+            let output = prev
+                .output
+                .get(input.previous_output.vout as usize)
+                .ok_or_else(|| electrum_err(format!("electrum: no {}", input.previous_output)))?;
+            inputs += output.value;
+        }
+        let outputs = tx.output.iter().map(|output| output.value).sum();
+        inputs.checked_sub(outputs).ok_or_else(|| {
+            electrum_err(format!(
+                "electrum: {} pays out more than it spends",
+                tx.compute_txid()
+            ))
+        })
+    }
+
     /// The transaction in `history` that spends `outpoint`. A transaction the
     /// server cannot serve leaves the answer unknown only if it could be the
     /// spend: the funding itself, and anything mined before it, cannot.
@@ -2937,6 +3035,63 @@ pub(crate) mod tests {
     /// A transaction paying the test script, made distinct by `n`.
     fn deposit(n: u8) -> Transaction {
         spend_of(OutPoint::new(Txid::from_byte_array([n; 32]), 0))
+    }
+
+    /// What replacing a mempool transaction has to beat: its fee and the
+    /// fees of everything spending from it. A fee the server reports is
+    /// taken as is; one it leaves out is the inputs' value less the outputs.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_adds_up_the_mempool_family() {
+        let pay = |outpoint, sats| {
+            let mut tx = spend_of(outpoint);
+            tx.output[0].value = Amount::from_sat(sats);
+            tx
+        };
+        let funding = deposit(1);
+        let refund = pay(OutPoint::new(funding.compute_txid(), 0), 700);
+        let child = pay(OutPoint::new(refund.compute_txid(), 0), 200);
+        let unrelated = deposit(9);
+        let entries = json!([
+            { "tx_hash": funding.compute_txid(), "height": 101 },
+            { "tx_hash": refund.compute_txid(), "height": 0, "fee": 300 },
+            { "tx_hash": child.compute_txid(), "height": -1 },
+            { "tx_hash": unrelated.compute_txid(), "height": 0, "fee": 50 },
+        ]);
+        let served: HashMap<String, String> = [&funding, &refund, &child, &unrelated]
+            .iter()
+            .map(|tx| (tx.compute_txid().to_string(), serialize_hex(*tx)))
+            .collect();
+        let server = mock_electrum(move |method, params| match method {
+            "blockchain.scripthash.get_history" => Ok(entries.clone()),
+            "blockchain.transaction.get" => served
+                .get(params[0].as_str().unwrap_or_default())
+                .map(|hex| json!(hex))
+                .ok_or_else(|| json!({ "code": 1, "message": "daemon error" })),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        // 300 reported for the refund, and 700 - 200 worked out for its child.
+        assert_eq!(
+            backend.mempool_package_fee(&refund.compute_txid()).unwrap(),
+            Some(Amount::from_sat(800))
+        );
+        assert_eq!(
+            backend.mempool_package_fee(&child.compute_txid()).unwrap(),
+            Some(Amount::from_sat(500))
+        );
+        // A confirmed transaction is not in the mempool.
+        assert_eq!(
+            backend
+                .mempool_package_fee(&funding.compute_txid())
+                .unwrap(),
+            None
+        );
     }
 
     /// A transaction the server cannot serve leaves the spend unknown only if

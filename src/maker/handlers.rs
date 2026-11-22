@@ -814,9 +814,9 @@ pub trait Maker: Send + Sync {
         Err(MakerError::General("lightning swaps not supported"))
     }
 
-    /// Fees of mempool transaction `txid` and everything the node knows
-    /// spends from it: what replacing `txid` has to pay above. `None` when
-    /// the backend cannot tell, as on Electrum.
+    /// Fees of mempool transaction `txid` and everything spending from it:
+    /// what replacing `txid` has to pay above. `None` when `txid` is not in
+    /// the mempool.
     #[cfg(feature = "lightning")]
     fn mempool_package_fee(&self, _txid: &bitcoin::Txid) -> Result<Option<Amount>, MakerError> {
         Err(MakerError::General("lightning swaps not supported"))

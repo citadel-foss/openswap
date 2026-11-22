@@ -4045,7 +4045,9 @@ impl MakerTrait for MakerServer {
             AnyBlockchain::CoreRPC(core) => {
                 core.mempool_package_fee(txid).map_err(MakerError::Wallet)
             }
-            AnyBlockchain::Electrum(_) => Ok(None),
+            AnyBlockchain::Electrum(electrum) => electrum
+                .mempool_package_fee(txid)
+                .map_err(MakerError::Wallet),
         }
     }
 
