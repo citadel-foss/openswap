@@ -382,6 +382,21 @@ impl CoreRPC {
         }
     }
 
+    /// Fees of mempool transaction `txid` and of every mempool descendant:
+    /// what a replacement of `txid` has to pay above. `None` when `txid` is
+    /// not in the mempool.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn mempool_package_fee(
+        &self,
+        txid: &Txid,
+    ) -> Result<Option<bitcoin::Amount>, WalletError> {
+        match self.rpc.get_mempool_entry(txid) {
+            Ok(entry) => Ok(Some(entry.fees.descendant)),
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -5 => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The mempool transaction spending `outpoint`.
     pub(crate) fn mempool_spending_transaction(
         &self,

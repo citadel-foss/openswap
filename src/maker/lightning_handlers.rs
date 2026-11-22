@@ -1068,7 +1068,7 @@ fn watchdog_finish_sweep<M: Maker>(
     // bumped once the market clears its rate and nothing spends its output;
     // with nothing pending, evicted or never sent, the sweep goes out again
     // at the market rate when that is higher. A spend that is not ours is
-    // the taker's refund racing the sweep, which this does not contest.
+    // the taker's refund racing the sweep, which the sweep outbids.
     let Some(preimage) = swap.preimage else {
         return Err(MakerError::General("swept swap without a preimage"));
     };
@@ -1095,13 +1095,49 @@ fn watchdog_finish_sweep<M: Maker>(
     let pending = match maker.htlc_pending_spend(&outpoint, &spk) {
         Ok(Some(tx)) if swap.htlc.extract_preimage(&tx).is_some() => Some(tx),
         Ok(None) => None,
-        other => {
-            // The taker's refund is racing the sweep, or the lookup failed:
-            // resend the recorded sweep, as before, and bump nothing.
-            match other {
-                Ok(_) => log::info!("Swap-in {swap_id}: a spend that is not our sweep is pending"),
-                Err(e) => log::debug!("Swap-in {swap_id}: pending spend lookup failed: {e:?}"),
+        Ok(Some(refund)) => {
+            // The taker's refund is racing the sweep. The invoice is already
+            // paid, so the sweep outbids it.
+            let to_beat = maker
+                .mempool_package_fee(&refund.compute_txid())
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| fee_paid(&refund, value));
+            let Some((sweep, rate)) = outbid_refund(
+                build,
+                value,
+                built_at.max(maker.htlc_spend_feerate()),
+                maker.htlc_replacement_increment(),
+                &refund,
+                to_beat,
+            )?
+            else {
+                log::warn!(
+                    "Swap-in {swap_id}: the HTLC cannot pay enough to replace the taker's \
+                     refund {}, which pays {to_beat}",
+                    refund.compute_txid()
+                );
+                return Ok(());
+            };
+            if rate > built_at {
+                let mut next = swap.clone();
+                next.sweep_feerate = Some(rate);
+                if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::InSwept, next)? {
+                    return Ok(());
+                }
             }
+            log::info!(
+                "Swap-in {swap_id}: contesting the taker's refund {} at {rate} sat/vB",
+                refund.compute_txid()
+            );
+            if let Err(e) = maker.broadcast_transaction(&sweep) {
+                log::warn!("Swap-in {swap_id}: sweep did not replace the taker's refund: {e:?}");
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            // Resend the recorded sweep and bump nothing until a lookup works.
+            log::debug!("Swap-in {swap_id}: pending spend lookup failed: {e:?}");
             if let Err(e) = maker.broadcast_transaction(&build(built_at)?) {
                 log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}");
             }
@@ -1997,6 +2033,31 @@ fn fee_paid(tx: &bitcoin::Transaction, value: Amount) -> Amount {
         .unwrap_or(Amount::ZERO)
 }
 
+/// The sweep that replaces `refund`, the taker's pending refund, with its
+/// rate. It pays `to_beat`, the fee of the refund and anything spending from
+/// it, plus the replacement step for [`SPEND_TX_VSIZE`]. It also pays more per
+/// vbyte than the refund by that step, since a replacement must, and the
+/// sweep is the larger of the two. It never goes below `floor_rate`. `None`
+/// when the HTLC cannot pay that much and the dust fallback would undo it.
+fn outbid_refund(
+    build: impl Fn(f64) -> Result<bitcoin::Transaction, MakerError>,
+    value: Amount,
+    floor_rate: f64,
+    increment: f64,
+    refund: &bitcoin::Transaction,
+    to_beat: Amount,
+) -> Result<Option<(bitcoin::Transaction, f64)>, MakerError> {
+    let refund_rate = fee_paid(refund, value).to_sat() as f64 / refund.vsize() as f64;
+    let rate = floor_rate
+        .max(to_beat.to_sat() as f64 / SPEND_TX_VSIZE as f64 + increment)
+        .max(refund_rate + increment);
+    let sweep = build(rate)?;
+    if fee_paid(&sweep, value) <= to_beat {
+        return Ok(None);
+    }
+    Ok(Some((sweep, rate)))
+}
+
 /// What the watchdog sends for an unconfirmed HTLC spend of ours.
 #[derive(Debug, PartialEq)]
 enum PlannedSpend {
@@ -2500,6 +2561,94 @@ mod tests {
             )
             .unwrap(),
             PlannedSpend::Resend(floor)
+        );
+    }
+
+    fn sweep_at(swap: &LnMakerSwap, value: Amount, rate: f64) -> bitcoin::Transaction {
+        let (outpoint, _) = swap.funding.unwrap();
+        let p2wpkh = ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x07; 20]].concat());
+        swap.htlc
+            .create_hashlock_spend(
+                outpoint,
+                value,
+                &swap.privkey,
+                &swap.preimage.unwrap(),
+                p2wpkh,
+                rate,
+            )
+            .unwrap()
+    }
+
+    /// The node takes a replacement only if it pays the fees it evicts plus
+    /// the incremental relay fee for its own size, and pays more per vbyte
+    /// than the transaction it conflicts with.
+    fn replaces(
+        sweep: &bitcoin::Transaction,
+        refund: &bitcoin::Transaction,
+        value: Amount,
+        to_beat: Amount,
+    ) -> bool {
+        let feerate =
+            |tx: &bitcoin::Transaction| fee_paid(tx, value).to_sat() as f64 / tx.vsize() as f64;
+        fee_paid(sweep, value).to_sat() >= to_beat.to_sat() + sweep.vsize() as u64
+            && feerate(sweep) > feerate(refund)
+    }
+
+    #[test]
+    fn a_taker_refund_is_outbid_by_fee_and_by_feerate() {
+        let swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InSwept);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(sweep_at(&swap, value, rate));
+        // At the floor, at a high rate where the larger sweep would lose on
+        // feerate with only the fee step, and with a child of the refund
+        // paying 1500 sat.
+        for (refund_rate, child_fee) in [(2.0, 0), (40.0, 0), (2.0, 1_500)] {
+            let refund = refund_at(&swap, value, refund_rate);
+            let to_beat = fee_paid(&refund, value) + Amount::from_sat(child_fee);
+            let (sweep, rate) = outbid_refund(build, value, refund_rate, 1.0, &refund, to_beat)
+                .unwrap()
+                .expect("the HTLC can pay to outbid this refund");
+            assert!(
+                replaces(&sweep, &refund, value, to_beat),
+                "{:?}",
+                (refund_rate, child_fee, rate, sweep.vsize(), refund.vsize())
+            );
+            assert_eq!(sweep, sweep_at(&swap, value, rate));
+        }
+        // The sweep carries the preimage, so it is the larger spend, and at
+        // 40 sat/vB the fee step alone loses on feerate.
+        let floor = SPEND_FEE_RATE_FLOOR;
+        assert!(sweep_at(&swap, value, floor).vsize() > refund_at(&swap, value, floor).vsize());
+        let refund = refund_at(&swap, value, 40.0);
+        let to_beat = fee_paid(&refund, value);
+        assert!(!replaces(
+            &sweep_at(&swap, value, 41.0),
+            &refund,
+            value,
+            to_beat
+        ));
+        // The market rate is a floor of its own.
+        let refund = refund_at(&swap, value, 2.0);
+        let (_, rate) = outbid_refund(build, value, 30.0, 1.0, &refund, fee_paid(&refund, value))
+            .unwrap()
+            .unwrap();
+        assert_eq!(rate, 30.0);
+    }
+
+    #[test]
+    fn a_refund_the_htlc_cannot_outbid_is_left_alone() {
+        let swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InSwept);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(sweep_at(&swap, value, rate));
+        let refund = refund_at(&swap, value, SPEND_FEE_RATE_FLOOR);
+        // A child paying most of the HTLC: the rate that beats it would
+        // leave dust, and the floor fallback pays less than the refund.
+        // Beating 39,600 sat takes 39,750, more than the 39,706 that keeps
+        // the output above dust.
+        let to_beat = Amount::from_sat(39_600);
+        assert_eq!(
+            outbid_refund(build, value, SPEND_FEE_RATE_FLOOR, 1.0, &refund, to_beat).unwrap(),
+            None
         );
     }
 

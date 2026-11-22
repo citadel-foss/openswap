@@ -109,7 +109,9 @@ openswap maker::lightning_handlers::tests::a_draining_maker_refuses_new_lightnin
 openswap maker::lightning_handlers::tests::a_pending_spend_is_bumped_past_the_step_while_its_output_is_unspent
 openswap maker::lightning_handlers::tests::a_pending_spend_is_read_by_its_fee_not_by_the_record
 openswap maker::lightning_handlers::tests::a_rate_the_dust_fallback_undoes_is_not_sent
+openswap maker::lightning_handlers::tests::a_refund_the_htlc_cannot_outbid_is_left_alone
 openswap maker::lightning_handlers::tests::a_refund_this_swap_replaced_is_still_ours
+openswap maker::lightning_handlers::tests::a_taker_refund_is_outbid_by_fee_and_by_feerate
 openswap maker::lightning_handlers::tests::compat_lightning_pins_require_exact_direction_and_requirements
 openswap maker::lightning_handlers::tests::directions_are_bounded_by_opposite_channel_sides
 openswap maker::lightning_handlers::tests::nothing_pending_goes_out_at_the_market_rate_never_below_the_record
@@ -779,11 +781,14 @@ openswap::integration lightning::maker_restart::swap_in_request_checks_terms_and
 openswap::integration lightning::maker_restart::swap_in_request_fails_when_payment_record_lookup_fails
 openswap::integration lightning::maker_restart::swap_in_request_refuses_payment_hash_already_on_record
 openswap::integration lightning::maker_restart::swap_in_sweep_is_bumped_once_the_market_rises
+openswap::integration lightning::maker_restart::swap_in_sweep_keeps_its_rate_across_a_restart
 openswap::integration lightning::maker_restart::swap_in_sweep_never_sent_goes_out_at_the_market_rate
 openswap::integration lightning::maker_restart::switch_resets_on_panic
+openswap::integration lightning::maker_restart::watchdog_contests_a_taker_refund_of_a_swept_swap_in
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_funding_height_is_unknown
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_payment_is_in_flight
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_without_payment_record_until_refunded
+openswap::integration lightning::maker_restart::watchdog_outbids_a_taker_refund_and_its_child
 openswap::integration lightning::maker_restart::watchdog_releases_swap_in_missing_funding_height
 openswap::integration lightning::offer_limits::maker_serves_only_the_direction_it_has_capacity_for
 openswap::integration lightning::routed::lightning_routed_swap_e2e

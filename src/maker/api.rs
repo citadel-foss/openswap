@@ -4035,6 +4035,21 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn mempool_package_fee(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Result<Option<bitcoin::Amount>, MakerError> {
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        match &wallet.blockchain {
+            AnyBlockchain::CoreRPC(core) => {
+                core.mempool_package_fee(txid).map_err(MakerError::Wallet)
+            }
+            AnyBlockchain::Electrum(_) => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "lightning")]
     fn is_output_unspent(&self, outpoint: &bitcoin::OutPoint) -> Result<bool, MakerError> {
         use crate::wallet::Blockchain;
         Ok(lock_debug!(self.wallet.read())

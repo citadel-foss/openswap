@@ -8,6 +8,7 @@
 //! maker has funded the on-chain HTLC.
 
 use std::{
+    collections::HashMap,
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
@@ -18,7 +19,13 @@ use bitcoin::{
     secp256k1::{Secp256k1, SecretKey},
     Amount, Network, OutPoint, PublicKey, Txid,
 };
-use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
+use bitcoind::{
+    bitcoincore_rpc::{
+        json::{CreateRawTransactionInput, SignRawTransactionInput},
+        RpcApi,
+    },
+    BitcoinD,
+};
 use openswap::{
     lightning::{
         invoice::verify_invoice, swap::SPEND_FEE_RATE_FLOOR, InvoiceParams, LightningBackend,
@@ -743,6 +750,248 @@ fn swap_in_sweep_never_sent_goes_out_at_the_market_rate(
     framework.set_block_gen_paused(false);
     maker.shutdown.store(true, Relaxed);
     maker.watch_service.shutdown();
+}
+
+/// A swept swap-in whose sweep was saved at 20 sat/vB keeps that rate
+/// through a restart. The sweep is not in the mempool, as after an
+/// eviction, and the market falls to 5 sat/vB while the maker is down: the
+/// restarted maker sends it at 20 sat/vB, not at the market rate or the
+/// 2 sat/vB floor a lost record would read as.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+)]
+fn swap_in_sweep_keeps_its_rate_across_a_restart(world: &mut World, ln: Arc<MockLightningBackend>) {
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+    let market = SpendFeerate::set(20.0);
+
+    let preimage = Preimage([0xb3; 32]);
+    let id = preimage.payment_hash().to_string();
+    let swap = accepted_swap_in(&preimage);
+    let funding = fund_htlc(bitcoind, &swap);
+    generate_blocks(bitcoind, 1);
+    let mut swept = paid_without_height(&swap, funding);
+    swept.funding_height = Some(confirmation_height(bitcoind, &funding.txid) as u32);
+    swept.phase = LnMakerPhase::InSwept;
+    swept.preimage = Some(preimage);
+    swept.sweep_feerate = Some(20.0);
+    maker.store_ln_swap(&id, swept).unwrap();
+
+    let mut config = maker.config.clone();
+    config.password = Some("integration-test".to_string());
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+    drop(maker);
+    world.drop_makers();
+    let mut restarted = MakerServer::init(config).expect("maker restarts");
+    restarted.set_lightning_backend(ln.clone() as Arc<dyn LightningBackend>);
+    world.adopt_makers([Arc::new(restarted)]);
+    let maker = world.makers()[0].inner().clone();
+    assert_eq!(
+        maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate,
+        Some(20.0),
+        "the saved sweep rate must survive the reload"
+    );
+
+    market.set_rate(5.0);
+    ln_watchdog_tick_now(&maker);
+    let value = swap.amount + swap.fee;
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(3_000),
+        "the sweep must keep the 20 sat/vB it was built at, not the 5 sat/vB market"
+    );
+    assert_eq!(
+        maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate,
+        Some(20.0)
+    );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
+/// The taker's refund of a swept swap-in can reach the mempool first. The
+/// invoice is already paid, so the watchdog contests it: the sweep pays
+/// what the refund pays plus the replacement step, at a higher feerate than
+/// the refund's own. Here the market sits at the same 2 sat/vB floor the
+/// refund pays, where a sweep at the market rate would only tie it and be
+/// rejected.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+)]
+fn watchdog_contests_a_taker_refund_of_a_swept_swap_in(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    let _ = &ln;
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+    let _market = SpendFeerate::set(SPEND_FEE_RATE_FLOOR);
+
+    let preimage = Preimage([0xb4; 32]);
+    let id = preimage.payment_hash().to_string();
+    let (swap, funding) = swept_past_its_refund_window(bitcoind, &maker, &preimage);
+    let refund = broadcast_taker_refund(bitcoind, &swap, funding);
+    let value = swap.amount + swap.fee;
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(300)
+    );
+
+    // The refund is smaller than the 150 vB the sweep is priced for, so its
+    // own feerate, plus the 1 sat/vB step, sets the rate.
+    let refund_vsize = bitcoind.client.get_mempool_entry(&refund).unwrap().vsize;
+    let rate = (300.0 / refund_vsize as f64 + 1.0).max(3.0);
+    let fee = Amount::from_sat((rate * 150.0).ceil() as u64);
+
+    ln_watchdog_tick_now(&maker);
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        fee,
+        "the sweep must outbid the refund's 300 sats by fee and by feerate"
+    );
+    assert!(
+        bitcoind.client.get_mempool_entry(&refund).is_err(),
+        "the taker's refund must be out of the mempool"
+    );
+    assert_eq!(
+        maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate,
+        Some(rate),
+        "the contested rate must be recorded"
+    );
+    // The pending spend is now our sweep: the next pass resends it.
+    ln_watchdog_tick_now(&maker);
+    assert_eq!(mempool_spend_fee(bitcoind, funding, value), fee);
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
+/// The same contest with a transaction spending the taker's refund.
+/// Replacing the refund evicts that child too, so the sweep pays both
+/// their fees plus the replacement step.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+)]
+fn watchdog_outbids_a_taker_refund_and_its_child(world: &mut World, ln: Arc<MockLightningBackend>) {
+    let _ = &ln;
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+    let _market = SpendFeerate::set(SPEND_FEE_RATE_FLOOR);
+
+    let preimage = Preimage([0xb5; 32]);
+    let (swap, funding) = swept_past_its_refund_window(bitcoind, &maker, &preimage);
+    let refund = broadcast_taker_refund(bitcoind, &swap, funding);
+    let child = spend_with_fee(bitcoind, refund, Amount::from_sat(1_500));
+
+    ln_watchdog_tick_now(&maker);
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, swap.amount + swap.fee),
+        Amount::from_sat(1_950),
+        "the sweep must pay the refund's 300 sats and the child's 1,500 plus the 1 sat/vB step, \
+         13 sat/vB for 150 vB"
+    );
+    for (txid, what) in [(refund, "the taker's refund"), (child, "its child")] {
+        assert!(
+            bitcoind.client.get_mempool_entry(&txid).is_err(),
+            "{} must be out of the mempool",
+            what
+        );
+    }
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
+/// Stores a swept swap-in for `preimage` on confirmed funding, then mines
+/// past its 10-block refund window so the taker's refund is valid.
+fn swept_past_its_refund_window(
+    bitcoind: &BitcoinD,
+    maker: &MakerServer,
+    preimage: &Preimage,
+) -> (LnMakerSwap, OutPoint) {
+    let swap = accepted_swap_in_with_locktime(preimage, 10);
+    let funding = fund_htlc(bitcoind, &swap);
+    generate_blocks(bitcoind, 1);
+    let mut swept = paid_without_height(&swap, funding);
+    swept.funding_height = Some(confirmation_height(bitcoind, &funding.txid) as u32);
+    swept.phase = LnMakerPhase::InSwept;
+    swept.preimage = Some(*preimage);
+    maker
+        .store_ln_swap(&preimage.payment_hash().to_string(), swept)
+        .unwrap();
+    generate_blocks(bitcoind, 10);
+    (swap, funding)
+}
+
+/// Spends output 0 of mempool transaction `parent`, which pays the node's
+/// wallet, back to the wallet with `fee`.
+fn spend_with_fee(bitcoind: &BitcoinD, parent: Txid, fee: Amount) -> Txid {
+    let prevout = bitcoind
+        .client
+        .get_raw_transaction(&parent, None)
+        .unwrap()
+        .output[0]
+        .clone();
+    let address = bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .require_network(Network::Regtest)
+        .unwrap();
+    let unsigned = bitcoind
+        .client
+        .create_raw_transaction(
+            &[CreateRawTransactionInput {
+                txid: parent,
+                vout: 0,
+                sequence: None,
+            }],
+            &HashMap::from([(address.to_string(), prevout.value - fee)]),
+            None,
+            None,
+        )
+        .unwrap();
+    let signed = bitcoind
+        .client
+        .sign_raw_transaction_with_wallet(
+            &unsigned,
+            Some(&[SignRawTransactionInput {
+                txid: parent,
+                vout: 0,
+                script_pub_key: prevout.script_pubkey,
+                redeem_script: None,
+                amount: Some(prevout.value),
+            }]),
+            None,
+        )
+        .unwrap();
+    assert!(signed.complete, "the wallet could not sign the child");
+    bitcoind
+        .client
+        .send_raw_transaction(&signed.transaction().unwrap())
+        .unwrap()
 }
 
 /// Holds a watchdog test switch on until dropped, even if the test panics.
