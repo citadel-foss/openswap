@@ -192,7 +192,11 @@ docker exec -it openswap-makerd maker-cli get-balances
 docker exec -it openswap-makerd maker-cli stop
 ```
 
-`maker-cli stop` drains the maker: it takes no new swaps and exits once the swaps in progress finish, within an hour at most. The command returns before the container has exited, so wait for it to stop. `docker stop` and the `docker-setup` stop, restart and seed commands stop the maker at once, as before.
+`maker-cli stop` drains the maker: it takes no new swaps and exits once the swaps in progress finish, within an hour at most. The command returns before the container has exited.
+
+Docker starts a container again when its process exits by itself, and the compose file uses `restart: unless-stopped`. So after a drain, makerd comes back on its own. Use `./docker-setup stop` instead. It drains the maker, waits for it to exit, and then stops the stack, so the maker stays down. `./docker-setup restart` does the same and then starts the stack again. The seed commands also drain the maker before they stop it. Add `--now` (for example `./docker-setup stop --now`) to stop at once. Swaps in progress then settle on-chain.
+
+To do it by hand, run `docker exec openswap-makerd maker-cli stop`, wait until the maker's log says it has shut down, and then run `docker stop openswap-makerd` before Docker starts it again. A plain `docker stop` stops the maker at once.
 
 ### Taker
 

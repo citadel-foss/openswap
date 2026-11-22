@@ -637,7 +637,7 @@ makerd does not wait for work that is already saved and picked up again after a 
 - recovery that runs at startup,
 - Lightning swaps already in progress.
 
-To stop at once, run `maker-cli stop --now`. This also works while makerd is draining, and it is how to cut a drain short. `SIGINT` and `SIGTERM` stop makerd at once too. In Docker, `SIGTERM` is followed by `SIGKILL` after about ten seconds, so a graceful stop there is `maker-cli stop`, then waiting for the container to exit. A `makerd` from before this release answers `stop` with "unknown request" and does not stop; use `stop --now` with it.
+To stop at once, run `maker-cli stop --now`. This also works while makerd is draining, and it is how to cut a drain short. `SIGINT` and `SIGTERM` stop makerd at once too. In Docker, `SIGTERM` is followed by `SIGKILL` after about ten seconds, and Docker starts the container again when makerd exits by itself. A graceful stop there is `./docker-setup stop`, which drains the maker and then stops the stack. See [Docker](./docker.md). A `makerd` from before this release answers `stop` with "unknown request" and does not stop; use `stop --now` with it.
 
 Once the maker server shuts down, we'll see the following logs indicating the shutdown process:
 

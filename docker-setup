@@ -611,11 +611,56 @@ start_stack() {
     start_makerd
 }
 
+# Let makerd finish the swaps in progress, then wait for it to exit (an hour at
+# most). Docker starts a container again when it exits by itself, so the caller
+# must stop the container right after this returns. Returns at once when makerd
+# is not running or does not accept a graceful stop.
+drain_makerd() {
+    local name="openswap-makerd" limit=3900 waited=0 started
+    [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ] || return 0
+    started=$(docker inspect -f '{{.State.StartedAt}}' "$name")
+    print_info "Asking makerd to finish its swaps in progress (an hour at most)..."
+    print_info "Press Ctrl+C to stop waiting. makerd keeps draining on its own."
+    if ! docker exec "$name" maker-cli stop; then
+        print_warning "makerd did not accept a graceful stop. Stopping it at once."
+        return 0
+    fi
+    while [ "$waited" -lt "$limit" ]; do
+        # A new StartedAt means Docker already started makerd again after it exited.
+        if [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != "true" ] ||
+            [ "$(docker inspect -f '{{.State.StartedAt}}' "$name" 2>/dev/null)" != "$started" ]; then
+            print_info "makerd has exited."
+            return 0
+        fi
+        sleep 5
+        waited=$((waited + 5))
+        if [ $((waited % 60)) -eq 0 ]; then
+            print_info "Still waiting for makerd ($((waited / 60)) min)..."
+        fi
+    done
+    print_warning "makerd is still running after an hour. Stopping it at once."
+}
+
+# The --now flag of stop, restart, show-seed and attach-seed: skip the drain.
+want_drain() {
+    case "${1:-}" in
+        "") return 0 ;;
+        --now) return 1 ;;
+        *)
+            print_error "Unknown option: $1 (only --now is accepted)"
+            exit 1
+            ;;
+    esac
+}
+
 stop_stack() {
+    local drain=1
+    want_drain "${1:-}" || drain=0
     print_info "Stopping OpenSwap stack..."
     cd "$SCRIPT_DIR"
     setup_env
-    
+
+    [ "$drain" -eq 0 ] || drain_makerd
     docker compose down
     
     print_success "OpenSwap stack stopped"
@@ -738,7 +783,8 @@ start_makerd() {
 # Run show-seed or attach-seed on the maker wallet. The running maker holds the
 # wallet, so stop it first and start it again after; Docker keeps no log of the run.
 run_seed_command() {
-    local cmd="$1"
+    local cmd="$1" drain=1
+    want_drain "${2:-}" || drain=0
     cd "$SCRIPT_DIR"
     setup_env
     if [[ ! -t 0 || ! -t 1 ]]; then
@@ -759,6 +805,7 @@ run_seed_command() {
     if [ -n "$(docker compose ps -q --status running "$service")" ]; then
         seed_restart_service="$service"
         print_info "Stopping makerd so $cmd can save the wallet..."
+        [ "$drain" -eq 0 ] || drain_makerd
         docker compose stop "$service"
     fi
 
@@ -844,15 +891,16 @@ show_help() {
     echo "  start [options]  Start the full OpenSwap stack"
     echo "                   Options:"
     echo "                     -d, --default   Use default configuration without prompting"
-    echo "  stop             Stop the OpenSwap stack"
-    echo "  restart          Restart the OpenSwap stack"
+    echo "  stop [--now]     Stop the OpenSwap stack. makerd first finishes the swaps"
+    echo "                   in progress (an hour at most); --now stops it at once"
+    echo "  restart [--now]  Restart the OpenSwap stack, the same way"
     echo "  logs [service]   Show logs (optionally for specific service)"
     echo "                   Services: bitcoind, tor, makerd-internal (bundled Tor), makerd (your own Tor)"
     echo "  status           Show status of running services"
     echo "  shell            Open shell in a new container"
-    echo "  show-seed        Show the maker seed phrase and confirm your backup"
+    echo "  show-seed [--now]  Show the maker seed phrase and confirm your backup"
     echo "                   (stops makerd while it runs, then starts it again)"
-    echo "  attach-seed      Add the original seed phrase to a maker wallet that has none"
+    echo "  attach-seed [--now]  Add the original seed phrase to a maker wallet that has none"
     echo ""
     echo "Individual application commands:"
     echo "  makerd [args]   Run makerd with arguments"
@@ -885,10 +933,10 @@ case "${1:-}" in
         start_stack "${@:2}"
     ;;
     "stop")
-        stop_stack
+        stop_stack "${2:-}"
     ;;
     "restart")
-        stop_stack
+        stop_stack "${2:-}"
         sleep 2
         start_stack
     ;;
@@ -906,7 +954,7 @@ case "${1:-}" in
     ;;
     "show-seed"|"attach-seed")
         check_docker
-        run_seed_command "$1"
+        run_seed_command "$1" "${2:-}"
     ;;
     "makerd"|"maker-cli"|"taker"|"bitcoin-cli")
         run_command "$@"
