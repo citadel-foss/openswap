@@ -22,7 +22,10 @@ use openswap::{
         lightning_handlers::{ln_watchdog_tick_now, LnMakerPhase},
         MakerServer,
     },
-    taker::{error::TakerError, lightning_swap::LnSwapParams},
+    taker::{
+        error::TakerError,
+        lightning_swap::{LnSwapParams, FAIL_RECOVERY_LOOKUP},
+    },
     wallet::AddressType,
 };
 
@@ -566,6 +569,23 @@ fn lightning_swap_out_recovery_claims_at_the_market_rate(world: &mut World) {
         "the first claim left the mempool: {:?}",
         second
     );
+
+    // Either lookup failing keeps the record and sends nothing, until a
+    // later pass can read the chain again.
+    for lookup in [1, 2] {
+        FAIL_RECOVERY_LOOKUP.store(lookup, std::sync::atomic::Ordering::SeqCst);
+        let failed = taker.recover_lightning_swaps().unwrap();
+        FAIL_RECOVERY_LOOKUP.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            failed.len() == 1 && failed[0].contains("spend status unknown"),
+            "lookup {lookup} failing must keep the record: {:?}",
+            failed
+        );
+        assert!(
+            bitcoind.client.get_mempool_entry(&claim_txid).is_ok(),
+            "lookup {lookup} failing replaced the claim"
+        );
+    }
 
     framework.set_block_gen_paused(false);
     recover_all_lightning_swaps(taker, Duration::from_secs(300));

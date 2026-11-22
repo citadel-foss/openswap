@@ -82,6 +82,11 @@ const EARLY_REJECT_WINDOW: Duration = Duration::from_secs(5);
 /// This is the bound the taker applies regardless of what was advertised.
 const MAX_FEE_PERCENT: u64 = 5;
 
+/// Fails one of recovery's two chain lookups, as a backend error would:
+/// 1 the confirmed-spend check, 2 the mempool check. Set by tests.
+#[cfg(feature = "integration-test")]
+pub static FAIL_RECOVERY_LOOKUP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// Parameters of a Lightning submarine swap.
 #[derive(Debug, Clone)]
 pub struct LnSwapParams {
@@ -1164,6 +1169,16 @@ impl Taker {
                         .blockchain
                         .get_tx_out(&outpoint.txid, outpoint.vout, Some(true)),
                 )
+            };
+            #[cfg(feature = "integration-test")]
+            let (confirmed, live) = {
+                use crate::wallet::WalletError;
+                let failed = || WalletError::General("Test: lookup failed".to_string());
+                match FAIL_RECOVERY_LOOKUP.load(std::sync::atomic::Ordering::SeqCst) {
+                    1 => (Err(failed()), live),
+                    2 => (confirmed, Err(failed())),
+                    _ => (confirmed, live),
+                }
             };
             match (confirmed, live) {
                 (Ok(true), _) => {
