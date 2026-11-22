@@ -977,7 +977,17 @@ fn sweep_swap_in<M: Maker>(
         .funding
         .ok_or(MakerError::General("swap-in sweep without funding"))?;
     let mut swap = swap.clone();
-    let destination = payout_script(maker, swap_id, &mut swap)?;
+    // Not payout_script(), whose store is unconditional: on a stale paid copy
+    // it would write that copy back over a swept swap. The guarded store
+    // below writes the script with the swept phase.
+    let destination = match &swap.payout_script {
+        Some(script) => script.clone(),
+        None => {
+            let script = maker.get_receive_address()?.script_pubkey();
+            swap.payout_script = Some(script.clone());
+            script
+        }
+    };
     let feerate = maker.htlc_spend_feerate();
     let claim_tx = swap
         .htlc
