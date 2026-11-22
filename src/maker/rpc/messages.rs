@@ -82,6 +82,10 @@ pub enum RpcMsgReq {
         /// 10,000 is cut to 10,000.
         limit: Option<u32>,
     },
+    /// Refuse new swaps and stop the Maker server once the swaps in progress
+    /// are done, or after an hour. Acknowledged at once; [`RpcMsgReq::Stop`]
+    /// stops immediately.
+    StopAfterSwaps,
 }
 
 /// Enum representing RPC message responses.
