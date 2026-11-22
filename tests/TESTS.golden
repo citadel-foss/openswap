@@ -116,9 +116,8 @@ openswap maker::lightning_handlers::tests::nothing_pending_goes_out_at_the_marke
 openswap maker::lightning_handlers::tests::only_a_rejection_leaves_the_connection_unpromoted
 openswap maker::lightning_handlers::tests::only_the_recorded_refund_is_ours
 openswap maker::lightning_handlers::tests::persisted_record_survives_serialization_and_still_spends
-openswap maker::lightning_handlers::tests::record_without_a_refund_feerate_rebuilds_at_the_market_rate
+openswap maker::lightning_handlers::tests::record_without_a_refund_feerate_reads_as_built_at_the_floor
 openswap maker::lightning_handlers::tests::recorded_spend_stays_spent
-openswap maker::lightning_handlers::tests::refund_never_drops_below_its_recorded_rate
 openswap maker::lightning_handlers::tests::refund_waits_for_the_chain_to_say_unspent
 openswap maker::lightning_handlers::tests::swap_out_limit_leaves_inbound_room_for_the_fee
 openswap maker::lightning_handlers::tests::unfunded_record_round_trips_without_funding
@@ -763,6 +762,7 @@ openswap::integration lightning::maker_restart::lightning_maker_keeps_a_shallow_
 openswap::integration lightning::maker_restart::lightning_maker_keeps_a_swap_out_while_its_funding_height_is_unknown
 openswap::integration lightning::maker_restart::lightning_maker_rebroadcasts_an_evicted_refund
 openswap::integration lightning::maker_restart::lightning_maker_refunds_a_swap_out_stored_without_funding_height
+openswap::integration lightning::maker_restart::lightning_maker_refunds_at_a_risen_rate_after_an_interrupted_refund
 openswap::integration lightning::maker_restart::lightning_maker_restart_recovers_an_interrupted_refund
 openswap::integration lightning::maker_restart::lightning_maker_restart_recovers_funded_swap
 openswap::integration lightning::maker_restart::lightning_maker_restart_refunds_unclaimed_swap_out

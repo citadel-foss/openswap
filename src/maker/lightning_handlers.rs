@@ -1092,16 +1092,20 @@ fn watchdog_finish_sweep<M: Maker>(
     };
     // Only the maker signs the hashlock branch, so a spend revealing the
     // preimage is our sweep.
-    let pending = match maker.htlc_pending_spend(&outpoint, &spk)? {
-        Some(tx) if swap.htlc.extract_preimage(&tx).is_some() => Some(tx),
-        Some(_) => {
-            // The taker's refund: resend the recorded sweep, as before.
+    let pending = match maker.htlc_pending_spend(&outpoint, &spk) {
+        Ok(Some(tx)) if swap.htlc.extract_preimage(&tx).is_some() => Some(tx),
+        other => {
+            // The taker's refund is racing the sweep, or the lookup failed:
+            // resend the recorded sweep, as before, and bump nothing.
+            match other {
+                Ok(_) => log::info!("Swap-in {swap_id}: a spend that is not our sweep is pending"),
+                Err(e) => log::debug!("Swap-in {swap_id}: pending spend lookup failed: {e:?}"),
+            }
             if let Err(e) = maker.broadcast_transaction(&build(built_at)?) {
                 log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}");
             }
             return Ok(());
         }
-        None => None,
     };
     let claim_tx = match plan_spend(
         build,
@@ -1773,7 +1777,7 @@ fn watchdog_resolve_swap_out(
                 // the watcher keeps it on record. Nothing else would send it
                 // again, so do that here; a duplicate is harmless.
                 if is_our_refund(swap, &spending_tx) {
-                    resend_refund(maker, swap_id, swap, outpoint, value, &spk)?;
+                    resend_refund(maker, ctx, swap_id, swap, outpoint, value, &spk)?;
                 }
                 return Ok(());
             }
@@ -1869,15 +1873,45 @@ fn watchdog_resolve_swap_out(
                     script
                 }
             };
-            let feerate = refund_feerate(&swap, || maker.htlc_spend_feerate());
+            let build = |rate| {
+                swap.htlc
+                    .create_timelock_spend(
+                        outpoint,
+                        value,
+                        &swap.privkey,
+                        destination.clone(),
+                        rate,
+                    )
+                    .map_err(|e| {
+                        log::warn!("lightning: refund build failed: {e}");
+                        MakerError::General("refund build failed")
+                    })
+            };
+            // Nothing spends the HTLC, so nothing is replaced: the first
+            // refund takes the market rate, and a recorded one is rebuilt at
+            // its rate, or at the market rate once that clears it by the
+            // replacement step and pays more. A record from before refunds
+            // were priced was built at [`SPEND_FEE_RATE_FLOOR`].
+            let market = maker.htlc_spend_feerate();
+            let (feerate, refund_tx) = match swap.refund_txid {
+                None => (market, build(market)?),
+                Some(_) => {
+                    let built_at = swap.refund_feerate.unwrap_or(SPEND_FEE_RATE_FLOOR);
+                    match plan_spend(
+                        build,
+                        value,
+                        built_at,
+                        market,
+                        maker.htlc_replacement_increment(),
+                        None,
+                        |_| false,
+                    )? {
+                        PlannedSpend::Resend(tx) => (built_at, tx),
+                        PlannedSpend::New { tx, rate, .. } => (rate, tx),
+                    }
+                }
+            };
             swap.refund_feerate = Some(feerate);
-            let refund_tx = swap
-                .htlc
-                .create_timelock_spend(outpoint, value, &swap.privkey, destination, feerate)
-                .map_err(|e| {
-                    log::warn!("lightning: refund build failed: {e}");
-                    MakerError::General("refund build failed")
-                })?;
             // Recorded before it can reach the network, so a crash after the
             // broadcast still leaves a record that knows the spend is ours.
             // It names the refund, nothing more: whether it was sent or
@@ -1885,10 +1919,11 @@ fn watchdog_resolve_swap_out(
             // transaction, so this is written once.
             let refund_txid = refund_tx.compute_txid();
             if swap.refund_txid != Some(refund_txid) {
-                // Nothing spends the HTLC, so a higher rate replaces nothing.
                 // The refund it supersedes can still confirm, so it is kept.
                 if let Some(earlier) = swap.refund_txid {
-                    swap.earlier_refund_txids.push(earlier);
+                    if !swap.earlier_refund_txids.contains(&earlier) {
+                        swap.earlier_refund_txids.push(earlier);
+                    }
                 }
                 swap.refund_txid = Some(refund_txid);
                 // A claim may have closed the swap since the snapshot.
@@ -1946,16 +1981,6 @@ pub static INTERRUPT_REFUND: std::sync::atomic::AtomicBool =
 pub static HIDE_HTLC_SPENDS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Feerate to build our refund at when nothing spends the HTLC: the market
-/// rate, never below the rate the latest refund was built at. A record from
-/// before refunds were priced was built at [`SPEND_FEE_RATE_FLOOR`], which
-/// the market rate never undercuts. Replacing nothing, a higher rate is safe:
-/// the superseded txid stays in `earlier_refund_txids`.
-fn refund_feerate(swap: &LnMakerSwap, market: impl FnOnce() -> f64) -> f64 {
-    let market = market();
-    swap.refund_feerate.map_or(market, |rate| rate.max(market))
-}
-
 /// Whether `spend` is a refund this swap built. Lacking the preimage does
 /// not make a spend ours; only a persisted refund txid does, the latest or
 /// one it replaced.
@@ -1988,7 +2013,8 @@ enum PlannedSpend {
 /// Decides what to send from the node's view of the HTLC. `pending` is our
 /// unconfirmed spend in the mempool; `None` means nothing of ours is
 /// pending, evicted or never sent, so a spend at the market rate replaces
-/// nothing. A pending spend is bumped once the market clears the rate it
+/// nothing and goes out once the market clears the recorded rate by the
+/// replacement step. A pending spend is bumped once the market clears the rate it
 /// actually pays by the replacement step, and only while `output_unspent`
 /// says nothing builds on it. That rate is read from its fee, so a record
 /// that disagrees with the mempool cannot mislead it.
@@ -2003,7 +2029,7 @@ fn plan_spend(
 ) -> Result<PlannedSpend, MakerError> {
     let Some(pending) = pending else {
         let recorded = build(built_at)?;
-        if market > built_at {
+        if market >= built_at + increment {
             let tx = build(market)?;
             // A rate the dust fallback undoes keeps the recorded spend.
             if fee_paid(&tx, value) > fee_paid(&recorded, value) {
@@ -2043,6 +2069,7 @@ fn plan_spend(
 /// still ours. A spend of the HTLC that is not our refund is left alone.
 fn resend_refund(
     maker: &Arc<MakerServer>,
+    ctx: &LnContext,
     swap_id: &str,
     swap: &LnMakerSwap,
     outpoint: OutPoint,
@@ -2052,11 +2079,6 @@ fn resend_refund(
     let Some(destination) = swap.payout_script.clone() else {
         return Ok(());
     };
-    let pending = match maker.htlc_pending_spend(&outpoint, spk)? {
-        Some(tx) if is_our_refund(swap, &tx) => Some(tx),
-        Some(_) => return Ok(()),
-        None => None,
-    };
     let built_at = swap.refund_feerate.unwrap_or(SPEND_FEE_RATE_FLOOR);
     let build = |rate| {
         swap.htlc
@@ -2065,6 +2087,29 @@ fn resend_refund(
                 log::warn!("lightning: refund build failed: {e}");
                 MakerError::General("refund build failed")
             })
+    };
+    let pending = match maker.htlc_pending_spend(&outpoint, spk) {
+        Ok(Some(tx)) if is_our_refund(swap, &tx) => Some(tx),
+        // The taker's claim, pending: its preimage settles the swap now.
+        Ok(Some(tx)) if swap.htlc.extract_preimage(&tx).is_some() => {
+            return settle_swap_out_from_spend(maker, ctx, swap_id, swap, &tx);
+        }
+        Ok(Some(tx)) => {
+            log::info!(
+                "Swap-out {swap_id}: {} spends the HTLC and is not our refund",
+                tx.compute_txid()
+            );
+            return Ok(());
+        }
+        Ok(None) => None,
+        Err(e) => {
+            // Resend the latest refund and bump nothing until a lookup works.
+            log::debug!("Swap-out {swap_id}: pending spend lookup failed: {e:?}");
+            if let Err(e) = maker.broadcast_transaction(&build(built_at)?) {
+                log::debug!("Swap-out {swap_id}: refund rebroadcast rejected: {e:?}");
+            }
+            return Ok(());
+        }
     };
     let refund = match plan_spend(
         build,
@@ -2292,25 +2337,11 @@ mod tests {
         assert!(!is_our_refund(&swap, &rival));
     }
 
+    /// A record written before refunds were priced or bumped has neither
+    /// field. It still reads, with no rate and no earlier refunds, and is
+    /// rebuilt from the floor rate it was built at.
     #[test]
-    fn refund_never_drops_below_its_recorded_rate() {
-        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
-        assert_eq!(
-            refund_feerate(&swap, || 30.0),
-            30.0,
-            "first build follows the market"
-        );
-        swap.refund_txid = Some(bitcoin::Txid::from_byte_array([0x42; 32]));
-        swap.refund_feerate = Some(30.0);
-        assert_eq!(refund_feerate(&swap, || 10.0), 30.0, "a falling market");
-        assert_eq!(refund_feerate(&swap, || 80.0), 80.0, "a rising market");
-    }
-
-    /// A refund recorded before spends were priced was built at the floor
-    /// rate, which the market rate never undercuts. Its record has no
-    /// feerate; a rebuild follows the market.
-    #[test]
-    fn record_without_a_refund_feerate_rebuilds_at_the_market_rate() {
+    fn record_without_a_refund_feerate_reads_as_built_at_the_floor() {
         let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
         swap.refund_txid = Some(bitcoin::Txid::from_byte_array([0x42; 32]));
         let serde_cbor::Value::Map(mut fields) =
@@ -2325,11 +2356,7 @@ mod tests {
             serde_cbor::value::from_value(serde_cbor::Value::Map(fields)).unwrap(),
         );
         assert_eq!(restored.refund_feerate, None);
-        assert_eq!(refund_feerate(&restored, || 80.0), 80.0);
-        assert_eq!(
-            refund_feerate(&restored, || SPEND_FEE_RATE_FLOOR),
-            SPEND_FEE_RATE_FLOOR
-        );
+        assert!(restored.earlier_refund_txids.is_empty());
     }
 
     fn sample_swap(direction: LnDirection, phase: LnMakerPhase) -> LnMakerSwap {

@@ -800,9 +800,11 @@ pub trait Maker: Send + Sync {
         crate::utill::MIN_RELAY_FEE_RATE
     }
 
-    /// The unconfirmed transaction spending `outpoint`, read from the node:
-    /// what a rebuild would replace. `None` when nothing in the mempool
-    /// spends it.
+    /// The transaction spending `outpoint`, read from the node: what a
+    /// rebuild would replace. Asked only once the outpoint has no confirmed
+    /// spend. `None` when nothing pending spends it. On Electrum the answer
+    /// comes from a briefly cached script history, so a just-evicted spend
+    /// can still be named for a few seconds; the next pass corrects it.
     #[cfg(feature = "lightning")]
     fn htlc_pending_spend(
         &self,
