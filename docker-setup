@@ -621,7 +621,8 @@ drain_makerd() {
     started=$(docker inspect -f '{{.State.StartedAt}}' "$name")
     print_info "Asking makerd to finish its swaps in progress (an hour at most)..."
     print_info "Press Ctrl+C to stop waiting. makerd keeps draining on its own."
-    if ! docker exec "$name" maker-cli stop; then
+    # maker-cli's own default is port 6103, so give it the configured RPC port.
+    if ! docker exec "$name" maker-cli -p "127.0.0.1:${MAKERD_RPC_PORT:-$DEFAULT_MAKERD_RPC_PORT}" stop; then
         print_warning "makerd did not accept a graceful stop. Stopping it at once."
         return 0
     fi
