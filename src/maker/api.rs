@@ -3827,6 +3827,14 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn htlc_replacement_increment(&self) -> f64 {
+        match lock_debug!(self.wallet.read()) {
+            Ok(wallet) => wallet.blockchain.replacement_increment_rate(),
+            Err(_) => crate::utill::MIN_RELAY_FEE_RATE,
+        }
+    }
+
+    #[cfg(feature = "lightning")]
     fn is_htlc_spend_confirmed(
         &self,
         outpoint: &bitcoin::OutPoint,

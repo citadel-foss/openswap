@@ -469,6 +469,11 @@ pub struct LnMakerSwapRecord {
     /// written before spends were priced from the market.
     #[serde(default)]
     pub refund_feerate: Option<f64>,
+    /// Txids of the refunds `refund_txid` replaced at a higher fee. Any of
+    /// them can be the one that confirms, so each still names our refund.
+    /// Absent from records written before refunds were bumped.
+    #[serde(default)]
+    pub earlier_refund_txids: Vec<bitcoin::Txid>,
     /// Feerate (sat/vB) the swap-in sweep was built at, so a restarted maker
     /// rebuilds the same transaction. Absent from records written before
     /// spends were priced from the market.
@@ -574,6 +579,11 @@ impl Requires for LnMakerSwapRecord {
             // confirms, which leaves the swap open until the held payment
             // fails back at its deadline. The coins are refunded either way.
             refund_feerate: _,
+            // An older build drops it and knows only the latest refund. If an
+            // earlier one confirms, it reads that as a taker spend and keeps
+            // the swap until the held payment fails back. The coins are the
+            // maker's either way.
+            earlier_refund_txids: _,
             // An older build drops it and resends the sweep at the floor
             // rate, which cannot replace a higher-fee one already sent.
             sweep_feerate: _,
@@ -1227,6 +1237,7 @@ pub(crate) mod compat_support {
                     preimage: Some([4; 32]),
                     refund_txid: Some(point.txid),
                     refund_feerate: None,
+                    earlier_refund_txids: Vec::new(),
                     sweep_feerate: None,
                     accepted_height: Some(123),
                     payout_script: Some(script.clone()),
@@ -2002,6 +2013,7 @@ mod tests {
                     preimage: Some([8; 32]),
                     refund_txid: Some(Txid::all_zeros()),
                     refund_feerate: None,
+                    earlier_refund_txids: Vec::new(),
                     sweep_feerate: None,
                     accepted_height: Some(42),
                     payout_script: Some(ScriptBuf::from_bytes(vec![0x52])),
@@ -2757,6 +2769,7 @@ mod tests {
             preimage: Some(preimage),
             refund_txid: None,
             refund_feerate: None,
+            earlier_refund_txids: Vec::new(),
             sweep_feerate: None,
             accepted_height: None,
             payout_script: None,

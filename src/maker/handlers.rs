@@ -781,6 +781,13 @@ pub trait Maker: Send + Sync {
         crate::lightning::swap::SPEND_FEE_RATE_FLOOR
     }
 
+    /// Feerate (sat/vB) a replacement must add over the spend it replaces:
+    /// the backend's incremental relay fee, never below the relay floor.
+    #[cfg(feature = "lightning")]
+    fn htlc_replacement_increment(&self) -> f64 {
+        crate::utill::MIN_RELAY_FEE_RATE
+    }
+
     /// Whether `outpoint` has a *confirmed* spend. A mempool-only spend
     /// reports false: it can still be evicted or reorged away, and dropping
     /// a swap's record on one would discard the only key that reaches the

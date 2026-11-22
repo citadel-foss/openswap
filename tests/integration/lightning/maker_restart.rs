@@ -509,6 +509,106 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
     framework.set_block_gen_paused(false);
 }
 
+/// A pending refund is bumped once the market rises by the replacement
+/// step, while nothing spends its output. The refund it replaced stays on
+/// record, so whichever of them confirms closes the swap.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+)]
+fn lightning_maker_bumps_a_pending_refund(world: &mut World, ln: Arc<MockLightningBackend>) {
+    use openswap::watch_tower::watcher::WatcherEvent;
+
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    let locktime: u16 = 30;
+    // The test mines every block itself, so the refund stays pending.
+    pause_block_generation(&framework);
+    let market = SpendFeerate::set(10.0);
+
+    let preimage = Preimage([0x7b; 32]);
+    let swap_id = preimage.payment_hash().to_string();
+    let funded = fund_swap_out(
+        &maker,
+        &ln,
+        preimage.payment_hash(),
+        Amount::from_sat(40_000),
+        locktime,
+    );
+    generate_blocks(bitcoind, 1);
+    let funded_at = bitcoind.client.get_block_count().unwrap()
+        - confirmations(bitcoind, &funded.outpoint.txid) as u64
+        + 1;
+    mine_to(bitcoind, funded_at + locktime as u64 + 1);
+
+    // ---- The watchdog refunds at the market rate ----
+    ln_watchdog_tick_now(&maker);
+    let first = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .and_then(|swap| swap.refund_txid)
+        .expect("the watchdog broadcast a refund");
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funded.outpoint, funded.value),
+        Amount::from_sat(1_500),
+        "the refund must pay the market rate, 10 sat/vB for 150 vB"
+    );
+    let recorded_spend = || match maker.watch_service.watch_request(funded.outpoint) {
+        Ok(WatcherEvent::UtxoSpent { spending_tx, .. }) => spending_tx.map(|tx| tx.compute_txid()),
+        other => panic!("unexpected watcher answer: {:?}", other),
+    };
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the watcher to record the refund",
+        recorded_spend() == Some(first)
+    );
+
+    // ---- The market rises, and the pending refund is bumped ----
+    market.set_rate(40.0);
+    ln_watchdog_tick_now(&maker);
+    let swap = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .expect("the swap stays open");
+    let bumped = swap.refund_txid.expect("the bump is recorded");
+    assert_ne!(bumped, first, "the refund was not bumped");
+    assert_eq!(swap.earlier_refund_txids, vec![first]);
+    assert_eq!(swap.refund_feerate, Some(40.0));
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funded.outpoint, funded.value),
+        Amount::from_sat(6_000),
+        "the bump must pay the new rate, 40 sat/vB for 150 vB"
+    );
+    assert!(
+        bitcoind.client.get_mempool_entry(&first).is_err(),
+        "the bump must replace the first refund"
+    );
+
+    // ---- The bumped refund is final, so the swap closes ----
+    generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
+    assert!(confirmations(bitcoind, &bumped) as u64 >= REFUND_FINALITY_DEPTH);
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the maker to close the refunded swap",
+        {
+            ln_watchdog_tick_now(&maker);
+            maker.get_ln_swap(&swap_id).unwrap().is_none()
+        }
+    );
+    assert!(
+        ln.claim_held_payment(&preimage).is_err(),
+        "the refunded swap's held payment must be failed back"
+    );
+    framework.set_block_gen_paused(false);
+}
+
 /// Holds a watchdog test switch on until dropped, even if the test panics.
 struct Switch(&'static AtomicBool);
 
@@ -1502,6 +1602,7 @@ fn accepted_swap_in_with_locktime(preimage: &Preimage, locktime: u16) -> LnMaker
         preimage: None,
         refund_txid: None,
         refund_feerate: None,
+        earlier_refund_txids: Vec::new(),
         sweep_feerate: None,
         accepted_height: None,
         payout_script: None,
@@ -2688,10 +2789,10 @@ fn mempool_spend_fee(bitcoind: &BitcoinD, funding: OutPoint, value: Amount) -> A
             .sum::<Amount>()
 }
 
-/// The swap-in sweep pays the market rate it was first built at. The
-/// watchdog resends that same transaction even after the market rises, and
-/// a second sweep from the paid phase sends nothing: replacing it would also
-/// evict anything the wallet has since funded from its output.
+/// The swap-in sweep pays the market rate. While it is pending and nothing
+/// spends its output, the watchdog bumps it once the market rises by the
+/// replacement step, and resends it unchanged otherwise. A second sweep
+/// from the paid phase sends nothing.
 #[world_test(
     backend = BitcoindBackend,
     bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone(), payee_ln = pair.1.clone()],
@@ -2699,7 +2800,7 @@ fn mempool_spend_fee(bitcoind: &BitcoinD, funding: OutPoint, value: Amount) -> A
     takers = [Normal],
     maker_lightning = [ln.clone()],
 )]
-fn swap_in_sweep_pays_the_market_rate_and_is_not_replaced(
+fn swap_in_sweep_is_bumped_once_the_market_rises(
     world: &mut World,
     ln: Arc<MockLightningBackend>,
     payee_ln: Arc<MockLightningBackend>,
@@ -2749,17 +2850,28 @@ fn swap_in_sweep_pays_the_market_rate_and_is_not_replaced(
     ln_watchdog_tick_now(&maker);
     assert_eq!(
         mempool_spend_fee(bitcoind, funding, value),
-        Amount::from_sat(750),
-        "the watchdog must not replace a sweep that is still in the mempool"
+        Amount::from_sat(3_000),
+        "the watchdog must bump a pending sweep to the new rate, 20 sat/vB"
+    );
+    assert_eq!(
+        maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate,
+        Some(20.0),
+        "the bump's rate must be recorded"
+    );
+    // At that rate, the next pass resends the bump unchanged.
+    ln_watchdog_tick_now(&maker);
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(3_000)
     );
 
     // The inline handler and the watchdog both sweep from the paid phase.
     // Whichever comes second, here on the paid snapshot, must not send a
-    // sweep of its own at the new rate.
+    // sweep of its own.
     watchdog_finish_swap_in_snapshot(&maker, &id, &paid).unwrap();
     assert_eq!(
         mempool_spend_fee(bitcoind, funding, value),
-        Amount::from_sat(750),
+        Amount::from_sat(3_000),
         "a second sweep from the paid phase must not replace the first"
     );
 

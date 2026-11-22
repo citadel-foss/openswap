@@ -96,6 +96,8 @@ openswap maker::handlers::tests::swap_id_must_be_16_hex_characters
 openswap maker::handlers::tests::taproot_refund_deadline_is_exact_at_the_boundary
 openswap maker::legacy_verification::tests::locktime_that_overflows_the_refund_step_is_rejected
 openswap maker::legacy_verification::tests::normal_locktime_is_accepted
+openswap maker::lightning_handlers::tests::a_refund_this_swap_replaced_is_still_ours
+openswap maker::lightning_handlers::tests::a_spend_is_bumped_only_past_the_step_and_with_its_output_unspent
 openswap maker::lightning_handlers::tests::compat_lightning_pins_require_exact_direction_and_requirements
 openswap maker::lightning_handlers::tests::directions_are_bounded_by_opposite_channel_sides
 openswap maker::lightning_handlers::tests::only_a_rejection_leaves_the_connection_unpromoted
@@ -734,6 +736,7 @@ openswap::integration lightning::e2e::lightning_swap_out_recovery_claims_at_the_
 openswap::integration lightning::e2e::lightning_swap_out_refuses_blocklisted_funding
 openswap::integration lightning::maker_restart::conditional_paid_store_refuses_stale_copy
 openswap::integration lightning::maker_restart::forged_swap_in_funding_keeps_accepted_swap
+openswap::integration lightning::maker_restart::lightning_maker_bumps_a_pending_refund
 openswap::integration lightning::maker_restart::lightning_maker_closes_a_refund_at_finality_depth
 openswap::integration lightning::maker_restart::lightning_maker_closes_a_refund_at_finality_depth_on_electrum
 openswap::integration lightning::maker_restart::lightning_maker_does_not_refund_a_claim_its_watcher_has_not_seen
@@ -757,7 +760,7 @@ openswap::integration lightning::maker_restart::swap_in_funded_handler_yields_to
 openswap::integration lightning::maker_restart::swap_in_request_checks_terms_and_invoice_before_payment_record_lookup
 openswap::integration lightning::maker_restart::swap_in_request_fails_when_payment_record_lookup_fails
 openswap::integration lightning::maker_restart::swap_in_request_refuses_payment_hash_already_on_record
-openswap::integration lightning::maker_restart::swap_in_sweep_pays_the_market_rate_and_is_not_replaced
+openswap::integration lightning::maker_restart::swap_in_sweep_is_bumped_once_the_market_rises
 openswap::integration lightning::maker_restart::switch_resets_on_panic
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_funding_height_is_unknown
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_payment_is_in_flight
