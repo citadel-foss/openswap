@@ -1145,37 +1145,37 @@ impl Taker {
                 .script_pubkey()
                 .map_err(|e| general(format!("htlc spk: {e}")))?;
 
-            // An HTLC that already has a spend is not built for again. Priced
-            // at a newer rate, a rebuild could replace our own earlier
-            // recovery, or the maker's sweep, and evict whatever already
-            // spends its output. A failed lookup builds anyway, as before.
-            let existing = self
-                .read_wallet()?
-                .blockchain
-                .spending_transaction(&outpoint, &script, None)
-                .unwrap_or_else(|e| {
-                    log::debug!("{swap_id}: spend lookup failed: {e:?}");
-                    None
-                });
-            if let Some(spend) = existing {
-                let txid = spend.compute_txid();
-                let settled = {
-                    use crate::wallet::blockchain::Blockchain;
-                    self.read_wallet()?
+            // Only an unspent HTLC is built for. A confirmed spend closes the
+            // record. A spend still in the mempool is left alone: priced at a
+            // newer rate, a rebuild could replace our own earlier recovery,
+            // or the maker's sweep, and evict whatever spends its output. A
+            // failed lookup skips the record until the next run. Both
+            // lookups stay cheap on Core, with no block scan.
+            let (confirmed, live) = {
+                use crate::wallet::blockchain::Blockchain;
+                let wallet = self.read_wallet()?;
+                (
+                    wallet.blockchain.is_confirmed_spend(&outpoint, &script),
+                    wallet
                         .blockchain
-                        .is_confirmed_spend(&outpoint, &script)
-                };
-                match settled {
-                    Ok(true) => {
-                        self.remove_pending_swap(&swap_id)?;
-                        outcomes.push(format!("{swap_id}: already resolved on-chain"));
-                    }
-                    Ok(false) => {
-                        outcomes.push(format!("{swap_id}: {txid} pending, awaiting confirmation"))
-                    }
-                    Err(e) => outcomes.push(format!("{swap_id}: spend status unknown: {e:?}")),
+                        .get_tx_out(&outpoint.txid, outpoint.vout, Some(true)),
+                )
+            };
+            match (confirmed, live) {
+                (Ok(true), _) => {
+                    self.remove_pending_swap(&swap_id)?;
+                    outcomes.push(format!("{swap_id}: already resolved on-chain"));
+                    continue;
                 }
-                continue;
+                (Ok(false), Ok(Some(_))) => {}
+                (Ok(false), Ok(None)) => {
+                    outcomes.push(format!("{swap_id}: spend pending, awaiting confirmation"));
+                    continue;
+                }
+                (Err(e), _) | (Ok(false), Err(e)) => {
+                    outcomes.push(format!("{swap_id}: spend status unknown: {e:?}"));
+                    continue;
+                }
             }
 
             let destination = self
