@@ -2082,13 +2082,18 @@ mod tests {
             let mode = Arc::new(AtomicUsize::new(0));
             let (url, _) = mock_core_rpc({
                 let mode = mode.clone();
-                move |method, _| match method {
+                move |method, params| match method {
                     "gettxspendingprevout" => match mode.load(Ordering::SeqCst) {
                         0 => Ok(json!([])),
                         1 => Err(json!({"code": -28, "message": "backend unavailable"})),
                         _ => Ok(json!([{"txid": outpoint.txid, "vout": outpoint.vout,
                             "spendingtxid": claim.compute_txid()}])),
                     },
+                    // The funding is not mined, so its height lookup finds no
+                    // block and the refund waits.
+                    "getrawtransaction" if params[0] == json!(outpoint.txid) => {
+                        Err(json!({"code": -5, "message": "transaction unavailable"}))
+                    }
                     "getrawtransaction" if mode.load(Ordering::SeqCst) == 0 => {
                         Err(json!({"code": -5, "message": "transaction unavailable"}))
                     }
