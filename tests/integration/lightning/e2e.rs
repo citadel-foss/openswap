@@ -26,7 +26,7 @@ use openswap::{
     wallet::AddressType,
 };
 
-use super::{tx_fee, SpendFeerate};
+use super::{maker_restart::pause_block_generation, tx_fee, SpendFeerate};
 use crate::test_framework::*;
 
 /// Two mock Lightning nodes over one shared ledger: the maker's first, the
@@ -495,7 +495,8 @@ fn lightning_swap_out_refuses_blocklisted_funding(world: &mut World) {
 
 /// A taker that stops once the maker has funded its swap-out, before its
 /// claim goes out, leaves the HTLC to recovery. Recovery claims it with the
-/// preimage, priced from the market like the direct claim.
+/// preimage, priced from the market like the direct claim, and a later pass
+/// at a higher rate does not replace that claim while it is pending.
 #[world_test(
     backend = BitcoindBackend,
     bind = [(maker_ln, taker_ln) = maker_and_taker_nodes()],
@@ -513,7 +514,7 @@ fn lightning_swap_out_recovery_claims_at_the_market_rate(world: &mut World) {
     let bitcoind = &framework.bitcoind;
     let maker_address = world.makers()[0].address();
     let taker = world.taker_mut().inner_mut();
-    let _market = SpendFeerate::set(10.0);
+    let market = SpendFeerate::set(10.0);
 
     let result = taker.lightning_swap_out(LnSwapParams {
         amount: Amount::from_sat(40_000),
@@ -527,11 +528,43 @@ fn lightning_swap_out_recovery_claims_at_the_market_rate(world: &mut World) {
         result
     );
 
-    let history = recover_all_lightning_swaps(taker, Duration::from_secs(300));
-    let claim_txid = recovery_txid(&history).expect("recovery reports its claim txid");
+    // The chain holds still, so the claim is still in the mempool when
+    // recovery runs again after the market moves.
+    pause_block_generation(&framework);
+    let first = taker.recover_lightning_swaps().unwrap();
+    let claim_txid = recovery_txid(&first).expect("recovery reports its claim txid");
     assert_eq!(
         tx_fee(bitcoind, &claim_txid),
         Amount::from_sat(1_500),
         "the recovered claim must pay the market rate, 10 sat/vB for 150 vB"
+    );
+
+    // A second pass at a higher rate leaves the pending claim alone. A
+    // rebuild would replace it, and evict anything spending its output.
+    market.set_rate(40.0);
+    let second = taker.recover_lightning_swaps().unwrap();
+    assert_eq!(
+        recovery_txid(&second),
+        None,
+        "recovery sent another spend: {:?}",
+        second
+    );
+    assert!(
+        bitcoind.client.get_mempool_entry(&claim_txid).is_ok(),
+        "the first claim left the mempool: {:?}",
+        second
+    );
+
+    framework.set_block_gen_paused(false);
+    recover_all_lightning_swaps(taker, Duration::from_secs(300));
+    assert!(
+        bitcoind
+            .client
+            .get_raw_transaction_info(&claim_txid, None)
+            .ok()
+            .and_then(|info| info.confirmations)
+            .unwrap_or(0)
+            >= 1,
+        "the first claim must be the spend that confirms"
     );
 }

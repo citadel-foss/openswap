@@ -2112,7 +2112,7 @@ const REFUND_GRACE_BLOCKS: u64 = 12;
 
 /// Stops the framework's block generation and waits out a round that may
 /// already be mining, so the heights a test reads stay put.
-fn pause_block_generation(framework: &TestFramework) {
+pub(super) fn pause_block_generation(framework: &TestFramework) {
     framework.set_block_gen_paused(true);
     let bitcoind = &framework.bitcoind;
     let mut height = bitcoind.client.get_block_count().unwrap();
