@@ -107,7 +107,8 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
     let funding_rate = tx_fee(bitcoind, &funding_txid).to_sat() as f64 / funding_vsize as f64;
     assert!(
         funding_rate >= 9.0,
-        "the taker must fund the HTLC near 10 sat/vB, paid {funding_rate:.2}"
+        "the taker must fund the HTLC near 10 sat/vB, paid {:.2}",
+        funding_rate
     );
 
     // The maker learned the preimage and swept the HTLC: its claim spends
@@ -583,7 +584,8 @@ fn lightning_swap_out_recovery_claims_at_the_market_rate(world: &mut World) {
         );
         assert!(
             bitcoind.client.get_mempool_entry(&claim_txid).is_ok(),
-            "lookup {lookup} failing replaced the claim"
+            "lookup {} failing replaced the claim",
+            lookup
         );
     }
 
