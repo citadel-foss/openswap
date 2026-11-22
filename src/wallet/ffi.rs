@@ -325,13 +325,9 @@ impl Wallet {
         let amount = tx.output[0].value;
         let inputs = tx.input.len();
 
-        let echoed = self.send_tx(&tx)?;
-        // The id of the transaction we built: a backend's reply is not trusted
-        // to name it.
+        self.send_tx(&tx)?;
+        // Named by the transaction we built: the backend's reply is not used.
         let txid = tx.compute_txid();
-        if echoed != txid {
-            log::warn!("Backend named the sweep {echoed}, but it built {txid}");
-        }
         // The broadcast is accepted, so the caller gets the txid whatever
         // happens next. The wallet is not synced: a sweep has one external
         // output and no change, so the spent coins are all there is to learn,
