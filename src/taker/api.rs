@@ -687,6 +687,7 @@ impl Taker {
     /// shutdown, so a backend that stays down neither keeps the wallet
     /// write-locked nor blocks shutdown. A failure is logged; the next sync
     /// catches up.
+    #[cfg(feature = "lightning")]
     pub(crate) fn sync_wallet_once(&self) -> Result<(), TakerError> {
         let synced = self.write_wallet()?.sync_and_save_once(&self.shutdown);
         if let Err(e) = synced {

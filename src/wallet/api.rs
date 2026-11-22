@@ -4787,6 +4787,7 @@ impl Wallet {
     /// until one succeeds: for callers that treat the sync as best-effort
     /// and must not wait on a backend that stays down. A failed sync returns
     /// its error before the save.
+    #[cfg(feature = "lightning")]
     pub(crate) fn sync_and_save_once(
         &mut self,
         shutdown: &std::sync::atomic::AtomicBool,
