@@ -2689,9 +2689,9 @@ fn mempool_spend_fee(bitcoind: &BitcoinD, funding: OutPoint, value: Amount) -> A
 }
 
 /// The swap-in sweep pays the market rate it was first built at. The
-/// watchdog resends that same transaction even after the market rises:
-/// replacing it would also evict anything the wallet has since funded from
-/// its output.
+/// watchdog resends that same transaction even after the market rises, and
+/// a second sweep from the paid phase sends nothing: replacing it would also
+/// evict anything the wallet has since funded from its output.
 #[world_test(
     backend = BitcoindBackend,
     bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone(), payee_ln = pair.1.clone()],
@@ -2729,7 +2729,7 @@ fn swap_in_sweep_pays_the_market_rate_and_is_not_replaced(
     let mut paid = paid_without_height(&swap, funding);
     paid.funding_height = Some(confirmation_height(bitcoind, &funding.txid) as u32);
     router.subscribe(paid.payment_hash);
-    maker.store_ln_swap(&id, paid).unwrap();
+    maker.store_ln_swap(&id, paid.clone()).unwrap();
     ln.pay_invoice(&swap.invoice, None, Some(100)).unwrap();
     payee_ln.claim_held_payment(&preimage).unwrap();
 
@@ -2751,6 +2751,16 @@ fn swap_in_sweep_pays_the_market_rate_and_is_not_replaced(
         mempool_spend_fee(bitcoind, funding, value),
         Amount::from_sat(750),
         "the watchdog must not replace a sweep that is still in the mempool"
+    );
+
+    // The inline handler and the watchdog both sweep from the paid phase.
+    // Whichever comes second, here on the paid snapshot, must not send a
+    // sweep of its own at the new rate.
+    watchdog_finish_swap_in_snapshot(&maker, &id, &paid).unwrap();
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(750),
+        "a second sweep from the paid phase must not replace the first"
     );
 
     framework.set_block_gen_paused(false);

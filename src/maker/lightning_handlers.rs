@@ -1001,7 +1001,13 @@ fn sweep_swap_in<M: Maker>(
     swept.preimage = Some(*preimage);
     swept.phase = LnMakerPhase::InSwept;
     swept.touch();
-    store_swap(maker, swap_id, swept)?;
+    // The inline handler and the watchdog can both get here for one swap.
+    // Only the first moves it to swept and sends: a second sweep, priced at
+    // a newer rate, could replace the first.
+    if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::InPaid, swept)? {
+        log::info!("Swap-in {swap_id}: already swept; keeping the first sweep");
+        return Ok(());
+    }
 
     let claim_txid = maker.broadcast_transaction(&claim_tx)?;
     log::info!(
