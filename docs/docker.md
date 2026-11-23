@@ -196,7 +196,7 @@ docker exec -it openswap-makerd maker-cli stop
 
 Docker starts a container again when its process exits by itself, and the compose file uses `restart: unless-stopped`. So after a drain, makerd comes back on its own. Use `./docker-setup stop` instead. It drains the maker, waits for it to exit, and then stops the stack, so the maker stays down. `./docker-setup restart` does the same and then starts the stack again. The seed commands also drain the maker before they stop it. Add `--now` (for example `./docker-setup stop --now`) to stop at once. Swaps in progress then settle on-chain.
 
-To do it by hand, run `docker exec openswap-makerd maker-cli -p 127.0.0.1:<rpc-port> stop` (your `MAKERD_RPC_PORT`, default 6103), wait until the maker's log says it has shut down, and then run `docker stop openswap-makerd` before Docker starts it again. A plain `docker stop` stops the maker at once.
+To do it by hand, run `docker exec openswap-makerd maker-cli -p 127.0.0.1:<rpc-port> stop`. The port is the `rpc_port` line in the maker's `config.toml` (default 6103). Wait until the maker's log says it has shut down, and then run `docker stop openswap-makerd`. Docker may already have started the maker again by then. It waits a few seconds before it does anything, and `docker stop` keeps it down. A plain `docker stop` stops the maker at once.
 
 ### Taker
 
