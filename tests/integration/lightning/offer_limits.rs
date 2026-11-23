@@ -14,7 +14,7 @@ use openswap::{
     lightning::{InvoiceParams, LightningBackend, MockLightningBackend, Preimage},
     maker::{
         handlers::{handle_message, ConnectionState, Maker as _},
-        lightning_handlers::LnDirection,
+        lightning_handlers::{LnDirection, ADMIT_NEW_SWAP_OUTS},
     },
     protocol::{
         common_messages::{Hello, MakerToTakerMessage, TakerToMakerMessage},
@@ -63,6 +63,10 @@ fn outbound_only_node() -> Arc<MockLightningBackend> {
     setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
 )]
 fn maker_serves_only_the_direction_it_has_capacity_for(world: &mut World) {
+    // This checks capacity and the duplicate-id guard, which only decide
+    // anything while swap-out admission is open. With it closed (#1239),
+    // every swap-out request is refused before either is consulted.
+    let _admitted = Switch::on(&ADMIT_NEW_SWAP_OUTS);
     let maker = world.makers()[0].inner().clone();
     let amount = Amount::from_sat(40_000);
     let preimage = Preimage([0x55; 32]);
