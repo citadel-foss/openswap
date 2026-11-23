@@ -4054,10 +4054,15 @@ impl MakerTrait for MakerServer {
             }
         };
         // The family takes several round trips to read. They go over a
-        // connection of their own, after the wallet lock is released.
-        crate::wallet::Electrum::with_shutdown_flag(&config, shutdown)
-            .and_then(|side| side.mempool_package_fee(txid))
-            .map_err(MakerError::Wallet)
+        // connection of their own, after the wallet lock is released, and the
+        // watchdog waits at most 20 seconds for the whole answer.
+        crate::wallet::Electrum::package_fee_on_side_connection(
+            config,
+            shutdown,
+            *txid,
+            std::time::Duration::from_secs(20),
+        )
+        .map_err(MakerError::Wallet)
     }
 
     #[cfg(feature = "lightning")]

@@ -774,24 +774,47 @@ impl Electrum {
     }
 
     /// Fees of mempool transaction `txid` and of every mempool transaction
-    /// spending from it: what a replacement of `txid` has to pay above. The
-    /// family is found through the server's current script histories, read
-    /// for all of a transaction's outputs in one round trip, and each fee is
-    /// worked out from the transaction's inputs and outputs, not taken from the
-    /// server. `None` when `txid` is not in the mempool. A family no
-    /// replacement could evict, or one that takes too long to read, is an
-    /// error, so a partial sum is never taken for the whole.
+    /// spending from it: what a replacement of `txid` has to pay above. Read
+    /// on a separate connection built from `config`, on a thread of its own,
+    /// and the whole answer, name lookup and connection setup included, is
+    /// given at most `budget`: past it the caller gets an error and the
+    /// thread finishes on its own socket timeouts. The family is found
+    /// through the server's current script histories, read for all of a
+    /// transaction's outputs in one round trip, and each fee is worked out
+    /// from the transaction's inputs and outputs, not taken from the server.
+    /// `None` when `txid` is not in the mempool. A family no replacement could
+    /// evict, or one that takes too long to read, is an error, so a partial
+    /// sum is never taken for the whole.
     #[cfg(feature = "lightning")]
-    pub(crate) fn mempool_package_fee(
-        &self,
-        txid: &Txid,
+    pub(crate) fn package_fee_on_side_connection(
+        config: ElectrumConfig,
+        shutdown: Arc<AtomicBool>,
+        txid: Txid,
+        budget: Duration,
     ) -> Result<Option<bitcoin::Amount>, WalletError> {
-        self.package_fee_within(txid, Duration::from_secs(20))
+        let started = Instant::now();
+        let (answer, wait) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("electrum-package-fee".to_string())
+            .spawn(move || {
+                let fee = Self::with_shutdown_flag(&config, shutdown).and_then(|side| {
+                    side.package_fee_within(&txid, budget.saturating_sub(started.elapsed()))
+                });
+                let _ = answer.send(fee);
+            })
+            .map_err(|e| {
+                electrum_err(format!("electrum: cannot start the package fee read: {e}"))
+            })?;
+        wait.recv_timeout(budget).unwrap_or_else(|_| {
+            Err(electrum_err(format!(
+                "electrum: reading what spends from {txid} took more than {budget:?}"
+            )))
+        })
     }
 
-    /// [`Self::mempool_package_fee`] within `budget`. The budget is checked
-    /// before every round trip, so an answer takes at most the budget plus one
-    /// read's socket timeout.
+    /// The package fee of `txid` read on this connection within `budget`,
+    /// checked before every round trip. See
+    /// [`Self::package_fee_on_side_connection`].
     #[cfg(feature = "lightning")]
     fn package_fee_within(
         &self,
@@ -3148,17 +3171,21 @@ pub(crate) mod tests {
         // 1000 - 700 for the refund, whatever the server reports, and 700 - 200
         // for its child.
         assert_eq!(
-            backend.mempool_package_fee(&refund.compute_txid()).unwrap(),
+            backend
+                .package_fee_within(&refund.compute_txid(), Duration::from_secs(20))
+                .unwrap(),
             Some(Amount::from_sat(800))
         );
         assert_eq!(
-            backend.mempool_package_fee(&child.compute_txid()).unwrap(),
+            backend
+                .package_fee_within(&child.compute_txid(), Duration::from_secs(20))
+                .unwrap(),
             Some(Amount::from_sat(500))
         );
         // A confirmed transaction is not in the mempool.
         assert_eq!(
             backend
-                .mempool_package_fee(&funding.compute_txid())
+                .package_fee_within(&funding.compute_txid(), Duration::from_secs(20))
                 .unwrap(),
             None
         );
@@ -3184,7 +3211,9 @@ pub(crate) mod tests {
         let (backend, _server) = family_backend(entries, &[&funding, &refund]);
         // 1000 in, 120 outputs of 5 out.
         assert_eq!(
-            backend.mempool_package_fee(&refund.compute_txid()).unwrap(),
+            backend
+                .package_fee_within(&refund.compute_txid(), Duration::from_secs(20))
+                .unwrap(),
             Some(Amount::from_sat(400))
         );
     }
@@ -3221,7 +3250,9 @@ pub(crate) mod tests {
         let mut served = vec![&funding, &refund];
         served.extend(children.iter());
         let (backend, _server) = family_backend(json!(entries), &served);
-        assert!(backend.mempool_package_fee(&refund.compute_txid()).is_err());
+        assert!(backend
+            .package_fee_within(&refund.compute_txid(), Duration::from_secs(20))
+            .is_err());
     }
 
     /// A server too slow for the budget gets an error, not a partial sum: the
@@ -3270,6 +3301,40 @@ pub(crate) mod tests {
                 .package_fee_within(&refund.compute_txid(), Duration::from_secs(20))
                 .unwrap(),
             Some(Amount::from_sat(800))
+        );
+    }
+
+    /// A server that accepts the connection and never answers the handshake
+    /// does not hold the caller past the budget: setup counts against it too.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_gives_up_on_a_stalled_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        let config = ElectrumConfig {
+            url,
+            timeout: Some(5),
+            max_retries: 0,
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let fee = Electrum::package_fee_on_side_connection(
+            config,
+            Arc::new(AtomicBool::new(false)),
+            Txid::from_byte_array([7; 32]),
+            Duration::from_millis(300),
+        );
+        assert!(fee.is_err(), "{:?}", fee);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the caller waited {:?}",
+            started.elapsed()
         );
     }
 

@@ -491,6 +491,7 @@ openswap wallet::blockchain::electrum::tests::onion_without_proxy_is_rejected_be
 openswap wallet::blockchain::electrum::tests::only_the_unknown_txid_protocol_error_reads_as_absent
 openswap wallet::blockchain::electrum::tests::other_scripts_subscribe_while_one_is_refused
 openswap wallet::blockchain::electrum::tests::package_fee_adds_up_the_mempool_family
+openswap wallet::blockchain::electrum::tests::package_fee_gives_up_on_a_stalled_connection
 openswap wallet::blockchain::electrum::tests::package_fee_gives_up_when_the_server_is_too_slow
 openswap wallet::blockchain::electrum::tests::package_fee_reads_a_wide_refund
 openswap wallet::blockchain::electrum::tests::package_fee_refuses_a_family_no_replacement_can_evict
