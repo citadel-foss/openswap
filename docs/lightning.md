@@ -224,11 +224,13 @@ Lightning swap state lives in your wallet file. A build without the `lightning` 
 
 ## Current limitations
 
-- `ln-swap-out` needs a maker whose `ldk-server` is patched to allow a larger
-  invoice `min_final_cltv_expiry_delta`. Stock `ldk-node` holds a payment for
-  only a few blocks, which is narrower than the on-chain refund window, so a
-  maker running it rejects swap-outs rather than risk losing the funds. Swap-in
-  and routed swaps are unaffected.
+- Makers do not accept new swap-outs for now, so `ln-swap-out` and
+  `ln-swap-routed` (whose second hop is a swap-out) are refused before you pay
+  or fund anything. A maker cannot yet make sure the held Lightning payment
+  stays collectible if its on-chain funding confirms late, which could cost it
+  the swap amount ([#1239](https://github.com/citadel-foss/openswap/issues/1239)).
+  Swap-outs already in progress still complete or refund as before. Swap-in is
+  unaffected.
 - Requires an external `ldk-server` sidecar; there is no embedded node.
 - The `ldk-server` dependency is pinned to a specific upstream commit, so build
   it from the matching revision.

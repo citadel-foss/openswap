@@ -2366,10 +2366,14 @@ impl MakerServer {
         // the sidecar each time. Capacity that goes stale within the window
         // only costs a later rejection, never safety — the funding and
         // payment steps fail closed on their own.
+        //
+        // The cache holds capacity only. Whether swap-out is admitted at all
+        // is applied on the way out, so it never waits on the cache.
+        let advertised = super::lightning_handlers::advertised_offer;
         if let Ok(cache) = lock_debug!(self.ln_offer_cache.lock()) {
             if let Some((computed_at, offer)) = cache.as_ref() {
                 if computed_at.elapsed() < LN_OFFER_TTL {
-                    return *offer;
+                    return offer.and_then(advertised);
                 }
             }
         }
@@ -2377,7 +2381,7 @@ impl MakerServer {
         if let Ok(mut cache) = lock_debug!(self.ln_offer_cache.lock()) {
             *cache = Some((Instant::now(), offer));
         }
-        offer
+        offer.and_then(advertised)
     }
 
     /// Derives the Lightning offer from live node and wallet state.
