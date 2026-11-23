@@ -36,7 +36,7 @@ use openswap::{
         lightning_handlers::{
             ln_watchdog_tick_now, refuse_swap_in_after_wait, watchdog_expire_swap_in_snapshot,
             watchdog_finish_swap_in_snapshot, watchdog_resolve_swap_out_snapshot, LnDirection,
-            LnMakerPhase, LnMakerSwap, HIDE_HTLC_SPENDS,
+            LnMakerPhase, LnMakerSwap, ADMIT_NEW_SWAP_OUTS, HIDE_HTLC_SPENDS,
         },
         MakerBehavior, MakerError, MakerServer,
     },
@@ -90,6 +90,11 @@ fn maker_node_pair() -> (Arc<MockLightningBackend>, Arc<MockLightningBackend>) {
 /// Drives `maker` through a swap-out for `payment_hash` until it has funded
 /// the on-chain HTLC: request, the taker's held payment, then `SwapOutPaid`.
 /// The taker never claims, so only the maker's timelock branch remains.
+///
+/// Only the request runs with swap-out admission open, as on a maker built
+/// before #1239 closed it. Everything after, funding included, runs with
+/// admission closed: the swap is one already on record, which an upgraded
+/// maker must still fund, settle and refund.
 fn fund_swap_out(
     maker: &Arc<MakerServer>,
     ln: &MockLightningBackend,
@@ -112,6 +117,7 @@ fn fund_swap_out(
     )
     .unwrap();
 
+    let admitted = Switch::on(&ADMIT_NEW_SWAP_OUTS);
     let accept = match expect_ln(
         handle_message(
             maker,
@@ -131,6 +137,7 @@ fn fund_swap_out(
         LightningMakerMessage::SwapOutAccept(accept) => accept,
         other => panic!("expected SwapOutAccept, got {}", other),
     };
+    drop(admitted);
 
     // The taker's payment lands at the maker and is routed to its mailbox.
     ln.simulate_htlc_arrival(payment_hash, (amount + accept.fee).to_sat() * 1000);
@@ -1003,22 +1010,6 @@ fn spend_with_fee(bitcoind: &BitcoinD, parent: Txid, fee: Amount) -> Txid {
         .client
         .send_raw_transaction(&signed.transaction().unwrap())
         .unwrap()
-}
-
-/// Holds a watchdog test switch on until dropped, even if the test panics.
-struct Switch(&'static AtomicBool);
-
-impl Switch {
-    fn on(switch: &'static AtomicBool) -> Self {
-        switch.store(true, SeqCst);
-        Self(switch)
-    }
-}
-
-impl Drop for Switch {
-    fn drop(&mut self) {
-        self.0.store(false, SeqCst);
-    }
 }
 
 /// A test that panics while holding a [`Switch`] still leaves it off.

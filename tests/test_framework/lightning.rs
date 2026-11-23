@@ -1,6 +1,10 @@
 //! Mock-node channels and chain helpers for the Lightning tests.
 
-use std::{thread, time::Duration};
+use std::{
+    sync::atomic::{AtomicBool, Ordering::SeqCst},
+    thread,
+    time::Duration,
+};
 
 use bitcoin::{secp256k1::PublicKey, Amount, Txid};
 use bitcoind::{bitcoincore_rpc::RpcApi, BitcoinD};
@@ -10,6 +14,22 @@ use openswap::{
 };
 
 use super::procs::bitcoind::{generate_blocks, send_to_address};
+
+/// Holds a maker test switch on until dropped, even if the test panics.
+pub(crate) struct Switch(&'static AtomicBool);
+
+impl Switch {
+    pub(crate) fn on(switch: &'static AtomicBool) -> Self {
+        switch.store(true, SeqCst);
+        Self(switch)
+    }
+}
+
+impl Drop for Switch {
+    fn drop(&mut self) {
+        self.0.store(false, SeqCst);
+    }
+}
 
 /// Fetches a transaction by txid, retrying briefly: the asynchronous txindex
 /// can lag behind a freshly mined block under parallel test load.
