@@ -244,6 +244,7 @@ openswap taker::lightning_swap::tests::resumed_funding_is_checked_before_it_is_r
 openswap taker::lightning_swap::tests::resumed_funding_near_the_maker_refund_is_refused
 openswap taker::lightning_swap::tests::screened_out_resent_funding_is_dropped_unclaimed
 openswap taker::lightning_swap::tests::second_hop_funding_is_rechecked_after_the_maker_replies
+openswap taker::lightning_swap::tests::second_hop_is_not_resumed_while_first_hop_is_unconfirmed
 openswap taker::lightning_swap::tests::second_hop_is_resumed_only_while_first_hop_is_unspent
 openswap taker::lightning_swap::tests::swap_in_records_keep_their_recovery_behaviour
 openswap taker::lightning_swap::tests::unavailable_direct_payment_history_does_not_withhold_a_first_claim
@@ -252,6 +253,7 @@ openswap taker::lightning_swap::tests::unsaved_payout_script_broadcasts_nothing
 openswap taker::lightning_swap::tests::unsent_second_hop_claim_does_not_depend_on_record_order
 openswap taker::lightning_swap::tests::unsent_second_hop_claim_is_withheld_once_first_hop_refund_is_mature
 openswap taker::lightning_swap::tests::unsent_second_hop_claim_is_withheld_when_the_tip_is_lost_after_first_hop
+openswap taker::lightning_swap::tests::unsent_second_hop_claim_is_withheld_while_first_hop_is_unconfirmed
 openswap taker::lightning_swap::tests::unsent_second_hop_claim_is_withheld_while_first_hop_is_unknown
 openswap taker::lightning_swap::tests::unsent_second_hop_claim_without_its_first_hop_record_is_withheld
 openswap taker::lightning_swap::tests::unsent_second_hop_is_claimed_while_first_hop_refund_is_immature

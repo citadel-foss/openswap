@@ -1469,6 +1469,9 @@ fn payment_never_sent(error: &LightningError) -> bool {
 /// What the chain says about a routed swap's funded first hop.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FirstHop {
+    /// Funding seen but not in a block, as after a reorg: maker 1 has no
+    /// confirmed HTLC to take with the preimage.
+    Unconfirmed,
     /// Unspent, and our refund cannot be mined yet.
     Unspent,
     /// Unspent, but our refund can be mined in the next block.
@@ -1525,8 +1528,8 @@ fn unfunded_action<'a>(
 
 /// Why a routed second hop under `key` must not reveal the preimage with a
 /// first claim, and whether its first hop is resolved for good. `None` while
-/// the first hop is funded and unspent and our refund of it cannot be mined
-/// yet, and for a key that is not a second hop. A claim already sent has
+/// the first hop's funding is mined and unspent and our refund of it cannot
+/// be mined yet, and for a key that is not a second hop. A claim already sent has
 /// revealed the preimage and goes out again whatever the first hop's state,
 /// so this is only for a claim not yet sent. `records` is the pass's
 /// snapshot; `first_hop` reads a funded first hop, `None` when it cannot.
@@ -1554,6 +1557,10 @@ fn first_hop_hold(
             // it waits unconfirmed: claiming hop 2 would reveal the preimage
             // maker 1 needs too late for it to be repaid.
             Some(FirstHop::RefundMature) => Some(("first hop refund mature", false)),
+            // Back in the mempool, maker 1 can lose its HTLC to an eviction
+            // or a conflicting spend after the preimage is out. Wait until
+            // it is mined again.
+            Some(FirstHop::Unconfirmed) => Some(("first hop unconfirmed", false)),
             Some(FirstHop::Unspent) => None,
             None => Some(("first hop status unknown", false)),
         },
@@ -1575,13 +1582,11 @@ fn first_hop_state(chain: &AnyBlockchain, hop: &LnPendingSwap) -> Result<FirstHo
     }
     // Our refund can be mined in the next block once the funding has
     // `locktime` confirmations (BIP68), and recovery broadcasts it.
-    Ok(
-        if funding_confirmations(chain, &outpoint.txid)? >= hop.locktime as u32 {
-            FirstHop::RefundMature
-        } else {
-            FirstHop::Unspent
-        },
-    )
+    Ok(match funding_confirmations(chain, &outpoint.txid)? {
+        0 => FirstHop::Unconfirmed,
+        n if n >= hop.locktime as u32 => FirstHop::RefundMature,
+        _ => FirstHop::Unspent,
+    })
 }
 
 /// Only direct swap-out keys are payment hashes. A missing outbound record
@@ -4646,6 +4651,144 @@ mod tests {
             taker.recover_lightning_swaps().unwrap();
             assert_eq!(spends(&chain, second.outpoint), 1, "{}", case);
         }
+    }
+
+    /// A reorg returns hop 1's funding to the mempool, after maker 1 paid,
+    /// while hop 2 stays confirmed and otherwise claimable. Maker 1 then has
+    /// no confirmed HTLC to take with the preimage, so hop 2's first claim is
+    /// withheld and its funded record kept, also after a restart, and no
+    /// address is taken. Once hop 1 is mined again the existing checks
+    /// decide: with hop 2 still in its window the claim goes out; with hop
+    /// 2 past it, the claim stays withheld. Before, hop 1 at zero
+    /// confirmations read as unspent and the claim went out at once.
+    #[test]
+    fn unsent_second_hop_claim_is_withheld_while_first_hop_is_unconfirmed() {
+        // (tip when hop 1 is mined again, what the existing checks then do)
+        for (remined_at, expected) in [
+            (102, "awaiting confirmation"),
+            (119, "before the maker can refund"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let chain = Arc::new(Mutex::new(Chain::default()));
+            let (mut taker, server) = taker_with(dir.path(), &chain);
+            let (first, second, in_key, out_key) = unsent_route(&taker, &chain, true, 100);
+            // Hop 1 back in the mempool; hop 2 has 2 of its 30 at tip 101.
+            chain.lock().unwrap().set(&first.funding, Some(0));
+            chain.lock().unwrap().csv_tip = Some(101);
+            let index = external_index(&taker);
+
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            assert_eq!(spends(&chain, second.outpoint), 0, "{:?}", outcomes);
+            assert!(
+                outcome(&outcomes, &out_key).contains("claim withheld: first hop unconfirmed"),
+                "{:?}",
+                outcomes
+            );
+            assert_eq!(on_disk(dir.path(), &out_key), Some(funded(&second)));
+            assert!(on_disk(dir.path(), &in_key).is_some());
+            // One address, for our refund of hop 1, saved with its record;
+            // none for hop 2.
+            assert_eq!(external_index(&taker), index + 1);
+
+            // Restart from the wallet on disk.
+            drop(taker);
+            let wallet = Wallet::load_or_init(
+                &dir.path().join("wallet"),
+                AnyBlockchain::Electrum(
+                    Electrum::new(&ElectrumConfig {
+                        url: server.url.clone(),
+                        max_retries: 0,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+                Some("test-password".into()),
+            )
+            .unwrap();
+            let mut taker = Taker::for_test(wallet, dir.path());
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            assert_eq!(spends(&chain, second.outpoint), 0, "{:?}", outcomes);
+            assert!(
+                outcome(&outcomes, &out_key).contains("claim withheld: first hop unconfirmed"),
+                "{:?}",
+                outcomes
+            );
+            assert_eq!(on_disk(dir.path(), &out_key), Some(funded(&second)));
+            assert_eq!(external_index(&taker), index + 1);
+
+            // Hop 1 is mined again, 1 confirmation at `remined_at`.
+            chain.lock().unwrap().set(&first.funding, Some(remined_at));
+            chain.lock().unwrap().csv_tip = Some(remined_at);
+            connect(&taker, &server, remined_at);
+            let outcomes = taker.recover_lightning_swaps().unwrap();
+            assert!(
+                outcome(&outcomes, &out_key).contains(expected),
+                "{}: {:?}",
+                remined_at,
+                outcomes
+            );
+            let claimed = expected == "awaiting confirmation";
+            assert_eq!(
+                spends(&chain, second.outpoint),
+                claimed as usize,
+                "{}: {:?}",
+                remined_at,
+                outcomes
+            );
+            if !claimed {
+                assert_eq!(on_disk(dir.path(), &out_key), Some(funded(&second)));
+            }
+        }
+    }
+
+    /// A routed second hop with no outpoint, whose first hop's funding is
+    /// back in the mempool: the record is kept and maker 2 is not asked.
+    /// Once hop 1 is mined again, maker 2 is asked as before. Before, hop 1
+    /// at zero confirmations read as unspent and maker 2 was asked at once.
+    #[test]
+    fn second_hop_is_not_resumed_while_first_hop_is_unconfirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = Arc::new(Mutex::new(Chain::default()));
+        let first = swap_out("unused:1");
+        let mut second = swap_out("unused:1");
+        let unknown = LightningMakerMessage::Reject(LnReject {
+            swap_id: second.id.clone(),
+            reason: "unknown swap".into(),
+        });
+        let (maker, asked) = counting_maker(&second.id, unknown);
+        second.record.resume.as_mut().unwrap().maker = maker;
+        let (in_key, out_key) = (format!("{}-in", first.id), format!("{}-out", first.id));
+        chain.lock().unwrap().set(&first.funding, Some(0));
+        chain.lock().unwrap().csv_tip = Some(101);
+        let (mut taker, server) = taker_with(dir.path(), &chain);
+        taker
+            .save_pending_swap(&in_key, first_hop_record(&first))
+            .unwrap();
+        taker
+            .save_pending_swap(&out_key, second.record.clone())
+            .unwrap();
+
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert!(
+            outcome(&outcomes, &out_key).ends_with(": first hop unconfirmed; kept"),
+            "{:?}",
+            outcomes
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+        assert_eq!(on_disk(dir.path(), &out_key), Some(second.record.clone()));
+
+        // Hop 1 is mined again.
+        chain.lock().unwrap().set(&first.funding, Some(102));
+        chain.lock().unwrap().csv_tip = Some(102);
+        connect(&taker, &server, 102);
+        let outcomes = taker.recover_lightning_swaps().unwrap();
+        assert!(
+            outcome(&outcomes, &out_key).contains("funding not recovered yet"),
+            "{:?}",
+            outcomes
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert_eq!(on_disk(dir.path(), &out_key), Some(second.record.clone()));
     }
 
     /// Hop 2's first claim is withheld, and its funded record kept, while
