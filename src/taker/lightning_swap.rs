@@ -4572,19 +4572,26 @@ mod tests {
 
     /// One block before our refund of hop 1 can be mined, with hop 1 funded
     /// and unspent, and hop 2's funding at the last block of its safety
-    /// margin: hop 2's first claim goes out.
+    /// margin: hop 2's first claim goes out. The mock applies BIP68, so our
+    /// refund of hop 1, broadcast in the same pass, is refused as immature.
     #[test]
     fn unsent_second_hop_is_claimed_while_first_hop_refund_is_immature() {
         let dir = tempfile::tempdir().unwrap();
         let chain = Arc::new(Mutex::new(Chain::default()));
         let (mut taker, server) = taker_with(dir.path(), &chain);
-        let (_, second, _, out_key) = unsent_route(&taker, &chain, true, 111);
+        let (_, second, in_key, out_key) = unsent_route(&taker, &chain, true, 111);
         // Hop 1 has 29 of its 30 confirmations; hop 2 has 18.
         connect(&taker, &server, 128);
+        chain.lock().unwrap().csv_tip = Some(128);
         let outcomes = taker.recover_lightning_swaps().unwrap();
         assert_eq!(spends(&chain, second.outpoint), 1, "{:?}", outcomes);
         assert!(
             outcome(&outcomes, &out_key).contains("awaiting confirmation"),
+            "{:?}",
+            outcomes
+        );
+        assert!(
+            outcome(&outcomes, &in_key).contains("refund not yet mature (locktime 30)"),
             "{:?}",
             outcomes
         );
