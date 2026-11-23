@@ -43,7 +43,7 @@ use crate::{
             LnSwapOutRequest,
         },
     },
-    utill::generate_keypair,
+    utill::{fee_at_rate_sats, generate_keypair},
     wallet::LnMakerSwapRecord,
     watch_tower::watcher::WatcherEvent,
 };
@@ -1014,7 +1014,7 @@ fn sweep_swap_in<M: Maker>(
             log::warn!("lightning: claim build failed: {e}");
             MakerError::General("claim build failed")
         })?;
-    swap.sweep_feerate = Some(feerate);
+    swap.sweep_feerate = Some(rate_paid(&claim_tx, value, feerate));
     // Record the preimage and the swept phase before broadcasting: the
     // record is what lets the watchdog rebuild this sweep if the broadcast
     // is evicted, and it must not be dropped until the sweep confirms.
@@ -1138,8 +1138,14 @@ fn watchdog_finish_sweep<M: Maker>(
                 "Swap-in {swap_id}: contesting the taker's refund {} at {rate} sat/vB",
                 refund.compute_txid()
             );
-            if let Err(e) = maker.broadcast_transaction(&sweep) {
-                log::warn!("Swap-in {swap_id}: sweep did not replace the taker's refund: {e:?}");
+            match maker.broadcast_transaction(&sweep) {
+                // The wallet reads the sweep's output in.
+                Ok(_) => {
+                    let _ = maker.sync_and_save_wallet();
+                }
+                Err(e) => {
+                    log::warn!("Swap-in {swap_id}: sweep did not replace the taker's refund: {e:?}")
+                }
             }
             return Ok(());
         }
@@ -1152,7 +1158,7 @@ fn watchdog_finish_sweep<M: Maker>(
             return Ok(());
         }
     };
-    let claim_tx = match plan_spend(
+    let (claim_tx, replaced) = match plan_spend(
         build,
         value,
         built_at,
@@ -1165,7 +1171,7 @@ fn watchdog_finish_sweep<M: Maker>(
                 .unwrap_or(false)
         },
     )? {
-        PlannedSpend::Resend(tx) => tx,
+        PlannedSpend::Resend(tx) => (tx, false),
         PlannedSpend::New { tx, rate, .. } => {
             let mut next = swap.clone();
             next.sweep_feerate = Some(rate);
@@ -1173,11 +1179,18 @@ fn watchdog_finish_sweep<M: Maker>(
                 return Ok(());
             }
             log::info!("Swap-in {swap_id}: sweep sent at {rate} sat/vB, up from {built_at}");
-            tx
+            (tx, true)
         }
     };
     match maker.broadcast_transaction(&claim_tx) {
-        Ok(txid) => log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}"),
+        Ok(txid) => {
+            log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}");
+            // The wallet may still hold the output of the sweep this
+            // replaced; read the new one in.
+            if replaced {
+                let _ = maker.sync_and_save_wallet();
+            }
+        }
         Err(e) => log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}"),
     }
     Ok(())
@@ -1939,7 +1952,10 @@ fn watchdog_resolve_swap_out(
             // were priced was built at [`SPEND_FEE_RATE_FLOOR`].
             let market = maker.htlc_spend_feerate();
             let (feerate, refund_tx) = match swap.refund_txid {
-                None => (market, build(market)?),
+                None => {
+                    let tx = build(market)?;
+                    (rate_paid(&tx, value, market), tx)
+                }
                 Some(_) => {
                     let built_at = swap.refund_feerate.unwrap_or(SPEND_FEE_RATE_FLOOR);
                     match plan_spend(
@@ -2045,8 +2061,9 @@ fn fee_paid(tx: &bitcoin::Transaction, value: Amount) -> Amount {
 /// rate. It pays `to_beat`, the fee of the refund and anything spending from
 /// it, plus the replacement step for [`SPEND_TX_VSIZE`]. It also pays more per
 /// vbyte than the refund by that step, since a replacement must, and the
-/// sweep is the larger of the two. It never goes below `floor_rate`. `None`
-/// when the HTLC cannot pay that much and the dust fallback would undo it.
+/// sweep is the larger of the two. It takes `floor_rate`, the market or
+/// recorded rate, when that is more and the HTLC affords it. `None` when the
+/// HTLC cannot pay even the least that replaces the refund.
 fn outbid_refund(
     build: impl Fn(f64) -> Result<bitcoin::Transaction, MakerError>,
     value: Amount,
@@ -2056,14 +2073,32 @@ fn outbid_refund(
     to_beat: Amount,
 ) -> Result<Option<(bitcoin::Transaction, f64)>, MakerError> {
     let refund_rate = fee_paid(refund, value).to_sat() as f64 / refund.vsize() as f64;
-    let rate = floor_rate
-        .max(to_beat.to_sat() as f64 / SPEND_TX_VSIZE as f64 + increment)
-        .max(refund_rate + increment);
-    let sweep = build(rate)?;
-    if fee_paid(&sweep, value) <= to_beat {
-        return Ok(None);
+    let needed = (to_beat.to_sat() as f64 / SPEND_TX_VSIZE as f64 + increment)
+        .max(refund_rate + increment)
+        .max(SPEND_FEE_RATE_FLOOR);
+    // The market or recorded rate when the HTLC affords it, else the least
+    // that still replaces the refund. A build the dust fallback undid pays
+    // less than its rate asks, so it is never sent.
+    let mut rates = vec![floor_rate.max(needed)];
+    if floor_rate > needed {
+        rates.push(needed);
     }
-    Ok(Some((sweep, rate)))
+    for rate in rates {
+        let sweep = build(rate)?;
+        if rate_paid(&sweep, value, rate) == rate {
+            return Ok(Some((sweep, rate)));
+        }
+    }
+    Ok(None)
+}
+
+/// The rate `tx` pays: `rate`, or the floor when the dust fallback stood in
+/// for it, so a record never claims a rate its spend did not pay.
+fn rate_paid(tx: &bitcoin::Transaction, value: Amount, rate: f64) -> f64 {
+    match fee_at_rate_sats(SPEND_TX_VSIZE, rate) {
+        Some(asked) if fee_paid(tx, value).to_sat() >= asked => rate,
+        _ => SPEND_FEE_RATE_FLOOR,
+    }
 }
 
 /// What the watchdog sends for an unconfirmed HTLC spend of ours.
@@ -2103,9 +2138,10 @@ fn plan_spend(
             let tx = build(market)?;
             // A rate the dust fallback undoes keeps the recorded spend.
             if fee_paid(&tx, value) > fee_paid(&recorded, value) {
+                let rate = rate_paid(&tx, value, market);
                 return Ok(PlannedSpend::New {
                     tx,
-                    rate: market,
+                    rate,
                     replaces: None,
                 });
             }
@@ -2125,9 +2161,10 @@ fn plan_spend(
     if fee_paid(&tx, value) <= paid {
         return Ok(PlannedSpend::Resend(pending));
     }
+    let rate = rate_paid(&tx, value, market);
     Ok(PlannedSpend::New {
         tx,
-        rate: market,
+        rate,
         replaces: Some(txid),
     })
 }
@@ -2181,7 +2218,7 @@ fn resend_refund(
             return Ok(());
         }
     };
-    let refund = match plan_spend(
+    let (refund, replaced) = match plan_spend(
         build,
         value,
         built_at,
@@ -2194,7 +2231,7 @@ fn resend_refund(
                 .unwrap_or(false)
         },
     )? {
-        PlannedSpend::Resend(tx) => tx,
+        PlannedSpend::Resend(tx) => (tx, false),
         PlannedSpend::New { tx, rate, .. } => {
             let mut next = swap.clone();
             let txid = tx.compute_txid();
@@ -2211,11 +2248,17 @@ fn resend_refund(
                 return Ok(());
             }
             log::info!("Swap-out {swap_id}: refund sent at {rate} sat/vB, up from {built_at}");
-            tx
+            (tx, true)
         }
     };
     match maker.broadcast_transaction(&refund) {
-        Ok(txid) => log::info!("Swap-out {swap_id}: refund sent as {txid}"),
+        Ok(txid) => {
+            log::info!("Swap-out {swap_id}: refund sent as {txid}");
+            // As for the sweep: drop the replaced refund's output.
+            if replaced {
+                let _ = maker.sync_and_save_wallet();
+            }
+        }
         Err(e) => log::debug!("Swap-out {swap_id}: refund rebroadcast rejected: {e:?}"),
     }
     Ok(())
@@ -2641,6 +2684,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rate, 30.0);
+    }
+
+    /// A spend whose rate left dust paid the floor, and is recorded at the
+    /// floor, so it is bumped once the market falls to a rate the HTLC
+    /// affords instead of being resent at the floor for good.
+    #[test]
+    fn a_fallback_spend_records_the_floor_it_pays() {
+        let swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InSwept);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(sweep_at(&swap, value, rate));
+        let fallback = sweep_at(&swap, value, 300.0);
+        let recorded = rate_paid(&fallback, value, 300.0);
+        assert_eq!(recorded, SPEND_FEE_RATE_FLOOR);
+        assert_eq!(rate_paid(&sweep_at(&swap, value, 40.0), value, 40.0), 40.0);
+        match plan_spend(build, value, recorded, 40.0, 1.0, Some(fallback), |_| true).unwrap() {
+            PlannedSpend::New { rate, .. } => assert_eq!(rate, 40.0),
+            other => panic!("the floor spend was not bumped: {:?}", other),
+        }
+    }
+
+    /// A market rate the HTLC cannot afford does not stop the contest: the
+    /// sweep goes out at the least rate that replaces the refund's family.
+    #[test]
+    fn an_unaffordable_market_rate_outbids_at_the_least_that_replaces() {
+        let swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InSwept);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(sweep_at(&swap, value, rate));
+        let refund = refund_at(&swap, value, SPEND_FEE_RATE_FLOOR);
+        // The refund and a child pay 1800 sat; 300 sat/vB asks 45,000.
+        let to_beat = Amount::from_sat(1_800);
+        let (sweep, rate) = outbid_refund(build, value, 300.0, 1.0, &refund, to_beat)
+            .unwrap()
+            .expect("13 sat/vB replaces the family");
+        assert_eq!(rate, 13.0);
+        assert_eq!(fee_paid(&sweep, value), Amount::from_sat(1_950));
+        assert!(replaces(&sweep, &refund, value, to_beat));
     }
 
     #[test]

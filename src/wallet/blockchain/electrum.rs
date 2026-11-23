@@ -766,8 +766,9 @@ impl Electrum {
     /// family is found through the server's current script histories, and
     /// each fee is worked out from the transaction's inputs and outputs, not
     /// taken from the server. `None` when `txid` is not in the mempool. A
-    /// family no replacement could evict is an error, so a partial sum is
-    /// never taken for the whole.
+    /// family no replacement could evict, or one the request and time budget
+    /// cannot read, is an error, so a partial sum is never taken for the
+    /// whole.
     #[cfg(feature = "lightning")]
     pub(crate) fn mempool_package_fee(
         &self,
@@ -775,11 +776,29 @@ impl Electrum {
     ) -> Result<Option<bitcoin::Amount>, WalletError> {
         // A replacement may evict at most 100 transactions (BIP125 rule 5).
         const MAX_FAMILY: usize = 100;
+        // Server round trips and time for one answer. A refund and a child
+        // take a handful; the budget bounds a family built to stall it.
+        const MAX_REQUESTS: usize = 100;
+        const MAX_TIME: Duration = Duration::from_secs(5);
+        let started = Instant::now();
+        let mut requests = 0;
+        let mut charge = || {
+            requests += 1;
+            if requests > MAX_REQUESTS || started.elapsed() > MAX_TIME {
+                return Err(electrum_err(format!(
+                    "electrum: reading what spends from {txid} took more than \
+                     {MAX_REQUESTS} requests or {MAX_TIME:?}"
+                )));
+            }
+            Ok(())
+        };
+        let mut txs: HashMap<Txid, Transaction> = HashMap::new();
+        let mut histories: HashMap<ScriptBuf, Vec<GetHistoryRes>> = HashMap::new();
         let mut total = bitcoin::Amount::ZERO;
         let mut family = HashSet::from([*txid]);
-        let mut checked = HashSet::new();
         let mut queue = vec![*txid];
         while let Some(parent) = queue.pop() {
+            charge()?;
             let tx = match self.transaction_get_live(&parent) {
                 Ok(tx) => tx,
                 Err(WalletError::Electrum(ref e)) if is_unknown_txid(e) && parent == *txid => {
@@ -790,9 +809,15 @@ impl Electrum {
             let mut pending = false;
             for (vout, output) in tx.output.iter().enumerate() {
                 let spent = OutPoint::new(parent, vout as u32);
-                let history =
-                    self.call(GET_HISTORY, |c| c.script_get_history(&output.script_pubkey))?;
-                for entry in history {
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    histories.entry(output.script_pubkey.clone())
+                {
+                    charge()?;
+                    slot.insert(
+                        self.call(GET_HISTORY, |c| c.script_get_history(&output.script_pubkey))?,
+                    );
+                }
+                for entry in &histories[&output.script_pubkey] {
                     if entry.tx_hash == parent {
                         pending |= entry.height <= 0;
                         continue;
@@ -800,11 +825,13 @@ impl Electrum {
                     if entry.height > 0 || family.contains(&entry.tx_hash) {
                         continue;
                     }
-                    if !checked.insert((entry.tx_hash, spent)) {
-                        continue;
+                    if let std::collections::hash_map::Entry::Vacant(slot) =
+                        txs.entry(entry.tx_hash)
+                    {
+                        charge()?;
+                        slot.insert(self.transaction_get_live(&entry.tx_hash)?);
                     }
-                    let candidate = self.transaction_get_live(&entry.tx_hash)?;
-                    if candidate
+                    if txs[&entry.tx_hash]
                         .input
                         .iter()
                         .any(|input| input.previous_output == spent)
@@ -827,17 +854,24 @@ impl Electrum {
                     "electrum: {parent} spends from {txid} but is not in the mempool"
                 )));
             }
-            total = checked_add_amount(total, self.fee_from_inputs(&tx)?, "package fee")?;
+            let fee = self.fee_from_inputs(&tx, &mut charge)?;
+            total = checked_add_amount(total, fee, "package fee")?;
         }
         Ok(Some(total))
     }
 
     /// What `tx` pays in fees: its inputs' values, read from the transactions
-    /// they spend, each checked against its txid, less its outputs.
+    /// they spend, each checked against its txid, less its outputs. `charge`
+    /// counts each read against the caller's budget.
     #[cfg(feature = "lightning")]
-    fn fee_from_inputs(&self, tx: &Transaction) -> Result<bitcoin::Amount, WalletError> {
+    fn fee_from_inputs(
+        &self,
+        tx: &Transaction,
+        charge: &mut impl FnMut() -> Result<(), WalletError>,
+    ) -> Result<bitcoin::Amount, WalletError> {
         let mut inputs = bitcoin::Amount::ZERO;
         for input in &tx.input {
+            charge()?;
             let prev = self.transaction_get_validating(&input.previous_output.txid)?;
             let output = prev
                 .output
@@ -3058,24 +3092,7 @@ pub(crate) mod tests {
             { "tx_hash": child.compute_txid(), "height": -1 },
             { "tx_hash": unrelated.compute_txid(), "height": 0, "fee": 50 },
         ]);
-        let served: HashMap<String, String> = [&funding, &refund, &child, &unrelated]
-            .iter()
-            .map(|tx| (tx.compute_txid().to_string(), serialize_hex(*tx)))
-            .collect();
-        let server = mock_electrum(move |method, params| match method {
-            "blockchain.scripthash.get_history" => Ok(entries.clone()),
-            "blockchain.transaction.get" => served
-                .get(params[0].as_str().unwrap_or_default())
-                .map(|hex| json!(hex))
-                .ok_or_else(|| json!({ "code": 1, "message": "daemon error" })),
-            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
-        });
-        let backend = Electrum::new(&ElectrumConfig {
-            url: server.url.clone(),
-            max_retries: 0,
-            ..Default::default()
-        })
-        .expect("connect to mock electrum");
+        let (backend, _server) = family_backend(entries, &[&funding, &refund, &child, &unrelated]);
         // 1000 - 700 for the refund, whatever the server reports, and 700 - 200
         // for its child.
         assert_eq!(
@@ -3093,6 +3110,56 @@ pub(crate) mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// Mempool noise on the refund's script costs a fetch per entry even
+    /// though none of it spends the refund. Past the budget the answer is an
+    /// error, never a partial sum.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_stops_at_its_request_budget() {
+        let funding = deposit(1);
+        let mut refund = spend_of(OutPoint::new(funding.compute_txid(), 0));
+        refund.output[0].value = Amount::from_sat(700);
+        let noise: Vec<Transaction> = (10..=130).map(deposit).collect();
+        let mut entries = vec![
+            json!({ "tx_hash": funding.compute_txid(), "height": 101 }),
+            json!({ "tx_hash": refund.compute_txid(), "height": 0 }),
+        ];
+        entries.extend(
+            noise
+                .iter()
+                .map(|tx| json!({ "tx_hash": tx.compute_txid(), "height": 0 })),
+        );
+        let mut served = vec![&funding, &refund];
+        served.extend(noise.iter());
+        let (backend, _server) = family_backend(json!(entries), &served);
+        assert!(backend.mempool_package_fee(&refund.compute_txid()).is_err());
+    }
+
+    /// A backend whose server lists `entries` as every script's history and
+    /// serves `txs`.
+    #[cfg(feature = "lightning")]
+    fn family_backend(entries: Value, txs: &[&Transaction]) -> (Electrum, MockElectrum) {
+        let served: HashMap<String, String> = txs
+            .iter()
+            .map(|tx| (tx.compute_txid().to_string(), serialize_hex(*tx)))
+            .collect();
+        let server = mock_electrum(move |method, params| match method {
+            "blockchain.scripthash.get_history" => Ok(entries.clone()),
+            "blockchain.transaction.get" => served
+                .get(params[0].as_str().unwrap_or_default())
+                .map(|hex| json!(hex))
+                .ok_or_else(|| json!({ "code": 1, "message": "daemon error" })),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        (backend, server)
     }
 
     /// A transaction the server cannot serve leaves the spend unknown only if

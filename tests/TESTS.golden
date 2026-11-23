@@ -106,12 +106,14 @@ openswap maker::handlers::tests::taproot_refund_deadline_is_exact_at_the_boundar
 openswap maker::legacy_verification::tests::locktime_that_overflows_the_refund_step_is_rejected
 openswap maker::legacy_verification::tests::normal_locktime_is_accepted
 openswap maker::lightning_handlers::tests::a_draining_maker_refuses_new_lightning_swaps
+openswap maker::lightning_handlers::tests::a_fallback_spend_records_the_floor_it_pays
 openswap maker::lightning_handlers::tests::a_pending_spend_is_bumped_past_the_step_while_its_output_is_unspent
 openswap maker::lightning_handlers::tests::a_pending_spend_is_read_by_its_fee_not_by_the_record
 openswap maker::lightning_handlers::tests::a_rate_the_dust_fallback_undoes_is_not_sent
 openswap maker::lightning_handlers::tests::a_refund_the_htlc_cannot_outbid_is_left_alone
 openswap maker::lightning_handlers::tests::a_refund_this_swap_replaced_is_still_ours
 openswap maker::lightning_handlers::tests::a_taker_refund_is_outbid_by_fee_and_by_feerate
+openswap maker::lightning_handlers::tests::an_unaffordable_market_rate_outbids_at_the_least_that_replaces
 openswap maker::lightning_handlers::tests::compat_lightning_pins_require_exact_direction_and_requirements
 openswap maker::lightning_handlers::tests::directions_are_bounded_by_opposite_channel_sides
 openswap maker::lightning_handlers::tests::nothing_pending_goes_out_at_the_market_rate_never_below_the_record
@@ -487,6 +489,7 @@ openswap wallet::blockchain::electrum::tests::onion_without_proxy_is_rejected_be
 openswap wallet::blockchain::electrum::tests::only_the_unknown_txid_protocol_error_reads_as_absent
 openswap wallet::blockchain::electrum::tests::other_scripts_subscribe_while_one_is_refused
 openswap wallet::blockchain::electrum::tests::package_fee_adds_up_the_mempool_family
+openswap wallet::blockchain::electrum::tests::package_fee_stops_at_its_request_budget
 openswap wallet::blockchain::electrum::tests::ping_cadence_follows_proxy
 openswap wallet::blockchain::electrum::tests::ping_cadence_override_wins
 openswap wallet::blockchain::electrum::tests::proxy_does_not_require_an_onion_url
