@@ -3199,6 +3199,43 @@ mod tests {
         maker.watch_service.shutdown();
     }
 
+    /// A height correction whose save fails puts the wallet record back to
+    /// the height it had, so the record and the swap still agree, and a
+    /// later correction succeeds.
+    #[test]
+    fn failed_funding_height_save_keeps_the_known_height() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let (swap, funding) = funded_swap_out(Some(9));
+        let id = swap.payment_hash.to_string();
+        let outpoint = swap.funding.unwrap().0;
+        let node = Arc::new(Mutex::new(chain_with(Some((&funding, 10)), 100)));
+        let (maker, _ctx, _broadcast) = csv_gate_maker(dir.path(), &swap, node, Default::default());
+        // A directory where the wallet file was makes every save fail.
+        let path = maker.wallet.read().unwrap().wallet_file_path.clone();
+        let saved = path.with_extension("saved");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(maker
+            .fill_ln_funding_height(&id, LnMakerPhase::OutFunded, outpoint, Some(9), 10)
+            .is_err());
+        assert_eq!(
+            stored_height_and_refund(&maker, &id),
+            (Some(9), None, Some(9), None)
+        );
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert!(maker
+            .fill_ln_funding_height(&id, LnMakerPhase::OutFunded, outpoint, Some(9), 10)
+            .unwrap());
+        assert_eq!(
+            stored_height_and_refund(&maker, &id),
+            (Some(10), None, Some(10), None)
+        );
+        maker.watch_service.shutdown();
+    }
+
     #[test]
     fn recorded_refund_recovery_survives_direct_lookup_failure() {
         use crate::{
