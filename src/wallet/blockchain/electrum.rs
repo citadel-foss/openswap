@@ -786,16 +786,27 @@ impl Electrum {
         &self,
         txid: &Txid,
     ) -> Result<Option<bitcoin::Amount>, WalletError> {
+        self.package_fee_within(txid, Duration::from_secs(20))
+    }
+
+    /// [`Self::mempool_package_fee`] within `budget`. The budget is checked
+    /// before every round trip, so an answer takes at most the budget plus one
+    /// read's socket timeout.
+    #[cfg(feature = "lightning")]
+    fn package_fee_within(
+        &self,
+        txid: &Txid,
+        budget: Duration,
+    ) -> Result<Option<bitcoin::Amount>, WalletError> {
         // A replacement may evict at most 100 transactions (BIP125 rule 5).
         const MAX_FAMILY: usize = 100;
-        // Each read has its own socket timeout on a side connection; this
-        // bounds the whole answer.
-        const MAX_TIME: Duration = Duration::from_secs(20);
+        // Transactions per batched fetch.
+        const TX_BATCH: usize = 100;
         let started = Instant::now();
         let in_time = || {
-            if started.elapsed() > MAX_TIME {
+            if started.elapsed() > budget {
                 return Err(electrum_err(format!(
-                    "electrum: reading what spends from {txid} took more than {MAX_TIME:?}"
+                    "electrum: reading what spends from {txid} took more than {budget:?}"
                 )));
             }
             Ok(())
@@ -862,12 +873,15 @@ impl Electrum {
                     "electrum: {parent} spends from {txid} but is not in the mempool"
                 )));
             }
-            in_time()?;
-            self.prefetch_transactions(&candidates)?;
+            for chunk in candidates.chunks(TX_BATCH) {
+                in_time()?;
+                self.prefetch_transactions(chunk)?;
+            }
             for candidate in candidates {
                 if family.contains(&candidate) {
                     continue;
                 }
+                in_time()?;
                 let spends_parent = self
                     .transaction_get_validating(&candidate)?
                     .input
@@ -883,26 +897,33 @@ impl Electrum {
                     queue.push(candidate);
                 }
             }
-            in_time()?;
-            let fee = self.fee_from_inputs(&tx)?;
+            let fee = self.fee_from_inputs(&tx, &in_time)?;
             total = checked_add_amount(total, fee, "package fee")?;
         }
         Ok(Some(total))
     }
 
-    /// What `tx` pays in fees: its inputs' values, read in one round trip from
-    /// the transactions they spend, each checked against its txid, less its
-    /// outputs.
+    /// What `tx` pays in fees: its inputs' values, read in batches from the
+    /// transactions they spend, each checked against its txid, less its
+    /// outputs. `in_time` is asked before every round trip.
     #[cfg(feature = "lightning")]
-    fn fee_from_inputs(&self, tx: &Transaction) -> Result<bitcoin::Amount, WalletError> {
+    fn fee_from_inputs(
+        &self,
+        tx: &Transaction,
+        in_time: &impl Fn() -> Result<(), WalletError>,
+    ) -> Result<bitcoin::Amount, WalletError> {
         let spent: Vec<Txid> = tx
             .input
             .iter()
             .map(|input| input.previous_output.txid)
             .collect();
-        self.prefetch_transactions(&spent)?;
+        for chunk in spent.chunks(100) {
+            in_time()?;
+            self.prefetch_transactions(chunk)?;
+        }
         let mut inputs = bitcoin::Amount::ZERO;
         for input in &tx.input {
+            in_time()?;
             let prev = self.transaction_get_validating(&input.previous_output.txid)?;
             let output = prev
                 .output
@@ -3201,6 +3222,55 @@ pub(crate) mod tests {
         served.extend(children.iter());
         let (backend, _server) = family_backend(json!(entries), &served);
         assert!(backend.mempool_package_fee(&refund.compute_txid()).is_err());
+    }
+
+    /// A server too slow for the budget gets an error, not a partial sum: the
+    /// budget is asked before every round trip.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_gives_up_when_the_server_is_too_slow() {
+        let funding = deposit(1);
+        let mut refund = spend_of(OutPoint::new(funding.compute_txid(), 0));
+        refund.output[0].value = Amount::from_sat(700);
+        let mut child = spend_of(OutPoint::new(refund.compute_txid(), 0));
+        child.output[0].value = Amount::from_sat(200);
+        let entries = json!([
+            { "tx_hash": funding.compute_txid(), "height": 101 },
+            { "tx_hash": refund.compute_txid(), "height": 0 },
+            { "tx_hash": child.compute_txid(), "height": 0 },
+        ]);
+        let served: HashMap<String, String> = [&funding, &refund, &child]
+            .iter()
+            .map(|tx| (tx.compute_txid().to_string(), serialize_hex(*tx)))
+            .collect();
+        let server = mock_electrum(move |method, params| match method {
+            "blockchain.scripthash.get_history" => {
+                thread::sleep(Duration::from_millis(300));
+                Ok(entries.clone())
+            }
+            "blockchain.transaction.get" => served
+                .get(params[0].as_str().unwrap_or_default())
+                .map(|hex| json!(hex))
+                .ok_or_else(|| json!({ "code": 1, "message": "daemon error" })),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        assert!(backend
+            .package_fee_within(&refund.compute_txid(), Duration::from_millis(100))
+            .is_err());
+        // With time to spare the same family reads in full: 300 for the
+        // refund and 500 for its child.
+        assert_eq!(
+            backend
+                .package_fee_within(&refund.compute_txid(), Duration::from_secs(20))
+                .unwrap(),
+            Some(Amount::from_sat(800))
+        );
     }
 
     /// A backend whose server lists `entries` as every script's history and

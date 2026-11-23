@@ -942,6 +942,132 @@ fn run_watchdog_outbids_a_taker_refund_and_its_child(
     maker.watch_service.shutdown();
 }
 
+/// The taker's refund can spread over many outputs, each to its own
+/// address, so reading what spends from it touches as many scripts. The
+/// sweep still replaces it, on Core and on Electrum, where the outputs'
+/// histories are read in one batch.
+#[world_test(
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    cases = [
+        watchdog_outbids_a_wide_taker_refund(backend = BitcoindBackend),
+        /// Same on Electrum.
+        watchdog_outbids_a_wide_taker_refund_on_electrum(backend = ElectrumBackend),
+    ],
+)]
+fn run_watchdog_outbids_a_wide_taker_refund(world: &mut World, ln: Arc<MockLightningBackend>) {
+    let _ = &ln;
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+    let _market = SpendFeerate::set(SPEND_FEE_RATE_FLOOR);
+
+    let preimage = Preimage([0xb6; 32]);
+    let (swap, funding) = swept_past_its_refund_window(bitcoind, &maker, &preimage);
+    let value = swap.amount + swap.fee;
+    let refund = broadcast_wide_taker_refund(bitcoind, &swap, funding, 50);
+    let refund_tx = bitcoind.client.get_raw_transaction(&refund, None).unwrap();
+    let refund_fee = value
+        - refund_tx
+            .output
+            .iter()
+            .map(|output| output.value)
+            .sum::<Amount>();
+    // It pays its fee plus the 1 sat/vB step for 150 vB, and more per vbyte
+    // than the refund by that step.
+    let rate = (refund_fee.to_sat() as f64 / 150.0 + 1.0)
+        .max(refund_fee.to_sat() as f64 / refund_tx.vsize() as f64 + 1.0)
+        .max(SPEND_FEE_RATE_FLOOR);
+
+    let gone = |txid: &Txid| bitcoind.client.get_mempool_entry(txid).is_err();
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(500),
+        "the sweep to replace the wide taker refund",
+        {
+            ln_watchdog_tick_now(&maker);
+            gone(&refund)
+        }
+    );
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat((rate * 150.0).ceil() as u64),
+        "the sweep must outbid the {} sat refund by fee and by feerate",
+        refund_fee.to_sat()
+    );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
+/// Broadcasts the taker's refund of `swap`'s HTLC spread over `outputs`
+/// outputs, each to its own address of the node's wallet, paying 3 sat/vB
+/// on its real size. Signed with the taker's key like
+/// [`broadcast_taker_refund`].
+fn broadcast_wide_taker_refund(
+    bitcoind: &BitcoinD,
+    swap: &LnMakerSwap,
+    funding: OutPoint,
+    outputs: usize,
+) -> Txid {
+    use bitcoin::{
+        secp256k1::Message,
+        sighash::{EcdsaSighashType, SighashCache},
+        ScriptBuf, TxOut, Witness,
+    };
+    let timelock_privkey = SecretKey::from_slice(&[0x42; 32]).unwrap();
+    let value = swap.amount + swap.fee;
+    let mut refund = swap
+        .htlc
+        .create_timelock_spend(
+            funding,
+            value,
+            &timelock_privkey,
+            ScriptBuf::new(),
+            SPEND_FEE_RATE_FLOOR,
+        )
+        .unwrap();
+    refund.output = (0..outputs)
+        .map(|_| TxOut {
+            value: Amount::ZERO,
+            script_pubkey: bitcoind
+                .client
+                .get_new_address(None, None)
+                .unwrap()
+                .require_network(Network::Regtest)
+                .unwrap()
+                .script_pubkey(),
+        })
+        .collect();
+    let fee = Amount::from_sat(3 * refund.vsize() as u64);
+    let each = (value - fee) / outputs as u64;
+    for output in &mut refund.output {
+        output.value = each;
+    }
+    let paid = each * outputs as u64;
+    refund.output[0].value += value - fee - paid;
+    let sighash = SighashCache::new(&refund)
+        .p2wsh_signature_hash(0, swap.htlc.redeemscript(), value, EcdsaSighashType::All)
+        .unwrap();
+    let signature = bitcoin::ecdsa::Signature {
+        signature: Secp256k1::new().sign_ecdsa_low_r(
+            &Message::from_digest(sighash.to_byte_array()),
+            &timelock_privkey,
+        ),
+        sighash_type: EcdsaSighashType::All,
+    };
+    let mut witness = Witness::new();
+    witness.push(signature.to_vec());
+    witness.push(Vec::<u8>::new());
+    witness.push(swap.htlc.redeemscript().to_bytes());
+    refund.input[0].witness = witness;
+    bitcoind.client.send_raw_transaction(&refund).unwrap()
+}
+
 /// Stores a swept swap-in for `preimage` on confirmed funding, then mines
 /// past its 10-block refund window so the taker's refund is valid.
 fn swept_past_its_refund_window(

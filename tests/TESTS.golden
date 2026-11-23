@@ -491,6 +491,7 @@ openswap wallet::blockchain::electrum::tests::onion_without_proxy_is_rejected_be
 openswap wallet::blockchain::electrum::tests::only_the_unknown_txid_protocol_error_reads_as_absent
 openswap wallet::blockchain::electrum::tests::other_scripts_subscribe_while_one_is_refused
 openswap wallet::blockchain::electrum::tests::package_fee_adds_up_the_mempool_family
+openswap wallet::blockchain::electrum::tests::package_fee_gives_up_when_the_server_is_too_slow
 openswap wallet::blockchain::electrum::tests::package_fee_reads_a_wide_refund
 openswap wallet::blockchain::electrum::tests::package_fee_refuses_a_family_no_replacement_can_evict
 openswap wallet::blockchain::electrum::tests::ping_cadence_follows_proxy
@@ -797,6 +798,8 @@ openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_while_pay
 openswap::integration lightning::maker_restart::watchdog_keeps_swap_in_without_payment_record_until_refunded
 openswap::integration lightning::maker_restart::watchdog_outbids_a_taker_refund_and_its_child
 openswap::integration lightning::maker_restart::watchdog_outbids_a_taker_refund_and_its_child_on_electrum
+openswap::integration lightning::maker_restart::watchdog_outbids_a_wide_taker_refund
+openswap::integration lightning::maker_restart::watchdog_outbids_a_wide_taker_refund_on_electrum
 openswap::integration lightning::maker_restart::watchdog_releases_swap_in_missing_funding_height
 openswap::integration lightning::offer_limits::maker_serves_only_the_direction_it_has_capacity_for
 openswap::integration lightning::routed::lightning_routed_swap_e2e
