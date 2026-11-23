@@ -2055,18 +2055,25 @@ mod tests {
         }
     }
 
+    /// Pays `value` to `script_pubkey`, spending a coin derived from that
+    /// output: fundings that pay different outputs spend different coins, so
+    /// one chain can hold them all.
     fn funding_paying(script_pubkey: ScriptBuf, value: Amount) -> Transaction {
+        let output = TxOut {
+            value,
+            script_pubkey,
+        };
         Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+                previous_output: OutPoint::new(
+                    Txid::hash(&bitcoin::consensus::serialize(&output)),
+                    0,
+                ),
                 ..Default::default()
             }],
-            output: vec![TxOut {
-                value,
-                script_pubkey,
-            }],
+            output: vec![output],
         }
     }
 
