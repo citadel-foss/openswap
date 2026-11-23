@@ -533,6 +533,8 @@ fn lightning_swap_out_refuses_blocklisted_funding(world: &mut World) {
     ],
 )]
 fn lightning_swap_out_recovery_claims_at_the_market_rate(world: &mut World) {
+    // A new swap-out needs admission open (#1239).
+    let _admitted = Switch::on(&ADMIT_NEW_SWAP_OUTS);
     let framework = world.framework().clone();
     let bitcoind = &framework.bitcoind;
     let maker_address = world.makers()[0].address();
