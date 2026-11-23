@@ -11,7 +11,10 @@ use bitcoin::{
 };
 use openswap::{
     lightning::{InvoiceParams, LightningBackend, MockLightningBackend, Preimage},
-    maker::handlers::{handle_message, ConnectionState, Maker as _},
+    maker::{
+        handlers::{handle_message, ConnectionState, Maker as _},
+        lightning_handlers::ADMIT_NEW_SWAP_OUTS,
+    },
     protocol::{
         common_messages::{Hello, MakerToTakerMessage, TakerToMakerMessage},
         lightning_messages::{
@@ -108,6 +111,9 @@ fn swap_out_request(amount: Amount, preimage: Preimage) -> LightningTakerMessage
     setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
 )]
 fn a_draining_maker_refuses_new_lightning_swaps(world: &mut World) {
+    // Swap-out admission is closed by default (#1242). Open it, so the drain
+    // is what refuses the swap-out below.
+    let _admitted = Switch::on(&ADMIT_NEW_SWAP_OUTS);
     let maker = world.makers()[0].inner().clone();
     let amount = Amount::from_sat(40_000);
 
