@@ -761,14 +761,26 @@ impl Electrum {
         self.spender_in(history, outpoint)
     }
 
+    /// Settings for a separate short-lived connection to the same server,
+    /// sharing this backend's shutdown flag: every read on it gives up after a
+    /// few seconds, longer through a proxy, and nothing is retried. For a
+    /// lookup that must not hold the wallet's lock while it waits on the server.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn side_connection_config(&self) -> (ElectrumConfig, Arc<AtomicBool>) {
+        let mut config = self.config.clone();
+        config.timeout = Some(if config.socks5.is_some() { 15 } else { 5 });
+        config.max_retries = 0;
+        (config, self.shutdown.clone())
+    }
+
     /// Fees of mempool transaction `txid` and of every mempool transaction
     /// spending from it: what a replacement of `txid` has to pay above. The
-    /// family is found through the server's current script histories, and
-    /// each fee is worked out from the transaction's inputs and outputs, not
-    /// taken from the server. `None` when `txid` is not in the mempool. A
-    /// family no replacement could evict, or one the request and time budget
-    /// cannot read, is an error, so a partial sum is never taken for the
-    /// whole.
+    /// family is found through the server's current script histories, read
+    /// for all of a transaction's outputs in one round trip, and each fee is
+    /// worked out from the transaction's inputs and outputs, not taken from the
+    /// server. `None` when `txid` is not in the mempool. A family no
+    /// replacement could evict, or one that takes too long to read, is an
+    /// error, so a partial sum is never taken for the whole.
     #[cfg(feature = "lightning")]
     pub(crate) fn mempool_package_fee(
         &self,
@@ -776,73 +788,69 @@ impl Electrum {
     ) -> Result<Option<bitcoin::Amount>, WalletError> {
         // A replacement may evict at most 100 transactions (BIP125 rule 5).
         const MAX_FAMILY: usize = 100;
-        // Server round trips and time for one answer. A refund and a child
-        // take a handful; the budget bounds a family built to stall it.
-        const MAX_REQUESTS: usize = 100;
-        const MAX_TIME: Duration = Duration::from_secs(5);
+        // Each read has its own socket timeout on a side connection; this
+        // bounds the whole answer.
+        const MAX_TIME: Duration = Duration::from_secs(20);
         let started = Instant::now();
-        let mut requests = 0;
-        let mut charge = || {
-            requests += 1;
-            if requests > MAX_REQUESTS || started.elapsed() > MAX_TIME {
+        let in_time = || {
+            if started.elapsed() > MAX_TIME {
                 return Err(electrum_err(format!(
-                    "electrum: reading what spends from {txid} took more than \
-                     {MAX_REQUESTS} requests or {MAX_TIME:?}"
+                    "electrum: reading what spends from {txid} took more than {MAX_TIME:?}"
                 )));
             }
             Ok(())
         };
-        let mut txs: HashMap<Txid, Transaction> = HashMap::new();
         let mut histories: HashMap<ScriptBuf, Vec<GetHistoryRes>> = HashMap::new();
         let mut total = bitcoin::Amount::ZERO;
         let mut family = HashSet::from([*txid]);
         let mut queue = vec![*txid];
         while let Some(parent) = queue.pop() {
-            charge()?;
-            let tx = match self.transaction_get_live(&parent) {
+            in_time()?;
+            let tx = match self.transaction_get_validating(&parent) {
                 Ok(tx) => tx,
                 Err(WalletError::Electrum(ref e)) if is_unknown_txid(e) && parent == *txid => {
                     return Ok(None)
                 }
                 Err(e) => return Err(e),
             };
-            let mut pending = false;
-            for (vout, output) in tx.output.iter().enumerate() {
-                let spent = OutPoint::new(parent, vout as u32);
-                if let std::collections::hash_map::Entry::Vacant(slot) =
-                    histories.entry(output.script_pubkey.clone())
-                {
-                    charge()?;
-                    slot.insert(
-                        self.call(GET_HISTORY, |c| c.script_get_history(&output.script_pubkey))?,
-                    );
+            // Every output's history in one round trip, however many outputs
+            // the transaction has.
+            let unread: Vec<ScriptBuf> = tx
+                .output
+                .iter()
+                .map(|output| output.script_pubkey.clone())
+                .filter(|script| !histories.contains_key(script))
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            if !unread.is_empty() {
+                in_time()?;
+                let scripts: Vec<&Script> =
+                    unread.iter().map(|script| script.as_script()).collect();
+                let read = self.call(GET_HISTORY, |c| {
+                    c.batch_script_get_history(scripts.iter().copied())
+                })?;
+                if read.len() != unread.len() {
+                    return Err(electrum_err(format!(
+                        "electrum: asked for {} histories, got {}",
+                        unread.len(),
+                        read.len()
+                    )));
                 }
+                histories.extend(unread.into_iter().zip(read));
+            }
+            let mut pending = false;
+            let mut candidates = Vec::new();
+            let mut listed = HashSet::new();
+            for output in &tx.output {
                 for entry in &histories[&output.script_pubkey] {
                     if entry.tx_hash == parent {
                         pending |= entry.height <= 0;
-                        continue;
-                    }
-                    if entry.height > 0 || family.contains(&entry.tx_hash) {
-                        continue;
-                    }
-                    if let std::collections::hash_map::Entry::Vacant(slot) =
-                        txs.entry(entry.tx_hash)
+                    } else if entry.height <= 0
+                        && !family.contains(&entry.tx_hash)
+                        && listed.insert(entry.tx_hash)
                     {
-                        charge()?;
-                        slot.insert(self.transaction_get_live(&entry.tx_hash)?);
-                    }
-                    if txs[&entry.tx_hash]
-                        .input
-                        .iter()
-                        .any(|input| input.previous_output == spent)
-                    {
-                        if family.len() >= MAX_FAMILY {
-                            return Err(electrum_err(format!(
-                                "electrum: more than {MAX_FAMILY} transactions spend from {txid}"
-                            )));
-                        }
-                        family.insert(entry.tx_hash);
-                        queue.push(entry.tx_hash);
+                        candidates.push(entry.tx_hash);
                     }
                 }
             }
@@ -854,24 +862,47 @@ impl Electrum {
                     "electrum: {parent} spends from {txid} but is not in the mempool"
                 )));
             }
-            let fee = self.fee_from_inputs(&tx, &mut charge)?;
+            in_time()?;
+            self.prefetch_transactions(&candidates)?;
+            for candidate in candidates {
+                if family.contains(&candidate) {
+                    continue;
+                }
+                let spends_parent = self
+                    .transaction_get_validating(&candidate)?
+                    .input
+                    .iter()
+                    .any(|input| input.previous_output.txid == parent);
+                if spends_parent {
+                    if family.len() >= MAX_FAMILY {
+                        return Err(electrum_err(format!(
+                            "electrum: more than {MAX_FAMILY} transactions spend from {txid}"
+                        )));
+                    }
+                    family.insert(candidate);
+                    queue.push(candidate);
+                }
+            }
+            in_time()?;
+            let fee = self.fee_from_inputs(&tx)?;
             total = checked_add_amount(total, fee, "package fee")?;
         }
         Ok(Some(total))
     }
 
-    /// What `tx` pays in fees: its inputs' values, read from the transactions
-    /// they spend, each checked against its txid, less its outputs. `charge`
-    /// counts each read against the caller's budget.
+    /// What `tx` pays in fees: its inputs' values, read in one round trip from
+    /// the transactions they spend, each checked against its txid, less its
+    /// outputs.
     #[cfg(feature = "lightning")]
-    fn fee_from_inputs(
-        &self,
-        tx: &Transaction,
-        charge: &mut impl FnMut() -> Result<(), WalletError>,
-    ) -> Result<bitcoin::Amount, WalletError> {
+    fn fee_from_inputs(&self, tx: &Transaction) -> Result<bitcoin::Amount, WalletError> {
+        let spent: Vec<Txid> = tx
+            .input
+            .iter()
+            .map(|input| input.previous_output.txid)
+            .collect();
+        self.prefetch_transactions(&spent)?;
         let mut inputs = bitcoin::Amount::ZERO;
         for input in &tx.input {
-            charge()?;
             let prev = self.transaction_get_validating(&input.previous_output.txid)?;
             let output = prev
                 .output
@@ -3112,27 +3143,62 @@ pub(crate) mod tests {
         );
     }
 
-    /// Mempool noise on the refund's script costs a fetch per entry even
-    /// though none of it spends the refund. Past the budget the answer is an
-    /// error, never a partial sum.
+    /// A refund with many outputs is read in one round trip for its
+    /// histories, so its width cannot run a reader out of budget.
     #[cfg(feature = "lightning")]
     #[test]
-    fn package_fee_stops_at_its_request_budget() {
+    fn package_fee_reads_a_wide_refund() {
         let funding = deposit(1);
         let mut refund = spend_of(OutPoint::new(funding.compute_txid(), 0));
-        refund.output[0].value = Amount::from_sat(700);
-        let noise: Vec<Transaction> = (10..=130).map(deposit).collect();
+        refund.output = (0..120u8)
+            .map(|i| bitcoin::TxOut {
+                value: Amount::from_sat(5),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x01, i]),
+            })
+            .collect();
+        let entries = json!([
+            { "tx_hash": funding.compute_txid(), "height": 101 },
+            { "tx_hash": refund.compute_txid(), "height": 0 },
+        ]);
+        let (backend, _server) = family_backend(entries, &[&funding, &refund]);
+        // 1000 in, 120 outputs of 5 out.
+        assert_eq!(
+            backend.mempool_package_fee(&refund.compute_txid()).unwrap(),
+            Some(Amount::from_sat(400))
+        );
+    }
+
+    /// A family larger than a replacement can evict is an error, never a
+    /// partial sum.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_refuses_a_family_no_replacement_can_evict() {
+        let funding = deposit(1);
+        let mut refund = spend_of(OutPoint::new(funding.compute_txid(), 0));
+        refund.output = (0..101u8)
+            .map(|i| bitcoin::TxOut {
+                value: Amount::from_sat(5),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x01, i]),
+            })
+            .collect();
+        let children: Vec<Transaction> = (0..101)
+            .map(|vout| {
+                let mut child = spend_of(OutPoint::new(refund.compute_txid(), vout));
+                child.output[0].value = Amount::from_sat(1);
+                child
+            })
+            .collect();
         let mut entries = vec![
             json!({ "tx_hash": funding.compute_txid(), "height": 101 }),
             json!({ "tx_hash": refund.compute_txid(), "height": 0 }),
         ];
         entries.extend(
-            noise
+            children
                 .iter()
                 .map(|tx| json!({ "tx_hash": tx.compute_txid(), "height": 0 })),
         );
         let mut served = vec![&funding, &refund];
-        served.extend(noise.iter());
+        served.extend(children.iter());
         let (backend, _server) = family_backend(json!(entries), &served);
         assert!(backend.mempool_package_fee(&refund.compute_txid()).is_err());
     }

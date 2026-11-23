@@ -4043,16 +4043,21 @@ impl MakerTrait for MakerServer {
         &self,
         txid: &bitcoin::Txid,
     ) -> Result<Option<bitcoin::Amount>, MakerError> {
-        let wallet = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-        match &wallet.blockchain {
-            AnyBlockchain::CoreRPC(core) => {
-                core.mempool_package_fee(txid).map_err(MakerError::Wallet)
+        let (config, shutdown) = {
+            let wallet = lock_debug!(self.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            match &wallet.blockchain {
+                AnyBlockchain::CoreRPC(core) => {
+                    return core.mempool_package_fee(txid).map_err(MakerError::Wallet)
+                }
+                AnyBlockchain::Electrum(electrum) => electrum.side_connection_config(),
             }
-            AnyBlockchain::Electrum(electrum) => electrum
-                .mempool_package_fee(txid)
-                .map_err(MakerError::Wallet),
-        }
+        };
+        // The family takes several round trips to read. They go over a
+        // connection of their own, after the wallet lock is released.
+        crate::wallet::Electrum::with_shutdown_flag(&config, shutdown)
+            .and_then(|side| side.mempool_package_fee(txid))
+            .map_err(MakerError::Wallet)
     }
 
     #[cfg(feature = "lightning")]
