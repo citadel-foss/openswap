@@ -1155,17 +1155,20 @@ fn watchdog_finish_sweep<M: Maker>(
         Ok(Some(refund)) => {
             // The taker's refund is racing the sweep. The invoice is already
             // paid, so the sweep outbids it.
-            let to_beat = match maker.mempool_package_fee(&refund.compute_txid()) {
-                Ok(Some(fee)) => fee,
+            let (to_beat, family_known) = match maker.mempool_package_fee(&refund.compute_txid()) {
+                Ok(Some(fee)) => (fee, true),
                 // Gone since it was read: the next pass sees what replaced it.
                 Ok(None) => return Ok(()),
-                // Without what spends from the refund, a sweep could underpay
-                // and be rejected. The next pass asks again.
+                // What spends from the refund is unknown, so the sweep bids
+                // against the refund alone. That can only replace a refund
+                // nothing spends from, and the rate is not recorded, so the
+                // next pass bids on what it reads then.
                 Err(e) => {
                     log::warn!(
-                        "Swap-in {swap_id}: cannot read what the taker's refund pays: {e:?}"
+                        "Swap-in {swap_id}: cannot read what spends from the taker's refund, \
+                         bidding against the refund alone: {e:?}"
                     );
-                    return Ok(());
+                    (fee_paid(&refund, value), false)
                 }
             };
             let Some((sweep, rate)) = outbid_refund(
@@ -1184,7 +1187,7 @@ fn watchdog_finish_sweep<M: Maker>(
                 );
                 return Ok(());
             };
-            if rate > built_at {
+            if family_known && rate > built_at {
                 let mut next = swap.clone();
                 next.sweep_feerate = Some(rate);
                 if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::InSwept, next)? {
@@ -1207,11 +1210,10 @@ fn watchdog_finish_sweep<M: Maker>(
             return Ok(());
         }
         Err(e) => {
-            // Resend the recorded sweep and bump nothing until a lookup works.
+            // The record can be ahead of what is pending, so resending it
+            // could replace a spend whose output something builds on. Send
+            // nothing until a lookup works.
             log::debug!("Swap-in {swap_id}: pending spend lookup failed: {e:?}");
-            if let Err(e) = maker.broadcast_transaction(&build(built_at)?) {
-                log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}");
-            }
             return Ok(());
         }
     };
@@ -1241,9 +1243,7 @@ fn watchdog_finish_sweep<M: Maker>(
             (tx, true)
         }
     };
-    let sent = maker.broadcast_transaction(&claim_tx);
-    drop(hold);
-    match sent {
+    match maker.broadcast_transaction(&claim_tx) {
         Ok(txid) => {
             log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}");
             // The wallet may still hold the output of the sweep this
@@ -1254,6 +1254,9 @@ fn watchdog_finish_sweep<M: Maker>(
         }
         Err(e) => log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}"),
     }
+    // Released only now, so no swap claims the replaced output while the
+    // wallet still lists it.
+    drop(hold);
     Ok(())
 }
 
@@ -2311,11 +2314,8 @@ fn resend_refund(
         }
         Ok(None) => None,
         Err(e) => {
-            // Resend the latest refund and bump nothing until a lookup works.
+            // As for the sweep: send nothing until a lookup works.
             log::debug!("Swap-out {swap_id}: pending spend lookup failed: {e:?}");
-            if let Err(e) = maker.broadcast_transaction(&build(built_at)?) {
-                log::debug!("Swap-out {swap_id}: refund rebroadcast rejected: {e:?}");
-            }
             return Ok(());
         }
     };
@@ -2354,9 +2354,7 @@ fn resend_refund(
             (tx, true)
         }
     };
-    let sent = maker.broadcast_transaction(&refund);
-    drop(hold);
-    match sent {
+    match maker.broadcast_transaction(&refund) {
         Ok(txid) => {
             log::info!("Swap-out {swap_id}: refund sent as {txid}");
             // As for the sweep: drop the replaced refund's output.
@@ -2366,6 +2364,7 @@ fn resend_refund(
         }
         Err(e) => log::debug!("Swap-out {swap_id}: refund rebroadcast rejected: {e:?}"),
     }
+    drop(hold);
     Ok(())
 }
 

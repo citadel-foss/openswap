@@ -106,8 +106,8 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
         .vsize();
     let funding_rate = tx_fee(bitcoind, &funding_txid).to_sat() as f64 / funding_vsize as f64;
     assert!(
-        funding_rate >= 9.0,
-        "the taker must fund the HTLC near 10 sat/vB, paid {:.2}",
+        funding_rate >= 10.0,
+        "the taker must fund the HTLC at the 10 sat/vB market rate, paid {:.2}",
         funding_rate
     );
 
