@@ -1213,7 +1213,10 @@ fn watchdog_finish_sweep<M: Maker>(
             // The record can be ahead of what is pending, so resending it
             // could replace a spend whose output something builds on. Send
             // nothing until a lookup works.
-            log::debug!("Swap-in {swap_id}: pending spend lookup failed: {e:?}");
+            log::warn!(
+                "Swap-in {swap_id}: cannot read what spends the HTLC, \
+                 sending nothing this pass: {e:?}"
+            );
             return Ok(());
         }
     };
@@ -2111,6 +2114,18 @@ pub static INTERRUPT_REFUND: std::sync::atomic::AtomicBool =
 pub static HIDE_HTLC_SPENDS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Fails the watchdog's lookup of what spends an HTLC, as a backend error
+/// would. Set by tests.
+#[cfg(feature = "integration-test")]
+pub static FAIL_PENDING_SPEND_LOOKUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Fails the watchdog's read of what spends from the taker's refund, as a
+/// backend error would. Set by tests.
+#[cfg(feature = "integration-test")]
+pub static FAIL_REFUND_FAMILY_LOOKUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether `spend` is a refund this swap built. Lacking the preimage does
 /// not make a spend ours; only a persisted refund txid does, the latest or
 /// one it replaced.
@@ -2328,7 +2343,10 @@ fn resend_refund(
         Ok(None) => None,
         Err(e) => {
             // As for the sweep: send nothing until a lookup works.
-            log::debug!("Swap-out {swap_id}: pending spend lookup failed: {e:?}");
+            log::warn!(
+                "Swap-out {swap_id}: cannot read what spends the HTLC, \
+                 sending nothing this pass: {e:?}"
+            );
             return Ok(());
         }
     };

@@ -36,7 +36,8 @@ use openswap::{
         lightning_handlers::{
             ln_watchdog_tick_now, refuse_swap_in_after_wait, watchdog_expire_swap_in_snapshot,
             watchdog_finish_swap_in_snapshot, watchdog_resolve_swap_out_snapshot, LnDirection,
-            LnMakerPhase, LnMakerSwap, ADMIT_NEW_SWAP_OUTS, HIDE_HTLC_SPENDS,
+            LnMakerPhase, LnMakerSwap, ADMIT_NEW_SWAP_OUTS, FAIL_PENDING_SPEND_LOOKUP,
+            FAIL_REFUND_FAMILY_LOOKUP, HIDE_HTLC_SPENDS,
         },
         MakerBehavior, MakerError, MakerServer,
     },
@@ -490,8 +491,28 @@ fn lightning_maker_rebroadcasts_an_evicted_refund(
     // The watcher still names the evicted refund as the spend.
     assert_eq!(recorded_spend(), Some(refund_txid));
 
-    // ---- The watchdog sends it again, at the risen rate ----
+    // ---- While the lookup of what spends the HTLC fails, nothing is sent ----
     let _market = SpendFeerate::set(40.0);
+    {
+        let _failing = Switch::on(&FAIL_PENDING_SPEND_LOOKUP);
+        ln_watchdog_tick_now(&maker);
+    }
+    assert!(
+        bitcoind
+            .client
+            .get_tx_out(&funded.outpoint.txid, funded.outpoint.vout, Some(true))
+            .unwrap()
+            .is_some(),
+        "a failed lookup must send nothing"
+    );
+    let swap = maker
+        .get_ln_swap(&swap_id)
+        .unwrap()
+        .expect("the swap stays open");
+    assert_eq!(swap.refund_txid, Some(refund_txid));
+    assert!(swap.earlier_refund_txids.is_empty());
+
+    // ---- The watchdog sends it again, at the risen rate ----
     ln_watchdog_tick_now(&maker);
     let swap = maker
         .get_ln_swap(&swap_id)
@@ -710,7 +731,8 @@ fn lightning_maker_closes_on_an_earlier_refund(world: &mut World, ln: Arc<MockLi
 
 /// A swept swap-in whose sweep never reached the mempool, or was evicted
 /// from it, goes out again at the market rate once that has risen past
-/// the recorded one. Nothing is pending, so nothing is replaced.
+/// the recorded one. Nothing is pending, so nothing is replaced. While the
+/// lookup of what spends the HTLC fails, nothing goes out.
 #[world_test(
     backend = BitcoindBackend,
     bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone()],
@@ -740,6 +762,23 @@ fn swap_in_sweep_never_sent_goes_out_at_the_market_rate(
     swept.preimage = Some(preimage);
     swept.sweep_feerate = Some(5.0);
     maker.store_ln_swap(&id, swept).unwrap();
+
+    {
+        let _failing = Switch::on(&FAIL_PENDING_SPEND_LOOKUP);
+        ln_watchdog_tick_now(&maker);
+    }
+    assert!(
+        bitcoind
+            .client
+            .get_tx_out(&funding.txid, funding.vout, Some(true))
+            .unwrap()
+            .is_some(),
+        "a failed lookup must send nothing"
+    );
+    assert_eq!(
+        maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate,
+        Some(5.0)
+    );
 
     ln_watchdog_tick_now(&maker);
     let value = swap.amount + swap.fee;
@@ -818,6 +857,64 @@ fn swap_in_sweep_keeps_its_rate_across_a_restart(world: &mut World, ln: Arc<Mock
         maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate,
         Some(20.0)
     );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
+/// When what spends from the taker's refund cannot be read, the sweep still
+/// contests it, bidding against the refund alone, and records nothing, so
+/// the next pass bids on what it reads then.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+)]
+fn watchdog_contests_a_taker_refund_whose_family_it_cannot_read(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    let _ = &ln;
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+    let _market = SpendFeerate::set(SPEND_FEE_RATE_FLOOR);
+
+    let preimage = Preimage([0xb8; 32]);
+    let id = preimage.payment_hash().to_string();
+    let (swap, funding) = swept_past_its_refund_window(bitcoind, &maker, &preimage);
+    let recorded = maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate;
+    let refund = broadcast_taker_refund(bitcoind, &swap, funding);
+    let value = swap.amount + swap.fee;
+    let refund_vsize = bitcoind.client.get_mempool_entry(&refund).unwrap().vsize;
+    let rate = (300.0 / refund_vsize as f64 + 1.0).max(3.0);
+    let fee = Amount::from_sat((rate * 150.0).ceil() as u64);
+
+    {
+        let _unread = Switch::on(&FAIL_REFUND_FAMILY_LOOKUP);
+        ln_watchdog_tick_now(&maker);
+    }
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        fee,
+        "the sweep must outbid the refund alone"
+    );
+    assert!(
+        bitcoind.client.get_mempool_entry(&refund).is_err(),
+        "the taker's refund must be out of the mempool"
+    );
+    assert_eq!(
+        maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate,
+        recorded,
+        "a bid on a family it could not read must not be recorded"
+    );
+    // The pending spend is now our sweep: the next pass resends it.
+    ln_watchdog_tick_now(&maker);
+    assert_eq!(mempool_spend_fee(bitcoind, funding, value), fee);
 
     framework.set_block_gen_paused(false);
     maker.shutdown.store(true, Relaxed);

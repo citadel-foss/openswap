@@ -4023,6 +4023,12 @@ impl MakerTrait for MakerServer {
         outpoint: &bitcoin::OutPoint,
         script: &bitcoin::ScriptBuf,
     ) -> Result<Option<Transaction>, MakerError> {
+        #[cfg(feature = "integration-test")]
+        if crate::maker::lightning_handlers::FAIL_PENDING_SPEND_LOOKUP
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(MakerError::General("Test: pending spend lookup failed"));
+        }
         let wallet = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
         // Core answers from the mempool alone, with no block scan; callers
@@ -4043,6 +4049,12 @@ impl MakerTrait for MakerServer {
         &self,
         txid: &bitcoin::Txid,
     ) -> Result<Option<bitcoin::Amount>, MakerError> {
+        #[cfg(feature = "integration-test")]
+        if crate::maker::lightning_handlers::FAIL_REFUND_FAMILY_LOOKUP
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(MakerError::General("Test: refund family lookup failed"));
+        }
         let (config, shutdown) = {
             let wallet = lock_debug!(self.wallet.read())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
