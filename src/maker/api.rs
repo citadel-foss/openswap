@@ -4066,6 +4066,24 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn hold_for_replacement(
+        &self,
+        key: &str,
+        outpoint: &bitcoin::OutPoint,
+    ) -> Result<bool, MakerError> {
+        Ok(lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .hold_for_replacement(key, *outpoint))
+    }
+
+    #[cfg(feature = "lightning")]
+    fn release_replacement_hold(&self, key: &str) {
+        if let Ok(mut wallet) = lock_debug!(self.wallet.write()) {
+            wallet.release_swap_locks(key, None);
+        }
+    }
+
+    #[cfg(feature = "lightning")]
     fn is_output_unspent(&self, outpoint: &bitcoin::OutPoint) -> Result<bool, MakerError> {
         use crate::wallet::Blockchain;
         Ok(lock_debug!(self.wallet.read())

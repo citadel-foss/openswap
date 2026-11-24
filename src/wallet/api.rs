@@ -2568,6 +2568,26 @@ impl Wallet {
             .any(|locks| locks.outpoints.contains(outpoint))
     }
 
+    /// Holds `outpoint` under `key` unless a swap already holds it or it is
+    /// locked, so no swap can claim it until [`Self::release_swap_locks`]
+    /// drops `key`. For replacing the transaction that created `outpoint`.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn hold_for_replacement(&mut self, key: &str, outpoint: OutPoint) -> bool {
+        if self.locked_utxos.contains(&outpoint) || self.is_swap_reserved(&outpoint) {
+            return false;
+        }
+        self.reserve_swap_locks(key, &[outpoint]);
+        true
+    }
+
+    /// Test-only: drop `swap_key`'s reservation and persist it, as the end
+    /// of another swap would.
+    #[cfg(feature = "integration-test")]
+    pub fn release_swap_locks_for_test(&mut self, swap_key: &str) -> Result<(), WalletError> {
+        self.release_swap_locks(swap_key, None);
+        self.save_to_disk()
+    }
+
     /// Test-only: reserve `outpoints` for `swap_key` and persist it, as
     /// another swap's claim would be.
     #[cfg(feature = "integration-test")]

@@ -790,6 +790,7 @@ openswap::integration lightning::maker_restart::swap_in_request_checks_terms_and
 openswap::integration lightning::maker_restart::swap_in_request_fails_when_payment_record_lookup_fails
 openswap::integration lightning::maker_restart::swap_in_request_refuses_payment_hash_already_on_record
 openswap::integration lightning::maker_restart::swap_in_sweep_is_bumped_once_the_market_rises
+openswap::integration lightning::maker_restart::swap_in_sweep_is_not_bumped_while_a_swap_holds_its_output
 openswap::integration lightning::maker_restart::swap_in_sweep_keeps_its_rate_across_a_restart
 openswap::integration lightning::maker_restart::swap_in_sweep_never_sent_goes_out_at_the_market_rate
 openswap::integration lightning::maker_restart::switch_resets_on_panic

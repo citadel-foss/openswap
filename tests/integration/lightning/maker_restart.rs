@@ -942,6 +942,98 @@ fn run_watchdog_outbids_a_taker_refund_and_its_child(
     maker.watch_service.shutdown();
 }
 
+/// A swap can hold the output of our pending sweep to fund itself before
+/// its funding is broadcast, where the node cannot see it. While a swap
+/// holds it, the sweep is not bumped, since a replacement would invalidate
+/// that funding. Once the hold is released, the sweep is bumped.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+)]
+fn swap_in_sweep_is_not_bumped_while_a_swap_holds_its_output(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+) {
+    let _ = &ln;
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+    let market = SpendFeerate::set(5.0);
+
+    let preimage = Preimage([0xb7; 32]);
+    let id = preimage.payment_hash().to_string();
+    let swap = accepted_swap_in(&preimage);
+    let funding = fund_htlc(bitcoind, &swap);
+    generate_blocks(bitcoind, 1);
+    let mut swept = paid_without_height(&swap, funding);
+    swept.funding_height = Some(confirmation_height(bitcoind, &funding.txid) as u32);
+    swept.phase = LnMakerPhase::InSwept;
+    swept.preimage = Some(preimage);
+    swept.sweep_feerate = Some(5.0);
+    maker.store_ln_swap(&id, swept).unwrap();
+    ln_watchdog_tick_now(&maker);
+    let value = swap.amount + swap.fee;
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(750)
+    );
+    let sweep = bitcoind
+        .client
+        .get_raw_mempool()
+        .unwrap()
+        .into_iter()
+        .find(|txid| {
+            bitcoind
+                .client
+                .get_raw_transaction(txid, None)
+                .unwrap()
+                .input
+                .iter()
+                .any(|input| input.previous_output == funding)
+        })
+        .expect("the sweep is in the mempool");
+
+    // A swap holds the sweep's output, as one building its funding would.
+    maker
+        .wallet
+        .write()
+        .unwrap()
+        .reserve_swap_locks_for_test("a-coinswap", &[OutPoint::new(sweep, 0)])
+        .unwrap();
+    market.set_rate(20.0);
+    ln_watchdog_tick_now(&maker);
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(750),
+        "a sweep whose output a swap holds must not be bumped"
+    );
+    assert_eq!(
+        maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate,
+        Some(5.0)
+    );
+
+    // Released, it is bumped to the market rate, 20 sat/vB.
+    maker
+        .wallet
+        .write()
+        .unwrap()
+        .release_swap_locks_for_test("a-coinswap")
+        .unwrap();
+    ln_watchdog_tick_now(&maker);
+    assert_eq!(
+        mempool_spend_fee(bitcoind, funding, value),
+        Amount::from_sat(3_000)
+    );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
+}
+
 /// The taker's refund can spread over many outputs, each to its own
 /// address, so reading what spends from it touches as many scripts. The
 /// sweep still replaces it, on Core and on Electrum, where the outputs'

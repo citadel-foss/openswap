@@ -1215,6 +1215,7 @@ fn watchdog_finish_sweep<M: Maker>(
             return Ok(());
         }
     };
+    let mut hold = ReplacementHold::new(maker, swap_id);
     let (claim_tx, replaced) = match plan_spend(
         build,
         value,
@@ -1223,9 +1224,10 @@ fn watchdog_finish_sweep<M: Maker>(
         maker.htlc_replacement_increment(),
         pending,
         |txid| {
-            maker
-                .is_output_unspent(&OutPoint::new(txid, 0))
-                .unwrap_or(false)
+            // Replacing the spend invalidates whatever spends its output: a
+            // transaction on chain, or a swap of ours that holds it to fund.
+            let output = OutPoint::new(txid, 0);
+            maker.is_output_unspent(&output).unwrap_or(false) && hold.take(&output)
         },
     )? {
         PlannedSpend::Resend(tx) => (tx, false),
@@ -1239,7 +1241,9 @@ fn watchdog_finish_sweep<M: Maker>(
             (tx, true)
         }
     };
-    match maker.broadcast_transaction(&claim_tx) {
+    let sent = maker.broadcast_transaction(&claim_tx);
+    drop(hold);
+    match sent {
         Ok(txid) => {
             log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}");
             // The wallet may still hold the output of the sweep this
@@ -2162,6 +2166,42 @@ fn rate_paid(tx: &bitcoin::Transaction, value: Amount, rate: f64) -> f64 {
     }
 }
 
+/// A hold on the output of a pending spend of ours while the spend is
+/// replaced, so no swap claims that output in between. Released when
+/// dropped.
+struct ReplacementHold<'a, M: Maker> {
+    maker: &'a Arc<M>,
+    key: String,
+    held: bool,
+}
+
+impl<'a, M: Maker> ReplacementHold<'a, M> {
+    fn new(maker: &'a Arc<M>, swap_id: &str) -> Self {
+        Self {
+            maker,
+            key: format!("ln-replace:{swap_id}"),
+            held: false,
+        }
+    }
+
+    /// Holds `output`; `false` when a swap already holds it.
+    fn take(&mut self, output: &OutPoint) -> bool {
+        self.held = self
+            .maker
+            .hold_for_replacement(&self.key, output)
+            .unwrap_or(false);
+        self.held
+    }
+}
+
+impl<M: Maker> Drop for ReplacementHold<'_, M> {
+    fn drop(&mut self) {
+        if self.held {
+            self.maker.release_replacement_hold(&self.key);
+        }
+    }
+}
+
 /// What the watchdog sends for an unconfirmed HTLC spend of ours.
 #[derive(Debug, PartialEq)]
 enum PlannedSpend {
@@ -2279,6 +2319,7 @@ fn resend_refund(
             return Ok(());
         }
     };
+    let mut hold = ReplacementHold::new(maker, swap_id);
     let (refund, replaced) = match plan_spend(
         build,
         value,
@@ -2287,9 +2328,10 @@ fn resend_refund(
         maker.htlc_replacement_increment(),
         pending,
         |txid| {
-            maker
-                .is_output_unspent(&OutPoint::new(txid, 0))
-                .unwrap_or(false)
+            // Replacing the spend invalidates whatever spends its output: a
+            // transaction on chain, or a swap of ours that holds it to fund.
+            let output = OutPoint::new(txid, 0);
+            maker.is_output_unspent(&output).unwrap_or(false) && hold.take(&output)
         },
     )? {
         PlannedSpend::Resend(tx) => (tx, false),
@@ -2312,7 +2354,9 @@ fn resend_refund(
             (tx, true)
         }
     };
-    match maker.broadcast_transaction(&refund) {
+    let sent = maker.broadcast_transaction(&refund);
+    drop(hold);
+    match sent {
         Ok(txid) => {
             log::info!("Swap-out {swap_id}: refund sent as {txid}");
             // As for the sweep: drop the replaced refund's output.
