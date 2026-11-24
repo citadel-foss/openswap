@@ -1228,8 +1228,10 @@ fn watchdog_finish_sweep<M: Maker>(
         |txid| {
             // Replacing the spend invalidates whatever spends its output: a
             // transaction on chain, or a swap of ours that holds it to fund.
+            // The hold comes first, so a swap's funding sent just before it
+            // still reads as a spend.
             let output = OutPoint::new(txid, 0);
-            maker.is_output_unspent(&output).unwrap_or(false) && hold.take(&output)
+            hold.take(&output) && maker.is_output_unspent(&output).unwrap_or(false)
         },
     )? {
         PlannedSpend::Resend(tx) => (tx, false),
@@ -1246,17 +1248,16 @@ fn watchdog_finish_sweep<M: Maker>(
     match maker.broadcast_transaction(&claim_tx) {
         Ok(txid) => {
             log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}");
-            // The wallet may still hold the output of the sweep this
-            // replaced; read the new one in.
             if replaced {
+                // Read the new sweep's output in, then take the replaced
+                // one out as the hold goes, so no swap claims it even when
+                // the sync fails or still lists it.
                 let _ = maker.sync_and_save_wallet();
+                hold.release_replaced();
             }
         }
         Err(e) => log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}"),
     }
-    // Released only now, so no swap claims the replaced output while the
-    // wallet still lists it.
-    drop(hold);
     Ok(())
 }
 
@@ -2175,7 +2176,7 @@ fn rate_paid(tx: &bitcoin::Transaction, value: Amount, rate: f64) -> f64 {
 struct ReplacementHold<'a, M: Maker> {
     maker: &'a Arc<M>,
     key: String,
-    held: bool,
+    held: Option<OutPoint>,
 }
 
 impl<'a, M: Maker> ReplacementHold<'a, M> {
@@ -2183,24 +2184,36 @@ impl<'a, M: Maker> ReplacementHold<'a, M> {
         Self {
             maker,
             key: format!("ln-replace:{swap_id}"),
-            held: false,
+            held: None,
         }
     }
 
     /// Holds `output`; `false` when a swap already holds it.
     fn take(&mut self, output: &OutPoint) -> bool {
-        self.held = self
+        let held = self
             .maker
             .hold_for_replacement(&self.key, output)
             .unwrap_or(false);
-        self.held
+        if held {
+            self.held = Some(*output);
+        }
+        held
+    }
+
+    /// Releases the hold once the spend that created the output was
+    /// replaced, taking the output out of the wallet in the same step.
+    fn release_replaced(mut self) {
+        if let Some(output) = self.held.take() {
+            self.maker
+                .release_replacement_hold(&self.key, Some(&output));
+        }
     }
 }
 
 impl<M: Maker> Drop for ReplacementHold<'_, M> {
     fn drop(&mut self) {
-        if self.held {
-            self.maker.release_replacement_hold(&self.key);
+        if self.held.take().is_some() {
+            self.maker.release_replacement_hold(&self.key, None);
         }
     }
 }
@@ -2330,8 +2343,10 @@ fn resend_refund(
         |txid| {
             // Replacing the spend invalidates whatever spends its output: a
             // transaction on chain, or a swap of ours that holds it to fund.
+            // The hold comes first, so a swap's funding sent just before it
+            // still reads as a spend.
             let output = OutPoint::new(txid, 0);
-            maker.is_output_unspent(&output).unwrap_or(false) && hold.take(&output)
+            hold.take(&output) && maker.is_output_unspent(&output).unwrap_or(false)
         },
     )? {
         PlannedSpend::Resend(tx) => (tx, false),
@@ -2357,14 +2372,14 @@ fn resend_refund(
     match maker.broadcast_transaction(&refund) {
         Ok(txid) => {
             log::info!("Swap-out {swap_id}: refund sent as {txid}");
-            // As for the sweep: drop the replaced refund's output.
+            // As for the sweep.
             if replaced {
                 let _ = maker.sync_and_save_wallet();
+                hold.release_replaced();
             }
         }
         Err(e) => log::debug!("Swap-out {swap_id}: refund rebroadcast rejected: {e:?}"),
     }
-    drop(hold);
     Ok(())
 }
 

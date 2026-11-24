@@ -4077,8 +4077,11 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
-    fn release_replacement_hold(&self, key: &str) {
+    fn release_replacement_hold(&self, key: &str, replaced: Option<&bitcoin::OutPoint>) {
         if let Ok(mut wallet) = lock_debug!(self.wallet.write()) {
+            if let Some(outpoint) = replaced {
+                wallet.release_swap_locks(key, Some(std::slice::from_ref(outpoint)));
+            }
             wallet.release_swap_locks(key, None);
         }
     }

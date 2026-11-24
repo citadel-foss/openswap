@@ -5326,6 +5326,56 @@ mod swap_reservation_tests {
         OutPoint::new(Txid::from_slice(&[n; 32]).unwrap(), 0)
     }
 
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn a_replaced_output_leaves_the_wallet_with_its_hold() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet.cbor"));
+        let sweep_output = outpoint(5);
+        let amount = Amount::from_sat(40_000);
+        wallet.store.utxo_cache.insert(
+            sweep_output,
+            (
+                ListUnspentResultEntry {
+                    txid: sweep_output.txid,
+                    vout: sweep_output.vout,
+                    address: None,
+                    label: None,
+                    redeem_script: None,
+                    witness_script: None,
+                    script_pub_key: ScriptBuf::from_bytes(vec![0x51]),
+                    amount,
+                    confirmations: 0,
+                    spendable: true,
+                    solvable: true,
+                    descriptor: None,
+                    safe: true,
+                },
+                UTXOSpendInfo::SeedCoin {
+                    path: "m/0/0".into(),
+                    input_value: amount,
+                    address_type: AddressType::P2WPKH,
+                },
+            ),
+        );
+
+        assert!(wallet.hold_for_replacement("ln-replace:s", sweep_output));
+        assert!(
+            !wallet.claim_swap_inputs("swap-a", &[sweep_output]),
+            "held while its spend is replaced"
+        );
+
+        // The replacement was accepted, so the output is gone for good: it
+        // leaves the cache as the hold goes, whatever the next sync reads.
+        wallet.release_swap_locks("ln-replace:s", Some(&[sweep_output]));
+        assert!(!wallet.store.swap_locks.contains_key("ln-replace:s"));
+        assert!(!wallet.store.utxo_cache.contains_key(&sweep_output));
+        assert!(
+            !wallet.claim_swap_inputs("swap-a", &[sweep_output]),
+            "a swap cannot fund from a replaced output"
+        );
+    }
+
     #[test]
     fn a_reservation_survives_a_wallet_reload() {
         let dir = tempdir().unwrap();

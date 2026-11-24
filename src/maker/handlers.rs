@@ -835,9 +835,11 @@ pub trait Maker: Send + Sync {
         Err(MakerError::General("lightning swaps not supported"))
     }
 
-    /// Releases a hold taken by [`Maker::hold_for_replacement`].
+    /// Releases a hold taken by [`Maker::hold_for_replacement`]. `replaced`
+    /// is a held output whose transaction was replaced: it leaves the wallet
+    /// in the same step, so no swap reads it as free.
     #[cfg(feature = "lightning")]
-    fn release_replacement_hold(&self, _key: &str) {}
+    fn release_replacement_hold(&self, _key: &str, _replaced: Option<&bitcoin::OutPoint>) {}
 
     /// Whether `outpoint` is unspent with the mempool included: for a
     /// pending HTLC spend's output, that nothing builds on it yet.
