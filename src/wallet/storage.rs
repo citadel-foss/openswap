@@ -528,6 +528,26 @@ pub struct LnPendingSwap {
     pub outpoint: Option<OutPoint>,
     /// The HTLC funding value, once known.
     pub value: Option<bitcoin::Amount>,
+    /// Where our claim or refund pays out. Saved before the first broadcast
+    /// so a rebuild is the same transaction and recovery does not take a new
+    /// address on every pass.
+    #[serde(default)]
+    pub payout_script: Option<ScriptBuf>,
+    /// How to ask the maker for a swap-out's funding again if its reply was
+    /// lost. Set on swap-outs and routed second hops.
+    #[serde(default)]
+    pub resume: Option<LnFundingResume>,
+}
+
+/// What a taker needs to repeat `SwapOutPaid` and check the answer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LnFundingResume {
+    /// The maker funding the HTLC.
+    pub maker: String,
+    /// The value the funding output must carry.
+    pub amount: bitcoin::Amount,
+    /// Confirmations the funding needs before we claim it.
+    pub min_confirmations: u32,
 }
 
 /// Redacted: the preimage is the secret the whole swap turns on, and
@@ -587,14 +607,22 @@ impl Requires for LnPendingSwap {
             redeemscript: _,
             locktime: _,
             privkey: _,
-            outpoint: _,
+            outpoint,
             value: _,
+            // An older build that drops it only takes a new payout address.
+            payout_script: _,
+            resume,
         } = self;
         out.insert(if *is_swap_in {
             "ln-swap-in"
         } else {
             "ln-swap-out"
         });
+        // An older build reads a record without an outpoint as "nothing was
+        // funded" and deletes it, though the maker may have funded.
+        if outpoint.is_none() && resume.is_some() {
+            out.insert("ln-funding-resume");
+        }
     }
 }
 
@@ -1183,6 +1211,8 @@ pub(crate) mod compat_support {
                     privkey: mine,
                     outpoint: Some(point),
                     value: Some(Amount::from_sat(100_000)),
+                    payout_script: None,
+                    resume: None,
                 },
             );
         }
@@ -1999,6 +2029,8 @@ mod tests {
                     privkey: SecretKey::from_slice(&[9; 32]).unwrap(),
                     outpoint: Some(cache_entry(0).0),
                     value: Some(Amount::from_sat(50_000)),
+                    payout_script: Some(ScriptBuf::from_bytes(vec![0x52])),
+                    resume: None,
                 };
                 let mut pending_names = BTreeSet::new();
                 pending.requires(&mut pending_names);
@@ -2032,6 +2064,104 @@ mod tests {
         store.write_to_disk(&path, &material).unwrap();
         let file: EncryptedDataV2 = serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(file.requires, [WALLET_STORE_FORMAT]);
+    }
+
+    /// A swap-out record that can resume its funding but has no outpoint yet
+    /// names `ln-funding-resume`, so a build without it refuses the wallet
+    /// instead of deleting the record as unfunded. Records an older build
+    /// reads correctly keep the old requirements, and the new fields
+    /// round-trip through the older record shape both ways.
+    #[test]
+    fn funding_resume_record_refuses_older_readers_until_funded() {
+        #[derive(Serialize, Deserialize)]
+        struct OlderLnPendingSwap {
+            is_swap_in: bool,
+            preimage: Option<[u8; 32]>,
+            redeemscript: ScriptBuf,
+            locktime: u16,
+            privkey: SecretKey,
+            outpoint: Option<OutPoint>,
+            value: Option<Amount>,
+        }
+
+        let dir = tempdir().unwrap();
+        let (path, mut store, material) = stored_wallet(dir.path());
+        let mut pending = LnPendingSwap {
+            is_swap_in: false,
+            preimage: Some([8; 32]),
+            redeemscript: ScriptBuf::from_bytes(vec![0x51]),
+            locktime: 60,
+            privkey: SecretKey::from_slice(&[9; 32]).unwrap(),
+            outpoint: None,
+            value: None,
+            payout_script: None,
+            resume: Some(LnFundingResume {
+                maker: "maker.onion:6102".into(),
+                amount: Amount::from_sat(50_000),
+                min_confirmations: 2,
+            }),
+        };
+        let header = |store: &WalletStore| -> EncryptedDataV2 {
+            store.write_to_disk(&path, &material).unwrap();
+            serde_cbor::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+
+        store
+            .ln_pending_swaps
+            .insert("taker".into(), pending.clone());
+        let file = header(&store);
+        assert_eq!(
+            file.requires,
+            ["ln-funding-resume", "ln-swap-out", WALLET_STORE_FORMAT]
+        );
+        let older: Vec<&str> = crate::protocol::features::supported()
+            .into_iter()
+            .filter(|name| *name != "ln-funding-resume")
+            .collect();
+        assert_eq!(
+            crate::protocol::features::check_requires(&file.requires, &older)
+                .unwrap_err()
+                .first()
+                .map(String::as_str),
+            Some("ln-funding-resume")
+        );
+        let read = WalletStore::read_from_disk(&path, Some(PASSWORD.into()));
+        if cfg!(feature = "lightning") {
+            assert_eq!(read.unwrap().0, store);
+        } else {
+            assert!(matches!(read, Err(WalletError::NeedsUpgrade(_))));
+        }
+
+        // Funded: an older build claims it like any other record.
+        pending.outpoint = Some(cache_entry(0).0);
+        pending.value = Some(Amount::from_sat(50_000));
+        pending.payout_script = Some(ScriptBuf::from_bytes(vec![0x52]));
+        store
+            .ln_pending_swaps
+            .insert("taker".into(), pending.clone());
+        assert_eq!(
+            header(&store).requires,
+            ["ln-swap-out", WALLET_STORE_FORMAT]
+        );
+        let older: OlderLnPendingSwap =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&pending).unwrap()).unwrap();
+        assert_eq!(older.outpoint, pending.outpoint);
+
+        // A record written before these fields existed reads them as unset,
+        // and needs nothing new even without an outpoint.
+        let legacy: LnPendingSwap = serde_cbor::from_slice(
+            &serde_cbor::to_vec(&OlderLnPendingSwap {
+                outpoint: None,
+                value: None,
+                ..older
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(legacy.payout_script.is_none() && legacy.resume.is_none());
+        let mut names = BTreeSet::new();
+        legacy.requires(&mut names);
+        assert_eq!(names, BTreeSet::from(["ln-swap-out"]));
     }
 
     #[test]

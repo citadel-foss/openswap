@@ -110,8 +110,7 @@ pub struct MockLightningBackend {
     claim_deadline: Mutex<Option<u32>>,
     /// How many times [`LightningBackend::has_payment_record`] was called.
     payment_record_lookups: AtomicUsize,
-    /// Fail every [`LightningBackend::has_payment_record`] call, as an
-    /// unreachable or broken backend would.
+    /// Fail payment-record reads, as an unreachable backend would.
     fail_payment_record_lookups: AtomicBool,
 }
 
@@ -147,6 +146,16 @@ impl MockLightningBackend {
     pub fn fail_payment_record_lookups(&self, fail: bool) {
         self.fail_payment_record_lookups
             .store(fail, Ordering::SeqCst);
+    }
+
+    fn check_payment_lookup(&self) -> Result<(), LightningError> {
+        if self.fail_payment_record_lookups.load(Ordering::SeqCst) {
+            return Err(LightningError::Api {
+                code: "InternalServerError".to_string(),
+                message: "mock: payment record lookup failed".to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Sets the claim deadline reported with held payments. `None` models a
@@ -637,6 +646,7 @@ impl LightningBackend for MockLightningBackend {
         &self,
         payment_hash: sha256::Hash,
     ) -> Result<PaymentOutcome, LightningError> {
+        self.check_payment_lookup()?;
         let ledger = self.ledger.lock()?;
         // Only an invoice this node paid is its payment. An HTLC that reached
         // one of its own invoices from elsewhere is not.
@@ -662,12 +672,7 @@ impl LightningBackend for MockLightningBackend {
 
     fn has_payment_record(&self, payment_hash: sha256::Hash) -> Result<bool, LightningError> {
         self.payment_record_lookups.fetch_add(1, Ordering::SeqCst);
-        if self.fail_payment_record_lookups.load(Ordering::SeqCst) {
-            return Err(LightningError::Api {
-                code: "InternalServerError".to_string(),
-                message: "mock: payment record lookup failed".to_string(),
-            });
-        }
+        self.check_payment_lookup()?;
         // This node created the invoice, or paid it and still has the record.
         Ok(self
             .ledger
