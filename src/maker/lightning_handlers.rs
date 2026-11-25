@@ -96,6 +96,9 @@ const SETTLE_MARGIN: u32 = 6;
 /// *confirms*, not after we build it. Measuring the on-chain window from the
 /// current tip would understate it by however long confirmation takes, and
 /// the taker's claim stays valid for that whole time.
+///
+/// Like [`REFUND_MINING_BUDGET`], this is an assumed latency, not a
+/// guarantee: nothing fee-bumps the funding if it confirms later.
 const FUNDING_CONF_BUDGET: u32 = 24;
 
 /// Confirmations the swap-out refund needs before the maker closes the swap.
@@ -109,12 +112,18 @@ const FUNDING_CONF_BUDGET: u32 = 24;
 /// deadline, at which the node would fail the payment back itself.
 const REFUND_FINALITY_DEPTH: u32 = 6;
 
-/// Blocks allowed for the swap-out refund to be mined once its CSV opens.
+/// Assumed blocks for the swap-out refund to be mined once its CSV opens.
 ///
 /// The refund can be mined no earlier than `locktime` blocks after the
 /// funding confirms, and a busy mempool can hold it back further. Admission
 /// budgets this delay so the refund can still reach [`REFUND_FINALITY_DEPTH`]
 /// before the held payment's claim deadline.
+///
+/// This is an assumed mining latency, not a guarantee. The refund pays a
+/// fixed fee and is only rebroadcast, never fee-bumped, so a fee spike after
+/// the CSV opens can keep it unmined past this budget. If the tip then
+/// reaches the claim deadline, the node fails the held payment back while
+/// the taker can still claim the funding by hashlock.
 const REFUND_MINING_BUDGET: u32 = 6;
 
 /// Direction of a swap and how far it has progressed. Defined alongside the
