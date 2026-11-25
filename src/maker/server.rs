@@ -532,6 +532,19 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     }
 }
 
+/// Test builds stop a maker once a reboot recovery completes, so a test can
+/// join it. A maker whose setup failed must instead reach the stop in
+/// `serve` that reports the error, so the tests for it can tell that stop
+/// apart from this one.
+#[cfg(feature = "integration-test")]
+fn stays_up_after_recovery(maker: &MakerServer) -> bool {
+    matches!(
+        maker.behavior,
+        super::handlers::MakerBehavior::FailFidelitySetup
+            | super::handlers::MakerBehavior::FailSwapLiquidityCheck
+    )
+}
+
 /// Whether a recovery-only maker has nothing left to recover: no reboot
 /// recovery is running and, with Lightning, no swap is left for the watchdog.
 fn recovery_finished(maker: &MakerServer, reboot_recoveries_left: &AtomicUsize) -> bool {
@@ -1765,7 +1778,9 @@ fn recover_from_swap(
                         swap_id
                     );
                     #[cfg(feature = "integration-test")]
-                    maker.shutdown.store(true, Relaxed);
+                    if !stays_up_after_recovery(&maker) {
+                        maker.shutdown.store(true, Relaxed);
+                    }
                     return Ok(());
                 }
                 Ok(pass) => {
@@ -2054,7 +2069,9 @@ fn recover_from_swap(
                     continue;
                 }
                 #[cfg(feature = "integration-test")]
-                maker.shutdown.store(true, Relaxed);
+                if !stays_up_after_recovery(&maker) {
+                    maker.shutdown.store(true, Relaxed);
+                }
                 return Ok(());
             }
         } else if current_height >= timelock_expiry && !incoming_swapcoins.is_empty() {
@@ -2124,7 +2141,9 @@ fn recover_from_swap(
                     continue;
                 }
                 #[cfg(feature = "integration-test")]
-                maker.shutdown.store(true, Relaxed);
+                if !stays_up_after_recovery(&maker) {
+                    maker.shutdown.store(true, Relaxed);
+                }
                 return Ok(());
             }
         }

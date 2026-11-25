@@ -221,6 +221,13 @@ pub(crate) fn run_reboot_recovery(world: &mut World, params: SwapParams, restart
         let port = restarted.config.network_port;
         // The recovery-only maker exits on its own once recovery is done.
         if let Some(failing_maker) = failing_maker {
+            // Its own stop, once nothing is left to recover: test builds no
+            // longer end this maker when its recovery completes.
+            wait_logged!(
+                world,
+                &format!("[{}] Recovery finished; stopping on the setup error", port),
+                Duration::from_secs(120)
+            );
             let expected = match restart {
                 Restart::BondSetupFails => "fidelity bond setup failed",
                 _ => "swap liquidity check failed",
