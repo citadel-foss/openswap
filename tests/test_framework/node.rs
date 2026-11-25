@@ -15,7 +15,6 @@ use std::{
 
 use bip39::rand;
 use bitcoind::{bitcoincore_rpc::Auth, BitcoinD};
-use electrsd::ElectrsD;
 use openswap::wallet::{BackendConfig, CoreRpcConfig, ElectrumConfig};
 
 use super::{
@@ -24,7 +23,7 @@ use super::{
     ports::free_ports,
     procs::{
         bitcoind::{generate_blocks, init_bitcoind},
-        electrs::{init_electrsd, wait_for_electrs_tip},
+        electrs::{init_electrsd, wait_for_electrs_tip, TestElectrs},
     },
 };
 
@@ -53,21 +52,21 @@ impl<B: TestBackend> NodeBuilder<B> {
         log::info!("temporary directory : {}", temp_dir.display());
         log::info!("test: {}", thread::current().name().unwrap_or("<unnamed>"));
 
-        if let Some(size) = self.keypool {
-            // bitcoind reads it from its datadir, `.bitcoin` under the temp dir.
-            fs::create_dir_all(temp_dir.join(".bitcoin")).unwrap();
-            fs::write(
-                temp_dir.join(".bitcoin/bitcoin.conf"),
-                format!("keypool={size}\n"),
-            )
-            .unwrap();
-        }
-
         // A freed OS port can be taken before bitcoind binds it, so retry.
+        // Each attempt has its own datadir: a failed start can leave the lock.
         let (bitcoind, zmq_addr) = (0..3)
-            .find_map(|_| {
+            .find_map(|attempt| {
+                let datadir = temp_dir.join(format!("bitcoind-{attempt}"));
+                if let Some(size) = self.keypool {
+                    fs::create_dir_all(datadir.join(".bitcoin")).unwrap();
+                    fs::write(
+                        datadir.join(".bitcoin/bitcoin.conf"),
+                        format!("keypool={size}\n"),
+                    )
+                    .unwrap();
+                }
                 let zmq_addr = format!("tcp://127.0.0.1:{}", free_ports(1)[0]);
-                init_bitcoind(&temp_dir, zmq_addr.clone())
+                init_bitcoind(&datadir, zmq_addr.clone())
                     .ok()
                     .map(|bitcoind| (bitcoind, zmq_addr))
             })
@@ -106,7 +105,7 @@ impl<B: TestBackend> NodeBuilder<B> {
 /// keep their data in.
 pub struct Node {
     // Dropped in this order: electrs polls bitcoind, so it goes first.
-    electrsd: Option<ElectrsD>,
+    electrsd: Option<TestElectrs>,
     bitcoind: Option<BitcoinD>,
     zmq_addr: String,
     rpc_config: CoreRpcConfig,
@@ -158,7 +157,7 @@ impl Node {
 
     /// The electrs serving this node.
     #[track_caller]
-    pub fn electrsd(&self) -> &ElectrsD {
+    pub fn electrsd(&self) -> &TestElectrs {
         self.electrsd
             .as_ref()
             .expect("this node has no electrs; build it over an Electrum backend")

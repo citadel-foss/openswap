@@ -1,4 +1,7 @@
-use std::{borrow::Cow, collections::HashSet, env, ffi::OsStr, fs, io::Write, path::PathBuf};
+use std::{borrow::Cow, collections::HashSet, env, ffi::OsStr, io::Write, path::PathBuf};
+// Directory fsync below is Unix-only. Tests import `fs` themselves on Windows.
+#[cfg(not(windows))]
+use std::fs;
 
 use crate::{
     protocol::features::{check_requires, supported},
@@ -814,6 +817,8 @@ mod tests {
     };
     use bitcoind::tempfile::tempdir;
     use std::collections::BTreeMap;
+    #[cfg(windows)]
+    use std::fs;
 
     /// `test_wallet`'s password.
     fn test_password() -> Zeroizing<String> {
