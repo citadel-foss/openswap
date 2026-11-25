@@ -1154,33 +1154,30 @@ fn watchdog_finish_sweep<M: Maker>(
         Ok(None) => None,
         Ok(Some(refund)) => {
             // The taker's refund is racing the sweep. The invoice is already
-            // paid, so the sweep outbids it. The taker signs the refund and
-            // can add inputs of its own, so its fee is read from all of them.
-            let Some(refund_paid) = refund_fee(&refund, outpoint, value, |txid| {
+            // paid, so the sweep outbids it.
+            let family = match maker.mempool_package_fee(&refund.compute_txid()) {
+                Ok(Some(fee)) => Some(fee),
+                // Gone since it was read: the next pass sees what replaced it.
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    log::warn!(
+                        "Swap-in {swap_id}: cannot read what spends from the taker's refund: {e:?}"
+                    );
+                    None
+                }
+            };
+            // The taker signs the refund and can add inputs of its own, so its
+            // fee is read from all of them.
+            let own = refund_fee(&refund, outpoint, value, |txid| {
                 maker.get_raw_transaction(txid).ok()
-            }) else {
+            });
+            let Some((refund_paid, to_beat, family_known)) = refund_bid(family, own) else {
                 log::warn!(
                     "Swap-in {swap_id}: cannot read what the taker's refund {} pays, \
                      contesting it next pass",
                     refund.compute_txid()
                 );
                 return Ok(());
-            };
-            let (to_beat, family_known) = match maker.mempool_package_fee(&refund.compute_txid()) {
-                Ok(Some(fee)) => (fee.max(refund_paid), true),
-                // Gone since it was read: the next pass sees what replaced it.
-                Ok(None) => return Ok(()),
-                // What spends from the refund is unknown, so the sweep bids
-                // against the refund alone. That can only replace a refund
-                // nothing spends from, and the rate is not recorded, so the
-                // next pass bids on what it reads then.
-                Err(e) => {
-                    log::warn!(
-                        "Swap-in {swap_id}: cannot read what spends from the taker's refund, \
-                         bidding against the refund alone: {e:?}"
-                    );
-                    (refund_paid, false)
-                }
             };
             let Some((sweep, rate)) = outbid_refund(
                 build,
@@ -2181,6 +2178,27 @@ fn outputs_total(tx: &bitcoin::Transaction) -> Option<Amount> {
         .try_fold(Amount::ZERO, |sum, output| sum.checked_add(output.value))
 }
 
+/// What the sweep bids against for the taker's refund, from `family`, what
+/// the refund and anything spending from it pay when that was read, and
+/// `own`, the refund's own fee when its inputs were read: the refund's own
+/// fee, the fee to beat, and whether the family was read.
+///
+/// With the family read and the refund's own fee not, as when the taker
+/// spread its inputs past what is read, the family's fee stands in for the
+/// refund's: it is at least as much, so the feerate step is met however
+/// much of it is the refund's. With only its own fee, the sweep bids
+/// against the refund alone. That can only replace a refund nothing spends
+/// from, and the rate is not recorded, so the next pass bids on what it
+/// reads then. `None` when neither was read.
+fn refund_bid(family: Option<Amount>, own: Option<Amount>) -> Option<(Amount, Amount, bool)> {
+    match (family, own) {
+        (Some(family), Some(own)) => Some((own, family.max(own), true)),
+        (Some(family), None) => Some((family, family, true)),
+        (None, Some(own)) => Some((own, own, false)),
+        (None, None) => None,
+    }
+}
+
 /// The most transactions read to price the taker's own inputs to a refund.
 const MAX_REFUND_FUNDING_READS: usize = 16;
 
@@ -2864,6 +2882,69 @@ mod tests {
             Some(Amount::from_sat(1_000))
         );
         assert_eq!(reads.get(), 1);
+    }
+
+    /// A taker refund spread over more funding transactions than are read is
+    /// still contested when its family's fee is known: that fee stands in
+    /// for the refund's own, and the sweep still replaces the refund.
+    #[test]
+    fn a_refund_past_the_read_cap_is_contested_from_its_family_fee() {
+        let swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InSwept);
+        let value = Amount::from_sat(40_000);
+        let (htlc, _) = swap.funding.unwrap();
+        let build = |rate| Ok(sweep_at(&swap, value, rate));
+        let mut refund = refund_at(&swap, value, SPEND_FEE_RATE_FLOOR);
+        refund.input.extend(
+            (1..=MAX_REFUND_FUNDING_READS as u8 + 1).map(|n| bitcoin::TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([n; 32]), 0),
+                ..Default::default()
+            }),
+        );
+        let funding = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![bitcoin::TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let reads = std::cell::Cell::new(0);
+        let own = refund_fee(&refund, htlc, value, |_| {
+            reads.set(reads.get() + 1);
+            Some(funding.clone())
+        });
+        assert_eq!(own, None, "17 funding transactions are past the cap");
+        assert_eq!(reads.get(), MAX_REFUND_FUNDING_READS);
+        // The backend reads the refund's family as paying 2,500.
+        let family = Amount::from_sat(2_500);
+        let (refund_paid, to_beat, family_known) = refund_bid(Some(family), own).unwrap();
+        assert_eq!((refund_paid, to_beat, family_known), (family, family, true));
+        let (sweep, _) = outbid_refund(
+            build,
+            value,
+            SPEND_FEE_RATE_FLOOR,
+            1.0,
+            &refund,
+            refund_paid,
+            to_beat,
+        )
+        .unwrap()
+        .expect("the HTLC affords the bid");
+        let paid = fee_paid(&sweep, value).to_sat();
+        assert!(paid >= family.to_sat() + sweep.vsize() as u64);
+        assert!(
+            paid as f64 / sweep.vsize() as f64 > family.to_sat() as f64 / refund.vsize() as f64
+        );
+        // With only its own fee it bids against the refund alone, and with
+        // neither the contest waits a pass.
+        let own = Amount::from_sat(300);
+        assert_eq!(refund_bid(None, Some(own)), Some((own, own, false)));
+        assert_eq!(
+            refund_bid(Some(Amount::from_sat(1_800)), Some(own)),
+            Some((own, Amount::from_sat(1_800), true))
+        );
+        assert_eq!(refund_bid(None, None), None);
     }
 
     #[test]
