@@ -1054,6 +1054,10 @@ impl MakerServer {
         // Misconfiguration (no txindex, dead ZMQ) must fail here, not mid-swap.
         if let AnyBlockchain::CoreRPC(core) = &blockchain {
             core.check_node_requirements().map_err(MakerError::Wallet)?;
+            #[cfg(feature = "lightning")]
+            if config.ldk_server_url.is_some() {
+                core.require_v24().map_err(MakerError::Wallet)?;
+            }
         }
         // Take the passphrase out of the config: the wallet keeps the derived
         // key material, so the cleartext passphrase must not linger in the

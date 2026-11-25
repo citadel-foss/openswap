@@ -463,6 +463,19 @@ impl CoreRPC {
         Ok(())
     }
 
+    /// The Lightning watchdog asks the node what spends an HTLC through
+    /// `gettxspendingprevout`, which Core added in 24.0. On an older node
+    /// every lookup would fail and no sweep or refund would be sent again.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn require_v24(&self) -> Result<(), WalletError> {
+        if self.rpc.version()? < 240_000 {
+            return Err(WalletError::General(
+                "Lightning swaps need Bitcoin Core v24.0 or newer".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Connect and subscribe the ZMQ notification socket up front.
     ///
     /// The watchtower calls this **before** its startup mempool scan so the SUB
