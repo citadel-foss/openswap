@@ -113,6 +113,8 @@ openswap maker::lightning_handlers::tests::a_rate_the_dust_fallback_undoes_is_no
 openswap maker::lightning_handlers::tests::a_refund_the_htlc_cannot_outbid_is_left_alone
 openswap maker::lightning_handlers::tests::a_refund_this_swap_replaced_is_still_ours
 openswap maker::lightning_handlers::tests::a_taker_refund_is_outbid_by_fee_and_by_feerate
+openswap maker::lightning_handlers::tests::a_taker_refund_is_priced_from_every_input
+openswap maker::lightning_handlers::tests::an_evicted_spend_a_swap_builds_on_is_resent_as_recorded
 openswap maker::lightning_handlers::tests::an_unaffordable_market_rate_outbids_at_the_least_that_replaces
 openswap maker::lightning_handlers::tests::compat_lightning_pins_require_exact_direction_and_requirements
 openswap maker::lightning_handlers::tests::directions_are_bounded_by_opposite_channel_sides

@@ -4089,6 +4089,14 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
+    fn sync_wallet_once(&self) -> Result<(), MakerError> {
+        lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .sync_once_and_save(&self.shutdown)
+            .map_err(MakerError::Wallet)
+    }
+
+    #[cfg(feature = "lightning")]
     fn release_replacement_hold(&self, key: &str, replaced: Option<&bitcoin::OutPoint>) {
         if let Ok(mut wallet) = lock_debug!(self.wallet.write()) {
             if let Some(outpoint) = replaced {

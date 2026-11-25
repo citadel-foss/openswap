@@ -1154,9 +1154,20 @@ fn watchdog_finish_sweep<M: Maker>(
         Ok(None) => None,
         Ok(Some(refund)) => {
             // The taker's refund is racing the sweep. The invoice is already
-            // paid, so the sweep outbids it.
+            // paid, so the sweep outbids it. The taker signs the refund and
+            // can add inputs of its own, so its fee is read from all of them.
+            let Some(refund_paid) = refund_fee(&refund, outpoint, value, |txid| {
+                maker.get_raw_transaction(txid).ok()
+            }) else {
+                log::warn!(
+                    "Swap-in {swap_id}: cannot read what the taker's refund {} pays, \
+                     contesting it next pass",
+                    refund.compute_txid()
+                );
+                return Ok(());
+            };
             let (to_beat, family_known) = match maker.mempool_package_fee(&refund.compute_txid()) {
-                Ok(Some(fee)) => (fee, true),
+                Ok(Some(fee)) => (fee.max(refund_paid), true),
                 // Gone since it was read: the next pass sees what replaced it.
                 Ok(None) => return Ok(()),
                 // What spends from the refund is unknown, so the sweep bids
@@ -1168,7 +1179,7 @@ fn watchdog_finish_sweep<M: Maker>(
                         "Swap-in {swap_id}: cannot read what spends from the taker's refund, \
                          bidding against the refund alone: {e:?}"
                     );
-                    (fee_paid(&refund, value), false)
+                    (refund_paid, false)
                 }
             };
             let Some((sweep, rate)) = outbid_refund(
@@ -1177,6 +1188,7 @@ fn watchdog_finish_sweep<M: Maker>(
                 built_at.max(maker.htlc_spend_feerate()),
                 maker.htlc_replacement_increment(),
                 &refund,
+                refund_paid,
                 to_beat,
             )?
             else {
@@ -1199,10 +1211,7 @@ fn watchdog_finish_sweep<M: Maker>(
                 refund.compute_txid()
             );
             match maker.broadcast_transaction(&sweep) {
-                // The wallet reads the sweep's output in.
-                Ok(_) => {
-                    let _ = maker.sync_and_save_wallet();
-                }
+                Ok(_) => read_new_output_in(maker.as_ref(), swap_id),
                 Err(e) => {
                     log::warn!("Swap-in {swap_id}: sweep did not replace the taker's refund: {e:?}")
                 }
@@ -1228,13 +1237,13 @@ fn watchdog_finish_sweep<M: Maker>(
         maker.htlc_spend_feerate(),
         maker.htlc_replacement_increment(),
         pending,
-        |txid| {
-            // Replacing the spend invalidates whatever spends its output: a
-            // transaction on chain, or a swap of ours that holds it to fund.
-            // The hold comes first, so a swap's funding sent just before it
-            // still reads as a spend.
+        |txid, pending| {
+            // Replacing a spend invalidates whatever spends its output: a
+            // swap of ours that holds it to fund and, while the spend is
+            // pending, a transaction in the mempool. The hold comes first,
+            // so a swap's funding sent just before it still reads as a spend.
             let output = OutPoint::new(txid, 0);
-            hold.take(&output) && maker.is_output_unspent(&output).unwrap_or(false)
+            hold.take(&output) && (!pending || maker.is_output_unspent(&output).unwrap_or(false))
         },
     )? {
         PlannedSpend::Resend(tx) => (tx, false),
@@ -1248,20 +1257,39 @@ fn watchdog_finish_sweep<M: Maker>(
             (tx, true)
         }
     };
-    match maker.broadcast_transaction(&claim_tx) {
-        Ok(txid) => {
-            log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}");
-            if replaced {
-                // Read the new sweep's output in, then take the replaced
-                // one out as the hold goes, so no swap claims it even when
-                // the sync fails or still lists it.
-                let _ = maker.sync_and_save_wallet();
-                hold.release_replaced();
-            }
-        }
+    let sent = maker.broadcast_transaction(&claim_tx);
+    match &sent {
+        Ok(txid) => log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}"),
         Err(e) => log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}"),
     }
+    if replaced {
+        settle_replaced(maker.as_ref(), swap_id, hold, sent.is_ok());
+    }
     Ok(())
+}
+
+/// Once a replacement of our pending spend went out, the replaced spend's
+/// output leaves the wallet as the hold goes, so no swap funds from it.
+/// That happens on a failed broadcast too, since an error can hide a
+/// replacement the node took, as when its reply is lost: a still-live
+/// output is only out of the wallet until the next sync lists it again,
+/// while a dead one left in would let a swap sign funding the node can't
+/// accept. An accepted replacement's output is read in with one sync.
+fn settle_replaced<M: Maker>(maker: &M, swap_id: &str, hold: ReplacementHold<'_, M>, sent: bool) {
+    hold.release_replaced();
+    if sent {
+        read_new_output_in(maker, swap_id);
+    }
+}
+
+/// Reads a new spend's output into the wallet with one sync, no retry, so a
+/// backend outage can't hold the watchdog or the wallet.
+fn read_new_output_in<M: Maker>(maker: &M, swap_id: &str) {
+    if let Err(e) = maker.sync_wallet_once() {
+        log::debug!(
+            "Swap {swap_id}: wallet sync after the spend failed, a later one reads it in: {e:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2023,6 +2051,10 @@ fn watchdog_resolve_swap_out(
             // replacement step and pays more. A record from before refunds
             // were priced was built at [`SPEND_FEE_RATE_FLOOR`].
             let market = maker.htlc_spend_feerate();
+            // A refund that was sent and evicted can have a swap's funding
+            // built on its output, so it is rebuilt at a new rate only while
+            // no swap holds that output.
+            let mut hold = ReplacementHold::new(maker, swap_id);
             let (feerate, refund_tx) = match swap.refund_txid {
                 None => {
                     let tx = build(market)?;
@@ -2037,7 +2069,7 @@ fn watchdog_resolve_swap_out(
                         market,
                         maker.htlc_replacement_increment(),
                         None,
-                        |_| false,
+                        |txid, _| hold.take(&OutPoint::new(txid, 0)),
                     )? {
                         PlannedSpend::Resend(tx) => (built_at, tx),
                         PlannedSpend::New { tx, rate, .. } => (rate, tx),
@@ -2134,29 +2166,73 @@ fn is_our_refund(swap: &LnMakerSwap, spend: &bitcoin::Transaction) -> bool {
     swap.refund_txid == Some(txid) || swap.earlier_refund_txids.contains(&txid)
 }
 
-/// What a spend of an HTLC holding `value` pays in fees.
+/// What a spend of an HTLC holding `value` pays in fees: zero when its
+/// outputs add up to more than `value`, or overflow.
 fn fee_paid(tx: &bitcoin::Transaction, value: Amount) -> Amount {
-    value
-        .checked_sub(tx.output.iter().map(|output| output.value).sum())
+    outputs_total(tx)
+        .and_then(|out| value.checked_sub(out))
         .unwrap_or(Amount::ZERO)
 }
 
-/// The sweep that replaces `refund`, the taker's pending refund, with its
-/// rate. It pays `to_beat`, the fee of the refund and anything spending from
-/// it, plus the replacement step for [`SPEND_TX_VSIZE`]. It also pays more per
-/// vbyte than the refund by that step, since a replacement must, and the
-/// sweep is the larger of the two. It takes `floor_rate`, the market or
-/// recorded rate, when that is more and the HTLC affords it. `None` when the
-/// HTLC cannot pay even the least that replaces the refund.
+/// The sum of `tx`'s outputs, `None` when it overflows.
+fn outputs_total(tx: &bitcoin::Transaction) -> Option<Amount> {
+    tx.output
+        .iter()
+        .try_fold(Amount::ZERO, |sum, output| sum.checked_add(output.value))
+}
+
+/// The most transactions read to price the taker's own inputs to a refund.
+const MAX_REFUND_FUNDING_READS: usize = 16;
+
+/// What the taker's `refund` pays in fees, from every input it spends: the
+/// HTLC at `htlc` holds `value`, and any other is read from the transaction
+/// it spends, through `read_tx`, each transaction once and at most
+/// [`MAX_REFUND_FUNDING_READS`] of them. `None` when an input cannot be read
+/// or the amounts do not add up.
+fn refund_fee(
+    refund: &bitcoin::Transaction,
+    htlc: OutPoint,
+    value: Amount,
+    read_tx: impl Fn(&bitcoin::Txid) -> Option<bitcoin::Transaction>,
+) -> Option<Amount> {
+    let mut read = std::collections::HashMap::new();
+    let mut inputs = Amount::ZERO;
+    for input in &refund.input {
+        let spent = input.previous_output;
+        let paid = if spent == htlc {
+            value
+        } else {
+            if !read.contains_key(&spent.txid) {
+                if read.len() >= MAX_REFUND_FUNDING_READS {
+                    return None;
+                }
+                read.insert(spent.txid, read_tx(&spent.txid)?);
+            }
+            read[&spent.txid].output.get(spent.vout as usize)?.value
+        };
+        inputs = inputs.checked_add(paid)?;
+    }
+    inputs.checked_sub(outputs_total(refund)?)
+}
+
+/// The sweep that replaces `refund`, the taker's pending refund paying
+/// `refund_paid`, with its rate. It pays `to_beat`, the fee of the refund and
+/// anything spending from it, plus the replacement step for
+/// [`SPEND_TX_VSIZE`]. It also pays more per vbyte than the refund by that
+/// step, since a replacement must, and the sweep is the larger of the two.
+/// It takes `floor_rate`, the market or recorded rate, when that is more and
+/// the HTLC affords it. `None` when the HTLC cannot pay even the least that
+/// replaces the refund.
 fn outbid_refund(
     build: impl Fn(f64) -> Result<bitcoin::Transaction, MakerError>,
     value: Amount,
     floor_rate: f64,
     increment: f64,
     refund: &bitcoin::Transaction,
+    refund_paid: Amount,
     to_beat: Amount,
 ) -> Result<Option<(bitcoin::Transaction, f64)>, MakerError> {
-    let refund_rate = fee_paid(refund, value).to_sat() as f64 / refund.vsize() as f64;
+    let refund_rate = refund_paid.to_sat() as f64 / refund.vsize() as f64;
     let needed = (to_beat.to_sat() as f64 / SPEND_TX_VSIZE as f64 + increment)
         .max(refund_rate + increment)
         .max(SPEND_FEE_RATE_FLOOR);
@@ -2250,11 +2326,13 @@ enum PlannedSpend {
 /// Decides what to send from the node's view of the HTLC. `pending` is our
 /// unconfirmed spend in the mempool; `None` means nothing of ours is
 /// pending, evicted or never sent, so a spend at the market rate replaces
-/// nothing and goes out once the market clears the recorded rate by the
-/// replacement step. A pending spend is bumped once the market clears the rate it
-/// actually pays by the replacement step, and only while `output_unspent`
-/// says nothing builds on it. That rate is read from its fee, so a record
-/// that disagrees with the mempool cannot mislead it.
+/// nothing in the mempool and goes out once the market clears the recorded
+/// rate by the replacement step. A pending spend is bumped once the market
+/// clears the rate it actually pays by the replacement step. That rate is
+/// read from its fee, so a record that disagrees with the mempool cannot
+/// mislead it. Either way a spend is given up only while `replaceable` says
+/// nothing builds on its output: asked with the spend's txid, and whether it
+/// is pending.
 fn plan_spend(
     build: impl Fn(f64) -> Result<bitcoin::Transaction, MakerError>,
     value: Amount,
@@ -2262,14 +2340,18 @@ fn plan_spend(
     market: f64,
     increment: f64,
     pending: Option<bitcoin::Transaction>,
-    output_unspent: impl FnOnce(bitcoin::Txid) -> bool,
+    replaceable: impl FnOnce(bitcoin::Txid, bool) -> bool,
 ) -> Result<PlannedSpend, MakerError> {
     let Some(pending) = pending else {
         let recorded = build(built_at)?;
         if market >= built_at + increment {
             let tx = build(market)?;
-            // A rate the dust fallback undoes keeps the recorded spend.
-            if fee_paid(&tx, value) > fee_paid(&recorded, value) {
+            // A rate the dust fallback undoes keeps the recorded spend, and
+            // so does a swap whose funding builds on the recorded spend's
+            // output: a new txid would leave that funding spending nothing.
+            if fee_paid(&tx, value) > fee_paid(&recorded, value)
+                && replaceable(recorded.compute_txid(), false)
+            {
                 let rate = rate_paid(&tx, value, market);
                 return Ok(PlannedSpend::New {
                     tx,
@@ -2286,7 +2368,7 @@ fn plan_spend(
         return Ok(PlannedSpend::Resend(pending));
     }
     let txid = pending.compute_txid();
-    if !output_unspent(txid) {
+    if !replaceable(txid, true) {
         return Ok(PlannedSpend::Resend(pending));
     }
     let tx = build(market)?;
@@ -2358,13 +2440,13 @@ fn resend_refund(
         maker.htlc_spend_feerate(),
         maker.htlc_replacement_increment(),
         pending,
-        |txid| {
-            // Replacing the spend invalidates whatever spends its output: a
-            // transaction on chain, or a swap of ours that holds it to fund.
-            // The hold comes first, so a swap's funding sent just before it
-            // still reads as a spend.
+        |txid, pending| {
+            // Replacing a spend invalidates whatever spends its output: a
+            // swap of ours that holds it to fund and, while the spend is
+            // pending, a transaction in the mempool. The hold comes first,
+            // so a swap's funding sent just before it still reads as a spend.
             let output = OutPoint::new(txid, 0);
-            hold.take(&output) && maker.is_output_unspent(&output).unwrap_or(false)
+            hold.take(&output) && (!pending || maker.is_output_unspent(&output).unwrap_or(false))
         },
     )? {
         PlannedSpend::Resend(tx) => (tx, false),
@@ -2387,16 +2469,13 @@ fn resend_refund(
             (tx, true)
         }
     };
-    match maker.broadcast_transaction(&refund) {
-        Ok(txid) => {
-            log::info!("Swap-out {swap_id}: refund sent as {txid}");
-            // As for the sweep.
-            if replaced {
-                let _ = maker.sync_and_save_wallet();
-                hold.release_replaced();
-            }
-        }
+    let sent = maker.broadcast_transaction(&refund);
+    match &sent {
+        Ok(txid) => log::info!("Swap-out {swap_id}: refund sent as {txid}"),
         Err(e) => log::debug!("Swap-out {swap_id}: refund rebroadcast rejected: {e:?}"),
+    }
+    if replaced {
+        settle_replaced(maker.as_ref(), swap_id, hold, sent.is_ok());
     }
     Ok(())
 }
@@ -2587,25 +2666,35 @@ mod tests {
         assert!(!is_our_refund(&swap, &rival));
     }
 
-    /// A record written before refunds were priced or bumped has neither
-    /// field. It still reads, with no rate and no earlier refunds, and is
-    /// rebuilt from the floor rate it was built at.
+    /// A record written before spends were priced or bumped has none of the
+    /// three fields. It still reads, with no rates and no earlier refunds,
+    /// and is rebuilt from the floor rate it was built at.
     #[test]
     fn record_without_a_refund_feerate_reads_as_built_at_the_floor() {
         let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
         swap.refund_txid = Some(bitcoin::Txid::from_byte_array([0x42; 32]));
+        swap.refund_feerate = Some(10.0);
+        swap.sweep_feerate = Some(20.0);
+        swap.earlier_refund_txids = vec![bitcoin::Txid::from_byte_array([0x43; 32])];
         let serde_cbor::Value::Map(mut fields) =
             serde_cbor::value::to_value(swap.to_record()).unwrap()
         else {
             panic!("a record serializes as a map");
         };
-        assert!(fields
-            .remove(&serde_cbor::Value::Text("refund_feerate".to_string()))
-            .is_some());
+        for key in ["refund_feerate", "earlier_refund_txids", "sweep_feerate"] {
+            assert!(
+                fields
+                    .remove(&serde_cbor::Value::Text(key.to_string()))
+                    .is_some(),
+                "{}",
+                key
+            );
+        }
         let restored = LnMakerSwap::from_record(
             serde_cbor::value::from_value(serde_cbor::Value::Map(fields)).unwrap(),
         );
         assert_eq!(restored.refund_feerate, None);
+        assert_eq!(restored.sweep_feerate, None);
         assert!(restored.earlier_refund_txids.is_empty());
     }
 
@@ -2651,8 +2740,11 @@ mod tests {
         let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
         let value = Amount::from_sat(40_000);
         let build = |rate| Ok(refund_at(&swap, value, rate));
-        let unused = |_| panic!("nothing pending, nothing to check");
-        match plan_spend(build, value, 10.0, 40.0, 1.0, None, unused).unwrap() {
+        let free = |_: bitcoin::Txid, pending: bool| {
+            assert!(!pending, "nothing is pending");
+            true
+        };
+        match plan_spend(build, value, 10.0, 40.0, 1.0, None, free).unwrap() {
             PlannedSpend::New { tx, rate, replaces } => {
                 assert_eq!(rate, 40.0);
                 assert_eq!(replaces, None);
@@ -2661,9 +2753,117 @@ mod tests {
             other => panic!("expected a new spend, got {:?}", other),
         }
         assert_eq!(
-            plan_spend(build, value, 10.0, 5.0, 1.0, None, unused).unwrap(),
+            plan_spend(build, value, 10.0, 5.0, 1.0, None, free).unwrap(),
             PlannedSpend::Resend(refund_at(&swap, value, 10.0))
         );
+    }
+
+    /// A spend evicted from the mempool can still have a swap's funding
+    /// built on its output, waiting on signatures. Rebuilt at a new rate it
+    /// would get a new txid and leave that funding spending nothing, so it
+    /// is resent as recorded.
+    #[test]
+    fn an_evicted_spend_a_swap_builds_on_is_resent_as_recorded() {
+        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(refund_at(&swap, value, rate));
+        let recorded = refund_at(&swap, value, 10.0);
+        let asked = std::cell::Cell::new(None);
+        assert_eq!(
+            plan_spend(build, value, 10.0, 40.0, 1.0, None, |txid, pending| {
+                asked.set(Some((txid, pending)));
+                false
+            })
+            .unwrap(),
+            PlannedSpend::Resend(recorded.clone())
+        );
+        assert_eq!(asked.get(), Some((recorded.compute_txid(), false)));
+    }
+
+    /// The taker signs its refund and can add inputs of its own, so the fee
+    /// it pays comes from all of them, never from the HTLC alone.
+    #[test]
+    fn a_taker_refund_is_priced_from_every_input() {
+        let htlc = OutPoint::new(bitcoin::Txid::from_byte_array([0x11; 32]), 0);
+        let extra = OutPoint::new(bitcoin::Txid::from_byte_array([0x22; 32]), 1);
+        let paying = |outputs: &[u64]| bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: [htlc, extra]
+                .iter()
+                .map(|spent| bitcoin::TxIn {
+                    previous_output: *spent,
+                    ..Default::default()
+                })
+                .collect(),
+            output: outputs
+                .iter()
+                .map(|sat| bitcoin::TxOut {
+                    value: Amount::from_sat(*sat),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        };
+        let value = Amount::from_sat(40_500);
+        let funding = |sats: &[u64]| bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: sats
+                .iter()
+                .map(|sat| bitcoin::TxOut {
+                    value: Amount::from_sat(*sat),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        };
+        let read = |txid: &bitcoin::Txid| (*txid == extra.txid).then(|| funding(&[7, 10_000]));
+        // Against the HTLC alone it reads as paying nothing.
+        let refund = paying(&[48_500]);
+        assert_eq!(fee_paid(&refund, value), Amount::ZERO);
+        assert_eq!(
+            refund_fee(&refund, htlc, value, read),
+            Some(Amount::from_sat(2_000))
+        );
+        // An input that cannot be read leaves the fee unknown, not zero.
+        assert_eq!(refund_fee(&refund, htlc, value, |_| None), None);
+        // Outputs past what the inputs hold, or past any amount.
+        assert_eq!(refund_fee(&paying(&[60_000]), htlc, value, read), None);
+        let overflowing = paying(&[u64::MAX, 1]);
+        assert_eq!(refund_fee(&overflowing, htlc, value, read), None);
+        assert_eq!(fee_paid(&overflowing, value), Amount::ZERO);
+        // Inputs from more transactions than it reads leave the fee unknown,
+        // and one transaction is read once however many inputs it funds.
+        let mut wide = paying(&[1_000]);
+        wide.input = (0..=MAX_REFUND_FUNDING_READS as u8)
+            .map(|n| bitcoin::TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([n; 32]), 0),
+                ..Default::default()
+            })
+            .collect();
+        let reads = std::cell::Cell::new(0);
+        let any = |_: &bitcoin::Txid| {
+            reads.set(reads.get() + 1);
+            Some(funding(&[1_000]))
+        };
+        assert_eq!(refund_fee(&wide, htlc, value, any), None);
+        assert_eq!(reads.get(), MAX_REFUND_FUNDING_READS);
+        let mut shared = paying(&[1_000]);
+        shared.input = (0..4)
+            .map(|vout| bitcoin::TxIn {
+                previous_output: OutPoint::new(extra.txid, vout),
+                ..Default::default()
+            })
+            .collect();
+        reads.set(0);
+        assert_eq!(
+            refund_fee(&shared, htlc, value, |_| {
+                reads.set(reads.get() + 1);
+                Some(funding(&[500; 4]))
+            }),
+            Some(Amount::from_sat(1_000))
+        );
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]
@@ -2672,9 +2872,15 @@ mod tests {
         let value = Amount::from_sat(40_000);
         let build = |rate| Ok(refund_at(&swap, value, rate));
         let pending = refund_at(&swap, value, 10.0);
-        match plan_spend(build, value, 10.0, 11.0, 1.0, Some(pending.clone()), |_| {
-            true
-        })
+        match plan_spend(
+            build,
+            value,
+            10.0,
+            11.0,
+            1.0,
+            Some(pending.clone()),
+            |_, _| true,
+        )
         .unwrap()
         {
             PlannedSpend::New { rate, replaces, .. } => {
@@ -2685,17 +2891,29 @@ mod tests {
         }
         // Under the replacement step.
         assert_eq!(
-            plan_spend(build, value, 10.0, 10.5, 1.0, Some(pending.clone()), |_| {
-                true
-            })
+            plan_spend(
+                build,
+                value,
+                10.0,
+                10.5,
+                1.0,
+                Some(pending.clone()),
+                |_, _| { true }
+            )
             .unwrap(),
             PlannedSpend::Resend(pending.clone())
         );
         // Something spends its output: a replacement would evict it.
         assert_eq!(
-            plan_spend(build, value, 10.0, 40.0, 1.0, Some(pending.clone()), |_| {
-                false
-            })
+            plan_spend(
+                build,
+                value,
+                10.0,
+                40.0,
+                1.0,
+                Some(pending.clone()),
+                |_, _| { false }
+            )
             .unwrap(),
             PlannedSpend::Resend(pending)
         );
@@ -2710,7 +2928,7 @@ mod tests {
         let build = |rate| Ok(refund_at(&swap, value, rate));
         let sent = refund_at(&swap, value, 10.0);
         let recorded = refund_at(&swap, value, 40.0);
-        match plan_spend(build, value, 40.0, 40.0, 1.0, Some(sent), |_| true).unwrap() {
+        match plan_spend(build, value, 40.0, 40.0, 1.0, Some(sent), |_, _| true).unwrap() {
             PlannedSpend::New { tx, .. } => assert_eq!(tx.compute_txid(), recorded.compute_txid()),
             other => panic!("expected the recorded bump, got {:?}", other),
         }
@@ -2732,7 +2950,7 @@ mod tests {
                 6.0,
                 1.0,
                 None,
-                |_| unreachable!()
+                |_, _| unreachable!()
             )
             .unwrap(),
             PlannedSpend::Resend(floor.clone())
@@ -2745,7 +2963,7 @@ mod tests {
                 6.0,
                 1.0,
                 Some(floor.clone()),
-                |_| true
+                |_, _| true
             )
             .unwrap(),
             PlannedSpend::Resend(floor)
@@ -2793,9 +3011,17 @@ mod tests {
         for (refund_rate, child_fee) in [(2.0, 0), (40.0, 0), (2.0, 1_500)] {
             let refund = refund_at(&swap, value, refund_rate);
             let to_beat = fee_paid(&refund, value) + Amount::from_sat(child_fee);
-            let (sweep, rate) = outbid_refund(build, value, refund_rate, 1.0, &refund, to_beat)
-                .unwrap()
-                .expect("the HTLC can pay to outbid this refund");
+            let (sweep, rate) = outbid_refund(
+                build,
+                value,
+                refund_rate,
+                1.0,
+                &refund,
+                fee_paid(&refund, value),
+                to_beat,
+            )
+            .unwrap()
+            .expect("the HTLC can pay to outbid this refund");
             assert!(
                 replaces(&sweep, &refund, value, to_beat),
                 "{:?}",
@@ -2817,9 +3043,17 @@ mod tests {
         ));
         // The market rate is a floor of its own.
         let refund = refund_at(&swap, value, 2.0);
-        let (_, rate) = outbid_refund(build, value, 30.0, 1.0, &refund, fee_paid(&refund, value))
-            .unwrap()
-            .unwrap();
+        let (_, rate) = outbid_refund(
+            build,
+            value,
+            30.0,
+            1.0,
+            &refund,
+            fee_paid(&refund, value),
+            fee_paid(&refund, value),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(rate, 30.0);
     }
 
@@ -2835,7 +3069,11 @@ mod tests {
         let recorded = rate_paid(&fallback, value, 300.0);
         assert_eq!(recorded, SPEND_FEE_RATE_FLOOR);
         assert_eq!(rate_paid(&sweep_at(&swap, value, 40.0), value, 40.0), 40.0);
-        match plan_spend(build, value, recorded, 40.0, 1.0, Some(fallback), |_| true).unwrap() {
+        match plan_spend(build, value, recorded, 40.0, 1.0, Some(fallback), |_, _| {
+            true
+        })
+        .unwrap()
+        {
             PlannedSpend::New { rate, .. } => assert_eq!(rate, 40.0),
             other => panic!("the floor spend was not bumped: {:?}", other),
         }
@@ -2851,9 +3089,17 @@ mod tests {
         let refund = refund_at(&swap, value, SPEND_FEE_RATE_FLOOR);
         // The refund and a child pay 1800 sat; 300 sat/vB asks 45,000.
         let to_beat = Amount::from_sat(1_800);
-        let (sweep, rate) = outbid_refund(build, value, 300.0, 1.0, &refund, to_beat)
-            .unwrap()
-            .expect("13 sat/vB replaces the family");
+        let (sweep, rate) = outbid_refund(
+            build,
+            value,
+            300.0,
+            1.0,
+            &refund,
+            fee_paid(&refund, value),
+            to_beat,
+        )
+        .unwrap()
+        .expect("13 sat/vB replaces the family");
         assert_eq!(rate, 13.0);
         assert_eq!(fee_paid(&sweep, value), Amount::from_sat(1_950));
         assert!(replaces(&sweep, &refund, value, to_beat));
@@ -2871,7 +3117,16 @@ mod tests {
         // the output above dust.
         let to_beat = Amount::from_sat(39_600);
         assert_eq!(
-            outbid_refund(build, value, SPEND_FEE_RATE_FLOOR, 1.0, &refund, to_beat).unwrap(),
+            outbid_refund(
+                build,
+                value,
+                SPEND_FEE_RATE_FLOOR,
+                1.0,
+                &refund,
+                fee_paid(&refund, value),
+                to_beat
+            )
+            .unwrap(),
             None
         );
     }

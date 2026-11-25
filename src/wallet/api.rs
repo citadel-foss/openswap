@@ -4814,6 +4814,17 @@ impl Wallet {
         Ok(())
     }
 
+    /// One sync attempt, then a save, with no retry: a caller holding the
+    /// wallet's lock waits on one round of backend reads at most.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn sync_once_and_save(
+        &mut self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), WalletError> {
+        self.sync(shutdown)?;
+        self.save_to_disk()
+    }
+
     /// Get all utxos tracked by the backend.
     ///
     /// Returns the full unspent set; coin locking is applied wallet-side at

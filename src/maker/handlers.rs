@@ -841,6 +841,13 @@ pub trait Maker: Send + Sync {
     #[cfg(feature = "lightning")]
     fn release_replacement_hold(&self, _key: &str, _replaced: Option<&bitcoin::OutPoint>) {}
 
+    /// One wallet sync and save with no retry, to read a new spend's output
+    /// in without holding the wallet through a backend outage.
+    #[cfg(feature = "lightning")]
+    fn sync_wallet_once(&self) -> Result<(), MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
     /// Whether `outpoint` is unspent with the mempool included: for a
     /// pending HTLC spend's output, that nothing builds on it yet.
     #[cfg(feature = "lightning")]
