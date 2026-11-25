@@ -784,7 +784,11 @@ impl Electrum {
     /// from the transaction's inputs and outputs, not taken from the server.
     /// `None` when `txid` is not in the mempool. A family no replacement could
     /// evict, or one that takes too long to read, is an error, so a partial
-    /// sum is never taken for the whole.
+    /// sum is never taken for the whole. One read of each `txid` runs at a
+    /// time: while a thread the last caller gave up on is still finishing,
+    /// the next caller for that `txid` gets an error rather than another
+    /// thread and connection, and a thread given up on stops at its next
+    /// round trip. Reads of other transactions are not held up by it.
     #[cfg(feature = "lightning")]
     pub(crate) fn package_fee_on_side_connection(
         config: ElectrumConfig,
@@ -792,20 +796,48 @@ impl Electrum {
         txid: Txid,
         budget: Duration,
     ) -> Result<Option<bitcoin::Amount>, WalletError> {
+        static RUNNING: std::sync::Mutex<Vec<Txid>> = std::sync::Mutex::new(Vec::new());
+        struct Running(Txid);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+                running.retain(|txid| *txid != self.0);
+            }
+        }
+        {
+            let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+            if running.contains(&txid) {
+                return Err(electrum_err(format!(
+                    "electrum: an earlier read of what spends from {txid} is still running"
+                )));
+            }
+            running.push(txid);
+        }
+        let running = Running(txid);
         let started = Instant::now();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancelled = cancel.clone();
         let (answer, wait) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("electrum-package-fee".to_string())
             .spawn(move || {
                 let fee = Self::with_shutdown_flag(&config, shutdown).and_then(|side| {
-                    side.package_fee_within(&txid, budget.saturating_sub(started.elapsed()))
+                    side.package_fee_until(
+                        &txid,
+                        budget.saturating_sub(started.elapsed()),
+                        &cancelled,
+                    )
                 });
+                // Done before answering, so a caller that asks again right
+                // after the answer finds no read running.
+                drop(running);
                 let _ = answer.send(fee);
             })
             .map_err(|e| {
                 electrum_err(format!("electrum: cannot start the package fee read: {e}"))
             })?;
         wait.recv_timeout(budget).unwrap_or_else(|_| {
+            cancel.store(true, Ordering::SeqCst);
             Err(electrum_err(format!(
                 "electrum: reading what spends from {txid} took more than {budget:?}"
             )))
@@ -815,11 +847,24 @@ impl Electrum {
     /// The package fee of `txid` read on this connection within `budget`,
     /// checked before every round trip. See
     /// [`Self::package_fee_on_side_connection`].
-    #[cfg(feature = "lightning")]
+    #[cfg(all(test, feature = "lightning"))]
     fn package_fee_within(
         &self,
         txid: &Txid,
         budget: Duration,
+    ) -> Result<Option<bitcoin::Amount>, WalletError> {
+        self.package_fee_until(txid, budget, &AtomicBool::new(false))
+    }
+
+    /// The package fee of `txid` read on this connection within `budget`,
+    /// checked before every round trip, and stopping before the next one
+    /// once `cancel` is set.
+    #[cfg(feature = "lightning")]
+    fn package_fee_until(
+        &self,
+        txid: &Txid,
+        budget: Duration,
+        cancel: &AtomicBool,
     ) -> Result<Option<bitcoin::Amount>, WalletError> {
         // A replacement may evict at most 100 transactions (BIP125 rule 5).
         const MAX_FAMILY: usize = 100;
@@ -827,19 +872,21 @@ impl Electrum {
         const TX_BATCH: usize = 100;
         let started = Instant::now();
         let in_time = || {
-            if started.elapsed() > budget {
+            if started.elapsed() > budget || cancel.load(Ordering::SeqCst) {
                 return Err(electrum_err(format!(
                     "electrum: reading what spends from {txid} took more than {budget:?}"
                 )));
             }
             Ok(())
         };
-        let mut histories: HashMap<ScriptBuf, Vec<GetHistoryRes>> = HashMap::new();
         let mut total = bitcoin::Amount::ZERO;
         let mut family = HashSet::from([*txid]);
         let mut queue = vec![*txid];
         while let Some(parent) = queue.pop() {
             in_time()?;
+            // Read fresh for each transaction: an output paying a script read
+            // for an earlier one may have a spender that history missed.
+            let mut histories: HashMap<ScriptBuf, Vec<GetHistoryRes>> = HashMap::new();
             let tx = match self.transaction_get_validating(&parent) {
                 Ok(tx) => tx,
                 Err(WalletError::Electrum(ref e)) if is_unknown_txid(e) && parent == *txid => {
@@ -853,7 +900,6 @@ impl Electrum {
                 .output
                 .iter()
                 .map(|output| output.script_pubkey.clone())
-                .filter(|script| !histories.contains_key(script))
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
@@ -3324,18 +3370,32 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let started = Instant::now();
-        let fee = Electrum::package_fee_on_side_connection(
-            config,
-            Arc::new(AtomicBool::new(false)),
-            Txid::from_byte_array([7; 32]),
-            Duration::from_millis(300),
-        );
+        let read = |txid| {
+            Electrum::package_fee_on_side_connection(
+                config.clone(),
+                Arc::new(AtomicBool::new(false)),
+                txid,
+                Duration::from_millis(300),
+            )
+        };
+        let refund = Txid::from_byte_array([7; 32]);
+        let fee = read(refund);
         assert!(fee.is_err(), "{:?}", fee);
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the caller waited {:?}",
             started.elapsed()
         );
+        // The first thread is still stuck in the handshake, so another read
+        // of the same refund is refused at once rather than piling up.
+        let again = Instant::now();
+        let fee = read(refund);
+        assert!(
+            matches!(&fee, Err(e) if format!("{:?}", e).contains("still running")),
+            "{:?}",
+            fee
+        );
+        assert!(again.elapsed() < Duration::from_millis(100));
     }
 
     /// A backend whose server lists `entries` as every script's history and
