@@ -791,9 +791,9 @@ impl Electrum {
     /// and the whole answer, name lookup and connection setup included, is
     /// given at most `budget`: past it the caller gets an error. Every read
     /// and write on that connection, its handshakes included, also ends by
-    /// then and its replies are capped in size (see [`side`]), so a thread
-    /// the caller gave up on is not held past the budget by a server that
-    /// trickles or pads its reply; only a name lookup can outlast it. The family is found
+    /// then and its replies are capped in size (see [`side`]), so a server
+    /// that trickles or pads its reply cannot hold the thread the caller gave
+    /// up on past the budget. Only a name lookup can. The family is found
     /// through the server's current script histories, read for all of a
     /// transaction's outputs in one round trip, and each fee is worked out
     /// from the transaction's inputs and outputs, not taken from the server.
@@ -1186,12 +1186,18 @@ impl Electrum {
         shutdown: Arc<AtomicBool>,
         deadline: Instant,
     ) -> Result<Self, WalletError> {
-        Self::with_client(cfg, shutdown, || {
+        // One attempt, never reconnected: a retry would sleep past the
+        // deadline, and a reconnect would open an unguarded connection.
+        let mut cfg = cfg.clone();
+        cfg.max_retries = 0;
+        let idle = Duration::from_secs(u64::from(derive_timeout_secs(&cfg)));
+        Self::with_client(&cfg, shutdown, || {
             side::connect(
                 &cfg.url,
                 cfg.socks5.as_deref(),
                 !url_host(&cfg.url).ends_with(".onion"),
                 deadline,
+                idle,
             )
             .map(|stream| {
                 ElectrumClient(Transport::Guarded(
@@ -2698,8 +2704,8 @@ mod side {
     };
 
     /// The most bytes a refund's family read takes from its server, every
-    /// reply included. A family no replacement could evict is refused at
-    /// 100 transactions, far under this.
+    /// reply and any TLS overhead included: a bound on what a server can make
+    /// the read hold, not a size an honest family needs.
     pub(super) const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
 
     /// Test-only: reads of these txids wait before they connect, as a name
@@ -2714,12 +2720,25 @@ mod side {
     pub(super) struct Guarded {
         stream: TcpStream,
         deadline: Instant,
+        /// The longest one read or write waits, as `electrum_client`'s own
+        /// socket timeout.
+        idle: Duration,
         left: usize,
     }
 
     impl Guarded {
         fn remaining(&self) -> io::Result<Duration> {
-            time_left(self.deadline)
+            time_left(self.deadline).map(|left| left.min(self.idle))
+        }
+    }
+
+    /// A read or write that waited out its timeout reads the same on every
+    /// platform: Unix reports it as `WouldBlock`, Windows as `TimedOut`.
+    fn quiet(e: io::Error) -> io::Error {
+        if e.kind() == io::ErrorKind::WouldBlock {
+            io::Error::new(io::ErrorKind::TimedOut, "electrum: the server went quiet")
+        } else {
+            e
         }
     }
 
@@ -2736,7 +2755,7 @@ mod side {
             }
             self.stream.set_read_timeout(Some(self.remaining()?))?;
             let take = buf.len().min(self.left);
-            let read = self.stream.read(&mut buf[..take])?;
+            let read = self.stream.read(&mut buf[..take]).map_err(quiet)?;
             self.left -= read;
             Ok(read)
         }
@@ -2745,7 +2764,7 @@ mod side {
     impl Write for Guarded {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.stream.set_write_timeout(Some(self.remaining()?))?;
-            self.stream.write(buf)
+            self.stream.write(buf).map_err(quiet)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -2797,6 +2816,7 @@ mod side {
         socks5: Option<&str>,
         validate_domain: bool,
         deadline: Instant,
+        idle: Duration,
     ) -> io::Result<GuardedStream> {
         let (tls, target) = match url.strip_prefix("ssl://") {
             Some(target) => (true, target),
@@ -2809,19 +2829,20 @@ mod side {
         let host = host.trim_start_matches('[').trim_end_matches(']');
         let stream = match socks5 {
             Some(proxy) => {
-                let mut stream = open(proxy, deadline)?;
+                let mut stream = open(proxy, deadline, idle)?;
                 socks5_connect(&mut stream, host, port)?;
                 stream
             }
-            None => open(target, deadline)?,
+            None => open(target, deadline, idle)?,
         };
         if !tls {
             return Ok(GuardedStream::Plain(stream));
         }
         let name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|e| failed(format!("electrum: {host} is not a server name: {e}")))?;
-        let connection = rustls::ClientConnection::new(Arc::new(tls_config(validate_domain)), name)
-            .map_err(|e| failed(format!("electrum: cannot start TLS: {e}")))?;
+        let connection =
+            rustls::ClientConnection::new(Arc::new(tls_config(validate_domain)?), name)
+                .map_err(|e| failed(format!("electrum: cannot start TLS: {e}")))?;
         // The handshake runs on the first read or write, under the deadline.
         Ok(GuardedStream::Tls(Box::new(rustls::StreamOwned::new(
             connection, stream,
@@ -2830,21 +2851,27 @@ mod side {
 
     /// A socket to `address`, trying each address the name resolves to while
     /// the deadline lasts.
-    fn open(address: &str, deadline: Instant) -> io::Result<Guarded> {
-        let mut last = failed(format!("electrum: {address} resolves to nothing"));
+    fn open(address: &str, deadline: Instant, idle: Duration) -> io::Result<Guarded> {
+        let mut last = None;
         for resolved in address.to_socket_addrs()? {
-            match TcpStream::connect_timeout(&resolved, time_left(deadline)?) {
+            // Past the deadline, the last address's own failure says more.
+            let time = match time_left(deadline) {
+                Ok(time) => time.min(idle),
+                Err(e) => return Err(last.unwrap_or(e)),
+            };
+            match TcpStream::connect_timeout(&resolved, time) {
                 Ok(stream) => {
                     return Ok(Guarded {
                         stream,
                         deadline,
+                        idle,
                         left: MAX_READ_BYTES,
                     })
                 }
-                Err(e) => last = e,
+                Err(e) => last = Some(e),
             }
         }
-        Err(last)
+        Err(last.unwrap_or_else(|| failed(format!("electrum: {address} resolves to nothing"))))
     }
 
     /// The time to `deadline`, or an error once it has passed.
@@ -2866,13 +2893,35 @@ mod side {
         stream.write_all(&[5, 1, 0])?;
         let mut choice = [0u8; 2];
         stream.read_exact(&mut choice)?;
-        if choice != [5, 0] {
-            return Err(failed("electrum: the socks5 proxy wants authentication"));
+        match choice {
+            [5, 0] => {}
+            [5, _] => {
+                return Err(failed(
+                    "electrum: the socks5 proxy takes no connection without authentication",
+                ))
+            }
+            _ => return Err(failed("electrum: the proxy did not answer as socks5")),
         }
-        let name = u8::try_from(host.len())
-            .map_err(|_| failed(format!("electrum: {host} is too long for socks5")))?;
-        let mut request = vec![5, 1, 0, 3, name];
-        request.extend_from_slice(host.as_bytes());
+        // An address goes as one, as `electrum_client` sends it; a name goes
+        // for the proxy to resolve.
+        let mut request = vec![5, 1, 0];
+        match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                request.push(1);
+                request.extend_from_slice(&ip.octets());
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                request.push(4);
+                request.extend_from_slice(&ip.octets());
+            }
+            Err(_) => {
+                let name = u8::try_from(host.len())
+                    .map_err(|_| failed(format!("electrum: {host} is too long for socks5")))?;
+                request.push(3);
+                request.push(name);
+                request.extend_from_slice(host.as_bytes());
+            }
+        }
         request.extend_from_slice(&port.to_be_bytes());
         stream.write_all(&request)?;
         let mut reply = [0u8; 4];
@@ -2898,12 +2947,12 @@ mod side {
 
     /// TLS settings as `electrum_client` uses them: the web's root
     /// certificates, or, for an onion server, no certificate check.
-    fn tls_config(validate_domain: bool) -> rustls::ClientConfig {
+    fn tls_config(validate_domain: bool) -> io::Result<rustls::ClientConfig> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
-            .expect("ring supports the default TLS versions");
-        if validate_domain {
+            .map_err(|e| failed(format!("electrum: cannot set up TLS: {e}")))?;
+        Ok(if validate_domain {
             let roots = rustls::RootCertStore {
                 roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
             };
@@ -2913,7 +2962,7 @@ mod side {
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerification(provider)))
                 .with_no_client_auth()
-        }
+        })
     }
 
     /// Accepts any certificate, for an onion server: Tor authenticates it.
@@ -3845,10 +3894,21 @@ pub(crate) mod tests {
             Txid::from_byte_array([12; 32]),
             Txid::from_byte_array([13; 32]),
         ];
+        // Cleared however the test ends, so no thread stays held.
+        struct Hold([Txid; 2]);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                side::HELD
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|txid| !self.0.contains(txid));
+            }
+        }
         side::HELD
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .extend(held);
+        let hold = Hold(held);
         let fee = side_read(&url, held[0], budget);
         assert!(fee.is_err() && !refused(&fee), "{:?}", fee);
         let again = Instant::now();
@@ -3858,10 +3918,7 @@ pub(crate) mod tests {
         let third = Txid::from_byte_array([14; 32]);
         assert!(refused(&side_read(&url, third, budget)));
         assert!(again.elapsed() < budget + Duration::from_millis(100));
-        side::HELD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|txid| !held.contains(txid));
+        drop(hold);
         // Released past their deadline, both threads end at once.
         thread::sleep(Duration::from_millis(300));
         let fee = side_read(&url, third, budget);
