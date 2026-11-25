@@ -150,9 +150,12 @@ pub struct LnMakerSwap {
     pub funding: Option<(OutPoint, Amount)>,
     /// Refund timing. Swap-in: the block that confirmed the funding, where the
     /// taker's CSV refund window starts. Swap-out: the chain tip when the
-    /// maker broadcast its funding, or, if that read failed, the block that
-    /// confirmed it.
+    /// maker broadcast its funding, or, if that read failed, nothing. The
+    /// watchdog replaces it with the block that confirmed the funding on the
+    /// active chain before it times the refund.
     pub funding_height: Option<u32>,
+    /// Backend deadline for claiming the held payment (swap-out only).
+    pub claim_deadline: Option<u32>,
     /// Last phase-change time; the watchdog only touches idle states.
     pub updated_at: Instant,
 }
@@ -187,6 +190,7 @@ impl LnMakerSwap {
             funding_outpoint,
             funding_value,
             funding_height: self.funding_height,
+            claim_deadline: self.claim_deadline,
         }
     }
 
@@ -211,6 +215,7 @@ impl LnMakerSwap {
             payout_script: record.payout_script,
             funding: record.funding_outpoint.zip(record.funding_value),
             funding_height: record.funding_height,
+            claim_deadline: record.claim_deadline,
             updated_at: Instant::now(),
         }
     }
@@ -756,6 +761,7 @@ fn handle_swap_in_request<M: Maker>(
             payout_script: None,
             funding: None,
             funding_height: None,
+            claim_deadline: None,
             updated_at: Instant::now(),
         },
     )?;
@@ -1165,6 +1171,7 @@ fn handle_swap_out_request<M: Maker>(
             payout_script: None,
             funding: None,
             funding_height: None,
+            claim_deadline: None,
             updated_at: Instant::now(),
         },
     )?;
@@ -1296,6 +1303,7 @@ fn handle_swap_out_paid<M: Maker>(
     let value = output.value;
     swap.funding = Some((outpoint, value));
     swap.funding_height = maker.get_current_height().ok();
+    swap.claim_deadline = claim_deadline;
     swap.phase = LnMakerPhase::OutFunded;
     swap.touch();
     store_swap(maker, swap_id, swap.clone())?;
@@ -1633,12 +1641,16 @@ fn swap_in_htlc_refunded(maker: &Arc<MakerServer>, swap: &LnMakerSwap) -> Result
     maker.is_htlc_spend_confirmed(&outpoint, &spk)
 }
 
-/// Recovers the funding height of a swap stored in `phase` without one, as a
-/// handler whose height lookup failed stores it. The watchdog cannot time
-/// the refund window without it. Returns the height once it is stored;
-/// `None` leaves the swap for a later pass, because the funding has no
-/// confirmation height yet or the swap has changed since `swap` was read.
-/// A failed lookup is an error, and the swap is kept.
+/// Reads the block that confirmed a swap's funding on the active chain and
+/// stores it as the swap's `funding_height` if the stored one differs: none,
+/// as a handler whose height lookup failed stores it, or a wrong one, such
+/// as the tip a swap-out is stored with at broadcast or a block a reorg has
+/// since replaced. The write lands only while the stored swap still has the
+/// phase, funding and height `swap` was read with. Returns the height once
+/// it is the stored one; `None` leaves the swap for a later pass, because
+/// the funding has no confirmation height on the active chain or the swap
+/// has changed since `swap` was read. A failed lookup is an error, and the
+/// swap is kept.
 fn recover_funding_height(
     maker: &Arc<MakerServer>,
     swap_id: &str,
@@ -1649,16 +1661,31 @@ fn recover_funding_height(
         return Ok(None);
     };
     let Some(height) = maker.tx_confirmation_height(&outpoint.txid)? else {
-        log::warn!(
-            "Swap {swap_id}: funding {outpoint} has no confirmation height; keeping the swap \
-             until it does"
-        );
+        match swap.funding_height {
+            None => log::warn!(
+                "Swap {swap_id}: funding {outpoint} has no confirmation height; keeping the \
+                 swap until it does"
+            ),
+            Some(stored) => log::info!(
+                "Swap {swap_id}: funding {outpoint} is not confirmed on the active chain \
+                 (stored height {stored}); keeping the swap until it is"
+            ),
+        }
         return Ok(None);
     };
-    if !maker.fill_ln_funding_height(swap_id, phase, outpoint, height)? {
+    if swap.funding_height == Some(height) {
+        return Ok(Some(height));
+    }
+    if !maker.fill_ln_funding_height(swap_id, phase, outpoint, swap.funding_height, height)? {
         return Ok(None);
     }
-    log::info!("Swap {swap_id}: recovered funding height {height} from the chain");
+    match swap.funding_height {
+        None => log::info!("Swap {swap_id}: recovered funding height {height} from the chain"),
+        Some(stored) => log::info!(
+            "Swap {swap_id}: funding confirmed at height {height}, not the stored {stored}; \
+             corrected"
+        ),
+    }
     Ok(Some(height))
 }
 
@@ -1689,22 +1716,93 @@ fn watchdog_resolve_swap_out(
         .funding
         .ok_or(MakerError::General("OutFunded without funding"))?;
 
-    let answer = maker.watch_service.watch_request(outpoint).map_err(|e| {
-        // Logged rather than formatted into the error: MakerError::General
-        // holds a &'static str, and the watchdog reaches this on every
-        // tick for a persistently failing watch.
-        log::warn!("swap-out {swap_id}: watch request failed: {e:?}");
-        MakerError::General("watch request failed")
-    })?;
+    let answer = maker.watch_service.watch_request(outpoint);
     #[cfg(feature = "integration-test")]
     let answer = if HIDE_HTLC_SPENDS.load(std::sync::atomic::Ordering::SeqCst) {
-        WatcherEvent::UtxoSpent {
+        Ok(WatcherEvent::UtxoSpent {
             outpoint,
             spending_tx: None,
-        }
+        })
     } else {
         answer
     };
+    // A watch can miss a claim without noticing the notification loss, or
+    // stay stuck reconciling it. Re-arming does not force a chain read.
+    // Recover before the CSV gate, even with no saved funding height: the
+    // held Lightning payment has its own deadline and cannot wait for CSV.
+    let answer = match &answer {
+        Ok(WatcherEvent::UtxoSpent {
+            spending_tx: Some(tx),
+            ..
+        }) if swap.htlc.extract_preimage(tx).is_some() => answer,
+        // The watcher holds our recorded refund, and it is mined: no claim can
+        // confirm against it, so the lookup could only return this refund,
+        // and on Core it reads every block since funding to do so. Unmined,
+        // or if the check fails, the lookup still runs to find a rival claim.
+        Ok(WatcherEvent::UtxoSpent {
+            spending_tx: Some(tx),
+            ..
+        }) if is_our_refund(swap, tx)
+            && matches!(maker.tx_confirmations(&tx.compute_txid()), Ok(Some(_))) =>
+        {
+            answer
+        }
+        _ => {
+            warn_swap_out_claim_deadline(maker, swap_id, swap);
+            let spk = swap
+                .htlc
+                .script_pubkey()
+                .map_err(|_| MakerError::General("htlc script build failed"))?;
+            let spend = maker
+                .backend
+                .connect()
+                .and_then(|chain| chain.spending_transaction(&outpoint, &spk, None))
+                .map_err(|e| {
+                    log::warn!(
+                        "Swap-out {swap_id}: direct preimage recovery failed: {e:?}; \
+                        retrying before the held Lightning payment expires"
+                    );
+                    MakerError::Wallet(e)
+                });
+            match spend {
+                Ok(Some(tx)) => {
+                    if !tx
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output == outpoint)
+                    {
+                        return Err(MakerError::General(
+                            "lookup returned a different HTLC spend",
+                        ));
+                    }
+                    Ok(WatcherEvent::UtxoSpent {
+                        outpoint,
+                        spending_tx: Some(tx),
+                    })
+                }
+                Ok(None) => answer,
+                // A failed lookup says nothing about the HTLC, so fall back
+                // to the watcher's answer and look again next pass. A refund
+                // still needs the chain to show the exact outpoint unspent,
+                // and closing still needs our refund final on the chain.
+                Err(_) => answer,
+            }
+        }
+    };
+    // Chain I/O may have outlived the swap. Never act on a removed record,
+    // a different funding outpoint, or a phase another handler advanced.
+    if !maker.get_ln_swap(swap_id)?.is_some_and(|current| {
+        current.direction == LnDirection::SwapOut
+            && current.phase == LnMakerPhase::OutFunded
+            && current.funding == swap.funding
+            && current.payment_hash == swap.payment_hash
+    }) {
+        return Ok(());
+    }
+    let answer = answer.map_err(|e| {
+        log::warn!("swap-out {swap_id}: watch request failed: {e:?}");
+        MakerError::General("watch request failed")
+    })?;
     match HtlcWatch::from_answer(answer)? {
         HtlcWatch::Spent(spending_tx) => {
             let spk = swap.htlc.script_pubkey().map_err(|e| {
@@ -1787,17 +1885,16 @@ fn watchdog_resolve_swap_out(
             Ok(())
         }
         HtlcWatch::Unspent => {
-            // Unspent: refund once the CSV window has passed. An early
-            // attempt fails non-BIP68-final harmlessly and is retried. A
-            // swap stored without its height gets the funding's.
-            let funded_at = match swap.funding_height {
-                Some(height) => height,
-                None => {
-                    match recover_funding_height(maker, swap_id, swap, LnMakerPhase::OutFunded)? {
-                        Some(height) => height,
-                        None => return Ok(()),
-                    }
-                }
+            // Unspent: refund once the CSV window has passed, counted from
+            // the block that confirmed the funding on the active chain. The
+            // stored height is not trusted for this: a swap-out is stored
+            // with the tip at broadcast, and a reorg can move the funding to
+            // another block or out of the chain. Unconfirmed funding or a
+            // failed lookup waits, with the swap kept.
+            let Some(funded_at) =
+                recover_funding_height(maker, swap_id, swap, LnMakerPhase::OutFunded)?
+            else {
+                return Ok(());
             };
             let current = maker.get_current_height()?;
             let refundable = current >= funded_at.saturating_add(swap.locktime as u32);
@@ -1811,7 +1908,8 @@ fn watchdog_resolve_swap_out(
                 UnspentHtlc::SpentUnseen => {
                     log::warn!(
                         "Swap-out {swap_id}: HTLC is spent on chain but the watcher has no \
-                         spend on record; waiting for it instead of refunding"
+                         spend on record and direct lookup has no transaction; preimage \
+                         recovery is urgent before the held Lightning payment expires"
                     );
                     return Ok(());
                 }
@@ -1819,7 +1917,7 @@ fn watchdog_resolve_swap_out(
             }
             let mut swap = swap.clone();
             // Stored below with the refund, so it must not carry the
-            // snapshot's missing height over the one just recovered.
+            // snapshot's height over the one just read from the chain.
             swap.funding_height = Some(funded_at);
             // Not payout_script(), whose store is unconditional: a new script
             // changes the refund txid, so the guarded store below writes both.
@@ -1871,6 +1969,35 @@ fn watchdog_resolve_swap_out(
             }
             Ok(())
         }
+    }
+}
+
+/// Warn before a potentially slow lookup. This is observational only: neither
+/// an approaching deadline nor a failed height read authorizes a refund.
+fn warn_swap_out_claim_deadline(maker: &Arc<MakerServer>, swap_id: &str, swap: &LnMakerSwap) {
+    let Some(deadline) = swap.claim_deadline else {
+        // Runs on every pass, healthy or not. A failed lookup or an unseen
+        // spend warns on its own path; without a deadline there is nothing
+        // more to warn about here.
+        log::debug!(
+            "Swap-out {swap_id}: held Lightning claim deadline is unknown in this legacy \
+            record; checking the chain for the claim without a deadline estimate"
+        );
+        return;
+    };
+    match maker.get_current_height() {
+        Ok(current) if current.saturating_add(SETTLE_MARGIN) >= deadline => {
+            log::warn!(
+                "Swap-out {swap_id}: preimage unrecovered; hold-invoice claim deadline \
+                is height {deadline}, current height {current}, {} blocks remaining",
+                deadline.saturating_sub(current)
+            );
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!(
+            "Swap-out {swap_id}: preimage unrecovered; hold-invoice claim \
+            deadline is height {deadline}, current height unavailable: {e:?}"
+        ),
     }
 }
 
@@ -1977,6 +2104,160 @@ mod tests {
     use super::*;
     use crate::maker::api::tests::compat_test_maker;
     use bitcoin::ScriptBuf;
+
+    /// Exercise the real watchdog and Core lookup with a watcher that never
+    /// learns the spend. A missing transaction or RPC error must keep the
+    /// held invoice and durable swap available for the next pass.
+    #[test]
+    fn unseen_swap_out_claim_retries_and_settles_before_csv() {
+        use crate::{
+            lightning::{InvoiceParams, MockLightningBackend},
+            wallet::{blockchain::BackendConnector, BackendConfig, CoreRpcConfig},
+            watch_tower::{service::answering, watcher::tests::mock_core_rpc},
+        };
+        use bitcoin::consensus::encode::serialize_hex;
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for answer in [
+            WatcherEvent::UtxoSpent {
+                outpoint: OutPoint::default(),
+                spending_tx: None,
+            },
+            WatcherEvent::Error("reconciliation pending".into()),
+            WatcherEvent::NoOutpoint,
+        ] {
+            let dir = bitcoind::tempfile::tempdir().unwrap();
+            let mut maker = compat_test_maker(dir.path(), vec![]);
+            let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+            let preimage = swap.preimage.unwrap();
+            let (outpoint, value) = swap.funding.unwrap();
+            let claim = swap
+                .htlc
+                .create_hashlock_spend(outpoint, value, &swap.privkey, &preimage, ScriptBuf::new())
+                .unwrap();
+            swap.preimage = None;
+            if matches!(answer, WatcherEvent::Error(_)) {
+                swap.funding_height = None;
+            }
+            let mode = Arc::new(AtomicUsize::new(0));
+            let (url, _) = mock_core_rpc({
+                let mode = mode.clone();
+                move |method, params| match method {
+                    "gettxspendingprevout" => match mode.load(Ordering::SeqCst) {
+                        0 => Ok(json!([])),
+                        1 => Err(json!({"code": -28, "message": "backend unavailable"})),
+                        _ => Ok(json!([{"txid": outpoint.txid, "vout": outpoint.vout,
+                            "spendingtxid": claim.compute_txid()}])),
+                    },
+                    // The funding is not mined, so its height lookup finds no
+                    // block and the refund waits.
+                    "getrawtransaction" if params[0] == json!(outpoint.txid) => {
+                        Err(json!({"code": -5, "message": "transaction unavailable"}))
+                    }
+                    "getrawtransaction" if mode.load(Ordering::SeqCst) == 0 => {
+                        Err(json!({"code": -5, "message": "transaction unavailable"}))
+                    }
+                    "getrawtransaction" => {
+                        let mut tx = claim.clone();
+                        match mode.load(Ordering::SeqCst) {
+                            2 => tx.input[0].previous_output.vout ^= 1,
+                            3 => {
+                                let witness: Vec<_> = tx.input[0].witness.iter().collect();
+                                tx.input[0].witness = bitcoin::Witness::from_slice(&[
+                                    witness[0],
+                                    &[0x55; 32],
+                                    witness[2],
+                                ]);
+                            }
+                            _ => {}
+                        }
+                        Ok(json!(serialize_hex(&tx)))
+                    }
+                    "gettxout" => Ok(json!(null)),
+                    "getblockcount" => Ok(json!(1)),
+                    other => panic!("unexpected RPC {}", other),
+                }
+            });
+            let watcher_fails = matches!(answer, WatcherEvent::Error(_));
+            let inner = Arc::get_mut(&mut maker).unwrap();
+            inner.watch_service.shutdown();
+            inner.watch_service = answering(answer);
+            let config = CoreRpcConfig {
+                url,
+                ..Default::default()
+            };
+            inner.wallet.write().unwrap().blockchain = crate::wallet::AnyBlockchain::CoreRPC(
+                crate::wallet::CoreRPC::new(&config).unwrap(),
+            );
+            inner.backend = BackendConnector::new(
+                BackendConfig::CoreRpc(config),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            let ln = Arc::new(MockLightningBackend::new());
+            ln.create_hold_invoice(swap.payment_hash, InvoiceParams::default())
+                .unwrap();
+            ln.simulate_htlc_arrival(swap.payment_hash, 40_000_000);
+            let ctx = LnContext {
+                ln: ln.clone(),
+                router: LnEventRouter::new(ln.clone()),
+            };
+            let id = swap.payment_hash.to_string();
+            maker.store_ln_swap(&id, swap.clone()).unwrap();
+            // Drain the arrival: only settlement should release a preimage.
+            while ln.poll_event().unwrap().is_some() {}
+            for state in [0, 1, 2, 3] {
+                mode.store(state, Ordering::SeqCst);
+                let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
+                match state {
+                    // A failed lookup falls back to the watcher's answer,
+                    // which is an error only when the watcher failed.
+                    1 => assert_eq!(result.is_err(), watcher_fails, "state 1: {:?}", result),
+                    2 => assert!(
+                        matches!(&result, Err(MakerError::General(msg))
+                            if *msg == "lookup returned a different HTLC spend"),
+                        "state 2: {:?}",
+                        result
+                    ),
+                    3 => assert!(result.is_err(), "state 3: {:?}", result),
+                    _ => {}
+                }
+                assert!(maker.get_ln_swap(&id).unwrap().is_some());
+                assert!(ln.poll_event().unwrap().is_none());
+                assert!(maker
+                    .get_ln_swap(&id)
+                    .unwrap()
+                    .unwrap()
+                    .refund_txid
+                    .is_none());
+            }
+            mode.store(4, Ordering::SeqCst);
+            let mut changed = swap.clone();
+            changed.phase = LnMakerPhase::OutAccepted;
+            maker.store_ln_swap(&id, changed).unwrap();
+            watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
+            assert!(ln.poll_event().unwrap().is_none());
+            assert_eq!(
+                maker.get_ln_swap(&id).unwrap().unwrap().phase,
+                LnMakerPhase::OutAccepted
+            );
+            maker.store_ln_swap(&id, swap.clone()).unwrap();
+            watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
+            assert!(
+                maker.get_ln_swap(&id).unwrap().is_none(),
+                "unseen claim was never recovered"
+            );
+            assert!(
+                matches!(ln.poll_event().unwrap(), Some(LnEvent::PaymentSuccessful {
+                preimage: Some(p), .. }) if p == preimage)
+            );
+            while ln.poll_event().unwrap().is_some() {}
+            // The old snapshot cannot re-settle a removed swap.
+            watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
+            assert!(ln.poll_event().unwrap().is_none());
+            maker.watch_service.shutdown();
+        }
+    }
 
     #[test]
     fn compat_lightning_pins_require_exact_direction_and_requirements() {
@@ -2114,6 +2395,7 @@ mod tests {
             payout_script: None,
             funding: Some((OutPoint::default(), Amount::from_sat(40_000))),
             funding_height: Some(812_345),
+            claim_deadline: None,
             updated_at: Instant::now(),
         }
     }
@@ -2123,7 +2405,8 @@ mod tests {
     /// byte-identical spend — that spend is the only way back to the money.
     #[test]
     fn persisted_record_survives_serialization_and_still_spends() {
-        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        swap.claim_deadline = Some(812_435);
         let bytes = serde_cbor::to_vec(&swap.to_record()).unwrap();
         let restored = LnMakerSwap::from_record(serde_cbor::from_slice(&bytes).unwrap());
 
@@ -2139,6 +2422,15 @@ mod tests {
         assert_eq!(restored.invoice, swap.invoice);
         assert_eq!(restored.funding, swap.funding);
         assert_eq!(restored.funding_height, swap.funding_height);
+        assert_eq!(restored.claim_deadline, swap.claim_deadline);
+
+        let mut legacy = swap.to_record();
+        legacy.claim_deadline = None;
+        let legacy = serde_cbor::value::to_value(legacy).unwrap();
+        assert!(!matches!(&legacy, serde_cbor::Value::Map(fields)
+            if fields.contains_key(&serde_cbor::Value::Text("claim_deadline".into()))));
+        let legacy: LnMakerSwapRecord = serde_cbor::value::from_value(legacy).unwrap();
+        assert_eq!(LnMakerSwap::from_record(legacy).claim_deadline, None);
 
         // The point of persisting at all: the refund still signs identically.
         let (outpoint, value) = swap.funding.unwrap();
@@ -2297,6 +2589,814 @@ mod tests {
         assert!(restored.funding.is_none());
         assert!(restored.funding_height.is_none());
         assert_eq!(restored.htlc, swap.htlc);
+    }
+    fn refund_after_lookup(close_during_height: bool, old_core: bool) {
+        use crate::{
+            lightning::MockLightningBackend,
+            wallet::{blockchain::BackendConnector, BackendConfig, CoreRpcConfig},
+            watch_tower::{
+                service::answering,
+                watcher::tests::{mock_core_rpc, Node},
+            },
+        };
+        use serde_json::json;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Weak,
+        };
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let mut maker = compat_test_maker(dir.path(), vec![]);
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        // The funding confirmed at height 1 on the active chain, the height
+        // stored with the swap: the refund is timed from the chain's answer.
+        let value = swap.funding.unwrap().1;
+        let funding = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![bitcoin::TxOut {
+                value,
+                script_pubkey: swap.htlc.script_pubkey().unwrap(),
+            }],
+        };
+        swap.funding = Some((OutPoint::new(funding.compute_txid(), 0), value));
+        let mut node = Node::default();
+        node.mine(vec![]);
+        node.mine(vec![funding]);
+        swap.funding_height = Some(1);
+        swap.payout_script = Some(ScriptBuf::new());
+        let id = swap.payment_hash.to_string();
+        let holder = Arc::new(Mutex::new(None::<Weak<MakerServer>>));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (url, _) = mock_core_rpc({
+            let holder = holder.clone();
+            let closed = closed.clone();
+            let id = id.clone();
+            move |method, params| match method {
+                "gettxspendingprevout" if old_core => {
+                    Err(json!({"code": -32601, "message": "Method not found"}))
+                }
+                "gettxspendingprevout" => Ok(json!([])),
+                "gettxout" => Ok(json!({"bestblock": "00".repeat(32), "confirmations": 100,
+                    "value": 0.0004, "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"},
+                    "coinbase": false})),
+                "getrawtransaction" | "getblockheader" => node.answer(method, params),
+                "getblockcount" => {
+                    // After the new guard, another handler can close the map
+                    // record while get_current_height holds the wallet read lock.
+                    // remove_ln_swap itself removes from this map first.
+                    if close_during_height && !closed.swap(true, Ordering::SeqCst) {
+                        let maker = holder.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
+                        assert!(maker.ln_swaps.lock().unwrap().remove(&id).is_some());
+                    }
+                    Ok(json!(100))
+                }
+                "sendrawtransaction" => Err(json!({"code": -26, "message": "test rejection"})),
+                other => panic!("unexpected RPC {}", other),
+            }
+        });
+        let inner = Arc::get_mut(&mut maker).unwrap();
+        inner.watch_service.shutdown();
+        inner.watch_service = answering(WatcherEvent::UtxoSpent {
+            outpoint: swap.funding.unwrap().0,
+            spending_tx: None,
+        });
+        let config = CoreRpcConfig {
+            url,
+            ..Default::default()
+        };
+        inner.wallet.write().unwrap().blockchain =
+            crate::wallet::AnyBlockchain::CoreRPC(crate::wallet::CoreRPC::new(&config).unwrap());
+        inner.backend = BackendConnector::new(
+            BackendConfig::CoreRpc(config),
+            Arc::new(AtomicBool::new(false)),
+        );
+        *holder.lock().unwrap() = Some(Arc::downgrade(&maker));
+        let ln = Arc::new(MockLightningBackend::new());
+        let ctx = LnContext {
+            ln: ln.clone(),
+            router: LnEventRouter::new(ln),
+        };
+        maker.store_ln_swap(&id, swap.clone()).unwrap();
+        let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
+        let resurrected = maker.get_ln_swap(&id).unwrap();
+        maker.watch_service.shutdown();
+        result.unwrap();
+        if close_during_height {
+            assert!(closed.load(Ordering::SeqCst));
+            assert!(resurrected.is_none(), "closed swap was recreated");
+        } else {
+            assert!(
+                resurrected.unwrap().refund_txid.is_some(),
+                "old Core could not refund"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_swap_out_is_not_recreated_after_the_lookup_guard() {
+        refund_after_lookup(true, false);
+    }
+
+    #[test]
+    fn old_core_can_refund_an_unspent_swap_out() {
+        refund_after_lookup(false, true);
+    }
+
+    /// On Electrum the direct spend lookup fails while the HTLC script's
+    /// history lists a transaction the server cannot serve, as anyone can pay
+    /// to that script. The failure says nothing about the HTLC, so the refund
+    /// decision falls to the live UTXO check of the exact outpoint: refund
+    /// only when it shows the outpoint unspent, no refund when it shows it
+    /// spent, and no decision when it fails. The held payment is untouched.
+    #[test]
+    fn electrum_lookup_failure_leaves_the_refund_to_the_utxo_check() {
+        use crate::{
+            lightning::{InvoiceParams, MockLightningBackend},
+            wallet::{
+                blockchain::{mock_electrum, BackendConnector},
+                AnyBlockchain, BackendConfig, Electrum, ElectrumConfig,
+            },
+            watch_tower::service::answering,
+        };
+        use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn, TxOut, Txid};
+        use serde_json::{json, Value};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Utxo {
+            Unspent,
+            Spent,
+            Fails,
+        }
+        for utxo in [Utxo::Unspent, Utxo::Spent, Utxo::Fails] {
+            let dir = bitcoind::tempfile::tempdir().unwrap();
+            let mut maker = compat_test_maker(dir.path(), vec![]);
+            let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+            let preimage = swap.preimage.take().unwrap();
+            swap.payout_script = Some(ScriptBuf::new());
+            let value = swap.funding.unwrap().1;
+            let htlc_spk = swap.htlc.script_pubkey().unwrap();
+            let funding = bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![TxIn::default()],
+                output: vec![TxOut {
+                    value,
+                    script_pubkey: htlc_spk.clone(),
+                }],
+            };
+            let outpoint = OutPoint::new(funding.compute_txid(), 0);
+            // Past the CSV: funded at 10, locktime 60, tip 100.
+            swap.funding = Some((outpoint, value));
+            swap.funding_height = Some(10);
+            let deposit = bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: htlc_spk,
+                }],
+            };
+            let (funding_id, deposit_id) = (
+                funding.compute_txid().to_string(),
+                deposit.compute_txid().to_string(),
+            );
+            let broadcasts = Arc::new(AtomicUsize::new(0));
+            let server = mock_electrum({
+                let broadcasts = broadcasts.clone();
+                let funding_hex = serialize_hex(&funding);
+                move |method, params| match method {
+                    "blockchain.scripthash.get_history" => Ok(json!([
+                        { "tx_hash": funding_id, "height": 10 },
+                        { "tx_hash": deposit_id, "height": 0 },
+                    ])),
+                    "blockchain.scripthash.listunspent" => match utxo {
+                        Utxo::Unspent => Ok(json!([{
+                            "tx_hash": funding_id, "tx_pos": 0, "height": 10,
+                            "value": value.to_sat(),
+                        }])),
+                        Utxo::Spent => Ok(json!([])),
+                        Utxo::Fails => Err(json!({ "code": 1, "message": "daemon error" })),
+                    },
+                    "blockchain.transaction.get" if params[0] == json!(funding_id) => {
+                        Ok(json!(funding_hex))
+                    }
+                    // The deposit is listed but cannot be served.
+                    "blockchain.transaction.get" => {
+                        Err(json!({ "code": 1, "message": "daemon error" }))
+                    }
+                    "blockchain.transaction.broadcast" => {
+                        broadcasts.fetch_add(1, Ordering::SeqCst);
+                        Err(json!({ "code": 1, "message": "test rejection" }))
+                    }
+                    _ => Ok(Value::Null),
+                }
+            });
+            server.set_tip(
+                100,
+                &bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header,
+            );
+            let config = ElectrumConfig {
+                url: server.url.clone(),
+                max_retries: 0,
+                ..Default::default()
+            };
+            let inner = Arc::get_mut(&mut maker).unwrap();
+            inner.watch_service.shutdown();
+            inner.watch_service = answering(WatcherEvent::UtxoSpent {
+                outpoint,
+                spending_tx: None,
+            });
+            inner.wallet.write().unwrap().blockchain =
+                AnyBlockchain::Electrum(Electrum::new(&config).unwrap());
+            inner.backend = BackendConnector::new(
+                BackendConfig::Electrum(config),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let ln = Arc::new(MockLightningBackend::new());
+            ln.create_hold_invoice(swap.payment_hash, InvoiceParams::default())
+                .unwrap();
+            ln.simulate_htlc_arrival(swap.payment_hash, 40_000_000);
+            while ln.poll_event().unwrap().is_some() {}
+            let ctx = LnContext {
+                ln: ln.clone(),
+                router: LnEventRouter::new(ln.clone()),
+            };
+            let id = swap.payment_hash.to_string();
+            maker.store_ln_swap(&id, swap.clone()).unwrap();
+
+            let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
+
+            assert_eq!(
+                result.is_err(),
+                utxo == Utxo::Fails,
+                "{:?}: {:?}",
+                utxo,
+                result
+            );
+            let stored = maker
+                .get_ln_swap(&id)
+                .unwrap()
+                .expect("the swap was removed");
+            assert_eq!(
+                stored.refund_txid.is_some(),
+                utxo == Utxo::Unspent,
+                "{:?}: refund recorded",
+                utxo
+            );
+            assert_eq!(
+                broadcasts.load(Ordering::SeqCst) > 0,
+                utxo == Utxo::Unspent,
+                "{:?}: refund broadcast",
+                utxo
+            );
+            assert!(
+                ln.poll_event().unwrap().is_none(),
+                "{:?}: Lightning changed",
+                utxo
+            );
+            assert!(
+                ln.claim_held_payment(&preimage).is_ok(),
+                "{:?}: the held payment was not kept",
+                utxo
+            );
+            maker.watch_service.shutdown();
+        }
+    }
+
+    use crate::watch_tower::watcher::tests::Node as ChainNode;
+
+    /// A chain of empty blocks up to `tip`, with `funding` mined at its height.
+    fn chain_with(funding: Option<(&bitcoin::Transaction, u64)>, tip: u64) -> ChainNode {
+        let mut node = ChainNode::default();
+        for height in 0..=tip {
+            match funding {
+                Some((tx, at)) if at == height => node.mine(vec![tx.clone()]),
+                _ => node.mine(vec![]),
+            }
+        }
+        node
+    }
+
+    /// An OutFunded swap-out stored with `stored_height`, whose funding is
+    /// the returned transaction. Its HTLC script is fixed, so the funding is
+    /// too: every chain built from it names the same outpoint.
+    fn funded_swap_out(stored_height: Option<u32>) -> (LnMakerSwap, bitcoin::Transaction) {
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let value = swap.funding.unwrap().1;
+        let funding = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![bitcoin::TxOut {
+                value,
+                script_pubkey: swap.htlc.script_pubkey().unwrap(),
+            }],
+        };
+        swap.funding = Some((OutPoint::new(funding.compute_txid(), 0), value));
+        swap.funding_height = stored_height;
+        swap.payout_script = Some(ScriptBuf::new());
+        (swap, funding)
+    }
+
+    /// A maker holding `swap`, whose watcher and chain both see its HTLC
+    /// unspent. Other chain reads come from `node`, which a test can replace
+    /// to reorg the chain. While `fail_lookup` is set, every transaction
+    /// lookup fails. The returned flag records a refund broadcast.
+    fn csv_gate_maker(
+        dir: &std::path::Path,
+        swap: &LnMakerSwap,
+        node: Arc<Mutex<ChainNode>>,
+        fail_lookup: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        Arc<MakerServer>,
+        LnContext,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use crate::{
+            lightning::MockLightningBackend,
+            wallet::{blockchain::BackendConnector, BackendConfig, CoreRpcConfig},
+            watch_tower::{service::answering, watcher::tests::mock_core_rpc},
+        };
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let broadcast = Arc::new(AtomicBool::new(false));
+        let (url, _) = mock_core_rpc({
+            let broadcast = broadcast.clone();
+            move |method, params| match method {
+                "getrawtransaction" if fail_lookup.load(Ordering::SeqCst) => {
+                    Err(json!({"code": -28, "message": "lookup unavailable"}))
+                }
+                "gettxout" => Ok(json!({"bestblock": "00".repeat(32), "confirmations": 1,
+                    "value": 0.0004, "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"},
+                    "coinbase": false})),
+                "sendrawtransaction" => {
+                    broadcast.store(true, Ordering::SeqCst);
+                    Err(json!({"code": -26, "message": "test rejection"}))
+                }
+                _ => node.lock().unwrap().answer(method, params),
+            }
+        });
+        let mut maker = compat_test_maker(dir, vec![]);
+        let inner = Arc::get_mut(&mut maker).unwrap();
+        inner.watch_service.shutdown();
+        inner.watch_service = answering(WatcherEvent::UtxoSpent {
+            outpoint: swap.funding.unwrap().0,
+            spending_tx: None,
+        });
+        let config = CoreRpcConfig {
+            url,
+            ..Default::default()
+        };
+        inner.wallet.write().unwrap().blockchain =
+            crate::wallet::AnyBlockchain::CoreRPC(crate::wallet::CoreRPC::new(&config).unwrap());
+        inner.backend = BackendConnector::new(
+            BackendConfig::CoreRpc(config),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let ln = Arc::new(MockLightningBackend::new());
+        let ctx = LnContext {
+            ln: ln.clone(),
+            router: LnEventRouter::new(ln),
+        };
+        maker
+            .store_ln_swap(&swap.payment_hash.to_string(), swap.clone())
+            .unwrap();
+        (maker, ctx, broadcast)
+    }
+
+    /// The stored swap's funding height and refund txid, in the swap map and
+    /// in the wallet record that is saved to disk.
+    fn stored_height_and_refund(
+        maker: &MakerServer,
+        id: &str,
+    ) -> (
+        Option<u32>,
+        Option<bitcoin::Txid>,
+        Option<u32>,
+        Option<bitcoin::Txid>,
+    ) {
+        let swap = maker.get_ln_swap(id).unwrap().expect("swap was deleted");
+        let wallet = maker.wallet.read().unwrap();
+        let record = wallet
+            .store
+            .ln_maker_swaps
+            .get(id)
+            .expect("record was deleted");
+        (
+            swap.funding_height,
+            swap.refund_txid,
+            record.funding_height,
+            record.refund_txid,
+        )
+    }
+
+    /// The CSV window is counted from the block that confirmed the funding
+    /// on the active chain, not from the height stored with the swap. Each
+    /// case stores a height the chain contradicts. The CSV of 60 blocks
+    /// opens at height 70 for funding confirmed at 10.
+    #[test]
+    fn swap_out_refund_is_timed_from_the_active_chain_funding_height() {
+        // (stored height, funding's block, tip, refund expected)
+        for (stored, confirmed, tip, refund) in [
+            // Stored at broadcast; the funding confirmed five blocks later.
+            // At 69 the window counted from the estimate has passed, the real
+            // one has not.
+            (Some(5), Some(10), 69, false),
+            (Some(5), Some(10), 70, true),
+            // A stale height above the real one must not delay the refund.
+            (Some(15), Some(10), 70, true),
+            // The funding is not in the active chain: no height, no refund.
+            (Some(10), None, 100, false),
+        ] {
+            let case = format!("stored {stored:?}, confirmed {confirmed:?}, tip {tip}");
+            let dir = bitcoind::tempfile::tempdir().unwrap();
+            let (swap, funding) = funded_swap_out(stored);
+            let id = swap.payment_hash.to_string();
+            let node = Arc::new(Mutex::new(chain_with(
+                confirmed.map(|height| (&funding, height)),
+                tip,
+            )));
+            let (maker, ctx, broadcast) =
+                csv_gate_maker(dir.path(), &swap, node, Default::default());
+
+            watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
+
+            assert_eq!(
+                broadcast.load(std::sync::atomic::Ordering::SeqCst),
+                refund,
+                "{case}: broadcast"
+            );
+            let (height, refund_txid, record_height, record_refund) =
+                stored_height_and_refund(&maker, &id);
+            assert_eq!(refund_txid.is_some(), refund, "{case}: refund recorded");
+            assert_eq!(record_refund, refund_txid, "{case}: refund saved");
+            // A confirmed funding's height replaces the stored one. With no
+            // confirmation there is nothing to replace it with, so it stays.
+            let expected = confirmed.map(|h| h as u32).or(stored);
+            assert_eq!(height, expected, "{case}: height in memory");
+            assert_eq!(record_height, expected, "{case}: height saved");
+            maker.watch_service.shutdown();
+        }
+    }
+
+    /// A corrected height is saved to the wallet file and survives a restart.
+    /// A reorg that later moves the funding to another block moves the CSV
+    /// window with it, also for the restored swap.
+    #[test]
+    fn swap_out_refund_follows_a_reorg_after_restart() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        // Stored at broadcast, one block before the funding confirmed at 10.
+        let (swap, funding) = funded_swap_out(Some(9));
+        let id = swap.payment_hash.to_string();
+        let node = Arc::new(Mutex::new(chain_with(Some((&funding, 10)), 50)));
+        let (maker, ctx, broadcast) =
+            csv_gate_maker(dir.path(), &swap, node.clone(), Default::default());
+        let read_wallet_file = || {
+            crate::wallet::WalletStore::read_from_disk(
+                &dir.path().join("wallet"),
+                Some("test-password".to_string()),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            read_wallet_file().0.ln_maker_swaps[&id].funding_height,
+            Some(9)
+        );
+
+        watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
+        assert_eq!(
+            stored_height_and_refund(&maker, &id),
+            (Some(10), None, Some(10), None)
+        );
+
+        // A restart reads the wallet file and rebuilds the swap map from it.
+        // Both replace what this maker holds in memory.
+        let (store, material) = read_wallet_file();
+        let restored = LnMakerSwap::from_record(store.ln_maker_swaps[&id].clone());
+        assert_eq!(
+            restored.funding_height,
+            Some(10),
+            "the corrected height was not saved"
+        );
+        {
+            let mut wallet = maker.wallet.write().unwrap();
+            wallet.store = store;
+            wallet.store_enc_material = material;
+        }
+        maker
+            .ln_swaps
+            .lock()
+            .unwrap()
+            .insert(id.clone(), restored.clone());
+
+        // A reorg drops the funding's block, and the funding confirms again
+        // at 13. At 70 the CSV counted from 10 has passed, not from 13.
+        *node.lock().unwrap() = chain_with(Some((&funding, 13)), 70);
+        watchdog_resolve_swap_out(&maker, &ctx, &id, &restored).unwrap();
+        assert!(
+            !broadcast.load(std::sync::atomic::Ordering::SeqCst),
+            "refunded from the reorged-out height"
+        );
+        assert_eq!(
+            stored_height_and_refund(&maker, &id),
+            (Some(13), None, Some(13), None)
+        );
+
+        *node.lock().unwrap() = chain_with(Some((&funding, 13)), 73);
+        let current = maker.get_ln_swap(&id).unwrap().unwrap();
+        watchdog_resolve_swap_out(&maker, &ctx, &id, &current).unwrap();
+        assert!(
+            broadcast.load(std::sync::atomic::Ordering::SeqCst),
+            "not refunded once the CSV opened"
+        );
+        let (height, refund_txid, record_height, record_refund) =
+            stored_height_and_refund(&maker, &id);
+        assert_eq!((height, record_height), (Some(13), Some(13)));
+        assert!(refund_txid.is_some() && record_refund == refund_txid);
+        maker.watch_service.shutdown();
+    }
+
+    /// A failed funding lookup is no answer: the swap and its stored height
+    /// are kept and nothing is refunded, even long past any CSV. The next
+    /// pass that can read the chain refunds.
+    #[test]
+    fn swap_out_refund_waits_while_the_funding_lookup_fails() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let (swap, funding) = funded_swap_out(Some(9));
+        let id = swap.payment_hash.to_string();
+        let node = Arc::new(Mutex::new(chain_with(Some((&funding, 10)), 100)));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (maker, ctx, broadcast) = csv_gate_maker(dir.path(), &swap, node, fail.clone());
+
+        assert!(watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).is_err());
+        assert!(!broadcast.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            stored_height_and_refund(&maker, &id),
+            (Some(9), None, Some(9), None)
+        );
+
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
+        assert!(broadcast.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(stored_height_and_refund(&maker, &id).0, Some(10));
+        maker.watch_service.shutdown();
+    }
+
+    /// The height correction writes only over the swap state it was read
+    /// from. A height another writer stored since, a phase that moved on or
+    /// a different funding all keep the stored swap as it is, and a pass on
+    /// the stale snapshot does not refund.
+    #[test]
+    fn funding_height_correction_keeps_newer_swap_state() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let (swap, funding) = funded_swap_out(Some(9));
+        let id = swap.payment_hash.to_string();
+        let outpoint = swap.funding.unwrap().0;
+        let node = Arc::new(Mutex::new(chain_with(Some((&funding, 10)), 100)));
+        let (maker, ctx, broadcast) = csv_gate_maker(dir.path(), &swap, node, Default::default());
+        let unchanged = (Some(9), None, Some(9), None);
+
+        for (phase, funded_at, previous) in [
+            (LnMakerPhase::OutFunded, outpoint, Some(5)),
+            (LnMakerPhase::OutFunded, outpoint, None),
+            (LnMakerPhase::OutAccepted, outpoint, Some(9)),
+            (LnMakerPhase::OutFunded, OutPoint::default(), Some(9)),
+        ] {
+            assert!(!maker
+                .fill_ln_funding_height(&id, phase, funded_at, previous, 10)
+                .unwrap());
+            assert_eq!(stored_height_and_refund(&maker, &id), unchanged);
+        }
+
+        // Another writer stored 12 after the watchdog read the swap at 9.
+        let mut newer = swap.clone();
+        newer.funding_height = Some(12);
+        maker.store_ln_swap(&id, newer).unwrap();
+        watchdog_resolve_swap_out(&maker, &ctx, &id, &swap).unwrap();
+        assert!(
+            !broadcast.load(std::sync::atomic::Ordering::SeqCst),
+            "refunded from a stale snapshot"
+        );
+        assert_eq!(
+            stored_height_and_refund(&maker, &id),
+            (Some(12), None, Some(12), None),
+            "a stale snapshot overwrote the stored height"
+        );
+
+        assert!(maker
+            .fill_ln_funding_height(&id, LnMakerPhase::OutFunded, outpoint, Some(12), 10)
+            .unwrap());
+        assert_eq!(
+            stored_height_and_refund(&maker, &id),
+            (Some(10), None, Some(10), None)
+        );
+        maker.watch_service.shutdown();
+    }
+
+    /// A height correction whose save fails puts the wallet record back to
+    /// the height it had, so the record and the swap still agree, and a
+    /// later correction succeeds.
+    #[test]
+    fn failed_funding_height_save_keeps_the_known_height() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let (swap, funding) = funded_swap_out(Some(9));
+        let id = swap.payment_hash.to_string();
+        let outpoint = swap.funding.unwrap().0;
+        let node = Arc::new(Mutex::new(chain_with(Some((&funding, 10)), 100)));
+        let (maker, _ctx, _broadcast) = csv_gate_maker(dir.path(), &swap, node, Default::default());
+        // A directory where the wallet file was makes every save fail.
+        let path = maker.wallet.read().unwrap().wallet_file_path.clone();
+        let saved = path.with_extension("saved");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(maker
+            .fill_ln_funding_height(&id, LnMakerPhase::OutFunded, outpoint, Some(9), 10)
+            .is_err());
+        assert_eq!(
+            stored_height_and_refund(&maker, &id),
+            (Some(9), None, Some(9), None)
+        );
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert!(maker
+            .fill_ln_funding_height(&id, LnMakerPhase::OutFunded, outpoint, Some(9), 10)
+            .unwrap());
+        assert_eq!(
+            stored_height_and_refund(&maker, &id),
+            (Some(10), None, Some(10), None)
+        );
+        maker.watch_service.shutdown();
+    }
+
+    #[test]
+    fn recorded_refund_recovery_survives_direct_lookup_failure() {
+        use crate::{
+            lightning::{InvoiceParams, MockLightningBackend},
+            wallet::{blockchain::BackendConnector, BackendConfig, CoreRpcConfig},
+            watch_tower::{
+                service::answering,
+                watcher::tests::{mock_core_rpc, Node},
+            },
+        };
+        use bitcoin::{consensus::encode::serialize_hex, hashes::Hash, TxIn, TxOut, Txid};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Evicted refund, final refund, rival claim, failed proof, an
+        // unrelated watcher transaction, and our refund one block short of
+        // final. Only our final refund closes.
+        for case in 0..6 {
+            let dir = bitcoind::tempfile::tempdir().unwrap();
+            let mut maker = compat_test_maker(dir.path(), vec![]);
+            let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+            let preimage = swap.preimage.take().unwrap();
+            let value = swap.funding.unwrap().1;
+            let funding = bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([55; 32]), 1),
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value,
+                    script_pubkey: swap.htlc.script_pubkey().unwrap(),
+                }],
+            };
+            let outpoint = OutPoint::new(funding.compute_txid(), 0);
+            swap.funding = Some((outpoint, value));
+            let refund = swap
+                .htlc
+                .create_timelock_spend(outpoint, value, &swap.privkey, ScriptBuf::new())
+                .unwrap();
+            let refund_id = refund.compute_txid();
+            swap.refund_txid = Some(refund_id);
+            let mut node = Node::default();
+            node.mine(vec![]);
+            node.mine(vec![funding]);
+            if case == 2 {
+                let claim = swap
+                    .htlc
+                    .create_hashlock_spend(
+                        outpoint,
+                        value,
+                        &swap.privkey,
+                        &preimage,
+                        ScriptBuf::new(),
+                    )
+                    .unwrap();
+                node.mine(vec![claim]);
+            } else if case != 0 {
+                node.mine(vec![refund.clone()]);
+            }
+            if case == 1 || case == 5 {
+                // Bury the refund to the depth at which the swap may close,
+                // or one block short of it.
+                let depth = REFUND_FINALITY_DEPTH - u32::from(case == 5);
+                for _ in 1..depth {
+                    node.mine(vec![]);
+                }
+            }
+            let broadcast = Arc::new(AtomicBool::new(false));
+            let (url, _) = mock_core_rpc({
+                let broadcast = broadcast.clone();
+                let refund_hex = serialize_hex(&refund);
+                move |method, params| match method {
+                    "gettxspendingprevout" => {
+                        Err(json!({"code": -28, "message": "spend lookup unavailable"}))
+                    }
+                    "gettxout" if case == 0 && params[2] == json!(false) => Ok(json!({
+                        "bestblock": "00".repeat(32), "confirmations": 1, "value": 0.0004,
+                        "scriptPubKey": {"asm": "", "hex": "", "type": "nonstandard"}, "coinbase": false
+                    })),
+                    "getrawtransaction" if case == 3 && params[0] == json!(refund_id) => {
+                        Err(json!({"code": -28, "message": "confirmation unavailable"}))
+                    }
+                    "sendrawtransaction" => {
+                        assert_eq!(params[0], json!(refund_hex));
+                        broadcast.store(true, Ordering::SeqCst);
+                        Err(json!({"code": -26, "message": "test rejection"}))
+                    }
+                    _ => node.answer(method, params),
+                }
+            });
+            let mut watched = refund;
+            if case == 4 {
+                watched.lock_time = bitcoin::absolute::LockTime::from_height(1).unwrap();
+            }
+            let inner = Arc::get_mut(&mut maker).unwrap();
+            inner.watch_service.shutdown();
+            inner.watch_service = answering(WatcherEvent::UtxoSpent {
+                outpoint,
+                spending_tx: Some(watched),
+            });
+            let config = CoreRpcConfig {
+                url,
+                ..Default::default()
+            };
+            inner.wallet.write().unwrap().blockchain = crate::wallet::AnyBlockchain::CoreRPC(
+                crate::wallet::CoreRPC::new(&config).unwrap(),
+            );
+            inner.backend = BackendConnector::new(
+                BackendConfig::CoreRpc(config),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let ln = Arc::new(MockLightningBackend::new());
+            ln.create_hold_invoice(swap.payment_hash, InvoiceParams::default())
+                .unwrap();
+            ln.simulate_htlc_arrival(swap.payment_hash, 40_000_000);
+            while ln.poll_event().unwrap().is_some() {}
+            let ctx = LnContext {
+                ln: ln.clone(),
+                router: LnEventRouter::new(ln.clone()),
+            };
+            let id = swap.payment_hash.to_string();
+            maker.store_ln_swap(&id, swap.clone()).unwrap();
+            if case == 1 || case == 5 {
+                // Closing also attempts a wallet sync; cancel those unrelated
+                // retries rather than requiring a full wallet RPC fixture.
+                // Case 5 must not close, but if it did it should fail, not hang.
+                maker.shutdown.store(true, Ordering::SeqCst);
+            }
+            if case == 1 || case == 5 {
+                assert_eq!(
+                    maker.tx_confirmations(&refund_id).unwrap(),
+                    Some(REFUND_FINALITY_DEPTH - u32::from(case == 5)),
+                    "case {}",
+                    case
+                );
+            }
+            let result = watchdog_resolve_swap_out(&maker, &ctx, &id, &swap);
+            assert_eq!(result.is_err(), case == 3, "case {}: {:?}", case, result);
+            assert_eq!(broadcast.load(Ordering::SeqCst), case == 0, "case {}", case);
+            assert_eq!(
+                maker.get_ln_swap(&id).unwrap().is_none(),
+                case == 1,
+                "case {}",
+                case
+            );
+            if case != 1 {
+                assert!(
+                    ln.poll_event().unwrap().is_none(),
+                    "case {} changed Lightning state",
+                    case
+                );
+            }
+            assert_eq!(
+                ln.claim_held_payment(&preimage).is_err(),
+                case == 1,
+                "case {}",
+                case
+            );
+            maker.watch_service.shutdown();
+        }
     }
 
     /// A maker on a mock node with a ready channel, half inbound and half

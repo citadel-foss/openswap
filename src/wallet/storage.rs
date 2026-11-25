@@ -481,8 +481,13 @@ pub struct LnMakerSwapRecord {
     pub funding_value: Option<bitcoin::Amount>,
     /// Refund timing. Swap-in: the block that confirmed the funding, where the
     /// taker's CSV refund window starts. Swap-out: the chain tip when the
-    /// maker broadcast its funding.
+    /// maker broadcast its funding, which the watchdog replaces with the block
+    /// that confirmed the funding on the active chain.
     pub funding_height: Option<u32>,
+    /// Hold-invoice claim deadline, retained for recovery warnings after restart.
+    /// Older records lack it. This field does not authorize financial actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_deadline: Option<u32>,
 }
 
 /// Redacted like [`LnPendingSwap`]: `Wallet` formats its store.
@@ -502,6 +507,7 @@ impl std::fmt::Debug for LnMakerSwapRecord {
             .field("funding_outpoint", &self.funding_outpoint)
             .field("funding_value", &self.funding_value)
             .field("funding_height", &self.funding_height)
+            .field("claim_deadline", &self.claim_deadline)
             .finish_non_exhaustive()
     }
 }
@@ -564,6 +570,7 @@ impl Requires for LnMakerSwapRecord {
             funding_outpoint: _,
             funding_value: _,
             funding_height: _,
+            claim_deadline: _,
         } = self;
         out.insert(match direction {
             LnMakerDirection::SwapIn => "ln-swap-in",
@@ -1213,6 +1220,7 @@ pub(crate) mod compat_support {
                     funding_outpoint: Some(point),
                     funding_value: Some(Amount::from_sat(101_000)),
                     funding_height: Some(125),
+                    claim_deadline: None,
                 },
             );
         }
@@ -1986,6 +1994,7 @@ mod tests {
                     funding_outpoint: Some(cache_entry(0).0),
                     funding_value: Some(Amount::from_sat(50_000)),
                     funding_height: Some(43),
+                    claim_deadline: None,
                 };
                 let mut names = BTreeSet::new();
                 record.requires(&mut names);
@@ -2739,6 +2748,7 @@ mod tests {
             funding_outpoint: None,
             funding_value: None,
             funding_height: None,
+            claim_deadline: None,
         };
         let debug = format!("{record:?}");
         assert!(debug.contains("preimage: Some(\"<redacted>\")"));
