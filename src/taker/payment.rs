@@ -139,6 +139,19 @@ fn solve_route_gross_sats(
     Ok(required)
 }
 
+/// Amount entering each hop when `gross_sats` enters the first and every
+/// maker spends `per_hop_mining_fee` on mining: entry `i` is what maker `i`
+/// is declared if its upstream makers spend exactly that fee.
+fn route_hop_amounts(hops: &[HopFeeTerms], per_hop_mining_fee: u64, gross_sats: u64) -> Vec<u64> {
+    let mut amounts = Vec::with_capacity(hops.len());
+    let mut amount = gross_sats;
+    for terms in hops {
+        amounts.push(amount);
+        amount = hop_net_sats(terms, per_hop_mining_fee, amount);
+    }
+    amounts
+}
+
 /// Settlement output values for `funding_amounts`: each keeps an equal share
 /// of `settlement_budget` for its claim fee, and the surplus over
 /// `receiver_amount` is shaved off the largest outputs, never below dust.
@@ -300,8 +313,10 @@ impl Taker {
                         ))
                     })?,
             };
-            // Checked against the receiver amount — the gross is unknown yet;
-            // negotiation re-validates on the gross.
+            // Checked against the receiver amount — the gross is unknown yet.
+            // Every amount negotiation later declares is at least this, so
+            // min_size and base_fee need no re-check; max_size is re-checked
+            // below.
             Self::validate_offer(&offer, i, receiver_amount)?;
             let locktime =
                 (REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - i - 1) as u16) as u32;
@@ -325,14 +340,23 @@ impl Taker {
         let gross = solve_route_gross_sats(&hops, per_hop_mining_fee, final_net)?;
 
         // Maker selection was sized on the receiver amount, since the gross is
-        // only known once their fees are in hand. Re-check the solved gross
-        // against each maker's advertised limits here: a maker whose max_size
-        // falls between the two would otherwise be rejected mid-negotiation,
-        // where a payment route cannot substitute it.
+        // only known once their fees are in hand. Re-check each maker's
+        // max_size here: a maker it excludes would otherwise be rejected
+        // mid-negotiation, where a payment route cannot substitute it.
+        // Only maker 0 is declared the gross; each later maker gets what the
+        // one before forwards, which depends on the mining fees those makers
+        // report. Every maker spends at least one funding input and sweeps
+        // at least one contract, so replaying at that floor gives the most
+        // any maker can be declared.
+        let floor_mining_fee = funding_fee_policy_sats(1, max_input_budget, swap_feerate)
+            .zip(sweep_fee_policy_sats(protocol, swap_feerate))
+            .and_then(|(funding, sweep)| funding.checked_add(sweep))
+            .ok_or_else(|| TakerError::General("Mining fee overflow".to_string()))?;
+        let highest = route_hop_amounts(&hops, floor_mining_fee, gross);
         // Every offer was stored on its maker in the loop above.
         for (i, maker) in self.swap_state()?.makers.iter().enumerate() {
             if let Some(offer) = maker.offer.as_ref() {
-                Self::validate_offer(offer, i, Amount::from_sat(gross))?;
+                Self::validate_offer(offer, i, Amount::from_sat(highest[i]))?;
             }
         }
 
@@ -548,6 +572,55 @@ mod tests {
             forward = hop_net_sats(hop, mining_fee, forward);
         }
         assert_eq!(forward, final_net);
+    }
+
+    #[test]
+    fn floor_replay_bounds_downstream_hop_amounts() {
+        let hops = [
+            terms(1000, 2.5, 0.005, 170),
+            terms(250, 0.75, 0.001, 95),
+            terms(0, 1.0, 0.0005, 20),
+        ];
+        let mining_fee = 442 * 3;
+        let gross = solve_route_gross_sats(&hops, mining_fee, 10_000_600).unwrap();
+
+        // Maker 0 is declared the gross either way; downstream makers get
+        // more when upstream hops spend less on mining, but never the gross.
+        let solved = route_hop_amounts(&hops, mining_fee, gross);
+        let highest = route_hop_amounts(&hops, 442, gross);
+        assert_eq!(highest.len(), hops.len());
+        assert_eq!(highest[0], gross);
+        // Each later maker is declared what the one before forwards at the
+        // floor fee.
+        for ((hop, prev), next) in hops.iter().zip(&highest).zip(&highest[1..]) {
+            assert_eq!(*next, hop_net_sats(hop, 442, *prev));
+        }
+        for (low, high) in solved.iter().zip(&highest).skip(1) {
+            assert!(low < high, "{} >= {}", low, high);
+            assert!(*high < gross, "{} >= {}", high, gross);
+        }
+    }
+
+    #[test]
+    fn downstream_max_size_is_checked_on_the_hop_amount() {
+        let hops = [terms(1000, 2.5, 0.005, 95), terms(250, 0.75, 0.001, 20)];
+        let mining_fee = 442 * 3;
+        let gross = solve_route_gross_sats(&hops, mining_fee, 500_000).unwrap();
+        let highest = route_hop_amounts(&hops, 442, gross);
+        assert!(highest[1] < gross);
+
+        // Maker 1 caps below the gross but at the most it can be declared:
+        // checking it on the gross would wrongly refuse it.
+        let mut offer = crate::taker::offers::tests::dummy_offer("maker1");
+        offer.max_size = highest[1];
+        assert!(Taker::validate_offer(&offer, 1, Amount::from_sat(highest[1])).is_ok());
+        let err = Taker::validate_offer(&offer, 1, Amount::from_sat(gross)).unwrap_err();
+        assert!(format!("{err:?}").contains("max_size"), "{:?}", err);
+
+        // One sat lower and negotiation could exceed it, so it is refused.
+        offer.max_size = highest[1] - 1;
+        let err = Taker::validate_offer(&offer, 1, Amount::from_sat(highest[1])).unwrap_err();
+        assert!(format!("{err:?}").contains("max_size"), "{:?}", err);
     }
 
     #[test]
