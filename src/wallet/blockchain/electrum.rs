@@ -785,10 +785,10 @@ impl Electrum {
     /// `None` when `txid` is not in the mempool. A family no replacement could
     /// evict, or one that takes too long to read, is an error, so a partial
     /// sum is never taken for the whole. One read of each `txid` runs at a
-    /// time: while a thread the last caller gave up on is still finishing,
-    /// the next caller for that `txid` gets an error rather than another
-    /// thread and connection, and a thread given up on stops at its next
-    /// round trip. Reads of other transactions are not held up by it.
+    /// time, and two in all: while a thread a caller gave up on is still
+    /// finishing, the next caller for that `txid`, or any caller once two
+    /// are running, gets an error rather than another thread and
+    /// connection, and a thread given up on stops at its next round trip.
     #[cfg(feature = "lightning")]
     pub(crate) fn package_fee_on_side_connection(
         config: ElectrumConfig,
@@ -804,11 +804,20 @@ impl Electrum {
                 running.retain(|txid| *txid != self.0);
             }
         }
+        // A server that keeps reads alive can hold at most this many threads
+        // and connections.
+        const MAX_RUNNING: usize = 2;
         {
             let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
             if running.contains(&txid) {
                 return Err(electrum_err(format!(
                     "electrum: an earlier read of what spends from {txid} is still running"
+                )));
+            }
+            if running.len() >= MAX_RUNNING {
+                return Err(electrum_err(format!(
+                    "electrum: {MAX_RUNNING} reads of what spends from a refund are still \
+                     running, so {txid} is not read"
                 )));
             }
             running.push(txid);
@@ -3388,14 +3397,19 @@ pub(crate) mod tests {
         );
         // The first thread is still stuck in the handshake, so another read
         // of the same refund is refused at once rather than piling up.
+        let refused = |fee: &Result<Option<bitcoin::Amount>, WalletError>| matches!(fee, Err(e) if format!("{:?}", e).contains("still running"));
         let again = Instant::now();
         let fee = read(refund);
-        assert!(
-            matches!(&fee, Err(e) if format!("{:?}", e).contains("still running")),
-            "{:?}",
-            fee
-        );
+        assert!(refused(&fee), "{:?}", fee);
         assert!(again.elapsed() < Duration::from_millis(100));
+        // Another refund gets a thread of its own, which the server stalls
+        // too. With two stuck, a third refund is refused at once.
+        let fee = read(Txid::from_byte_array([8; 32]));
+        assert!(fee.is_err() && !refused(&fee), "{:?}", fee);
+        let third = Instant::now();
+        let fee = read(Txid::from_byte_array([9; 32]));
+        assert!(refused(&fee), "{:?}", fee);
+        assert!(third.elapsed() < Duration::from_millis(100));
     }
 
     /// A backend whose server lists `entries` as every script's history and
