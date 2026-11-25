@@ -94,6 +94,21 @@ fn fund_swap_out(
     amount: Amount,
     locktime: u16,
 ) -> LnHtlcFunded {
+    match pay_swap_out(maker, ln, payment_hash, amount, locktime) {
+        LightningMakerMessage::SwapOutFunded(funded) => funded,
+        other => panic!("expected SwapOutFunded, got {}", other),
+    }
+}
+
+/// Requests a swap-out for `payment_hash`, parks the taker's payment at the
+/// maker, sends `SwapOutPaid`, and returns the maker's reply to it.
+fn pay_swap_out(
+    maker: &Arc<MakerServer>,
+    ln: &MockLightningBackend,
+    payment_hash: sha256::Hash,
+    amount: Amount,
+    locktime: u16,
+) -> LightningMakerMessage {
     let swap_id = payment_hash.to_string();
     let taker_hashlock_pubkey = PublicKey::new(
         SecretKey::from_slice(&[0x31; 32])
@@ -139,7 +154,7 @@ fn fund_swap_out(
         "the held payment must reach the swap's mailbox"
     );
 
-    match expect_ln(
+    expect_ln(
         handle_message(
             maker,
             &mut state,
@@ -148,10 +163,115 @@ fn fund_swap_out(
             })),
         )
         .unwrap(),
-    ) {
-        LightningMakerMessage::SwapOutFunded(funded) => funded,
-        other => panic!("expected SwapOutFunded, got {}", other),
+    )
+}
+
+/// The confirmation budget for the maker's HTLC funding,
+/// `FUNDING_CONF_BUDGET` in its handler.
+const LN_FUNDING_CONF_BUDGET: u32 = 24;
+/// Blocks the maker allows its refund to be mined in once the CSV opens,
+/// `REFUND_MINING_BUDGET` in its handler.
+const LN_REFUND_MINING_BUDGET: u32 = 6;
+/// The depth the maker waits for on its refund, `REFUND_FINALITY_DEPTH` in
+/// its handler.
+const LN_REFUND_FINALITY_DEPTH: u32 = 6;
+/// The settle margin the maker's admission used alone before it budgeted for
+/// refund finality, `SETTLE_MARGIN` in its handler.
+const LN_SETTLE_MARGIN: u32 = 6;
+
+/// Swap-out admission must leave the held payment claimable until the
+/// maker's refund can be mined and reach finality. Otherwise the node fails
+/// the payment back while the refund is still shallow, and a reorg that
+/// replaces it with the taker's claim costs the maker both sides.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [ln = maker_node()],
+    maker_behaviors = [Normal],
+    takers = [Normal],
+    maker_lightning = [ln.clone()],
+    setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
+    cases = [
+        /// The smallest deadline that leaves room for the refund to be mined
+        /// within its budget and reach finality: the maker funds.
+        swap_out_admits_a_hold_that_outlasts_refund_finality(
+            hash_byte = 0xe1,
+            extra = Some(LN_REFUND_MINING_BUDGET + LN_REFUND_FINALITY_DEPTH),
+            refusal = None,
+        ),
+        /// One block less: a refund mined at the end of its budget would be
+        /// one block short of finality when the node fails the payment.
+        swap_out_refuses_a_hold_one_block_short_of_refund_finality(
+            hash_byte = 0xe2,
+            extra = Some(LN_REFUND_MINING_BUDGET + LN_REFUND_FINALITY_DEPTH - 1),
+            refusal = Some("hold window is too narrow"),
+        ),
+        /// The deadline the settle margin alone accepted. A refund mined a
+        /// couple of blocks after its CSV opens is still shallow when the
+        /// node fails the payment, so the maker must not fund.
+        swap_out_refuses_a_hold_covering_only_the_settle_margin(
+            hash_byte = 0xe3,
+            extra = Some(LN_SETTLE_MARGIN),
+            refusal = Some("hold window is too narrow"),
+        ),
+        /// A backend that reports no claim deadline leaves the hold window
+        /// unknown: the maker must refuse and release the payment.
+        swap_out_refuses_a_hold_without_a_claim_deadline(
+            hash_byte = 0xe4,
+            extra = None,
+            refusal = Some("backend reported no claim deadline"),
+        ),
+    ],
+)]
+fn swap_out_admission_budgets_for_refund_finality(
+    world: &mut World,
+    ln: Arc<MockLightningBackend>,
+    hash_byte: u8,
+    extra: Option<u32>,
+    refusal: Option<&str>,
+) {
+    let admitted = refusal.is_none();
+    let framework = world.framework().clone();
+    let maker = world.makers()[0].inner().clone();
+    pause_block_generation(&framework);
+
+    let locktime: u16 = 30;
+    let tip = framework.bitcoind.client.get_block_count().unwrap() as u32;
+    let claim_window_ends = tip + LN_FUNDING_CONF_BUDGET + locktime as u32;
+    ln.set_claim_deadline(extra.map(|extra| claim_window_ends + extra));
+
+    let preimage = Preimage([hash_byte; 32]);
+    let payment_hash = preimage.payment_hash();
+    let reply = pay_swap_out(
+        &maker,
+        &ln,
+        payment_hash,
+        Amount::from_sat(40_000),
+        locktime,
+    );
+    match (admitted, reply) {
+        (true, LightningMakerMessage::SwapOutFunded(_)) => {}
+        (false, LightningMakerMessage::Reject(reject)) => assert!(
+            reject.reason.contains(refusal.unwrap()),
+            "the maker refused for another reason: {}",
+            reject.reason
+        ),
+        (_, other) => panic!(
+            "expected the maker to {} the swap-out, got {}",
+            if admitted { "fund" } else { "refuse" },
+            other
+        ),
     }
+    // A refusal cancels the taker's payment at once; an admission keeps it
+    // held for the maker to settle.
+    let still_held = ln.claim_held_payment(&preimage).is_ok();
+    assert_eq!(
+        still_held, admitted,
+        "the held payment must be cancelled exactly when the swap-out is refused"
+    );
+
+    framework.set_block_gen_paused(false);
+    maker.shutdown.store(true, Relaxed);
+    maker.watch_service.shutdown();
 }
 
 #[world_test(
