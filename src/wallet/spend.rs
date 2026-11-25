@@ -85,6 +85,23 @@ impl Wallet {
             }
         }
 
+        // The caller selected these coins earlier, maybe under another guard:
+        // a swap may have claimed one since, or a broadcast spent it. Checked
+        // after the filter, since skipped fidelity and contract coins stay locked.
+        if let Some(held) = coins
+            .iter()
+            .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+            .find(|outpoint| {
+                self.is_swap_reserved(outpoint)
+                    || self.locked_utxos.contains(outpoint)
+                    || self.pending_sends.contains_key(outpoint)
+            })
+        {
+            return Err(WalletError::General(format!(
+                "coin {held} is reserved by a swap or already spent; select coins again"
+            )));
+        }
+
         let tx = self.spend_coins(&coins, destination, feerate)?;
 
         Ok(tx)
@@ -538,6 +555,84 @@ mod tests {
         Amount::from_sat(n)
     }
 
+    /// A direct spend refuses a coin a swap reserved after the caller selected
+    /// it, and one already spent by our own broadcast.
+    #[test]
+    fn direct_spend_refuses_coins_held_elsewhere() {
+        use crate::wallet::{api::test_support::test_wallet, AddressType, UTXOSpendInfo};
+        use bitcoin::{hashes::Hash, ScriptBuf, Txid};
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let coin = |n: u8| {
+            let entry = ListUnspentResultEntry {
+                txid: Txid::from_byte_array([n; 32]),
+                vout: 0,
+                address: None,
+                label: None,
+                redeem_script: None,
+                witness_script: None,
+                script_pub_key: ScriptBuf::new(),
+                amount: sats(100_000),
+                confirmations: 1,
+                spendable: true,
+                solvable: true,
+                descriptor: None,
+                safe: true,
+            };
+            let info = UTXOSpendInfo::SeedCoin {
+                path: "m/84'/1'/0'/0/0".to_string(),
+                input_value: sats(100_000),
+                address_type: AddressType::P2WPKH,
+            };
+            (entry, info)
+        };
+        let outpoint = |n: u8| OutPoint::new(Txid::from_byte_array([n; 32]), 0);
+        // Any address will do: the check runs before the output is used.
+        let to = Destination::Sweep(Address::p2wsh(&ScriptBuf::new(), bitcoin::Network::Regtest));
+        let refused = |result: Result<Transaction, WalletError>| matches!(result, Err(WalletError::General(e)) if e.contains("select coins again"));
+
+        wallet.reserve_swap_locks("swap", &[outpoint(1)]);
+        assert!(refused(wallet.spend_from_wallet(
+            1.0,
+            to.clone(),
+            &[coin(1)]
+        )));
+
+        wallet.lock_utxos(&[outpoint(2)]);
+        assert!(refused(wallet.spend_from_wallet(
+            1.0,
+            to.clone(),
+            &[coin(2)]
+        )));
+
+        wallet.hold_for_send(&[outpoint(4)], Txid::from_byte_array([9; 32]));
+        assert!(refused(wallet.spend_from_wallet(
+            1.0,
+            to.clone(),
+            &[coin(4)]
+        )));
+
+        // A locked fidelity bond is skipped, not refused, so the free coin next
+        // to it passes the check and reaches the block-height query that
+        // `spend_coins` makes for the locktime; this wallet's backend is offline,
+        // so that query, and nothing earlier, is what fails.
+        wallet.lock_utxos(&[outpoint(5)]);
+        let bond = (
+            coin(5).0,
+            UTXOSpendInfo::FidelityBondCoin {
+                index: 0,
+                input_value: sats(100_000),
+            },
+        );
+        let result = wallet.spend_from_wallet(1.0, to, &[bond, coin(3)]);
+        assert!(
+            matches!(result, Err(WalletError::Rpc(_))),
+            "free coin should fail only at the backend, got {:?}",
+            result
+        );
+    }
+
     #[test]
     fn sweep_refuses_a_dust_or_empty_output() {
         // 330 sats is the P2TR dust limit.
@@ -561,6 +656,122 @@ mod tests {
         let dust = sats(294);
         assert_eq!(change_output(sats(294), dust), Some(sats(294)));
         assert_eq!(change_output(sats(293), dust), None);
+    }
+
+    #[test]
+    fn sync_releases_only_settled_send_inputs() {
+        use crate::wallet::{api::test_support::test_wallet, AddressType, UTXOSpendInfo};
+        use bitcoin::{hashes::Hash, ScriptBuf, Txid};
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let outpoint = |n: u8| OutPoint::new(Txid::from_byte_array([n; 32]), 0);
+        let send = Txid::from_byte_array([9; 32]);
+        let entry = ListUnspentResultEntry {
+            txid: outpoint(2).txid,
+            vout: 0,
+            address: None,
+            label: None,
+            redeem_script: None,
+            witness_script: None,
+            script_pub_key: ScriptBuf::new(),
+            amount: sats(100_000),
+            confirmations: 1,
+            spendable: true,
+            solvable: true,
+            descriptor: None,
+            safe: true,
+        };
+        let info = UTXOSpendInfo::SeedCoin {
+            path: "m/84'/1'/0'/0/0".to_string(),
+            input_value: sats(100_000),
+            address_type: AddressType::P2WPKH,
+        };
+        // Coin 1 left the synced cache; coin 2 is still cached and the offline
+        // backend cannot say whether the send is known, as a lagging one can't.
+        wallet.store.utxo_cache.insert(outpoint(2), (entry, info));
+        wallet.hold_for_send(&[outpoint(1), outpoint(2)], send);
+        // Past the broadcast, so the cached coin reaches the backend query,
+        // whose failure must keep it held.
+        wallet.broadcast_returned(&send);
+
+        wallet.release_settled_sends();
+        assert!(!wallet.pending_sends.contains_key(&outpoint(1)));
+        assert!(wallet.list_lock_unspent().contains(&outpoint(2)));
+
+        // A wallet-lock rebuild must not drop a held send.
+        wallet.locked_utxos.clear();
+        assert!(wallet.list_lock_unspent().contains(&outpoint(2)));
+    }
+
+    #[test]
+    fn answers_read_without_the_wallet_settle_only_returned_sends() {
+        use crate::wallet::{api::test_support::test_wallet, AddressType, UTXOSpendInfo};
+        use bitcoin::{hashes::Hash, ScriptBuf, Txid};
+        use std::collections::HashSet;
+
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet"));
+        let outpoint = |n: u8| OutPoint::new(Txid::from_byte_array([n; 32]), 0);
+        let cache = |wallet: &mut Wallet, n: u8| {
+            let entry = ListUnspentResultEntry {
+                txid: outpoint(n).txid,
+                vout: 0,
+                address: None,
+                label: None,
+                redeem_script: None,
+                witness_script: None,
+                script_pub_key: ScriptBuf::new(),
+                amount: sats(100_000),
+                confirmations: 1,
+                spendable: true,
+                solvable: true,
+                descriptor: None,
+                safe: true,
+            };
+            let info = UTXOSpendInfo::SeedCoin {
+                path: "m/84'/1'/0'/0/0".to_string(),
+                input_value: sats(100_000),
+                address_type: AddressType::P2WPKH,
+            };
+            wallet.store.utxo_cache.insert(outpoint(n), (entry, info));
+        };
+        let (returned, in_flight) = (
+            Txid::from_byte_array([8; 32]),
+            Txid::from_byte_array([9; 32]),
+        );
+        cache(&mut wallet, 1);
+        cache(&mut wallet, 2);
+        cache(&mut wallet, 3);
+        wallet.hold_for_send(&[outpoint(1), outpoint(2)], returned);
+        wallet.broadcast_returned(&returned);
+        wallet.hold_for_send(&[outpoint(3)], in_flight);
+
+        // One probe per returned send, none for one still broadcasting.
+        let probes = wallet.sends_to_probe();
+        assert_eq!(
+            probes.iter().map(|hold| hold.txid).collect::<Vec<_>>(),
+            vec![returned]
+        );
+
+        // Answers gathered outside the wallet cannot free a send still in
+        // flight, even if the backend called it unknown.
+        let in_flight_hold = *wallet.pending_sends.get(&outpoint(3)).unwrap();
+        let mut unknown: HashSet<_> = probes.iter().copied().collect();
+        unknown.insert(in_flight_hold);
+        wallet.settle_sends(&unknown);
+        assert_eq!(wallet.list_lock_unspent(), vec![outpoint(3)]);
+
+        // A retry that signs the same tx is a new hold: the answer about the
+        // first one, arriving late, must not free it.
+        wallet.hold_for_send(&[outpoint(1), outpoint(2)], returned);
+        wallet.broadcast_returned(&returned);
+        wallet.settle_sends(&probes.into_iter().collect());
+        let mut held = wallet.list_lock_unspent();
+        held.sort();
+        let mut expected = vec![outpoint(1), outpoint(2), outpoint(3)];
+        expected.sort();
+        assert_eq!(held, expected);
     }
 
     #[test]
