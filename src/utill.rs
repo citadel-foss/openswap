@@ -432,6 +432,88 @@ pub fn read_message(reader: &mut TcpStream) -> Result<Vec<u8>, NetError> {
     Ok(buffer)
 }
 
+/// Longest a peer gets to finish a message once its first byte arrives.
+/// The stream's read timeout bounds each read, not the message, so without
+/// this a peer sending a started message a byte at a time could hold the
+/// read open for as long as it liked. Same limit as the maker's.
+pub(crate) const MESSAGE_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Like [`read_message`], but the rest of a message must arrive within
+/// `assembly` of its first byte. The first byte still waits the stream's
+/// own read timeout, which is back in place when this returns.
+pub(crate) fn read_message_assembled_within(
+    stream: &mut TcpStream,
+    assembly: Duration,
+) -> Result<Vec<u8>, NetError> {
+    let timeout = stream.read_timeout()?;
+    let message = read_assembled(stream, timeout, assembly);
+    let restored = stream.set_read_timeout(timeout);
+    let message = message?;
+    restored?;
+    Ok(message)
+}
+
+fn read_assembled(
+    stream: &mut TcpStream,
+    timeout: Option<Duration>,
+    assembly: Duration,
+) -> Result<Vec<u8>, NetError> {
+    let mut length = [0u8; 4];
+    read_exact_by(stream, &mut length[..1], None, timeout)?;
+    let deadline = Instant::now() + assembly;
+    read_exact_by(stream, &mut length[1..], Some(deadline), timeout)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_RPC_MESSAGE_SIZE {
+        return Err(NetError::MessageTooLarge);
+    }
+    let mut message = vec![0; length];
+    read_exact_by(stream, &mut message, Some(deadline), timeout)?;
+    Ok(message)
+}
+
+/// Fills `buf`. Before a `deadline`, each read waits at most the time left,
+/// and never longer than the stream's `timeout`. Reaching the deadline is a
+/// `TimedOut` error.
+fn read_exact_by(
+    stream: &mut TcpStream,
+    mut buf: &mut [u8],
+    deadline: Option<Instant>,
+    timeout: Option<Duration>,
+) -> Result<(), NetError> {
+    let expired = || {
+        NetError::IO(io::Error::new(
+            ErrorKind::TimedOut,
+            "message not finished within its assembly limit",
+        ))
+    };
+    while !buf.is_empty() {
+        let mut capped = false;
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(expired());
+            }
+            capped = timeout.is_none_or(|timeout| left <= timeout);
+            let wait = if capped {
+                left
+            } else {
+                timeout.unwrap_or(left)
+            };
+            stream.set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
+        }
+        match stream.read(buf) {
+            Ok(0) => return Err(NetError::ReachedEOF),
+            Ok(read) => buf = &mut buf[read..],
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if capped && matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(expired())
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 /// Generate The Maker's Multisig and HashLock keys and respective nonce values.
 /// Nonce values are random integers and resulting Pubkeys are derived by tweaking
 ///
@@ -1804,6 +1886,111 @@ mod tests {
 
         assert!(matches!(error, NetError::MessageTooLarge));
         sender.join().unwrap();
+    }
+
+    /// `body` behind its 4-byte length, as `send_message` frames it.
+    fn frame(body: &[u8]) -> Vec<u8> {
+        [&(body.len() as u32).to_be_bytes()[..], body].concat()
+    }
+
+    /// A peer that waits `first`, then writes `bytes`: all at once for a zero
+    /// `gap`, otherwise one byte every `gap`. It stops once the reader hangs
+    /// up.
+    fn slow_peer(
+        bytes: Vec<u8>,
+        first: Duration,
+        gap: Duration,
+    ) -> (TcpStream, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let peer = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            thread::sleep(first);
+            if gap.is_zero() {
+                let _ = socket.write_all(&bytes);
+                return;
+            }
+            for (i, byte) in bytes.iter().enumerate() {
+                if i > 0 {
+                    thread::sleep(gap);
+                }
+                if socket.write_all(&[*byte]).is_err() {
+                    return;
+                }
+            }
+        });
+        (stream, peer)
+    }
+
+    /// Each read gets the stream's timeout afresh, so a peer sending a
+    /// started message one byte at a time, each inside that timeout, could
+    /// hold the read open for as long as it liked.
+    #[test]
+    fn assembled_read_stops_a_peer_sending_a_message_slowly() {
+        let (mut stream, peer) =
+            slow_peer(frame(&[7; 16]), Duration::ZERO, Duration::from_millis(600));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let start = Instant::now();
+        let read = read_message_assembled_within(&mut stream, Duration::from_secs(2));
+        let took = start.elapsed();
+        drop(stream);
+        peer.join().unwrap();
+        assert!(
+            matches!(&read, Err(NetError::IO(e)) if e.kind() == ErrorKind::TimedOut),
+            "{:?}",
+            read
+        );
+        assert!(
+            took >= Duration::from_secs(2) && took < Duration::from_secs(4),
+            "took {:?}",
+            took
+        );
+    }
+
+    /// Only a started message is capped: the first byte still waits the
+    /// stream's own timeout, as a maker may take minutes to answer.
+    #[test]
+    fn assembled_read_waits_the_stream_timeout_for_the_first_byte() {
+        let (mut stream, peer) = slow_peer(frame(&[7; 16]), Duration::from_secs(2), Duration::ZERO);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .unwrap();
+        let read = read_message_assembled_within(&mut stream, Duration::from_secs(1));
+        peer.join().unwrap();
+        assert_eq!(read.unwrap(), vec![7; 16]);
+    }
+
+    /// The caller's read timeout is back after each message, read or not, so
+    /// the next reply's first byte gets the full wait.
+    #[test]
+    fn assembled_read_restores_the_stream_timeout() {
+        let timeout = Some(Duration::from_secs(1));
+        let (mut stream, peer) = slow_peer(frame(&[7; 16]), Duration::ZERO, Duration::ZERO);
+        stream.set_read_timeout(timeout).unwrap();
+        let read = read_message_assembled_within(&mut stream, Duration::from_secs(2));
+        assert_eq!(read.unwrap(), vec![7; 16]);
+        assert_eq!(stream.read_timeout().unwrap(), timeout);
+        peer.join().unwrap();
+
+        let (mut stream, peer) =
+            slow_peer(frame(&[7; 16]), Duration::ZERO, Duration::from_millis(600));
+        stream.set_read_timeout(timeout).unwrap();
+        let read = read_message_assembled_within(&mut stream, Duration::from_secs(2));
+        assert!(read.is_err(), "{:?}", read);
+        assert_eq!(stream.read_timeout().unwrap(), timeout);
+        drop(stream);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn assembled_read_rejects_an_oversized_length() {
+        let length = (MAX_RPC_MESSAGE_SIZE as u32 + 1).to_be_bytes().to_vec();
+        let (mut stream, peer) = slow_peer(length, Duration::ZERO, Duration::ZERO);
+        let read = read_message_assembled_within(&mut stream, Duration::from_secs(1));
+        assert!(matches!(read, Err(NetError::MessageTooLarge)), "{:?}", read);
+        peer.join().unwrap();
     }
 
     /// A fake Tor control port. Answers each command it reads with the next

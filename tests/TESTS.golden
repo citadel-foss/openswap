@@ -197,6 +197,7 @@ openswap taker::api::tests::compat_taker_cli_merge_refuses_bad_requirements_befo
 openswap taker::api::tests::compat_taker_cli_merge_skips_unchanged_values
 openswap taker::api::tests::compat_taker_requirements_survive_cli_merge_and_bind_pins
 openswap taker::api::tests::compat_v023_maker_hello_cannot_repin_a_new_taker
+openswap taker::api::tests::hello_sent_slowly_fails_within_the_assembly_limit
 openswap taker::api::tests::init_taker_config_persists_lightning_settings
 openswap taker::api::tests::taker_config_debug_hides_wallet_password
 openswap taker::background_services::tests::abort_flag_clears_once_the_watcher_answers
@@ -223,6 +224,8 @@ openswap taker::config::tests::test_missing_file
 openswap taker::config::tests::test_valid_config
 openswap taker::config::tests::unreadable_values_are_refused
 openswap taker::lightning_swap::tests::cltv_delta_above_u16_is_rejected_not_truncated
+openswap taker::lightning_swap::tests::early_reject_window_is_not_stretched_by_a_slow_reply
+openswap taker::lightning_swap::tests::ln_reply_sent_slowly_fails_within_the_assembly_limit
 openswap taker::lightning_swap::tests::oversized_amounts_are_rejected_not_wrapped
 openswap taker::offers::tests::a_ban_is_never_pruned_or_polled
 openswap taker::offers::tests::a_ban_is_terminal_and_persists
@@ -276,6 +279,10 @@ openswap taker::payment::tests::settlement_outputs_refuse_what_dust_cannot_absor
 openswap taker::payment::tests::settlement_outputs_split_the_budget_and_shave_the_surplus
 openswap taker::payment::tests::swap_feerate_returns_the_configured_rate
 openswap taker::taproot_verification::tests::rejects_wrong_internal_key
+openswap utill::tests::assembled_read_rejects_an_oversized_length
+openswap utill::tests::assembled_read_restores_the_stream_timeout
+openswap utill::tests::assembled_read_stops_a_peer_sending_a_message_slowly
+openswap utill::tests::assembled_read_waits_the_stream_timeout_for_the_first_byte
 openswap utill::tests::capped_fee_steps_down_until_the_output_relays
 openswap utill::tests::compat_atomic_write_creates_private_files
 openswap utill::tests::compat_list_rejects_line_breaks

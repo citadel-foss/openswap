@@ -41,7 +41,10 @@ use crate::{
             LnSwapInRequest, LnSwapOutClaimed, LnSwapOutPaid, LnSwapOutRequest,
         },
     },
-    utill::{generate_keypair, read_message, send_message, MIN_RELAY_FEE_RATE},
+    utill::{
+        generate_keypair, read_message_assembled_within, send_message, MESSAGE_ASSEMBLY_TIMEOUT,
+        MIN_RELAY_FEE_RATE,
+    },
     wallet::{AddressType, LnPendingSwap},
 };
 
@@ -273,7 +276,7 @@ impl LnMakerConn {
         if self.socket.set_read_timeout(Some(window)).is_err() {
             return Ok(());
         }
-        let early = read_message(&mut self.socket);
+        let early = read_message_assembled_within(&mut self.socket, MESSAGE_ASSEMBLY_TIMEOUT);
         let _ = self.socket.set_read_timeout(previous);
         match early {
             Ok(bytes) => match serde_cbor::from_slice::<MakerToTakerMessage>(&bytes) {
@@ -300,7 +303,7 @@ impl LnMakerConn {
     /// Reads the next Lightning-family reply, surfacing `Reject` and
     /// `Unsupported` as errors.
     fn read_ln(&mut self) -> Result<LightningMakerMessage, TakerError> {
-        let bytes = read_message(&mut self.socket)
+        let bytes = read_message_assembled_within(&mut self.socket, MESSAGE_ASSEMBLY_TIMEOUT)
             .map_err(|e| general(format!("read from maker failed: {e:?}")))?;
         let msg: MakerToTakerMessage = serde_cbor::from_slice(&bytes)
             .map_err(|e| general(format!("bad maker message: {e:?}")))?;
@@ -377,8 +380,8 @@ impl Taker {
 
         send_message(&mut socket, &TakerToMakerMessage::GetOffer(GetOffer))
             .map_err(|e| general(format!("get offer failed: {e:?}")))?;
-        let bytes =
-            read_message(&mut socket).map_err(|e| general(format!("offer reply: {e:?}")))?;
+        let bytes = read_message_assembled_within(&mut socket, MESSAGE_ASSEMBLY_TIMEOUT)
+            .map_err(|e| general(format!("offer reply: {e:?}")))?;
         let msg: MakerToTakerMessage =
             serde_cbor::from_slice(&bytes).map_err(|e| general(format!("bad offer: {e:?}")))?;
         let offer: Offer = match msg {
@@ -1225,5 +1228,95 @@ mod tests {
             Amount::from_sat(15)
         );
         assert!(total_with_fee(Amount::from_sat(u64::MAX), Amount::from_sat(1)).is_err());
+    }
+
+    /// A maker connection whose peer sends `message` one byte every 3 s,
+    /// starting at once. The connection's read timeout is 5 s, so each byte
+    /// lands inside it. The peer stops once the reader hangs up.
+    fn slow_maker(message: LightningMakerMessage) -> (LnMakerConn, std::thread::JoinHandle<()>) {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = serde_cbor::to_vec(&MakerToTakerMessage::Lightning(Box::new(message))).unwrap();
+        let frame = [&(body.len() as u32).to_be_bytes()[..], &body].concat();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            for (i, byte) in frame.iter().enumerate() {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_secs(3));
+                }
+                if socket.write_all(&[*byte]).is_err() {
+                    return;
+                }
+            }
+        });
+        let conn = LnMakerConn {
+            socket,
+            address: String::new(),
+            ln_offer: LightningOffer {
+                swap_in: true,
+                swap_out: true,
+                base_fee: 0,
+                amount_relative_fee_pct: 0.0,
+                min_size: 0,
+                max_swap_in: 0,
+                max_swap_out: 0,
+            },
+            pins: Vec::new(),
+        };
+        (conn, peer)
+    }
+
+    /// Longer than `MESSAGE_ASSEMBLY_TIMEOUT` at one byte every 3 s.
+    fn long_swap_id() -> String {
+        "a".repeat(64)
+    }
+
+    /// A maker reply sent one byte at a time, each inside the read timeout,
+    /// fails once the message assembly limit passes, instead of holding the
+    /// swap until the maker finishes. Takes about a minute.
+    #[test]
+    fn ln_reply_sent_slowly_fails_within_the_assembly_limit() {
+        let assembly = MESSAGE_ASSEMBLY_TIMEOUT;
+        let (mut conn, peer) = slow_maker(LightningMakerMessage::SwapOutComplete(
+            crate::protocol::lightning_messages::LnSwapOutComplete {
+                swap_id: long_swap_id(),
+            },
+        ));
+        let start = Instant::now();
+        let read = conn.read_ln();
+        let took = start.elapsed();
+        drop(conn);
+        peer.join().unwrap();
+        assert!(read.is_err(), "{:?}", read);
+        assert!(
+            took >= assembly && took < assembly + Duration::from_secs(10),
+            "took {:?}",
+            took
+        );
+    }
+
+    /// The early-reject window cannot be stretched by a reply sent one byte
+    /// at a time: once the assembly limit passes it counts as no early
+    /// reply. Takes about a minute.
+    #[test]
+    fn early_reject_window_is_not_stretched_by_a_slow_reply() {
+        let assembly = MESSAGE_ASSEMBLY_TIMEOUT;
+        let (mut conn, peer) = slow_maker(LightningMakerMessage::Reject(
+            crate::protocol::lightning_messages::LnReject {
+                swap_id: long_swap_id(),
+                reason: String::new(),
+            },
+        ));
+        let start = Instant::now();
+        let early = conn.check_no_early_reject(EARLY_REJECT_WINDOW);
+        let took = start.elapsed();
+        drop(conn);
+        peer.join().unwrap();
+        assert!(early.is_ok(), "{:?}", early);
+        assert!(took < assembly + Duration::from_secs(10), "took {:?}", took);
     }
 }

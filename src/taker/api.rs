@@ -35,8 +35,9 @@ use crate::{
         features::{choose_pins, supported, unmet_for_flow, KNOWN},
     },
     utill::{
-        funding_fee_policy_sats, generate_maker_keys, get_taker_dir, read_message, send_message,
-        set_config_key, sweep_fee_policy_sats, MAX_TX_COUNT, MIN_RELAY_FEE_RATE,
+        funding_fee_policy_sats, generate_maker_keys, get_taker_dir, read_message,
+        read_message_assembled_within, send_message, set_config_key, sweep_fee_policy_sats,
+        MAX_TX_COUNT, MESSAGE_ASSEMBLY_TIMEOUT, MIN_RELAY_FEE_RATE,
     },
     wallet::{
         blockchain::BackendConnector,
@@ -2862,7 +2863,10 @@ pub(crate) fn handshake_with_maker(
     };
     send_message(stream, &TakerToMakerMessage::Hello(hello))?;
 
-    let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message(stream)?)?;
+    let msg: MakerToTakerMessage = serde_cbor::from_slice(&read_message_assembled_within(
+        stream,
+        MESSAGE_ASSEMBLY_TIMEOUT,
+    )?)?;
     let features = match msg {
         MakerToTakerMessage::Hello(hello) => hello.features,
         MakerToTakerMessage::Unsupported(refusal) => {
@@ -4100,6 +4104,48 @@ mod tests {
         assert_eq!(
             compat_hello_reply(reply, &[]).unwrap(),
             KNOWN.iter().map(|f| f.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// A maker sending its Hello one byte every 3 s, inside the 5 s read
+    /// timeout, is given up on once the message assembly limit passes, not
+    /// when it chooses to finish. Takes about a minute.
+    #[test]
+    fn hello_sent_slowly_fails_within_the_assembly_limit() {
+        use std::io::Write as _;
+        let assembly = MESSAGE_ASSEMBLY_TIMEOUT;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let hello = MakerToTakerMessage::Hello(Hello {
+            features: vec!["x".repeat(40)],
+        });
+        let body = serde_cbor::to_vec(&hello).unwrap();
+        let frame = [&(body.len() as u32).to_be_bytes()[..], &body].concat();
+        let peer = thread::spawn(move || {
+            let (mut server, _) = listener.accept().unwrap();
+            read_message(&mut server).unwrap();
+            for (i, byte) in frame.iter().enumerate() {
+                if i > 0 {
+                    thread::sleep(Duration::from_secs(3));
+                }
+                if server.write_all(&[*byte]).is_err() {
+                    return;
+                }
+            }
+        });
+        let start = Instant::now();
+        let result = handshake_with_maker(&mut client, &[]);
+        let took = start.elapsed();
+        drop(client);
+        peer.join().unwrap();
+        assert!(result.is_err(), "{:?}", result);
+        assert!(
+            took >= assembly && took < assembly + Duration::from_secs(10),
+            "took {:?}",
+            took
         );
     }
 
