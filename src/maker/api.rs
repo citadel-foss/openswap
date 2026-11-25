@@ -909,6 +909,13 @@ pub struct MakerServer {
     /// Test-only behavior override.
     #[cfg(feature = "integration-test")]
     pub behavior: MakerBehavior,
+    /// Funding height lookups made so far, for
+    /// [`MakerBehavior::FundingHeightLagsOnce`].
+    #[cfg(feature = "integration-test")]
+    pub funding_height_lookups: std::sync::atomic::AtomicU32,
+    /// Ends the pause [`MakerBehavior::FundingHeightLagsWhileChainMoves`] holds.
+    #[cfg(feature = "integration-test")]
+    pub funding_height_pause_released: AtomicBool,
     /// Reserved by the framework at allocation; taken at server start so no
     /// parallel test can snipe the port in between.
     #[cfg(feature = "integration-test")]
@@ -1197,6 +1204,10 @@ impl MakerServer {
             ln_swaps: Mutex::new(restored_ln_swaps),
             #[cfg(feature = "integration-test")]
             behavior: MakerBehavior::default(),
+            #[cfg(feature = "integration-test")]
+            funding_height_lookups: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "integration-test")]
+            funding_height_pause_released: AtomicBool::new(false),
             #[cfg(feature = "integration-test")]
             reserved_network_listener: Mutex::new(None),
             #[cfg(feature = "integration-test")]
@@ -3983,12 +3994,42 @@ impl MakerTrait for MakerServer {
     fn tx_confirmation_height(&self, txid: &bitcoin::Txid) -> Result<Option<u32>, MakerError> {
         use crate::wallet::Blockchain;
         #[cfg(feature = "integration-test")]
-        match self.behavior() {
-            MakerBehavior::FailFundingHeightLookup => {
-                return Err(MakerError::General("Test: funding height lookup failed"))
+        {
+            let earlier = self
+                .funding_height_lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match self.behavior() {
+                MakerBehavior::FailFundingHeightLookup => {
+                    return Err(MakerError::General("Test: funding height lookup failed"))
+                }
+                MakerBehavior::NoFundingHeight => return Ok(None),
+                MakerBehavior::ShutdownDuringFundingHeightRetry if earlier == 0 => {
+                    self.shutdown
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(None);
+                }
+                MakerBehavior::FundingHeightLagsOnce
+                | MakerBehavior::FundingReminedAtTip
+                | MakerBehavior::ShutdownDuringFundingHeightPause
+                | MakerBehavior::FundingHeightLagsWhileChainMoves
+                    if earlier == 0 =>
+                {
+                    return Ok(None)
+                }
+                MakerBehavior::FundingReminedAtTip => {
+                    return Ok(Some(self.get_current_height()?));
+                }
+                MakerBehavior::ChainMovesDuringHeightRead if earlier == 0 => {
+                    while !self
+                        .funding_height_pause_released
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        && !self.is_shutdown()
+                    {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                _ => {}
             }
-            MakerBehavior::NoFundingHeight => return Ok(None),
-            _ => {}
         }
         let height = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -4013,34 +4054,16 @@ impl MakerTrait for MakerServer {
     }
 
     #[cfg(feature = "lightning")]
-    fn htlc_unspent_and_age(
-        &self,
-        outpoint: &bitcoin::OutPoint,
-    ) -> Result<(bool, u32), MakerError> {
+    fn htlc_unspent(&self, outpoint: &bitcoin::OutPoint) -> Result<bool, MakerError> {
         use crate::wallet::Blockchain;
-        let wallet = lock_debug!(self.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
         // Mempool included: a spend that is only in the mempool still means
         // the taker is taking this output back.
-        let unspent = wallet
+        Ok(lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
             .blockchain
             .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
             .map_err(MakerError::Wallet)?
-            .is_some();
-        let tip = wallet
-            .blockchain
-            .get_block_count()
-            .map_err(MakerError::Wallet)?;
-        let confirmed_at = wallet
-            .blockchain
-            .tx_block_height(&outpoint.txid)
-            .map_err(MakerError::Wallet)?;
-        // An unconfirmed funding has aged zero blocks; the confirmation wait
-        // is what decides whether that is acceptable.
-        let age = confirmed_at
-            .map(|height| tip.saturating_sub(height) as u32)
-            .unwrap_or(0);
-        Ok((unspent, age))
+            .is_some())
     }
 
     #[cfg(feature = "lightning")]
@@ -4165,6 +4188,27 @@ impl MakerTrait for MakerServer {
     #[cfg(feature = "lightning")]
     fn shutdown_requested(&self) -> bool {
         self.is_shutdown()
+    }
+
+    #[cfg(feature = "lightning")]
+    fn pause_before_height_reread(&self, duration: Duration) {
+        std::thread::sleep(duration);
+        // Inside the pause, after the handler's check before it.
+        #[cfg(feature = "integration-test")]
+        if self.behavior == MakerBehavior::ShutdownDuringFundingHeightPause {
+            self.shutdown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(feature = "integration-test")]
+        if self.behavior == MakerBehavior::FundingHeightLagsWhileChainMoves {
+            while !self
+                .funding_height_pause_released
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && !self.is_shutdown()
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -4498,6 +4542,10 @@ pub(crate) mod tests {
             ln_swaps: Mutex::new(HashMap::new()),
             #[cfg(feature = "integration-test")]
             behavior: MakerBehavior::default(),
+            #[cfg(feature = "integration-test")]
+            funding_height_lookups: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "integration-test")]
+            funding_height_pause_released: AtomicBool::new(false),
             #[cfg(feature = "integration-test")]
             reserved_network_listener: Mutex::new(None),
             #[cfg(feature = "integration-test")]
