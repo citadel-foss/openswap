@@ -541,6 +541,47 @@ impl CoreRPC {
     }
 }
 
+impl CoreRPC {
+    /// [`Blockchain::is_spend_buried`] against the chain whose tip is `best`.
+    /// The caller checks the tip did not move while this answered.
+    fn spend_buried_at(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+        depth: u64,
+        best: BlockHash,
+    ) -> Result<bool, WalletError> {
+        // The funding tx must be `depth` deep on the active chain, or no spend
+        // of it can be. A tx whose block was reorged out keeps that block's
+        // hash in the txindex, but has no confirmations.
+        let confirmations = match self.rpc.get_raw_transaction_info(&outpoint.txid, None) {
+            Ok(info) => info.confirmations.unwrap_or(0),
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -5 => {
+                return Ok(false)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if u64::from(confirmations) < depth || !self.is_confirmed_spend(outpoint, script)? {
+            return Ok(false);
+        }
+        // Core keeps no spend index: the spend is buried unless one of the
+        // `depth - 1` blocks from `best` down holds it.
+        let mut hash = best;
+        for _ in 1..depth {
+            let block = self.rpc.get_block(&hash)?;
+            if block
+                .txdata
+                .iter()
+                .any(|tx| tx.input.iter().any(|i| i.previous_output == *outpoint))
+            {
+                return Ok(false);
+            }
+            hash = block.header.prev_blockhash;
+        }
+        Ok(true)
+    }
+}
+
 impl Blockchain for CoreRPC {
     fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResult, WalletError> {
         Ok(self.rpc.get_blockchain_info()?)
@@ -592,6 +633,18 @@ impl Blockchain for CoreRPC {
                 .is_none())
     }
 
+    fn is_spend_buried(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+        depth: u64,
+    ) -> Result<bool, WalletError> {
+        on_one_tip(
+            || Ok(self.rpc.get_best_block_hash()?),
+            |best| self.spend_buried_at(outpoint, script, depth, best),
+        )
+    }
+
     fn get_raw_transaction(
         &self,
         txid: &Txid,
@@ -606,6 +659,18 @@ impl Blockchain for CoreRPC {
         block_hash: Option<&BlockHash>,
     ) -> Result<GetRawTransactionResult, WalletError> {
         Ok(self.rpc.get_raw_transaction_info(txid, block_hash)?)
+    }
+
+    fn abandon_transaction(&self, txid: &Txid) -> Result<(), WalletError> {
+        match self
+            .rpc
+            .call::<Value>("abandontransaction", &[json!(txid.to_string())])
+        {
+            Ok(_) => Ok(()),
+            // -5: not a wallet tx, or not eligible (in the mempool or a block).
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -5 => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn is_tx_unknown(&self, txid: &Txid) -> Result<bool, WalletError> {
@@ -881,6 +946,24 @@ fn list_wallet_dir(client: &Client) -> Result<Vec<String>, WalletError> {
     }
     let result: CallResult = client.call("listwalletdir", &[])?;
     Ok(result.wallets.into_iter().map(|n| n.name).collect())
+}
+
+/// Runs `check` against the tip `best` reports, and keeps its answer only if
+/// the tip is unchanged afterwards: a block connected or disconnected between
+/// the queries could move a spend. Retried a few times, then reported
+/// unproven (false).
+fn on_one_tip(
+    mut best: impl FnMut() -> Result<BlockHash, WalletError>,
+    mut check: impl FnMut(BlockHash) -> Result<bool, WalletError>,
+) -> Result<bool, WalletError> {
+    for _ in 0..3 {
+        let tip = best()?;
+        let answer = check(tip)?;
+        if best()? == tip {
+            return Ok(answer);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -1641,5 +1724,33 @@ pub(crate) mod tests {
         );
         assert!(err.contains("Insufficient data"), "{}", err);
         server.join().unwrap();
+    }
+
+    /// A tip that moves during the check discards its answer: the check is
+    /// retried on the new tip, and a tip that keeps moving reads unproven.
+    #[test]
+    fn a_spend_is_proven_buried_only_on_one_tip() {
+        use bitcoin::hashes::Hash;
+        let hash = |n: u8| BlockHash::from_byte_array([n; 32]);
+        let run = |tips: &[u8]| {
+            let mut tips = tips.iter().map(|n| hash(*n));
+            let mut checked = Vec::new();
+            let answer = on_one_tip(
+                || Ok(tips.next().unwrap()),
+                |tip| {
+                    checked.push(tip);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            (answer, checked)
+        };
+        assert_eq!(run(&[1, 1]), (true, vec![hash(1)]));
+        // A reorg during the first check: the answer comes from the new tip.
+        assert_eq!(run(&[1, 2, 2, 2]), (true, vec![hash(1), hash(2)]));
+        assert_eq!(
+            run(&[1, 2, 3, 4, 5, 6]),
+            (false, vec![hash(1), hash(3), hash(5)])
+        );
     }
 }

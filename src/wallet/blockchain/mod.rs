@@ -201,6 +201,23 @@ pub trait Blockchain: Send + Sync + 'static {
     /// mempool-blind UTXO set.
     fn is_confirmed_spend(&self, outpoint: &OutPoint, script: &Script)
         -> Result<bool, WalletError>;
+    /// True only when the backend can prove a block at least `depth` deep (the
+    /// tip is 1 deep) on its active chain spends `outpoint`, so a reorg that
+    /// short will not undo the spend. `script` is the outpoint's
+    /// scriptPubKey, as for [`is_confirmed_spend`](Self::is_confirmed_spend).
+    ///
+    /// A false answer only means "not proven". Bitcoin Core answers from its
+    /// own validated chain. An Electrum server's history is its word alone:
+    /// nothing checks that a listed spend is in a block, so Electrum always
+    /// answers false, the default.
+    fn is_spend_buried(
+        &self,
+        _outpoint: &OutPoint,
+        _script: &Script,
+        _depth: u64,
+    ) -> Result<bool, WalletError> {
+        Ok(false)
+    }
     /// Fetch a raw transaction by txid.
     fn get_raw_transaction(
         &self,
@@ -223,6 +240,14 @@ pub trait Blockchain: Send + Sync + 'static {
     /// Any transport or server failure is propagated, so a failed query is
     /// never read as absence.
     fn is_tx_unknown(&self, txid: &Txid) -> Result<bool, WalletError>;
+    /// Stop counting the coins an unconfirmed transaction spends as spent,
+    /// once it is in neither the mempool nor a block.
+    ///
+    /// Core's watch-only wallet keeps such a transaction and leaves its coins
+    /// out of `listunspent` until it is abandoned. Electrum has no server-side
+    /// wallet, so there is nothing to do. A transaction the node does not hold,
+    /// or one that is in the mempool or a block, is left as is.
+    fn abandon_transaction(&self, txid: &Txid) -> Result<(), WalletError>;
     /// Unspent output at `txid:vout`, following Core's `gettxout`.
     ///
     /// `include_mempool`:
@@ -608,6 +633,17 @@ impl Blockchain for AnyBlockchain {
             AnyBlockchain::Electrum(b) => b.is_confirmed_spend(outpoint, script),
         }
     }
+    fn is_spend_buried(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+        depth: u64,
+    ) -> Result<bool, WalletError> {
+        match self {
+            AnyBlockchain::CoreRPC(b) => b.is_spend_buried(outpoint, script, depth),
+            AnyBlockchain::Electrum(b) => b.is_spend_buried(outpoint, script, depth),
+        }
+    }
     fn get_raw_transaction(
         &self,
         txid: &Txid,
@@ -632,6 +668,12 @@ impl Blockchain for AnyBlockchain {
         match self {
             AnyBlockchain::CoreRPC(b) => b.is_tx_unknown(txid),
             AnyBlockchain::Electrum(b) => b.is_tx_unknown(txid),
+        }
+    }
+    fn abandon_transaction(&self, txid: &Txid) -> Result<(), WalletError> {
+        match self {
+            AnyBlockchain::CoreRPC(b) => b.abandon_transaction(txid),
+            AnyBlockchain::Electrum(b) => b.abandon_transaction(txid),
         }
     }
     fn get_tx_out(
