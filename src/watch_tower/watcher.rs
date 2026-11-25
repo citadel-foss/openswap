@@ -355,7 +355,7 @@ impl<R: Role> Watcher<R> {
                     }
                 };
                 let mut spent = false;
-                for watch in watches {
+                for mut watch in watches {
                     if self.shutdown.load(Ordering::Relaxed) {
                         return false;
                     }
@@ -367,13 +367,16 @@ impl<R: Role> Watcher<R> {
                     if watch.in_block
                         && !self.confirm_recorded_spend(&outpoint, &watch.script_pubkey)
                     {
-                        let mut cleared = watch.clone();
-                        cleared.spent_tx = None;
-                        cleared.in_block = false;
-                        if let Err(e) = self.registry.upsert_watch(&cleared) {
-                            log::error!("registry lock poisoned, spend not cleared: {e:?}");
+                        // Only the confirmed mark goes, matching `reconcile_watch`.
+                        // The transaction stays: it may carry the only copy of a
+                        // preimage.
+                        watch.in_block = false;
+                        if let Err(e) = self.registry.upsert_watch(&watch) {
+                            log::error!(
+                                "registry lock poisoned, confirmed mark not cleared: {e:?}"
+                            );
                         }
-                        continue;
+                        self.queue_reconcile(outpoint);
                     }
                     // What is on record proves nothing for a watch that may have
                     // missed a spend or its replacement, so ask the server. If
@@ -527,7 +530,9 @@ impl<R: Role> Watcher<R> {
         match self.blockchain.is_confirmed_spend(outpoint, spk) {
             Ok(still_there) => {
                 if !still_there {
-                    log::warn!("recorded spend of {outpoint} is no longer on chain, clearing it");
+                    log::warn!(
+                        "recorded spend of {outpoint} is no longer on chain, clearing its confirmed mark"
+                    );
                 }
                 still_there
             }
@@ -3494,5 +3499,215 @@ mod tests {
 
         assert_eq!(recorded_spend(&watcher, outpoint), Some(confirmed));
         assert!(is_recorded_confirmed(&watcher, outpoint));
+    }
+
+    /// Issue #1244 Variant A:
+    /// When answering a watch request for an outpoint whose spend was recorded as
+    /// confirmed, if a reorg replaces the block that held it, the claim is not in the
+    /// mempool, and the funding transaction is back in the mempool, the watcher must:
+    /// 1. NOT return NoOutpoint on the 1st watch request,
+    /// 2. keep the recorded spent_tx and serve it as unconfirmed (in_block = false),
+    /// 3. keep the watch registered in the registry,
+    /// 4. serve the same kept spend on the 2nd watch request,
+    /// 5. queue for reconciliation so a replacement spend is found if one exists,
+    ///    or keep the recorded claim if no replacement spend exists.
+    #[test]
+    fn watch_request_keeps_spend_when_confirmation_lost_and_funding_in_mempool() {
+        let funding = spend(OutPoint::new(Txid::from_byte_array([9; 32]), 0));
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let claim = spend(outpoint);
+
+        let node = Arc::new(Mutex::new(Node::default()));
+        {
+            let mut node = node.lock().unwrap();
+            node.mine(Vec::new()); // block 0
+            node.mempool.push(funding.clone());
+        }
+
+        let (url, _calls) = mock_node(&node);
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        record_confirmed_spend(&mut watcher, &claim);
+
+        // 1st watch request
+        let first = ask(&mut watcher, outpoint);
+        assert_eq!(answered_spend(first), Some(claim.clone()));
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(claim.clone()));
+        assert!(!is_recorded_confirmed(&watcher, outpoint));
+        assert!(watcher
+            .registry
+            .list_watches()
+            .unwrap()
+            .iter()
+            .any(|w| w.outpoint == outpoint));
+
+        // 2nd watch request
+        let second = ask(&mut watcher, outpoint);
+        assert_eq!(answered_spend(second), Some(claim.clone()));
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(claim.clone()));
+        assert!(!is_recorded_confirmed(&watcher, outpoint));
+        assert!(watcher
+            .registry
+            .list_watches()
+            .unwrap()
+            .iter()
+            .any(|w| w.outpoint == outpoint));
+
+        // Subsequent reconciliation keeps the recorded claim when no replacement exists
+        watcher.retry_pending_work();
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(claim.clone()));
+        assert!(!is_recorded_confirmed(&watcher, outpoint));
+
+        // And finds a replacement spend once a missed event triggers re-check
+        let mut replacement = spend(outpoint);
+        replacement.lock_time = bitcoin::absolute::LockTime::from_consensus(2);
+        {
+            let mut node = node.lock().unwrap();
+            node.mempool.clear();
+            node.mine(vec![funding.clone()]);
+            node.mine(vec![replacement.clone()]);
+        }
+        watcher.handle_event(WatchEvent::Missed);
+        watcher.retry_pending_work();
+        assert_eq!(
+            recorded_spend(&watcher, outpoint),
+            Some(replacement.clone())
+        );
+        assert!(is_recorded_confirmed(&watcher, outpoint));
+    }
+
+    /// When answering a watch request whose spend was recorded as confirmed, if the
+    /// funding transaction is confirmed on chain but its output is reported unspent in
+    /// Core's UTXO set (is_confirmed_spend returns false because get_tx_out is Some),
+    /// the watcher must:
+    /// 1. NOT return NoOutpoint on the 1st watch request,
+    /// 2. keep the recorded spent_tx and serve it as unconfirmed (in_block = false),
+    /// 3. keep the watch registered in the registry,
+    /// 4. serve the same kept spend on the 2nd watch request.
+    #[test]
+    fn watch_request_keeps_spend_when_funding_remined_unspent() {
+        let funding = spend(OutPoint::new(Txid::from_byte_array([9; 32]), 0));
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let claim = spend(outpoint);
+
+        let node = Arc::new(Mutex::new(Node::default()));
+        {
+            let mut node = node.lock().unwrap();
+            node.mine(Vec::new()); // block 0
+            node.mine(vec![funding.clone()]); // funding is mined on chain
+        }
+
+        let (url, _calls) = mock_core_rpc({
+            let node = node.clone();
+            move |method, params| {
+                let node = node.lock().unwrap();
+                if method == "gettxout" && params[0] == json!(outpoint.txid) {
+                    return Ok(unspent_output(&node));
+                }
+                node.answer(method, params)
+            }
+        });
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        record_confirmed_spend(&mut watcher, &claim);
+
+        // 1st watch request: confirm_recorded_spend fails because output is in UTXO set
+        let first = ask(&mut watcher, outpoint);
+        assert_eq!(answered_spend(first), Some(claim.clone()));
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(claim.clone()));
+        assert!(!is_recorded_confirmed(&watcher, outpoint));
+        assert!(watcher
+            .registry
+            .list_watches()
+            .unwrap()
+            .iter()
+            .any(|w| w.outpoint == outpoint));
+
+        // 2nd watch request: still serves the kept spend
+        let second = ask(&mut watcher, outpoint);
+        assert_eq!(answered_spend(second), Some(claim.clone()));
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(claim.clone()));
+        assert!(!is_recorded_confirmed(&watcher, outpoint));
+    }
+
+    /// When answering a watch request whose recorded spend lost confirmation, if a
+    /// replacement spend is already in the mempool after the reorg, the watch request
+    /// must discover and answer with the replacement spend immediately via
+    /// `self.queue_reconcile(outpoint)`, without any manual retry_pending_work.
+    #[test]
+    fn watch_request_discovers_replacement_spend_immediately() {
+        let funding = spend(OutPoint::new(Txid::from_byte_array([9; 32]), 0));
+        let outpoint = OutPoint::new(funding.compute_txid(), 0);
+        let claim = spend(outpoint);
+        let mut replacement = spend(outpoint);
+        replacement.lock_time = bitcoin::absolute::LockTime::from_consensus(2);
+
+        let node = Arc::new(Mutex::new(Node::default()));
+        {
+            let mut node = node.lock().unwrap();
+            node.mine(Vec::new()); // block 0
+            node.mempool.push(funding.clone());
+            node.mempool.push(replacement.clone());
+        }
+
+        let (url, _calls) = mock_node(&node);
+        let mut watcher = core_watcher(&CoreRpcConfig {
+            url,
+            ..CoreRpcConfig::default()
+        });
+        record_confirmed_spend(&mut watcher, &claim);
+
+        // Watch request arrives when replacement spend is already in mempool.
+        // It should answer with the replacement spend immediately.
+        let answer = ask(&mut watcher, outpoint);
+        assert_eq!(answered_spend(answer), Some(replacement.clone()));
+        assert_eq!(
+            recorded_spend(&watcher, outpoint),
+            Some(replacement.clone())
+        );
+        assert!(!is_recorded_confirmed(&watcher, outpoint));
+    }
+
+    /// Electrum watcher: when an outpoint's spend was recorded as confirmed, if a reorg
+    /// loses its confirmation, the watch request must keep the recorded spend, clear in_block,
+    /// and answer with the kept spend rather than NoOutpoint.
+    #[test]
+    fn electrum_watch_request_keeps_spend_when_confirmation_lost() {
+        let outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let claim = spend(outpoint);
+        let spk = contract_script(1);
+        let node = Arc::new(Mutex::new(ElectrumNode::default()));
+        let (mut watcher, _calls) = electrum_watcher(&node);
+        watcher
+            .registry
+            .upsert_watch(&WatchRequest {
+                outpoint,
+                script_pubkey: spk.clone(),
+                in_block: true,
+                spent_tx: Some(claim.clone()),
+            })
+            .unwrap();
+
+        // 1st watch request
+        let first = ask(&mut watcher, outpoint);
+        assert_eq!(answered_spend(first), Some(claim.clone()));
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(claim.clone()));
+        assert!(!is_recorded_confirmed(&watcher, outpoint));
+        assert!(watcher
+            .registry
+            .list_watches()
+            .unwrap()
+            .iter()
+            .any(|w| w.outpoint == outpoint));
+
+        // 2nd watch request
+        let second = ask(&mut watcher, outpoint);
+        assert_eq!(answered_spend(second), Some(claim.clone()));
+        assert_eq!(recorded_spend(&watcher, outpoint), Some(claim.clone()));
+        assert!(!is_recorded_confirmed(&watcher, outpoint));
     }
 }
