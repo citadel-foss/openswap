@@ -1055,9 +1055,8 @@ impl MakerServer {
         if let AnyBlockchain::CoreRPC(core) = &blockchain {
             core.check_node_requirements().map_err(MakerError::Wallet)?;
             #[cfg(feature = "lightning")]
-            if config.ldk_server_url.is_some() {
-                core.require_v24().map_err(MakerError::Wallet)?;
-            }
+            core.require_v24_for_lightning(config.ldk_server_url.is_some())
+                .map_err(MakerError::Wallet)?;
         }
         // Take the passphrase out of the config: the wallet keeps the derived
         // key material, so the cleartext passphrase must not linger in the
