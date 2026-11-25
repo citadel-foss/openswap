@@ -1133,8 +1133,8 @@ fn swap_in_sweep_is_not_bumped_while_a_swap_holds_its_output(
 
 /// The taker's refund can spread over many outputs, each to its own
 /// address, so reading what spends from it touches as many scripts. The
-/// sweep still replaces it, on Core and on Electrum, where the outputs'
-/// histories are read in one batch.
+/// sweep still replaces it and a child of one of its outputs, on Core and on
+/// Electrum, where the outputs' histories are read in one batch.
 #[world_test(
     bind = [ln = maker_node()],
     maker_behaviors = [Normal],
@@ -1165,9 +1165,14 @@ fn run_watchdog_outbids_a_wide_taker_refund(world: &mut World, ln: Arc<MockLight
             .iter()
             .map(|output| output.value)
             .sum::<Amount>();
-    // It pays its fee plus the 1 sat/vB step for 150 vB, and more per vbyte
-    // than the refund by that step.
-    let rate = (refund_fee.to_sat() as f64 / 150.0 + 1.0)
+    // A child of one output, so only a read of the whole family prices the
+    // sweep high enough: bidding against the refund alone would be refused.
+    let child_fee = Amount::from_sat(300);
+    let child = spend_with_fee(bitcoind, refund, child_fee);
+    // It pays both fees plus the 1 sat/vB step for 150 vB, and more per
+    // vbyte than the refund by that step.
+    let to_beat = refund_fee + child_fee;
+    let rate = (to_beat.to_sat() as f64 / 150.0 + 1.0)
         .max(refund_fee.to_sat() as f64 / refund_tx.vsize() as f64 + 1.0)
         .max(SPEND_FEE_RATE_FLOOR);
 
@@ -1175,17 +1180,18 @@ fn run_watchdog_outbids_a_wide_taker_refund(world: &mut World, ln: Arc<MockLight
     wait_until!(
         Duration::from_secs(30),
         every Duration::from_millis(500),
-        "the sweep to replace the wide taker refund",
+        "the sweep to replace the wide taker refund and its child",
         {
             ln_watchdog_tick_now(&maker);
-            gone(&refund)
+            gone(&refund) && gone(&child)
         }
     );
     assert_eq!(
         mempool_spend_fee(bitcoind, funding, value),
         Amount::from_sat((rate * 150.0).ceil() as u64),
-        "the sweep must outbid the {} sat refund by fee and by feerate",
-        refund_fee.to_sat()
+        "the sweep must outbid the {} sat refund and its {} sat child",
+        refund_fee.to_sat(),
+        child_fee.to_sat()
     );
 
     framework.set_block_gen_paused(false);
@@ -1364,6 +1370,9 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
     let bitcoind = &framework.bitcoind;
     let maker = world.makers()[0].inner().clone();
     let locktime: u16 = 30;
+    // The test mines every block itself, so a refund sent early cannot
+    // confirm unseen before the checks below.
+    pause_block_generation(&framework);
     let market = SpendFeerate::set(10.0);
 
     let preimage = Preimage([0x7a; 32]);
@@ -1388,11 +1397,15 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
     let recorded = maker
         .get_ln_swap(&swap_id)
         .unwrap()
-        .and_then(|swap| swap.refund_txid);
-    let in_mempool = |txid: &Txid| bitcoind.client.get_mempool_entry(txid).is_ok();
-    let sent_before_recorded = recorded.is_some_and(|txid| in_mempool(&txid));
-    // The maker stays down long enough for anything it sent to confirm.
+        .and_then(|swap| swap.refund_txid)
+        .expect("the refund was recorded before the crash");
+    // Nothing reached the network before it was recorded: the refund is in
+    // neither the mempool nor a block, before or after the maker is down
+    // long enough for anything it sent to confirm.
+    let unknown = |txid: &Txid| bitcoind.client.get_raw_transaction(txid, None).is_err();
+    assert!(unknown(&recorded), "the interrupted refund was sent");
     generate_blocks(bitcoind, 1);
+    assert!(unknown(&recorded), "the interrupted refund was mined");
 
     let mut config = maker.config.clone();
     config.password = Some("integration-test".to_string());
@@ -1424,10 +1437,7 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
         "the refunded swap's held payment must be failed back"
     );
 
-    // The txid recorded before the crash named the refund that confirmed,
-    // and nothing reached the network before it was recorded.
-    let recorded = recorded.expect("the refund was recorded before the crash");
-    assert!(!sent_before_recorded);
+    // The txid recorded before the crash named the refund that confirmed.
     assert!(confirmations(bitcoind, &recorded) >= 1);
     let refund = raw_tx_with_retry(bitcoind, &recorded);
     assert_eq!(
@@ -1448,6 +1458,7 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
         Amount::from_sat(1_500),
         "the refund must keep the 10 sat/vB it was recorded at, not the 5 sat/vB market"
     );
+    framework.set_block_gen_paused(false);
 }
 
 /// The same crash, with the market risen while the maker was down. Nothing
