@@ -482,6 +482,7 @@ openswap wallet::blockchain::electrum::tests::an_unreachable_history_read_stops_
 openswap wallet::blockchain::electrum::tests::an_unreadable_header_notification_rereads_the_tip
 openswap wallet::blockchain::electrum::tests::an_unreadable_script_notification_drops_cached_coins
 openswap wallet::blockchain::electrum::tests::an_unsubscribe_recycles_the_connection_during_a_refusal_backoff
+openswap wallet::blockchain::electrum::tests::at_most_two_family_reads_run_at_once
 openswap wallet::blockchain::electrum::tests::blind_watch_logs_count_shared_outpoints_and_global_rearm
 openswap wallet::blockchain::electrum::tests::cached_transaction_does_not_hide_server_eviction
 openswap wallet::blockchain::electrum::tests::calls_on_one_electrum_socket_are_serialized
@@ -496,10 +497,12 @@ openswap wallet::blockchain::electrum::tests::onion_without_proxy_is_rejected_be
 openswap wallet::blockchain::electrum::tests::only_the_unknown_txid_protocol_error_reads_as_absent
 openswap wallet::blockchain::electrum::tests::other_scripts_subscribe_while_one_is_refused
 openswap wallet::blockchain::electrum::tests::package_fee_adds_up_the_mempool_family
+openswap wallet::blockchain::electrum::tests::package_fee_cuts_off_a_trickling_reply
 openswap wallet::blockchain::electrum::tests::package_fee_gives_up_on_a_stalled_connection
 openswap wallet::blockchain::electrum::tests::package_fee_gives_up_when_the_server_is_too_slow
 openswap wallet::blockchain::electrum::tests::package_fee_reads_a_wide_refund
 openswap wallet::blockchain::electrum::tests::package_fee_refuses_a_family_no_replacement_can_evict
+openswap wallet::blockchain::electrum::tests::package_fee_stops_a_reply_past_its_size_limit
 openswap wallet::blockchain::electrum::tests::ping_cadence_follows_proxy
 openswap wallet::blockchain::electrum::tests::ping_cadence_override_wins
 openswap wallet::blockchain::electrum::tests::proxy_does_not_require_an_onion_url

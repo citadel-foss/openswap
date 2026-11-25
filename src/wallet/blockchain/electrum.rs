@@ -174,21 +174,33 @@ fn client_config(cfg: &ElectrumConfig) -> ClientConfig {
 /// instead replaces every error except `Protocol` and `AlreadySubscribed` with
 /// an empty `AllAttemptsErrored`, so the root cause is lost. Reconnection is
 /// handled by [`Electrum::call`], which knows what to re-arm.
-struct ElectrumClient(ClientType);
+struct ElectrumClient(Transport);
+
+/// How an [`ElectrumClient`] reaches its server.
+enum Transport {
+    /// One of `electrum_client`'s own connections.
+    Lib(ClientType),
+    /// A side connection whose every read and write ends by a deadline and
+    /// whose replies are capped in size. See [`side`].
+    #[cfg(feature = "lightning")]
+    Guarded(electrum_client::raw_client::RawClient<side::GuardedStream>),
+}
 
 macro_rules! raw {
     ($client:expr, $method:ident($($arg:expr),*)) => {
         match &$client.0 {
-            ClientType::TCP(c) => c.$method($($arg),*),
-            ClientType::SSL(c) => c.$method($($arg),*),
-            ClientType::Socks5(c) => c.$method($($arg),*),
+            Transport::Lib(ClientType::TCP(c)) => c.$method($($arg),*),
+            Transport::Lib(ClientType::SSL(c)) => c.$method($($arg),*),
+            Transport::Lib(ClientType::Socks5(c)) => c.$method($($arg),*),
+            #[cfg(feature = "lightning")]
+            Transport::Guarded(c) => c.$method($($arg),*),
         }
     };
 }
 
 impl ElectrumClient {
     fn from_config(url: &str, config: ClientConfig) -> Result<Self, electrum_client::Error> {
-        ClientType::from_config(url, &config).map(Self)
+        ClientType::from_config(url, &config).map(|client| Self(Transport::Lib(client)))
     }
 
     fn raw_call(
@@ -777,8 +789,11 @@ impl Electrum {
     /// spending from it: what a replacement of `txid` has to pay above. Read
     /// on a separate connection built from `config`, on a thread of its own,
     /// and the whole answer, name lookup and connection setup included, is
-    /// given at most `budget`: past it the caller gets an error and the
-    /// thread finishes on its own socket timeouts. The family is found
+    /// given at most `budget`: past it the caller gets an error. Every read
+    /// and write on that connection, its handshakes included, also ends by
+    /// then and its replies are capped in size (see [`side`]), so a thread
+    /// the caller gave up on is not held past the budget by a server that
+    /// trickles or pads its reply; only a name lookup can outlast it. The family is found
     /// through the server's current script histories, read for all of a
     /// transaction's outputs in one round trip, and each fee is worked out
     /// from the transaction's inputs and outputs, not taken from the server.
@@ -788,7 +803,7 @@ impl Electrum {
     /// time, and two in all: while a thread a caller gave up on is still
     /// finishing, the next caller for that `txid`, or any caller once two
     /// are running, gets an error rather than another thread and
-    /// connection, and a thread given up on stops at its next round trip.
+    /// connection.
     #[cfg(feature = "lightning")]
     pub(crate) fn package_fee_on_side_connection(
         config: ElectrumConfig,
@@ -824,13 +839,22 @@ impl Electrum {
         }
         let running = Running(txid);
         let started = Instant::now();
+        let deadline = started + budget;
         let cancel = Arc::new(AtomicBool::new(false));
         let cancelled = cancel.clone();
         let (answer, wait) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("electrum-package-fee".to_string())
             .spawn(move || {
-                let fee = Self::with_shutdown_flag(&config, shutdown).and_then(|side| {
+                #[cfg(test)]
+                while side::HELD
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&txid)
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let fee = Self::side_connection(&config, shutdown, deadline).and_then(|side| {
                     side.package_fee_until(
                         &txid,
                         budget.saturating_sub(started.elapsed()),
@@ -1148,6 +1172,42 @@ impl Electrum {
         cfg: &ElectrumConfig,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self, WalletError> {
+        Self::with_client(cfg, shutdown, || {
+            ElectrumClient::from_config(&cfg.url, client_config(cfg))
+        })
+    }
+
+    /// A side connection to the server in `cfg` that gives up at `deadline`:
+    /// every read and write on it, the handshakes included, ends by then, and
+    /// its replies are capped in size. See [`side`].
+    #[cfg(feature = "lightning")]
+    fn side_connection(
+        cfg: &ElectrumConfig,
+        shutdown: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> Result<Self, WalletError> {
+        Self::with_client(cfg, shutdown, || {
+            side::connect(
+                &cfg.url,
+                cfg.socks5.as_deref(),
+                !url_host(&cfg.url).ends_with(".onion"),
+                deadline,
+            )
+            .map(|stream| {
+                ElectrumClient(Transport::Guarded(
+                    electrum_client::raw_client::RawClient::from(stream),
+                ))
+            })
+            .map_err(electrum_client::Error::IOError)
+        })
+    }
+
+    /// The backend on the client `make` opens. See [`Self::connect`].
+    fn with_client(
+        cfg: &ElectrumConfig,
+        shutdown: Arc<AtomicBool>,
+        make: impl Fn() -> Result<ElectrumClient, electrum_client::Error>,
+    ) -> Result<Self, WalletError> {
         // Without a proxy an onion host has no route: it cannot be resolved, so
         // fail with the reason rather than an opaque DNS error.
         if cfg.socks5.is_none() && url_host(&cfg.url).ends_with(".onion") {
@@ -1155,7 +1215,7 @@ impl Electrum {
                 "electrum url is an onion address but no socks5 proxy is configured".to_string(),
             ));
         }
-        let (inner, genesis, last_height, last_hash) = Self::connect(cfg, &shutdown)?;
+        let (inner, genesis, last_height, last_hash) = Self::connect(cfg, &shutdown, make)?;
         let config = cfg.clone();
         // Not retried: a server on the wrong chain will keep saying so.
         let network = network_from_electrum_genesis(&genesis).ok_or_else(|| {
@@ -1192,15 +1252,17 @@ impl Electrum {
     /// A first connect over Tor often fails while the circuit or the onion
     /// descriptor is still settling, and that should not kill process startup.
     /// Returns the client, the server's genesis hash, and the tip height.
+    /// `make` opens each attempt's client.
     fn connect(
         cfg: &ElectrumConfig,
         shutdown: &AtomicBool,
+        make: impl Fn() -> Result<ElectrumClient, electrum_client::Error>,
     ) -> Result<(ElectrumClient, [u8; 32], i64, BlockHash), WalletError> {
         if shutdown.load(Ordering::Relaxed) {
             return Err(WalletError::Interrupted("Shutdown requested"));
         }
         let once = || -> Result<_, electrum_client::Error> {
-            let inner = ElectrumClient::from_config(&cfg.url, client_config(cfg))?;
+            let inner = make()?;
             // Some servers do not implement `server.features` (-32601 is the
             // JSON-RPC "method not found" code). Read the genesis header
             // instead, which every server answers.
@@ -2616,6 +2678,284 @@ impl Blockchain for Electrum {
     }
 }
 
+/// The side connection a refund's family is read on.
+///
+/// `electrum_client` keeps no deadline on a whole reply: its socket timeout
+/// restarts with every byte, and it buffers a reply until its newline
+/// however long that is. A server could keep a read going, or grow it, for
+/// as long as it liked. Here the socket is our own, and every read and write
+/// on it, TLS and proxy handshakes included, ends by one deadline and counts
+/// against one cap on the bytes read, so the read ends with an error when
+/// either runs out.
+#[cfg(feature = "lightning")]
+mod side {
+    use std::{
+        convert::TryFrom,
+        io::{self, Read, Write},
+        net::{TcpStream, ToSocketAddrs},
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    /// The most bytes a refund's family read takes from its server, every
+    /// reply included. A family no replacement could evict is refused at
+    /// 100 transactions, far under this.
+    pub(super) const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
+
+    /// Test-only: reads of these txids wait before they connect, as a name
+    /// lookup that hangs would.
+    #[cfg(test)]
+    pub(super) static HELD: std::sync::Mutex<Vec<bitcoin::Txid>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// A socket that gives up at `deadline` and after reading `left` more
+    /// bytes.
+    #[derive(Debug)]
+    pub(super) struct Guarded {
+        stream: TcpStream,
+        deadline: Instant,
+        left: usize,
+    }
+
+    impl Guarded {
+        fn remaining(&self) -> io::Result<Duration> {
+            time_left(self.deadline)
+        }
+    }
+
+    impl Read for Guarded {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if self.left == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "electrum: the server sent more than the read takes",
+                ));
+            }
+            self.stream.set_read_timeout(Some(self.remaining()?))?;
+            let take = buf.len().min(self.left);
+            let read = self.stream.read(&mut buf[..take])?;
+            self.left -= read;
+            Ok(read)
+        }
+    }
+
+    impl Write for Guarded {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.stream.set_write_timeout(Some(self.remaining()?))?;
+            self.stream.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    /// The side connection's stream: [`Guarded`], or TLS over it.
+    #[derive(Debug)]
+    pub(super) enum GuardedStream {
+        Plain(Guarded),
+        Tls(Box<rustls::StreamOwned<rustls::ClientConnection, Guarded>>),
+    }
+
+    impl Read for GuardedStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self {
+                Self::Plain(stream) => stream.read(buf),
+                Self::Tls(stream) => stream.read(buf),
+            }
+        }
+    }
+
+    impl Write for GuardedStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            match self {
+                Self::Plain(stream) => stream.write(buf),
+                Self::Tls(stream) => stream.write(buf),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            match self {
+                Self::Plain(stream) => stream.flush(),
+                Self::Tls(stream) => stream.flush(),
+            }
+        }
+    }
+
+    fn failed(msg: impl Into<String>) -> io::Error {
+        io::Error::other(msg.into())
+    }
+
+    /// Opens the stream to the server at `url`, `tcp://` or `ssl://`, through
+    /// the SOCKS5 proxy at `socks5` when there is one, checking the server's
+    /// certificate when `validate_domain`.
+    pub(super) fn connect(
+        url: &str,
+        socks5: Option<&str>,
+        validate_domain: bool,
+        deadline: Instant,
+    ) -> io::Result<GuardedStream> {
+        let (tls, target) = match url.strip_prefix("ssl://") {
+            Some(target) => (true, target),
+            None => (false, url.strip_prefix("tcp://").unwrap_or(url)),
+        };
+        let (host, port) = target
+            .rsplit_once(':')
+            .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
+            .ok_or_else(|| failed(format!("electrum: no port in {url}")))?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let stream = match socks5 {
+            Some(proxy) => {
+                let mut stream = open(proxy, deadline)?;
+                socks5_connect(&mut stream, host, port)?;
+                stream
+            }
+            None => open(target, deadline)?,
+        };
+        if !tls {
+            return Ok(GuardedStream::Plain(stream));
+        }
+        let name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| failed(format!("electrum: {host} is not a server name: {e}")))?;
+        let connection = rustls::ClientConnection::new(Arc::new(tls_config(validate_domain)), name)
+            .map_err(|e| failed(format!("electrum: cannot start TLS: {e}")))?;
+        // The handshake runs on the first read or write, under the deadline.
+        Ok(GuardedStream::Tls(Box::new(rustls::StreamOwned::new(
+            connection, stream,
+        ))))
+    }
+
+    /// A socket to `address`, trying each address the name resolves to while
+    /// the deadline lasts.
+    fn open(address: &str, deadline: Instant) -> io::Result<Guarded> {
+        let mut last = failed(format!("electrum: {address} resolves to nothing"));
+        for resolved in address.to_socket_addrs()? {
+            match TcpStream::connect_timeout(&resolved, time_left(deadline)?) {
+                Ok(stream) => {
+                    return Ok(Guarded {
+                        stream,
+                        deadline,
+                        left: MAX_READ_BYTES,
+                    })
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// The time to `deadline`, or an error once it has passed.
+    fn time_left(deadline: Instant) -> io::Result<Duration> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "electrum: the read ran out of time",
+                )
+            })
+    }
+
+    /// The no-authentication SOCKS5 handshake (RFC 1928) asking the proxy to
+    /// connect to `host:port` by name.
+    fn socks5_connect(stream: &mut Guarded, host: &str, port: u16) -> io::Result<()> {
+        stream.write_all(&[5, 1, 0])?;
+        let mut choice = [0u8; 2];
+        stream.read_exact(&mut choice)?;
+        if choice != [5, 0] {
+            return Err(failed("electrum: the socks5 proxy wants authentication"));
+        }
+        let name = u8::try_from(host.len())
+            .map_err(|_| failed(format!("electrum: {host} is too long for socks5")))?;
+        let mut request = vec![5, 1, 0, 3, name];
+        request.extend_from_slice(host.as_bytes());
+        request.extend_from_slice(&port.to_be_bytes());
+        stream.write_all(&request)?;
+        let mut reply = [0u8; 4];
+        stream.read_exact(&mut reply)?;
+        if reply[0] != 5 || reply[1] != 0 {
+            return Err(failed(format!(
+                "electrum: the socks5 proxy could not connect, code {}",
+                reply[1]
+            )));
+        }
+        let bound = match reply[3] {
+            1 => 4,
+            4 => 16,
+            3 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len)?;
+                len[0] as usize
+            }
+            other => return Err(failed(format!("electrum: socks5 address type {other}"))),
+        };
+        stream.read_exact(&mut vec![0u8; bound + 2])
+    }
+
+    /// TLS settings as `electrum_client` uses them: the web's root
+    /// certificates, or, for an onion server, no certificate check.
+    fn tls_config(validate_domain: bool) -> rustls::ClientConfig {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default TLS versions");
+        if validate_domain {
+            let roots = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            builder.with_root_certificates(roots).with_no_client_auth()
+        } else {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerification(provider)))
+                .with_no_client_auth()
+        }
+    }
+
+    /// Accepts any certificate, for an onion server: Tor authenticates it.
+    #[derive(Debug)]
+    struct NoVerification(Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for NoVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
@@ -3359,57 +3699,173 @@ pub(crate) mod tests {
         );
     }
 
+    /// Side reads share one process-wide count of running reads, so the tests
+    /// that make them take turns.
+    #[cfg(feature = "lightning")]
+    static SIDE_READS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A server at the returned url that hands each connection to `serve` on
+    /// a thread of its own.
+    #[cfg(feature = "lightning")]
+    fn side_server(serve: impl Fn(std::net::TcpStream) + Send + Sync + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let serve = Arc::new(serve);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let serve = serve.clone();
+                thread::spawn(move || serve(stream));
+            }
+        });
+        url
+    }
+
+    /// A family read of `txid` on a side connection to `url` within `budget`,
+    /// with the 5 s socket timeout a side connection has.
+    #[cfg(feature = "lightning")]
+    fn side_read(
+        url: &str,
+        txid: Txid,
+        budget: Duration,
+    ) -> Result<Option<bitcoin::Amount>, WalletError> {
+        Electrum::package_fee_on_side_connection(
+            ElectrumConfig {
+                url: url.to_string(),
+                timeout: Some(5),
+                max_retries: 0,
+                ..Default::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+            txid,
+            budget,
+        )
+    }
+
+    /// Whether a read was refused because others are still running.
+    #[cfg(feature = "lightning")]
+    fn refused(fee: &Result<Option<bitcoin::Amount>, WalletError>) -> bool {
+        matches!(fee, Err(e) if format!("{:?}", e).contains("still running"))
+    }
+
     /// A server that accepts the connection and never answers the handshake
-    /// does not hold the caller past the budget: setup counts against it too.
+    /// holds neither the caller nor the reading thread past the budget: the
+    /// thread's reads end at the same deadline, well before the 5 s socket
+    /// timeout, so the next read of that refund goes ahead.
     #[cfg(feature = "lightning")]
     #[test]
     fn package_fee_gives_up_on_a_stalled_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("tcp://{}", listener.local_addr().unwrap());
-        thread::spawn(move || {
-            let mut held = Vec::new();
-            for stream in listener.incoming().flatten() {
-                held.push(stream);
-            }
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let url = side_server(|stream| {
+            let _held = stream;
+            thread::sleep(Duration::from_secs(30));
         });
-        let config = ElectrumConfig {
-            url,
-            timeout: Some(5),
-            max_retries: 0,
-            ..Default::default()
-        };
-        let started = Instant::now();
-        let read = |txid| {
-            Electrum::package_fee_on_side_connection(
-                config.clone(),
-                Arc::new(AtomicBool::new(false)),
-                txid,
-                Duration::from_millis(300),
-            )
-        };
         let refund = Txid::from_byte_array([7; 32]);
-        let fee = read(refund);
+        let started = Instant::now();
+        let fee = side_read(&url, refund, Duration::from_millis(300));
         assert!(fee.is_err(), "{:?}", fee);
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the caller waited {:?}",
             started.elapsed()
         );
-        // The first thread is still stuck in the handshake, so another read
-        // of the same refund is refused at once rather than piling up.
-        let refused = |fee: &Result<Option<bitcoin::Amount>, WalletError>| matches!(fee, Err(e) if format!("{:?}", e).contains("still running"));
-        let again = Instant::now();
-        let fee = read(refund);
-        assert!(refused(&fee), "{:?}", fee);
-        assert!(again.elapsed() < Duration::from_millis(100));
-        // Another refund gets a thread of its own, which the server stalls
-        // too. With two stuck, a third refund is refused at once.
-        let fee = read(Txid::from_byte_array([8; 32]));
+        thread::sleep(Duration::from_millis(500));
+        let fee = side_read(&url, refund, Duration::from_millis(300));
         assert!(fee.is_err() && !refused(&fee), "{:?}", fee);
-        let third = Instant::now();
-        let fee = read(Txid::from_byte_array([9; 32]));
-        assert!(refused(&fee), "{:?}", fee);
-        assert!(third.elapsed() < Duration::from_millis(100));
+    }
+
+    /// A server that answers a byte at a time, never finishing the reply,
+    /// cannot keep the reading thread going: its reads end at the deadline.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_cuts_off_a_trickling_reply() {
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let url = side_server(|mut stream| {
+            let mut request = [0u8; 256];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            let _ = stream.write_all(b"{");
+            while stream.write_all(b" ").is_ok() {
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let refund = Txid::from_byte_array([10; 32]);
+        let fee = side_read(&url, refund, Duration::from_millis(400));
+        assert!(fee.is_err(), "{:?}", fee);
+        thread::sleep(Duration::from_millis(500));
+        let fee = side_read(&url, refund, Duration::from_millis(400));
+        assert!(fee.is_err() && !refused(&fee), "{:?}", fee);
+    }
+
+    /// A server that pads its reply past what a family read takes is cut off
+    /// at that size, long before the deadline.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_stops_a_reply_past_its_size_limit() {
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let url = side_server(|mut stream| {
+            let mut request = [0u8; 256];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            let chunk = vec![b' '; 64 * 1024];
+            let mut sent = 0;
+            while sent <= side::MAX_READ_BYTES && stream.write_all(&chunk).is_ok() {
+                sent += chunk.len();
+            }
+        });
+        let started = Instant::now();
+        let fee = side_read(
+            &url,
+            Txid::from_byte_array([11; 32]),
+            Duration::from_secs(20),
+        );
+        assert!(
+            matches!(&fee, Err(e) if format!("{:?}", e).contains("more than the read takes")),
+            "{:?}",
+            fee
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the reply ran {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// At most one read of a refund runs at a time, and two in all: while two
+    /// threads are held up, as a name lookup that hangs would hold them, the
+    /// same refund and any third one are refused at once, and once they end
+    /// a read goes ahead again.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn at_most_two_family_reads_run_at_once() {
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let url = side_server(|stream| {
+            let _held = stream;
+            thread::sleep(Duration::from_secs(30));
+        });
+        let budget = Duration::from_millis(200);
+        let held = [
+            Txid::from_byte_array([12; 32]),
+            Txid::from_byte_array([13; 32]),
+        ];
+        side::HELD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(held);
+        let fee = side_read(&url, held[0], budget);
+        assert!(fee.is_err() && !refused(&fee), "{:?}", fee);
+        let again = Instant::now();
+        assert!(refused(&side_read(&url, held[0], budget)));
+        let fee = side_read(&url, held[1], budget);
+        assert!(fee.is_err() && !refused(&fee), "{:?}", fee);
+        let third = Txid::from_byte_array([14; 32]);
+        assert!(refused(&side_read(&url, third, budget)));
+        assert!(again.elapsed() < budget + Duration::from_millis(100));
+        side::HELD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|txid| !held.contains(txid));
+        // Released past their deadline, both threads end at once.
+        thread::sleep(Duration::from_millis(300));
+        let fee = side_read(&url, third, budget);
+        assert!(fee.is_err() && !refused(&fee), "{:?}", fee);
     }
 
     /// A backend whose server lists `entries` as every script's history and
