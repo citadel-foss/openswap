@@ -683,6 +683,19 @@ impl Taker {
             .map_err(|_| TakerError::General("Failed to lock wallet".to_string()))
     }
 
+    /// A best-effort sync and save: one attempt, stopped by this taker's
+    /// shutdown, so a backend that stays down neither keeps the wallet
+    /// write-locked nor blocks shutdown. A failure is logged; the next sync
+    /// catches up.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn sync_wallet_once(&self) -> Result<(), TakerError> {
+        let synced = self.write_wallet()?.sync_and_save_once(&self.shutdown);
+        if let Err(e) = synced {
+            log::warn!("Wallet sync failed; the next sync catches up: {e:?}");
+        }
+        Ok(())
+    }
+
     /// What a hop may forward once the policy funding fee for `input_counts`
     /// comes off. The swap fee and sweep price are already inside
     /// `forwardable`, so this is an exact figure, not a minimum.
@@ -1039,6 +1052,39 @@ impl Taker {
             shutdown,
         )
         .start()
+    }
+
+    /// A taker over `wallet` with no background services, for library tests
+    /// of code that needs a whole taker. It reaches makers over clearnet, and
+    /// its watcher reports every outpoint as unwatched.
+    #[cfg(all(test, feature = "lightning"))]
+    pub(crate) fn for_test(wallet: Wallet, data_dir: &std::path::Path) -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let config = TakerInitConfig {
+            data_dir: Some(data_dir.to_path_buf()),
+            connection_type: ConnectionType::Clearnet,
+            ..Default::default()
+        };
+        let offerbook = OfferBookHandle::load_or_create(data_dir).expect("empty offerbook");
+        Taker {
+            backend: BackendConnector::new(config.backend.clone(), shutdown.clone()),
+            config,
+            require_features: Vec::new(),
+            wallet: Arc::new(RwLock::new(wallet)),
+            shutdown,
+            offer_sync_handle: OfferSyncHandle::idle(offerbook.clone()),
+            offerbook,
+            watch_service: crate::watch_tower::service::answering(
+                crate::watch_tower::watcher::WatcherEvent::NoOutpoint,
+            ),
+            ongoing_swap: None,
+            live_swap: Arc::new(Mutex::new(None)),
+            recovery_loop: None,
+            breach_detector: None,
+            lightning: None,
+            #[cfg(feature = "integration-test")]
+            behavior: TakerBehavior::Normal,
+        }
     }
 
     /// Get reference to the wallet.
@@ -4025,6 +4071,9 @@ pub enum TakerBehavior {
     /// Announce a swap-in HTLC value one sat above the funded output, so the
     /// maker must refuse the funding message (Lightning swap-in mismatch test).
     ForgeSwapInFundedValue,
+    /// Drop the connection right after `SwapOutPaid`, so the swap-out's
+    /// funding reply is lost and recovery has to ask for it again.
+    DropSwapOutFundingReply,
     /// Once the hop-0 funding is signed and before it is broadcast, pay from
     /// its planned coins through the public wallet API. The funding claim must
     /// refuse the payment, and the swap must go on.

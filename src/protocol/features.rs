@@ -44,6 +44,13 @@ pub const KNOWN: &[Feature] = &[
         flows: &["ln-swap-out"],
         lightning: true,
     },
+    // Storage only: a taker record that resumes a swap-out's lost funding
+    // reply. It changes no flow, so it is never pinned or negotiated.
+    Feature {
+        name: "ln-funding-resume",
+        flows: &[],
+        lightning: true,
+    },
 ];
 
 /// Names this build can serve.
@@ -239,9 +246,34 @@ mod tests {
             );
         }
         for (i, feature) in KNOWN.iter().enumerate() {
-            assert!(!feature.flows.is_empty());
+            assert_eq!(
+                feature.flows.is_empty(),
+                feature.name == "ln-funding-resume",
+                "{}",
+                feature.name
+            );
             assert!(!KNOWN[..i].iter().any(|f| f.name == feature.name));
         }
+    }
+
+    /// A storage-only name refuses an older reader of the wallet but never
+    /// reaches a swap: it is not pinned, not accepted as a pin, and a
+    /// requirement for it binds no flow.
+    #[test]
+    fn storage_only_names_change_no_flow() {
+        let name = "ln-funding-resume";
+        assert_eq!(supported().contains(&name), cfg!(feature = "lightning"));
+        let theirs = KNOWN.iter().map(|f| f.name.to_string()).collect::<Vec<_>>();
+        for flow in ["legacy", "taproot", "ln-swap-in", "ln-swap-out"] {
+            assert!(!choose_pins(flow, &theirs).iter().any(|p| p == name));
+            assert!(check_pins(&names(&[flow, name]), &[]).is_err());
+            assert_eq!(
+                unmet_for_flow(&names(&[name]), &names(&[flow]), flow),
+                Ok(())
+            );
+        }
+        assert_eq!(unmet_at_hello(&names(&[name]), &[]), Ok(()));
+        assert!(check_requires([name], &["ln-swap-out"]).is_err());
     }
 
     #[test]

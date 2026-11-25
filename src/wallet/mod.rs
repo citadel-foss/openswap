@@ -42,7 +42,9 @@ pub use report::{
 };
 pub use seed::SecretMnemonic;
 pub use spend::Destination;
-pub use storage::{AddressType, LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap};
+pub use storage::{
+    AddressType, LnFundingResume, LnMakerDirection, LnMakerPhase, LnMakerSwapRecord, LnPendingSwap,
+};
 
 #[cfg(test)]
 pub(crate) use backup::compat_backup;
