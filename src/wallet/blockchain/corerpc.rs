@@ -1302,8 +1302,8 @@ pub(crate) mod tests {
     }
 
     /// A maker running Lightning swaps needs Core 24.0 for
-    /// `gettxspendingprevout`: 22 and 23 are refused and 24 is taken. A maker
-    /// without Lightning does not ask the node at all, so 23 is fine there.
+    /// `gettxspendingprevout`: 22 and 23 are refused and 24 is taken. Without
+    /// Lightning the check does not ask the node.
     #[cfg(feature = "lightning")]
     #[test]
     fn lightning_needs_core_v24() {

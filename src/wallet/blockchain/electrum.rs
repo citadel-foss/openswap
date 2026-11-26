@@ -3777,9 +3777,21 @@ pub(crate) mod tests {
         txid: Txid,
         budget: Duration,
     ) -> Result<Option<bitcoin::Amount>, WalletError> {
+        side_read_via(url, None, txid, budget)
+    }
+
+    /// [`side_read`] through the SOCKS5 proxy at `socks5`, if any.
+    #[cfg(feature = "lightning")]
+    fn side_read_via(
+        url: &str,
+        socks5: Option<&str>,
+        txid: Txid,
+        budget: Duration,
+    ) -> Result<Option<bitcoin::Amount>, WalletError> {
         Electrum::package_fee_on_side_connection(
             ElectrumConfig {
                 url: url.to_string(),
+                socks5: socks5.map(str::to_string),
                 timeout: Some(5),
                 max_retries: 0,
                 ..Default::default()
@@ -3925,22 +3937,517 @@ pub(crate) mod tests {
         assert!(fee.is_err() && !refused(&fee), "{:?}", fee);
     }
 
-    /// A backend whose server lists `entries` as every script's history and
-    /// serves `txs`.
+    /// An Electrum server listing `entries` as every script's history and
+    /// serving `txs`.
     #[cfg(feature = "lightning")]
-    fn family_backend(entries: Value, txs: &[&Transaction]) -> (Electrum, MockElectrum) {
+    fn family_server(entries: Value, txs: &[&Transaction]) -> MockElectrum {
         let served: HashMap<String, String> = txs
             .iter()
             .map(|tx| (tx.compute_txid().to_string(), serialize_hex(*tx)))
             .collect();
-        let server = mock_electrum(move |method, params| match method {
+        mock_electrum(move |method, params| match method {
             "blockchain.scripthash.get_history" => Ok(entries.clone()),
             "blockchain.transaction.get" => served
                 .get(params[0].as_str().unwrap_or_default())
                 .map(|hex| json!(hex))
                 .ok_or_else(|| json!({ "code": 1, "message": "daemon error" })),
             method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        })
+    }
+
+    /// A refund paying 300 with a child paying 500, built on deposit `n` so
+    /// each test reads a refund of its own, and the server holding them.
+    #[cfg(feature = "lightning")]
+    fn family_on_server(n: u8) -> (Txid, MockElectrum) {
+        let pay = |outpoint, sats| {
+            let mut tx = spend_of(outpoint);
+            tx.output[0].value = Amount::from_sat(sats);
+            tx
+        };
+        let funding = deposit(n);
+        let refund = pay(OutPoint::new(funding.compute_txid(), 0), 700);
+        let child = pay(OutPoint::new(refund.compute_txid(), 0), 200);
+        let entries = json!([
+            { "tx_hash": funding.compute_txid(), "height": 101 },
+            { "tx_hash": refund.compute_txid(), "height": 0 },
+            { "tx_hash": child.compute_txid(), "height": 0 },
+        ]);
+        let server = family_server(entries, &[&funding, &refund, &child]);
+        (refund.compute_txid(), server)
+    }
+
+    /// The `host:port` of a mock server's `tcp://` url.
+    #[cfg(feature = "lightning")]
+    fn address_of(url: &str) -> String {
+        url.trim_start_matches("tcp://").to_string()
+    }
+
+    /// Copies bytes both ways between `client` and `server` until one side
+    /// closes.
+    #[cfg(feature = "lightning")]
+    fn relay(client: std::net::TcpStream, server: std::net::TcpStream) {
+        let (mut from_client, mut to_server) = match (client.try_clone(), server.try_clone()) {
+            (Ok(from_client), Ok(to_server)) => (from_client, to_server),
+            _ => return,
+        };
+        let upload = thread::spawn(move || {
+            let _ = std::io::copy(&mut from_client, &mut to_server);
+            let _ = to_server.shutdown(std::net::Shutdown::Write);
         });
+        let (mut from_server, mut to_client) = (server, client);
+        let _ = std::io::copy(&mut from_server, &mut to_client);
+        let _ = to_client.shutdown(std::net::Shutdown::Both);
+        let _ = upload.join();
+    }
+
+    /// How a [`socks5_proxy`] answers a connection.
+    #[cfg(feature = "lightning")]
+    enum ProxyAnswer {
+        /// Takes the greeting and says nothing.
+        Silent,
+        /// Answers the greeting with these two bytes and hangs up.
+        Choice([u8; 2]),
+        /// Takes the connect request and refuses it with this code.
+        Refuse(u8),
+        /// Connects to the server at this address whatever was asked for,
+        /// reports this bound address (type, address and port), and relays.
+        Relay(String, Vec<u8>),
+    }
+
+    /// A running [`socks5_proxy`].
+    #[cfg(feature = "lightning")]
+    struct MockProxy {
+        address: String,
+        /// What each connection sent before it was relayed: the greeting,
+        /// then the connect request if the proxy took one.
+        handshakes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    /// A SOCKS5 proxy (RFC 1928) that answers every connection as `answer`
+    /// says and records its handshake.
+    #[cfg(feature = "lightning")]
+    fn socks5_proxy(answer: ProxyAnswer) -> MockProxy {
+        use std::io::Read;
+        let handshakes = Arc::new(Mutex::new(Vec::new()));
+        let seen = handshakes.clone();
+        let url = side_server(move |mut client| {
+            let mut sent = vec![0u8; 2];
+            if client.read_exact(&mut sent).is_err() {
+                return;
+            }
+            let mut methods = vec![0u8; usize::from(sent[1])];
+            if client.read_exact(&mut methods).is_err() {
+                return;
+            }
+            sent.extend(methods);
+            match &answer {
+                ProxyAnswer::Silent => {
+                    seen.lock().unwrap().push(sent);
+                    thread::sleep(Duration::from_secs(30));
+                    return;
+                }
+                ProxyAnswer::Choice(choice) => {
+                    seen.lock().unwrap().push(sent);
+                    let _ = client.write_all(choice);
+                    return;
+                }
+                ProxyAnswer::Refuse(_) | ProxyAnswer::Relay(..) => {}
+            }
+            let mut request = vec![0u8; 4];
+            if client.write_all(&[5, 0]).is_err() || client.read_exact(&mut request).is_err() {
+                seen.lock().unwrap().push(sent);
+                return;
+            }
+            let address = match request[3] {
+                1 => 4,
+                4 => 16,
+                3 => {
+                    let mut len = [0u8; 1];
+                    if client.read_exact(&mut len).is_err() {
+                        return;
+                    }
+                    request.push(len[0]);
+                    usize::from(len[0])
+                }
+                _ => 0,
+            };
+            let mut target = vec![0u8; address + 2];
+            if client.read_exact(&mut target).is_err() {
+                return;
+            }
+            request.extend(target);
+            sent.extend(request);
+            seen.lock().unwrap().push(sent);
+            let (upstream, bound) = match &answer {
+                ProxyAnswer::Relay(upstream, bound) => (upstream, bound),
+                ProxyAnswer::Refuse(code) => {
+                    let _ = client.write_all(&[5, *code, 0, 1, 0, 0, 0, 0, 0, 0]);
+                    return;
+                }
+                ProxyAnswer::Silent | ProxyAnswer::Choice(_) => return,
+            };
+            let Ok(server) = std::net::TcpStream::connect(upstream) else {
+                return;
+            };
+            let mut reply = vec![5, 0, 0];
+            reply.extend_from_slice(bound);
+            if client.write_all(&reply).is_ok() {
+                relay(client, server);
+            }
+        });
+        MockProxy {
+            address: address_of(&url),
+            handshakes,
+        }
+    }
+
+    /// The SOCKS5 greeting a side connection sends, offering no
+    /// authentication, then a connect request for `target` (type and
+    /// address) at `port`.
+    #[cfg(feature = "lightning")]
+    fn socks5_handshake(target: &[u8], port: u16) -> Vec<u8> {
+        let mut sent = vec![5, 1, 0, 5, 1, 0];
+        sent.extend_from_slice(target);
+        sent.extend_from_slice(&port.to_be_bytes());
+        sent
+    }
+
+    /// A name goes to the proxy for it to look up: `.invalid` never resolves
+    /// (RFC 6761), so the read only works if nothing looks it up here. The
+    /// family reads in full whichever form of bound address the proxy
+    /// reports, so the reply is read to its exact end, and one connection is
+    /// opened for it.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_reads_through_a_socks5_proxy() {
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let (refund, server) = family_on_server(40);
+        let port = 50001u16.to_be_bytes();
+        let mut ipv6 = vec![4];
+        ipv6.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        ipv6.extend_from_slice(&port);
+        let mut name = vec![3, 9];
+        name.extend_from_slice(b"localhost");
+        name.extend_from_slice(&port);
+        let mut asked = vec![3, 16];
+        asked.extend_from_slice(b"electrum.invalid");
+        for bound in [vec![1, 127, 0, 0, 1, port[0], port[1]], ipv6, name] {
+            let proxy = socks5_proxy(ProxyAnswer::Relay(address_of(&server.url), bound.clone()));
+            let fee = side_read_via(
+                "tcp://electrum.invalid:50001",
+                Some(&proxy.address),
+                refund,
+                Duration::from_secs(20),
+            );
+            assert_eq!(fee.unwrap(), Some(Amount::from_sat(800)), "bound {bound:?}");
+            assert_eq!(
+                *proxy.handshakes.lock().unwrap(),
+                vec![socks5_handshake(&asked, 50001)],
+                "bound {bound:?}"
+            );
+        }
+    }
+
+    /// An IP address goes to the proxy as one, IPv4 or IPv6, not as a name.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_asks_a_socks5_proxy_for_an_address_as_one() {
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let (refund, server) = family_on_server(41);
+        let mut ipv6 = vec![4];
+        ipv6.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        for (url, target) in [
+            ("tcp://127.0.0.1:50001", vec![1, 127, 0, 0, 1]),
+            ("tcp://[::1]:50001", ipv6),
+        ] {
+            let proxy = socks5_proxy(ProxyAnswer::Relay(
+                address_of(&server.url),
+                vec![1, 0, 0, 0, 0, 0, 0],
+            ));
+            let fee = side_read_via(url, Some(&proxy.address), refund, Duration::from_secs(20));
+            assert_eq!(fee.unwrap(), Some(Amount::from_sat(800)), "{url}");
+            assert_eq!(
+                *proxy.handshakes.lock().unwrap(),
+                vec![socks5_handshake(&target, 50001)],
+                "{url}"
+            );
+        }
+    }
+
+    /// A proxy that wants a password, one that is not SOCKS5, one that
+    /// cannot reach the server, and a name too long to ask for each end the
+    /// read at once with the reason.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_says_why_a_socks5_proxy_failed() {
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let long = format!("tcp://{}.invalid:50001", "a".repeat(250));
+        let cases = vec![
+            (
+                ProxyAnswer::Choice([5, 2]),
+                "tcp://electrum.invalid:50001",
+                "without authentication",
+            ),
+            (
+                ProxyAnswer::Choice([5, 0xFF]),
+                "tcp://electrum.invalid:50001",
+                "without authentication",
+            ),
+            (
+                ProxyAnswer::Choice(*b"HT"),
+                "tcp://electrum.invalid:50001",
+                "did not answer as socks5",
+            ),
+            (
+                ProxyAnswer::Refuse(5),
+                "tcp://electrum.invalid:50001",
+                "could not connect, code 5",
+            ),
+            (ProxyAnswer::Refuse(0), long.as_str(), "too long for socks5"),
+        ];
+        for (n, (answer, url, reason)) in cases.into_iter().enumerate() {
+            let proxy = socks5_proxy(answer);
+            let started = Instant::now();
+            let fee = side_read_via(
+                url,
+                Some(&proxy.address),
+                Txid::from_byte_array([42 + n as u8; 32]),
+                Duration::from_secs(20),
+            );
+            assert!(
+                matches!(&fee, Err(e) if format!("{:?}", e).contains(reason)),
+                "{reason}: {:?}",
+                fee
+            );
+            assert!(started.elapsed() < Duration::from_secs(2), "{}", reason);
+        }
+    }
+
+    /// A proxy that takes the greeting and never answers holds neither the
+    /// caller nor the reading thread past the budget.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_gives_up_on_a_silent_socks5_proxy() {
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let proxy = socks5_proxy(ProxyAnswer::Silent);
+        let refund = Txid::from_byte_array([50; 32]);
+        let started = Instant::now();
+        let fee = side_read_via(
+            "tcp://electrum.invalid:50001",
+            Some(&proxy.address),
+            refund,
+            Duration::from_millis(300),
+        );
+        assert!(fee.is_err(), "{:?}", fee);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        thread::sleep(Duration::from_millis(500));
+        let fee = side_read_via(
+            "tcp://electrum.invalid:50001",
+            Some(&proxy.address),
+            refund,
+            Duration::from_millis(300),
+        );
+        assert!(fee.is_err() && !refused(&fee), "{:?}", fee);
+    }
+
+    /// A throwaway self-signed certificate for `localhost` and 127.0.0.1,
+    /// valid to 2126, and its key, for the TLS servers below. It guards
+    /// nothing.
+    #[cfg(feature = "lightning")]
+    const TEST_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBlzCCAT6gAwIBAgIUYYcZu/aNmaDBEF19N3Ow/m3xCdgwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTEyNTIyMTQyOVoYDzIxMjYxMTAx
+MjIxNDI5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAAQHVnmlPmfYwF02xvojN2CChQ/hghB0KOiigxkL6TvYwP19SOxz/Uxx
+fMkGUpBfd/SGj8yBQfC9i2sTAVpsDL6Ao2wwajAdBgNVHQ4EFgQUA30fw4Ti73q2
+v/yPVcxG8Q0fScQwHwYDVR0jBBgwFoAUA30fw4Ti73q2v/yPVcxG8Q0fScQwGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwCgYIKoZIzj0E
+AwIDRwAwRAIgHE0CmjeekXNOihnVsliuitv5/9W3Lsb3XcV+ju10JGcCIHfdKemb
+c1D+U8XAr3M3oATMgkuifzN1EZT2IzBtcby3
+-----END CERTIFICATE-----
+";
+    #[cfg(feature = "lightning")]
+    const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgZVU1sKxADAux5J+I
+HP//PqN3NGob0AuB6soSmwyyOfmhRANCAAQHVnmlPmfYwF02xvojN2CChQ/hghB0
+KOiigxkL6TvYwP19SOxz/UxxfMkGUpBfd/SGj8yBQfC9i2sTAVpsDL6A
+-----END PRIVATE KEY-----
+";
+
+    /// A TLS server presenting [`TEST_CERT`] that hands each connection to
+    /// `serve`, at the returned `host:port`.
+    #[cfg(feature = "lightning")]
+    fn tls_server(
+        serve: impl Fn(rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>)
+            + Send
+            + Sync
+            + 'static,
+    ) -> String {
+        use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default TLS versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from_pem_slice(TEST_CERT.as_bytes()).expect("test cert")],
+                PrivateKeyDer::from_pem_slice(TEST_KEY.as_bytes()).expect("test key"),
+            )
+            .expect("TLS server config");
+        let config = Arc::new(config);
+        let url = side_server(move |stream| {
+            if let Ok(connection) = rustls::ServerConnection::new(config.clone()) {
+                serve(rustls::StreamOwned::new(connection, stream));
+            }
+        });
+        address_of(&url)
+    }
+
+    /// Passes each request line from `client` to the Electrum server at
+    /// `upstream` and its one reply line back, setting `asked` once a
+    /// request arrives.
+    #[cfg(feature = "lightning")]
+    fn relay_lines(client: impl std::io::Read + Write, upstream: &str, asked: &AtomicBool) {
+        let Ok(server) = std::net::TcpStream::connect(upstream) else {
+            return;
+        };
+        let Ok(mut to_server) = server.try_clone() else {
+            return;
+        };
+        let (mut from_server, mut client) = (BufReader::new(server), BufReader::new(client));
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if client.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            asked.store(true, Ordering::SeqCst);
+            if to_server.write_all(line.as_bytes()).is_err() {
+                return;
+            }
+            line.clear();
+            if from_server.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let back = client.get_mut();
+            if back
+                .write_all(line.as_bytes())
+                .and_then(|()| back.flush())
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// An onion server is reached by name through its proxy and read over
+    /// TLS without a certificate check, as Tor authenticates it: the family
+    /// reads in full.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_reads_an_onion_server_over_tls() {
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let (refund, server) = family_on_server(60);
+        let upstream = address_of(&server.url);
+        let asked = Arc::new(AtomicBool::new(false));
+        let seen = asked.clone();
+        let tls = tls_server(move |stream| relay_lines(stream, &upstream, &seen));
+        let proxy = socks5_proxy(ProxyAnswer::Relay(tls, vec![1, 0, 0, 0, 0, 0, 0]));
+        let onion = format!("{}.onion", "a".repeat(56));
+        let fee = side_read_via(
+            &format!("ssl://{onion}:50002"),
+            Some(&proxy.address),
+            refund,
+            Duration::from_secs(20),
+        );
+        assert_eq!(fee.unwrap(), Some(Amount::from_sat(800)));
+        assert!(asked.load(Ordering::SeqCst));
+        let mut target = vec![3, 62];
+        target.extend_from_slice(onion.as_bytes());
+        assert_eq!(
+            *proxy.handshakes.lock().unwrap(),
+            vec![socks5_handshake(&target, 50002)]
+        );
+    }
+
+    /// Off Tor the server's certificate is checked against the web's roots:
+    /// one they do not vouch for ends the read in the handshake, before any
+    /// request is sent.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_refuses_a_certificate_it_cannot_verify() {
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let (refund, server) = family_on_server(61);
+        let upstream = address_of(&server.url);
+        let asked = Arc::new(AtomicBool::new(false));
+        let seen = asked.clone();
+        let tls = tls_server(move |stream| relay_lines(stream, &upstream, &seen));
+        let fee = side_read(&format!("ssl://{tls}"), refund, Duration::from_secs(20));
+        assert!(
+            matches!(&fee, Err(e) if format!("{:?}", e).contains("UnknownIssuer")),
+            "{:?}",
+            fee
+        );
+        assert!(!asked.load(Ordering::SeqCst));
+    }
+
+    /// A TLS server that answers a byte at a time cannot keep the reading
+    /// thread going: its reads end at the deadline, under TLS as over plain
+    /// TCP.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_cuts_off_a_trickling_tls_reply() {
+        let _turn = SIDE_READS.lock().unwrap_or_else(|e| e.into_inner());
+        // Set once the handshake is done and the reply has begun, so the read
+        // is shown to end in the trickle and not in the handshake.
+        let trickling = Arc::new(AtomicBool::new(false));
+        let began = trickling.clone();
+        let tls = tls_server(move |mut stream| {
+            let mut request = [0u8; 256];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            if stream.write_all(b"{").and_then(|()| stream.flush()).is_ok() {
+                began.store(true, Ordering::SeqCst);
+            }
+            while stream.write_all(b" ").and_then(|()| stream.flush()).is_ok() {
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let proxy = socks5_proxy(ProxyAnswer::Relay(tls, vec![1, 0, 0, 0, 0, 0, 0]));
+        let url = format!("ssl://{}.onion:50002", "b".repeat(56));
+        let refund = Txid::from_byte_array([62; 32]);
+        let started = Instant::now();
+        let fee = side_read_via(
+            &url,
+            Some(&proxy.address),
+            refund,
+            Duration::from_millis(400),
+        );
+        assert!(fee.is_err(), "{:?}", fee);
+        assert!(trickling.load(Ordering::SeqCst), "the reply never began");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        thread::sleep(Duration::from_millis(500));
+        let fee = side_read_via(
+            &url,
+            Some(&proxy.address),
+            refund,
+            Duration::from_millis(400),
+        );
+        assert!(fee.is_err() && !refused(&fee), "{:?}", fee);
+    }
+
+    /// A backend whose server lists `entries` as every script's history and
+    /// serves `txs`.
+    #[cfg(feature = "lightning")]
+    fn family_backend(entries: Value, txs: &[&Transaction]) -> (Electrum, MockElectrum) {
+        let server = family_server(entries, txs);
         let backend = Electrum::new(&ElectrumConfig {
             url: server.url.clone(),
             max_retries: 0,
