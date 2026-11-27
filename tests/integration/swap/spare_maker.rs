@@ -6,7 +6,7 @@
 
 use std::{thread, time::Duration};
 
-use bitcoin::Amount;
+use bitcoin::{Amount, Txid};
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::MakerBehavior,
@@ -193,28 +193,27 @@ fn legacy_spare_survives_slow_funding_confirm(world: &mut World) {
         }
     }
     let resume_mining = ResumeMining(&test_framework);
-    let mempool_before = bitcoind.client.get_raw_mempool().unwrap();
     wait_logged!(
         world,
         "Waiting for maker 0's funding to be confirmed",
         Duration::from_secs(60)
     );
-    // Maker 0 broadcasts its funding after the taker logs the wait.
-    let maker0_funding = wait_for!(
-        Duration::from_secs(60),
-        every Duration::from_millis(100),
-        "maker 0's funding in the mempool",
-        {
-            let new_txids: Vec<_> = bitcoind
-                .client
-                .get_raw_mempool()
-                .unwrap()
-                .into_iter()
-                .filter(|txid| !mempool_before.contains(txid))
-                .collect();
-            (!new_txids.is_empty()).then_some(new_txids)
-        }
+    // Maker 0 logs every funding txid it broadcasts, so take them from the log.
+    // This finds them whether the broadcast happened before or after this point.
+    let maker0_port = world.makers()[0].inner().config.network_port;
+    wait_logged!(
+        world,
+        &format!("[{}] Funding broadcast complete", maker0_port),
+        Duration::from_secs(60)
     );
+    let funding_line = format!("[{}] Broadcast Legacy funding tx: ", maker0_port);
+    let maker0_funding: Vec<Txid> = std::fs::read_to_string(world.taker_log_path())
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once(funding_line.as_str()))
+        .map(|(_, txid)| txid.trim().parse().unwrap())
+        .collect();
+    assert!(!maker0_funding.is_empty(), "maker 0 logged no funding txid");
     let height = bitcoind.client.get_block_count().unwrap();
     thread::sleep(Duration::from_secs(40));
     // Checked at the end of the hold: a mining tick that started before the
