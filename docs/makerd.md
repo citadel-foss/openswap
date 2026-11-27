@@ -196,7 +196,7 @@ OpenSwap Maker Server
 
 The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet (mainnet use is experimental). It requires some starting balance — around 50,000 sats for Fidelity + Swap Liquidity. A 0.001 BTC top-up covers this with margin. Suggested faucet: <https://faucet.openswap.live/>
 
-All server processes will start after the fidelity bond transaction is confirmed. This may take some time. Approx: 10 mins. Once the bond is confirmed, the server starts listening for incoming swap requests. As it performs swaps for clients, it keeps earning fees.
+The maker waits for its fidelity bond transaction to confirm before it takes swaps. This may take some time. Approx: 10 mins. `maker-cli` works during the wait, except `send-to-address` while the bond is set up. Once the bond is confirmed, the server starts listening for incoming swap requests. As it performs swaps for clients, it keeps earning fees.
 
 The server is operated with the maker-cli app, for all basic wallet related operations.
 
@@ -382,14 +382,15 @@ This will launch `makerd` and connect it to the Bitcoin RPC core running on its 
   INFO openswap::maker::api - Swap Liquidity: 5001672 sats | Min: 1500 sats | Listening for requests.
   ```
 
-- **Server Ready**: Finally, the `makerd` server is fully set up and ready to connect with other takers for coin swaps. It shows the network and the spendable balance. It then starts the RPC server for `maker-cli`:
+- **Server Ready**: Finally, the `makerd` server is fully set up and ready to connect with other takers for coin swaps. It shows the network and the spendable balance:
 
 ```bash
 INFO openswap::maker::server - [6102] Bitcoin Network: regtest
 INFO openswap::maker::server - [6102] Spendable Wallet Balance: 0.05001672 BTC
 INFO openswap::maker::server - [6102] Server setup complete! Listening on port 6102
-INFO openswap::maker::rpc::server - [6103] RPC socket binding successful at 127.0.0.1:6103
 ```
+
+The RPC server for `maker-cli` starts earlier, before the fidelity bond setup, so `maker-cli` works during the waits above. It logs `RPC socket binding successful at 127.0.0.1:6103`.
 
 `makerd` also starts an idle-state checker and a fidelity renewal loop in the background. It then keeps listening for requests.
 

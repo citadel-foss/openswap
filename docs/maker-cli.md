@@ -6,9 +6,7 @@ In this guide, we'll walk you through how to use `maker-cli` to get the most out
 
 > ### **Important Note**
 >
-> `makerd` listens to RPC requests from `maker-cli` **only** when it is fully set up. This setup includes creating a new fidelity bond (if one doesn't already exist) and completing other necessary configurations.
->
-> If `makerd` is not fully set up, `maker-cli` commands will not function.
+> `makerd` answers `maker-cli` before it sets up its fidelity bond, so also while it waits for funds or for the bond to confirm. It takes swaps only once it is fully set up. While it sets up the bond at startup it refuses `send-to-address`, so a spend cannot race the bond for the same coins. A plain `maker-cli stop` during that wait stops it right away, since no swap can be in progress yet.
 >
 > 👉 **Before starting this tutorial**, ensure your `makerd` setup is complete.  
 > If you're unsure how to set it up, check out our [Makerd Setup Guide](./makerd.md) first, and then return to this tutorial.

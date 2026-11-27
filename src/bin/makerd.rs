@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 /// The server requires a Bitcoin Core RPC connection or an Electrum server (via --electrum), running on the custom signet (mainnet use is experimental). It requires some starting balance — around 50,000 sats for Fidelity + Swap Liquidity.
 /// A 0.001 BTC top-up covers this with margin. Suggested faucet: <https://faucet.openswap.live/>
 ///
-/// All server processes will start after the fidelity bond transaction is confirmed. This may take some time. Approx: 10 mins.
+/// The maker waits for its fidelity bond transaction to confirm before it takes swaps. This may take some time. Approx: 10 mins. `maker-cli` works during the wait, except `send-to-address` while the bond is set up.
 /// Once the bond is confirmed, the server starts listening for incoming swap requests. As it performs swaps for clients, it keeps earning fees.
 ///
 /// The server is operated with the maker-cli app, for all basic wallet related operations.

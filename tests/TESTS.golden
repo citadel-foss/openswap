@@ -86,6 +86,9 @@ openswap maker::api::tests::replay_grace_does_not_outlast_the_drain_deadline
 openswap maker::api::tests::serving_a_replay_restarts_the_grace_window
 openswap maker::api::tests::shutdown_join_releases_pool_lock_and_drains_late_child
 openswap maker::api::tests::shutdown_signal_latches_request_and_rearms_backend_after_joins
+openswap maker::api::tests::stop_after_setup_only_starts_the_drain
+openswap maker::api::tests::stop_during_setup_stops_at_once
+openswap maker::api::tests::stopped_liquidity_wait_is_a_clean_stop
 openswap maker::api::tests::unpriceable_fees_are_refused_before_the_bond
 openswap maker::handlers::tests::compat_maker_rejects_invalid_pins_before_admission
 openswap maker::handlers::tests::funding_guard_admits_one_handler_per_swap
@@ -718,6 +721,7 @@ openswap::bin/taker tests::password_file_excludes_the_argv_password
 openswap::bin/taker tests::restore_needs_exactly_one_source
 openswap::bin/taker tests::restore_reads_options_and_keeps_wallet_name_unset
 openswap::integration cli::maker::rpc_server
+openswap::integration cli::makerd::maker_cli_works_while_waiting_for_bond_funds
 openswap::integration cli::makerd::makerd_stops_cleanly_on_sigterm_and_sigint
 openswap::integration cli::taker::show_seed_refuses_pipes_and_argv_passwords
 openswap::integration cli::taker::taker_cli_shows_maker_states
