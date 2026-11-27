@@ -255,12 +255,14 @@ impl SwapOutTaker {
     }
 
     /// Builds the signed claim transaction sweeping the HTLC through the
-    /// hashlock branch. Broadcasting it publishes the preimage on-chain.
+    /// hashlock branch at `feerate` sat/vB. Broadcasting it publishes the
+    /// preimage on-chain.
     pub fn claim_tx(
         &self,
         outpoint: OutPoint,
         input_value: Amount,
         destination: ScriptBuf,
+        feerate: f64,
     ) -> Result<Transaction, SwapError> {
         let htlc = self
             .htlc
@@ -272,6 +274,7 @@ impl SwapOutTaker {
             &self.hashlock_privkey,
             &self.preimage,
             destination,
+            feerate,
         )
     }
 }
@@ -380,26 +383,34 @@ impl SwapOutMaker {
     }
 
     /// Builds the signed refund transaction spending the HTLC through the
-    /// timelock branch. Broadcastable only `locktime` blocks after the
-    /// funding output confirms; used when the taker never claims.
+    /// timelock branch at `feerate` sat/vB. Broadcastable only `locktime`
+    /// blocks after the funding output confirms; used when the taker never
+    /// claims.
     pub fn refund_tx(
         &self,
         outpoint: OutPoint,
         input_value: Amount,
         destination: ScriptBuf,
+        feerate: f64,
     ) -> Result<Transaction, SwapError> {
         let htlc = self
             .htlc
             .as_ref()
             .ok_or(SwapError::NotReady("refund_tx before accept"))?;
-        htlc.create_timelock_spend(outpoint, input_value, &self.timelock_privkey, destination)
+        htlc.create_timelock_spend(
+            outpoint,
+            input_value,
+            &self.timelock_privkey,
+            destination,
+            feerate,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lightning::MockLightningBackend;
+    use crate::lightning::{swap::SPEND_FEE_RATE_FLOOR, MockLightningBackend};
 
     fn test_params() -> SwapOutParams {
         SwapOutParams {
@@ -468,6 +479,7 @@ mod tests {
                 OutPoint::default(),
                 Amount::from_sat(50_000),
                 ScriptBuf::new(),
+                SPEND_FEE_RATE_FLOOR,
             )
             .unwrap();
         let learned = maker.settle_from_spend(&claim).unwrap();
@@ -479,6 +491,7 @@ mod tests {
                 OutPoint::default(),
                 Amount::from_sat(50_000),
                 ScriptBuf::new(),
+                SPEND_FEE_RATE_FLOOR,
             )
             .unwrap();
         assert!(matches!(

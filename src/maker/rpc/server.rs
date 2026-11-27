@@ -3,7 +3,7 @@ use std::{
     io::{ErrorKind, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
         Arc, Mutex,
     },
     thread::sleep,
@@ -261,20 +261,35 @@ fn handle_request<M: MakerRpc>(
                     change_address_type: AddressType::P2TR,
                 };
 
-                let coins_to_send = lock_debug!(maker.wallet().read())?.coin_select(
-                    amount,
-                    feerate,
-                    address_type,
-                    None,
-                    None,
-                )?;
-                let tx = lock_debug!(maker.wallet().write())?.spend_from_wallet(
-                    feerate,
-                    destination,
-                    &coins_to_send,
-                )?;
-
-                let txid = lock_debug!(maker.wallet().read())?.send_tx(&tx)?;
+                // Selected and claimed under one lock, so the Lightning
+                // watchdog either holds an output first and selection skips
+                // it, or finds it claimed and does not replace the spend that
+                // created it. The claim lasts until the send is out.
+                static SENDS: AtomicU64 = AtomicU64::new(0);
+                let key = format!("rpc-send:{}", SENDS.fetch_add(1, Relaxed));
+                let (coins_to_send, inputs) = {
+                    let mut wallet = lock_debug!(maker.wallet().write())?;
+                    let coins = wallet.coin_select(amount, feerate, address_type, None, None)?;
+                    let inputs: Vec<bitcoin::OutPoint> = coins
+                        .iter()
+                        .map(|(utxo, _)| bitcoin::OutPoint::new(utxo.txid, utxo.vout))
+                        .collect();
+                    wallet.reserve_swap_locks(&key, &inputs);
+                    (coins, inputs)
+                };
+                let sent = (|| -> Result<bitcoin::Txid, MakerError> {
+                    let tx = lock_debug!(maker.wallet().write())?.spend_from_wallet(
+                        feerate,
+                        destination,
+                        &coins_to_send,
+                    )?;
+                    Ok(lock_debug!(maker.wallet().read())?.send_tx(&tx)?)
+                })();
+                // A sent transaction's inputs leave the cache with the claim;
+                // otherwise they are only freed, as before the claim.
+                lock_debug!(maker.wallet().write())?
+                    .release_swap_locks(&key, sent.as_ref().ok().map(|_| inputs.as_slice()));
+                let txid = sent?;
 
                 log::info!("Sync at:----handle_request----");
                 lock_debug!(maker.wallet().write())?.sync_and_save(maker.shutdown())?;

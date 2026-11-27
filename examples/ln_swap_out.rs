@@ -31,7 +31,10 @@ use std::{env, path::Path, sync::Arc, time::Duration};
 use bitcoin::{Amount, Network, OutPoint};
 use openswap::{
     bitcoind::bitcoincore_rpc::{Auth, Client, RpcApi},
-    lightning::{HtlcFunded, LightningBackend, LnEvent, SwapOutMaker, SwapOutParams, SwapOutTaker},
+    lightning::{
+        swap::SPEND_FEE_RATE_FLOOR, HtlcFunded, LightningBackend, LnEvent, SwapOutMaker,
+        SwapOutParams, SwapOutTaker,
+    },
 };
 
 #[path = "ln_common/mod.rs"]
@@ -164,7 +167,12 @@ fn main() {
         .assume_checked()
         .script_pubkey();
     let claim_tx = taker
-        .claim_tx(outpoint, funding_output.value, claim_spk)
+        .claim_tx(
+            outpoint,
+            funding_output.value,
+            claim_spk,
+            SPEND_FEE_RATE_FLOOR,
+        )
         .expect("claim_tx");
     let claim_txid = rpc
         .send_raw_transaction(&claim_tx)

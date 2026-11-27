@@ -786,6 +786,75 @@ pub trait Maker: Send + Sync {
         Err(MakerError::General("lightning swaps not supported"))
     }
 
+    /// Feerate (sat/vB) to build a Lightning HTLC spend at. The default is
+    /// the rate every spend used before spends were priced from the market.
+    #[cfg(feature = "lightning")]
+    fn htlc_spend_feerate(&self) -> f64 {
+        crate::lightning::swap::SPEND_FEE_RATE_FLOOR
+    }
+
+    /// Feerate (sat/vB) a replacement must add over the spend it replaces:
+    /// the backend's incremental relay fee, never below the relay floor.
+    #[cfg(feature = "lightning")]
+    fn htlc_replacement_increment(&self) -> f64 {
+        crate::utill::MIN_RELAY_FEE_RATE
+    }
+
+    /// The transaction spending `outpoint`, read from the node: what a
+    /// rebuild would replace. Asked only once the outpoint has no confirmed
+    /// spend. `None` when nothing pending spends it. On Electrum the answer
+    /// comes from a briefly cached script history, so a just-evicted spend
+    /// can still be named for a few seconds; the next pass corrects it.
+    #[cfg(feature = "lightning")]
+    fn htlc_pending_spend(
+        &self,
+        _outpoint: &bitcoin::OutPoint,
+        _script: &bitcoin::ScriptBuf,
+    ) -> Result<Option<Transaction>, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Fees of mempool transaction `txid` and everything spending from it:
+    /// what replacing `txid` has to pay above. `None` when `txid` is not in
+    /// the mempool.
+    #[cfg(feature = "lightning")]
+    fn mempool_package_fee(&self, _txid: &bitcoin::Txid) -> Result<Option<Amount>, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Holds `outpoint`, the output of a pending spend of ours, under `key`
+    /// while that spend is replaced, so no swap can claim it in between.
+    /// `false` when a swap already holds it: replacing the spend would
+    /// invalidate that swap's funding.
+    #[cfg(feature = "lightning")]
+    fn hold_for_replacement(
+        &self,
+        _key: &str,
+        _outpoint: &bitcoin::OutPoint,
+    ) -> Result<bool, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Releases a hold taken by [`Maker::hold_for_replacement`]. `replaced`
+    /// is a held output whose transaction was replaced: it leaves the wallet
+    /// in the same step, so no swap reads it as free.
+    #[cfg(feature = "lightning")]
+    fn release_replacement_hold(&self, _key: &str, _replaced: Option<&bitcoin::OutPoint>) {}
+
+    /// One wallet sync and save with no retry, to read a new spend's output
+    /// in without holding the wallet through a backend outage.
+    #[cfg(feature = "lightning")]
+    fn sync_wallet_once(&self) -> Result<(), MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Whether `outpoint` is unspent with the mempool included: for a
+    /// pending HTLC spend's output, that nothing builds on it yet.
+    #[cfg(feature = "lightning")]
+    fn is_output_unspent(&self, _outpoint: &bitcoin::OutPoint) -> Result<bool, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
     /// Whether `outpoint` has a *confirmed* spend. A mempool-only spend
     /// reports false: it can still be evicted or reorged away, and dropping
     /// a swap's record on one would discard the only key that reaches the

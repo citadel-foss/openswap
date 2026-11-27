@@ -2568,6 +2568,26 @@ impl Wallet {
             .any(|locks| locks.outpoints.contains(outpoint))
     }
 
+    /// Holds `outpoint` under `key` unless a swap already holds it or it is
+    /// locked, so no swap can claim it until [`Self::release_swap_locks`]
+    /// drops `key`. For replacing the transaction that created `outpoint`.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn hold_for_replacement(&mut self, key: &str, outpoint: OutPoint) -> bool {
+        if self.locked_utxos.contains(&outpoint) || self.is_swap_reserved(&outpoint) {
+            return false;
+        }
+        self.reserve_swap_locks(key, &[outpoint]);
+        true
+    }
+
+    /// Test-only: drop `swap_key`'s reservation and persist it, as the end
+    /// of another swap would.
+    #[cfg(feature = "integration-test")]
+    pub fn release_swap_locks_for_test(&mut self, swap_key: &str) -> Result<(), WalletError> {
+        self.release_swap_locks(swap_key, None);
+        self.save_to_disk()
+    }
+
     /// Test-only: reserve `outpoints` for `swap_key` and persist it, as
     /// another swap's claim would be.
     #[cfg(feature = "integration-test")]
@@ -4794,6 +4814,17 @@ impl Wallet {
         Ok(())
     }
 
+    /// One sync attempt, then a save, with no retry: a caller holding the
+    /// wallet's lock waits on one round of backend reads at most.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn sync_once_and_save(
+        &mut self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), WalletError> {
+        self.sync(shutdown)?;
+        self.save_to_disk()
+    }
+
     /// Get all utxos tracked by the backend.
     ///
     /// Returns the full unspent set; coin locking is applied wallet-side at
@@ -5304,6 +5335,56 @@ mod swap_reservation_tests {
 
     fn outpoint(n: u8) -> OutPoint {
         OutPoint::new(Txid::from_slice(&[n; 32]).unwrap(), 0)
+    }
+
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn a_replaced_output_leaves_the_wallet_with_its_hold() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet.cbor"));
+        let sweep_output = outpoint(5);
+        let amount = Amount::from_sat(40_000);
+        wallet.store.utxo_cache.insert(
+            sweep_output,
+            (
+                ListUnspentResultEntry {
+                    txid: sweep_output.txid,
+                    vout: sweep_output.vout,
+                    address: None,
+                    label: None,
+                    redeem_script: None,
+                    witness_script: None,
+                    script_pub_key: ScriptBuf::from_bytes(vec![0x51]),
+                    amount,
+                    confirmations: 0,
+                    spendable: true,
+                    solvable: true,
+                    descriptor: None,
+                    safe: true,
+                },
+                UTXOSpendInfo::SeedCoin {
+                    path: "m/0/0".into(),
+                    input_value: amount,
+                    address_type: AddressType::P2WPKH,
+                },
+            ),
+        );
+
+        assert!(wallet.hold_for_replacement("ln-replace:s", sweep_output));
+        assert!(
+            !wallet.claim_swap_inputs("swap-a", &[sweep_output]),
+            "held while its spend is replaced"
+        );
+
+        // The replacement was accepted, so the output is gone for good: it
+        // leaves the cache as the hold goes, whatever the next sync reads.
+        wallet.release_swap_locks("ln-replace:s", Some(&[sweep_output]));
+        assert!(!wallet.store.swap_locks.contains_key("ln-replace:s"));
+        assert!(!wallet.store.utxo_cache.contains_key(&sweep_output));
+        assert!(
+            !wallet.claim_swap_inputs("swap-a", &[sweep_output]),
+            "a swap cannot fund from a replaced output"
+        );
     }
 
     #[test]

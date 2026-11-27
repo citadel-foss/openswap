@@ -33,7 +33,10 @@ use std::{
 use bitcoin::{hashes::sha256, secp256k1::SecretKey, Amount, OutPoint};
 
 use crate::{
-    lightning::{swap::SwapHtlc, ChannelInfo, LightningBackend, LnEvent, PaymentOutcome, Preimage},
+    lightning::{
+        swap::{SwapHtlc, SPEND_FEE_RATE_FLOOR, SPEND_TX_VSIZE},
+        ChannelInfo, LightningBackend, LnEvent, PaymentOutcome, Preimage,
+    },
     protocol::{
         common_messages::MakerToTakerMessage,
         features::check_pins,
@@ -43,7 +46,7 @@ use crate::{
             LnSwapOutRequest,
         },
     },
-    utill::generate_keypair,
+    utill::{fee_at_rate_sats, generate_keypair},
     wallet::LnMakerSwapRecord,
     watch_tower::watcher::WatcherEvent,
 };
@@ -142,6 +145,17 @@ pub struct LnMakerSwap {
     /// Txid of our refund, recorded before it is broadcast. Names it only:
     /// whether it was sent or confirmed is read from the chain.
     pub refund_txid: Option<bitcoin::Txid>,
+    /// Feerate (sat/vB) our refund was built at, recorded with its txid so a
+    /// rebuild is the same transaction. `None` with a txid means the refund
+    /// predates priced spends and was built at [`SPEND_FEE_RATE_FLOOR`].
+    pub refund_feerate: Option<f64>,
+    /// Refunds `refund_txid` replaced at a higher fee. Any of them can be
+    /// the one that confirms, so each still names our refund.
+    pub earlier_refund_txids: Vec<bitcoin::Txid>,
+    /// Feerate (sat/vB) our pending swap-in sweep was built at, so a rebuild
+    /// at it is the same transaction; a bump records its new rate. `None` on
+    /// a swept record means it was built at [`SPEND_FEE_RATE_FLOOR`].
+    pub sweep_feerate: Option<f64>,
     /// Chain tip when the swap was accepted.
     pub accepted_height: Option<u32>,
     /// Where this swap pays out, fixed on first use.
@@ -182,6 +196,9 @@ impl LnMakerSwap {
             invoice: self.invoice.clone(),
             preimage: self.preimage.map(|p| p.0),
             refund_txid: self.refund_txid,
+            refund_feerate: self.refund_feerate,
+            earlier_refund_txids: self.earlier_refund_txids.clone(),
+            sweep_feerate: self.sweep_feerate,
             accepted_height: self.accepted_height,
             payout_script: self.payout_script.clone(),
             funding_outpoint,
@@ -207,6 +224,9 @@ impl LnMakerSwap {
             invoice: record.invoice,
             preimage: record.preimage.map(Preimage),
             refund_txid: record.refund_txid,
+            refund_feerate: record.refund_feerate,
+            earlier_refund_txids: record.earlier_refund_txids,
+            sweep_feerate: record.sweep_feerate,
             accepted_height: record.accepted_height,
             payout_script: record.payout_script,
             funding: record.funding_outpoint.zip(record.funding_value),
@@ -752,6 +772,9 @@ fn handle_swap_in_request<M: Maker>(
             invoice: req.invoice.clone(),
             preimage: None,
             refund_txid: None,
+            refund_feerate: None,
+            earlier_refund_txids: Vec::new(),
+            sweep_feerate: None,
             accepted_height: maker.get_current_height().ok(),
             payout_script: None,
             funding: None,
@@ -1022,14 +1045,33 @@ fn sweep_swap_in<M: Maker>(
         .funding
         .ok_or(MakerError::General("swap-in sweep without funding"))?;
     let mut swap = swap.clone();
-    let destination = payout_script(maker, swap_id, &mut swap)?;
+    // Not payout_script(), whose store is unconditional: on a stale paid copy
+    // it would write that copy back over a swept swap. The guarded store
+    // below writes the script with the swept phase.
+    let destination = match &swap.payout_script {
+        Some(script) => script.clone(),
+        None => {
+            let script = maker.get_receive_address()?.script_pubkey();
+            swap.payout_script = Some(script.clone());
+            script
+        }
+    };
+    let feerate = maker.htlc_spend_feerate();
     let claim_tx = swap
         .htlc
-        .create_hashlock_spend(outpoint, value, &swap.privkey, preimage, destination)
+        .create_hashlock_spend(
+            outpoint,
+            value,
+            &swap.privkey,
+            preimage,
+            destination,
+            feerate,
+        )
         .map_err(|e| {
             log::warn!("lightning: claim build failed: {e}");
             MakerError::General("claim build failed")
         })?;
+    swap.sweep_feerate = Some(rate_paid(&claim_tx, value, feerate));
     // Record the preimage and the swept phase before broadcasting: the
     // record is what lets the watchdog rebuild this sweep if the broadcast
     // is evicted, and it must not be dropped until the sweep confirms.
@@ -1037,7 +1079,13 @@ fn sweep_swap_in<M: Maker>(
     swept.preimage = Some(*preimage);
     swept.phase = LnMakerPhase::InSwept;
     swept.touch();
-    store_swap(maker, swap_id, swept)?;
+    // The inline handler and the watchdog can both get here for one swap.
+    // Only the first moves it to swept and sends: a second sweep, priced at
+    // a newer rate, could replace the first.
+    if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::InPaid, swept)? {
+        log::info!("Swap-in {swap_id}: already swept; keeping the first sweep");
+        return Ok(());
+    }
 
     let claim_txid = maker.broadcast_transaction(&claim_tx)?;
     log::info!(
@@ -1072,25 +1120,185 @@ fn watchdog_finish_sweep<M: Maker>(
         ctx.router.unsubscribe(&swap.payment_hash);
         return maker.remove_ln_swap(swap_id);
     }
-    // Still unconfirmed: rebuild and rebroadcast. A duplicate is harmless,
-    // and this is what recovers from an eviction.
+    // Still unconfirmed. What spends the HTLC now is read from the node,
+    // not from the record: our sweep pending in the mempool is resent, or
+    // bumped once the market clears its rate and nothing spends its output;
+    // with nothing pending, evicted or never sent, the sweep goes out again
+    // at the market rate when that is higher. A spend that is not ours is
+    // the taker's refund racing the sweep, which the sweep outbids.
     let Some(preimage) = swap.preimage else {
         return Err(MakerError::General("swept swap without a preimage"));
     };
     let mut swap = swap.clone();
     let destination = payout_script(maker, swap_id, &mut swap)?;
-    let claim_tx = swap
-        .htlc
-        .create_hashlock_spend(outpoint, value, &swap.privkey, &preimage, destination)
-        .map_err(|e| {
-            log::warn!("lightning: claim rebuild failed: {e}");
-            MakerError::General("claim rebuild failed")
-        })?;
-    match maker.broadcast_transaction(&claim_tx) {
+    let built_at = swap.sweep_feerate.unwrap_or(SPEND_FEE_RATE_FLOOR);
+    let build = |rate| {
+        swap.htlc
+            .create_hashlock_spend(
+                outpoint,
+                value,
+                &swap.privkey,
+                &preimage,
+                destination.clone(),
+                rate,
+            )
+            .map_err(|e| {
+                log::warn!("lightning: claim rebuild failed: {e}");
+                MakerError::General("claim rebuild failed")
+            })
+    };
+    // Only the maker signs the hashlock branch, so a spend revealing the
+    // preimage is our sweep.
+    let pending = match maker.htlc_pending_spend(&outpoint, &spk) {
+        Ok(Some(tx)) if swap.htlc.extract_preimage(&tx).is_some() => Some(tx),
+        Ok(None) => None,
+        Ok(Some(refund)) => {
+            // The taker's refund is racing the sweep. The invoice is already
+            // paid, so the sweep outbids it.
+            let family = match maker.mempool_package_fee(&refund.compute_txid()) {
+                Ok(Some(fee)) => Some(fee),
+                // Gone since it was read: the next pass sees what replaced it.
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    log::warn!(
+                        "Swap-in {swap_id}: cannot read what spends from the taker's refund: {e:?}"
+                    );
+                    None
+                }
+            };
+            // The taker signs the refund and can add inputs of its own, so its
+            // fee is read from all of them.
+            let own = refund_fee(&refund, outpoint, value, |txid| {
+                maker.get_raw_transaction(txid).ok()
+            });
+            let Some((refund_paid, to_beat, family_known)) = refund_bid(family, own) else {
+                log::warn!(
+                    "Swap-in {swap_id}: cannot read what the taker's refund {} pays, \
+                     contesting it next pass",
+                    refund.compute_txid()
+                );
+                return Ok(());
+            };
+            let Some((sweep, rate)) = outbid_refund(
+                build,
+                value,
+                built_at.max(maker.htlc_spend_feerate()),
+                maker.htlc_replacement_increment(),
+                &refund,
+                refund_paid,
+                to_beat,
+            )?
+            else {
+                log::warn!(
+                    "Swap-in {swap_id}: the HTLC cannot pay enough to replace the taker's \
+                     refund {}, which pays {to_beat}",
+                    refund.compute_txid()
+                );
+                return Ok(());
+            };
+            if family_known && rate > built_at {
+                let mut next = swap.clone();
+                next.sweep_feerate = Some(rate);
+                if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::InSwept, next)? {
+                    return Ok(());
+                }
+            }
+            log::info!(
+                "Swap-in {swap_id}: contesting the taker's refund {} at {rate} sat/vB",
+                refund.compute_txid()
+            );
+            match maker.broadcast_transaction(&sweep) {
+                Ok(_) => {
+                    // A bid on a family it could not read is recorded once the
+                    // node took it: it is then the pending sweep, and a rebuild
+                    // after an eviction must give the same transaction.
+                    if !family_known && rate > built_at {
+                        let mut next = swap.clone();
+                        next.sweep_feerate = Some(rate);
+                        if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::InSwept, next)? {
+                            return Ok(());
+                        }
+                    }
+                    read_new_output_in(maker.as_ref(), swap_id)
+                }
+                Err(e) => {
+                    log::warn!("Swap-in {swap_id}: sweep did not replace the taker's refund: {e:?}")
+                }
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            // The record can be ahead of what is pending, so resending it
+            // could replace a spend whose output something builds on. Send
+            // nothing until a lookup works.
+            log::warn!(
+                "Swap-in {swap_id}: cannot read what spends the HTLC, \
+                 sending nothing this pass: {e:?}"
+            );
+            return Ok(());
+        }
+    };
+    let mut hold = ReplacementHold::new(maker, swap_id);
+    let (claim_tx, replaced) = match plan_spend(
+        build,
+        value,
+        built_at,
+        maker.htlc_spend_feerate(),
+        maker.htlc_replacement_increment(),
+        pending,
+        |txid, pending| {
+            // Replacing a spend invalidates whatever spends its output: a
+            // swap of ours that holds it to fund and, while the spend is
+            // pending, a transaction in the mempool. The hold comes first,
+            // so a swap's funding sent just before it still reads as a spend.
+            let output = OutPoint::new(txid, 0);
+            hold.take(&output) && (!pending || maker.is_output_unspent(&output).unwrap_or(false))
+        },
+    )? {
+        PlannedSpend::Resend(tx) => (tx, false),
+        PlannedSpend::New { tx, rate, .. } => {
+            let mut next = swap.clone();
+            next.sweep_feerate = Some(rate);
+            if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::InSwept, next)? {
+                return Ok(());
+            }
+            log::info!("Swap-in {swap_id}: sweep sent at {rate} sat/vB, up from {built_at}");
+            (tx, true)
+        }
+    };
+    let sent = maker.broadcast_transaction(&claim_tx);
+    match &sent {
         Ok(txid) => log::info!("Swap-in {swap_id}: sweep rebroadcast as {txid}"),
         Err(e) => log::debug!("Swap-in {swap_id}: sweep rebroadcast rejected: {e:?}"),
     }
+    if replaced {
+        settle_replaced(maker.as_ref(), swap_id, hold, sent.is_ok());
+    }
     Ok(())
+}
+
+/// Once a replacement of our pending spend went out, the replaced spend's
+/// output leaves the wallet as the hold goes, so no swap funds from it.
+/// That happens on a failed broadcast too, since an error can hide a
+/// replacement the node took, as when its reply is lost: a still-live
+/// output is only out of the wallet until the next sync lists it again,
+/// while a dead one left in would let a swap sign funding the node can't
+/// accept. An accepted replacement's output is read in with one sync.
+fn settle_replaced<M: Maker>(maker: &M, swap_id: &str, hold: ReplacementHold<'_, M>, sent: bool) {
+    hold.release_replaced();
+    if sent {
+        read_new_output_in(maker, swap_id);
+    }
+}
+
+/// Reads a new spend's output into the wallet with one sync, no retry, so a
+/// backend outage can't hold the watchdog or the wallet.
+fn read_new_output_in<M: Maker>(maker: &M, swap_id: &str) {
+    if let Err(e) = maker.sync_wallet_once() {
+        log::debug!(
+            "Swap {swap_id}: wallet sync after the spend failed, a later one reads it in: {e:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1369,9 @@ fn handle_swap_out_request<M: Maker>(
             invoice: invoice.invoice.clone(),
             preimage: None,
             refund_txid: None,
+            refund_feerate: None,
+            earlier_refund_txids: Vec::new(),
+            sweep_feerate: None,
             accepted_height: maker.get_current_height().ok(),
             payout_script: None,
             funding: None,
@@ -1733,19 +1944,17 @@ fn watchdog_resolve_swap_out(
                 // the watcher keeps it on record. Nothing else would send it
                 // again, so do that here; a duplicate is harmless.
                 if is_our_refund(swap, &spending_tx) {
-                    match maker.broadcast_transaction(&spending_tx) {
-                        Ok(txid) => log::info!("Swap-out {swap_id}: refund rebroadcast as {txid}"),
-                        Err(e) => {
-                            log::debug!("Swap-out {swap_id}: refund rebroadcast rejected: {e:?}")
-                        }
-                    }
+                    resend_refund(maker, ctx, swap_id, swap, outpoint, value, &spk)?;
                 }
                 return Ok(());
             }
-            let refund_depth = match swap.refund_txid {
-                Some(txid) => maker.tx_confirmations(&txid)?,
-                None => None,
-            };
+            // Any refund this swap recorded can be the one that confirmed.
+            let mut refund_depth = None;
+            for txid in swap.refund_txid.iter().chain(&swap.earlier_refund_txids) {
+                if let Some(depth) = maker.tx_confirmations(txid)? {
+                    refund_depth = refund_depth.max(Some(depth));
+                }
+            }
             let Some(depth) = refund_depth else {
                 // Someone else won the outpoint, which can only be the
                 // taker's claim. Keep the swap and retry until we hold the
@@ -1831,13 +2040,52 @@ fn watchdog_resolve_swap_out(
                     script
                 }
             };
-            let refund_tx = swap
-                .htlc
-                .create_timelock_spend(outpoint, value, &swap.privkey, destination)
-                .map_err(|e| {
-                    log::warn!("lightning: refund build failed: {e}");
-                    MakerError::General("refund build failed")
-                })?;
+            let build = |rate| {
+                swap.htlc
+                    .create_timelock_spend(
+                        outpoint,
+                        value,
+                        &swap.privkey,
+                        destination.clone(),
+                        rate,
+                    )
+                    .map_err(|e| {
+                        log::warn!("lightning: refund build failed: {e}");
+                        MakerError::General("refund build failed")
+                    })
+            };
+            // Nothing spends the HTLC, so nothing is replaced: the first
+            // refund takes the market rate, and a recorded one is rebuilt at
+            // its rate, or at the market rate once that clears it by the
+            // replacement step and pays more. A record from before refunds
+            // were priced was built at [`SPEND_FEE_RATE_FLOOR`].
+            let market = maker.htlc_spend_feerate();
+            // A refund that was sent and evicted can have a swap's funding
+            // built on its output, so it is rebuilt at a new rate only while
+            // no swap holds that output.
+            let mut hold = ReplacementHold::new(maker, swap_id);
+            let (feerate, refund_tx, replaced) = match swap.refund_txid {
+                None => {
+                    let tx = build(market)?;
+                    (rate_paid(&tx, value, market), tx, false)
+                }
+                Some(_) => {
+                    let built_at = swap.refund_feerate.unwrap_or(SPEND_FEE_RATE_FLOOR);
+                    match plan_spend(
+                        build,
+                        value,
+                        built_at,
+                        market,
+                        maker.htlc_replacement_increment(),
+                        None,
+                        |txid, _| hold.take(&OutPoint::new(txid, 0)),
+                    )? {
+                        PlannedSpend::Resend(tx) => (built_at, tx, false),
+                        PlannedSpend::New { tx, rate, .. } => (rate, tx, true),
+                    }
+                }
+            };
+            swap.refund_feerate = Some(feerate);
             // Recorded before it can reach the network, so a crash after the
             // broadcast still leaves a record that knows the spend is ours.
             // It names the refund, nothing more: whether it was sent or
@@ -1845,6 +2093,12 @@ fn watchdog_resolve_swap_out(
             // transaction, so this is written once.
             let refund_txid = refund_tx.compute_txid();
             if swap.refund_txid != Some(refund_txid) {
+                // The refund it supersedes can still confirm, so it is kept.
+                if let Some(earlier) = swap.refund_txid {
+                    if !swap.earlier_refund_txids.contains(&earlier) {
+                        swap.earlier_refund_txids.push(earlier);
+                    }
+                }
                 swap.refund_txid = Some(refund_txid);
                 // A claim may have closed the swap since the snapshot.
                 if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::OutFunded, swap.clone())? {
@@ -1859,17 +2113,28 @@ fn watchdog_resolve_swap_out(
             // is final, and until then this record holds the only key that
             // can rebuild it. The confirmed-spend branch above closes the
             // swap and fails the held payment on a later tick.
-            match maker.broadcast_transaction(&refund_tx) {
+            let sent = maker.broadcast_transaction(&refund_tx);
+            let stored = match &sent {
                 Ok(txid) => {
                     log::info!(
                         "Swap-out {swap_id} refund broadcast: {txid} (held until confirmed)"
                     );
                     swap.touch();
-                    maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::OutFunded, swap)?;
+                    maker
+                        .store_ln_swap_if_phase(swap_id, LnMakerPhase::OutFunded, swap)
+                        .map(|_| ())
                 }
-                Err(e) => log::debug!("swap-out {swap_id} refund not yet broadcastable: {e:?}"),
+                Err(e) => {
+                    log::debug!("swap-out {swap_id} refund not yet broadcastable: {e:?}");
+                    Ok(())
+                }
+            };
+            // The evicted refund's output leaves the wallet, as in
+            // [`resend_refund`], whatever the store above returned.
+            if replaced {
+                settle_replaced(maker.as_ref(), swap_id, hold, sent.is_ok());
             }
-            Ok(())
+            stored
         }
     }
 }
@@ -1901,10 +2166,359 @@ pub static INTERRUPT_REFUND: std::sync::atomic::AtomicBool =
 pub static HIDE_HTLC_SPENDS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Whether `spend` is the refund this swap built. Lacking the preimage
-/// does not make a spend ours; only the persisted refund txid does.
+/// Fails the watchdog's lookup of what spends an HTLC, as a backend error
+/// would. Set by tests.
+#[cfg(feature = "integration-test")]
+pub static FAIL_PENDING_SPEND_LOOKUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Fails the watchdog's read of what spends from the taker's refund, as a
+/// backend error would. Set by tests.
+#[cfg(feature = "integration-test")]
+pub static FAIL_REFUND_FAMILY_LOOKUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `spend` is a refund this swap built. Lacking the preimage does
+/// not make a spend ours; only a persisted refund txid does, the latest or
+/// one it replaced.
 fn is_our_refund(swap: &LnMakerSwap, spend: &bitcoin::Transaction) -> bool {
-    swap.refund_txid == Some(spend.compute_txid())
+    let txid = spend.compute_txid();
+    swap.refund_txid == Some(txid) || swap.earlier_refund_txids.contains(&txid)
+}
+
+/// What a spend of an HTLC holding `value` pays in fees: zero when its
+/// outputs add up to more than `value`, or overflow.
+fn fee_paid(tx: &bitcoin::Transaction, value: Amount) -> Amount {
+    outputs_total(tx)
+        .and_then(|out| value.checked_sub(out))
+        .unwrap_or(Amount::ZERO)
+}
+
+/// The sum of `tx`'s outputs, `None` when it overflows.
+fn outputs_total(tx: &bitcoin::Transaction) -> Option<Amount> {
+    tx.output
+        .iter()
+        .try_fold(Amount::ZERO, |sum, output| sum.checked_add(output.value))
+}
+
+/// What the sweep bids against for the taker's refund, from `family`, what
+/// the refund and anything spending from it pay when that was read, and
+/// `own`, the refund's own fee when its inputs were read: the refund's own
+/// fee, the fee to beat, and whether the family was read.
+///
+/// With the family read and the refund's own fee not, as when the taker
+/// spread its inputs past what is read, the family's fee stands in for the
+/// refund's: it is at least as much, so the feerate step is met however
+/// much of it is the refund's. With only its own fee, the sweep bids
+/// against the refund alone. That can only replace a refund nothing spends
+/// from, and the rate is not recorded, so the next pass bids on what it
+/// reads then. `None` when neither was read.
+fn refund_bid(family: Option<Amount>, own: Option<Amount>) -> Option<(Amount, Amount, bool)> {
+    match (family, own) {
+        (Some(family), Some(own)) => Some((own, family.max(own), true)),
+        (Some(family), None) => Some((family, family, true)),
+        (None, Some(own)) => Some((own, own, false)),
+        (None, None) => None,
+    }
+}
+
+/// The most transactions read to price the taker's own inputs to a refund.
+const MAX_REFUND_FUNDING_READS: usize = 16;
+
+/// What the taker's `refund` pays in fees, from every input it spends: the
+/// HTLC at `htlc` holds `value`, and any other is read from the transaction
+/// it spends, through `read_tx`, each transaction once and at most
+/// [`MAX_REFUND_FUNDING_READS`] of them. `None` when an input cannot be read
+/// or the amounts do not add up.
+fn refund_fee(
+    refund: &bitcoin::Transaction,
+    htlc: OutPoint,
+    value: Amount,
+    read_tx: impl Fn(&bitcoin::Txid) -> Option<bitcoin::Transaction>,
+) -> Option<Amount> {
+    let mut read = std::collections::HashMap::new();
+    let mut inputs = Amount::ZERO;
+    for input in &refund.input {
+        let spent = input.previous_output;
+        let paid = if spent == htlc {
+            value
+        } else {
+            if !read.contains_key(&spent.txid) {
+                if read.len() >= MAX_REFUND_FUNDING_READS {
+                    return None;
+                }
+                read.insert(spent.txid, read_tx(&spent.txid)?);
+            }
+            read[&spent.txid].output.get(spent.vout as usize)?.value
+        };
+        inputs = inputs.checked_add(paid)?;
+    }
+    inputs.checked_sub(outputs_total(refund)?)
+}
+
+/// The sweep that replaces `refund`, the taker's pending refund paying
+/// `refund_paid`, with its rate. It pays `to_beat`, the fee of the refund and
+/// anything spending from it, plus the replacement step for
+/// [`SPEND_TX_VSIZE`]. It also pays more per vbyte than the refund by that
+/// step, since a replacement must, and the sweep is the larger of the two.
+/// It takes `floor_rate`, the market or recorded rate, when that is more and
+/// the HTLC affords it. `None` when the HTLC cannot pay even the least that
+/// replaces the refund.
+fn outbid_refund(
+    build: impl Fn(f64) -> Result<bitcoin::Transaction, MakerError>,
+    value: Amount,
+    floor_rate: f64,
+    increment: f64,
+    refund: &bitcoin::Transaction,
+    refund_paid: Amount,
+    to_beat: Amount,
+) -> Result<Option<(bitcoin::Transaction, f64)>, MakerError> {
+    let refund_rate = refund_paid.to_sat() as f64 / refund.vsize() as f64;
+    let needed = (to_beat.to_sat() as f64 / SPEND_TX_VSIZE as f64 + increment)
+        .max(refund_rate + increment)
+        .max(SPEND_FEE_RATE_FLOOR);
+    // The market or recorded rate when the HTLC affords it, else the least
+    // that still replaces the refund. A build the dust fallback undid pays
+    // less than its rate asks, so it is never sent.
+    let mut rates = vec![floor_rate.max(needed)];
+    if floor_rate > needed {
+        rates.push(needed);
+    }
+    for rate in rates {
+        let sweep = build(rate)?;
+        if rate_paid(&sweep, value, rate) == rate {
+            return Ok(Some((sweep, rate)));
+        }
+    }
+    Ok(None)
+}
+
+/// The rate `tx` pays: `rate`, or the floor when the dust fallback stood in
+/// for it, so a record never claims a rate its spend did not pay.
+fn rate_paid(tx: &bitcoin::Transaction, value: Amount, rate: f64) -> f64 {
+    match fee_at_rate_sats(SPEND_TX_VSIZE, rate) {
+        Some(asked) if fee_paid(tx, value).to_sat() >= asked => rate,
+        _ => SPEND_FEE_RATE_FLOOR,
+    }
+}
+
+/// A hold on the output of a pending spend of ours while the spend is
+/// replaced, so no swap claims that output in between. Released when
+/// dropped.
+struct ReplacementHold<'a, M: Maker> {
+    maker: &'a Arc<M>,
+    key: String,
+    held: Option<OutPoint>,
+}
+
+impl<'a, M: Maker> ReplacementHold<'a, M> {
+    fn new(maker: &'a Arc<M>, swap_id: &str) -> Self {
+        Self {
+            maker,
+            key: format!("ln-replace:{swap_id}"),
+            held: None,
+        }
+    }
+
+    /// Holds `output`; `false` when a swap already holds it.
+    fn take(&mut self, output: &OutPoint) -> bool {
+        let held = self
+            .maker
+            .hold_for_replacement(&self.key, output)
+            .unwrap_or(false);
+        if held {
+            self.held = Some(*output);
+        }
+        held
+    }
+
+    /// Releases the hold once the spend that created the output was
+    /// replaced, taking the output out of the wallet in the same step.
+    fn release_replaced(mut self) {
+        if let Some(output) = self.held.take() {
+            self.maker
+                .release_replacement_hold(&self.key, Some(&output));
+        }
+    }
+}
+
+impl<M: Maker> Drop for ReplacementHold<'_, M> {
+    fn drop(&mut self) {
+        if self.held.take().is_some() {
+            self.maker.release_replacement_hold(&self.key, None);
+        }
+    }
+}
+
+/// What the watchdog sends for an unconfirmed HTLC spend of ours.
+#[derive(Debug, PartialEq)]
+enum PlannedSpend {
+    /// Send this again: the spend already pending, or the recorded one.
+    Resend(bitcoin::Transaction),
+    /// Send this spend at `rate`, recording it first. `replaces` is the
+    /// pending spend it replaces, if any.
+    New {
+        tx: bitcoin::Transaction,
+        rate: f64,
+        replaces: Option<bitcoin::Txid>,
+    },
+}
+
+/// Decides what to send from the node's view of the HTLC. `pending` is our
+/// unconfirmed spend in the mempool; `None` means nothing of ours is
+/// pending, evicted or never sent, so a spend at the market rate replaces
+/// nothing in the mempool and goes out once the market clears the recorded
+/// rate by the replacement step. A pending spend is bumped once the market
+/// clears the rate it actually pays by the replacement step. That rate is
+/// read from its fee, so a record that disagrees with the mempool cannot
+/// mislead it. Either way a spend is given up only while `replaceable` says
+/// nothing builds on its output: asked with the spend's txid, and whether it
+/// is pending.
+fn plan_spend(
+    build: impl Fn(f64) -> Result<bitcoin::Transaction, MakerError>,
+    value: Amount,
+    built_at: f64,
+    market: f64,
+    increment: f64,
+    pending: Option<bitcoin::Transaction>,
+    replaceable: impl FnOnce(bitcoin::Txid, bool) -> bool,
+) -> Result<PlannedSpend, MakerError> {
+    let Some(pending) = pending else {
+        let recorded = build(built_at)?;
+        if market >= built_at + increment {
+            let tx = build(market)?;
+            // A rate the dust fallback undoes keeps the recorded spend, and
+            // so does a swap whose funding builds on the recorded spend's
+            // output: a new txid would leave that funding spending nothing.
+            if fee_paid(&tx, value) > fee_paid(&recorded, value)
+                && replaceable(recorded.compute_txid(), false)
+            {
+                let rate = rate_paid(&tx, value, market);
+                return Ok(PlannedSpend::New {
+                    tx,
+                    rate,
+                    replaces: None,
+                });
+            }
+        }
+        return Ok(PlannedSpend::Resend(recorded));
+    };
+    let paid = fee_paid(&pending, value);
+    let paying = paid.to_sat() as f64 / SPEND_TX_VSIZE as f64;
+    if market < paying + increment {
+        return Ok(PlannedSpend::Resend(pending));
+    }
+    let txid = pending.compute_txid();
+    if !replaceable(txid, true) {
+        return Ok(PlannedSpend::Resend(pending));
+    }
+    let tx = build(market)?;
+    if fee_paid(&tx, value) <= paid {
+        return Ok(PlannedSpend::Resend(pending));
+    }
+    let rate = rate_paid(&tx, value, market);
+    Ok(PlannedSpend::New {
+        tx,
+        rate,
+        replaces: Some(txid),
+    })
+}
+
+/// Sends our refund again as the node sees it: the pending one, a bump of
+/// it, or, with nothing pending, the latest recorded refund at the market
+/// rate when that is higher. A new refund is recorded before it can reach
+/// the network, keeping the txid it supersedes, so whichever confirms is
+/// still ours. A spend of the HTLC that is not our refund is left alone.
+fn resend_refund(
+    maker: &Arc<MakerServer>,
+    ctx: &LnContext,
+    swap_id: &str,
+    swap: &LnMakerSwap,
+    outpoint: OutPoint,
+    value: Amount,
+    spk: &bitcoin::ScriptBuf,
+) -> Result<(), MakerError> {
+    let Some(destination) = swap.payout_script.clone() else {
+        return Ok(());
+    };
+    let built_at = swap.refund_feerate.unwrap_or(SPEND_FEE_RATE_FLOOR);
+    let build = |rate| {
+        swap.htlc
+            .create_timelock_spend(outpoint, value, &swap.privkey, destination.clone(), rate)
+            .map_err(|e| {
+                log::warn!("lightning: refund build failed: {e}");
+                MakerError::General("refund build failed")
+            })
+    };
+    let pending = match maker.htlc_pending_spend(&outpoint, spk) {
+        Ok(Some(tx)) if is_our_refund(swap, &tx) => Some(tx),
+        // The taker's claim, pending: its preimage settles the swap now.
+        Ok(Some(tx)) if swap.htlc.extract_preimage(&tx).is_some() => {
+            return settle_swap_out_from_spend(maker, ctx, swap_id, swap, &tx);
+        }
+        Ok(Some(tx)) => {
+            log::info!(
+                "Swap-out {swap_id}: {} spends the HTLC and is not our refund",
+                tx.compute_txid()
+            );
+            return Ok(());
+        }
+        Ok(None) => None,
+        Err(e) => {
+            // As for the sweep: send nothing until a lookup works.
+            log::warn!(
+                "Swap-out {swap_id}: cannot read what spends the HTLC, \
+                 sending nothing this pass: {e:?}"
+            );
+            return Ok(());
+        }
+    };
+    let mut hold = ReplacementHold::new(maker, swap_id);
+    let (refund, replaced) = match plan_spend(
+        build,
+        value,
+        built_at,
+        maker.htlc_spend_feerate(),
+        maker.htlc_replacement_increment(),
+        pending,
+        |txid, pending| {
+            // Replacing a spend invalidates whatever spends its output: a
+            // swap of ours that holds it to fund and, while the spend is
+            // pending, a transaction in the mempool. The hold comes first,
+            // so a swap's funding sent just before it still reads as a spend.
+            let output = OutPoint::new(txid, 0);
+            hold.take(&output) && (!pending || maker.is_output_unspent(&output).unwrap_or(false))
+        },
+    )? {
+        PlannedSpend::Resend(tx) => (tx, false),
+        PlannedSpend::New { tx, rate, .. } => {
+            let mut next = swap.clone();
+            let txid = tx.compute_txid();
+            if next.refund_txid != Some(txid) {
+                if let Some(earlier) = next.refund_txid {
+                    if !next.earlier_refund_txids.contains(&earlier) {
+                        next.earlier_refund_txids.push(earlier);
+                    }
+                }
+                next.refund_txid = Some(txid);
+            }
+            next.refund_feerate = Some(rate);
+            if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::OutFunded, next)? {
+                return Ok(());
+            }
+            log::info!("Swap-out {swap_id}: refund sent at {rate} sat/vB, up from {built_at}");
+            (tx, true)
+        }
+    };
+    let sent = maker.broadcast_transaction(&refund);
+    match &sent {
+        Ok(txid) => log::info!("Swap-out {swap_id}: refund sent as {txid}"),
+        Err(e) => log::debug!("Swap-out {swap_id}: refund rebroadcast rejected: {e:?}"),
+    }
+    if replaced {
+        settle_replaced(maker.as_ref(), swap_id, hold, sent.is_ok());
+    }
+    Ok(())
 }
 
 /// A swap-out HTLC as the watcher's answer describes it.
@@ -1976,7 +2590,7 @@ impl HtlcWatch {
 mod tests {
     use super::*;
     use crate::maker::api::tests::compat_test_maker;
-    use bitcoin::ScriptBuf;
+    use bitcoin::{hashes::Hash, ScriptBuf};
 
     #[test]
     fn compat_lightning_pins_require_exact_direction_and_requirements() {
@@ -2093,6 +2707,38 @@ mod tests {
         assert!(!is_our_refund(&swap, &rival));
     }
 
+    /// A record written before spends were priced or bumped has none of the
+    /// three fields. It still reads, with no rates and no earlier refunds,
+    /// and is rebuilt from the floor rate it was built at.
+    #[test]
+    fn record_without_a_refund_feerate_reads_as_built_at_the_floor() {
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        swap.refund_txid = Some(bitcoin::Txid::from_byte_array([0x42; 32]));
+        swap.refund_feerate = Some(10.0);
+        swap.sweep_feerate = Some(20.0);
+        swap.earlier_refund_txids = vec![bitcoin::Txid::from_byte_array([0x43; 32])];
+        let serde_cbor::Value::Map(mut fields) =
+            serde_cbor::value::to_value(swap.to_record()).unwrap()
+        else {
+            panic!("a record serializes as a map");
+        };
+        for key in ["refund_feerate", "earlier_refund_txids", "sweep_feerate"] {
+            assert!(
+                fields
+                    .remove(&serde_cbor::Value::Text(key.to_string()))
+                    .is_some(),
+                "{}",
+                key
+            );
+        }
+        let restored = LnMakerSwap::from_record(
+            serde_cbor::value::from_value(serde_cbor::Value::Map(fields)).unwrap(),
+        );
+        assert_eq!(restored.refund_feerate, None);
+        assert_eq!(restored.sweep_feerate, None);
+        assert!(restored.earlier_refund_txids.is_empty());
+    }
+
     fn sample_swap(direction: LnDirection, phase: LnMakerPhase) -> LnMakerSwap {
         let preimage = Preimage([0x33; 32]);
         let (branch_pubkey, branch_privkey) = generate_keypair();
@@ -2110,6 +2756,9 @@ mod tests {
             invoice: "lnbcrt-test".to_string(),
             preimage: Some(preimage),
             refund_txid: None,
+            refund_feerate: None,
+            earlier_refund_txids: Vec::new(),
+            sweep_feerate: None,
             accepted_height: Some(812_000),
             payout_script: None,
             funding: Some((OutPoint::default(), Amount::from_sat(40_000))),
@@ -2118,12 +2767,500 @@ mod tests {
         }
     }
 
+    /// A refund of the sample swap's HTLC at `rate`, holding `value`.
+    fn refund_at(swap: &LnMakerSwap, value: Amount, rate: f64) -> bitcoin::Transaction {
+        let (outpoint, _) = swap.funding.unwrap();
+        let p2wpkh = ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x07; 20]].concat());
+        swap.htlc
+            .create_timelock_spend(outpoint, value, &swap.privkey, p2wpkh, rate)
+            .unwrap()
+    }
+
+    #[test]
+    fn nothing_pending_goes_out_at_the_market_rate_never_below_the_record() {
+        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(refund_at(&swap, value, rate));
+        let free = |_: bitcoin::Txid, pending: bool| {
+            assert!(!pending, "nothing is pending");
+            true
+        };
+        match plan_spend(build, value, 10.0, 40.0, 1.0, None, free).unwrap() {
+            PlannedSpend::New { tx, rate, replaces } => {
+                assert_eq!(rate, 40.0);
+                assert_eq!(replaces, None);
+                assert_eq!(fee_paid(&tx, value), Amount::from_sat(6_000));
+            }
+            other => panic!("expected a new spend, got {:?}", other),
+        }
+        assert_eq!(
+            plan_spend(build, value, 10.0, 5.0, 1.0, None, free).unwrap(),
+            PlannedSpend::Resend(refund_at(&swap, value, 10.0))
+        );
+    }
+
+    /// A spend evicted from the mempool can still have a swap's funding
+    /// built on its output, waiting on signatures. Rebuilt at a new rate it
+    /// would get a new txid and leave that funding spending nothing, so it
+    /// is resent as recorded.
+    #[test]
+    fn an_evicted_spend_a_swap_builds_on_is_resent_as_recorded() {
+        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(refund_at(&swap, value, rate));
+        let recorded = refund_at(&swap, value, 10.0);
+        let asked = std::cell::Cell::new(None);
+        assert_eq!(
+            plan_spend(build, value, 10.0, 40.0, 1.0, None, |txid, pending| {
+                asked.set(Some((txid, pending)));
+                false
+            })
+            .unwrap(),
+            PlannedSpend::Resend(recorded.clone())
+        );
+        assert_eq!(asked.get(), Some((recorded.compute_txid(), false)));
+    }
+
+    /// The taker signs its refund and can add inputs of its own, so the fee
+    /// it pays comes from all of them, never from the HTLC alone.
+    #[test]
+    fn a_taker_refund_is_priced_from_every_input() {
+        let htlc = OutPoint::new(bitcoin::Txid::from_byte_array([0x11; 32]), 0);
+        let extra = OutPoint::new(bitcoin::Txid::from_byte_array([0x22; 32]), 1);
+        let paying = |outputs: &[u64]| bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: [htlc, extra]
+                .iter()
+                .map(|spent| bitcoin::TxIn {
+                    previous_output: *spent,
+                    ..Default::default()
+                })
+                .collect(),
+            output: outputs
+                .iter()
+                .map(|sat| bitcoin::TxOut {
+                    value: Amount::from_sat(*sat),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        };
+        let value = Amount::from_sat(40_500);
+        let funding = |sats: &[u64]| bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: sats
+                .iter()
+                .map(|sat| bitcoin::TxOut {
+                    value: Amount::from_sat(*sat),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        };
+        let read = |txid: &bitcoin::Txid| (*txid == extra.txid).then(|| funding(&[7, 10_000]));
+        // Against the HTLC alone it reads as paying nothing.
+        let refund = paying(&[48_500]);
+        assert_eq!(fee_paid(&refund, value), Amount::ZERO);
+        assert_eq!(
+            refund_fee(&refund, htlc, value, read),
+            Some(Amount::from_sat(2_000))
+        );
+        // An input that cannot be read leaves the fee unknown, not zero.
+        assert_eq!(refund_fee(&refund, htlc, value, |_| None), None);
+        // Outputs past what the inputs hold, or past any amount.
+        assert_eq!(refund_fee(&paying(&[60_000]), htlc, value, read), None);
+        let overflowing = paying(&[u64::MAX, 1]);
+        assert_eq!(refund_fee(&overflowing, htlc, value, read), None);
+        assert_eq!(fee_paid(&overflowing, value), Amount::ZERO);
+        // Inputs from more transactions than it reads leave the fee unknown,
+        // and one transaction is read once however many inputs it funds.
+        let mut wide = paying(&[1_000]);
+        wide.input = (0..=MAX_REFUND_FUNDING_READS as u8)
+            .map(|n| bitcoin::TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([n; 32]), 0),
+                ..Default::default()
+            })
+            .collect();
+        let reads = std::cell::Cell::new(0);
+        let any = |_: &bitcoin::Txid| {
+            reads.set(reads.get() + 1);
+            Some(funding(&[1_000]))
+        };
+        assert_eq!(refund_fee(&wide, htlc, value, any), None);
+        assert_eq!(reads.get(), MAX_REFUND_FUNDING_READS);
+        let mut shared = paying(&[1_000]);
+        shared.input = (0..4)
+            .map(|vout| bitcoin::TxIn {
+                previous_output: OutPoint::new(extra.txid, vout),
+                ..Default::default()
+            })
+            .collect();
+        reads.set(0);
+        assert_eq!(
+            refund_fee(&shared, htlc, value, |_| {
+                reads.set(reads.get() + 1);
+                Some(funding(&[500; 4]))
+            }),
+            Some(Amount::from_sat(1_000))
+        );
+        assert_eq!(reads.get(), 1);
+    }
+
+    /// A taker refund spread over more funding transactions than are read is
+    /// still contested when its family's fee is known: that fee stands in
+    /// for the refund's own, and the sweep still replaces the refund.
+    #[test]
+    fn a_refund_past_the_read_cap_is_contested_from_its_family_fee() {
+        let swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InSwept);
+        let value = Amount::from_sat(40_000);
+        let (htlc, _) = swap.funding.unwrap();
+        let build = |rate| Ok(sweep_at(&swap, value, rate));
+        let mut refund = refund_at(&swap, value, SPEND_FEE_RATE_FLOOR);
+        refund.input.extend(
+            (1..=MAX_REFUND_FUNDING_READS as u8 + 1).map(|n| bitcoin::TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([n; 32]), 0),
+                ..Default::default()
+            }),
+        );
+        let funding = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![bitcoin::TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let reads = std::cell::Cell::new(0);
+        let own = refund_fee(&refund, htlc, value, |_| {
+            reads.set(reads.get() + 1);
+            Some(funding.clone())
+        });
+        assert_eq!(own, None, "17 funding transactions are past the cap");
+        assert_eq!(reads.get(), MAX_REFUND_FUNDING_READS);
+        // The backend reads the refund's family as paying 2,500.
+        let family = Amount::from_sat(2_500);
+        let (refund_paid, to_beat, family_known) = refund_bid(Some(family), own).unwrap();
+        assert_eq!((refund_paid, to_beat, family_known), (family, family, true));
+        let (sweep, _) = outbid_refund(
+            build,
+            value,
+            SPEND_FEE_RATE_FLOOR,
+            1.0,
+            &refund,
+            refund_paid,
+            to_beat,
+        )
+        .unwrap()
+        .expect("the HTLC affords the bid");
+        let paid = fee_paid(&sweep, value).to_sat();
+        assert!(paid >= family.to_sat() + sweep.vsize() as u64);
+        assert!(
+            paid as f64 / sweep.vsize() as f64 > family.to_sat() as f64 / refund.vsize() as f64
+        );
+        // With only its own fee it bids against the refund alone, and with
+        // neither the contest waits a pass.
+        let own = Amount::from_sat(300);
+        assert_eq!(refund_bid(None, Some(own)), Some((own, own, false)));
+        assert_eq!(
+            refund_bid(Some(Amount::from_sat(1_800)), Some(own)),
+            Some((own, Amount::from_sat(1_800), true))
+        );
+        assert_eq!(refund_bid(None, None), None);
+    }
+
+    #[test]
+    fn a_pending_spend_is_bumped_past_the_step_while_its_output_is_unspent() {
+        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(refund_at(&swap, value, rate));
+        let pending = refund_at(&swap, value, 10.0);
+        match plan_spend(
+            build,
+            value,
+            10.0,
+            11.0,
+            1.0,
+            Some(pending.clone()),
+            |_, _| true,
+        )
+        .unwrap()
+        {
+            PlannedSpend::New { rate, replaces, .. } => {
+                assert_eq!(rate, 11.0);
+                assert_eq!(replaces, Some(pending.compute_txid()));
+            }
+            other => panic!("expected a bump, got {:?}", other),
+        }
+        // Under the replacement step.
+        assert_eq!(
+            plan_spend(
+                build,
+                value,
+                10.0,
+                10.5,
+                1.0,
+                Some(pending.clone()),
+                |_, _| { true }
+            )
+            .unwrap(),
+            PlannedSpend::Resend(pending.clone())
+        );
+        // Something spends its output: a replacement would evict it.
+        assert_eq!(
+            plan_spend(
+                build,
+                value,
+                10.0,
+                40.0,
+                1.0,
+                Some(pending.clone()),
+                |_, _| { false }
+            )
+            .unwrap(),
+            PlannedSpend::Resend(pending)
+        );
+    }
+
+    /// A bump recorded and never sent leaves the record ahead of the mempool.
+    /// The pending refund's own fee decides, so the recorded bump is sent.
+    #[test]
+    fn a_pending_spend_is_read_by_its_fee_not_by_the_record() {
+        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(refund_at(&swap, value, rate));
+        let sent = refund_at(&swap, value, 10.0);
+        let recorded = refund_at(&swap, value, 40.0);
+        match plan_spend(build, value, 40.0, 40.0, 1.0, Some(sent), |_, _| true).unwrap() {
+            PlannedSpend::New { tx, .. } => assert_eq!(tx.compute_txid(), recorded.compute_txid()),
+            other => panic!("expected the recorded bump, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_rate_the_dust_fallback_undoes_is_not_sent() {
+        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        // At 6 sat/vB the output would fall under dust, so the build falls
+        // back to the floor: no more fee than the spend already recorded.
+        let value = Amount::from_sat(1_000);
+        let build = |rate| Ok(refund_at(&swap, value, rate));
+        let floor = refund_at(&swap, value, SPEND_FEE_RATE_FLOOR);
+        assert_eq!(
+            plan_spend(
+                build,
+                value,
+                SPEND_FEE_RATE_FLOOR,
+                6.0,
+                1.0,
+                None,
+                |_, _| unreachable!()
+            )
+            .unwrap(),
+            PlannedSpend::Resend(floor.clone())
+        );
+        assert_eq!(
+            plan_spend(
+                build,
+                value,
+                SPEND_FEE_RATE_FLOOR,
+                6.0,
+                1.0,
+                Some(floor.clone()),
+                |_, _| true
+            )
+            .unwrap(),
+            PlannedSpend::Resend(floor)
+        );
+    }
+
+    fn sweep_at(swap: &LnMakerSwap, value: Amount, rate: f64) -> bitcoin::Transaction {
+        let (outpoint, _) = swap.funding.unwrap();
+        let p2wpkh = ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x07; 20]].concat());
+        swap.htlc
+            .create_hashlock_spend(
+                outpoint,
+                value,
+                &swap.privkey,
+                &swap.preimage.unwrap(),
+                p2wpkh,
+                rate,
+            )
+            .unwrap()
+    }
+
+    /// The node takes a replacement only if it pays the fees it evicts plus
+    /// the incremental relay fee for its own size, and pays more per vbyte
+    /// than the transaction it conflicts with.
+    fn replaces(
+        sweep: &bitcoin::Transaction,
+        refund: &bitcoin::Transaction,
+        value: Amount,
+        to_beat: Amount,
+    ) -> bool {
+        let feerate =
+            |tx: &bitcoin::Transaction| fee_paid(tx, value).to_sat() as f64 / tx.vsize() as f64;
+        fee_paid(sweep, value).to_sat() >= to_beat.to_sat() + sweep.vsize() as u64
+            && feerate(sweep) > feerate(refund)
+    }
+
+    #[test]
+    fn a_taker_refund_is_outbid_by_fee_and_by_feerate() {
+        let swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InSwept);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(sweep_at(&swap, value, rate));
+        // At the floor, at a high rate where the larger sweep would lose on
+        // feerate with only the fee step, and with a child of the refund
+        // paying 1500 sat.
+        for (refund_rate, child_fee) in [(2.0, 0), (40.0, 0), (2.0, 1_500)] {
+            let refund = refund_at(&swap, value, refund_rate);
+            let to_beat = fee_paid(&refund, value) + Amount::from_sat(child_fee);
+            let (sweep, rate) = outbid_refund(
+                build,
+                value,
+                refund_rate,
+                1.0,
+                &refund,
+                fee_paid(&refund, value),
+                to_beat,
+            )
+            .unwrap()
+            .expect("the HTLC can pay to outbid this refund");
+            assert!(
+                replaces(&sweep, &refund, value, to_beat),
+                "{:?}",
+                (refund_rate, child_fee, rate, sweep.vsize(), refund.vsize())
+            );
+            assert_eq!(sweep, sweep_at(&swap, value, rate));
+        }
+        // The sweep carries the preimage, so it is the larger spend, and at
+        // 40 sat/vB the fee step alone loses on feerate.
+        let floor = SPEND_FEE_RATE_FLOOR;
+        assert!(sweep_at(&swap, value, floor).vsize() > refund_at(&swap, value, floor).vsize());
+        let refund = refund_at(&swap, value, 40.0);
+        let to_beat = fee_paid(&refund, value);
+        assert!(!replaces(
+            &sweep_at(&swap, value, 41.0),
+            &refund,
+            value,
+            to_beat
+        ));
+        // The market rate is a floor of its own.
+        let refund = refund_at(&swap, value, 2.0);
+        let (_, rate) = outbid_refund(
+            build,
+            value,
+            30.0,
+            1.0,
+            &refund,
+            fee_paid(&refund, value),
+            fee_paid(&refund, value),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rate, 30.0);
+    }
+
+    /// A spend whose rate left dust paid the floor, and is recorded at the
+    /// floor, so it is bumped once the market falls to a rate the HTLC
+    /// affords instead of being resent at the floor for good.
+    #[test]
+    fn a_fallback_spend_records_the_floor_it_pays() {
+        let swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InSwept);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(sweep_at(&swap, value, rate));
+        let fallback = sweep_at(&swap, value, 300.0);
+        let recorded = rate_paid(&fallback, value, 300.0);
+        assert_eq!(recorded, SPEND_FEE_RATE_FLOOR);
+        assert_eq!(rate_paid(&sweep_at(&swap, value, 40.0), value, 40.0), 40.0);
+        match plan_spend(build, value, recorded, 40.0, 1.0, Some(fallback), |_, _| {
+            true
+        })
+        .unwrap()
+        {
+            PlannedSpend::New { rate, .. } => assert_eq!(rate, 40.0),
+            other => panic!("the floor spend was not bumped: {:?}", other),
+        }
+    }
+
+    /// A market rate the HTLC cannot afford does not stop the contest: the
+    /// sweep goes out at the least rate that replaces the refund's family.
+    #[test]
+    fn an_unaffordable_market_rate_outbids_at_the_least_that_replaces() {
+        let swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InSwept);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(sweep_at(&swap, value, rate));
+        let refund = refund_at(&swap, value, SPEND_FEE_RATE_FLOOR);
+        // The refund and a child pay 1800 sat; 300 sat/vB asks 45,000.
+        let to_beat = Amount::from_sat(1_800);
+        let (sweep, rate) = outbid_refund(
+            build,
+            value,
+            300.0,
+            1.0,
+            &refund,
+            fee_paid(&refund, value),
+            to_beat,
+        )
+        .unwrap()
+        .expect("13 sat/vB replaces the family");
+        assert_eq!(rate, 13.0);
+        assert_eq!(fee_paid(&sweep, value), Amount::from_sat(1_950));
+        assert!(replaces(&sweep, &refund, value, to_beat));
+    }
+
+    #[test]
+    fn a_refund_the_htlc_cannot_outbid_is_left_alone() {
+        let swap = sample_swap(LnDirection::SwapIn, LnMakerPhase::InSwept);
+        let value = Amount::from_sat(40_000);
+        let build = |rate| Ok(sweep_at(&swap, value, rate));
+        let refund = refund_at(&swap, value, SPEND_FEE_RATE_FLOOR);
+        // A child paying most of the HTLC: the rate that beats it would
+        // leave dust, and the floor fallback pays less than the refund.
+        // Beating 39,600 sat takes 39,750, more than the 39,706 that keeps
+        // the output above dust.
+        let to_beat = Amount::from_sat(39_600);
+        assert_eq!(
+            outbid_refund(
+                build,
+                value,
+                SPEND_FEE_RATE_FLOOR,
+                1.0,
+                &refund,
+                fee_paid(&refund, value),
+                to_beat
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_refund_this_swap_replaced_is_still_ours() {
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let (outpoint, value) = swap.funding.unwrap();
+        let refund_at = |rate| {
+            swap.htlc
+                .create_timelock_spend(outpoint, value, &swap.privkey, ScriptBuf::new(), rate)
+                .unwrap()
+        };
+        let (first, bumped, other) = (refund_at(10.0), refund_at(40.0), refund_at(20.0));
+        swap.refund_txid = Some(bumped.compute_txid());
+        swap.earlier_refund_txids = vec![first.compute_txid()];
+        assert!(is_our_refund(&swap, &bumped));
+        assert!(is_our_refund(&swap, &first));
+        assert!(!is_our_refund(&swap, &other));
+    }
+
     /// A restarted maker rebuilds its state from the encrypted wallet store,
     /// so the record must survive a real CBOR round-trip and still produce a
     /// byte-identical spend — that spend is the only way back to the money.
     #[test]
     fn persisted_record_survives_serialization_and_still_spends() {
-        let swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        let mut swap = sample_swap(LnDirection::SwapOut, LnMakerPhase::OutFunded);
+        swap.refund_feerate = Some(13.0);
+        swap.sweep_feerate = Some(20.0);
+        swap.earlier_refund_txids = vec![bitcoin::Txid::from_byte_array([0x43; 32])];
         let bytes = serde_cbor::to_vec(&swap.to_record()).unwrap();
         let restored = LnMakerSwap::from_record(serde_cbor::from_slice(&bytes).unwrap());
 
@@ -2139,16 +3276,32 @@ mod tests {
         assert_eq!(restored.invoice, swap.invoice);
         assert_eq!(restored.funding, swap.funding);
         assert_eq!(restored.funding_height, swap.funding_height);
+        assert_eq!(restored.refund_feerate, Some(13.0));
+        assert_eq!(restored.sweep_feerate, Some(20.0));
+        assert_eq!(restored.earlier_refund_txids, swap.earlier_refund_txids);
 
-        // The point of persisting at all: the refund still signs identically.
+        // The point of persisting at all: the refund still signs identically,
+        // at the rate it was first built at.
         let (outpoint, value) = swap.funding.unwrap();
         let original = swap
             .htlc
-            .create_timelock_spend(outpoint, value, &swap.privkey, ScriptBuf::new())
+            .create_timelock_spend(
+                outpoint,
+                value,
+                &swap.privkey,
+                ScriptBuf::new(),
+                swap.refund_feerate.unwrap(),
+            )
             .unwrap();
         let after_restart = restored
             .htlc
-            .create_timelock_spend(outpoint, value, &restored.privkey, ScriptBuf::new())
+            .create_timelock_spend(
+                outpoint,
+                value,
+                &restored.privkey,
+                ScriptBuf::new(),
+                restored.refund_feerate.unwrap(),
+            )
             .unwrap();
         assert_eq!(original, after_restart);
     }

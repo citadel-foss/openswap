@@ -12,8 +12,8 @@ use bitcoin::{Amount, OutPoint, ScriptBuf, Witness};
 use bitcoind::bitcoincore_rpc::RpcApi;
 
 use openswap::lightning::{
-    HtlcFunded, LightningBackend, LnEvent, MockLightningBackend, PaymentOutcome, SwapError,
-    SwapOutMaker, SwapOutParams, SwapOutTaker,
+    swap::SPEND_FEE_RATE_FLOOR, HtlcFunded, LightningBackend, LnEvent, MockLightningBackend,
+    PaymentOutcome, SwapError, SwapOutMaker, SwapOutParams, SwapOutTaker,
 };
 
 use crate::test_framework::*;
@@ -74,7 +74,12 @@ fn swap_out_happy_path(node: &mut Node) {
         )
         .unwrap();
     let claim_tx = taker
-        .claim_tx(outpoint, funding_output.value, miner_spk(bitcoind))
+        .claim_tx(
+            outpoint,
+            funding_output.value,
+            miner_spk(bitcoind),
+            SPEND_FEE_RATE_FLOOR,
+        )
         .unwrap();
     let claim_txid = bitcoind.client.send_raw_transaction(&claim_tx).unwrap();
     generate_blocks(bitcoind, 1);
@@ -129,7 +134,12 @@ fn swap_out_refund_path(node: &mut Node) {
     let (_txid, outpoint, funding_output) = fund_script(bitcoind, &spk, params.amount);
 
     let refund_tx = maker
-        .refund_tx(outpoint, funding_output.value, miner_spk(bitcoind))
+        .refund_tx(
+            outpoint,
+            funding_output.value,
+            miner_spk(bitcoind),
+            SPEND_FEE_RATE_FLOOR,
+        )
         .unwrap();
 
     // Too early: CSV not yet satisfied.
@@ -195,6 +205,7 @@ fn swap_out_settle_rejects_foreign_spend() {
             OutPoint::default(),
             Amount::from_sat(50_000),
             ScriptBuf::new(),
+            SPEND_FEE_RATE_FLOOR,
         )
         .unwrap();
     let mut forged_claim = claim.clone();

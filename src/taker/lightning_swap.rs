@@ -31,7 +31,9 @@ use bitcoin::{
 
 use crate::{
     lightning::{
-        invoice::verify_invoice, swap::SwapHtlc, InvoiceParams, LightningBackend, LnEvent, Preimage,
+        invoice::verify_invoice,
+        swap::{htlc_funding_feerate, htlc_spend_feerate, SwapHtlc},
+        InvoiceParams, LightningBackend, LnEvent, Preimage,
     },
     protocol::{
         common_messages::{GetOffer, MakerToTakerMessage, Offer, TakerToMakerMessage},
@@ -41,7 +43,7 @@ use crate::{
             LnSwapInRequest, LnSwapOutClaimed, LnSwapOutPaid, LnSwapOutRequest,
         },
     },
-    utill::{generate_keypair, read_message, send_message, MIN_RELAY_FEE_RATE},
+    utill::{generate_keypair, read_message, send_message},
     wallet::{AddressType, LnPendingSwap},
 };
 
@@ -79,6 +81,11 @@ const EARLY_REJECT_WINDOW: Duration = Duration::from_secs(5);
 /// maker's own offer, so the maker sets both the ceiling and the charge.
 /// This is the bound the taker applies regardless of what was advertised.
 const MAX_FEE_PERCENT: u64 = 5;
+
+/// Fails one of recovery's two chain lookups, as a backend error would:
+/// 1 the confirmed-spend check, 2 the mempool check. Set by tests.
+#[cfg(feature = "integration-test")]
+pub static FAIL_RECOVERY_LOOKUP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Parameters of a Lightning submarine swap.
 #[derive(Debug, Clone)]
@@ -491,6 +498,10 @@ impl Taker {
         // the only copy of our branch key.
         let (outpoint, actual_value) = {
             let mut wallet = self.write_wallet()?;
+            // Priced to confirm while the maker still waits for it, as the
+            // maker prices its swap-out funding: at the relay floor a busy
+            // chain leaves it unconfirmed and the swap is abandoned.
+            let feerate = htlc_funding_feerate(&wallet.blockchain);
             // One split, one destination: an HTLC output is a single exact
             // payment, with no hop to reimburse and nothing to randomize.
             // A Lightning HTLC is a script-path P2WSH contract, priced like
@@ -498,14 +509,14 @@ impl Taker {
             let plan = wallet.plan_funding(
                 value,
                 1,
-                MIN_RELAY_FEE_RATE,
+                feerate,
                 u32::MAX,
                 None,
                 None,
                 None,
                 crate::protocol::ProtocolVersion::Legacy,
             )?;
-            let result = wallet.execute_funding_plan(&plan, &[address], MIN_RELAY_FEE_RATE)?;
+            let result = wallet.execute_funding_plan(&plan, &[address], feerate)?;
             let tx = result
                 .funding_txes
                 .into_iter()
@@ -806,11 +817,16 @@ impl Taker {
             }
             wallet.save_to_disk()?;
         }
+        #[cfg(feature = "integration-test")]
+        if self.behavior == super::api::TakerBehavior::StopBeforeSwapOutClaim {
+            return Err(general("Test: stopped before the swap-out claim"));
+        }
 
         let destination = self
             .write_wallet()?
             .get_next_external_address(AddressType::P2WPKH)?
             .script_pubkey();
+        let feerate = htlc_spend_feerate(&self.read_wallet()?.blockchain);
         let claim_tx = htlc
             .create_hashlock_spend(
                 funded.outpoint,
@@ -818,6 +834,7 @@ impl Taker {
                 &hashlock_privkey,
                 &preimage,
                 destination,
+                feerate,
             )
             .map_err(|e| general(format!("claim build: {e}")))?;
         let claim_txid = self.read_wallet()?.send_tx(&claim_tx)?;
@@ -1068,6 +1085,7 @@ impl Taker {
             .write_wallet()?
             .get_next_external_address(AddressType::P2WPKH)?
             .script_pubkey();
+        let feerate = htlc_spend_feerate(&self.read_wallet()?.blockchain);
         let claim_tx = htlc2
             .create_hashlock_spend(
                 funded2.outpoint,
@@ -1075,6 +1093,7 @@ impl Taker {
                 &hashlock_privkey,
                 &preimage,
                 destination,
+                feerate,
             )
             .map_err(|e| general(format!("claim build: {e}")))?;
         let claim_txid = self.read_wallet()?.send_tx(&claim_tx)?;
@@ -1131,13 +1150,61 @@ impl Taker {
                 }
             };
             let htlc = SwapHtlc::from_redeemscript(record.redeemscript.clone(), record.locktime);
+            let script = htlc
+                .script_pubkey()
+                .map_err(|e| general(format!("htlc spk: {e}")))?;
+
+            // Only an unspent HTLC is built for. A confirmed spend closes the
+            // record. A spend still in the mempool is left alone: priced at a
+            // newer rate, a rebuild could replace our own earlier recovery,
+            // or the maker's sweep, and evict whatever spends its output. A
+            // failed lookup skips the record until the next run. Both
+            // lookups stay cheap on Core, with no block scan.
+            let (confirmed, live) = {
+                use crate::wallet::blockchain::Blockchain;
+                let wallet = self.read_wallet()?;
+                (
+                    wallet.blockchain.is_confirmed_spend(&outpoint, &script),
+                    wallet
+                        .blockchain
+                        .get_tx_out(&outpoint.txid, outpoint.vout, Some(true)),
+                )
+            };
+            #[cfg(feature = "integration-test")]
+            let (confirmed, live) = {
+                use crate::wallet::WalletError;
+                let failed = || WalletError::General("Test: lookup failed".to_string());
+                match FAIL_RECOVERY_LOOKUP.load(std::sync::atomic::Ordering::SeqCst) {
+                    1 => (Err(failed()), live),
+                    2 => (confirmed, Err(failed())),
+                    _ => (confirmed, live),
+                }
+            };
+            match (confirmed, live) {
+                (Ok(true), _) => {
+                    self.remove_pending_swap(&swap_id)?;
+                    outcomes.push(format!("{swap_id}: already resolved on-chain"));
+                    continue;
+                }
+                (Ok(false), Ok(Some(_))) => {}
+                (Ok(false), Ok(None)) => {
+                    outcomes.push(format!("{swap_id}: spend pending, awaiting confirmation"));
+                    continue;
+                }
+                (Err(e), _) | (Ok(false), Err(e)) => {
+                    outcomes.push(format!("{swap_id}: spend status unknown: {e:?}"));
+                    continue;
+                }
+            }
+
             let destination = self
                 .write_wallet()?
                 .get_next_external_address(AddressType::P2WPKH)?
                 .script_pubkey();
+            let feerate = htlc_spend_feerate(&self.read_wallet()?.blockchain);
             let spend = if record.is_swap_in {
                 // Our money, refund branch (CSV-gated).
-                htlc.create_timelock_spend(outpoint, value, &record.privkey, destination)
+                htlc.create_timelock_spend(outpoint, value, &record.privkey, destination, feerate)
             } else {
                 // Claim with our own preimage.
                 let preimage = Preimage(
@@ -1145,7 +1212,14 @@ impl Taker {
                         .preimage
                         .ok_or_else(|| general("swap-out record without preimage"))?,
                 );
-                htlc.create_hashlock_spend(outpoint, value, &record.privkey, &preimage, destination)
+                htlc.create_hashlock_spend(
+                    outpoint,
+                    value,
+                    &record.privkey,
+                    &preimage,
+                    destination,
+                    feerate,
+                )
             }
             .map_err(|e| general(format!("recovery spend build: {e}")))?;
 
@@ -1161,9 +1235,6 @@ impl Taker {
                 Err(e) => log::debug!("{swap_id}: recovery spend not accepted: {e:?}"),
             }
 
-            let script = htlc
-                .script_pubkey()
-                .map_err(|e| general(format!("htlc spk: {e}")))?;
             let settled = {
                 use crate::wallet::blockchain::Blockchain;
                 self.read_wallet()?

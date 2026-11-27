@@ -1054,6 +1054,9 @@ impl MakerServer {
         // Misconfiguration (no txindex, dead ZMQ) must fail here, not mid-swap.
         if let AnyBlockchain::CoreRPC(core) = &blockchain {
             core.check_node_requirements().map_err(MakerError::Wallet)?;
+            #[cfg(feature = "lightning")]
+            core.require_v24_for_lightning(config.ldk_server_url.is_some())
+                .map_err(MakerError::Wallet)?;
         }
         // Take the passphrase out of the config: the wallet keeps the derived
         // key material, so the cleartext passphrase must not linger in the
@@ -3996,6 +3999,125 @@ impl MakerTrait for MakerServer {
             .tx_block_height(txid)
             .map_err(MakerError::Wallet)?;
         Ok(height.map(|h| h as u32))
+    }
+
+    #[cfg(feature = "lightning")]
+    fn htlc_spend_feerate(&self) -> f64 {
+        match lock_debug!(self.wallet.read()) {
+            Ok(wallet) => crate::lightning::swap::htlc_spend_feerate(&wallet.blockchain),
+            Err(_) => {
+                log::warn!("lightning: wallet lock failed; spending the HTLC at the floor rate");
+                crate::lightning::swap::SPEND_FEE_RATE_FLOOR
+            }
+        }
+    }
+
+    #[cfg(feature = "lightning")]
+    fn htlc_replacement_increment(&self) -> f64 {
+        match lock_debug!(self.wallet.read()) {
+            Ok(wallet) => wallet.blockchain.replacement_increment_rate(),
+            Err(_) => crate::utill::MIN_RELAY_FEE_RATE,
+        }
+    }
+
+    #[cfg(feature = "lightning")]
+    fn htlc_pending_spend(
+        &self,
+        outpoint: &bitcoin::OutPoint,
+        script: &bitcoin::ScriptBuf,
+    ) -> Result<Option<Transaction>, MakerError> {
+        #[cfg(feature = "integration-test")]
+        if crate::maker::lightning_handlers::FAIL_PENDING_SPEND_LOOKUP
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(MakerError::General("Test: pending spend lookup failed"));
+        }
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        // Core answers from the mempool alone, with no block scan; callers
+        // ask only once the HTLC has no confirmed spend.
+        match &wallet.blockchain {
+            AnyBlockchain::CoreRPC(core) => core.mempool_spending_transaction(outpoint),
+            AnyBlockchain::Electrum(_) => {
+                wallet
+                    .blockchain
+                    .spending_transaction(outpoint, script.as_script(), None)
+            }
+        }
+        .map_err(MakerError::Wallet)
+    }
+
+    #[cfg(feature = "lightning")]
+    fn mempool_package_fee(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Result<Option<bitcoin::Amount>, MakerError> {
+        #[cfg(feature = "integration-test")]
+        if crate::maker::lightning_handlers::FAIL_REFUND_FAMILY_LOOKUP
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(MakerError::General("Test: refund family lookup failed"));
+        }
+        let (config, shutdown) = {
+            let wallet = lock_debug!(self.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+            match &wallet.blockchain {
+                AnyBlockchain::CoreRPC(core) => {
+                    return core.mempool_package_fee(txid).map_err(MakerError::Wallet)
+                }
+                AnyBlockchain::Electrum(electrum) => electrum.side_connection_config(),
+            }
+        };
+        // The family takes several round trips to read. They go over a
+        // connection of their own, after the wallet lock is released, and the
+        // watchdog waits at most 20 seconds for the whole answer.
+        crate::wallet::Electrum::package_fee_on_side_connection(
+            config,
+            shutdown,
+            *txid,
+            std::time::Duration::from_secs(20),
+        )
+        .map_err(MakerError::Wallet)
+    }
+
+    #[cfg(feature = "lightning")]
+    fn hold_for_replacement(
+        &self,
+        key: &str,
+        outpoint: &bitcoin::OutPoint,
+    ) -> Result<bool, MakerError> {
+        Ok(lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .hold_for_replacement(key, *outpoint))
+    }
+
+    #[cfg(feature = "lightning")]
+    fn sync_wallet_once(&self) -> Result<(), MakerError> {
+        lock_debug!(self.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .sync_once_and_save(&self.shutdown)
+            .map_err(MakerError::Wallet)
+    }
+
+    #[cfg(feature = "lightning")]
+    fn release_replacement_hold(&self, key: &str, replaced: Option<&bitcoin::OutPoint>) {
+        if let Ok(mut wallet) = lock_debug!(self.wallet.write()) {
+            if let Some(outpoint) = replaced {
+                wallet.release_swap_locks(key, Some(std::slice::from_ref(outpoint)));
+            }
+            wallet.release_swap_locks(key, None);
+        }
+    }
+
+    #[cfg(feature = "lightning")]
+    fn is_output_unspent(&self, outpoint: &bitcoin::OutPoint) -> Result<bool, MakerError> {
+        use crate::wallet::Blockchain;
+        Ok(lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .blockchain
+            .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+            .map_err(MakerError::Wallet)?
+            .is_some())
     }
 
     #[cfg(feature = "lightning")]

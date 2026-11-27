@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use bitcoin::{hashes::sha256, Amount, Network, TxOut};
+use bitcoin::{hashes::sha256, Amount, Network, TxOut, Txid};
 use bitcoind::bitcoincore_rpc::{json::ScanTxOutRequest, RpcApi};
 use openswap::{
     blocklist::BlocklistError,
@@ -22,10 +22,14 @@ use openswap::{
         lightning_handlers::{ln_watchdog_tick_now, LnMakerPhase, ADMIT_NEW_SWAP_OUTS},
         MakerServer,
     },
-    taker::{error::TakerError, lightning_swap::LnSwapParams},
+    taker::{
+        error::TakerError,
+        lightning_swap::{LnSwapParams, FAIL_RECOVERY_LOOKUP},
+    },
     wallet::AddressType,
 };
 
+use super::{maker_restart::pause_block_generation, tx_fee, SpendFeerate};
 use crate::test_framework::*;
 
 /// Two mock Lightning nodes over one shared ledger: the maker's first, the
@@ -40,6 +44,18 @@ fn maker_and_taker_nodes() -> (Arc<MockLightningBackend>, Arc<MockLightningBacke
         Some(500_000_000),
     );
     (maker_ln, taker_ln)
+}
+
+/// The txid of the spend a recovery pass broadcast, from its outcome lines.
+fn recovery_txid(history: &[String]) -> Option<Txid> {
+    history.iter().find_map(|line| {
+        let (_, outcome) = line.split_once(": ")?;
+        let txid = match outcome.strip_prefix("recovered via ") {
+            Some(txid) => txid,
+            None => outcome.strip_prefix("recovery ")?.split_once(' ')?.0,
+        };
+        txid.parse().ok()
+    })
 }
 
 /// One maker, one taker; a swap-in followed by a swap-out over the same
@@ -65,6 +81,7 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
     let maker = world.makers()[0].inner().clone();
     let maker_address = world.makers()[0].address();
     let taker = world.taker_mut().inner_mut();
+    let _market = SpendFeerate::set(10.0);
 
     // ---- Swap-in: taker pays on-chain, gains Lightning balance ----
     let swap_in = taker
@@ -79,6 +96,19 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
     assert!(
         swap_in.fee.to_sat() >= 500,
         "fee must include the maker's base fee"
+    );
+    // The taker funded the HTLC at the market rate, not the relay floor.
+    let funding_txid = swap_in.funding_outpoint.txid;
+    let funding_vsize = bitcoind
+        .client
+        .get_raw_transaction(&funding_txid, None)
+        .unwrap()
+        .vsize();
+    let funding_rate = tx_fee(bitcoind, &funding_txid).to_sat() as f64 / funding_vsize as f64;
+    assert!(
+        funding_rate >= 10.0,
+        "the taker must fund the HTLC at the 10 sat/vB market rate, paid {:.2}",
+        funding_rate
     );
 
     // The maker learned the preimage and swept the HTLC: its claim spends
@@ -127,6 +157,11 @@ fn lightning_submarine_swaps_e2e(world: &mut World, taker_ln: Arc<MockLightningB
             .and_then(|info| info.confirmations)
             .unwrap_or(0)
             >= 1
+    );
+    assert_eq!(
+        tx_fee(bitcoind, &claim_txid),
+        Amount::from_sat(1_500),
+        "the taker's claim must pay the market rate, 10 sat/vB for 150 vB"
     );
 
     // Both swaps fully resolved: no taker-side recovery records remain.
@@ -259,6 +294,7 @@ fn lightning_swap_in_refuses_blocklisted_funding(
 
     // The maker never paid, so it never learned the preimage: only the
     // taker's refund branch can resolve the HTLC.
+    let _market = SpendFeerate::set(10.0);
     let history = recover_all_lightning_swaps(taker, Duration::from_secs(300));
     assert!(
         history
@@ -266,6 +302,12 @@ fn lightning_swap_in_refuses_blocklisted_funding(
             .any(|line| line.contains("recovered via") || line.contains("already resolved")),
         "the taker must refund its swap-in HTLC, got: {:?}",
         history
+    );
+    let refund_txid = recovery_txid(&history).expect("recovery reports its refund txid");
+    assert_eq!(
+        tx_fee(world.bitcoind(), &refund_txid),
+        Amount::from_sat(1_500),
+        "the recovered refund must pay the market rate, 10 sat/vB for 150 vB"
     );
 
     // The swap failing is not enough: the maker must have refused this swap's
@@ -471,5 +513,101 @@ fn lightning_swap_out_refuses_blocklisted_funding(world: &mut World) {
         outcomes[0].contains("no on-chain commitment"),
         "{:?}",
         outcomes
+    );
+}
+
+/// A taker that stops once the maker has funded its swap-out, before its
+/// claim goes out, leaves the HTLC to recovery. Recovery claims it with the
+/// preimage, priced from the market like the direct claim, and a later pass
+/// at a higher rate does not replace that claim while it is pending.
+#[world_test(
+    backend = BitcoindBackend,
+    bind = [(maker_ln, taker_ln) = maker_and_taker_nodes()],
+    maker_behaviors = [Normal],
+    takers = [StopBeforeSwapOutClaim],
+    maker_lightning = [maker_ln],
+    taker_lightning = [taker_ln],
+    setup = [
+        fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH),
+        start_makers(120),
+    ],
+)]
+fn lightning_swap_out_recovery_claims_at_the_market_rate(world: &mut World) {
+    // A new swap-out needs admission open (#1239).
+    let _admitted = Switch::on(&ADMIT_NEW_SWAP_OUTS);
+    let framework = world.framework().clone();
+    let bitcoind = &framework.bitcoind;
+    let maker_address = world.makers()[0].address();
+    let taker = world.taker_mut().inner_mut();
+    let market = SpendFeerate::set(10.0);
+
+    let result = taker.lightning_swap_out(LnSwapParams {
+        amount: Amount::from_sat(40_000),
+        maker_address: Some(maker_address),
+        locktime: Some(30),
+        min_confirmations: 1,
+    });
+    assert!(
+        result.is_err(),
+        "the taker must stop before its claim, got: {:?}",
+        result
+    );
+
+    // The chain holds still, so the claim is still in the mempool when
+    // recovery runs again after the market moves.
+    pause_block_generation(&framework);
+    let first = taker.recover_lightning_swaps().unwrap();
+    let claim_txid = recovery_txid(&first).expect("recovery reports its claim txid");
+    assert_eq!(
+        tx_fee(bitcoind, &claim_txid),
+        Amount::from_sat(1_500),
+        "the recovered claim must pay the market rate, 10 sat/vB for 150 vB"
+    );
+
+    // A second pass at a higher rate leaves the pending claim alone. A
+    // rebuild would replace it, and evict anything spending its output.
+    market.set_rate(40.0);
+    let second = taker.recover_lightning_swaps().unwrap();
+    assert_eq!(
+        recovery_txid(&second),
+        None,
+        "recovery sent another spend: {:?}",
+        second
+    );
+    assert!(
+        bitcoind.client.get_mempool_entry(&claim_txid).is_ok(),
+        "the first claim left the mempool: {:?}",
+        second
+    );
+
+    // Either lookup failing keeps the record and sends nothing, until a
+    // later pass can read the chain again.
+    for lookup in [1, 2] {
+        FAIL_RECOVERY_LOOKUP.store(lookup, std::sync::atomic::Ordering::SeqCst);
+        let failed = taker.recover_lightning_swaps().unwrap();
+        FAIL_RECOVERY_LOOKUP.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            failed.len() == 1 && failed[0].contains("spend status unknown"),
+            "lookup {lookup} failing must keep the record: {:?}",
+            failed
+        );
+        assert!(
+            bitcoind.client.get_mempool_entry(&claim_txid).is_ok(),
+            "lookup {} failing replaced the claim",
+            lookup
+        );
+    }
+
+    framework.set_block_gen_paused(false);
+    recover_all_lightning_swaps(taker, Duration::from_secs(300));
+    assert!(
+        bitcoind
+            .client
+            .get_raw_transaction_info(&claim_txid, None)
+            .ok()
+            .and_then(|info| info.confirmations)
+            .unwrap_or(0)
+            >= 1,
+        "the first claim must be the spend that confirms"
     );
 }

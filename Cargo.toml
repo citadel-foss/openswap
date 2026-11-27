@@ -38,6 +38,9 @@ crossterm = "0.29.0"
 zmq = "0.10.0"
 tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"]}
 rustls = { version = "0.23.40", default-features = false, features = ["std", "ring"] }
+# Root certificates for the Lightning watchdog's own TLS side connection to an
+# Electrum server, the ones `electrum-client` uses.
+webpki-roots = { version = "1.0", optional = true }
 nostr = "0.44.2"
 crossbeam-channel = "0.5.15"
 # Lightning (optional, behind the `lightning` feature).
@@ -66,7 +69,7 @@ default = []
 # Only used for running the integration tests
 integration-test = []
 # Lightning backend over an LDK Server sidecar (gRPC).
-lightning = ["dep:ldk-server-client", "dep:tokio", "dep:lightning-invoice"]
+lightning = ["dep:ldk-server-client", "dep:tokio", "dep:lightning-invoice", "dep:webpki-roots"]
 
 [package.metadata.cargo-machete]
 ignored = ["rustls"]

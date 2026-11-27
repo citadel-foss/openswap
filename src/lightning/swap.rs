@@ -46,7 +46,11 @@ use bitcoin::{
 
 use crate::{
     protocol::{contract::create_contract_redeemscript, error::ProtocolError, Hash160},
-    utill::{fee_at_rate_sats, generate_keypair, redeemscript_to_scriptpubkey},
+    utill::{
+        capped_fee, generate_keypair, redeemscript_to_scriptpubkey, LEGACY_CONTRACT_SPEND_VSIZE,
+        MIN_RELAY_FEE_RATE,
+    },
+    wallet::{Blockchain, FeePriority, WalletError},
 };
 
 use super::{
@@ -55,13 +59,82 @@ use super::{
     types::{InvoiceParams, LnEvent, PaymentId, Preimage},
 };
 
-/// Virtual size (vB) assumed for HTLC spend transactions when computing the
-/// fixed fee. POC simplification: no feerate estimation.
-const SPEND_TX_VSIZE: u64 = 150;
+/// Virtual size (vB) an HTLC spend is priced at: the legacy contract spend
+/// model, which upper-bounds both branches of the same script.
+pub(crate) const SPEND_TX_VSIZE: u64 = LEGACY_CONTRACT_SPEND_VSIZE;
 
-/// Feerate (sat/vB) HTLC spends are built at. Fixed for the same reason as
-/// [`SPEND_TX_VSIZE`]; a production path would estimate it.
-const SPEND_FEE_RATE: f64 = 2.0;
+/// Lowest feerate (sat/vB) an HTLC spend is built at, and the one every
+/// spend used before spends were priced from the backend's estimate. A
+/// maker refund recorded before then is rebuilt at this rate, so it keeps
+/// the txid the record names.
+pub const SPEND_FEE_RATE_FLOOR: f64 = 2.0;
+
+/// Feerate (sat/vB) to spend an HTLC at: the backend's estimate for about an
+/// hour, never below [`SPEND_FEE_RATE_FLOOR`]. Both branches are time-bound,
+/// so a spend priced under the market can still be unconfirmed when the
+/// other side's branch opens.
+pub fn htlc_spend_feerate<B: Blockchain + ?Sized>(chain: &B) -> f64 {
+    #[cfg(feature = "integration-test")]
+    if let Some(rate) = test_market_feerate() {
+        return spend_feerate_from(Ok(rate));
+    }
+    spend_feerate_with(|priority| chain.estimate_feerate(priority))
+}
+
+/// Feerate (sat/vB) to fund an HTLC at: the backend's estimate for about an
+/// hour, never below the relay floor, as the maker prices its own HTLC
+/// funding. Funding left at the floor on a busy chain can still be
+/// unconfirmed when the counterparty gives up on the swap.
+pub fn htlc_funding_feerate<B: Blockchain + ?Sized>(chain: &B) -> f64 {
+    #[cfg(feature = "integration-test")]
+    if let Some(rate) = test_market_feerate() {
+        return funding_feerate_from(Ok(rate));
+    }
+    funding_feerate_from(chain.estimate_feerate(FeePriority::High))
+}
+
+fn funding_feerate_from(estimate: Result<f64, WalletError>) -> f64 {
+    match estimate {
+        Ok(rate) if rate.is_finite() => rate.max(MIN_RELAY_FEE_RATE),
+        other => {
+            log::warn!(
+                "lightning: no high-priority feerate estimate ({other:?}); \
+                 funding the HTLC at the relay floor"
+            );
+            MIN_RELAY_FEE_RATE
+        }
+    }
+}
+
+/// The market rate a test names, since regtest has no fee estimates.
+#[cfg(feature = "integration-test")]
+fn test_market_feerate() -> Option<f64> {
+    std::env::var(SPEND_FEERATE_ENV)
+        .ok()
+        .and_then(|rate| rate.parse::<f64>().ok())
+}
+
+fn spend_feerate_with(estimate: impl FnOnce(FeePriority) -> Result<f64, WalletError>) -> f64 {
+    spend_feerate_from(estimate(FeePriority::High))
+}
+
+/// Names the market feerate [`htlc_spend_feerate`] and
+/// [`htlc_funding_feerate`] see in test builds.
+#[cfg(feature = "integration-test")]
+pub const SPEND_FEERATE_ENV: &str = "OPENSWAP_HTLC_SPEND_FEERATE";
+
+fn spend_feerate_from(estimate: Result<f64, WalletError>) -> f64 {
+    match estimate {
+        Ok(rate) if rate.is_finite() => rate.max(SPEND_FEE_RATE_FLOOR),
+        other => {
+            log::warn!(
+                "lightning: no high-priority feerate estimate ({other:?}); \
+                 spending the HTLC at {SPEND_FEE_RATE_FLOOR} sat/vB"
+            );
+            SPEND_FEE_RATE_FLOOR
+        }
+    }
+}
 
 /// Blocks kept between the latest a Lightning payment may resolve and the
 /// moment the counterparty's refund matures. The payer only learns the
@@ -258,7 +331,8 @@ impl SwapHtlc {
         Ok(())
     }
 
-    /// Builds and signs the maker's hashlock spend, revealing `preimage`.
+    /// Builds and signs the maker's hashlock spend, revealing `preimage`,
+    /// paying `feerate` sat/vB.
     ///
     /// Witness: `[sig, preimage (32B), redeemscript]`, input sequence
     /// [`Sequence::ZERO`] (satisfies the `0 OP_CSV` of the hashlock branch).
@@ -269,8 +343,10 @@ impl SwapHtlc {
         hashlock_privkey: &SecretKey,
         preimage: &Preimage,
         destination: ScriptBuf,
+        feerate: f64,
     ) -> Result<Transaction, SwapError> {
-        let mut tx = self.build_spend(outpoint, input_value, Sequence::ZERO, destination)?;
+        let mut tx =
+            self.build_spend(outpoint, input_value, Sequence::ZERO, destination, feerate)?;
         let sig = self.sign_input(&tx, input_value, hashlock_privkey)?;
         let witness = &mut tx.input[0].witness;
         witness.push(sig.to_vec());
@@ -279,7 +355,8 @@ impl SwapHtlc {
         Ok(tx)
     }
 
-    /// Builds and signs the taker's timelock refund spend.
+    /// Builds and signs the taker's timelock refund spend, paying `feerate`
+    /// sat/vB.
     ///
     /// Witness: `[sig, <empty>, redeemscript]`, input sequence
     /// `Sequence::from_height(locktime)` (satisfies the `locktime OP_CSV` of
@@ -291,12 +368,14 @@ impl SwapHtlc {
         input_value: Amount,
         timelock_privkey: &SecretKey,
         destination: ScriptBuf,
+        feerate: f64,
     ) -> Result<Transaction, SwapError> {
         let mut tx = self.build_spend(
             outpoint,
             input_value,
             Sequence::from_height(self.locktime),
             destination,
+            feerate,
         )?;
         let sig = self.sign_input(&tx, input_value, timelock_privkey)?;
         let witness = &mut tx.input[0].witness;
@@ -327,22 +406,36 @@ impl SwapHtlc {
         })
     }
 
-    /// Builds the unsigned single-input single-output spend skeleton with a
-    /// fixed fee derived from [`SPEND_TX_VSIZE`] and [`SPEND_FEE_RATE`].
+    /// Builds the unsigned single-input single-output spend skeleton, paying
+    /// [`SPEND_TX_VSIZE`] at `feerate` sat/vB.
     fn build_spend(
         &self,
         outpoint: OutPoint,
         input_value: Amount,
         sequence: Sequence,
         destination: ScriptBuf,
+        feerate: f64,
     ) -> Result<Transaction, SwapError> {
-        let fee = Amount::from_sat(
-            fee_at_rate_sats(SPEND_TX_VSIZE, SPEND_FEE_RATE)
-                .ok_or_else(|| SwapError::Validation("spend fee overflow".to_string()))?,
-        );
-        let output_value = input_value.checked_sub(fee).ok_or_else(|| {
-            SwapError::Validation(format!("fee {fee} exceeds input value {input_value}"))
+        // Below the floor is a caller bug, not a market rate: it would let a
+        // spend that cannot fit the floor fee pay less than every spend did.
+        if !feerate.is_finite() || feerate < SPEND_FEE_RATE_FLOOR {
+            return Err(SwapError::Validation(format!(
+                "no spend fee at {feerate} sat/vB"
+            )));
+        }
+        // An estimate is a backend's word, so a rate whose fee would leave no
+        // relayable output falls back to the floor instead of failing the
+        // spend on every rebuild while the other branch's timelock runs.
+        let fee = capped_fee(
+            &[feerate, SPEND_FEE_RATE_FLOOR],
+            SPEND_TX_VSIZE,
+            input_value,
+            &destination,
+        )
+        .ok_or_else(|| {
+            SwapError::Validation(format!("no fee leaves {input_value} a relayable output"))
         })?;
+        let output_value = input_value - fee;
         Ok(Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -488,19 +581,26 @@ impl SwapInTaker {
     }
 
     /// Builds the signed refund transaction spending the HTLC through the
-    /// timelock branch. Broadcastable only `locktime` blocks after the
-    /// funding output confirms.
+    /// timelock branch at `feerate` sat/vB. Broadcastable only `locktime`
+    /// blocks after the funding output confirms.
     pub fn refund_tx(
         &self,
         outpoint: OutPoint,
         input_value: Amount,
         destination: ScriptBuf,
+        feerate: f64,
     ) -> Result<Transaction, SwapError> {
         let htlc = self
             .htlc
             .as_ref()
             .ok_or(SwapError::NotReady("refund_tx before on_accept"))?;
-        htlc.create_timelock_spend(outpoint, input_value, &self.timelock_privkey, destination)
+        htlc.create_timelock_spend(
+            outpoint,
+            input_value,
+            &self.timelock_privkey,
+            destination,
+            feerate,
+        )
     }
 }
 
@@ -641,12 +741,13 @@ impl SwapInMaker {
     }
 
     /// Builds the signed claim transaction sweeping the HTLC through the
-    /// hashlock branch with the learned preimage.
+    /// hashlock branch with the learned preimage, at `feerate` sat/vB.
     pub fn claim_tx(
         &self,
         outpoint: OutPoint,
         input_value: Amount,
         destination: ScriptBuf,
+        feerate: f64,
     ) -> Result<Transaction, SwapError> {
         let htlc = self
             .htlc
@@ -662,6 +763,7 @@ impl SwapInMaker {
             &self.hashlock_privkey,
             preimage,
             destination,
+            feerate,
         )
     }
 }
@@ -756,6 +858,7 @@ mod tests {
                 &privkey,
                 &preimage,
                 ScriptBuf::new(),
+                SPEND_FEE_RATE_FLOOR,
             )
             .unwrap();
         assert_eq!(tx.input[0].sequence, Sequence::ZERO);
@@ -776,6 +879,7 @@ mod tests {
                 Amount::from_sat(100_000),
                 &privkey,
                 ScriptBuf::new(),
+                SPEND_FEE_RATE_FLOOR,
             )
             .unwrap();
         assert_eq!(tx.input[0].sequence, Sequence::from_height(20));
@@ -799,6 +903,7 @@ mod tests {
                 &privkey,
                 &preimage,
                 ScriptBuf::new(),
+                SPEND_FEE_RATE_FLOOR,
             )
             .unwrap();
         assert_eq!(htlc.extract_preimage(&claim), Some(preimage));
@@ -810,6 +915,7 @@ mod tests {
                 Amount::from_sat(100_000),
                 &privkey,
                 ScriptBuf::new(),
+                SPEND_FEE_RATE_FLOOR,
             )
             .unwrap();
         assert_eq!(htlc.extract_preimage(&refund), None);
@@ -826,6 +932,166 @@ mod tests {
     }
 
     #[test]
+    fn spend_pays_its_feerate_on_both_branches() {
+        let (htlc, preimage, ..) = test_htlc();
+        let (_, privkey) = generate_keypair();
+        let input = Amount::from_sat(100_000);
+        for (feerate, fee) in [(SPEND_FEE_RATE_FLOOR, 300), (12.5, 1_875), (40.0, 6_000)] {
+            let claim = htlc
+                .create_hashlock_spend(
+                    OutPoint::default(),
+                    input,
+                    &privkey,
+                    &preimage,
+                    ScriptBuf::new(),
+                    feerate,
+                )
+                .unwrap();
+            let refund = htlc
+                .create_timelock_spend(
+                    OutPoint::default(),
+                    input,
+                    &privkey,
+                    ScriptBuf::new(),
+                    feerate,
+                )
+                .unwrap();
+            assert_eq!(claim.output[0].value, input - Amount::from_sat(fee));
+            assert_eq!(refund.output[0].value, input - Amount::from_sat(fee));
+        }
+    }
+
+    /// The fee is charged on a model, so the model must cover the largest
+    /// spend either branch can sign: a P2TR payout is the widest output the
+    /// maker and taker pay to.
+    #[test]
+    fn spend_vsize_model_covers_a_signed_spend() {
+        let preimage = Preimage([0xAB; 32]);
+        let (hashlock_pubkey, privkey) = generate_keypair();
+        let (timelock_pubkey, _) = generate_keypair();
+        let p2tr = ScriptBuf::from_bytes([&[0x51, 0x20][..], &[0x07; 32]].concat());
+        let input = Amount::from_sat(100_000);
+        // The longest locktime gives the longest script.
+        for locktime in [20, u16::MAX] {
+            let htlc = SwapHtlc::new(
+                &hashlock_pubkey,
+                &timelock_pubkey,
+                &preimage.payment_hash(),
+                locktime,
+            );
+            let claim = htlc
+                .create_hashlock_spend(
+                    OutPoint::default(),
+                    input,
+                    &privkey,
+                    &preimage,
+                    p2tr.clone(),
+                    SPEND_FEE_RATE_FLOOR,
+                )
+                .unwrap();
+            let refund = htlc
+                .create_timelock_spend(
+                    OutPoint::default(),
+                    input,
+                    &privkey,
+                    p2tr.clone(),
+                    SPEND_FEE_RATE_FLOOR,
+                )
+                .unwrap();
+            assert!(claim.vsize() as u64 <= SPEND_TX_VSIZE, "{}", claim.vsize());
+            assert!(
+                refund.vsize() as u64 <= SPEND_TX_VSIZE,
+                "{}",
+                refund.vsize()
+            );
+        }
+    }
+
+    /// A rate that would leave no relayable output falls back to the floor
+    /// rather than failing every rebuild of the spend.
+    #[test]
+    fn spend_falls_back_to_the_floor_when_the_rate_leaves_dust() {
+        let (htlc, preimage, ..) = test_htlc();
+        let (_, privkey) = generate_keypair();
+        let p2wpkh = ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x07; 20]].concat());
+        let input = Amount::from_sat(1_000);
+        for feerate in [6.0, 1e9] {
+            let claim = htlc
+                .create_hashlock_spend(
+                    OutPoint::default(),
+                    input,
+                    &privkey,
+                    &preimage,
+                    p2wpkh.clone(),
+                    feerate,
+                )
+                .unwrap();
+            assert_eq!(
+                claim.output[0].value,
+                input - Amount::from_sat(300),
+                "{}",
+                feerate
+            );
+        }
+    }
+
+    #[test]
+    fn spend_refuses_an_unusable_feerate() {
+        let (htlc, preimage, ..) = test_htlc();
+        let (_, privkey) = generate_keypair();
+        for feerate in [f64::NAN, f64::INFINITY, 0.5, 1.5] {
+            let result = htlc.create_hashlock_spend(
+                OutPoint::default(),
+                Amount::from_sat(100_000),
+                &privkey,
+                &preimage,
+                ScriptBuf::new(),
+                feerate,
+            );
+            assert!(
+                matches!(result, Err(SwapError::Validation(_))),
+                "{}",
+                feerate
+            );
+        }
+    }
+
+    #[test]
+    fn spend_feerate_asks_for_the_high_priority_estimate() {
+        let mut asked = None;
+        let rate = spend_feerate_with(|priority| {
+            asked = Some(priority as u16);
+            Ok(27.3)
+        });
+        assert_eq!(rate, 27.3);
+        assert_eq!(asked, Some(FeePriority::High as u16));
+    }
+
+    #[test]
+    fn spend_feerate_follows_the_estimate_but_not_below_the_floor() {
+        assert_eq!(spend_feerate_from(Ok(27.3)), 27.3);
+        assert_eq!(spend_feerate_from(Ok(1.0)), SPEND_FEE_RATE_FLOOR);
+        assert_eq!(spend_feerate_from(Ok(f64::NAN)), SPEND_FEE_RATE_FLOOR);
+        assert_eq!(spend_feerate_from(Ok(f64::INFINITY)), SPEND_FEE_RATE_FLOOR);
+        assert_eq!(
+            spend_feerate_from(Err(WalletError::General("no estimate".to_string()))),
+            SPEND_FEE_RATE_FLOOR
+        );
+    }
+
+    #[test]
+    fn funding_feerate_follows_the_estimate_but_not_below_the_relay_floor() {
+        assert_eq!(funding_feerate_from(Ok(27.3)), 27.3);
+        assert_eq!(funding_feerate_from(Ok(1.5)), 1.5);
+        assert_eq!(funding_feerate_from(Ok(0.5)), MIN_RELAY_FEE_RATE);
+        assert_eq!(funding_feerate_from(Ok(f64::NAN)), MIN_RELAY_FEE_RATE);
+        assert_eq!(
+            funding_feerate_from(Err(WalletError::General("no estimate".to_string()))),
+            MIN_RELAY_FEE_RATE
+        );
+    }
+
+    #[test]
     fn spend_fails_when_fee_exceeds_input() {
         let (htlc, preimage, ..) = test_htlc();
         let (_, privkey) = generate_keypair();
@@ -835,6 +1101,7 @@ mod tests {
             &privkey,
             &preimage,
             ScriptBuf::new(),
+            SPEND_FEE_RATE_FLOOR,
         );
         assert!(matches!(result, Err(SwapError::Validation(_))));
     }

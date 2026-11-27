@@ -464,6 +464,21 @@ pub struct LnMakerSwapRecord {
     /// transaction confirmed was the refund ours.
     #[serde(default)]
     pub refund_txid: Option<bitcoin::Txid>,
+    /// Feerate (sat/vB) that refund was built at, so a restarted maker
+    /// rebuilds the transaction `refund_txid` names. Absent from records
+    /// written before spends were priced from the market.
+    #[serde(default)]
+    pub refund_feerate: Option<f64>,
+    /// Txids of the refunds `refund_txid` replaced at a higher fee. Any of
+    /// them can be the one that confirms, so each still names our refund.
+    /// Absent from records written before refunds were bumped.
+    #[serde(default)]
+    pub earlier_refund_txids: Vec<bitcoin::Txid>,
+    /// Feerate (sat/vB) the swap-in sweep was built at, so a restarted maker
+    /// rebuilds the same transaction. Absent from records written before
+    /// spends were priced from the market.
+    #[serde(default)]
+    pub sweep_feerate: Option<f64>,
     /// Chain tip when this swap was accepted. A swap-in's funding deadline
     /// is measured in blocks from here, since the taker must wait for the
     /// confirmations the maker demanded before it can announce.
@@ -559,6 +574,19 @@ impl Requires for LnMakerSwapRecord {
             invoice: _,
             preimage: _,
             refund_txid: _,
+            // An older build drops it and prices a rebuild at the floor
+            // rate. The refund it records may then not be the one that
+            // confirms, which leaves the swap open until the held payment
+            // fails back at its deadline. The coins are refunded either way.
+            refund_feerate: _,
+            // An older build drops it and knows only the latest refund. If an
+            // earlier one confirms, it reads that as a taker spend and keeps
+            // the swap until the held payment fails back. The coins are the
+            // maker's either way.
+            earlier_refund_txids: _,
+            // An older build drops it and resends the sweep at the floor
+            // rate, which cannot replace a higher-fee one already sent.
+            sweep_feerate: _,
             accepted_height: _,
             payout_script: _,
             funding_outpoint: _,
@@ -1208,6 +1236,9 @@ pub(crate) mod compat_support {
                     invoice: "fixture-invoice".into(),
                     preimage: Some([4; 32]),
                     refund_txid: Some(point.txid),
+                    refund_feerate: None,
+                    earlier_refund_txids: Vec::new(),
+                    sweep_feerate: None,
                     accepted_height: Some(123),
                     payout_script: Some(script.clone()),
                     funding_outpoint: Some(point),
@@ -1981,6 +2012,9 @@ mod tests {
                     invoice: "invoice".into(),
                     preimage: Some([8; 32]),
                     refund_txid: Some(Txid::all_zeros()),
+                    refund_feerate: None,
+                    earlier_refund_txids: Vec::new(),
+                    sweep_feerate: None,
                     accepted_height: Some(42),
                     payout_script: Some(ScriptBuf::from_bytes(vec![0x52])),
                     funding_outpoint: Some(cache_entry(0).0),
@@ -2734,6 +2768,9 @@ mod tests {
             invoice: String::new(),
             preimage: Some(preimage),
             refund_txid: None,
+            refund_feerate: None,
+            earlier_refund_txids: Vec::new(),
+            sweep_feerate: None,
             accepted_height: None,
             payout_script: None,
             funding_outpoint: None,

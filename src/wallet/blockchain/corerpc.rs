@@ -382,6 +382,21 @@ impl CoreRPC {
         }
     }
 
+    /// Fees of mempool transaction `txid` and of every mempool descendant:
+    /// what a replacement of `txid` has to pay above. `None` when `txid` is
+    /// not in the mempool.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn mempool_package_fee(
+        &self,
+        txid: &Txid,
+    ) -> Result<Option<bitcoin::Amount>, WalletError> {
+        match self.rpc.get_mempool_entry(txid) {
+            Ok(entry) => Ok(Some(entry.fees.descendant)),
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -5 => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The mempool transaction spending `outpoint`.
     pub(crate) fn mempool_spending_transaction(
         &self,
@@ -444,6 +459,21 @@ impl CoreRPC {
     pub(crate) fn require_v22(&self) -> Result<(), WalletError> {
         if self.rpc.version()? < 220_000 {
             return Err(WalletError::CoreTooOld);
+        }
+        Ok(())
+    }
+
+    /// The Lightning watchdog asks the node what spends an HTLC through
+    /// `gettxspendingprevout`, which Core added in 24.0. On an older node
+    /// every lookup would fail and no sweep or refund would be sent again,
+    /// so a maker running `lightning` swaps needs 24.0. Without them the
+    /// node is not asked.
+    #[cfg(feature = "lightning")]
+    pub(crate) fn require_v24_for_lightning(&self, lightning: bool) -> Result<(), WalletError> {
+        if lightning && self.rpc.version()? < 240_000 {
+            return Err(WalletError::General(
+                "Lightning swaps need Bitcoin Core v24.0 or newer".to_string(),
+            ));
         }
         Ok(())
     }
@@ -1269,6 +1299,23 @@ pub(crate) mod tests {
             ("getnetworkinfo", json!({ "version": 210100 })),
             ("getnetworkinfo", json!({ "version": 210100 })),
         ])
+    }
+
+    /// A maker running Lightning swaps needs Core 24.0 for
+    /// `gettxspendingprevout`: 22 and 23 are refused and 24 is taken. Without
+    /// Lightning the check does not ask the node.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn lightning_needs_core_v24() {
+        for (version, taken) in [(220_000, false), (230_000, false), (240_000, true)] {
+            let (core, server) = mock_core(vec![("getnetworkinfo", json!({ "version": version }))]);
+            let result = core.require_v24_for_lightning(true);
+            assert_eq!(result.is_ok(), taken, "Core {}: {:?}", version, result);
+            assert_eq!(server.join().unwrap(), ["getnetworkinfo"]);
+        }
+        let (core, server) = mock_core(vec![]);
+        assert!(core.require_v24_for_lightning(false).is_ok());
+        assert!(server.join().unwrap().is_empty(), "the node was asked");
     }
 
     /// The restore's backend probe refuses Core 0.21, so no wallet file is left.
