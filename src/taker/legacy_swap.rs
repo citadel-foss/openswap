@@ -139,7 +139,8 @@ impl Taker {
 
         // Ping every maker for the life of the march: while we negotiate one
         // hop, the others must not read our silence as a dropped swap.
-        let _heartbeat = self.start_route_heartbeat(&swap_id);
+        // Restarted on spare substitution, as it pings a fixed list of makers.
+        let mut _heartbeat = self.start_route_heartbeat(&swap_id);
 
         let mut prev_senders_info: Option<Vec<SenderContractTxInfo>> = None;
         // Taker's own keys for the last hop (set during last iteration)
@@ -536,10 +537,6 @@ impl Taker {
             } else {
                 // Try forwarding ReqContractSigsForSender to the next maker.
                 // If the next maker fails (e.g., connection drop), attempt spare
-                // substitution and retry the forward (not the whole iteration,
-                // since maker[maker_idx] already processed ProofOfFunding).
-                // Try forwarding ReqContractSigsForSender to the next maker.
-                // If the next maker fails (e.g., connection drop), attempt spare
                 // substitution and restart this iteration to redo ProofOfFunding
                 // with the spare's keys for the next hop.
                 log::info!("Requesting sender signatures from next maker");
@@ -572,6 +569,9 @@ impl Taker {
                                 spare_addr
                             );
                             self.substitute_and_negotiate_spare(maker_idx + 1, spare_addr)?;
+                            // The spare is unfunded until its ProofOfFunding, which can
+                            // be a block wait away: without keepalives it drops the swap.
+                            _heartbeat = self.start_route_heartbeat(&swap_id);
                             // Restart current iteration: reconnect to maker[maker_idx],
                             // redo ProofOfFunding with the spare's keys for the next hop.
                             continue 'exchange;

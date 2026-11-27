@@ -4,6 +4,8 @@
 //! `legacy_middle_maker_drops_before_sender_sigs` runs [`complete_with_spare`]
 //! too, then checks that nobody was blamed for the drop.
 
+use std::{thread, time::Duration};
+
 use bitcoin::Amount;
 use openswap::{
     maker::MakerBehavior,
@@ -144,6 +146,59 @@ fn legacy_middle_maker_drops_before_sender_sigs(world: &mut World) {
             standing
         );
     }
+}
+
+/// The middle maker drops and the spare takes its place, then maker 0's funding
+/// is slow to confirm. The spare holds an unfunded swap through that wait, and
+/// only the route heartbeat stops it from dropping the swap as idle.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtReqContractSigsForSender, Normal],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+)]
+fn legacy_spare_survives_slow_funding_confirm(world: &mut World) {
+    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+    // The swap runs on its own thread, so the taker leaves the world here.
+    let mut taker = world.take_taker();
+    let summary = taker.prepare(swap_params).expect("prepare swap");
+    let log_offset = log_mark(&world);
+    let swap_handle = thread::spawn(move || {
+        let result = taker.start(&summary.swap_id);
+        (taker, result)
+    });
+
+    // Stop blocks once the spare is in, so maker 0's funding stays unconfirmed
+    // and the taker parks in its wait, as on a slow block. Without the pause the
+    // funding confirms in seconds and the spare is never idle for long. Hold past
+    // the maker's 30s idle timeout (idle drains run every 3s). The needle is the
+    // mid-exchange substitution's own log line, not the negotiation-time one.
+    wait_logged!(
+        world,
+        "Substituting with spare at",
+        Duration::from_secs(120)
+    );
+    world.framework().set_block_gen_paused(true);
+    wait_logged!(
+        world,
+        "Waiting for maker 0's funding to be confirmed",
+        Duration::from_secs(60)
+    );
+    thread::sleep(Duration::from_secs(40));
+    world.framework().set_block_gen_paused(false);
+
+    let (_taker, result) = swap_handle.join().expect("swap thread panicked");
+    result.expect("the spare must keep the swap through a slow confirmation");
+
+    let spare_port = world.makers()[2].inner().config.network_port;
+    assert_log!(world, since log_offset; {
+        // The heartbeat reached the spare ...
+        has format!("[{}] Taker is waiting for funding confirmation", spare_port),
+        // ... so it never dropped the swap as idle.
+        lacks format!("[{}] Released idle unfunded swap", spare_port),
+    });
 }
 
 /// Maker 0 has to re-plan its funding, then rebuild it for the spare's keys
