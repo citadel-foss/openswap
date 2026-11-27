@@ -4,9 +4,12 @@
 //! `legacy_middle_maker_drops_before_sender_sigs` runs [`complete_with_spare`]
 //! too, then checks that nobody was blamed for the drop.
 
-use bitcoin::Amount;
+use std::{thread, time::Duration};
+
+use bitcoin::{Amount, Txid};
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
-    maker::MakerBehavior,
+    maker::{server::IDLE_CONNECTION_TIMEOUT, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{MakerState, SwapParams},
 };
@@ -144,6 +147,125 @@ fn legacy_middle_maker_drops_before_sender_sigs(world: &mut World) {
             standing
         );
     }
+}
+
+/// The middle maker drops and the spare takes its place, then maker 0's funding
+/// is slow to confirm. The spare holds an unfunded swap through that wait, and
+/// only the route heartbeat stops it from dropping the swap as idle.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [Normal, CloseAtReqContractSigsForSender, Normal],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+)]
+fn legacy_spare_survives_slow_funding_confirm(world: &mut World) {
+    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 2)
+        .with_tx_count(3)
+        .with_required_confirms(1);
+    // The swap runs on its own thread, so the taker leaves the world here.
+    let mut taker = world.take_taker();
+    let summary = taker.prepare(swap_params).expect("prepare swap");
+
+    // Stop background blocks before the swap starts and mine the one block the
+    // swap needs by hand. Maker 0's funding then stays unconfirmed and the
+    // taker parks in its wait, as on a slow block.
+    let test_framework = world.framework().clone();
+    let bitcoind = &test_framework.bitcoind;
+    test_framework.set_block_gen_paused(true);
+    // Let any in-flight mining tick finish before the swap starts.
+    thread::sleep(Duration::from_secs(4));
+    // Resume mining even if a check below fails, so the swap thread cannot
+    // stay blocked in its confirmation wait.
+    struct ResumeMining<'a>(&'a TestFramework);
+    impl Drop for ResumeMining<'_> {
+        fn drop(&mut self) {
+            self.0.set_block_gen_paused(false);
+        }
+    }
+    let resume_mining = ResumeMining(&test_framework);
+
+    let log_offset = log_mark(&world);
+    let log_path = world.taker_log_path();
+    // This swap's part of the log, read fresh on each call.
+    let swap_log = || {
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        let from = (log_offset as usize..=log.len())
+            .find(|&i| log.is_char_boundary(i))
+            .unwrap_or(log.len());
+        log[from..].to_string()
+    };
+    let swap_handle = thread::spawn(move || {
+        let result = taker.start(&summary.swap_id);
+        (taker, result)
+    });
+
+    // The taker logs its confirmation wait only after every funding send has
+    // returned, so one block now confirms all of its funding. Makers log the
+    // same wording, but only after the ProofOfFunding that follows this wait,
+    // so the first match after the taker's broadcast line is the taker's.
+    wait_until!(
+        Duration::from_secs(120),
+        "the taker waiting on its own funding",
+        {
+            let log = swap_log();
+            log.find("Broadcasting funding transactions")
+                .is_some_and(|at| log[at..].contains("Waiting for 1 confirmation(s) on"))
+        }
+    );
+    world.mine(1);
+
+    // No block is mined from here until the hold ends. The middle maker drops,
+    // the spare joins (the mid-exchange line, not the negotiation-time one),
+    // and maker 0 broadcasts its funding.
+    let maker0_port = world.makers()[0].inner().config.network_port;
+    let broadcast_done = format!("[{}] Funding broadcast complete", maker0_port);
+    wait_until!(
+        Duration::from_secs(120),
+        "the spare to join and maker 0 to fund",
+        {
+            let log = swap_log();
+            log.find("Substituting with spare at")
+                .is_some_and(|at| log[at..].contains(&broadcast_done))
+        }
+    );
+    // Maker 0 logs every funding txid it broadcasts, so take them from the log.
+    let funding_line = format!("[{}] Broadcast Legacy funding tx: ", maker0_port);
+    let maker0_funding: Vec<Txid> = swap_log()
+        .lines()
+        .filter_map(|line| line.split_once(funding_line.as_str()))
+        .map(|(_, txid)| txid.trim().parse().unwrap())
+        .collect();
+    assert!(!maker0_funding.is_empty(), "maker 0 logged no funding txid");
+    let spare_port = world.makers()[2].inner().config.network_port;
+    let height = bitcoind.client.get_block_count().unwrap();
+    let hold_mark = log_mark(&world);
+    // Tied to the timeout, so raising it cannot turn this into a silent pass.
+    // The extra 10 s covers the idle drain, which runs every 3 s.
+    thread::sleep(IDLE_CONNECTION_TIMEOUT + Duration::from_secs(10));
+    // The hold proves nothing if maker 0's funding confirmed, so check that
+    // nothing was mined and the funding is still waiting.
+    assert_eq!(
+        bitcoind.client.get_block_count().unwrap(),
+        height,
+        "no block may be mined during the hold"
+    );
+    let mempool = bitcoind.client.get_raw_mempool().unwrap();
+    assert!(
+        maker0_funding.iter().all(|txid| mempool.contains(txid)),
+        "maker 0's funding must still be unconfirmed at the end of the hold"
+    );
+    // The heartbeat reached the spare during the hold, not only after it.
+    assert_log!(world, since hold_mark; {
+        has format!("[{}] Taker is waiting for funding confirmation", spare_port),
+    });
+    drop(resume_mining);
+
+    let (_taker, result) = swap_handle.join().expect("swap thread panicked");
+    result.expect("the spare must keep the swap through a slow confirmation");
+
+    assert_log!(world, since log_offset; {
+        lacks format!("[{}] Released idle unfunded swap", spare_port),
+    });
 }
 
 /// Maker 0 has to re-plan its funding, then rebuild it for the spare's keys
