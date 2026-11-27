@@ -7,6 +7,7 @@
 use std::{thread, time::Duration};
 
 use bitcoin::Amount;
+use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
     maker::MakerBehavior,
     protocol::common_messages::ProtocolVersion,
@@ -180,14 +181,55 @@ fn legacy_spare_survives_slow_funding_confirm(world: &mut World) {
         "Substituting with spare at",
         Duration::from_secs(120)
     );
-    world.framework().set_block_gen_paused(true);
+    let test_framework = world.framework().clone();
+    let bitcoind = &test_framework.bitcoind;
+    test_framework.set_block_gen_paused(true);
+    // Resume mining even if a check below fails, so the swap thread cannot
+    // stay blocked in its confirmation wait.
+    struct ResumeMining<'a>(&'a TestFramework);
+    impl Drop for ResumeMining<'_> {
+        fn drop(&mut self) {
+            self.0.set_block_gen_paused(false);
+        }
+    }
+    let resume_mining = ResumeMining(&test_framework);
+    let mempool_before = bitcoind.client.get_raw_mempool().unwrap();
     wait_logged!(
         world,
         "Waiting for maker 0's funding to be confirmed",
         Duration::from_secs(60)
     );
+    // Maker 0 broadcasts its funding after the taker logs the wait.
+    let maker0_funding = wait_for!(
+        Duration::from_secs(60),
+        every Duration::from_millis(100),
+        "maker 0's funding in the mempool",
+        {
+            let new_txids: Vec<_> = bitcoind
+                .client
+                .get_raw_mempool()
+                .unwrap()
+                .into_iter()
+                .filter(|txid| !mempool_before.contains(txid))
+                .collect();
+            (!new_txids.is_empty()).then_some(new_txids)
+        }
+    );
+    let height = bitcoind.client.get_block_count().unwrap();
     thread::sleep(Duration::from_secs(40));
-    world.framework().set_block_gen_paused(false);
+    // Checked at the end of the hold: a mining tick that started before the
+    // pause could still confirm the funding and skip the slow wait.
+    assert_eq!(
+        bitcoind.client.get_block_count().unwrap(),
+        height,
+        "no block may be mined during the hold"
+    );
+    let mempool = bitcoind.client.get_raw_mempool().unwrap();
+    assert!(
+        maker0_funding.iter().all(|txid| mempool.contains(txid)),
+        "maker 0's funding must still be unconfirmed at the end of the hold"
+    );
+    drop(resume_mining);
 
     let (_taker, result) = swap_handle.join().expect("swap thread panicked");
     result.expect("the spare must keep the swap through a slow confirmation");
