@@ -570,7 +570,7 @@ impl Taker {
                             );
                             self.substitute_and_negotiate_spare(maker_idx + 1, spare_addr)?;
                             // The spare is unfunded until its ProofOfFunding, which can
-                            // be a block wait away: without keepalives it drops the swap.
+                            // be a block wait away: without keepalives it can drop the swap.
                             _heartbeat = self.start_route_heartbeat(&swap_id);
                             // Restart current iteration: reconnect to maker[maker_idx],
                             // redo ProofOfFunding with the spare's keys for the next hop.

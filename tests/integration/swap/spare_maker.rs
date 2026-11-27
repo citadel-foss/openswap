@@ -9,7 +9,7 @@ use std::{thread, time::Duration};
 use bitcoin::{Amount, Txid};
 use bitcoind::bitcoincore_rpc::RpcApi;
 use openswap::{
-    maker::MakerBehavior,
+    maker::{server::IDLE_CONNECTION_TIMEOUT, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
     taker::{MakerState, SwapParams},
 };
@@ -174,7 +174,7 @@ fn legacy_spare_survives_slow_funding_confirm(world: &mut World) {
     // Stop blocks once the spare is in, so maker 0's funding stays unconfirmed
     // and the taker parks in its wait, as on a slow block. Without the pause the
     // funding confirms in seconds and the spare is never idle for long. Hold past
-    // the maker's 30s idle timeout (idle drains run every 3s). The needle is the
+    // the maker's idle timeout (idle drains run every 3s). The needle is the
     // mid-exchange substitution's own log line, not the negotiation-time one.
     wait_logged!(
         world,
@@ -207,15 +207,22 @@ fn legacy_spare_survives_slow_funding_confirm(world: &mut World) {
         Duration::from_secs(60)
     );
     let funding_line = format!("[{}] Broadcast Legacy funding tx: ", maker0_port);
-    let maker0_funding: Vec<Txid> = std::fs::read_to_string(world.taker_log_path())
-        .unwrap()
+    // Only this swap's lines: read past the mark taken before it started.
+    let log = std::fs::read_to_string(world.taker_log_path()).unwrap();
+    let from = (log_offset as usize..=log.len())
+        .find(|&i| log.is_char_boundary(i))
+        .unwrap_or(log.len());
+    let maker0_funding: Vec<Txid> = log[from..]
         .lines()
         .filter_map(|line| line.split_once(funding_line.as_str()))
         .map(|(_, txid)| txid.trim().parse().unwrap())
         .collect();
     assert!(!maker0_funding.is_empty(), "maker 0 logged no funding txid");
+    let spare_port = world.makers()[2].inner().config.network_port;
     let height = bitcoind.client.get_block_count().unwrap();
-    thread::sleep(Duration::from_secs(40));
+    let hold_mark = log_mark(&world);
+    // Tied to the timeout, so raising it cannot turn this into a silent pass.
+    thread::sleep(IDLE_CONNECTION_TIMEOUT + Duration::from_secs(10));
     // Checked at the end of the hold: a mining tick that started before the
     // pause could still confirm the funding and skip the slow wait.
     assert_eq!(
@@ -228,16 +235,16 @@ fn legacy_spare_survives_slow_funding_confirm(world: &mut World) {
         maker0_funding.iter().all(|txid| mempool.contains(txid)),
         "maker 0's funding must still be unconfirmed at the end of the hold"
     );
+    // The heartbeat reached the spare during the hold, not only after it.
+    assert_log!(world, since hold_mark; {
+        has format!("[{}] Taker is waiting for funding confirmation", spare_port),
+    });
     drop(resume_mining);
 
     let (_taker, result) = swap_handle.join().expect("swap thread panicked");
     result.expect("the spare must keep the swap through a slow confirmation");
 
-    let spare_port = world.makers()[2].inner().config.network_port;
     assert_log!(world, since log_offset; {
-        // The heartbeat reached the spare ...
-        has format!("[{}] Taker is waiting for funding confirmation", spare_port),
-        // ... so it never dropped the swap as idle.
         lacks format!("[{}] Released idle unfunded swap", spare_port),
     });
 }
