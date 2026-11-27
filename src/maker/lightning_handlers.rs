@@ -1208,7 +1208,19 @@ fn watchdog_finish_sweep<M: Maker>(
                 refund.compute_txid()
             );
             match maker.broadcast_transaction(&sweep) {
-                Ok(_) => read_new_output_in(maker.as_ref(), swap_id),
+                Ok(_) => {
+                    // A bid on a family it could not read is recorded once the
+                    // node took it: it is then the pending sweep, and a rebuild
+                    // after an eviction must give the same transaction.
+                    if !family_known && rate > built_at {
+                        let mut next = swap.clone();
+                        next.sweep_feerate = Some(rate);
+                        if !maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::InSwept, next)? {
+                            return Ok(());
+                        }
+                    }
+                    read_new_output_in(maker.as_ref(), swap_id)
+                }
                 Err(e) => {
                     log::warn!("Swap-in {swap_id}: sweep did not replace the taker's refund: {e:?}")
                 }
@@ -2052,10 +2064,10 @@ fn watchdog_resolve_swap_out(
             // built on its output, so it is rebuilt at a new rate only while
             // no swap holds that output.
             let mut hold = ReplacementHold::new(maker, swap_id);
-            let (feerate, refund_tx) = match swap.refund_txid {
+            let (feerate, refund_tx, replaced) = match swap.refund_txid {
                 None => {
                     let tx = build(market)?;
-                    (rate_paid(&tx, value, market), tx)
+                    (rate_paid(&tx, value, market), tx, false)
                 }
                 Some(_) => {
                     let built_at = swap.refund_feerate.unwrap_or(SPEND_FEE_RATE_FLOOR);
@@ -2068,8 +2080,8 @@ fn watchdog_resolve_swap_out(
                         None,
                         |txid, _| hold.take(&OutPoint::new(txid, 0)),
                     )? {
-                        PlannedSpend::Resend(tx) => (built_at, tx),
-                        PlannedSpend::New { tx, rate, .. } => (rate, tx),
+                        PlannedSpend::Resend(tx) => (built_at, tx, false),
+                        PlannedSpend::New { tx, rate, .. } => (rate, tx, true),
                     }
                 }
             };
@@ -2101,17 +2113,28 @@ fn watchdog_resolve_swap_out(
             // is final, and until then this record holds the only key that
             // can rebuild it. The confirmed-spend branch above closes the
             // swap and fails the held payment on a later tick.
-            match maker.broadcast_transaction(&refund_tx) {
+            let sent = maker.broadcast_transaction(&refund_tx);
+            let stored = match &sent {
                 Ok(txid) => {
                     log::info!(
                         "Swap-out {swap_id} refund broadcast: {txid} (held until confirmed)"
                     );
                     swap.touch();
-                    maker.store_ln_swap_if_phase(swap_id, LnMakerPhase::OutFunded, swap)?;
+                    maker
+                        .store_ln_swap_if_phase(swap_id, LnMakerPhase::OutFunded, swap)
+                        .map(|_| ())
                 }
-                Err(e) => log::debug!("swap-out {swap_id} refund not yet broadcastable: {e:?}"),
+                Err(e) => {
+                    log::debug!("swap-out {swap_id} refund not yet broadcastable: {e:?}");
+                    Ok(())
+                }
+            };
+            // The evicted refund's output leaves the wallet, as in
+            // [`resend_refund`], whatever the store above returned.
+            if replaced {
+                settle_replaced(maker.as_ref(), swap_id, hold, sent.is_ok());
             }
-            Ok(())
+            stored
         }
     }
 }

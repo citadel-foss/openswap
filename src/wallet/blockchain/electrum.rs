@@ -929,9 +929,11 @@ impl Electrum {
             };
             // Every output's history in one round trip, however many outputs
             // the transaction has.
+            // An `OP_RETURN` output has no history to read.
             let unread: Vec<ScriptBuf> = tx
                 .output
                 .iter()
+                .filter(|output| !output.script_pubkey.is_op_return())
                 .map(|output| output.script_pubkey.clone())
                 .collect::<HashSet<_>>()
                 .into_iter()
@@ -956,7 +958,10 @@ impl Electrum {
             let mut candidates = Vec::new();
             let mut listed = HashSet::new();
             for output in &tx.output {
-                for entry in &histories[&output.script_pubkey] {
+                let Some(history) = histories.get(&output.script_pubkey) else {
+                    continue;
+                };
+                for entry in history {
                     if entry.tx_hash == parent {
                         pending |= entry.height <= 0;
                     } else if entry.height <= 0
@@ -967,13 +972,11 @@ impl Electrum {
                     }
                 }
             }
-            if !pending {
-                if parent == *txid {
-                    return Ok(None);
-                }
-                return Err(electrum_err(format!(
-                    "electrum: {parent} spends from {txid} but is not in the mempool"
-                )));
+            // Only the refund itself is looked for in its own histories. A
+            // transaction spending from it was found unconfirmed in its
+            // parent's, and one paying only to `OP_RETURN` has none.
+            if !pending && parent == *txid {
+                return Ok(None);
             }
             for chunk in candidates.chunks(TX_BATCH) {
                 in_time()?;
@@ -3654,6 +3657,64 @@ pub(crate) mod tests {
         ]);
         let (backend, _server) = family_backend(entries, &[&funding, &refund]);
         // 1000 in, 120 outputs of 5 out.
+        assert_eq!(
+            backend
+                .package_fee_within(&refund.compute_txid(), Duration::from_secs(20))
+                .unwrap(),
+            Some(Amount::from_sat(400))
+        );
+    }
+
+    /// A child paying only to `OP_RETURN` has no history of its own on an
+    /// Electrum server, as on Core it has no output to look up, and its fee
+    /// still counts in the refund's family.
+    #[cfg(feature = "lightning")]
+    #[test]
+    fn package_fee_counts_a_child_paying_only_to_op_return() {
+        let funding = deposit(1);
+        let mut refund = spend_of(OutPoint::new(funding.compute_txid(), 0));
+        refund.output[0].value = Amount::from_sat(600);
+        refund.output.push(bitcoin::TxOut {
+            value: Amount::from_sat(100),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x01, 0x02]),
+        });
+        let mut child = spend_of(OutPoint::new(refund.compute_txid(), 1));
+        child.output[0] = bitcoin::TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x04, 0x42, 0x42, 0x42, 0x42]),
+        };
+        assert!(child.output[0].script_pubkey.is_op_return());
+        let op_return = scripthash(&child.output[0].script_pubkey);
+        let entries = json!([
+            { "tx_hash": funding.compute_txid(), "height": 101 },
+            { "tx_hash": refund.compute_txid(), "height": 0 },
+            { "tx_hash": child.compute_txid(), "height": 0 },
+        ]);
+        let served: HashMap<String, String> = [&funding, &refund, &child]
+            .iter()
+            .map(|tx| (tx.compute_txid().to_string(), serialize_hex(*tx)))
+            .collect();
+        let server = mock_electrum(move |method, params| match method {
+            // A server keeps no history for an `OP_RETURN` script.
+            "blockchain.scripthash.get_history"
+                if params[0].as_str() == Some(op_return.as_str()) =>
+            {
+                Ok(json!([]))
+            }
+            "blockchain.scripthash.get_history" => Ok(entries.clone()),
+            "blockchain.transaction.get" => served
+                .get(params[0].as_str().unwrap_or_default())
+                .map(|hex| json!(hex))
+                .ok_or_else(|| json!({ "code": 1, "message": "daemon error" })),
+            method => Err(json!({ "code": -32601, "message": format!("unexpected {method}") })),
+        });
+        let backend = Electrum::new(&ElectrumConfig {
+            url: server.url.clone(),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .expect("connect to mock electrum");
+        // 1000 - 700 for the refund, and 100 - 0 for its child.
         assert_eq!(
             backend
                 .package_fee_within(&refund.compute_txid(), Duration::from_secs(20))

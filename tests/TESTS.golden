@@ -498,6 +498,7 @@ openswap wallet::blockchain::electrum::tests::only_the_unknown_txid_protocol_err
 openswap wallet::blockchain::electrum::tests::other_scripts_subscribe_while_one_is_refused
 openswap wallet::blockchain::electrum::tests::package_fee_adds_up_the_mempool_family
 openswap wallet::blockchain::electrum::tests::package_fee_asks_a_socks5_proxy_for_an_address_as_one
+openswap wallet::blockchain::electrum::tests::package_fee_counts_a_child_paying_only_to_op_return
 openswap wallet::blockchain::electrum::tests::package_fee_cuts_off_a_trickling_reply
 openswap wallet::blockchain::electrum::tests::package_fee_cuts_off_a_trickling_tls_reply
 openswap wallet::blockchain::electrum::tests::package_fee_gives_up_on_a_silent_socks5_proxy

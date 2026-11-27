@@ -681,6 +681,8 @@ fn lightning_maker_bumps_a_pending_refund(world: &mut World, ln: Arc<MockLightni
     setup = [fund_makers(4, Amount::from_btc(0.05).unwrap(), AddressType::P2WPKH)],
 )]
 fn lightning_maker_closes_on_an_earlier_refund(world: &mut World, ln: Arc<MockLightningBackend>) {
+    use openswap::watch_tower::watcher::WatcherEvent;
+
     let framework = world.framework().clone();
     let bitcoind = &framework.bitcoind;
     let maker = world.makers()[0].inner().clone();
@@ -710,7 +712,33 @@ fn lightning_maker_closes_on_an_earlier_refund(world: &mut World, ln: Arc<MockLi
     swap.earlier_refund_txids = vec![first];
     swap.refund_txid = Some(Txid::from_byte_array([0x5b; 32]));
     maker.store_ln_swap(&swap_id, swap).unwrap();
-    generate_blocks(bitcoind, REFUND_FINALITY_DEPTH);
+
+    // ---- One block short of final: still open ----
+    generate_blocks(bitcoind, REFUND_FINALITY_DEPTH - 1);
+    assert_eq!(
+        confirmations(bitcoind, &first) as u64,
+        REFUND_FINALITY_DEPTH - 1
+    );
+    // Only once the watcher holds the earlier refund does a pass reach the
+    // depth check; before that it waits on the unseen spend instead.
+    wait_until!(
+        Duration::from_secs(30),
+        every Duration::from_millis(200),
+        "the watcher to record the earlier refund",
+        matches!(
+            maker.watch_service.watch_request(funded.outpoint),
+            Ok(WatcherEvent::UtxoSpent { spending_tx: Some(tx), .. })
+                if tx.compute_txid() == first
+        )
+    );
+    ln_watchdog_tick_now(&maker);
+    assert!(
+        maker.get_ln_swap(&swap_id).unwrap().is_some(),
+        "the maker closed the swap before its earlier refund was final"
+    );
+
+    // ---- At the finality depth the swap closes ----
+    generate_blocks(bitcoind, 1);
     assert!(confirmations(bitcoind, &first) as u64 >= REFUND_FINALITY_DEPTH);
 
     wait_until!(
@@ -864,8 +892,10 @@ fn swap_in_sweep_keeps_its_rate_across_a_restart(world: &mut World, ln: Arc<Mock
 }
 
 /// When what spends from the taker's refund cannot be read, the sweep still
-/// contests it, bidding against the refund alone, and records nothing, so
-/// the next pass bids on what it reads then.
+/// contests it, bidding against the refund alone. The rate is recorded only
+/// once the node takes the sweep, so a rebuild gives the same transaction.
+/// A rejected bid records nothing, and the next pass bids on what it reads
+/// then.
 #[world_test(
     backend = BitcoindBackend,
     bind = [pair = MockLightningBackend::new_pair(), ln = pair.0.clone()],
@@ -907,10 +937,17 @@ fn watchdog_contests_a_taker_refund_whose_family_it_cannot_read(
         bitcoind.client.get_mempool_entry(&refund).is_err(),
         "the taker's refund must be out of the mempool"
     );
+    let taken = maker
+        .get_ln_swap(&id)
+        .unwrap()
+        .unwrap()
+        .sweep_feerate
+        .expect("a sweep rate is on record");
+    assert_ne!(Some(taken), recorded, "the accepted bid must be recorded");
     assert_eq!(
-        maker.get_ln_swap(&id).unwrap().unwrap().sweep_feerate,
-        recorded,
-        "a bid on a family it could not read must not be recorded"
+        Amount::from_sat((taken * 150.0).ceil() as u64),
+        fee,
+        "the recorded rate must rebuild the sweep the node took"
     );
     // The pending spend is now our sweep: the next pass resends it.
     ln_watchdog_tick_now(&maker);
@@ -1399,13 +1436,20 @@ fn lightning_maker_restart_recovers_an_interrupted_refund(
         .unwrap()
         .and_then(|swap| swap.refund_txid)
         .expect("the refund was recorded before the crash");
-    // Nothing reached the network before it was recorded: the refund is in
-    // neither the mempool nor a block, before or after the maker is down
-    // long enough for anything it sent to confirm.
-    let unknown = |txid: &Txid| bitcoind.client.get_raw_transaction(txid, None).is_err();
-    assert!(unknown(&recorded), "the interrupted refund was sent");
+    // Nothing reached the network before it was recorded: the HTLC is spent
+    // neither in the mempool nor in a block, before or after the maker is
+    // down long enough for anything it sent to confirm. A failed lookup
+    // fails the test rather than reading as nothing sent.
+    let unspent = || {
+        bitcoind
+            .client
+            .get_tx_out(&funded.outpoint.txid, funded.outpoint.vout, Some(true))
+            .expect("the node answers gettxout")
+            .is_some()
+    };
+    assert!(unspent(), "the interrupted refund was sent");
     generate_blocks(bitcoind, 1);
-    assert!(unknown(&recorded), "the interrupted refund was mined");
+    assert!(unspent(), "the interrupted refund was mined");
 
     let mut config = maker.config.clone();
     config.password = Some("integration-test".to_string());
