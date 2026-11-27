@@ -4,6 +4,7 @@ pub extern crate bitcoin;
 pub extern crate bitcoind;
 
 pub(crate) mod atomic_file;
+pub mod bip324_stream;
 pub mod blocklist;
 #[cfg(test)]
 mod compat_fixtures;
