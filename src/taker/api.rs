@@ -2875,14 +2875,13 @@ impl Taker {
         needed: &[String],
         read_timeout: Duration,
     ) -> Result<(TcpStream, Vec<String>), TakerError> {
-        let mut stream = connect_to_maker(
+        greet_maker(
             address,
             self.config.connection_type,
             self.config.socks_port,
+            needed,
             read_timeout,
-        )?;
-        let features = handshake_with_maker(&mut stream, needed)?;
-        Ok((stream, features))
+        )
     }
 }
 
@@ -2926,6 +2925,20 @@ pub(crate) fn handshake_with_maker(
         )));
     }
     Ok(features)
+}
+
+/// Connect to a maker and exchange Hellos, waiting at most `read_timeout` for
+/// each read on the stream, the Hello reply included.
+fn greet_maker(
+    address: &str,
+    connection_type: ConnectionType,
+    socks_port: u16,
+    needed: &[String],
+    read_timeout: Duration,
+) -> Result<(TcpStream, Vec<String>), TakerError> {
+    let mut stream = connect_to_maker(address, connection_type, socks_port, read_timeout)?;
+    let features = handshake_with_maker(&mut stream, needed)?;
+    Ok((stream, features))
 }
 
 /// Connect to a maker directly or through Tor. Free of `Taker` so background
@@ -4070,6 +4083,39 @@ pub enum TakerBehavior {
 
 #[cfg(test)]
 mod tests {
+    /// A maker that accepts the connection and never answers the Hello. The
+    /// Hello reply is read with the timeout the caller gave, not the long
+    /// maker response timeout, so a stalled handover retry gives up in time.
+    #[test]
+    fn a_hello_that_is_never_answered_times_out_at_the_given_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        // The call runs in a thread: a Hello that waits the full response
+        // timeout must fail this test fast, not hang it for half an hour.
+        thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = greet_maker(
+                &address,
+                ConnectionType::Clearnet,
+                9050,
+                &[],
+                Duration::from_millis(300),
+            );
+            let _ = sender.send((result.is_err(), started.elapsed()));
+        });
+        let (_silent_maker, _) = listener.accept().unwrap();
+        let (failed, took) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the Hello read did not use the given timeout");
+        assert!(failed, "an unanswered Hello is an error");
+        assert!(
+            took >= Duration::from_millis(300),
+            "gave up early: {:?}",
+            took
+        );
+    }
+
     use super::*;
     use serde_cbor::{value::to_value, Value};
     use std::{collections::BTreeMap, net::TcpListener, thread};

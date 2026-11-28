@@ -188,6 +188,7 @@ openswap security::tests::sealed_secret_needs_the_password_on_every_open
 openswap security::tests::v2_container_is_refused_by_old_readers
 openswap security::tests::v2_container_refuses_unknown_versions_and_edited_headers
 openswap security::tests::v2_version_precedes_requirements_password_and_payload
+openswap taker::api::tests::a_hello_that_is_never_answered_times_out_at_the_given_timeout
 openswap taker::api::tests::compat_hello_accepts_many_future_names_and_fields
 openswap taker::api::tests::compat_hello_keeps_recognized_names_bounded_by_registry
 openswap taker::api::tests::compat_hello_requires_exact_reconnect_pins_and_readable_reply
