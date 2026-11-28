@@ -374,3 +374,38 @@ fn drain_stays_up_for_a_taker_retrying_a_lost_handover_reply(world: &mut World) 
         .unwrap());
     world.shutdown_makers();
 }
+
+/// The last handover reply is lost and the connection stays open, as on a
+/// stalled Tor stream, so the taker sees no close either. It must give up on
+/// the read and retry while the draining maker still keeps its replay cache.
+/// Waiting the full maker response timeout outlasts the drain, and the swap
+/// falls into on-chain recovery.
+#[world_test(
+    backend = BitcoindBackend,
+    maker_behaviors = [StallHandoverResponse],
+    takers = [Normal],
+    setup = [fund_taker_default(3), fund_makers_default(), spawn_ready_makers_and_mine()],
+)]
+fn drain_answers_a_taker_whose_handover_read_stalled(world: &mut World) {
+    let maker = world.makers()[0].inner().clone();
+    let maker_address = world.makers()[0].address();
+    let summary = world
+        .taker_mut()
+        .prepare(route(ProtocolVersion::Taproot, vec![maker_address]))
+        .expect("the maker admits the swap");
+    maker.start_drain();
+
+    world
+        .taker_mut()
+        .start(&summary.swap_id)
+        .expect("the retry is answered before the draining maker stops");
+    wait_until!(
+        Duration::from_secs(60),
+        "the maker to stop once the retry is served",
+        maker.shutdown.load(Relaxed)
+    );
+    assert!(!maker
+        .has_unfinished_outgoing_swapcoin(&summary.swap_id)
+        .unwrap());
+    world.shutdown_makers();
+}

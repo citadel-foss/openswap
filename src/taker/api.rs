@@ -98,6 +98,18 @@ const MAKER_RESPONSE_TIMEOUT_SECS: u64 = 1800;
 #[cfg(feature = "integration-test")]
 const MAKER_RESPONSE_TIMEOUT_SECS: u64 = 180;
 
+/// How long the taker waits for each read on a handover connection: the
+/// Hello and the handover reply. A maker answers a handover without waiting
+/// on the chain. It checks the keys, saves them and replies before it sweeps.
+/// A stalled Tor stream delivers neither the reply nor the close, and a
+/// draining maker keeps its replay cache only for
+/// `maker::api::HANDOVER_REPLAY_GRACE`, which counts this wait. So the taker
+/// must give up and retry well before [`MAKER_RESPONSE_TIMEOUT_SECS`].
+#[cfg(not(feature = "integration-test"))]
+pub(crate) const HANDOVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(feature = "integration-test")]
+pub(crate) const HANDOVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How long the taker waits for a maker's funding to show on-chain before
 /// declaring the swap failed. A live maker broadcasts right after processing;
 /// if nothing appears, the maker is gone and waiting longer helps no one.
@@ -2820,6 +2832,16 @@ impl Taker {
     /// Connect to a maker on the live swap and exchange Hellos. The maker must
     /// still list this hop's pins.
     pub(crate) fn net_connect(&self, address: &str) -> Result<TcpStream, TakerError> {
+        self.net_connect_within(address, Duration::from_secs(MAKER_RESPONSE_TIMEOUT_SECS))
+    }
+
+    /// [`net_connect`](Self::net_connect), waiting at most `read_timeout` for
+    /// each read on the stream, the Hello included.
+    fn net_connect_within(
+        &self,
+        address: &str,
+        read_timeout: Duration,
+    ) -> Result<TcpStream, TakerError> {
         let swap = self.swap_state()?;
         let needed = match swap
             .makers
@@ -2829,7 +2851,7 @@ impl Taker {
             Some(maker) => maker.needed(),
             None => vec![swap.params.protocol.feature_name().to_string()],
         };
-        Ok(self.net_connect_with(address, &needed)?.0)
+        Ok(self.connect_and_greet(address, &needed, read_timeout)?.0)
     }
 
     /// Connect to a maker directly or through Tor and exchange Hellos. The
@@ -2839,11 +2861,25 @@ impl Taker {
         address: &str,
         needed: &[String],
     ) -> Result<(TcpStream, Vec<String>), TakerError> {
+        self.connect_and_greet(
+            address,
+            needed,
+            Duration::from_secs(MAKER_RESPONSE_TIMEOUT_SECS),
+        )
+    }
+
+    /// Connect with `read_timeout` on every read, then exchange Hellos.
+    fn connect_and_greet(
+        &self,
+        address: &str,
+        needed: &[String],
+        read_timeout: Duration,
+    ) -> Result<(TcpStream, Vec<String>), TakerError> {
         let mut stream = connect_to_maker(
             address,
             self.config.connection_type,
             self.config.socks_port,
-            Duration::from_secs(MAKER_RESPONSE_TIMEOUT_SECS),
+            read_timeout,
         )?;
         let features = handshake_with_maker(&mut stream, needed)?;
         Ok((stream, features))
@@ -3011,7 +3047,8 @@ impl Taker {
                 loop {
                     let result = (|| -> Result<Vec<SecretKey>, TakerError> {
                         let maker_address = self.swap_state()?.makers[i].address.to_string();
-                        let mut stream = self.net_connect(&maker_address)?;
+                        let mut stream =
+                            self.net_connect_within(&maker_address, HANDOVER_RESPONSE_TIMEOUT)?;
 
                         log::info!("Sending privkey to maker {} and awaiting response", i);
 

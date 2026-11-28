@@ -60,6 +60,14 @@ const _: () = assert!(
 pub(crate) const PENDING_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 /// Maximum time to finish a frame after its first byte arrives.
 const MESSAGE_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Second handles on the connections that
+/// [`MakerBehavior::StallHandoverResponse`](super::handlers::MakerBehavior::StallHandoverResponse)
+/// stalls. They keep each socket open after its connection ends, and the
+/// pool's shutdown never sees them, so the taker gets no close.
+#[cfg(feature = "integration-test")]
+static STALLED_STREAMS: Mutex<Vec<TcpStream>> = Mutex::new(Vec::new());
+
 const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(feature = "integration-test"))]
 const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -811,8 +819,11 @@ fn handle_connection(
         state.touch();
 
         #[cfg(feature = "integration-test")]
-        let send_response = maker.behavior != super::handlers::MakerBehavior::DropHandoverResponse
-            || state.phase != super::handlers::SwapPhase::Completed;
+        let send_response = !matches!(
+            maker.behavior,
+            super::handlers::MakerBehavior::DropHandoverResponse
+                | super::handlers::MakerBehavior::StallHandoverResponse
+        ) || state.phase != super::handlers::SwapPhase::Completed;
         #[cfg(not(feature = "integration-test"))]
         let send_response = true;
         if !send_response {
@@ -820,6 +831,14 @@ fn handle_connection(
                 "[{}] Test behavior: dropping completed handover response",
                 maker.config.network_port
             );
+            #[cfg(feature = "integration-test")]
+            if maker.behavior == super::handlers::MakerBehavior::StallHandoverResponse {
+                if let Ok(held) = stream.try_clone() {
+                    lock_debug!(STALLED_STREAMS.lock())
+                        .map_err(|_| MakerError::MutexPossion)?
+                        .push(held);
+                }
+            }
         }
         // We close after a refusal, so the taker never has to count them.
         let refused = matches!(response, Some(MakerToTakerMessage::Unsupported(_)));

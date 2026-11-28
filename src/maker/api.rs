@@ -919,20 +919,26 @@ pub struct MakerServer {
 }
 
 /// How long a drain outlives the last settled swap, so a taker that lost its
-/// handover reply can retry. A taker waits its retry delay, then connects
-/// (over Tor, with a connect budget of its own), and the maker gives that
-/// connection its admission budget for the Hello and the handover, so the
-/// window covers all three with a margin. Integration tests connect directly.
+/// handover reply can retry. The reply goes out before the swap settles. If
+/// the stream stalls, the taker sees neither the reply nor the close, and
+/// waits out its handover read timeout. Then it waits its retry delay and
+/// connects (over Tor, with a connect budget of its own), and the maker gives
+/// that connection its admission budget for the Hello and the handover. The
+/// window covers all four with a margin. Integration tests connect directly.
 #[cfg(not(feature = "integration-test"))]
 const HANDOVER_REPLAY_GRACE: Duration = Duration::from_secs(
-    crate::taker::api::FINALIZE_RETRY_DELAY.as_secs()
+    crate::taker::api::HANDOVER_RESPONSE_TIMEOUT.as_secs()
+        + crate::taker::api::FINALIZE_RETRY_DELAY.as_secs()
         + crate::taker::api::CONNECT_TIMEOUT_SECS
         + crate::maker::server::PENDING_CONNECTION_TIMEOUT.as_secs()
         + 15,
 );
 #[cfg(feature = "integration-test")]
-const HANDOVER_REPLAY_GRACE: Duration =
-    Duration::from_secs(crate::taker::api::FINALIZE_RETRY_DELAY.as_secs() + 5);
+const HANDOVER_REPLAY_GRACE: Duration = Duration::from_secs(
+    crate::taker::api::HANDOVER_RESPONSE_TIMEOUT.as_secs()
+        + crate::taker::api::FINALIZE_RETRY_DELAY.as_secs()
+        + 5,
+);
 
 /// How long `maker-cli stop` waits for the swaps in progress before the maker
 /// stops anyway. A peer can keep a swap that holds no funds alive with
@@ -4648,20 +4654,22 @@ pub(crate) mod tests {
         assert!(maker.shutdown.load(Ordering::SeqCst));
     }
 
-    /// The replay window covers a taker's retry delay, its connect budget and
-    /// the maker's admission budget for the retry.
+    /// The replay window covers a taker that waits out a stalled handover
+    /// read, then its retry delay, its connect budget and the maker's
+    /// admission budget for the retry.
     #[test]
     fn replay_grace_covers_the_takers_retry_path() {
-        use crate::taker::api::FINALIZE_RETRY_DELAY;
+        use crate::taker::api::{FINALIZE_RETRY_DELAY, HANDOVER_RESPONSE_TIMEOUT};
         #[cfg(not(feature = "integration-test"))]
         assert!(
             super::HANDOVER_REPLAY_GRACE
-                >= FINALIZE_RETRY_DELAY
+                >= HANDOVER_RESPONSE_TIMEOUT
+                    + FINALIZE_RETRY_DELAY
                     + Duration::from_secs(crate::taker::api::CONNECT_TIMEOUT_SECS)
                     + crate::maker::server::PENDING_CONNECTION_TIMEOUT
         );
         #[cfg(feature = "integration-test")]
-        assert!(super::HANDOVER_REPLAY_GRACE > FINALIZE_RETRY_DELAY);
+        assert!(super::HANDOVER_REPLAY_GRACE > HANDOVER_RESPONSE_TIMEOUT + FINALIZE_RETRY_DELAY);
     }
 
     /// Serving a replay keeps the drain up for a further retry.

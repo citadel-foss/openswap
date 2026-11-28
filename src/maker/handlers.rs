@@ -107,6 +107,9 @@ pub enum MakerBehavior {
     CloseAtPrivateKeyHandover,
     /// Process a handover but drop its first response.
     DropHandoverResponse,
+    /// Drop the first handover response and keep the connection open, the
+    /// way a stalled Tor stream loses both the reply and the close.
+    StallHandoverResponse,
     /// Close after sending the successful handover response, before sweeping
     /// incoming swapcoins.
     CloseAfterHandoverResponse,

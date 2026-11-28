@@ -914,6 +914,7 @@ openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract
 openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract_data_electrum
 openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract_data_in_flight
 openswap::integration rejection::replay::maker_rejects_replayed_taproot_contract_data_in_flight_electrum
+openswap::integration restart::drain_on_stop::drain_answers_a_taker_whose_handover_read_stalled
 openswap::integration restart::drain_on_stop::drain_does_not_wait_for_a_swap_that_went_into_recovery
 openswap::integration restart::drain_on_stop::drain_during_admission_rejects_the_swap_and_leaves_no_state
 openswap::integration restart::drain_on_stop::drain_gives_up_on_a_swap_held_open_without_funding
