@@ -176,6 +176,9 @@ impl KeychainKind {
     }
 }
 
+/// Coins with the info needed to spend them.
+pub(crate) type CoinPool = Vec<(ListUnspentResultEntry, UTXOSpendInfo)>;
+
 /// Enum representing additional data needed to spend a UTXO, in addition to `ListUnspentResultEntry`.
 // data needed to find information  in addition to ListUnspentResultEntry
 // about a UTXO required to spend it
@@ -3456,6 +3459,29 @@ impl Wallet {
         Ok(())
     }
 
+    /// The coins a direct spend may use, as `(regular, swap)` pools: seed coins
+    /// and swept swap coins. Locked coins, coins a swap has reserved and
+    /// `excluded` ones are left out. The pools stay apart so a spend never links
+    /// a swap's coins to the rest of the wallet.
+    pub(crate) fn spendable_pools(&self, excluded: &HashSet<OutPoint>) -> (CoinPool, CoinPool) {
+        let locked_utxos = self.list_lock_unspent();
+        let filter_locked = |utxos: CoinPool| {
+            utxos
+                .into_iter()
+                .filter(|(utxo, _)| {
+                    let outpoint = OutPoint::new(utxo.txid, utxo.vout);
+                    !locked_utxos.contains(&outpoint)
+                        && !excluded.contains(&outpoint)
+                        && !self.is_swap_reserved(&outpoint)
+                })
+                .collect::<Vec<_>>()
+        };
+        (
+            filter_locked(self.list_descriptor_utxo_spend_info()),
+            filter_locked(self.list_swept_incoming_swap_utxos()),
+        )
+    }
+
     /// Performs coin selection to choose UTXOs that sum to a target amount.
     ///
     /// Uses the rust-coinselect library to implement Bitcoin Core's coin selection algorithm.
@@ -3524,24 +3550,10 @@ impl Wallet {
         let change_output_weight = (Amount::SIZE as u64 + 1 + 34u64) * 4;
 
         // 1. Drop locked, swap-reserved, and explicitly excluded UTXOs.
-        let locked_utxos = self.list_lock_unspent();
+        // 2. Segregate spendable UTXOs into two pools: regular and swap.
         let excluded: std::collections::HashSet<OutPoint> =
             excluded_outpoints.unwrap_or_default().into_iter().collect();
-        let filter_locked = |utxos: Vec<(ListUnspentResultEntry, UTXOSpendInfo)>| {
-            utxos
-                .into_iter()
-                .filter(|(utxo, _)| {
-                    let outpoint = OutPoint::new(utxo.txid, utxo.vout);
-                    !locked_utxos.contains(&outpoint)
-                        && !excluded.contains(&outpoint)
-                        && !self.is_swap_reserved(&outpoint)
-                })
-                .collect::<Vec<_>>()
-        };
-
-        // 2. Segregate spendable UTXOs into two pools: regular and swap.
-        let available_regular_utxos = filter_locked(self.list_descriptor_utxo_spend_info());
-        let available_swap_utxos = filter_locked(self.list_swept_incoming_swap_utxos());
+        let (available_regular_utxos, available_swap_utxos) = self.spendable_pools(&excluded);
 
         // Assert that no non-spendable UTXOs are included after filtering
         debug_assert!(
@@ -5400,6 +5412,104 @@ mod swap_reservation_tests {
             "a refused claim reserves nothing"
         );
         assert!(!wallet.store.swap_locks.contains_key("swap-b"));
+    }
+}
+
+#[cfg(test)]
+mod spendable_pool_tests {
+    use super::{test_support::test_wallet, *};
+    use bitcoin::hashes::Hash;
+    use bitcoind::tempfile::tempdir;
+
+    fn outpoint(n: u8) -> OutPoint {
+        OutPoint::new(Txid::from_slice(&[n; 32]).unwrap(), 0)
+    }
+
+    fn add(wallet: &mut Wallet, n: u8, spend_info: UTXOSpendInfo) {
+        let coin = outpoint(n);
+        wallet.store.utxo_cache.insert(
+            coin,
+            (
+                ListUnspentResultEntry {
+                    txid: coin.txid,
+                    vout: coin.vout,
+                    address: None,
+                    label: None,
+                    redeem_script: None,
+                    witness_script: None,
+                    script_pub_key: ScriptBuf::from_bytes(vec![0x51]),
+                    amount: Amount::from_sat(10_000),
+                    confirmations: 1,
+                    spendable: true,
+                    solvable: true,
+                    descriptor: None,
+                    safe: true,
+                },
+                spend_info,
+            ),
+        );
+    }
+
+    fn seed() -> UTXOSpendInfo {
+        UTXOSpendInfo::SeedCoin {
+            path: "m/0/0".into(),
+            input_value: Amount::from_sat(10_000),
+            address_type: AddressType::P2TR,
+        }
+    }
+
+    fn swept() -> UTXOSpendInfo {
+        UTXOSpendInfo::SweptCoin {
+            path: "m/0/1".into(),
+            input_value: Amount::from_sat(10_000),
+            address_type: AddressType::P2TR,
+        }
+    }
+
+    fn outpoints(pool: &[(ListUnspentResultEntry, UTXOSpendInfo)]) -> HashSet<OutPoint> {
+        pool.iter()
+            .map(|(utxo, _)| OutPoint::new(utxo.txid, utxo.vout))
+            .collect()
+    }
+
+    #[test]
+    fn pools_keep_seed_and_swept_coins_apart() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet.cbor"));
+        add(&mut wallet, 1, seed());
+        add(&mut wallet, 2, swept());
+        // A fidelity bond is never a direct-spend coin.
+        add(
+            &mut wallet,
+            3,
+            UTXOSpendInfo::FidelityBondCoin {
+                index: 0,
+                input_value: Amount::from_sat(10_000),
+            },
+        );
+
+        let (regular, swap) = wallet.spendable_pools(&HashSet::new());
+        assert_eq!(outpoints(&regular), HashSet::from([outpoint(1)]));
+        assert_eq!(outpoints(&swap), HashSet::from([outpoint(2)]));
+    }
+
+    #[test]
+    fn pools_leave_out_locked_reserved_and_excluded_coins() {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet.cbor"));
+        for n in 1..=5 {
+            add(&mut wallet, n, seed());
+        }
+        wallet.store.swap_locks.entry("swap-a".into()).or_default();
+        wallet.reserve_swap_locks("swap-a", &[outpoint(2)]);
+        wallet.locked_utxos.insert(outpoint(3));
+
+        let (regular, swap) = wallet.spendable_pools(&HashSet::from([outpoint(4)]));
+        assert_eq!(
+            outpoints(&regular),
+            HashSet::from([outpoint(1), outpoint(5)])
+        );
+        assert!(swap.is_empty());
     }
 }
 

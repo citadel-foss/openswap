@@ -7,8 +7,8 @@ use crate::{
     security::{is_encrypted_cbor, load_sensitive_struct, KeyMaterial, SerdeJson},
     utill::{get_taker_dir, is_unusable_fee_rate, parse_checked_address, MIN_RELAY_FEE_RATE},
     wallet::{
-        infer_address_type, AddressType, Destination, RestoreOptions, Wallet, WalletBackup,
-        WalletError,
+        infer_address_type, spend::pick_sweep_pool, AddressType, Destination, RestoreOptions,
+        Wallet, WalletBackup, WalletError,
     },
 };
 use bitcoin::{Amount, OutPoint, Txid};
@@ -284,6 +284,86 @@ impl Wallet {
 
         Ok(txid)
     }
+
+    /// Sends every spendable coin of one pool to an external address, with the
+    /// fee taken from the total: one input set, one output, no change.
+    ///
+    /// Regular coins go first. Swap coins go only when the wallet has no
+    /// regular ones, because a spend never mixes the two pools. Coins that are
+    /// locked or reserved by a swap stay put. [`Sweep::left_behind`] counts
+    /// the coins of the other pool. The caller should send those to a fresh
+    /// address: the same one would link the two pools on-chain.
+    pub fn sweep_to_address(
+        &mut self,
+        address: String,
+        fee_rate: Option<f64>,
+    ) -> Result<Sweep, WalletError> {
+        let addr = parse_checked_address(&address, self.store.network).map_err(|e| {
+            log::debug!(
+                "Address validation failed for network {:?}: {:?}",
+                self.store.network,
+                e
+            );
+            WalletError::General("Invalid address for the current wallet network".to_string())
+        })?;
+
+        let fee_rate = checked_fee_rate(fee_rate)?;
+
+        let (regular, swap) = self.spendable_pools(&Default::default());
+        let script = addr.script_pubkey();
+        let pick = pick_sweep_pool(
+            regular,
+            swap,
+            fee_rate,
+            script.len(),
+            script.minimal_non_dust(),
+        )?;
+
+        let tx = self.spend_from_wallet(fee_rate, Destination::Sweep(addr), &pick.coins)?;
+        let amount = tx.output[0].value;
+        let inputs = tx.input.len();
+
+        self.send_tx(&tx)?;
+        // Named by the transaction we built: the backend's reply is not used.
+        let txid = tx.compute_txid();
+        // The broadcast is accepted, so the caller gets the txid whatever
+        // happens next. The wallet is not synced: a sweep has one external
+        // output and no change, so the spent coins are all there is to learn,
+        // and they leave the cache here. No network call can then hold the
+        // wallet lock or delay the result, and a retry cannot pick the coins
+        // again. The next sync of the wallet confirms the spend.
+        for input in &tx.input {
+            self.store.utxo_cache.remove(&input.previous_output);
+        }
+        if let Err(e) = self.save_to_disk() {
+            log::error!("Wallet save failed after broadcasting {txid}: {e:?}");
+        }
+
+        Ok(Sweep {
+            txid,
+            amount,
+            inputs,
+            left_behind: pick.left_behind,
+            uneconomic: pick.uneconomic,
+        })
+    }
+}
+
+/// What [`Wallet::sweep_to_address`] sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sweep {
+    /// The broadcast transaction.
+    pub txid: Txid,
+    /// What the address receives: the coins' total less the fee.
+    pub amount: Amount,
+    /// How many coins were spent.
+    pub inputs: usize,
+    /// Spendable coins of the other pool, which this send did not touch and a
+    /// second send can move.
+    pub left_behind: usize,
+    /// Coins left in the wallet because they cost more to spend than they hold
+    /// at this feerate, or because their pool is too small to send.
+    pub uneconomic: usize,
 }
 
 #[cfg(test)]
@@ -332,6 +412,42 @@ mod tests {
             assert!(
                 !format!("{err:?}").contains("relay floor"),
                 "rate {:?} must clear the rate check, got {:?}",
+                rate,
+                err
+            );
+        }
+    }
+
+    fn sweep(address: String, fee_rate: Option<f64>) -> Result<Sweep, WalletError> {
+        let dir = tempdir().unwrap();
+        let mut wallet = test_wallet(&dir.path().join("wallet.cbor"));
+        wallet.sweep_to_address(address, fee_rate)
+    }
+
+    #[test]
+    fn a_sweep_of_an_empty_wallet_is_refused() {
+        let err = sweep(destination(), None).unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("No spendable coins"),
+            "an empty wallet has nothing to sweep: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn a_sweep_refuses_a_bad_address_and_unusable_fee_rates() {
+        let err = sweep("not-an-address".to_string(), None).unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("Invalid address"),
+            "{:?}",
+            err
+        );
+
+        for rate in [f64::NAN, f64::INFINITY, 0.0, 0.999] {
+            let err = sweep(destination(), Some(rate)).unwrap_err();
+            assert!(
+                format!("{:?}", err).contains("relay floor"),
+                "rate {} must be refused: {:?}",
                 rate,
                 err
             );

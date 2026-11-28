@@ -132,8 +132,15 @@ enum Commands {
         #[clap(long, short = 't')]
         address: String,
         /// Amount to send in sats
-        #[clap(long, short = 'a')]
-        amount: u64,
+        #[clap(long, short = 'a', required_unless_present = "max")]
+        amount: Option<u64>,
+        /// Send everything instead of an amount, with the fee taken from it.
+        /// Spends all regular coins; if the wallet has none, all swap coins.
+        /// The two kinds are never sent together, so run it again for the
+        /// other, to a fresh address. Coins held by a swap stay, and so do
+        /// coins that cost more to spend than they hold.
+        #[clap(long, conflicts_with = "amount")]
+        max: bool,
         /// Feerate in sats/vByte. Defaults to 1 sat/vByte; values below the
         /// 1 sat/vByte relay floor are rejected
         #[clap(long, short = 'f')]
@@ -732,9 +739,34 @@ fn run() -> Result<(), TakerError> {
         Commands::SendToAddress {
             address,
             amount,
+            max,
             feerate,
         } => {
-            let amount = Amount::from_sat(*amount);
+            if *max {
+                let mut wallet = lock_debug!(taker.get_wallet().write()).unwrap();
+                let sweep = wallet.sweep_to_address(address.clone(), *feerate)?;
+                println!("{}", sweep.txid);
+                eprintln!(
+                    "Sent {} sats from {} coin(s), fee taken from the total.",
+                    sweep.amount.to_sat(),
+                    sweep.inputs
+                );
+                if sweep.uneconomic > 0 {
+                    eprintln!(
+                        "{} coin(s) were left in the wallet: they cost more to spend than they hold at this feerate, or their kind is too small to send.",
+                        sweep.uneconomic
+                    );
+                }
+                if sweep.left_behind > 0 {
+                    eprintln!(
+                        "{} swap coin(s) were not sent, as they are never mixed with regular coins. Run the command again to send them, to a fresh address: reusing this one would link them to the coins just sent.",
+                        sweep.left_behind
+                    );
+                }
+                return Ok(());
+            }
+            // clap requires an amount whenever --max is absent.
+            let amount = Amount::from_sat(amount.expect("clap requires --amount without --max"));
 
             #[cfg(not(feature = "integration-test"))]
             let manually_selected_outpoints = {
@@ -1123,6 +1155,18 @@ mod tests {
             assert!(!needs(&[cmd]), "{} must not need Tor", cmd);
         }
         assert!(!needs(&["blocklist-remove", "bcrt1qxyz"]));
+    }
+
+    /// `--max` replaces `--amount`; a send needs exactly one of them.
+    #[test]
+    fn send_to_address_takes_an_amount_or_max_not_both() {
+        let to = ["send-to-address", "-t", "bcrt1qxyz"];
+        let with = |extra: &[&str]| parse(&[&to[..], extra].concat());
+        assert!(with(&["-a", "1000"]).is_ok());
+        assert!(with(&["--max"]).is_ok());
+        assert!(with(&["--max", "-f", "2"]).is_ok());
+        assert!(with(&[]).is_err(), "an amount or --max is required");
+        assert!(with(&["-a", "1000", "--max"]).is_err());
     }
 
     #[test]
