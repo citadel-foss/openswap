@@ -859,6 +859,9 @@ pub struct MakerServer {
     pub shutdown: ShutdownSignal,
     /// Is setup complete flag.
     pub is_setup_complete: AtomicBool,
+    /// Set while `serve` sets up the fidelity bond at startup. The RPC server answers
+    /// then, but refuses spends: they would race the bond for the same coins.
+    pub(crate) setting_up: AtomicBool,
     /// Highest fidelity proof.
     pub highest_fidelity_proof: RwLock<Option<FidelityProof>>,
     /// Ongoing swap states by swap_id.
@@ -1175,6 +1178,7 @@ impl MakerServer {
             backend,
             shutdown,
             is_setup_complete: AtomicBool::new(false),
+            setting_up: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
             drain_deadline: OnceLock::new(),
@@ -1669,10 +1673,16 @@ impl MakerServer {
             }
         }
 
-        lock_debug!(self.highest_fidelity_proof.read())
+        let proof = lock_debug!(self.highest_fidelity_proof.read())
             .map_err(|_| MakerError::General("Failed to lock fidelity proof"))?
-            .clone()
-            .ok_or(MakerError::General("No fidelity proof after setup"))
+            .clone();
+        match proof {
+            Some(proof) => Ok(proof),
+            // A stop can land before or between the loop checks above: that is
+            // a clean stop, not a missing bond.
+            None if self.is_shutdown() => Err(MakerError::Shutdown),
+            None => Err(MakerError::General("No fidelity proof after setup")),
+        }
     }
 
     /// Check if maker has enough liquidity for swaps.
@@ -1719,6 +1729,10 @@ impl MakerServer {
             }
         }
 
+        // Stopped while waiting: not set up, so `serve` must not go on as if it were.
+        if self.is_shutdown() {
+            return Err(MakerError::Shutdown);
+        }
         Ok(())
     }
 
@@ -1909,7 +1923,8 @@ impl MakerServer {
     }
 
     /// Stops the server if a drain is running and no swap is left, or its
-    /// deadline has passed. Called by the serve loop.
+    /// deadline has passed. Called by the serve loop, and once when `maker-cli
+    /// stop` starts the drain before setup completes.
     ///
     /// Swaps in recovery and Lightning swaps are not counted: they are saved in
     /// the wallet, may wait on a timelock for hours, and the next start picks
@@ -4187,6 +4202,22 @@ impl MakerRpc for MakerServer {
 
     fn start_drain(&self) {
         MakerServer::start_drain(self);
+        // Until setup completes the serve loop may not be checking the drain
+        // yet, and no swap can be in progress: check it here too. The check is
+        // safe to repeat, as a recovery-only serve loop also runs it.
+        if !self.is_setup_complete.load(Ordering::Relaxed) {
+            if let Err(e) = self.stop_if_drained() {
+                log::error!(
+                    "[{}] Failed to check the drain: {:?}",
+                    self.config.network_port,
+                    e
+                );
+            }
+        }
+    }
+
+    fn refuses_spends(&self) -> bool {
+        self.setting_up.load(Ordering::Relaxed)
     }
 
     fn rpc_client(&self) -> Option<&Mutex<Option<TcpStream>>> {
@@ -4447,6 +4478,49 @@ pub(crate) mod tests {
         );
     }
 
+    /// A stop during the liquidity wait is a clean stop, not a finished setup:
+    /// `serve` must not go on to "Server setup complete".
+    #[test]
+    fn stopped_liquidity_wait_is_a_clean_stop() {
+        use crate::wallet::{blockchain::mock_electrum, AnyBlockchain, Electrum, ElectrumConfig};
+        use serde_json::Value;
+        // The wait takes a fresh address first, which needs a backend.
+        let server = mock_electrum(|_, _| Ok(Value::Null));
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        maker.wallet.write().unwrap().blockchain = AnyBlockchain::Electrum(
+            Electrum::new(&ElectrumConfig {
+                url: server.url.clone(),
+                ..Default::default()
+            })
+            .expect("connect to mock electrum"),
+        );
+        maker.shutdown.store(true, Ordering::SeqCst);
+        let stopped = maker.check_swap_liquidity().unwrap_err();
+        assert!(stopped.is_shutdown(), "not a clean stop: {:?}", stopped);
+    }
+
+    /// `maker-cli stop` during setup stops the maker at once: the serve loop
+    /// that acts on a drain is not running yet.
+    #[test]
+    fn stop_during_setup_stops_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        crate::maker::rpc::server::MakerRpc::start_drain(&*maker);
+        assert!(maker.is_shutdown());
+    }
+
+    /// After setup a `stop` only starts the drain; the serve loop decides.
+    #[test]
+    fn stop_after_setup_only_starts_the_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let maker = compat_test_maker(dir.path(), Vec::new());
+        maker.is_setup_complete.store(true, Ordering::SeqCst);
+        crate::maker::rpc::server::MakerRpc::start_drain(&*maker);
+        assert!(maker.is_draining());
+        assert!(!maker.is_shutdown());
+    }
+
     pub(crate) fn compat_test_maker(
         path: &Path,
         require_features: Vec<String>,
@@ -4475,6 +4549,7 @@ pub(crate) mod tests {
             wallet: Arc::new(RwLock::new(wallet)),
             shutdown,
             is_setup_complete: AtomicBool::new(false),
+            setting_up: AtomicBool::new(false),
             highest_fidelity_proof: RwLock::new(None),
             ongoing_swaps: Mutex::new(HashMap::new()),
             drain_deadline: OnceLock::new(),

@@ -134,9 +134,15 @@ pub trait MakerRpc {
     fn data_dir(&self) -> &Path;
     fn config(&self) -> &MakerServerConfig;
     fn shutdown(&self) -> &ShutdownSignal;
-    /// Starts a drain: refuse new swaps and let the serve loop stop the server
-    /// once the swaps in progress are done. Returns at once.
+    /// Starts a drain: refuse new swaps and stop the server once the swaps in
+    /// progress are done. The serve loop checks it, and so does this call
+    /// before setup completes. Returns at once.
     fn start_drain(&self);
+    /// Whether spends are refused: the maker is setting up its fidelity bond
+    /// at startup, and a spend would race it for the same coins.
+    fn refuses_spends(&self) -> bool {
+        false
+    }
     /// Where the client being served is parked, so shutdown can close it
     /// under a blocked read.
     fn rpc_client(&self) -> Option<&Mutex<Option<TcpStream>>> {
@@ -242,9 +248,15 @@ fn handle_request<M: MakerRpc>(
             feerate,
         } => {
             let amount = Amount::from_sat(amount);
+            // During setup a spend would race the bond for the same coins.
             // Below the relay floor the tx would not propagate; an invalid
             // rate is the caller's error, not something to repair.
-            if is_unusable_fee_rate(feerate) {
+            if maker.refuses_spends() {
+                RpcMsgResp::ServerError(
+                    "makerd is still setting up its fidelity bond; send-to-address works once that is done"
+                        .to_string(),
+                )
+            } else if is_unusable_fee_rate(feerate) {
                 RpcMsgResp::ServerError(
                     "SendToAddress feerate must be finite and at least the 1 sats/vB relay floor"
                         .to_string(),
@@ -298,7 +310,7 @@ fn handle_request<M: MakerRpc>(
             maker.shutdown().store(true, Relaxed);
             RpcMsgResp::Shutdown
         }
-        // Only latches the drain: the serve loop does the waiting, so this
+        // Only latches and checks the drain: the serve loop does the waiting, so this
         // sequential RPC server stays free for a following `stop --now`. The
         // latch comes after the reply is written, so an idle maker cannot shut
         // the socket before the caller has its answer.
