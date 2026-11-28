@@ -12,7 +12,10 @@ use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 
 use crate::{
     utill::{fee_at_rate_sats, is_unusable_fee_rate},
-    wallet::{api::UTXOSpendInfo, p2tr_min_non_dust_sats, FidelityError},
+    wallet::{
+        api::{CoinPool, UTXOSpendInfo},
+        p2tr_min_non_dust_sats, FidelityError,
+    },
 };
 
 use super::{error::WalletError, AddressType, Blockchain, Wallet};
@@ -44,6 +47,104 @@ pub(crate) enum SpendTarget {
         spend: Amount,
         change_address_type: AddressType,
     },
+}
+
+/// Virtual size of a sweep of `inputs` coins holding `witness` witness bytes in
+/// all, paying one output whose script is `spk_len` bytes. The same arithmetic
+/// the sweep in [`Wallet::spend_coins_to`] prices its fee with.
+pub(crate) fn sweep_vsize(inputs: usize, witness: usize, spk_len: usize) -> u64 {
+    let varint = |n: usize| bitcoin::VarInt(n as u64).size();
+    // version, input count, 41 bytes per input, output count, output, locktime
+    let base = 4 + varint(inputs) + 41 * inputs + 1 + (8 + varint(spk_len) + spk_len) + 4;
+    (base * 4 + witness + 2).div_ceil(4) as u64
+}
+
+/// What a sweep spends, and what it leaves.
+pub(crate) struct SweepPick {
+    /// The coins to spend: one pool only.
+    pub coins: CoinPool,
+    /// Coins of the other pool that a second sweep can send.
+    pub left_behind: usize,
+    /// Coins left in either pool because they cost more to spend than they
+    /// hold, or because their pool is too small to send.
+    pub uneconomic: usize,
+}
+
+/// Splits `pool` into the coins worth more than their own input fee at
+/// `fee_rate`, and a count of the rest.
+fn economic_coins(pool: CoinPool, fee_rate: f64) -> (CoinPool, usize) {
+    let total = pool.len();
+    let kept: CoinPool = pool
+        .into_iter()
+        .filter(|(utxo, info)| {
+            let input_vsize = ((41 * 4 + info.estimate_witness_size()).div_ceil(4)) as u64;
+            fee_at_rate_sats(input_vsize, fee_rate).is_some_and(|fee| utxo.amount.to_sat() > fee)
+        })
+        .collect();
+    let skipped = total - kept.len();
+    (kept, skipped)
+}
+
+/// Whether sweeping all of `pool` leaves an output of at least `dust`.
+fn sweep_pays(pool: &CoinPool, fee_rate: f64, spk_len: usize, dust: Amount) -> bool {
+    if pool.is_empty() {
+        return false;
+    }
+    let total: u64 = pool.iter().map(|(utxo, _)| utxo.amount.to_sat()).sum();
+    let witness: usize = pool
+        .iter()
+        .map(|(_, info)| info.estimate_witness_size())
+        .sum();
+    fee_at_rate_sats(sweep_vsize(pool.len(), witness, spk_len), fee_rate)
+        .and_then(|fee| total.checked_sub(fee))
+        .is_some_and(|left| left >= dust.to_sat())
+}
+
+/// Picks the pool a sweep spends. Regular coins go first and swap coins never
+/// go with them, but only a pool that can pay for a non-dust output is chosen:
+/// a dust-sized regular coin must not stop the swap coins from leaving. Coins
+/// that cost more than they hold are left out of the sweep.
+pub(crate) fn pick_sweep_pool(
+    regular: CoinPool,
+    swap: CoinPool,
+    fee_rate: f64,
+    spk_len: usize,
+    dust: Amount,
+) -> Result<SweepPick, WalletError> {
+    let spendable = regular.len() + swap.len();
+    if spendable == 0 {
+        return Err(WalletError::General(
+            "No spendable coins in the wallet".to_string(),
+        ));
+    }
+    let (regular, regular_skipped) = economic_coins(regular, fee_rate);
+    let (swap, swap_skipped) = economic_coins(swap, fee_rate);
+    let regular_pays = sweep_pays(&regular, fee_rate, spk_len, dust);
+    let swap_pays = sweep_pays(&swap, fee_rate, spk_len, dust);
+    let skipped = regular_skipped + swap_skipped;
+
+    if regular_pays {
+        let (left_behind, stuck) = if swap_pays {
+            (swap.len(), 0)
+        } else {
+            (0, swap.len())
+        };
+        Ok(SweepPick {
+            coins: regular,
+            left_behind,
+            uneconomic: skipped + stuck,
+        })
+    } else if swap_pays {
+        Ok(SweepPick {
+            coins: swap,
+            left_behind: 0,
+            uneconomic: skipped + regular.len(),
+        })
+    } else {
+        Err(WalletError::General(format!(
+            "The wallet's {spendable} spendable coin(s) are too small to send to this address at {fee_rate} sat/vB"
+        )))
+    }
 }
 
 impl Wallet {
@@ -536,6 +637,157 @@ mod tests {
 
     const fn sats(n: u64) -> Amount {
         Amount::from_sat(n)
+    }
+
+    fn coin(n: u8, amount: u64, info: UTXOSpendInfo) -> (ListUnspentResultEntry, UTXOSpendInfo) {
+        use bitcoin::hashes::Hash;
+        (
+            ListUnspentResultEntry {
+                txid: bitcoin::Txid::from_slice(&[n; 32]).unwrap(),
+                vout: 0,
+                address: None,
+                label: None,
+                redeem_script: None,
+                witness_script: None,
+                script_pub_key: ScriptBuf::new(),
+                amount: sats(amount),
+                confirmations: 1,
+                spendable: true,
+                solvable: true,
+                descriptor: None,
+                safe: true,
+            },
+            info,
+        )
+    }
+
+    fn seed(n: u8, amount: u64) -> (ListUnspentResultEntry, UTXOSpendInfo) {
+        coin(
+            n,
+            amount,
+            UTXOSpendInfo::SeedCoin {
+                path: "m/0/0".into(),
+                input_value: sats(amount),
+                address_type: AddressType::P2TR,
+            },
+        )
+    }
+
+    fn swept(n: u8, amount: u64) -> (ListUnspentResultEntry, UTXOSpendInfo) {
+        coin(
+            n,
+            amount,
+            UTXOSpendInfo::SweptCoin {
+                path: "m/0/1".into(),
+                input_value: sats(amount),
+                address_type: AddressType::P2TR,
+            },
+        )
+    }
+
+    /// A P2TR script is 34 bytes; 330 sats is its dust limit.
+    const P2TR_SPK: usize = 34;
+    const DUST: Amount = sats(330);
+
+    fn amounts(pool: &CoinPool) -> Vec<u64> {
+        pool.iter().map(|(utxo, _)| utxo.amount.to_sat()).collect()
+    }
+
+    /// The size the sweep prices its fee with must be the size of the
+    /// transaction it builds, for any number of inputs.
+    #[test]
+    fn sweep_vsize_is_the_size_of_the_sweep() {
+        use bitcoin::{absolute::LockTime, transaction::Version};
+        let witness_each = 66; // a P2TR key-path spend
+        for inputs in [1usize, 3, 252, 300] {
+            let tx = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: (0..inputs)
+                    .map(|_| TxIn {
+                        previous_output: OutPoint::null(),
+                        sequence: Sequence::ZERO,
+                        witness: Witness::new(),
+                        script_sig: ScriptBuf::new(),
+                    })
+                    .collect(),
+                output: vec![TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::from_bytes(vec![0; P2TR_SPK]),
+                }],
+            };
+            let expected = (tx.base_size() * 4 + witness_each * inputs + 2).div_ceil(4) as u64;
+            assert_eq!(
+                sweep_vsize(inputs, witness_each * inputs, P2TR_SPK),
+                expected,
+                "{inputs} inputs"
+            );
+        }
+    }
+
+    /// A dust-sized regular coin must not be picked alone while swap coins
+    /// that can leave exist: at 2 sat/vB it cannot pay for an output.
+    #[test]
+    fn a_regular_pool_too_small_to_send_does_not_block_the_swap_coins() {
+        let pick = pick_sweep_pool(
+            vec![seed(1, 400)],
+            vec![swept(2, 100_000)],
+            2.0,
+            P2TR_SPK,
+            DUST,
+        )
+        .unwrap();
+        assert_eq!(amounts(&pick.coins), [100_000]);
+        assert_eq!(pick.left_behind, 0);
+        assert_eq!(pick.uneconomic, 1, "the 400 sat coin stays and is counted");
+    }
+
+    #[test]
+    fn regular_coins_go_first_and_report_the_swap_coins_left() {
+        let pick = pick_sweep_pool(
+            vec![seed(1, 50_000), seed(2, 70_000)],
+            vec![swept(3, 100_000)],
+            2.0,
+            P2TR_SPK,
+            DUST,
+        )
+        .unwrap();
+        assert_eq!(amounts(&pick.coins), [50_000, 70_000]);
+        assert_eq!(pick.left_behind, 1);
+        assert_eq!(pick.uneconomic, 0);
+    }
+
+    /// A coin worth less than its own input fee only lowers what arrives.
+    #[test]
+    fn a_coin_that_costs_more_than_it_holds_is_left_out() {
+        // A P2TR input is 58 vB: 580 sats at 10 sat/vB.
+        let pick = pick_sweep_pool(
+            vec![seed(1, 500), seed(2, 50_000)],
+            Vec::new(),
+            10.0,
+            P2TR_SPK,
+            DUST,
+        )
+        .unwrap();
+        assert_eq!(amounts(&pick.coins), [50_000]);
+        assert_eq!(pick.uneconomic, 1);
+    }
+
+    #[test]
+    fn a_wallet_with_nothing_to_send_says_why() {
+        let none = pick_sweep_pool(Vec::new(), Vec::new(), 2.0, P2TR_SPK, DUST)
+            .err()
+            .unwrap();
+        assert!(format!("{:?}", none).contains("No spendable coins"));
+
+        let small = pick_sweep_pool(vec![seed(1, 400)], vec![swept(2, 300)], 2.0, P2TR_SPK, DUST)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{:?}", small).contains("too small to send"),
+            "{:?}",
+            small
+        );
     }
 
     #[test]

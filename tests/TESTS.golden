@@ -580,6 +580,9 @@ openswap wallet::seed_cli::tests::quiz_never_asks_for_more_words_than_exist
 openswap wallet::seed_cli::tests::quiz_positions_are_distinct_sorted_and_in_range
 openswap wallet::seed_cli::tests::seed_commands_write_only_when_no_process_runs_on_the_wallet
 openswap wallet::seed_cli::tests::sentinel_open_failures_refuse_every_wallet_lock_mode
+openswap wallet::spend::tests::a_coin_that_costs_more_than_it_holds_is_left_out
+openswap wallet::spend::tests::a_regular_pool_too_small_to_send_does_not_block_the_swap_coins
+openswap wallet::spend::tests::a_wallet_with_nothing_to_send_says_why
 openswap wallet::spend::tests::change_at_the_dust_limit_is_kept
 openswap wallet::spend::tests::exact_spend_refuses_a_fee_below_the_real_size
 openswap wallet::spend::tests::exact_spend_refuses_dust_change
@@ -587,7 +590,9 @@ openswap wallet::spend::tests::exact_spend_refuses_inputs_below_the_spend
 openswap wallet::spend::tests::exact_spend_refuses_outputs_above_the_spend
 openswap wallet::spend::tests::exact_spend_with_no_change
 openswap wallet::spend::tests::exact_spend_with_the_smallest_change
+openswap wallet::spend::tests::regular_coins_go_first_and_report_the_swap_coins_left
 openswap wallet::spend::tests::sweep_refuses_a_dust_or_empty_output
+openswap wallet::spend::tests::sweep_vsize_is_the_size_of_the_sweep
 openswap wallet::storage::compat_support::compat_fixtures_nested_bond_rename_cannot_hide_in_extra
 openswap wallet::storage::compat_support::compat_fixtures_wallet_index_rename_cannot_hide_in_extra
 openswap wallet::storage::tests::compat_cache_future_spend_info_drops_only_its_entry

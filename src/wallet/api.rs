@@ -177,7 +177,7 @@ impl KeychainKind {
 }
 
 /// Coins with the info needed to spend them.
-type CoinPool = Vec<(ListUnspentResultEntry, UTXOSpendInfo)>;
+pub(crate) type CoinPool = Vec<(ListUnspentResultEntry, UTXOSpendInfo)>;
 
 /// Enum representing additional data needed to spend a UTXO, in addition to `ListUnspentResultEntry`.
 // data needed to find information  in addition to ListUnspentResultEntry

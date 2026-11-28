@@ -7,8 +7,8 @@ use crate::{
     security::{is_encrypted_cbor, load_sensitive_struct, KeyMaterial, SerdeJson},
     utill::{get_taker_dir, is_unusable_fee_rate, parse_checked_address, MIN_RELAY_FEE_RATE},
     wallet::{
-        infer_address_type, AddressType, Destination, RestoreOptions, Wallet, WalletBackup,
-        WalletError,
+        infer_address_type, spend::pick_sweep_pool, AddressType, Destination, RestoreOptions,
+        Wallet, WalletBackup, WalletError,
     },
 };
 use bitcoin::{Amount, OutPoint, Txid};
@@ -310,18 +310,16 @@ impl Wallet {
         let fee_rate = checked_fee_rate(fee_rate)?;
 
         let (regular, swap) = self.spendable_pools(&Default::default());
-        let (coins, left_behind) = if regular.is_empty() {
-            (swap, 0)
-        } else {
-            (regular, swap.len())
-        };
-        if coins.is_empty() {
-            return Err(WalletError::General(
-                "No spendable coins in the wallet".to_string(),
-            ));
-        }
+        let script = addr.script_pubkey();
+        let pick = pick_sweep_pool(
+            regular,
+            swap,
+            fee_rate,
+            script.len(),
+            script.minimal_non_dust(),
+        )?;
 
-        let tx = self.spend_from_wallet(fee_rate, Destination::Sweep(addr), &coins)?;
+        let tx = self.spend_from_wallet(fee_rate, Destination::Sweep(addr), &pick.coins)?;
         let amount = tx.output[0].value;
         let inputs = tx.input.len();
 
@@ -345,7 +343,8 @@ impl Wallet {
             txid,
             amount,
             inputs,
-            left_behind,
+            left_behind: pick.left_behind,
+            uneconomic: pick.uneconomic,
         })
     }
 }
@@ -359,8 +358,12 @@ pub struct Sweep {
     pub amount: Amount,
     /// How many coins were spent.
     pub inputs: usize,
-    /// Spendable coins of the other pool, which this send did not touch.
+    /// Spendable coins of the other pool, which this send did not touch and a
+    /// second send can move.
     pub left_behind: usize,
+    /// Coins left in the wallet because they cost more to spend than they hold
+    /// at this feerate, or because their pool is too small to send.
+    pub uneconomic: usize,
 }
 
 #[cfg(test)]
