@@ -1016,8 +1016,10 @@ pub fn check_tor_status(control_port: u16, password: &str) -> Result<(), TorErro
 }
 
 /// Connect to `target_host:target_port` through the local Tor SOCKS5 proxy,
-/// with connect and handshake bounded by `timeout`. The `socks` crate does an
-/// un-timed connect, so a wedged proxy would hang shutdown joins forever.
+/// with connect and handshake bounded by `timeout` in total: every step gets
+/// only what is left of it, so a proxy that stalls a little at each step
+/// cannot add up to more. The `socks` crate does an un-timed connect, so a
+/// wedged proxy would hang shutdown joins forever.
 #[cfg(not(feature = "integration-test"))]
 pub(crate) fn socks5_connect(
     socks_port: u16,
@@ -1026,10 +1028,20 @@ pub(crate) fn socks5_connect(
     auth: Option<(&str, &str)>,
     timeout: Duration,
 ) -> io::Result<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    // Limit the next read or write to what is left of the deadline.
+    let within_deadline = |socket: &TcpStream| -> io::Result<()> {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, "socks5 handshake timed out"))?;
+        socket.set_read_timeout(Some(left))?;
+        socket.set_write_timeout(Some(left))
+    };
+
     let proxy = std::net::SocketAddr::from(([127, 0, 0, 1], socks_port));
     let mut socket = TcpStream::connect_timeout(&proxy, timeout)?;
-    socket.set_read_timeout(Some(timeout))?;
-    socket.set_write_timeout(Some(timeout))?;
+    within_deadline(&socket)?;
 
     // Greeting: always offer no-auth, plus password when credentials exist.
     let mut greeting = vec![5u8];
@@ -1040,6 +1052,7 @@ pub(crate) fn socks5_connect(
     socket.write_all(&greeting)?;
 
     let mut choice = [0u8; 2];
+    within_deadline(&socket)?;
     socket.read_exact(&mut choice)?;
     if choice[0] != 5 {
         return Err(io::Error::new(
@@ -1063,8 +1076,10 @@ pub(crate) fn socks5_connect(
             req.extend_from_slice(username.as_bytes());
             req.push(password.len() as u8);
             req.extend_from_slice(password.as_bytes());
+            within_deadline(&socket)?;
             socket.write_all(&req)?;
             let mut status = [0u8; 2];
+            within_deadline(&socket)?;
             socket.read_exact(&mut status)?;
             if status[1] != 0 {
                 return Err(io::Error::new(
@@ -1091,9 +1106,11 @@ pub(crate) fn socks5_connect(
     let mut req = vec![5u8, 1, 0, 3, host.len() as u8];
     req.extend_from_slice(host);
     req.extend_from_slice(&target_port.to_be_bytes());
+    within_deadline(&socket)?;
     socket.write_all(&req)?;
 
     let mut head = [0u8; 4];
+    within_deadline(&socket)?;
     socket.read_exact(&mut head)?;
     if head[0] != 5 || head[1] != 0 {
         return Err(io::Error::other(format!(
@@ -1102,16 +1119,22 @@ pub(crate) fn socks5_connect(
         )));
     }
     // Drain the bound address; its length depends on the address type.
+    within_deadline(&socket)?;
     match head[3] {
         1 => socket.read_exact(&mut [0u8; 6])?,
         3 => {
             let mut len = [0u8; 1];
             socket.read_exact(&mut len)?;
+            within_deadline(&socket)?;
             socket.read_exact(&mut vec![0u8; len[0] as usize + 2])?;
         }
         4 => socket.read_exact(&mut [0u8; 18])?,
         t => return Err(io::Error::other(format!("unknown socks address type: {t}"))),
     }
+    // The deadline only bounded the handshake. Callers get the socket with the
+    // timeouts they asked for, as before.
+    socket.set_read_timeout(Some(timeout))?;
+    socket.set_write_timeout(Some(timeout))?;
     Ok(socket)
 }
 
@@ -1646,6 +1669,65 @@ pub fn interactive_select(
 
 #[cfg(test)]
 mod tests {
+    /// A SOCKS5 proxy on a free local port that answers each step of the
+    /// handshake after `step`. Returns the port and the proxy thread.
+    #[cfg(not(feature = "integration-test"))]
+    fn slow_socks_proxy(step: Duration) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Greeting, then CONNECT for the 4 byte host "abcd".
+            let mut greeting = [0u8; 3];
+            let mut request = [0u8; 5 + 4 + 2];
+            let _ = stream.read_exact(&mut greeting);
+            std::thread::sleep(step);
+            let _ = stream.write_all(&[5, 0]);
+            let _ = stream.read_exact(&mut request);
+            std::thread::sleep(step);
+            let _ = stream.write_all(&[5, 0, 0, 1]);
+            std::thread::sleep(step);
+            let _ = stream.write_all(&[0u8; 6]);
+        });
+        (port, proxy)
+    }
+
+    /// Each step of the handshake fits the timeout, but together they do not.
+    /// The timeout is for the whole connect, so it must fail.
+    #[test]
+    #[cfg(not(feature = "integration-test"))]
+    fn socks5_connect_bounds_the_whole_handshake() {
+        let (port, proxy) = slow_socks_proxy(Duration::from_millis(300));
+        let started = Instant::now();
+        let error = socks5_connect(port, "abcd", 6102, None, Duration::from_millis(500))
+            .expect_err("three 300 ms steps do not fit in 500 ms");
+        assert!(
+            matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock),
+            "unexpected error: {}",
+            error
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "took {:?}",
+            started.elapsed()
+        );
+        proxy.join().unwrap();
+    }
+
+    /// A proxy that is quick enough is not affected by the deadline, and the
+    /// caller gets the socket with its own `timeout`.
+    #[test]
+    #[cfg(not(feature = "integration-test"))]
+    fn socks5_connect_keeps_the_callers_timeout_after_the_handshake() {
+        let (port, proxy) = slow_socks_proxy(Duration::from_millis(10));
+        let timeout = Duration::from_secs(5);
+        let socket = socks5_connect(port, "abcd", 6102, None, timeout).expect("fast proxy");
+        assert_eq!(socket.read_timeout().unwrap(), Some(timeout));
+        assert_eq!(socket.write_timeout().unwrap(), Some(timeout));
+        proxy.join().unwrap();
+    }
+
     use std::{
         net::TcpListener,
         os::unix::fs::{symlink, PermissionsExt},
